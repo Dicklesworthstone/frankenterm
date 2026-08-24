@@ -339,6 +339,18 @@ impl FileDescriptor {
         self.set_non_blocking_impl(non_blocking)
     }
 
+    /// Probe a socket for read readiness without consuming data or waiting.
+    ///
+    /// `Ok(true)` means that the next read will not block, including orderly
+    /// peer shutdown (EOF). `Ok(false)` means that no data or EOF is currently
+    /// available. Non-socket descriptors and terminal socket errors are
+    /// returned as errors.
+    ///
+    /// Unlike [`poll`], this probe has no `FD_SETSIZE` ceiling on macOS.
+    pub fn socket_readable_now(&self) -> Result<bool> {
+        self.socket_readable_now_impl()
+    }
+
     /// Return the underlying socket descriptor when this value owns a socket.
     ///
     /// On Unix, sockets and file descriptors share the same descriptor space,
@@ -747,6 +759,40 @@ mod tests {
         assert_eq!(n, 1);
         assert!(pfd[0].revents & POLLIN != 0);
         assert_eq!(pfd[1].revents & POLLIN, 0);
+    }
+
+    #[test]
+    fn socket_readable_now_is_zero_wait_and_non_consuming() {
+        let (mut reader, mut writer) = socketpair().unwrap();
+        let mut unblock_writer = writer.try_clone().unwrap();
+        let (cancel_unblock, unblock_cancelled) = std::sync::mpsc::channel();
+        let unblock = std::thread::spawn(move || {
+            if unblock_cancelled
+                .recv_timeout(Duration::from_secs(2))
+                .is_err()
+            {
+                unblock_writer.write_all(b"unexpected-block").unwrap();
+            }
+        });
+
+        assert!(!reader.socket_readable_now().unwrap());
+        cancel_unblock.send(()).unwrap();
+        unblock.join().unwrap();
+
+        writer.write_all(b"x").unwrap();
+        assert!(reader.socket_readable_now().unwrap());
+        assert!(reader.socket_readable_now().unwrap());
+
+        let mut byte = [0_u8; 1];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"x");
+        assert!(!reader.socket_readable_now().unwrap());
+
+        drop(writer);
+        assert!(
+            reader.socket_readable_now().unwrap(),
+            "orderly peer shutdown must be reported as readable EOF"
+        );
     }
 
     // ── IntoRawFileDescriptor / FromRawFileDescriptor ─────────

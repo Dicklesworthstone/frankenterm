@@ -3382,6 +3382,18 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_RELIABLE_KEY_EVENT_TRACED_V1_ZSTD_ENCODED_BYTES,
         }
     };
+    (ReliablePaneWriteV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_RELIABLE_PANE_WRITE_V1_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_RELIABLE_PANE_WRITE_V1_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (ReliablePaneWriteV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_RELIABLE_PANE_WRITE_V1_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_RELIABLE_PANE_WRITE_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (SendKeyDownTracedV1, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_SEND_KEY_DOWN_TRACED_V1_DECOMPRESSED_BYTES,
@@ -4161,7 +4173,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 63;
+pub const CODEC_VERSION: usize = 64;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4471,6 +4483,12 @@ pdu! {
     SendPasteTracedV1: 99, 63, client_request, none,
         interactive_input, bulk_data, interactive
         => deserialize_send_paste_traced_v1;
+    ReliablePaneWriteV1: 100, 64, client_request, none,
+        interactive_input, interactive_input, interactive
+        => deserialize_reliable_pane_write_v1;
+    ReliablePaneWriteV1Response: 101, 64, server_reply, none,
+        interactive_input, interactive_input, interactive
+        => deserialize_reliable_pane_write_v1_response;
 }
 
 impl Pdu {
@@ -4492,6 +4510,8 @@ impl Pdu {
             Self::ReliableKeyEventV1(value) => value.validate()?,
             Self::ReliableKeyEventV1Response(value) => value.validate()?,
             Self::ReliableKeyEventTracedV1(value) => value.validate()?,
+            Self::ReliablePaneWriteV1(value) => value.validate()?,
+            Self::ReliablePaneWriteV1Response(value) => value.validate()?,
             _ => {}
         }
         Ok(())
@@ -4754,9 +4774,11 @@ impl Pdu {
                 | Self::SendKeyDownTracedV1(_)
                 | Self::ReliableKeyEventV1(_)
                 | Self::ReliableKeyEventTracedV1(_)
+                | Self::ReliablePaneWriteV1(_)
                 | Self::SendKeyUp(_)
                 | Self::SendMouseEvent(_)
                 | Self::SendPaste(_)
+                | Self::SendPasteTracedV1(_)
                 | Self::Resize(_)
                 | Self::SetPaneZoomed(_)
                 | Self::SpawnV2(_)
@@ -5588,6 +5610,34 @@ fn deserialize_reliable_key_event_traced_v1(
     )?;
     request.validate()?;
     Ok(request)
+}
+
+fn deserialize_reliable_pane_write_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ReliablePaneWriteV1, Error> {
+    let request: ReliablePaneWriteV1 = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ReliablePaneWriteV1",
+        MAX_RELIABLE_PANE_WRITE_V1_DECOMPRESSED_BYTES,
+    )?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_reliable_pane_write_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ReliablePaneWriteV1Response, Error> {
+    let response: ReliablePaneWriteV1Response = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ReliablePaneWriteV1Response",
+        MAX_RELIABLE_PANE_WRITE_V1_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    response.validate()?;
+    Ok(response)
 }
 
 fn deserialize_send_paste_traced_v1(
@@ -12027,6 +12077,104 @@ pub struct ReliableKeyEventV1Response {
     pub outcome: ReliableKeyEventOutcomeV1,
 }
 
+/// One bounded byte-write attempt in the same ordered identity lane as
+/// reliable key transitions.
+///
+/// The server performs at most one `Write::write` call for this request. A
+/// successful response names the exact applied prefix; a client that still
+/// owns a suffix assigns that suffix a fresh, pre-reserved [`InputSerial`].
+/// Replaying the same request after response loss therefore returns the same
+/// prefix disposition without applying those bytes twice.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ReliablePaneWriteV1 {
+    pub pane_id: PaneId,
+    pub pane_registration: Option<ReliablePaneRegistrationIdentityV1>,
+    pub input_serial: InputSerial,
+    #[serde(deserialize_with = "deserialize_reliable_pane_write_data")]
+    pub data: Vec<u8>,
+}
+
+fn deserialize_reliable_pane_write_data<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedPaneWriteDataVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for BoundedPaneWriteDataVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_RELIABLE_PANE_WRITE_DATA_BYTES} reliable pane-write bytes"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let hinted = sequence.size_hint().unwrap_or(0);
+            if hinted > MAX_RELIABLE_PANE_WRITE_DATA_BYTES {
+                return Err(serde::de::Error::custom(format_args!(
+                    "reliable pane write data length {hinted} exceeds maximum {MAX_RELIABLE_PANE_WRITE_DATA_BYTES}",
+                )));
+            }
+            let mut data = Vec::new();
+            data.try_reserve(hinted)
+                .map_err(serde::de::Error::custom)?;
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                if data.len() == MAX_RELIABLE_PANE_WRITE_DATA_BYTES {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "reliable pane write data length exceeds maximum {MAX_RELIABLE_PANE_WRITE_DATA_BYTES}",
+                    )));
+                }
+                data.push(byte);
+            }
+            Ok(data)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedPaneWriteDataVisitor)
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum ReliablePaneWriteRetryV1 {
+    /// A callback-free retry disposition shared with the reliable-key lane.
+    Input(ReliableKeyEventRetryV1),
+    /// The pane writer returned `Ok(0)`, proving that this attempt consumed no
+    /// prefix while leaving the exact request eligible for a later retry.
+    DefinitelyNotApplied { retry_after_ns: u64 },
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum ReliablePaneWriteRejectionV1 {
+    Input(ReliableKeyEventRejectionV1),
+    /// `Write::write` returned an error, whose trait contract proves that no
+    /// bytes were accepted. The opaque error is logged server-side; request
+    /// content and platform error text never cross the wire.
+    DefinitelyNotApplied,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum ReliablePaneWriteOutcomeV1 {
+    AppliedPrefix { bytes: u32 },
+    DuplicateAppliedPrefix { bytes: u32 },
+    Retry(ReliablePaneWriteRetryV1),
+    Rejected(ReliablePaneWriteRejectionV1),
+    /// The pane callback began but panicked, violated the `Write` contract, or
+    /// otherwise returned without an authoritative applied-prefix result.
+    /// Replaying this identity is forbidden.
+    Indeterminate,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub struct ReliablePaneWriteV1Response {
+    pub pane_id: PaneId,
+    pub input_serial: InputSerial,
+    pub outcome: ReliablePaneWriteOutcomeV1,
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
 pub struct ReliablePaneRegistrationIdentityV1([u8; 16]);
 
@@ -12049,12 +12197,21 @@ impl ReliablePaneRegistrationIdentityV1 {
 pub const RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION: usize = 60;
 /// First dialect that can carry sampled context on the reliable key lane.
 pub const RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION: usize = 62;
+/// First dialect that acknowledges an exact applied prefix for pane bytes.
+pub const RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION: usize = 64;
+/// One admitted chunk is deliberately small enough that synchronous queue
+/// ownership transfer remains bounded on a GUI callback.
+pub const MAX_RELIABLE_PANE_WRITE_DATA_BYTES: usize = 16 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_V1_DECOMPRESSED_BYTES: usize = 64 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_V1_ZSTD_ENCODED_BYTES: usize = 128 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_TRACED_V1_DECOMPRESSED_BYTES: usize = 64 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_TRACED_V1_ZSTD_ENCODED_BYTES: usize = 128 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_DECOMPRESSED_BYTES: usize = 4 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_ZSTD_ENCODED_BYTES: usize = 8 * 1024;
+pub const MAX_RELIABLE_PANE_WRITE_V1_DECOMPRESSED_BYTES: usize = 20 * 1024;
+pub const MAX_RELIABLE_PANE_WRITE_V1_ZSTD_ENCODED_BYTES: usize = 32 * 1024;
+pub const MAX_RELIABLE_PANE_WRITE_V1_RESPONSE_DECOMPRESSED_BYTES: usize = 4 * 1024;
+pub const MAX_RELIABLE_PANE_WRITE_V1_RESPONSE_ZSTD_ENCODED_BYTES: usize = 8 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -12073,6 +12230,18 @@ pub enum ReliableKeyEventProtocolError {
         active: u64,
         capacity: u64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ReliablePaneWriteProtocolError {
+    #[error(transparent)]
+    ReliableInput(#[from] ReliableKeyEventProtocolError),
+    #[error("reliable pane write payload must not be empty")]
+    EmptyPayload,
+    #[error("reliable pane write payload length {actual} exceeds maximum {maximum}")]
+    PayloadTooLarge { actual: usize, maximum: usize },
+    #[error("reliable pane write applied-prefix length must be in 1..={maximum}; got {actual}")]
+    InvalidAppliedPrefix { actual: u32, maximum: usize },
 }
 
 impl ReliableKeyEventV1 {
@@ -12107,27 +12276,84 @@ impl ReliableKeyEventV1Response {
     pub fn validate(&self) -> Result<(), ReliableKeyEventProtocolError> {
         validate_reliable_input_serial(self.input_serial)?;
         match self.outcome {
-            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerFull(pressure))
-            | ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerRetired(
-                pressure,
-            )) => validate_reliable_scheduler_pressure(pressure),
-            ReliableKeyEventOutcomeV1::Retry(
-                ReliableKeyEventRetryV1::SchedulerUnavailable { retry_after_ns }
-                | ReliableKeyEventRetryV1::DuplicatePending { retry_after_ns }
-                | ReliableKeyEventRetryV1::ClientRegistrationTransition { retry_after_ns },
-            ) => validate_reliable_retry_delay(retry_after_ns),
-            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::PaneAuthorityRequired {
-                pane_registration,
-            }) => {
-                if pane_registration.is_reserved() {
-                    Err(ReliableKeyEventProtocolError::ReservedPaneRegistration)
+            ReliableKeyEventOutcomeV1::Retry(retry) => validate_reliable_input_retry(retry),
+            ReliableKeyEventOutcomeV1::Applied
+            | ReliableKeyEventOutcomeV1::DuplicateApplied
+            | ReliableKeyEventOutcomeV1::Rejected(_) => Ok(()),
+        }
+    }
+}
+
+impl ReliablePaneWriteV1 {
+    pub fn validate(&self) -> Result<(), ReliablePaneWriteProtocolError> {
+        validate_reliable_input_serial(self.input_serial)?;
+        if self
+            .pane_registration
+            .is_some_and(ReliablePaneRegistrationIdentityV1::is_reserved)
+        {
+            return Err(ReliableKeyEventProtocolError::ReservedPaneRegistration.into());
+        }
+        if self.data.is_empty() {
+            return Err(ReliablePaneWriteProtocolError::EmptyPayload);
+        }
+        if self.data.len() > MAX_RELIABLE_PANE_WRITE_DATA_BYTES {
+            return Err(ReliablePaneWriteProtocolError::PayloadTooLarge {
+                actual: self.data.len(),
+                maximum: MAX_RELIABLE_PANE_WRITE_DATA_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ReliablePaneWriteV1Response {
+    pub fn validate(&self) -> Result<(), ReliablePaneWriteProtocolError> {
+        validate_reliable_input_serial(self.input_serial)?;
+        match self.outcome {
+            ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes }
+            | ReliablePaneWriteOutcomeV1::DuplicateAppliedPrefix { bytes } => {
+                let bytes_usize = usize::try_from(bytes).unwrap_or(usize::MAX);
+                if bytes == 0 || bytes_usize > MAX_RELIABLE_PANE_WRITE_DATA_BYTES {
+                    Err(ReliablePaneWriteProtocolError::InvalidAppliedPrefix {
+                        actual: bytes,
+                        maximum: MAX_RELIABLE_PANE_WRITE_DATA_BYTES,
+                    })
                 } else {
                     Ok(())
                 }
             }
-            ReliableKeyEventOutcomeV1::Applied
-            | ReliableKeyEventOutcomeV1::DuplicateApplied
-            | ReliableKeyEventOutcomeV1::Rejected(_) => Ok(()),
+            ReliablePaneWriteOutcomeV1::Retry(ReliablePaneWriteRetryV1::Input(retry)) => {
+                validate_reliable_input_retry(retry).map_err(Into::into)
+            }
+            ReliablePaneWriteOutcomeV1::Retry(
+                ReliablePaneWriteRetryV1::DefinitelyNotApplied { retry_after_ns },
+            ) => validate_reliable_retry_delay(retry_after_ns).map_err(Into::into),
+            ReliablePaneWriteOutcomeV1::Rejected(_) | ReliablePaneWriteOutcomeV1::Indeterminate => {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_reliable_input_retry(
+    retry: ReliableKeyEventRetryV1,
+) -> Result<(), ReliableKeyEventProtocolError> {
+    match retry {
+        ReliableKeyEventRetryV1::SchedulerFull(pressure)
+        | ReliableKeyEventRetryV1::SchedulerRetired(pressure) => {
+            validate_reliable_scheduler_pressure(pressure)
+        }
+        ReliableKeyEventRetryV1::SchedulerUnavailable { retry_after_ns }
+        | ReliableKeyEventRetryV1::DuplicatePending { retry_after_ns }
+        | ReliableKeyEventRetryV1::ClientRegistrationTransition { retry_after_ns } => {
+            validate_reliable_retry_delay(retry_after_ns)
+        }
+        ReliableKeyEventRetryV1::PaneAuthorityRequired { pane_registration } => {
+            if pane_registration.is_reserved() {
+                Err(ReliableKeyEventProtocolError::ReservedPaneRegistration)
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -12244,7 +12470,24 @@ impl InputSerial {
     #[must_use]
     pub fn try_now() -> Option<Self> {
         let wall_clock = input_serial_from_system_time(std::time::SystemTime::now()).0;
-        next_input_serial(&LAST_INPUT_SERIAL, wall_clock).map(Self)
+        reserve_input_serials(&LAST_INPUT_SERIAL, wall_clock, 1).map(|(first, _last)| Self(first))
+    }
+
+    /// Reserve a contiguous, process-local identity range.
+    ///
+    /// A bounded pane write may legally complete one byte at a time. Reserving
+    /// one identity per admitted byte lets each unapplied suffix take a fresh
+    /// serial without overtaking key events that were queued later. Unused
+    /// identities are intentionally left as gaps.
+    #[must_use]
+    pub fn try_reserve(count: usize) -> Option<(Self, Self)> {
+        let count = u64::try_from(count).ok()?;
+        if count == 0 {
+            return None;
+        }
+        let wall_clock = input_serial_from_system_time(std::time::SystemTime::now()).0;
+        reserve_input_serials(&LAST_INPUT_SERIAL, wall_clock, count)
+            .map(|(first, last)| (Self(first), Self(last)))
     }
 
     pub fn elapsed_millis(&self) -> u64 {
@@ -12254,18 +12497,30 @@ impl InputSerial {
 }
 
 fn next_input_serial(counter: &std::sync::atomic::AtomicU64, wall_clock: u64) -> Option<u64> {
+    reserve_input_serials(counter, wall_clock, 1).map(|(first, _last)| first)
+}
+
+fn reserve_input_serials(
+    counter: &std::sync::atomic::AtomicU64,
+    wall_clock: u64,
+    count: u64,
+) -> Option<(u64, u64)> {
     use std::sync::atomic::Ordering;
 
+    if count == 0 {
+        return None;
+    }
     let mut observed = counter.load(Ordering::Relaxed);
     loop {
-        let candidate = wall_clock.max(observed.checked_add(1)?);
+        let first = wall_clock.max(observed.checked_add(1)?);
+        let last = first.checked_add(count.checked_sub(1)?)?;
         match counter.compare_exchange_weak(
             observed,
-            candidate,
+            last,
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
-            Ok(_) => return Some(candidate),
+            Ok(_) => return Some((first, last)),
             Err(current) => observed = current,
         }
     }
@@ -14891,6 +15146,24 @@ mod test {
     }
 
     #[test]
+    fn input_serial_range_reservation_is_contiguous_and_fences_later_input() {
+        use std::sync::atomic::Ordering;
+
+        let counter = std::sync::atomic::AtomicU64::new(41);
+        assert_eq!(reserve_input_serials(&counter, 100, 3), Some((100, 102)));
+        assert_eq!(next_input_serial(&counter, 1), Some(103));
+        assert_eq!(counter.load(Ordering::Relaxed), 103);
+
+        let terminal = std::sync::atomic::AtomicU64::new(u64::MAX - 2);
+        assert_eq!(
+            reserve_input_serials(&terminal, 0, 2),
+            Some((u64::MAX - 1, u64::MAX))
+        );
+        assert_eq!(next_input_serial(&terminal, 0), None);
+        assert_eq!(reserve_input_serials(&terminal, 0, 0), None);
+    }
+
+    #[test]
     fn input_serial_elapsed_millis() {
         let before = InputSerial::now();
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -14996,7 +15269,7 @@ mod test {
         assert!(!Pdu::ListPanes(ListPanes {}).is_user_input());
         assert!(!Pdu::GetCodecVersion(GetCodecVersion {}).is_user_input());
         assert!(!Pdu::GetTlsCreds(GetTlsCreds {}).is_user_input());
-        assert!(!Pdu::Invalid { ident: 99 }.is_user_input());
+        assert!(!Pdu::Invalid { ident: 102 }.is_user_input());
     }
 
     // --- Pdu::pdu_name tests ---
@@ -20098,8 +20371,8 @@ mod test {
     }
 
     #[test]
-    fn codec_v63_additive_paste_trace_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 63);
+    fn codec_v64_additive_reliable_pane_write_preserves_the_v61_compatibility_floor() {
+        assert_eq!(CODEC_VERSION, 64);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -21315,6 +21588,154 @@ mod test {
     }
 
     #[test]
+    fn reliable_pane_write_request_and_exact_prefix_outcomes_roundtrip_under_v64() {
+        let request = ReliablePaneWriteV1 {
+            pane_id: 7,
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x6a; 16])),
+            input_serial: InputSerial::from_millis_since_epoch(41),
+            data: b"bounded-pane-bytes".to_vec(),
+        };
+        let outcomes = [
+            ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 3 },
+            ReliablePaneWriteOutcomeV1::DuplicateAppliedPrefix { bytes: 3 },
+            ReliablePaneWriteOutcomeV1::Retry(
+                ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+                    retry_after_ns: 1_000_000,
+                },
+            ),
+            ReliablePaneWriteOutcomeV1::Rejected(
+                ReliablePaneWriteRejectionV1::DefinitelyNotApplied,
+            ),
+            ReliablePaneWriteOutcomeV1::Indeterminate,
+        ];
+
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let request_pdu = Pdu::ReliablePaneWriteV1(request.clone());
+            let frame = request_pdu
+                .encode_frame_with_mode(51, mode)
+                .expect("valid bounded pane-write request should frame");
+            let decoded = Pdu::decode(frame.as_slice()).expect("pane-write request should decode");
+            assert_eq!(decoded.serial, 51);
+            assert_eq!(decoded.pdu, request_pdu);
+
+            for outcome in outcomes {
+                let response_pdu =
+                    Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                        pane_id: request.pane_id,
+                        input_serial: request.input_serial,
+                        outcome,
+                    });
+                let frame = response_pdu
+                    .encode_frame_with_mode(51, mode)
+                    .expect("valid exact-prefix response should frame");
+                let decoded =
+                    Pdu::decode(frame.as_slice()).expect("pane-write response should decode");
+                assert_eq!(decoded.serial, 51);
+                assert_eq!(decoded.pdu, response_pdu);
+            }
+        }
+
+        assert_eq!(<ReliablePaneWriteV1 as PduWireIdent>::IDENT, 100);
+        assert_eq!(<ReliablePaneWriteV1Response as PduWireIdent>::IDENT, 101);
+        assert_eq!(
+            <ReliablePaneWriteV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION
+        );
+        assert_eq!(
+            <ReliablePaneWriteV1 as PduWireIdent>::WIRE_SPEC.encoded_body_limit,
+            PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+                max_decompressed_bytes: MAX_RELIABLE_PANE_WRITE_V1_DECOMPRESSED_BYTES,
+                max_zstd_encoded_bytes: MAX_RELIABLE_PANE_WRITE_V1_ZSTD_ENCODED_BYTES,
+            }
+        );
+        assert!(Pdu::ReliablePaneWriteV1(request).is_user_input());
+    }
+
+    #[test]
+    fn reliable_pane_write_rejects_unbounded_payloads_and_invalid_prefixes_before_framing() {
+        let valid = ReliablePaneWriteV1 {
+            pane_id: 7,
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x6a; 16])),
+            input_serial: InputSerial::from_millis_since_epoch(41),
+            data: b"abc".to_vec(),
+        };
+        let malformed_requests = [
+            ReliablePaneWriteV1 {
+                data: Vec::new(),
+                ..valid.clone()
+            },
+            ReliablePaneWriteV1 {
+                data: vec![0; MAX_RELIABLE_PANE_WRITE_DATA_BYTES + 1],
+                ..valid.clone()
+            },
+            ReliablePaneWriteV1 {
+                pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0; 16])),
+                ..valid.clone()
+            },
+            ReliablePaneWriteV1 {
+                input_serial: InputSerial::empty(),
+                ..valid.clone()
+            },
+        ];
+        for malformed in malformed_requests {
+            let mut frame = Vec::new();
+            Pdu::ReliablePaneWriteV1(malformed)
+                .encode(&mut frame, 51)
+                .expect_err("invalid pane-write request must fail before framing");
+            assert!(frame.is_empty());
+        }
+
+        let oversized_wire_request = ReliablePaneWriteV1 {
+            data: vec![0; MAX_RELIABLE_PANE_WRITE_DATA_BYTES + 1],
+            ..valid.clone()
+        };
+        let (oversized_wire_payload, compressed) =
+            serialize_with_mode(&oversized_wire_request, CompressionMode::Never)
+                .expect("the raw fixture bypasses outbound PDU validation");
+        assert!(!compressed);
+        let error = deserialize_reliable_pane_write_v1(&oversized_wire_payload, compressed)
+            .expect_err("the field decoder must stop before retaining an oversized byte buffer");
+        assert!(
+            error
+                .to_string()
+                .contains("reliable pane write data length exceeds maximum 16384"),
+            "unexpected bounded field error: {error:#}"
+        );
+
+        for bytes in [0, u32::try_from(MAX_RELIABLE_PANE_WRITE_DATA_BYTES + 1).unwrap()] {
+            let mut frame = Vec::new();
+            Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                pane_id: valid.pane_id,
+                input_serial: valid.input_serial,
+                outcome: ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes },
+            })
+            .encode(&mut frame, 51)
+            .expect_err("invalid applied prefix must fail before framing");
+            assert!(frame.is_empty());
+        }
+
+        for (compressed, body_len) in [
+            (false, MAX_RELIABLE_PANE_WRITE_V1_DECOMPRESSED_BYTES + 1),
+            (true, MAX_RELIABLE_PANE_WRITE_V1_ZSTD_ENCODED_BYTES + 1),
+        ] {
+            let mut frame = Vec::new();
+            encode_raw(
+                <ReliablePaneWriteV1 as PduWireIdent>::IDENT,
+                51,
+                &vec![0; body_len],
+                compressed,
+                &mut frame,
+            )
+            .expect("oversized pane-write fixture should frame");
+            let error = Pdu::decode(frame.as_slice())
+                .expect_err("oversized pane-write body must fail at header admission");
+            assert!(error
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .is_some());
+        }
+    }
+
+    #[test]
     fn reliable_key_event_traced_wrapper_roundtrips_under_additive_v62() {
         let request = ReliableKeyEventV1 {
             pane_id: 7,
@@ -21803,7 +22224,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 63);
+        assert_eq!(CODEC_VERSION, 64);
     }
 
     #[test]
@@ -22092,7 +22513,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=98 {
+        for ident in 0..=101 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -22106,9 +22527,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(99).is_none());
+        assert!(Pdu::wire_spec_for_ident(102).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 99 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 102 - GAPS.len());
     }
 
     #[test]
@@ -22146,6 +22567,8 @@ mod test {
                 95 => 59,
                 96..=97 => 60,
                 98 => 62,
+                99 => 63,
+                100..=101 => 64,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -22180,11 +22603,11 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98,
+            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97,
+            97, 101,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -22265,7 +22688,7 @@ mod test {
 
             let expected_class = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Class::ConnectionControl,
-                9 | 11..=13 | 73 | 95..=97 => Class::InteractiveInput,
+                9 | 11..=13 | 73 | 95..=101 => Class::InteractiveInput,
                 8
                 | 14
                 | 20
@@ -22289,14 +22712,16 @@ mod test {
             };
             let expected_cap = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Cap::Control,
-                9 | 11 | 12 | 73 | 95..=97 => Cap::InteractiveInput,
+                9 | 11 | 12 | 73 | 95..=98 | 100..=101 => Cap::InteractiveInput,
                 8 | 14 | 33..=36 | 38 | 43 | 45 | 48..=50 | 56..=59 | 62..=72 | 74 | 88 | 89 => {
                     Cap::InteractiveState
                 }
                 37 | 39 | 44 | 53..=55 | 83 | 90 => Cap::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Cap::Render,
                 3 | 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 75 | 77 | 81 | 86 | 93 => Cap::Query,
-                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 => Cap::BulkData,
+                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 => {
+                    Cap::BulkData
+                }
                 ident => panic!("PDU {} is missing from the admission-cap census", ident),
             };
             let expected_qos = match spec.ident {
@@ -22314,7 +22739,7 @@ mod test {
                 | 62..=74
                 | 88
                 | 89
-                | 95..=97 => Qos::Interactive,
+                | 95..=101 => Qos::Interactive,
                 3
                 | 22
                 | 24
@@ -23278,9 +23703,9 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_keeps_v61_floor_after_additive_v62() {
+    fn check_compat_current_build_keeps_v61_floor_after_additive_v64() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 63);
+        assert_eq!(CODEC_VERSION, 64);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
@@ -24059,7 +24484,7 @@ mod test {
     fn async_selector_truncated_discard_fails_closed() {
         runtime::block_on(async {
             let mut wire = Vec::new();
-            encode_raw(99, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
+            encode_raw(102, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
             wire.pop().expect("encoded frame has a payload byte");
             let mut reader = runtime::Cursor::new(wire);
 
@@ -24107,21 +24532,21 @@ mod test {
 
     #[test]
     fn decode_accepts_valid_non_canonical_leb128_headers() {
-        let wire = [0x84, 0x00, 0x81, 0x00, 0xE3, 0x00];
+        let wire = [0x84, 0x00, 0x81, 0x00, 0xE6, 0x00];
         let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
         assert_eq!(decoded.serial, 1);
-        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 99 });
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 102 });
     }
 
     #[test]
     fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
         runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xE3, 0x00]);
+            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xE6, 0x00]);
             let decoded = Pdu::decode_async(&mut reader, None)
                 .await
                 .expect("valid non-canonical header");
             assert_eq!(decoded.serial, 1);
-            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 99 });
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 102 });
         });
     }
 

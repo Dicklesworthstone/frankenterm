@@ -47,6 +47,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::convert::TryFrom;
 use std::io::Result as IoResult;
+#[cfg(unix)]
+use std::os::fd::AsFd;
 #[cfg(windows)]
 use std::os::windows::prelude::{AsRawHandle, RawHandle};
 
@@ -87,6 +89,19 @@ impl Default for PtySize {
     }
 }
 
+/// A PTY reader that can be registered with a Unix readiness poller.
+///
+/// Implementations must place their descriptor in non-blocking mode before
+/// returning it from [`MasterPty::try_clone_pollable_reader`]. On Unix,
+/// `O_NONBLOCK` is an open-file-description flag and is therefore shared by
+/// duplicated master handles. Callers that also retain a writer must handle
+/// partial writes and [`std::io::ErrorKind::WouldBlock`].
+#[cfg(unix)]
+pub trait PollablePtyReader: std::io::Read + AsFd + Send {}
+
+#[cfg(unix)]
+impl<T> PollablePtyReader for T where T: std::io::Read + AsFd + Send {}
+
 /// Represents the master/control end of the pty
 pub trait MasterPty: Downcast + Send {
     /// Inform the kernel and thus the child process that the window resized.
@@ -98,6 +113,17 @@ pub trait MasterPty: Downcast + Send {
     /// Obtain a readable handle; output from the slave(s) is readable
     /// via this stream.
     fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, Error>;
+    /// Obtain a non-blocking readable handle suitable for registration with a
+    /// Unix readiness poller.
+    ///
+    /// The default is deliberately unsupported so non-native PTY backends do
+    /// not accidentally claim a readiness contract they cannot uphold.
+    #[cfg(unix)]
+    fn try_clone_pollable_reader(&self) -> Result<Box<dyn PollablePtyReader>, Error> {
+        Err(anyhow::anyhow!(
+            "this PTY backend does not provide a pollable non-blocking reader"
+        ))
+    }
     /// Obtain a writable handle; writing to it will send data to the
     /// slave end.
     /// Dropping the writer will send EOF to the slave end.

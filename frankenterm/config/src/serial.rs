@@ -15,12 +15,14 @@ pub struct SerialDomain {
     pub port: Option<String>,
 
     /// Set the baud rate.  The default is 9600 baud.
-    pub baud: Option<usize>,
+    pub baud: Option<u32>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankenterm_dynamic::Value;
+    use std::collections::BTreeMap;
 
     #[test]
     fn serial_domain_default() {
@@ -59,5 +61,40 @@ mod tests {
         };
         assert_eq!(sd.baud, Some(9600));
         assert!(sd.port.is_none());
+    }
+
+    #[test]
+    fn serial_domain_rejects_baud_above_backend_boundary_during_config_decode() {
+        let serial_config = |baud| {
+            Value::Object(
+                BTreeMap::from([
+                    (
+                        Value::String("name".to_string()),
+                        Value::String("bounded-serial".to_string()),
+                    ),
+                    (Value::String("baud".to_string()), Value::U64(baud)),
+                ])
+                .into(),
+            )
+        };
+
+        let maximum = SerialDomain::from_dynamic(
+            &serial_config(u64::from(u32::MAX)),
+            Default::default(),
+        )
+        .expect("the serial backend's maximum representable baud must decode");
+        let exact_backend_type: Option<u32> = maximum.baud;
+        assert_eq!(exact_backend_type, Some(u32::MAX));
+
+        let first_unrepresentable = u64::from(u32::MAX) + 1;
+        let rejected = SerialDomain::from_dynamic(
+            &serial_config(first_unrepresentable),
+            Default::default(),
+        );
+        assert!(
+            rejected.is_err(),
+            "baud {} must fail at config decode, before domain construction",
+            first_unrepresentable
+        );
     }
 }

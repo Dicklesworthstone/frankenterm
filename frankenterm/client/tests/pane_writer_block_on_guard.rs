@@ -1,16 +1,16 @@
 //! Source-level regression guard for bug #4 (the smol->asupersync blocking
 //! class). `PaneWriter::write` is a sync `std::io::Write` impl invoked on the
-//! GUI main-thread spawn queue; it must enqueue its mux RPC through the runtime
-//! without synchronously waiting for the reply.
+//! GUI main-thread spawn queue; it must transfer bounded ownership to the
+//! shared reliable-input FIFO without constructing or awaiting an RPC there.
 //!
 //! This is intentionally a cheap static check that fails fast at test time if
-//! anyone reverts the write path. The behavioural guards live in
-//! `client::tests::main_thread_pane_write_round_trips_ft_connect_fix`.
+//! anyone reverts the write path. The behavioural guards live in the client-
+//! pane and mux-server modules.
 
 use std::path::Path;
 
 #[test]
-fn pane_writer_write_is_nonblocking_and_spawns_the_rpc() {
+fn pane_writer_write_is_nonblocking_and_uses_the_shared_reliable_fifo() {
     let src = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pane/clientpane.rs"),
     )
@@ -39,18 +39,80 @@ fn pane_writer_write_is_nonblocking_and_spawns_the_rpc() {
         .join("\n");
 
     assert!(
-        executable.contains("write_to_pane(WriteToPane"),
-        "PaneWriter::write must construct the remote pane-write RPC"
+        executable.contains(".reliable_input_queue"),
+        "PaneWriter::write must enter the ClientInner shared reliable-input lane"
     );
     assert!(
-        executable.contains("dispatch_interactive_rpc(request, \"write_to_pane\")"),
-        "PaneWriter::write must use explicit bounded input admission for the constructed RPC"
+        executable.contains(".enqueue_pane_write("),
+        "PaneWriter::write must transfer ownership through bounded pane-write admission"
     );
-    for forbidden in ["block_on(", "block_on_io("] {
+    for forbidden in [
+        "write_to_pane(",
+        "WriteToPane",
+        "dispatch_interactive_rpc(",
+        "block_on(",
+        "block_on_io(",
+    ] {
         assert!(
             !executable.contains(forbidden),
-            "PaneWriter::write must never wait synchronously via {}",
+            "PaneWriter::write must not retain legacy or blocking path {}",
             forbidden
         );
     }
+
+    let impl_end = src[flush_start..]
+        .find("\n}\n\n#[cfg(test)]")
+        .map(|offset| flush_start + offset)
+        .expect("locate the end of PaneWriter's Write implementation");
+    let flush_executable = src[flush_start..impl_end]
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        flush_executable.contains(".flush_pending()"),
+        "PaneWriter::flush must observe pending ownership and sticky failure under one lock"
+    );
+    for torn_snapshot in [".sticky_failure()", ".pending_chunks()"] {
+        assert!(
+            !flush_executable.contains(torn_snapshot),
+            "PaneWriter::flush must not reconstruct delivery state from separate {} reads",
+            torn_snapshot
+        );
+    }
+
+    let enqueue_start = src
+        .find("fn enqueue_pane_write(")
+        .expect("locate bounded pane-write admission");
+    let worker_start = src[enqueue_start..]
+        .find("fn start_worker_now(")
+        .map(|offset| enqueue_start + offset)
+        .expect("locate reliable-input worker after pane-write admission");
+    let enqueue_executable = src[enqueue_start..worker_start]
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        enqueue_executable.contains("delivery.try_accept_chunk()"),
+        "queue ownership transfer must linearize against sticky terminal delivery state"
+    );
+
+    let run_start = src[worker_start..]
+        .find("async fn run(")
+        .map(|offset| worker_start + offset)
+        .expect("locate reliable-input worker loop");
+    let attempt_start = src[run_start..]
+        .find("async fn attempt(")
+        .map(|offset| run_start + offset)
+        .expect("locate reliable-input attempt dispatcher");
+    let run_executable = src[run_start..attempt_start]
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        run_executable.contains("queue.fail_pane_write_stream(&entry, outcome, failure)"),
+        "a terminal pane-write result must retire later chunks owned by that same writer"
+    );
 }

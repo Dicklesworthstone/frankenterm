@@ -226,6 +226,16 @@ impl IntoRawHandle for OwnedHandle {
 
 impl FileDescriptor {
     #[inline]
+    pub(crate) fn socket_readable_now_impl(&self) -> Result<bool> {
+        let mut descriptor = [pollfd {
+            fd: self.try_as_socket_descriptor_impl()?,
+            events: POLLIN,
+            revents: 0,
+        }];
+        Ok(poll_impl(&mut descriptor, Some(std::time::Duration::ZERO))? != 0)
+    }
+
+    #[inline]
     pub(crate) fn try_as_socket_descriptor_impl(&self) -> Result<SocketDescriptor> {
         if self.handle.is_socket_handle() {
             Ok(self.handle.as_raw_handle() as SocketDescriptor)

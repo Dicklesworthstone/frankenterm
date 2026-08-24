@@ -143,10 +143,40 @@ pub trait StorageBackend: Send + Sync {
     /// guess when the state cannot be established authoritatively.
     fn transaction_state(&self) -> Result<BackendTransactionState, BackendError>;
 
-    /// Begin a transaction. Returns a guard that commits on
-    /// `commit()` or rolls back on `Drop` (default rollback
-    /// semantics — explicit commit required for durability).
-    fn begin_transaction(&self) -> Result<TransactionGuard<'_>, BackendError>;
+    /// Dyn-safe transaction execution.
+    ///
+    /// The backend holds exclusive connection authority for the entire
+    /// duration of `f`. Concurrent calls on the backend queue until the transaction finishes.
+    /// - If `f` returns `Ok(())`, `COMMIT` is executed.
+    /// - If `f` returns `Err(error)` or panics, `ROLLBACK` is executed and the connection
+    ///   is verified to return to autocommit mode before reuse.
+    fn with_transaction_dyn(
+        &self,
+        f: &mut dyn FnMut(&mut dyn StorageTransaction) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError>;
+
+    /// Execute a closure inside an exclusive transaction and return its value.
+    ///
+    /// The closure receives an exclusive [`StorageTransaction`] handle.
+    /// Concurrent operations on the backend are serialized and cannot interleave.
+    /// - If `f` returns `Ok(val)`, the transaction commits and returns `Ok(val)`.
+    /// - If `f` returns `Err(err)` or panics, the transaction rolls back before returning
+    ///   the error or resuming unwind, and the connection is verified to return to autocommit.
+    fn with_transaction<T, F>(&self, f: F) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn StorageTransaction) -> Result<T, BackendError>,
+        Self: Sized,
+    {
+        let mut output = None;
+        let mut f_slot = Some(f);
+        self.with_transaction_dyn(&mut |tx| {
+            if let Some(f_once) = f_slot.take() {
+                output = Some(f_once(tx)?);
+            }
+            Ok(())
+        })?;
+        output.ok_or_else(|| BackendError::Other("transaction produced no output".into()))
+    }
 
     /// Schema-version probe used by the migration runner.
     /// Returns the current `PRAGMA user_version` value.
@@ -750,41 +780,396 @@ fn sqlite_user_version_value(version: u32) -> Result<i64, BackendError> {
     Ok(i64::from(version))
 }
 
-/// RAII transaction guard. Drops with rollback by default;
-/// explicit `commit()` is required for durability.
-pub struct TransactionGuard<'a> {
-    backend: &'a dyn StorageBackend,
-    committed: bool,
-    /// Backends may carry impl-specific state in this slot.
-    /// The minimal substrate doesn't use it; cont.extract will.
-    _marker: std::marker::PhantomData<&'a ()>,
+/// Exclusive transaction interface provided to closures passed to
+/// [`StorageBackend::with_transaction`] or [`StorageBackend::with_transaction_dyn`].
+///
+/// Implementors guarantee exclusive ownership of the underlying connection
+/// for the duration of the transaction.
+pub trait StorageTransaction {
+    /// Execute a SQL statement (DDL or DML). Returns rows affected.
+    fn execute(&mut self, sql: &str) -> Result<usize, BackendError>;
+
+    /// Execute multiple SQL statements separated by `;`.
+    fn execute_batch(&mut self, sql: &str) -> Result<(), BackendError>;
+
+    /// Run a scalar query returning the first column of the first row.
+    fn query_scalar(&mut self, sql: &str) -> Result<Option<String>, BackendError>;
+
+    /// Run a query returning at most one row as strings.
+    fn query_row_strings(
+        &mut self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Option<Vec<String>>, BackendError>;
+
+    /// Run a query returning multiple rows as strings.
+    fn query_map_strings(
+        &mut self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Vec<Vec<String>>, BackendError>;
+
+    /// Run a query returning at most one row with typed parameters.
+    fn query_row_typed(
+        &mut self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let strings: Vec<String> = params.iter().map(ToSqlValue::to_canonical_string).collect();
+        let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        self.query_row_strings(sql, &refs)
+    }
+
+    /// Run a query returning multiple rows with typed parameters.
+    fn query_map_typed(
+        &mut self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        let strings: Vec<String> = params.iter().map(ToSqlValue::to_canonical_string).collect();
+        let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        self.query_map_strings(sql, &refs)
+    }
+
+    /// Run a query returning at most one row as typed `SqlCell`s.
+    fn query_row_cells(
+        &mut self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Option<Vec<SqlCell>>, BackendError> {
+        let cells = self.query_row_typed(sql, params)?.map(|row| {
+            row.into_iter()
+                .map(|s| SqlCell::from_canonical_string(&s))
+                .collect()
+        });
+        Ok(cells)
+    }
+
+    /// Run a query returning multiple rows as typed `SqlCell`s.
+    fn query_map_cells(
+        &mut self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Vec<Vec<SqlCell>>, BackendError> {
+        let rows = self
+            .query_map_typed(sql, params)?
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|s| SqlCell::from_canonical_string(&s))
+                    .collect()
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Return the current `PRAGMA user_version`.
+    fn user_version(&mut self) -> Result<u32, BackendError>;
+
+    /// Set `PRAGMA user_version`.
+    fn set_user_version(&mut self, version: u32) -> Result<(), BackendError>;
 }
 
-impl TransactionGuard<'_> {
-    /// Commit the transaction. Consumes the guard.
-    pub fn commit(mut self) -> Result<(), BackendError> {
-        self.backend.execute("COMMIT")?;
-        self.committed = true;
+/// Transaction handle wrapping a borrowed `rusqlite::Connection`.
+pub struct RusqliteTransactionHandle<'a> {
+    conn: &'a mut rusqlite::Connection,
+}
+
+impl StorageTransaction for RusqliteTransactionHandle<'_> {
+    fn execute(&mut self, sql: &str) -> Result<usize, BackendError> {
+        self.conn
+            .execute(sql, [])
+            .map_err(|e| BackendError::Query(e.to_string()))
+    }
+
+    fn execute_batch(&mut self, sql: &str) -> Result<(), BackendError> {
+        self.conn
+            .execute_batch(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))
+    }
+
+    fn query_scalar(&mut self, sql: &str) -> Result<Option<String>, BackendError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let v: rusqlite::types::Value =
+                    row.get(0).map_err(|e| BackendError::Query(e.to_string()))?;
+                Ok(Some(match v {
+                    rusqlite::types::Value::Null => String::new(),
+                    rusqlite::types::Value::Integer(i) => i.to_string(),
+                    rusqlite::types::Value::Real(f) => f.to_string(),
+                    rusqlite::types::Value::Text(s) => s,
+                    rusqlite::types::Value::Blob(b) => format!("<blob:{} bytes>", b.len()),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn query_row_strings(
+        &mut self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params.iter().copied()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let mut out = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let v: rusqlite::types::Value =
+                        row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                    out.push(encode_sqlite_value_as_string(&v));
+                }
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn query_map_strings(
+        &mut self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params.iter().copied()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut out: Vec<Vec<String>> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            let mut row_strings = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let v: rusqlite::types::Value =
+                    row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                row_strings.push(encode_sqlite_value_as_string(&v));
+            }
+            out.push(row_strings);
+        }
+        Ok(out)
+    }
+
+    fn query_row_typed(
+        &mut self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let typed_values: Vec<rusqlite::types::Value> =
+            params.iter().map(to_sqlite_value).collect();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(typed_values.iter()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let mut out = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let v: rusqlite::types::Value =
+                        row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                    out.push(encode_sqlite_value_as_string(&v));
+                }
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn query_map_typed(
+        &mut self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let typed_values: Vec<rusqlite::types::Value> =
+            params.iter().map(to_sqlite_value).collect();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(typed_values.iter()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut out: Vec<Vec<String>> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            let mut row_strings = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let v: rusqlite::types::Value =
+                    row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                row_strings.push(encode_sqlite_value_as_string(&v));
+            }
+            out.push(row_strings);
+        }
+        Ok(out)
+    }
+
+    fn query_row_cells(
+        &mut self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Option<Vec<SqlCell>>, BackendError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let typed_values: Vec<rusqlite::types::Value> =
+            params.iter().map(to_sqlite_value).collect();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(typed_values.iter()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let mut out = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let v: rusqlite::types::Value =
+                        row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                    out.push(rusqlite_value_to_sql_cell(v));
+                }
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn query_map_cells(
+        &mut self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Vec<Vec<SqlCell>>, BackendError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let typed_values: Vec<rusqlite::types::Value> =
+            params.iter().map(to_sqlite_value).collect();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(typed_values.iter()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut out: Vec<Vec<SqlCell>> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            let mut row_cells = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let v: rusqlite::types::Value =
+                    row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                row_cells.push(rusqlite_value_to_sql_cell(v));
+            }
+            out.push(row_cells);
+        }
+        Ok(out)
+    }
+
+    fn user_version(&mut self) -> Result<u32, BackendError> {
+        let v: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|e| BackendError::Schema(e.to_string()))?;
+        Ok(v.max(0) as u32)
+    }
+
+    fn set_user_version(&mut self, version: u32) -> Result<(), BackendError> {
+        let version = sqlite_user_version_value(version)?;
+        self.conn
+            .pragma_update(None, "user_version", version)
+            .map_err(|e| BackendError::Schema(e.to_string()))
+    }
+}
+
+/// Transaction handle wrapping a borrowed [`MockState`].
+#[cfg(test)]
+pub struct MockTransactionHandle<'a> {
+    state: &'a mut MockState,
+}
+
+#[cfg(test)]
+impl StorageTransaction for MockTransactionHandle<'_> {
+    fn execute(&mut self, sql: &str) -> Result<usize, BackendError> {
+        self.state.executed.push(sql.to_string());
+        Ok(0)
+    }
+
+    fn execute_batch(&mut self, sql: &str) -> Result<(), BackendError> {
+        for stmt in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            self.execute(stmt)?;
+        }
         Ok(())
     }
 
-    /// Explicitly rollback the transaction. Equivalent to
-    /// `drop(guard)` but explicit at call sites that want to
-    /// document the intent.
-    pub fn rollback(self) {
-        // Drop will fire and run the rollback path.
+    fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>, BackendError> {
+        Ok(None)
     }
-}
 
-impl Drop for TransactionGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            // Best effort — if the backend is already in an
-            // inconsistent state, swallow the rollback error
-            // since panicking from Drop would mask the original
-            // failure.
-            let _ = self.backend.execute("ROLLBACK");
-        }
+    fn query_row_strings(
+        &mut self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        self.state
+            .queries
+            .push((sql.to_string(), params.iter().map(|s| (*s).to_string()).collect()));
+        Ok(self.state.row_responses.pop_front().flatten())
+    }
+
+    fn query_map_strings(
+        &mut self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        self.state
+            .queries
+            .push((sql.to_string(), params.iter().map(|s| (*s).to_string()).collect()));
+        Ok(self.state.map_responses.pop_front().unwrap_or_default())
+    }
+
+    fn user_version(&mut self) -> Result<u32, BackendError> {
+        Ok(self.state.user_version)
+    }
+
+    fn set_user_version(&mut self, version: u32) -> Result<(), BackendError> {
+        let _ = sqlite_user_version_value(version)?;
+        self.state.user_version = version;
+        Ok(())
     }
 }
 
@@ -935,13 +1320,44 @@ impl StorageBackend for MockBackend {
         })
     }
 
-    fn begin_transaction(&self) -> Result<TransactionGuard<'_>, BackendError> {
-        self.execute("BEGIN")?;
-        Ok(TransactionGuard {
-            backend: self,
-            committed: false,
-            _marker: std::marker::PhantomData,
-        })
+    fn with_transaction_dyn(
+        &self,
+        f: &mut dyn FnMut(&mut dyn StorageTransaction) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.in_tx {
+            return Err(BackendError::Other(
+                "cannot start transaction: mock connection is not in autocommit mode".into(),
+            ));
+        }
+
+        guard.in_tx = true;
+        guard.executed.push("BEGIN".to_string());
+
+        let mut tx_handle = MockTransactionHandle { state: &mut *guard };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx_handle)));
+
+        match result {
+            Ok(Ok(())) => {
+                guard.in_tx = false;
+                guard.tx_committed = true;
+                guard.executed.push("COMMIT".to_string());
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                guard.in_tx = false;
+                guard.tx_committed = false;
+                guard.executed.push("ROLLBACK".to_string());
+                Err(err)
+            }
+            Err(panic_payload) => {
+                guard.in_tx = false;
+                guard.tx_committed = false;
+                guard.executed.push("ROLLBACK".to_string());
+                std::panic::resume_unwind(panic_payload);
+            }
+        }
     }
 
     fn user_version(&self) -> Result<u32, BackendError> {
@@ -1199,13 +1615,56 @@ impl StorageBackend for RusqliteBackend {
         })
     }
 
-    fn begin_transaction(&self) -> Result<TransactionGuard<'_>, BackendError> {
-        self.execute("BEGIN")?;
-        Ok(TransactionGuard {
-            backend: self,
-            committed: false,
-            _marker: std::marker::PhantomData,
-        })
+    fn with_transaction_dyn(
+        &self,
+        f: &mut dyn FnMut(&mut dyn StorageTransaction) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let mut guard = self.conn_guard();
+        if !guard.is_autocommit() {
+            return Err(BackendError::Other(
+                "cannot start transaction: connection is not in autocommit mode".into(),
+            ));
+        }
+
+        guard
+            .execute("BEGIN", [])
+            .map_err(|e| BackendError::Query(format!("BEGIN failed: {e}")))?;
+
+        let mut tx_handle = RusqliteTransactionHandle {
+            conn: &mut *guard,
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx_handle)));
+
+        match result {
+            Ok(Ok(())) => {
+                let commit_res = guard.execute("COMMIT", []);
+                match commit_res {
+                    Ok(_) => {
+                        if !guard.is_autocommit() {
+                            let _ = guard.execute("ROLLBACK", []);
+                            return Err(BackendError::TxPoisoned);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = guard.execute("ROLLBACK", []);
+                        Err(BackendError::Query(format!("COMMIT failed: {e}")))
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                let _ = guard.execute("ROLLBACK", []);
+                if !guard.is_autocommit() {
+                    return Err(BackendError::TxPoisoned);
+                }
+                Err(err)
+            }
+            Err(panic_payload) => {
+                let _ = guard.execute("ROLLBACK", []);
+                std::panic::resume_unwind(panic_payload);
+            }
+        }
     }
 
     fn user_version(&self) -> Result<u32, BackendError> {
@@ -1698,22 +2157,44 @@ mod tests {
     #[test]
     fn transaction_commit_records_committed_state() {
         let mock = MockBackend::new();
-        let tx = mock.begin_transaction().unwrap();
-        tx.commit().unwrap();
+        mock.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)")?;
+            Ok::<(), BackendError>(())
+        })
+        .unwrap();
         assert!(mock.last_tx_committed());
         let log = mock.executed();
+        assert_eq!(log.first().map(|s| s.as_str()), Some("BEGIN"));
         assert_eq!(log.last().map(|s| s.as_str()), Some("COMMIT"));
     }
 
     #[test]
-    fn transaction_drop_rolls_back_when_not_committed() {
+    fn transaction_error_rolls_back_when_not_committed() {
         let mock = MockBackend::new();
-        {
-            let _tx = mock.begin_transaction().unwrap();
-            // _tx drops here without commit().
-        }
+        let res = mock.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)")?;
+            Err::<(), _>(BackendError::Other("test error".into()))
+        });
+        assert!(res.is_err());
         assert!(!mock.last_tx_committed());
         let log = mock.executed();
+        assert_eq!(log.first().map(|s| s.as_str()), Some("BEGIN"));
+        assert_eq!(log.last().map(|s| s.as_str()), Some("ROLLBACK"));
+    }
+
+    #[test]
+    fn transaction_panic_rolls_back_and_resumes_unwind() {
+        let mock = MockBackend::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = mock.with_transaction::<(), _>(|tx| {
+                tx.execute("INSERT INTO t VALUES (1)")?;
+                panic!("test panic in mock transaction");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(!mock.last_tx_committed());
+        let log = mock.executed();
+        assert_eq!(log.first().map(|s| s.as_str()), Some("BEGIN"));
         assert_eq!(log.last().map(|s| s.as_str()), Some("ROLLBACK"));
     }
 

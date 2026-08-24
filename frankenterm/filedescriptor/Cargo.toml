@@ -25,3 +25,6 @@ winapi = { workspace=true, features = [
     "winsock2",
     "processenv"
 ]}
+
+[target.'cfg(unix)'.dependencies]
+socket2.workspace = true

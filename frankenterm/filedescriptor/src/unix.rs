@@ -258,6 +258,27 @@ impl FromRawFd for FileDescriptor {
 
 impl FileDescriptor {
     #[inline]
+    pub(crate) fn socket_readable_now_impl(&self) -> Result<bool> {
+        let socket = socket2::SockRef::from(self);
+        let mut byte = [std::mem::MaybeUninit::uninit(); 1];
+        // Absorb ordinary transient signal interruption without allowing a
+        // signal storm to turn this zero-time probe into an unbounded loop.
+        let mut interrupted_retries = 0_u8;
+        loop {
+            match socket.recv_with_flags(&mut byte, libc::MSG_PEEK | libc::MSG_DONTWAIT) {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::Interrupted && interrupted_retries < 3 =>
+                {
+                    interrupted_retries += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    #[inline]
     pub(crate) fn try_as_socket_descriptor_impl(&self) -> Result<SocketDescriptor> {
         Ok(self.as_raw_fd())
     }

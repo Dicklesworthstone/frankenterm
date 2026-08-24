@@ -482,7 +482,72 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
         builder.mode(0o700);
     }
 
-    builder.create(p)?;
+    builder
+        .create(p)
+        .with_context(|| format!("creating private user directory {}", p.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+        // Pin the final path without following a planted symbolic link.  All
+        // callers use this helper for user-private state, so an older 0755
+        // directory is tightened through the opened directory descriptor
+        // before any state file is created inside it.
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        let directory = options
+            .open(p)
+            .with_context(|| format!("opening private user directory {}", p.display()))?;
+        let before = directory
+            .metadata()
+            .with_context(|| format!("inspecting private user directory {}", p.display()))?;
+        if !before.is_dir() {
+            bail!("private user path is not a directory: {}", p.display());
+        }
+        if before.permissions().mode() & 0o7777 != 0o700 {
+            directory
+                .set_permissions(std::fs::Permissions::from_mode(0o700))
+                .with_context(|| {
+                    format!("tightening private user directory {}", p.display())
+                })?;
+        }
+
+        let after = directory
+            .metadata()
+            .with_context(|| format!("re-inspecting private user directory {}", p.display()))?;
+        let path_after = std::fs::symlink_metadata(p).with_context(|| {
+            format!("revalidating private user directory name {}", p.display())
+        })?;
+        if path_after.file_type().is_symlink()
+            || !path_after.is_dir()
+            || path_after.dev() != after.dev()
+            || path_after.ino() != after.ino()
+        {
+            bail!(
+                "private user directory changed identity during validation: {}",
+                p.display()
+            );
+        }
+        if after.permissions().mode() & 0o7777 != 0o700 {
+            bail!(
+                "private user directory permissions are not 0700: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(p)
+            .with_context(|| format!("inspecting private user directory {}", p.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("private user path is not a direct directory: {}", p.display());
+        }
+    }
+
     Ok(())
 }
 
@@ -1454,6 +1519,56 @@ mod tests {
                 first.path().join("frankenterm"),
                 second.path().join("frankenterm"),
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_owned_directory_creation_is_private_and_symlink_safe() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let fixture = tempfile::tempdir().expect("private-directory fixture");
+        let private = fixture.path().join("state").join("nested");
+        create_user_owned_dirs(&private).expect("create private nested directory");
+        assert_eq!(
+            std::fs::symlink_metadata(&private)
+                .expect("inspect private directory")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755))
+            .expect("plant legacy permissive mode");
+        create_user_owned_dirs(&private).expect("tighten legacy private directory");
+        assert_eq!(
+            std::fs::symlink_metadata(&private)
+                .expect("reinspect tightened directory")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+
+        let target = fixture.path().join("symlink-target");
+        std::fs::create_dir(&target).expect("create symlink target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("plant public target permissions");
+        let alias = fixture.path().join("symlink-alias");
+        symlink(&target, &alias).expect("plant final-component symlink");
+        assert!(
+            create_user_owned_dirs(&alias).is_err(),
+            "a symbolic-link directory authority must fail closed"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&target)
+                .expect("inspect untouched symlink target")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755,
+            "rejected symbolic-link authority must not tighten its target"
         );
     }
 }

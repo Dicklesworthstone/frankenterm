@@ -173,7 +173,7 @@ pub struct SshCommand {
 pub struct SerialCommand {
     /// Set the baud rate.  The default is 9600 baud.
     #[arg(long = "baud")]
-    pub baud: Option<usize>,
+    pub baud: Option<u32>,
 
     /// Override the default windowing system class.
     /// The default is "com.dicklesworthstone.frankenterm".
@@ -276,7 +276,7 @@ pub struct ShowKeysCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectCommand, StartCommand};
+    use super::{ConnectCommand, SerialCommand, StartCommand};
     use clap::Parser;
 
     #[test]
@@ -294,5 +294,29 @@ mod tests {
             "agent-fleet",
         ]);
         assert_eq!(cmd.workspace.as_deref(), Some("agent-fleet"));
+    }
+
+    #[test]
+    fn serial_command_rejects_baud_above_backend_boundary() {
+        let maximum = SerialCommand::try_parse_from([
+            "frankenterm-gui",
+            "--baud",
+            "4294967295",
+            "/dev/ttyUSB0",
+        ])
+        .expect("the serial backend's maximum representable baud must parse");
+        let exact_backend_type: Option<u32> = maximum.baud;
+        assert_eq!(exact_backend_type, Some(u32::MAX));
+
+        let rejected = SerialCommand::try_parse_from([
+            "frankenterm-gui",
+            "--baud",
+            "4294967296",
+            "/dev/ttyUSB0",
+        ]);
+        assert!(
+            rejected.is_err(),
+            "the CLI must reject the first baud value the serial backend cannot represent"
+        );
     }
 }

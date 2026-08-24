@@ -1172,6 +1172,36 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 thread_local! {
     static IN_MAIN_THREAD_DISPATCH: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    #[cfg(feature = "async-asupersync")]
+    static IN_BLOCK_ON_IO_TASK_POLL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "async-asupersync")]
+struct BlockOnIoTaskPollScope {
+    previous: bool,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(feature = "async-asupersync")]
+impl Drop for BlockOnIoTaskPollScope {
+    fn drop(&mut self) {
+        IN_BLOCK_ON_IO_TASK_POLL.with(|flag| flag.set(self.previous));
+    }
+}
+
+#[cfg(feature = "async-asupersync")]
+fn enter_block_on_io_task_poll_scope() -> BlockOnIoTaskPollScope {
+    let previous = IN_BLOCK_ON_IO_TASK_POLL.with(|flag| flag.replace(true));
+    BlockOnIoTaskPollScope {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+#[cfg(feature = "async-asupersync")]
+fn is_in_block_on_io_task_poll() -> bool {
+    IN_BLOCK_ON_IO_TASK_POLL.with(std::cell::Cell::get)
 }
 
 /// RAII guard returned by [`enter_main_thread_dispatch_scope`]. While
@@ -1679,33 +1709,114 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// bites real remote connections.
 ///
 /// `block_on_io` spawns the future as a scheduler-managed task (whose reactor
-/// registrations *are* driven) and blocks on its join handle, so I/O wakeups
-/// fire correctly. Use this for any future that does socket/timer I/O on a
-/// dedicated blocking thread (the mux client reader) OR a short sync-over-async
-/// I/O call made from the GUI main thread (e.g. `PaneWriter::write` shipping a
-/// keystroke to a remote pane).
+/// registrations *are* driven) and parks on a one-shot completion channel, so
+/// I/O wakeups fire correctly without polling a runtime join handle. Use this
+/// for a future that does socket/timer I/O on a dedicated blocking thread, such
+/// as the mux client reader.
 ///
-/// Unlike [`block_on`], this is SAFE to call on the main-thread spawn queue: the
+/// Unlike [`block_on`], this is safe to call on the main-thread spawn queue: the
 /// spawned task runs on a *separate* runtime worker that drives it (and its I/O)
-/// to completion independently, so parking the caller on the join handle cannot
-/// self-deadlock the GUI the way a directly-polled `block_on` would. (It does
-/// briefly block the event loop until the I/O completes — acceptable for the
-/// short mux RPCs this is used for, and the behavior the prior runtime had
-/// before the asupersync migration. A future, fully-async rewrite of those sync
-/// write paths is the proper end state.)
+/// to completion independently, so parking the caller on the completion channel
+/// cannot self-deadlock the GUI the way a directly-polled `block_on` would. A
+/// caller still blocks until the I/O completes, so main-thread call sites must
+/// remain short and exceptional; normal GUI RPCs use nonblocking admission.
 ///
 /// The future MUST NOT depend on the calling thread making progress (e.g. it
 /// must not block on `spawn_into_main_thread`), or it will deadlock when invoked
 /// from the main thread. Mux client RPCs satisfy this: they are serviced by the
 /// reader task on the runtime, not by the caller.
+///
+/// This function also MUST NOT be called recursively while a `block_on_io`
+/// future (or its destructor) is executing. The private runtime has one worker;
+/// parking that worker would prevent the nested task from ever running. That
+/// context is detected synchronously and rejected with a panic instead of
+/// hanging forever. Production callers are dedicated external OS threads.
+#[cfg(feature = "async-asupersync")]
+fn receive_block_on_io_outcome<T>(
+    output_rx: &std::sync::mpsc::Receiver<std::thread::Result<T>>,
+) -> T {
+    match output_rx.recv() {
+        Ok(Ok(output)) => output,
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Err(_) => panic!("task was dropped or cancelled before completion"), // ubs:ignore - runtime shutdown panic
+    }
+}
+
 #[cfg(feature = "async-asupersync")]
 pub fn block_on_io<F>(future: F) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let join = ASUPERSYNC_RUNTIME.handle().spawn(future);
-    ASUPERSYNC_RUNTIME.block_on(join)
+    assert!(
+        !is_in_block_on_io_task_poll(),
+        "block_on_io cannot recursively park its sole runtime worker"
+    );
+    let (output_tx, output_rx) = std::sync::mpsc::sync_channel(1);
+
+    // Catching here is strictly a cross-thread panic-transfer mechanism and
+    // mirrors asupersync's own spawned-task boundary. The primary payload is
+    // never inspected, logged as recovery, or polled a second time; the
+    // blocked caller immediately resumes its original unwind. A pathological
+    // second panic while destroying the same failed future is quarantined
+    // below because running its destructor again cannot be made sound.
+    let mut future = Box::pin(future);
+    let _join_liveness_guard = ASUPERSYNC_RUNTIME.handle().spawn(async move {
+        let poll_outcome = std::future::poll_fn(|cx| {
+            let _worker_scope = enter_block_on_io_task_poll_scope();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                future.as_mut().poll(cx)
+            })) {
+                Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+                Ok(Poll::Pending) => Poll::Pending,
+                Err(payload) => Poll::Ready(Err(payload)),
+            }
+        })
+        .await;
+        // Dispose all future-owned state before publishing completion, just as
+        // asupersync does before it fills a JoinHandle's completion state. A
+        // destructor panic is part of this cross-thread execution boundary too:
+        // transfer it exactly instead of letting the sender disappear and
+        // misreporting the outcome as task cancellation. If both polling and
+        // destruction panic, preserve the primary poll panic and quarantine
+        // the secondary payload without beginning a second unwind.
+        let drop_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _worker_scope = enter_block_on_io_task_poll_scope();
+            drop(future);
+        }));
+        let outcome = match (poll_outcome, drop_outcome) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(output), Err(primary)) => {
+                if let Err(secondary) = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        let _worker_scope = enter_block_on_io_task_poll_scope();
+                        drop(output);
+                    }),
+                ) {
+                    // A second panic cannot replace the earlier execution
+                    // failure. Quarantine its payload without invoking a
+                    // potentially panicking destructor a second time.
+                    std::mem::forget(secondary);
+                }
+                Err(primary)
+            }
+            (Err(payload), Ok(())) => Err(payload),
+            (Err(primary), Err(secondary)) => {
+                // Preserve the primary poll panic. The secondary destructor
+                // payload cannot be safely dropped while retaining that exact
+                // cross-thread identity.
+                std::mem::forget(secondary);
+                Err(primary)
+            }
+        };
+        let _ = output_tx.send(outcome);
+    });
+
+    // A capacity-one standard channel parks this OS thread until the runtime
+    // worker completes the task. Do not poll the JoinHandle here: asupersync's
+    // block_on join path rechecks every millisecond while any runtime task is
+    // live, multiplying idle CPU consumption by every connected mux client.
+    receive_block_on_io_outcome(&output_rx)
 }
 
 /// Non-asupersync fallback: `async_io::block_on` already drives the global
@@ -3481,7 +3592,7 @@ mod tests {
                 .unwrap();
         let reservation = match try_reserve_main_thread(MainThreadServiceClass::Topology, 32) {
             MainThreadReservationOutcome::Reserved(reservation) => reservation,
-            outcome => panic!("expected exact handoff reservation, got {outcome:?}"),
+            outcome => panic!("expected exact handoff reservation, got {:?}", outcome),
         };
         let main_thread = std::thread::current().id();
         let factory_ran = Arc::new(AtomicBool::new(false));
@@ -4340,12 +4451,13 @@ mod tests {
     }
 
     /// Counterpart to `block_on_panics_when_called_inside_dispatch_scope`:
-    /// `block_on_io` MUST be usable from the GUI main-thread spawn queue. It
-    /// spawns the future onto a runtime worker and joins, so the worker drives
-    /// the task (and its I/O) independently of the parked caller — it cannot
-    /// trip the main-thread guard and cannot self-deadlock. This is the property
-    /// that lets `PaneWriter::write` ship a keystroke to a remote pane and the
-    /// mux client reader run, both correctly, after the smol->asupersync move.
+    /// `block_on_io` must be usable from the GUI main-thread spawn queue. It
+    /// spawns the future onto a runtime worker and receives its one-shot result,
+    /// so the worker drives the task (and its I/O) independently of the parked
+    /// caller, so it does not trip the main-thread guard. Recursive use from
+    /// that sole worker is a separate rejected contract tested below. This is
+    /// the property the mux client reader required after the smol-to-asupersync
+    /// move. GUI pane writes use a separate nonblocking admission path.
     #[test]
     fn block_on_io_is_safe_inside_dispatch_scope() {
         assert!(!is_in_main_thread_dispatch());
@@ -4358,5 +4470,165 @@ mod tests {
             42,
         );
         assert!(!is_in_main_thread_dispatch());
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn block_on_io_rejects_recursive_use_on_its_sole_runtime_worker() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on_io(async { block_on_io(async { 42 }) })
+        }));
+        let payload = result.expect_err("recursive block_on_io must fail instead of deadlocking");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .expect("recursive rejection uses a textual panic payload");
+        assert!(message.contains("cannot recursively park its sole runtime worker"));
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn block_on_io_rethrows_the_original_panic_payload() {
+        #[derive(Debug)]
+        struct PanicIdentity(Arc<()>);
+
+        let expected_identity = Arc::new(());
+        let payload_identity = Arc::clone(&expected_identity);
+        let result: std::thread::Result<()> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                block_on_io(async move {
+                    std::panic::panic_any(PanicIdentity(payload_identity));
+                });
+            }));
+        let payload = result.expect_err("block_on_io must resume the worker's panic");
+        let payload = payload
+            .downcast::<PanicIdentity>()
+            .expect("block_on_io must preserve the original typed panic payload");
+        assert!(Arc::ptr_eq(&payload.0, &expected_identity));
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn block_on_io_rethrows_a_future_destructor_panic_payload() {
+        #[derive(Debug)]
+        struct DropPanicIdentity(Arc<()>);
+
+        struct PanicsOnDrop(Option<DropPanicIdentity>);
+
+        impl std::future::Future for PanicsOnDrop {
+            type Output = ();
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _task_cx: &mut Context<'_>,
+            ) -> Poll<Self::Output> {
+                Poll::Ready(())
+            }
+        }
+
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                std::panic::panic_any(
+                    self.0
+                        .take()
+                        .expect("future destructor must run exactly once"),
+                );
+            }
+        }
+
+        let expected_identity = Arc::new(());
+        let payload_identity = Arc::clone(&expected_identity);
+        let result: std::thread::Result<()> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                block_on_io(PanicsOnDrop(Some(DropPanicIdentity(payload_identity))));
+            }));
+        let payload = result.expect_err("block_on_io must resume the destructor panic");
+        let payload = payload
+            .downcast::<DropPanicIdentity>()
+            .expect("block_on_io must preserve the destructor's typed panic payload");
+        assert!(Arc::ptr_eq(&payload.0, &expected_identity));
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn block_on_io_reports_sender_disconnect_as_task_cancellation() {
+        let (output_tx, output_rx) =
+            std::sync::mpsc::sync_channel::<std::thread::Result<()>>(1);
+        drop(output_tx);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            receive_block_on_io_outcome(&output_rx)
+        }));
+        let payload = result.expect_err("a disconnected completion channel must panic");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("task was dropped or cancelled before completion")
+        );
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn block_on_io_completes_parallel_parked_callers_exactly_once() {
+        const CALLERS: usize = 16;
+        let start = Arc::new(std::sync::Barrier::new(CALLERS + 1));
+        let completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut callers = Vec::with_capacity(CALLERS);
+
+        for value in 0..CALLERS {
+            let start = Arc::clone(&start);
+            let completions = Arc::clone(&completions);
+            callers.push(std::thread::spawn(move || {
+                start.wait();
+                block_on_io(async move {
+                    sleep(Duration::from_millis(10)).await;
+                    completions.fetch_add(1, Ordering::AcqRel);
+                    value
+                })
+            }));
+        }
+
+        start.wait();
+        let mut values = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("block_on_io caller must not panic"))
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, (0..CALLERS).collect::<Vec<_>>());
+        assert_eq!(completions.load(Ordering::Acquire), CALLERS);
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn block_on_io_source_parks_without_runtime_join_polling() {
+        let source = include_str!("spawn.rs");
+        let start = source
+            .find("pub fn block_on_io<F>(future: F)")
+            .expect("locate asupersync block_on_io");
+        let end = source[start..]
+            .find("/// Non-asupersync fallback")
+            .map(|offset| start + offset)
+            .expect("locate end of asupersync block_on_io");
+        let implementation = &source[start..end];
+
+        assert!(implementation.contains("sync_channel(1)"));
+        assert!(implementation.contains("receive_block_on_io_outcome(&output_rx)"));
+        for forbidden in [
+            "ASUPERSYNC_RUNTIME.block_on",
+            "park_timeout(",
+            "try_recv(",
+            "thread::sleep(",
+            "thread::yield_now(",
+        ] {
+            assert!(
+                !implementation.contains(forbidden),
+                "block_on_io must park on completion, not poll via {}",
+                forbidden
+            );
+        }
     }
 }

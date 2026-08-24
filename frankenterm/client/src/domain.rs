@@ -1335,6 +1335,7 @@ pub struct ClientDomain {
     policy: parking_lot::RwLock<ClientDomainPolicy>,
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
+    background_attachment_ui: Mutex<Option<ConnectionUI>>,
     initial_attachment_pending: AtomicBool,
     retired: AtomicBool,
     local_domain_id: DomainId,
@@ -1432,6 +1433,14 @@ impl Drop for InitialAttachmentCleanup {
 
 impl Drop for ClientDomain {
     fn drop(&mut self) {
+        if let Some(ui) = lock_or_recover(
+            &self.background_attachment_ui,
+            "client_domain_background_attachment_ui",
+        )
+        .take()
+        {
+            ui.close();
+        }
         if let (Some(mux), Some(subscriber_id)) = (self.mux_owner.upgrade(), self.mux_subscriber_id)
         {
             mux.unsubscribe(subscriber_id);
@@ -1989,6 +1998,7 @@ impl ClientDomain {
             policy: parking_lot::RwLock::new(policy),
             label,
             inner: Mutex::new(None),
+            background_attachment_ui: Mutex::new(None),
             initial_attachment_pending: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             local_domain_id,
@@ -2015,6 +2025,75 @@ impl ClientDomain {
         Ok(InitialAttachmentClaim {
             pending: &self.initial_attachment_pending,
         })
+    }
+
+    fn background_attachment_ui_is_reusable(ui: &ConnectionUI) -> bool {
+        ui.is_open() && ui.is_interactive()
+    }
+
+    fn initial_attachment_ui(
+        &self,
+        window_id: Option<WindowId>,
+    ) -> anyhow::Result<(ConnectionUI, bool)> {
+        if let Some(window_id) = window_id {
+            let ui = ConnectionUI::with_params(ConnectionUIParams {
+                window_id: Some(window_id),
+                ..Default::default()
+            });
+            if !ui.is_interactive() {
+                ui.close();
+                bail!("interactive connection UI admission is temporarily unavailable");
+            }
+            return Ok((ui, false));
+        }
+
+        let mut retained = lock_or_recover(
+            &self.background_attachment_ui,
+            "client_domain_background_attachment_ui",
+        );
+        if retained
+            .as_ref()
+            .is_none_or(|ui| !Self::background_attachment_ui_is_reusable(ui))
+        {
+            if let Some(closed) = retained.take() {
+                closed.close();
+            }
+            // Background reconnect may still need host-key confirmation,
+            // passphrase, keyboard-interactive authentication, or MFA. Keep
+            // exactly one interactive prompt surface per domain across retry
+            // attempts, and disable the implicit 120-second linger because
+            // this exact sender slot owns its lifetime explicitly.
+            let candidate = ConnectionUI::with_params(ConnectionUIParams {
+                disable_close_delay: true,
+                window_id: None,
+                ..Default::default()
+            });
+            if !candidate.is_interactive() {
+                candidate.close();
+                bail!(
+                    "background connection prompt admission is temporarily unavailable; retrying without starting transport authentication"
+                );
+            }
+            retained.replace(candidate);
+        }
+        Ok((
+            retained
+                .as_ref()
+                .expect("background connection UI was installed")
+                .clone(),
+            true,
+        ))
+    }
+
+    fn close_background_attachment_ui(&self) {
+        if let Some(ui) = lock_or_recover(
+            &self.background_attachment_ui,
+            "client_domain_background_attachment_ui",
+        )
+        .take()
+        {
+            ui.close();
+        }
     }
 
     fn ensure_mux_owner(&self, mux: &Arc<Mux>) -> anyhow::Result<()> {
@@ -2051,6 +2130,7 @@ impl ClientDomain {
     }
 
     pub fn perform_detach(&self) {
+        self.close_background_attachment_ui();
         let expected = self.inner();
         if let Some(expected) = expected {
             let _ = self.perform_detach_if_current(&expected);
@@ -2082,6 +2162,7 @@ impl ClientDomain {
             retired
         };
         drop(retired);
+        self.close_background_attachment_ui();
 
         log::info!(
             "detached exact attachment for domain {}",
@@ -3886,13 +3967,15 @@ impl Domain for ClientDomain {
         let config = self.config.clone();
 
         let activity = mux::activity::Activity::new_for_mux(mux);
-        let ui = ConnectionUI::with_params(ConnectionUIParams {
-            window_id,
-            ..Default::default()
-        });
+        // A missing target window denotes a background attach (automatic
+        // supervisor or Lua startup/watchdog). It reuses one domain-owned
+        // prompt surface across retries rather than allocating an unbounded
+        // stream of delayed-close windows. Direct user opens carry a concrete
+        // window and retain a one-shot connection surface.
+        let (ui, background_ui) = self.initial_attachment_ui(window_id)?;
         ui.title("FrankenTerm: Connecting...");
 
-        ui.async_run_and_log_error({
+        let attach_result = ui.async_run_and_log_error({
             let ui = ui.clone();
             let mux = Arc::clone(mux);
             async move {
@@ -3959,12 +4042,19 @@ impl Domain for ClientDomain {
         .map_err(|e| {
             ui.output_str(&format!("Error during attach: {:#}\n", e));
             e
-        })?;
-
-        ui.output_str("Attached!\n");
+        });
+        if attach_result.is_ok() {
+            ui.output_str("Attached!\n");
+        }
         drop(activity);
-        ui.close();
-        Ok(())
+        if background_ui {
+            if attach_result.is_ok() {
+                self.close_background_attachment_ui();
+            }
+        } else {
+            ui.close();
+        }
+        attach_result
     }
 
     fn detachable(&self) -> bool {
@@ -4010,6 +4100,7 @@ mod tests {
             policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
             config,
             inner: Mutex::new(None),
+            background_attachment_ui: Mutex::new(None),
             initial_attachment_pending: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             local_domain_id: 91_020,
@@ -4035,6 +4126,51 @@ mod tests {
     }
 
     #[test]
+    fn headless_fallback_cannot_poison_background_prompt_reuse() {
+        let headless = ConnectionUI::new_headless();
+        assert!(headless.is_open());
+        assert!(!headless.is_interactive());
+        assert!(!ClientDomain::background_attachment_ui_is_reusable(
+            &headless
+        ));
+        headless.close();
+    }
+
+    #[test]
+    fn policy_reconciliation_updates_the_live_attachment_policy_in_place() {
+        let domain_id = 91_021;
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "live-policy-reload-test".to_string(),
+            connect_automatically: false,
+            ..UnixDomain::default()
+        });
+        let domain = ClientDomain {
+            label: config.label(),
+            config: config.clone(),
+            policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+            inner: Mutex::new(None),
+            background_attachment_ui: Mutex::new(None),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id: domain_id,
+            mux_owner: Weak::new(),
+            mux_subscriber_id: None,
+        };
+
+        let mut enabled = config.clone();
+        let ClientDomainConfig::Unix(enabled) = &mut enabled else {
+            unreachable!("test config is unix")
+        };
+        enabled.connect_automatically = true;
+        assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(
+            enabled.clone(),
+        )));
+        assert!(domain.connect_automatically());
+
+        enabled.connect_automatically = false;
+        assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(enabled.clone())));
+        assert!(!domain.connect_automatically());
+    }
     fn rejected_remote_workspace_update_deterministically_resyncs() {
         let resyncs = Arc::new(AtomicUsize::new(0));
         let resyncs_for_call = Arc::clone(&resyncs);
@@ -4364,6 +4500,7 @@ mod tests {
             policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
             config,
             inner: Mutex::new(Some(Arc::clone(inner))),
+            background_attachment_ui: Mutex::new(None),
             initial_attachment_pending: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             local_domain_id: inner.local_domain_id,
@@ -4397,6 +4534,7 @@ mod tests {
                 policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
                 config,
                 inner: Mutex::new(Some(Arc::clone(&inner))),
+                background_attachment_ui: Mutex::new(None),
                 initial_attachment_pending: AtomicBool::new(false),
                 retired: AtomicBool::new(false),
                 local_domain_id: domain_id,
@@ -4459,6 +4597,7 @@ mod tests {
                 )),
                 config: successor_config,
                 inner: Mutex::new(Some(successor_inner)),
+                background_attachment_ui: Mutex::new(None),
                 initial_attachment_pending: AtomicBool::new(false),
                 retired: AtomicBool::new(false),
                 local_domain_id: domain_id,
@@ -4537,6 +4676,11 @@ mod tests {
             "the exact current attachment must remain detachable",
         );
         assert!(domain.inner().is_none());
+        assert_eq!(
+            domain.state(),
+            DomainState::Detached,
+            "exact transport retirement must make desired-state health truthful"
+        );
         assert!(replacement.is_detached());
         assert!(mux.get_domain(domain.local_domain_id).is_none());
     }

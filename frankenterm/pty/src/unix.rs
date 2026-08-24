@@ -1,13 +1,15 @@
 //! Working with pseudo-terminals
 
-use crate::{Child, CommandBuilder, MasterPty, PtyPair, PtySize, PtySystem, SlavePty};
+use crate::{
+    Child, CommandBuilder, MasterPty, PollablePtyReader, PtyPair, PtySize, PtySystem, SlavePty,
+};
 use anyhow::{bail, Error};
 use filedescriptor::FileDescriptor;
 use libc::{self, winsize};
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
@@ -98,6 +100,12 @@ impl std::ops::Deref for PtyFd {
 impl std::ops::DerefMut for PtyFd {
     fn deref_mut(&mut self) -> &mut FileDescriptor {
         &mut self.0
+    }
+}
+
+impl AsFd for PtyFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
     }
 }
 
@@ -362,6 +370,12 @@ impl MasterPty for UnixMasterPty {
 
     fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, Error> {
         let fd = PtyFd(self.fd.try_clone()?);
+        Ok(Box::new(fd))
+    }
+
+    fn try_clone_pollable_reader(&self) -> Result<Box<dyn PollablePtyReader>, Error> {
+        let mut fd = PtyFd(self.fd.try_clone()?);
+        fd.set_non_blocking(true)?;
         Ok(Box::new(fd))
     }
 

@@ -14,8 +14,7 @@ use ordered_float::NotNan;
 use portable_pty::CommandBuilder;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 pub use mlua;
@@ -424,13 +423,10 @@ end
         // schedules a one-shot Lua callback via the asupersync timer
         // primitive (NOT tokio — the project bans direct tokio use; see
         // AGENTS.md "Async Runtime: asupersync"). Implemented in
-        // `lua_time_call_after` below, which stores the callback in the
-        // Lua named-registry then spawns a future that awaits
-        // `promise::spawn::sleep` (asupersync-backed when the
-        // async-asupersync feature is on, per
-        // frankenterm/promise/src/spawn.rs::sleep) and re-enters the
-        // main-thread Lua state via `with_lua_config_on_main_thread`
-        // to invoke the callback. The wezterm.time alias below is the
+        // `lua_time_call_after` below, which pins the callback to the Lua
+        // generation that created it, owns the delay on the bounded background
+        // executor, and retries transient main-thread admission failures
+        // without dropping the callback. The wezterm.time alias below is the
         // back-compat surface for upstream configs.
         let time_mod = get_or_create_sub_module(&lua, "time")?;
         time_mod.set("call_after", lua.create_function(lua_time_call_after)?)?;
@@ -542,10 +538,179 @@ fn lua_log_trace(lua: &Lua, args: Variadic<mlua::Value>) -> mlua::Result<()> {
 
 // ─── FrankenTerm Lua API: time helpers ────────────────────────────────────────
 
-/// Monotonically-incrementing counter used to mint unique Lua named-registry
-/// keys for each pending `time.call_after` callback. Combined with a
-/// nanosecond timestamp to avoid collisions across config reloads.
-static TIME_CALL_AFTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+const TIME_CALL_AFTER_TASK_ESTIMATED_BYTES: usize = 8 * 1024;
+const TIME_CALL_AFTER_INITIAL_ADMISSION_RETRY: Duration = Duration::from_millis(10);
+const TIME_CALL_AFTER_MAX_ADMISSION_RETRY: Duration = Duration::from_secs(1);
+
+// asupersync's canonical timer represents deadlines as u64 nanoseconds. Do
+// not accept a larger Duration and silently let that layer saturate it to a
+// different delay. This also keeps the non-asupersync promise backend within
+// the same public input contract.
+const TIME_CALL_AFTER_MAX_DURATION: Duration = Duration::from_nanos(u64::MAX);
+
+/// One accepted timer owns the exact Lua generation and function that created
+/// it. A config reload publishes a distinct `Lua`; looking a registry key up in
+/// that replacement state is both type-correct and semantically wrong. The
+/// clone here deliberately retains the origin generation until the callback
+/// finishes. `time.call_after` is explicit fire-and-forget work, so an accepted
+/// callback is not implicitly revoked by an unrelated config reload.
+///
+/// This is a deliberate FrankenTerm divergence from upstream's
+/// generation-cancel policy: this profile's sole reconnect watchdog starts
+/// from `gui-startup`, which does not re-fire on reload. Reloading therefore
+/// neither clones nor reschedules an old timer; one self-rescheduling chain
+/// remains one chain in its origin VM. That VM-retention tradeoff is bounded by
+/// `try_reserve_background_task`'s process-wide task and byte authority.
+struct LuaTimerCallback {
+    origin_lua: Lua,
+    callback: mlua::Function,
+}
+
+impl LuaTimerCallback {
+    async fn invoke(self) {
+        let Self {
+            origin_lua,
+            callback,
+        } = self;
+        if let Err(err) = callback.call_async::<()>(()).await {
+            log::warn!(
+                target: "lua_config",
+                "time.call_after callback raised: {err}"
+            );
+        }
+        // Keep the origin state alive across the complete async invocation,
+        // including any yields from Lua code.
+        drop(origin_lua);
+    }
+}
+
+fn lua_timer_callback_lock(
+    callback: &Mutex<Option<LuaTimerCallback>>,
+) -> MutexGuard<'_, Option<LuaTimerCallback>> {
+    match callback.lock() {
+        Ok(callback) => callback,
+        Err(poisoned) => {
+            log::warn!(target: "lua_config", "recovering poisoned Lua timer callback mutex");
+            callback.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn lua_time_call_after_duration(seconds: f64) -> mlua::Result<Duration> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(mlua::Error::external(format!(
+            "time.call_after: seconds must be a finite, non-negative number; got {seconds}"
+        )));
+    }
+
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|err| {
+        mlua::Error::external(format!(
+            "time.call_after: seconds is outside the representable duration range; got {seconds}: {err}"
+        ))
+    })?;
+    if duration > TIME_CALL_AFTER_MAX_DURATION {
+        return Err(mlua::Error::external(format!(
+            "time.call_after: seconds exceeds the maximum supported timer duration of {} seconds; got {seconds}",
+            TIME_CALL_AFTER_MAX_DURATION.as_secs_f64()
+        )));
+    }
+    Ok(duration)
+}
+
+fn lua_timer_admission_retry_delay(rejection_count: u32) -> Duration {
+    let exponent = rejection_count.saturating_sub(1).min(7);
+    let multiplier = 1_u32 << exponent;
+    TIME_CALL_AFTER_INITIAL_ADMISSION_RETRY
+        .saturating_mul(multiplier)
+        .min(TIME_CALL_AFTER_MAX_ADMISSION_RETRY)
+}
+
+/// Retain an already-accepted callback until some live main-thread scheduler
+/// generation admits it. In particular, a timer callback can schedule its
+/// successor while its own main-thread permit is still live: the successor is
+/// handed to the independent bounded background executor, rather than being
+/// rejected just because the current callback temporarily consumes the last
+/// general main-thread slot.
+async fn dispatch_lua_timer_callback(callback: LuaTimerCallback) {
+    // Keep fallback ownership outside the scheduled future until that future
+    // actually starts. A scheduler generation can retire after admitting the
+    // task but before polling its first runnable; in that race the fallible
+    // task resolves to None and the callback is still present here for a new
+    // generation. Once the task takes it, execution is at-most-once.
+    let callback = Arc::new(Mutex::new(Some(callback)));
+    let mut rejection_count = 0_u32;
+
+    loop {
+        match promise::spawn::try_reserve_main_thread_with_low_priority(
+            promise::spawn::MainThreadServiceClass::Background,
+            TIME_CALL_AFTER_TASK_ESTIMATED_BYTES,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                let callback_for_task = Arc::clone(&callback);
+                let completed = reservation
+                    .spawn(async move {
+                        let callback = lua_timer_callback_lock(&callback_for_task).take();
+                        let Some(callback) = callback else {
+                            log::error!(
+                                target: "lua_config",
+                                "time.call_after: admitted task found callback ownership already consumed"
+                            );
+                            return;
+                        };
+                        callback.invoke().await;
+                    })
+                    .into_task()
+                    .fallible()
+                    .await;
+                if completed.is_some() {
+                    return;
+                }
+
+                if lua_timer_callback_lock(&callback).is_none() {
+                    // The runnable began and consumed the callback before its
+                    // scheduler disappeared. Replaying could invoke user code
+                    // twice, so preserve the at-most-once contract and report
+                    // the indeterminate interrupted execution loudly.
+                    log::error!(
+                        target: "lua_config",
+                        "time.call_after: callback execution was interrupted after main-thread start; refusing an unsafe duplicate invocation"
+                    );
+                    return;
+                }
+
+                rejection_count = rejection_count.saturating_add(1);
+                if rejection_count.is_power_of_two() {
+                    log::warn!(
+                        target: "lua_config",
+                        "time.call_after: retaining callback after admitted scheduler generation retired before first poll (attempt {rejection_count})"
+                    );
+                }
+                promise::spawn::sleep(lua_timer_admission_retry_delay(rejection_count)).await;
+            }
+            promise::spawn::MainThreadReservationOutcome::InvalidSize(rejection) => {
+                // The estimate above is a positive constant, so retrying this
+                // result can never make progress. Preserve a loud diagnostic
+                // instead of spinning forever on an internal contract breach.
+                log::error!(
+                    target: "lua_config",
+                    "time.call_after: main-thread scheduler rejected the fixed callback size: {rejection:?}"
+                );
+                return;
+            }
+            rejected => {
+                rejection_count = rejection_count.saturating_add(1);
+                if rejection_count.is_power_of_two() {
+                    log::warn!(
+                        target: "lua_config",
+                        "time.call_after: retaining callback after transient main-thread admission rejection (attempt {rejection_count}): {rejected:?}"
+                    );
+                }
+                promise::spawn::sleep(lua_timer_admission_retry_delay(rejection_count)).await;
+            }
+        }
+    }
+}
 
 /// `wezterm.time.now()` — returns seconds since UNIX epoch as a float.
 fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<f64> {
@@ -558,8 +723,8 @@ fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<f64> {
 
 /// `wezterm.time.call_after(seconds, function)` — schedules `function` to be
 /// called once after `seconds` have elapsed. Returns immediately (fire-and-
-/// forget); the callback runs on the main thread with access to the live
-/// Lua state.
+/// forget); the callback runs on the main thread against the exact Lua
+/// generation that accepted it.
 ///
 /// Implementation uses the project's `promise` crate, which delegates to
 /// `asupersync::time::sleep` when the `async-asupersync` feature is enabled
@@ -568,89 +733,31 @@ fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<f64> {
 /// by AGENTS.md.
 ///
 /// Internals:
-///   1. Stash the Lua callback in the named registry under a unique key
-///      (sync, while we still hold the `Lua` reference).
-///   2. Reserve bounded background scheduler capacity, then spawn a future that awaits
-///      `promise::spawn::sleep(duration)` (asupersync-backed).
-///   3. On wake, re-enter the main-thread Lua state via
-///      `crate::with_lua_config_on_main_thread`, fetch the callback
-///      from the registry, invoke it via `call_async`, then unset the
-///      registry slot. If the lua context has gone away (reload, shutdown)
-///      we silently drop the callback.
+///   1. Validate and convert the delay without a panic path.
+///   2. Reserve bounded background capacity before retaining callback state.
+///   3. Clone the originating `Lua` and move its function handle into that
+///      reserved timer task.
+///   4. On wake, retry bounded main-thread admission until a live scheduler
+///      generation accepts the still-owned callback, then invoke it there.
 fn lua_time_call_after(lua: &Lua, (seconds, func): (f64, mlua::Function)) -> mlua::Result<()> {
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(mlua::Error::external(format!(
-            "time.call_after: seconds must be a finite, non-negative number; got {seconds}"
-        )));
-    }
+    let duration = lua_time_call_after_duration(seconds)?;
+    let reservation = promise::spawn::try_reserve_background_task(
+        TIME_CALL_AFTER_TASK_ESTIMATED_BYTES,
+    )
+    .map_err(|err| {
+        mlua::Error::external(format!(
+            "time.call_after: bounded background timer capacity unavailable before callback handoff: {err}"
+        ))
+    })?;
 
-    let ts_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let counter = TIME_CALL_AFTER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let key = format!("frankenterm-time-call-after-{ts_ns}-{counter}");
-
-    let reservation = match promise::spawn::try_reserve_main_thread_with_low_priority(
-        promise::spawn::MainThreadServiceClass::Background,
-        8 * 1024,
-    ) {
-        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
-        rejected => {
-            return Err(mlua::Error::external(format!(
-                "time.call_after: main-thread scheduler rejected timer before callback registration: {rejected:?}"
-            )));
-        }
+    let callback = LuaTimerCallback {
+        origin_lua: lua.clone(),
+        callback: func,
     };
-
-    lua.set_named_registry_value(&key, func)?;
-
-    let duration = Duration::from_secs_f64(seconds);
-    let key_for_async = key.clone();
-    reservation
-        .spawn_local(async move {
-            promise::spawn::sleep(duration).await;
-            let _ = crate::with_lua_config_on_main_thread(move |lua_opt| {
-                let key = key_for_async.clone();
-                async move {
-                    let Some(lua) = lua_opt else {
-                        // No live Lua state (config reload mid-flight or
-                        // shutdown). The registry holding the callback is
-                        // gone with it, so there's nothing to clean up.
-                        return Ok(());
-                    };
-                    let result: mlua::Result<Value> = lua.named_registry_value(&key);
-                    // Unset before the call so re-entrant config reloads or
-                    // panics inside the callback don't leave the slot
-                    // permanently allocated.
-                    let _ = lua.unset_named_registry_value(&key);
-                    match result {
-                        Ok(Value::Function(func)) => {
-                            if let Err(err) = func.call_async::<()>(()).await {
-                                log::warn!(
-                                    target: "lua_config",
-                                    "time.call_after callback raised: {err}"
-                                );
-                            }
-                        }
-                        Ok(other) => {
-                            log::warn!(
-                                target: "lua_config",
-                                "time.call_after: registry slot {key} held non-function value {}",
-                                other.type_name()
-                            );
-                        }
-                        Err(_) => {
-                            // Registry slot vanished (config reload between
-                            // schedule and fire). Silently drop.
-                        }
-                    }
-                    Ok(())
-                }
-            })
-            .await;
-        })
-        .detach();
+    reservation.spawn(async move {
+        promise::spawn::sleep(duration).await;
+        dispatch_lua_timer_callback(callback).await;
+    });
 
     Ok(())
 }
@@ -1147,7 +1254,331 @@ pub fn add_to_config_reload_watch_list(lua: &Lua, args: Variadic<String>) -> mlu
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Instant;
+
+    fn timer_test_executor() -> promise::spawn::SimpleExecutor {
+        let limits = promise::spawn::MainThreadAdmissionLimits::new(
+            1,
+            TIME_CALL_AFTER_TASK_ESTIMATED_BYTES * 2,
+            0,
+            0,
+        )
+        .expect("timer test scheduler limits are valid");
+        promise::spawn::SimpleExecutor::try_with_limits(limits)
+            .expect("timer test scheduler identity is available")
+    }
+
+    fn drive_timer_executor_until<T>(
+        executor: &promise::spawn::SimpleExecutor,
+        receiver: &mpsc::Receiver<T>,
+    ) -> anyhow::Result<Option<T>> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match receiver.try_recv() {
+                Ok(value) => return Ok(Some(value)),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("timer callback result channel disconnected before delivery")
+                }
+            }
+            while executor.try_tick()? {}
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn wait_for_timer_queue_depth(
+        executor: &promise::spawn::SimpleExecutor,
+        expected_depth: usize,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if executor.queue_snapshot().depth == expected_depth {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn time_call_after_duration_validation_has_no_finite_overflow_panic() {
+        assert_eq!(
+            lua_time_call_after_duration(0.0).expect("zero is a valid delay"),
+            Duration::ZERO
+        );
+        assert!(lua_time_call_after_duration(-1.0).is_err());
+        assert!(lua_time_call_after_duration(f64::NAN).is_err());
+        assert!(lua_time_call_after_duration(f64::INFINITY).is_err());
+
+        let oversized_but_finite = f64::MAX;
+        let result =
+            std::panic::catch_unwind(|| lua_time_call_after_duration(oversized_but_finite));
+        assert!(
+            result.is_ok(),
+            "finite Lua input must never reach Duration::from_secs_f64's panic path"
+        );
+        assert!(
+            result.expect("duration conversion did not panic").is_err(),
+            "an unrepresentable finite delay must be rejected"
+        );
+
+        let exceeds_canonical_timer = TIME_CALL_AFTER_MAX_DURATION.as_secs_f64() * 2.0;
+        assert!(
+            lua_time_call_after_duration(exceeds_canonical_timer).is_err(),
+            "a delay that the canonical timer would saturate must be rejected"
+        );
+    }
+
+    #[test]
+    fn time_call_after_admission_retry_is_bounded_exponential_backoff() {
+        assert_eq!(
+            lua_timer_admission_retry_delay(1),
+            TIME_CALL_AFTER_INITIAL_ADMISSION_RETRY
+        );
+        assert_eq!(
+            lua_timer_admission_retry_delay(2),
+            TIME_CALL_AFTER_INITIAL_ADMISSION_RETRY * 2
+        );
+        assert_eq!(
+            lua_timer_admission_retry_delay(u32::MAX),
+            TIME_CALL_AFTER_MAX_ADMISSION_RETRY
+        );
+    }
+
+    #[test]
+    fn time_call_after_retains_callback_across_transient_main_admission_rejection(
+    ) -> anyhow::Result<()> {
+        let _env = crate::test_env_lock();
+        let executor = timer_test_executor();
+        let blocker = match promise::spawn::try_reserve_main_thread_with_low_priority(
+            promise::spawn::MainThreadServiceClass::Background,
+            TIME_CALL_AFTER_TASK_ESTIMATED_BYTES,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => anyhow::bail!("failed to plant full main-thread admission: {outcome:?}"),
+        };
+
+        let lua = make_lua_context(Path::new("testing"))?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let callback = lua.create_function(move |_, ()| {
+            let _ = sender.try_send(());
+            Ok(())
+        })?;
+        lua_time_call_after(&lua, (0.0, callback))?;
+
+        // The background owner may wake, but the planted reservation is the
+        // only main-thread slot, so the callback cannot have run yet.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(blocker);
+        assert!(
+            drive_timer_executor_until(&executor, &receiver)?.is_some(),
+            "the still-owned callback must run after transient pressure clears"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn time_call_after_retries_when_admitted_generation_retires_before_poll() -> anyhow::Result<()>
+    {
+        let _env = crate::test_env_lock();
+        let old_executor = timer_test_executor();
+        let lua = make_lua_context(Path::new("testing"))?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let callback = lua.create_function(move |_, ()| {
+            let _ = sender.try_send(());
+            Ok(())
+        })?;
+        lua_time_call_after(&lua, (0.0, callback))?;
+
+        let queued_on_old_generation = wait_for_timer_queue_depth(&old_executor, 1);
+        let new_executor = timer_test_executor();
+        drop(old_executor);
+
+        assert!(
+            queued_on_old_generation,
+            "test must plant admission and enqueue on the retiring generation"
+        );
+        assert!(
+            drive_timer_executor_until(&new_executor, &receiver)?.is_some(),
+            "callback authority must return to the background owner and retry on the replacement generation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn time_call_after_successor_survives_parent_callback_admission() -> anyhow::Result<()> {
+        let _env = crate::test_env_lock();
+        let executor = timer_test_executor();
+        crate::designate_this_as_the_main_thread();
+        crate::run_immediate_with_lua_config(|_| Ok(()))?;
+
+        let lua = make_lua_context(Path::new("testing"))?;
+        crate::LUA_PIPE
+            .sender
+            .try_send(lua.clone())
+            .map_err(|err| anyhow!("failed to publish timer-chain Lua test context: {err}"))?;
+        crate::run_immediate_with_lua_config(|_| Ok(()))?;
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        lua.globals().set(
+            "record_timer_chain_completion",
+            lua.create_function(move |_, ()| {
+                let _ = sender.try_send(());
+                Ok(())
+            })?,
+        )?;
+        let first_callback: mlua::Function = lua
+            .load(
+                r#"
+local frankenterm = require 'frankenterm'
+return function()
+  frankenterm.time.call_after(0, function()
+    record_timer_chain_completion()
+  end)
+end
+"#,
+            )
+            .eval()?;
+
+        lua_time_call_after(&lua, (0.0, first_callback))?;
+        assert!(
+            drive_timer_executor_until(&executor, &receiver)?.is_some(),
+            "a callback holding the only main-thread slot must durably hand off its successor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn time_call_after_dispatches_against_its_origin_lua_after_reload() -> anyhow::Result<()> {
+        let _env = crate::test_env_lock();
+        let executor = timer_test_executor();
+        crate::designate_this_as_the_main_thread();
+        crate::run_immediate_with_lua_config(|_| Ok(()))?;
+
+        let origin = make_lua_context(Path::new("origin.lua"))?;
+        origin.set_named_registry_value("timer-generation-marker", "origin")?;
+        let replacement = make_lua_context(Path::new("replacement.lua"))?;
+        replacement.set_named_registry_value("timer-generation-marker", "replacement")?;
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let callback = origin.create_function(move |lua, ()| {
+            let marker: String = lua.named_registry_value("timer-generation-marker")?;
+            let _ = sender.try_send(marker);
+            Ok(())
+        })?;
+        lua_time_call_after(&origin, (0.0, callback))?;
+
+        // Publish a replacement before the timer is allowed to fire. The old
+        // implementation fetched the origin registry key from this newest Lua
+        // and silently lost the callback.
+        crate::LUA_PIPE
+            .sender
+            .try_send(replacement)
+            .map_err(|err| anyhow!("failed to publish replacement Lua test context: {err}"))?;
+        drop(origin);
+
+        let marker = drive_timer_executor_until(&executor, &receiver)?
+            .context("origin-generation timer callback did not run")?;
+        assert_eq!(marker, "origin");
+
+        let latest_marker = crate::run_immediate_with_lua_config(|lua| {
+            let lua = lua.context("replacement Lua was not published")?;
+            Ok(lua.named_registry_value::<String>("timer-generation-marker")?)
+        })?;
+        assert_eq!(latest_marker, "replacement");
+        Ok(())
+    }
+
+    #[test]
+    fn time_call_after_origin_chain_survives_reloads_once_without_multiplication(
+    ) -> anyhow::Result<()> {
+        let _env = crate::test_env_lock();
+        let executor = timer_test_executor();
+        crate::designate_this_as_the_main_thread();
+        crate::run_immediate_with_lua_config(|_| Ok(()))?;
+
+        let origin = make_lua_context(Path::new("origin-chain.lua"))?;
+        origin.globals().set("timer_generation_marker", "origin")?;
+        let (sender, receiver) = mpsc::sync_channel(4);
+        origin.globals().set(
+            "record_timer_chain_generation",
+            origin.create_function(move |_, marker: String| {
+                let _ = sender.try_send(marker);
+                Ok(())
+            })?,
+        )?;
+        let first_callback: mlua::Function = origin
+            .load(
+                r#"
+local frankenterm = require 'frankenterm'
+return function()
+  record_timer_chain_generation(timer_generation_marker)
+  frankenterm.time.call_after(0, function()
+    record_timer_chain_generation(timer_generation_marker)
+  end)
+end
+"#,
+            )
+            .eval()?;
+        lua_time_call_after(&origin, (0.0, first_callback))?;
+
+        for (path, marker) in [
+            ("replacement-chain-1.lua", "replacement-1"),
+            ("replacement-chain-2.lua", "replacement-2"),
+        ] {
+            let replacement = make_lua_context(Path::new(path))?;
+            replacement
+                .globals()
+                .set("timer_generation_marker", marker)?;
+            crate::LUA_PIPE
+                .sender
+                .try_send(replacement)
+                .map_err(|err| anyhow!("failed to publish {marker} Lua test context: {err}"))?;
+        }
+        drop(origin);
+
+        let first = drive_timer_executor_until(&executor, &receiver)?
+            .context("origin callback was silently lost across reload publications")?;
+        let successor = drive_timer_executor_until(&executor, &receiver)?
+            .context("origin callback failed to hand off its sole successor")?;
+        assert_eq!((first.as_str(), successor.as_str()), ("origin", "origin"));
+
+        // Continue pumping after both expected deliveries. Reload publication
+        // must not clone or restart the old chain behind our back.
+        let quiet_deadline = Instant::now() + Duration::from_millis(100);
+        let mut duplicate = None;
+        while Instant::now() < quiet_deadline {
+            while executor.try_tick()? {}
+            match receiver.try_recv() {
+                Ok(marker) => {
+                    duplicate = Some(marker);
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(duplicate, None, "reload multiplied the origin timer chain");
+
+        let latest_marker = crate::run_immediate_with_lua_config(|lua| {
+            let lua = lua.context("latest replacement Lua was not published")?;
+            Ok(lua.globals().get::<String>("timer_generation_marker")?)
+        })?;
+        assert_eq!(latest_marker, "replacement-2");
+        Ok(())
+    }
 
     /// GH#76: `require` from frankenterm.lua must resolve modules in the
     /// FrankenTerm-namespaced config dirs before any wezterm-namespaced
