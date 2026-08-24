@@ -2204,7 +2204,10 @@ impl LiveScrollbackSpillSink {
             "append WAL predecessor epoch",
         )?;
         let schema_matches = (wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1
-            && manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3)
+            && matches!(
+                manifest.schema.as_str(),
+                LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 | LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
+            ))
             || (wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
                 && manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
         let chain_matches = if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 {
@@ -2225,6 +2228,7 @@ impl LiveScrollbackSpillSink {
             true
         };
         Ok(schema_matches
+            && live_scrollback_manifest_is_authenticated(manifest)
             && manifest.publication_state == "complete"
             && live_scrollback_manifest_generation(manifest)?
                 == Some((target_epoch, wal.target_revision))
@@ -2242,6 +2246,36 @@ impl LiveScrollbackSpillSink {
             && manifest.next_seq == wal.target_next_sequence
             && manifest.retained_record_bytes == Some(wal.target_retained_record_bytes)
             && chain_matches)
+    }
+
+    fn append_wal_is_v1_to_v4_target_migration(
+        wal: &LiveScrollbackAppendWalV1,
+        manifest: &LiveScrollbackManifestV1,
+    ) -> bool {
+        wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1
+            && manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
+    }
+
+    /// A recovered v1 WAL may be republished as a v4 manifest for the same
+    /// generation. Accept that one-time schema migration only after proving
+    /// both durable commitments over the exact same store: the v1 target-set
+    /// digest and the v4 incremental chain. Ordinary v2/v4 steady-state
+    /// acceptance deliberately does not call this full-scan verifier.
+    fn verify_v1_append_wal_v4_target_migration(
+        wal: &LiveScrollbackAppendWalV1,
+        manifest: &LiveScrollbackManifestV1,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Self::append_wal_is_v1_to_v4_target_migration(wal, manifest)
+                && Self::append_wal_matches_target_manifest(wal, manifest)?,
+            "append WAL is not an exact v1-to-v4 target migration"
+        );
+        Self::verify_append_wal_target_store(wal, store)
+            .context("verify v1 target-set digest during v4 migration")?;
+        Self::verify_logical_ledger_digest_from_store(manifest, wal.ledger_pane_id, store)
+            .context("verify v4 incremental chain during v1 WAL migration")?;
+        Ok(())
     }
 
     fn append_wal_supersession_matches_manifest(
@@ -2388,13 +2422,17 @@ impl LiveScrollbackSpillSink {
         Self::authenticate_append_wal(wal, keyring)?;
 
         if Self::append_wal_matches_target_manifest(wal, manifest)? {
-            Self::verify_append_wal_target_store(wal, store)?;
-            Self::verify_logical_ledger_digest_from_store(
-                manifest,
-                wal.ledger_pane_id,
-                store,
-            )
-            .context("bind consumed append WAL to its authenticated target manifest")?;
+            if Self::append_wal_is_v1_to_v4_target_migration(wal, manifest) {
+                Self::verify_v1_append_wal_v4_target_migration(wal, manifest, store)?;
+            } else {
+                Self::verify_append_wal_target_store(wal, store)?;
+                Self::verify_logical_ledger_digest_from_store(
+                    manifest,
+                    wal.ledger_pane_id,
+                    store,
+                )
+                .context("bind consumed append WAL to its authenticated target manifest")?;
+            }
             return Ok(None);
         }
         if Self::append_wal_supersession_matches_manifest(wal, manifest)?
@@ -2677,7 +2715,15 @@ impl LiveScrollbackSpillSink {
                     let store = self
                         .lock_store("replace consumed append WAL target")
                         .map_err(anyhow::Error::new)?;
-                    Self::verify_append_wal_target_store(&active, &store)?;
+                    if Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
+                        Self::verify_v1_append_wal_v4_target_migration(
+                            &active,
+                            &manifest,
+                            &store,
+                        )?;
+                    } else {
+                        Self::verify_append_wal_target_store(&active, &store)?;
+                    }
                     if active.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 {
                         let authority = Self::v2_append_wal_target_authority(&active)?;
                         anyhow::ensure!(
@@ -2686,7 +2732,10 @@ impl LiveScrollbackSpillSink {
                                     == (authority.chain_anchor, authority.chain_tail),
                             "consumed v2 append WAL disagrees with its published v4 authority"
                         );
-                    } else {
+                    } else if !Self::append_wal_is_v1_to_v4_target_migration(
+                        &active,
+                        &manifest,
+                    ) {
                         Self::verify_logical_ledger_digest_from_store(
                             &manifest,
                             active.ledger_pane_id,
@@ -2878,15 +2927,26 @@ impl LiveScrollbackSpillSink {
                 "append WAL supersession requires an authenticated manifest"
             );
         }
-        if Self::append_wal_matches_target_manifest(&active, &manifest)?
-            || Self::append_wal_supersession_matches_manifest(&active, &manifest)?
-        {
+        let matches_target = Self::append_wal_matches_target_manifest(&active, &manifest)?;
+        let v1_to_v4_target = matches_target
+            && Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest);
+        if matches_target && !v1_to_v4_target {
             return Ok(());
         }
-        anyhow::ensure!(
-            Self::append_wal_is_immediately_superseded_by_manifest(&active, &manifest)?,
-            "retained append WAL is not linked to the current manifest"
-        );
+        if Self::append_wal_supersession_matches_manifest(&active, &manifest)? {
+            return Ok(());
+        }
+        if v1_to_v4_target {
+            let store = self
+                .lock_store("advance v1 append WAL v4 target migration")
+                .map_err(anyhow::Error::new)?;
+            Self::verify_v1_append_wal_v4_target_migration(&active, &manifest, &store)?;
+        } else {
+            anyhow::ensure!(
+                Self::append_wal_is_immediately_superseded_by_manifest(&active, &manifest)?,
+                "retained append WAL is not linked to the current manifest"
+            );
+        }
 
         let (content_epoch, revision) = live_scrollback_manifest_generation(&manifest)?
             .ok_or_else(|| anyhow::anyhow!("superseding manifest has no generation"))?;
@@ -3467,6 +3527,15 @@ impl LiveScrollbackSpillSink {
                 .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
             Self::validate_append_wal_identity(wal, context.durable_pane_id)?;
             Self::authenticate_append_wal(wal, &keyring_guard)?;
+            if Self::append_wal_is_v1_to_v4_target_migration(wal, published_manifest)
+                && Self::append_wal_matches_target_manifest(wal, published_manifest)?
+            {
+                Self::verify_v1_append_wal_v4_target_migration(
+                    wal,
+                    published_manifest,
+                    &store,
+                )?;
+            }
             anyhow::ensure!(
                 Self::append_wal_matches_predecessor_manifest(wal, published_manifest)?
                     || Self::append_wal_is_consumed_or_superseded(
@@ -3706,18 +3775,44 @@ impl LiveScrollbackSpillSink {
                         .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
                     Self::validate_append_wal_identity(&staged_wal, context.durable_pane_id)?;
                     Self::authenticate_append_wal(&staged_wal, &keyring_guard)?;
+                    if Self::append_wal_is_v1_to_v4_target_migration(
+                        &staged_wal,
+                        published_manifest,
+                    ) && Self::append_wal_matches_target_manifest(
+                        &staged_wal,
+                        published_manifest,
+                    )? {
+                        Self::verify_v1_append_wal_v4_target_migration(
+                            &staged_wal,
+                            published_manifest,
+                            &store,
+                        )?;
+                    }
                     if let Some(active_wal) = active_append_wal.as_ref() {
                         if Self::append_wal_matches_target_manifest(
                             active_wal,
                             published_manifest,
                         )? {
-                            Self::verify_append_wal_target_store(active_wal, &store)?;
-                            Self::verify_logical_ledger_digest_from_store(
+                            if Self::append_wal_is_v1_to_v4_target_migration(
+                                active_wal,
                                 published_manifest,
-                                active_wal.ledger_pane_id,
-                                &store,
-                            )
-                            .context("bind consumed append WAL before staged successor recovery")?;
+                            ) {
+                                Self::verify_v1_append_wal_v4_target_migration(
+                                    active_wal,
+                                    published_manifest,
+                                    &store,
+                                )?;
+                            } else {
+                                Self::verify_append_wal_target_store(active_wal, &store)?;
+                                Self::verify_logical_ledger_digest_from_store(
+                                    published_manifest,
+                                    active_wal.ledger_pane_id,
+                                    &store,
+                                )
+                                .context(
+                                    "bind consumed append WAL before staged successor recovery",
+                                )?;
+                            }
                         } else {
                             anyhow::ensure!(
                                 Self::append_wal_supersession_matches_manifest(

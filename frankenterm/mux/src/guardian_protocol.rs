@@ -90,7 +90,7 @@ const CHECKPOINT_STAGE_REPLY_BYTES: usize = 100;
 const REPLAY_CURSOR_BYTES: usize = 160;
 const REPLAY_OPEN_REQUEST_BYTES: usize = 92;
 const REPLAY_CONTINUE_REQUEST_BYTES: usize = 8 + REPLAY_CURSOR_BYTES;
-const REPLAY_ACK_BYTES: usize = 164;
+const REPLAY_ACK_BYTES: usize = 168;
 const REPLAY_ACK_REPLY_BYTES: usize = 132;
 const REPLAY_PAGE_HEADER_BYTES: usize = 316;
 const REPLAY_PAGE_DIGEST_OFFSET: usize = 120;
@@ -1878,6 +1878,686 @@ impl GuardianCheckpointStageReplyV1 {
             | Self::Progress { upload_id, .. }
             | Self::Sealed { upload_id, .. } => upload_id,
         }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianReplayPhaseV1 {
+    Checkpoint = 1,
+    Output = 2,
+}
+
+impl GuardianReplayPhaseV1 {
+    fn from_wire(value: u8) -> Result<Self, GuardianProtocolError> {
+        match value {
+            1 => Ok(Self::Checkpoint),
+            2 => Ok(Self::Output),
+            _ => Err(GuardianProtocolError::InvalidOperationPayload),
+        }
+    }
+}
+
+/// Authenticated continuation for one immutable replay snapshot. The digest
+/// covers every cursor field and the negotiated page bounds, preventing a
+/// cursor from being retargeted to a different snapshot or resource budget.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianReplayCursorV1 {
+    snapshot_id: Uuid,
+    snapshot_digest: [u8; 32],
+    phase: GuardianReplayPhaseV1,
+    page_index: u32,
+    checkpoint_offset: u64,
+    next_sequence: u64,
+    previous_record_digest: [u8; 32],
+    compaction_generation: u64,
+    max_plaintext_bytes: u32,
+    max_records: u16,
+    cursor_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for GuardianReplayCursorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianReplayCursorV1")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("phase", &self.phase)
+            .field("page_index", &self.page_index)
+            .field("checkpoint_offset", &self.checkpoint_offset)
+            .field("next_sequence", &self.next_sequence)
+            .field("compaction_generation", &self.compaction_generation)
+            .field("max_plaintext_bytes", &self.max_plaintext_bytes)
+            .field("max_records", &self.max_records)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianReplayCursorV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        snapshot_id: Uuid,
+        snapshot_digest: [u8; 32],
+        phase: GuardianReplayPhaseV1,
+        page_index: u32,
+        checkpoint_offset: u64,
+        next_sequence: u64,
+        previous_record_digest: [u8; 32],
+        compaction_generation: u64,
+        max_plaintext_bytes: u32,
+        max_records: u16,
+    ) -> Result<Self, GuardianProtocolError> {
+        let mut cursor = Self {
+            snapshot_id,
+            snapshot_digest,
+            phase,
+            page_index,
+            checkpoint_offset,
+            next_sequence,
+            previous_record_digest,
+            compaction_generation,
+            max_plaintext_bytes,
+            max_records,
+            cursor_digest: [0; 32],
+        };
+        cursor.validate_fields()?;
+        cursor.cursor_digest = cursor.compute_digest();
+        Ok(cursor)
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(self) -> Uuid {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn snapshot_digest(self) -> [u8; 32] {
+        self.snapshot_digest
+    }
+
+    #[must_use]
+    pub const fn phase(self) -> GuardianReplayPhaseV1 {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn page_index(self) -> u32 {
+        self.page_index
+    }
+
+    #[must_use]
+    pub const fn checkpoint_offset(self) -> u64 {
+        self.checkpoint_offset
+    }
+
+    #[must_use]
+    pub const fn next_sequence(self) -> u64 {
+        self.next_sequence
+    }
+
+    #[must_use]
+    pub const fn previous_record_digest(self) -> [u8; 32] {
+        self.previous_record_digest
+    }
+
+    #[must_use]
+    pub const fn compaction_generation(self) -> u64 {
+        self.compaction_generation
+    }
+
+    #[must_use]
+    pub const fn max_plaintext_bytes(self) -> u32 {
+        self.max_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn max_records(self) -> u16 {
+        self.max_records
+    }
+
+    #[must_use]
+    pub const fn digest(self) -> [u8; 32] {
+        self.cursor_digest
+    }
+
+    fn encode(self) -> [u8; REPLAY_CURSOR_BYTES] {
+        let mut payload = self.encode_prefix();
+        payload[128..160].copy_from_slice(&self.cursor_digest);
+        payload
+    }
+
+    fn encode_prefix(self) -> [u8; REPLAY_CURSOR_BYTES] {
+        let mut payload = [0; REPLAY_CURSOR_BYTES];
+        payload[..16].copy_from_slice(self.snapshot_id.as_bytes());
+        payload[16..48].copy_from_slice(&self.snapshot_digest);
+        payload[48] = self.phase as u8;
+        payload[56..60].copy_from_slice(&self.page_index.to_be_bytes());
+        payload[64..72].copy_from_slice(&self.checkpoint_offset.to_be_bytes());
+        payload[72..80].copy_from_slice(&self.next_sequence.to_be_bytes());
+        payload[80..112].copy_from_slice(&self.previous_record_digest);
+        payload[112..120].copy_from_slice(&self.compaction_generation.to_be_bytes());
+        payload[120..124].copy_from_slice(&self.max_plaintext_bytes.to_be_bytes());
+        payload[124..126].copy_from_slice(&self.max_records.to_be_bytes());
+        payload
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != REPLAY_CURSOR_BYTES
+            || payload[49..56].iter().any(|byte| *byte != 0)
+            || payload[60..64].iter().any(|byte| *byte != 0)
+            || payload[126..128].iter().any(|byte| *byte != 0)
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let mut snapshot_digest = [0; 32];
+        snapshot_digest.copy_from_slice(&payload[16..48]);
+        let mut previous_record_digest = [0; 32];
+        previous_record_digest.copy_from_slice(&payload[80..112]);
+        let mut cursor_digest = [0; 32];
+        cursor_digest.copy_from_slice(&payload[128..160]);
+        let cursor = Self {
+            snapshot_id: read_required_uuid(payload, 0)?,
+            snapshot_digest,
+            phase: GuardianReplayPhaseV1::from_wire(payload[48])?,
+            page_index: read_u32(payload, 56)?,
+            checkpoint_offset: read_u64(payload, 64)?,
+            next_sequence: read_u64(payload, 72)?,
+            previous_record_digest,
+            compaction_generation: read_u64(payload, 112)?,
+            max_plaintext_bytes: read_u32(payload, 120)?,
+            max_records: read_u16(payload, 124)?,
+            cursor_digest,
+        };
+        cursor.validate_fields()?;
+        if cursor.compute_digest() != cursor.cursor_digest {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        Ok(cursor)
+    }
+
+    fn validate_fields(self) -> Result<(), GuardianProtocolError> {
+        let previous_is_zero = digest_is_zero(self.previous_record_digest);
+        if self.snapshot_id.is_nil()
+            || digest_is_zero(self.snapshot_digest)
+            || self.next_sequence == 0
+            || self.max_plaintext_bytes == 0
+            || self.max_plaintext_bytes > GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES
+            || self.max_records == 0
+            || self.max_records > GUARDIAN_MAX_REPLAY_RECORDS
+            || (self.next_sequence == 1) != previous_is_zero
+            || (self.phase == GuardianReplayPhaseV1::Output && self.checkpoint_offset != 0)
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        Ok(())
+    }
+
+    fn compute_digest(self) -> [u8; 32] {
+        let prefix = self.encode_prefix();
+        let mut hasher = Sha256::new();
+        hasher.update(REPLAY_CURSOR_DIGEST_DOMAIN);
+        hasher.update(&prefix[..128]);
+        hasher.finalize().into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianReplaySelectorV1 {
+    LatestCompatible,
+    ExactCheckpoint {
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+    },
+    Resume {
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        next_sequence: u64,
+        previous_record_digest: [u8; 32],
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianReplayRequestV1 {
+    Open {
+        selector: GuardianReplaySelectorV1,
+        max_plaintext_bytes: u32,
+        max_records: u16,
+        wait_millis: u16,
+    },
+    Continue {
+        cursor: GuardianReplayCursorV1,
+    },
+}
+
+impl GuardianReplayRequestV1 {
+    pub fn encode(self) -> Result<Vec<u8>, GuardianProtocolError> {
+        self.validate()?;
+        let mut payload = match self {
+            Self::Open { .. } => Vec::with_capacity(REPLAY_OPEN_REQUEST_BYTES),
+            Self::Continue { .. } => Vec::with_capacity(REPLAY_CONTINUE_REQUEST_BYTES),
+        };
+        payload.extend_from_slice(&REPLAY_REQUEST_PAYLOAD_MAGIC);
+        payload.extend_from_slice(&REPLAY_WIRE_VERSION.to_be_bytes());
+        match self {
+            Self::Open {
+                selector,
+                max_plaintext_bytes,
+                max_records,
+                wait_millis,
+            } => {
+                payload.push(1);
+                payload.push(match selector {
+                    GuardianReplaySelectorV1::LatestCompatible => 1,
+                    GuardianReplaySelectorV1::ExactCheckpoint { .. } => 2,
+                    GuardianReplaySelectorV1::Resume { .. } => 3,
+                });
+                payload.extend_from_slice(&max_plaintext_bytes.to_be_bytes());
+                payload.extend_from_slice(&max_records.to_be_bytes());
+                payload.extend_from_slice(&wait_millis.to_be_bytes());
+                match selector {
+                    GuardianReplaySelectorV1::LatestCompatible => {
+                        payload.extend_from_slice(&[0; 72]);
+                    }
+                    GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id } => {
+                        payload.extend_from_slice(&checkpoint_id.0);
+                        payload.extend_from_slice(&[0; 40]);
+                    }
+                    GuardianReplaySelectorV1::Resume {
+                        checkpoint_id,
+                        next_sequence,
+                        previous_record_digest,
+                    } => {
+                        payload.extend_from_slice(&checkpoint_id.0);
+                        payload.extend_from_slice(&next_sequence.to_be_bytes());
+                        payload.extend_from_slice(&previous_record_digest);
+                    }
+                }
+                payload.extend_from_slice(&[0; 4]);
+            }
+            Self::Continue { cursor } => {
+                payload.push(2);
+                payload.push(0);
+                payload.extend_from_slice(&cursor.encode());
+            }
+        }
+        let expected = match self {
+            Self::Open { .. } => REPLAY_OPEN_REQUEST_BYTES,
+            Self::Continue { .. } => REPLAY_CONTINUE_REQUEST_BYTES,
+        };
+        if payload.len() != expected {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "replay-request-encoded-size",
+            ));
+        }
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() < 8
+            || payload.get(..4) != Some(REPLAY_REQUEST_PAYLOAD_MAGIC.as_slice())
+            || read_u16(payload, 4)? != REPLAY_WIRE_VERSION
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let request = match payload[6] {
+            1 if payload.len() == REPLAY_OPEN_REQUEST_BYTES => {
+                if payload[88..92].iter().any(|byte| *byte != 0) {
+                    return Err(GuardianProtocolError::InvalidOperationPayload);
+                }
+                let max_plaintext_bytes = read_u32(payload, 8)?;
+                let max_records = read_u16(payload, 12)?;
+                let wait_millis = read_u16(payload, 14)?;
+                let mut checkpoint_id = [0; 32];
+                checkpoint_id.copy_from_slice(&payload[16..48]);
+                let next_sequence = read_u64(payload, 48)?;
+                let mut previous_record_digest = [0; 32];
+                previous_record_digest.copy_from_slice(&payload[56..88]);
+                let selector = match payload[7] {
+                    1 if digest_is_zero(checkpoint_id)
+                        && next_sequence == 0
+                        && digest_is_zero(previous_record_digest) =>
+                    {
+                        GuardianReplaySelectorV1::LatestCompatible
+                    }
+                    2 if next_sequence == 0 && digest_is_zero(previous_record_digest) => {
+                        GuardianReplaySelectorV1::ExactCheckpoint {
+                            checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(
+                                checkpoint_id,
+                            )
+                            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
+                        }
+                    }
+                    3 => GuardianReplaySelectorV1::Resume {
+                        checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
+                            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
+                        next_sequence,
+                        previous_record_digest,
+                    },
+                    _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+                };
+                Self::Open {
+                    selector,
+                    max_plaintext_bytes,
+                    max_records,
+                    wait_millis,
+                }
+            }
+            2 if payload.len() == REPLAY_CONTINUE_REQUEST_BYTES && payload[7] == 0 => {
+                Self::Continue {
+                    cursor: GuardianReplayCursorV1::decode(&payload[8..])?,
+                }
+            }
+            _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(self) -> Result<(), GuardianProtocolError> {
+        match self {
+            Self::Open {
+                selector,
+                max_plaintext_bytes,
+                max_records,
+                wait_millis,
+            } => {
+                if max_plaintext_bytes == 0
+                    || max_plaintext_bytes > GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES
+                    || max_records == 0
+                    || max_records > GUARDIAN_MAX_REPLAY_RECORDS
+                    || wait_millis > GUARDIAN_MAX_REPLAY_WAIT_MILLIS
+                {
+                    return Err(GuardianProtocolError::InvalidOperationPayload);
+                }
+                if let GuardianReplaySelectorV1::Resume {
+                    next_sequence,
+                    previous_record_digest,
+                    ..
+                } = selector
+                {
+                    if next_sequence == 0
+                        || (next_sequence == 1) != digest_is_zero(previous_record_digest)
+                    {
+                        return Err(GuardianProtocolError::InvalidOperationPayload);
+                    }
+                }
+                Ok(())
+            }
+            Self::Continue { cursor } => {
+                cursor.validate_fields()?;
+                if cursor.compute_digest() != cursor.cursor_digest {
+                    return Err(GuardianProtocolError::InvalidOperationPayload);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn incoming_cursor(self) -> Option<GuardianReplayCursorV1> {
+        match self {
+            Self::Open { .. } => None,
+            Self::Continue { cursor } => Some(cursor),
+        }
+    }
+
+    #[must_use]
+    pub const fn limits(self) -> (u32, u16) {
+        match self {
+            Self::Open {
+                max_plaintext_bytes,
+                max_records,
+                ..
+            } => (max_plaintext_bytes, max_records),
+            Self::Continue { cursor } => (cursor.max_plaintext_bytes, cursor.max_records),
+        }
+    }
+}
+
+/// Cumulative acknowledgement for the one page currently outstanding in a
+/// replay snapshot. It cannot authorize compaction or retention advancement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianReplayAckV1 {
+    snapshot_id: Uuid,
+    snapshot_digest: [u8; 32],
+    page_index: u32,
+    page_digest: [u8; 32],
+    next_cursor_digest: Option<[u8; 32]>,
+    through_sequence: u64,
+    through_record_digest: [u8; 32],
+    release_if_complete: bool,
+}
+
+impl GuardianReplayAckV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        snapshot_id: Uuid,
+        snapshot_digest: [u8; 32],
+        page_index: u32,
+        page_digest: [u8; 32],
+        next_cursor_digest: Option<[u8; 32]>,
+        through_sequence: u64,
+        through_record_digest: [u8; 32],
+        release_if_complete: bool,
+    ) -> Result<Self, GuardianProtocolError> {
+        let ack = Self {
+            snapshot_id,
+            snapshot_digest,
+            page_index,
+            page_digest,
+            next_cursor_digest,
+            through_sequence,
+            through_record_digest,
+            release_if_complete,
+        };
+        ack.validate(GuardianProtocolError::InvalidOperationPayload)?;
+        Ok(ack)
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(self) -> Uuid {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn snapshot_digest(self) -> [u8; 32] {
+        self.snapshot_digest
+    }
+
+    #[must_use]
+    pub const fn page_index(self) -> u32 {
+        self.page_index
+    }
+
+    #[must_use]
+    pub const fn page_digest(self) -> [u8; 32] {
+        self.page_digest
+    }
+
+    #[must_use]
+    pub const fn next_cursor_digest(self) -> Option<[u8; 32]> {
+        self.next_cursor_digest
+    }
+
+    #[must_use]
+    pub const fn through_sequence(self) -> u64 {
+        self.through_sequence
+    }
+
+    #[must_use]
+    pub const fn through_record_digest(self) -> [u8; 32] {
+        self.through_record_digest
+    }
+
+    #[must_use]
+    pub const fn release_if_complete(self) -> bool {
+        self.release_if_complete
+    }
+
+    pub fn encode(self) -> Result<[u8; REPLAY_ACK_BYTES], GuardianProtocolError> {
+        self.validate(GuardianProtocolError::InvalidOperationPayload)?;
+        let mut payload = [0; REPLAY_ACK_BYTES];
+        payload[..4].copy_from_slice(&REPLAY_ACK_PAYLOAD_MAGIC);
+        payload[4..6].copy_from_slice(&REPLAY_WIRE_VERSION.to_be_bytes());
+        payload[6] = u8::from(self.release_if_complete);
+        payload[8..24].copy_from_slice(self.snapshot_id.as_bytes());
+        payload[24..56].copy_from_slice(&self.snapshot_digest);
+        payload[56..60].copy_from_slice(&self.page_index.to_be_bytes());
+        payload[60..92].copy_from_slice(&self.page_digest);
+        if let Some(digest) = self.next_cursor_digest {
+            payload[92] = 1;
+            payload[96..128].copy_from_slice(&digest);
+        }
+        payload[128..136].copy_from_slice(&self.through_sequence.to_be_bytes());
+        payload[136..168].copy_from_slice(&self.through_record_digest);
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != REPLAY_ACK_BYTES
+            || payload.get(..4) != Some(REPLAY_ACK_PAYLOAD_MAGIC.as_slice())
+            || read_u16(payload, 4)? != REPLAY_WIRE_VERSION
+            || payload[6] > 1
+            || payload[7] != 0
+            || payload[93..96].iter().any(|byte| *byte != 0)
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let mut snapshot_digest = [0; 32];
+        snapshot_digest.copy_from_slice(&payload[24..56]);
+        let mut page_digest = [0; 32];
+        page_digest.copy_from_slice(&payload[60..92]);
+        let next_cursor_digest = match payload[92] {
+            0 if payload[96..128].iter().all(|byte| *byte == 0) => None,
+            1 => {
+                let mut digest = [0; 32];
+                digest.copy_from_slice(&payload[96..128]);
+                Some(digest)
+            }
+            _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+        };
+        let mut through_record_digest = [0; 32];
+        through_record_digest.copy_from_slice(&payload[136..168]);
+        let ack = Self {
+            snapshot_id: read_required_uuid(payload, 8)?,
+            snapshot_digest,
+            page_index: read_u32(payload, 56)?,
+            page_digest,
+            next_cursor_digest,
+            through_sequence: read_u64(payload, 128)?,
+            through_record_digest,
+            release_if_complete: payload[6] == 1,
+        };
+        ack.validate(GuardianProtocolError::InvalidOperationPayload)?;
+        Ok(ack)
+    }
+
+    fn validate(self, error: GuardianProtocolError) -> Result<(), GuardianProtocolError> {
+        let through_digest_is_zero = digest_is_zero(self.through_record_digest);
+        if self.snapshot_id.is_nil()
+            || digest_is_zero(self.snapshot_digest)
+            || digest_is_zero(self.page_digest)
+            || self
+                .next_cursor_digest
+                .is_some_and(digest_is_zero)
+            || (self.through_sequence == 0) != through_digest_is_zero
+            || (self.release_if_complete && self.next_cursor_digest.is_some())
+        {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianReplayAckReceiptV1 {
+    snapshot_id: Uuid,
+    page_index: u32,
+    page_digest: [u8; 32],
+    through_sequence: u64,
+    through_record_digest: [u8; 32],
+}
+
+impl GuardianReplayAckReceiptV1 {
+    pub fn from_ack(ack: GuardianReplayAckV1) -> Self {
+        Self {
+            snapshot_id: ack.snapshot_id,
+            page_index: ack.page_index,
+            page_digest: ack.page_digest,
+            through_sequence: ack.through_sequence,
+            through_record_digest: ack.through_record_digest,
+        }
+    }
+
+    fn encode(self) -> Result<[u8; REPLAY_ACK_REPLY_BYTES], GuardianProtocolError> {
+        self.validate()?;
+        let mut payload = [0; REPLAY_ACK_REPLY_BYTES];
+        payload[..4].copy_from_slice(&REPLAY_ACK_REPLY_MAGIC);
+        payload[4..6].copy_from_slice(&REPLAY_WIRE_VERSION.to_be_bytes());
+        payload[8..24].copy_from_slice(self.snapshot_id.as_bytes());
+        payload[24..28].copy_from_slice(&self.page_index.to_be_bytes());
+        payload[28..60].copy_from_slice(&self.page_digest);
+        payload[60..68].copy_from_slice(&self.through_sequence.to_be_bytes());
+        payload[68..100].copy_from_slice(&self.through_record_digest);
+        Ok(payload)
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != REPLAY_ACK_REPLY_BYTES
+            || payload.get(..4) != Some(REPLAY_ACK_REPLY_MAGIC.as_slice())
+            || read_u16(payload, 4)? != REPLAY_WIRE_VERSION
+            || payload[6..8].iter().any(|byte| *byte != 0)
+            || payload[100..].iter().any(|byte| *byte != 0)
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let mut page_digest = [0; 32];
+        page_digest.copy_from_slice(&payload[28..60]);
+        let mut through_record_digest = [0; 32];
+        through_record_digest.copy_from_slice(&payload[68..100]);
+        let receipt = Self {
+            snapshot_id: read_required_uuid(payload, 8)?,
+            page_index: read_u32(payload, 24)?,
+            page_digest,
+            through_sequence: read_u64(payload, 60)?,
+            through_record_digest,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn validate(self) -> Result<(), GuardianProtocolError> {
+        if self.snapshot_id.is_nil()
+            || digest_is_zero(self.page_digest)
+            || (self.through_sequence == 0) != digest_is_zero(self.through_record_digest)
+        {
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(self) -> Uuid {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn page_index(self) -> u32 {
+        self.page_index
+    }
+
+    #[must_use]
+    pub const fn page_digest(self) -> [u8; 32] {
+        self.page_digest
+    }
+
+    #[must_use]
+    pub const fn through_sequence(self) -> u64 {
+        self.through_sequence
+    }
+
+    #[must_use]
+    pub const fn through_record_digest(self) -> [u8; 32] {
+        self.through_record_digest
     }
 }
 
