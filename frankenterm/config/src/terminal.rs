@@ -3,7 +3,7 @@
 use crate::{configuration, ConfigHandle, NewlineCanon};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::{
-    BidiMode, ScrollbackSpillSink, TerminalConfigurationRevision,
+    BidiMode, RecoveryActivationLease, ScrollbackSpillSink, TerminalConfigurationRevision,
 };
 use frankenterm_term::MonospaceKpCostModel;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,11 +60,26 @@ fn scrollback_spill_sink_for(
 
 #[derive(Debug)]
 pub struct TermConfig {
+    recovery_activation_gate: Mutex<()>,
     config: Mutex<Option<ConfigHandle>>,
     client_palette: Mutex<Option<ColorPalette>>,
     overlay_generation: AtomicUsize,
     scrollback_spill_sink: Option<Arc<dyn ScrollbackSpillSink>>,
 }
+
+struct TermConfigRecoveryActivationLease<'config> {
+    _guard: MutexGuard<'config, ()>,
+}
+
+impl std::fmt::Debug for TermConfigRecoveryActivationLease<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TermConfigRecoveryActivationLease")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecoveryActivationLease for TermConfigRecoveryActivationLease<'_> {}
 
 fn bump_overlay_generation(generation: &AtomicUsize) {
     let mut current = generation.load(Ordering::Relaxed);
@@ -89,6 +104,7 @@ fn bump_overlay_generation(generation: &AtomicUsize) {
 impl TermConfig {
     pub fn new() -> Self {
         Self {
+            recovery_activation_gate: Mutex::new(()),
             config: Mutex::new(None),
             client_palette: Mutex::new(None),
             overlay_generation: AtomicUsize::new(0),
@@ -110,6 +126,7 @@ impl TermConfig {
             command_description,
         });
         Self {
+            recovery_activation_gate: Mutex::new(()),
             config: Mutex::new(None),
             client_palette: Mutex::new(None),
             overlay_generation: AtomicUsize::new(0),
@@ -119,6 +136,7 @@ impl TermConfig {
 
     pub fn with_config(config: ConfigHandle) -> Self {
         Self {
+            recovery_activation_gate: Mutex::new(()),
             config: Mutex::new(Some(config)),
             client_palette: Mutex::new(None),
             overlay_generation: AtomicUsize::new(0),
@@ -131,6 +149,7 @@ impl TermConfig {
         scrollback_spill_sink: Option<Arc<dyn ScrollbackSpillSink>>,
     ) -> Self {
         Self {
+            recovery_activation_gate: Mutex::new(()),
             config: Mutex::new(Some(config)),
             client_palette: Mutex::new(None),
             overlay_generation: AtomicUsize::new(0),
@@ -139,12 +158,20 @@ impl TermConfig {
     }
 
     pub fn set_config(&self, config: ConfigHandle) {
+        let _activation = lock_terminal_mutex(
+            &self.recovery_activation_gate,
+            "terminal recovery activation gate",
+        );
         let mut current = lock_terminal_mutex(&self.config, "terminal config");
         bump_overlay_generation(&self.overlay_generation);
         let _previous = current.replace(config);
     }
 
     pub fn set_client_palette(&self, palette: ColorPalette) {
+        let _activation = lock_terminal_mutex(
+            &self.recovery_activation_gate,
+            "terminal recovery activation gate",
+        );
         let mut current = lock_terminal_mutex(&self.client_palette, "terminal client palette");
         bump_overlay_generation(&self.overlay_generation);
         let _previous = current.replace(palette);
@@ -175,6 +202,29 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
                 return TerminalConfigurationRevision::new(base_generation, overlay_generation);
             }
         }
+    }
+
+    fn acquire_recovery_activation_lease(&self) -> Box<dyn RecoveryActivationLease + '_> {
+        let activation = lock_terminal_mutex(
+            &self.recovery_activation_gate,
+            "terminal recovery activation gate",
+        );
+
+        // A pane created before its first explicit config assignment otherwise
+        // consults the reloadable global on every getter. Pin the exact current
+        // handle while the mutation gate is held so the lease also excludes a
+        // global reload from changing semantics between verification and
+        // installation. This does not bump the overlay revision because the
+        // effective value is unchanged at the pinning instant.
+        let mut current = lock_terminal_mutex(&self.config, "terminal config");
+        if current.is_none() {
+            *current = Some(configuration());
+        }
+        drop(current);
+
+        Box::new(TermConfigRecoveryActivationLease {
+            _guard: activation,
+        })
     }
 
     fn scrollback_size(&self) -> usize {
@@ -375,6 +425,20 @@ mod tests {
             Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
         }
 
+        fn replace_scrollback_prefix(
+            &self,
+            _expected_generation: Option<
+                frankenterm_term::config::ScrollbackSnapshotGeneration,
+            >,
+            _prefix: frankenterm_term::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackReplaceCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
         fn clear_scrollback(
             &self,
         ) -> Result<
@@ -552,6 +616,67 @@ mod tests {
 
         term_config.set_client_palette(ColorPalette::default());
         assert_ne!(term_config.revision(), after_same_generation_config_swap);
+    }
+
+    #[test]
+    fn recovery_activation_lease_excludes_every_overlay_setter() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let term_config = Arc::new(TermConfig::with_config(ConfigHandle::default_config()));
+        let lease = term_config.acquire_recovery_activation_lease();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let palette_config = Arc::clone(&term_config);
+        let palette_started_tx = started_tx.clone();
+        let palette_finished_tx = finished_tx.clone();
+        let palette_setter = std::thread::spawn(move || {
+            palette_started_tx
+                .send("palette")
+                .expect("report palette setter start");
+            palette_config.set_client_palette(ColorPalette::default());
+            palette_finished_tx
+                .send("palette")
+                .expect("report palette setter completion");
+        });
+        let config_setter_config = Arc::clone(&term_config);
+        let config_setter = std::thread::spawn(move || {
+            started_tx
+                .send("config")
+                .expect("report config setter start");
+            config_setter_config.set_config(ConfigHandle::default_config());
+            finished_tx
+                .send("config")
+                .expect("report config setter completion");
+        });
+
+        let mut started = [
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first setter reached its mutation call"),
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second setter reached its mutation call"),
+        ];
+        started.sort_unstable();
+        assert_eq!(started, ["config", "palette"]);
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "all semantic setters must remain excluded while activation owns the lease",
+        );
+        drop(lease);
+        let mut finished = [
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first setter completes after activation releases its lease"),
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second setter completes after activation releases its lease"),
+        ];
+        finished.sort_unstable();
+        assert_eq!(finished, ["config", "palette"]);
+        palette_setter.join().expect("palette setter thread joins");
+        config_setter.join().expect("config setter thread joins");
     }
 
     #[test]
