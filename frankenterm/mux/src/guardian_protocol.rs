@@ -2561,6 +2561,698 @@ impl GuardianReplayAckReceiptV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianCheckpointOutputBoundaryV1 {
+    Genesis {
+        spawn_effect_id: Uuid,
+    },
+    Record {
+        segment_id: Uuid,
+        sequence: u64,
+        record_digest: [u8; 32],
+        committed_log_bytes: u64,
+        cumulative_plaintext_bytes: u64,
+        parser_stream_bytes: u64,
+    },
+}
+
+/// Metadata needed to select, bound, and assemble one canonical terminal
+/// checkpoint. It deliberately contains no terminal plaintext.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianCheckpointDescriptorV1 {
+    checkpoint_id: GuardianCheckpointIdentityDigest,
+    boundary_id: GuardianOutputBoundaryIdentityDigest,
+    capture_generation: u64,
+    replay_semantics_id: [u8; 32],
+    rows: u32,
+    cols: u32,
+    total_bytes: u64,
+    output_boundary: GuardianCheckpointOutputBoundaryV1,
+}
+
+impl std::fmt::Debug for GuardianCheckpointDescriptorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointDescriptorV1")
+            .field("capture_generation", &self.capture_generation)
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("total_bytes", &self.total_bytes)
+            .field("output_boundary", &self.output_boundary)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianCheckpointDescriptorV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary_id: GuardianOutputBoundaryIdentityDigest,
+        capture_generation: u64,
+        replay_semantics_id: [u8; 32],
+        rows: u32,
+        cols: u32,
+        total_bytes: u64,
+        output_boundary: GuardianCheckpointOutputBoundaryV1,
+    ) -> Result<Self, GuardianProtocolError> {
+        let descriptor = Self {
+            checkpoint_id,
+            boundary_id,
+            capture_generation,
+            replay_semantics_id,
+            rows,
+            cols,
+            total_bytes,
+            output_boundary,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    #[must_use]
+    pub const fn checkpoint_id(self) -> GuardianCheckpointIdentityDigest {
+        self.checkpoint_id
+    }
+
+    #[must_use]
+    pub const fn boundary_id(self) -> GuardianOutputBoundaryIdentityDigest {
+        self.boundary_id
+    }
+
+    #[must_use]
+    pub const fn capture_generation(self) -> u64 {
+        self.capture_generation
+    }
+
+    #[must_use]
+    pub const fn replay_semantics_id(self) -> [u8; 32] {
+        self.replay_semantics_id
+    }
+
+    #[must_use]
+    pub const fn rows(self) -> u32 {
+        self.rows
+    }
+
+    #[must_use]
+    pub const fn cols(self) -> u32 {
+        self.cols
+    }
+
+    #[must_use]
+    pub const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+
+    #[must_use]
+    pub const fn output_boundary(self) -> GuardianCheckpointOutputBoundaryV1 {
+        self.output_boundary
+    }
+
+    #[must_use]
+    pub const fn suffix_start(self) -> Option<(u64, [u8; 32])> {
+        match self.output_boundary {
+            GuardianCheckpointOutputBoundaryV1::Genesis { .. } => Some((1, [0; 32])),
+            GuardianCheckpointOutputBoundaryV1::Record {
+                sequence,
+                record_digest,
+                ..
+            } => match sequence.checked_add(1) {
+                Some(next) => Some((next, record_digest)),
+                None => None,
+            },
+        }
+    }
+
+    fn encode(self) -> [u8; REPLAY_CHECKPOINT_DESCRIPTOR_BYTES] {
+        let mut payload = [0; REPLAY_CHECKPOINT_DESCRIPTOR_BYTES];
+        payload[..32].copy_from_slice(&self.checkpoint_id.0);
+        payload[32..64].copy_from_slice(&self.boundary_id.0);
+        payload[64..72].copy_from_slice(&self.capture_generation.to_be_bytes());
+        payload[72..104].copy_from_slice(&self.replay_semantics_id);
+        payload[104..108].copy_from_slice(&self.rows.to_be_bytes());
+        payload[108..112].copy_from_slice(&self.cols.to_be_bytes());
+        payload[112..120].copy_from_slice(&self.total_bytes.to_be_bytes());
+        match self.output_boundary {
+            GuardianCheckpointOutputBoundaryV1::Genesis { spawn_effect_id } => {
+                payload[120] = 1;
+                payload[128..144].copy_from_slice(spawn_effect_id.as_bytes());
+            }
+            GuardianCheckpointOutputBoundaryV1::Record {
+                segment_id,
+                sequence,
+                record_digest,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                parser_stream_bytes,
+            } => {
+                payload[120] = 2;
+                payload[144..160].copy_from_slice(segment_id.as_bytes());
+                payload[160..168].copy_from_slice(&sequence.to_be_bytes());
+                payload[168..200].copy_from_slice(&record_digest);
+                payload[200..208].copy_from_slice(&committed_log_bytes.to_be_bytes());
+                payload[208..216].copy_from_slice(&cumulative_plaintext_bytes.to_be_bytes());
+                payload[216..224].copy_from_slice(&parser_stream_bytes.to_be_bytes());
+            }
+        }
+        payload
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != REPLAY_CHECKPOINT_DESCRIPTOR_BYTES
+            || payload[121..128].iter().any(|byte| *byte != 0)
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let mut checkpoint_id = [0; 32];
+        checkpoint_id.copy_from_slice(&payload[..32]);
+        let mut boundary_id = [0; 32];
+        boundary_id.copy_from_slice(&payload[32..64]);
+        let mut replay_semantics_id = [0; 32];
+        replay_semantics_id.copy_from_slice(&payload[72..104]);
+        let output_boundary = match payload[120] {
+            1 if payload[144..].iter().all(|byte| *byte == 0) => {
+                GuardianCheckpointOutputBoundaryV1::Genesis {
+                    spawn_effect_id: read_required_uuid(payload, 128)?,
+                }
+            }
+            2 if payload[128..144].iter().all(|byte| *byte == 0) => {
+                let mut record_digest = [0; 32];
+                record_digest.copy_from_slice(&payload[168..200]);
+                GuardianCheckpointOutputBoundaryV1::Record {
+                    segment_id: read_required_uuid(payload, 144)?,
+                    sequence: read_u64(payload, 160)?,
+                    record_digest,
+                    committed_log_bytes: read_u64(payload, 200)?,
+                    cumulative_plaintext_bytes: read_u64(payload, 208)?,
+                    parser_stream_bytes: read_u64(payload, 216)?,
+                }
+            }
+            _ => return Err(GuardianProtocolError::InvalidReplyPayload),
+        };
+        Self::new(
+            GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
+                .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+            GuardianOutputBoundaryIdentityDigest::from_bytes(boundary_id)
+                .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+            read_u64(payload, 64)?,
+            replay_semantics_id,
+            read_u32(payload, 104)?,
+            read_u32(payload, 108)?,
+            read_u64(payload, 112)?,
+            output_boundary,
+        )
+    }
+
+    fn validate(self) -> Result<(), GuardianProtocolError> {
+        let boundary_valid = match self.output_boundary {
+            GuardianCheckpointOutputBoundaryV1::Genesis { spawn_effect_id } => {
+                !spawn_effect_id.is_nil()
+            }
+            GuardianCheckpointOutputBoundaryV1::Record {
+                segment_id,
+                sequence,
+                record_digest,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                parser_stream_bytes,
+            } => {
+                !segment_id.is_nil()
+                    && sequence > 0
+                    && !digest_is_zero(record_digest)
+                    && committed_log_bytes > 0
+                    && cumulative_plaintext_bytes > 0
+                    && parser_stream_bytes > 0
+            }
+        };
+        if self.capture_generation == 0
+            || digest_is_zero(self.replay_semantics_id)
+            || self.rows == 0
+            || self.cols == 0
+            || self.total_bytes == 0
+            || self.total_bytes > GUARDIAN_MAX_CHECKPOINT_BYTES
+            || !boundary_valid
+            || self.suffix_start().is_none()
+        {
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianReplayPredecessorV1 {
+    segment_id: Uuid,
+    last_sequence: u64,
+    terminal_record_digest: [u8; 32],
+    cumulative_plaintext_bytes: u64,
+    committed_log_bytes: u64,
+}
+
+impl GuardianReplayPredecessorV1 {
+    pub fn new(
+        segment_id: Uuid,
+        last_sequence: u64,
+        terminal_record_digest: [u8; 32],
+        cumulative_plaintext_bytes: u64,
+        committed_log_bytes: u64,
+    ) -> Result<Self, GuardianProtocolError> {
+        let predecessor = Self {
+            segment_id,
+            last_sequence,
+            terminal_record_digest,
+            cumulative_plaintext_bytes,
+            committed_log_bytes,
+        };
+        predecessor.validate()?;
+        Ok(predecessor)
+    }
+
+    fn validate(self) -> Result<(), GuardianProtocolError> {
+        if self.segment_id.is_nil()
+            || self.last_sequence == 0
+            || digest_is_zero(self.terminal_record_digest)
+            || self.cumulative_plaintext_bytes == 0
+            || self.committed_log_bytes == 0
+        {
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[must_use]
+    pub const fn segment_id(self) -> Uuid {
+        self.segment_id
+    }
+
+    #[must_use]
+    pub const fn last_sequence(self) -> u64 {
+        self.last_sequence
+    }
+
+    #[must_use]
+    pub const fn terminal_record_digest(self) -> [u8; 32] {
+        self.terminal_record_digest
+    }
+
+    #[must_use]
+    pub const fn cumulative_plaintext_bytes(self) -> u64 {
+        self.cumulative_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn committed_log_bytes(self) -> u64 {
+        self.committed_log_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianReplayRecordMetadataV1 {
+    segment_id: Uuid,
+    segment_first_sequence: u64,
+    predecessor: Option<GuardianReplayPredecessorV1>,
+    sequence: u64,
+    payload_bytes: u32,
+    cumulative_plaintext_bytes: u64,
+    committed_log_bytes: u64,
+    record_digest: [u8; 32],
+}
+
+impl GuardianReplayRecordMetadataV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        segment_id: Uuid,
+        segment_first_sequence: u64,
+        predecessor: Option<GuardianReplayPredecessorV1>,
+        sequence: u64,
+        payload_bytes: u32,
+        cumulative_plaintext_bytes: u64,
+        committed_log_bytes: u64,
+        record_digest: [u8; 32],
+    ) -> Result<Self, GuardianProtocolError> {
+        let metadata = Self {
+            segment_id,
+            segment_first_sequence,
+            predecessor,
+            sequence,
+            payload_bytes,
+            cumulative_plaintext_bytes,
+            committed_log_bytes,
+            record_digest,
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    fn validate(self) -> Result<(), GuardianProtocolError> {
+        if self.segment_id.is_nil()
+            || self.segment_first_sequence == 0
+            || self.sequence < self.segment_first_sequence
+            || self.payload_bytes == 0
+            || self.payload_bytes > GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES
+            || self.cumulative_plaintext_bytes < u64::from(self.payload_bytes)
+            || self.committed_log_bytes == 0
+            || digest_is_zero(self.record_digest)
+            || self.predecessor.is_some_and(|predecessor| {
+                predecessor.validate().is_err()
+                    || predecessor
+                        .last_sequence
+                        .checked_add(1)
+                        .is_none_or(|next| next != self.segment_first_sequence)
+            })
+            || (self.segment_first_sequence == 1) != self.predecessor.is_none()
+        {
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[must_use]
+    pub const fn segment_id(self) -> Uuid {
+        self.segment_id
+    }
+
+    #[must_use]
+    pub const fn segment_first_sequence(self) -> u64 {
+        self.segment_first_sequence
+    }
+
+    #[must_use]
+    pub const fn predecessor(self) -> Option<GuardianReplayPredecessorV1> {
+        self.predecessor
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn payload_bytes(self) -> u32 {
+        self.payload_bytes
+    }
+
+    #[must_use]
+    pub const fn cumulative_plaintext_bytes(self) -> u64 {
+        self.cumulative_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn committed_log_bytes(self) -> u64 {
+        self.committed_log_bytes
+    }
+
+    #[must_use]
+    pub const fn record_digest(self) -> [u8; 32] {
+        self.record_digest
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianReplayDeliveryError {
+    #[error(transparent)]
+    Protocol(#[from] GuardianProtocolError),
+    #[error("guardian replay plaintext delivery failed")]
+    Io(#[source] std::io::Error),
+}
+
+/// Single-use replay record. Plaintext stays in a zeroizing allocation and is
+/// observable only by consuming the capability into a bounded writer.
+pub struct GuardianReplayRecordDelivery {
+    metadata: GuardianReplayRecordMetadataV1,
+    plaintext_digest: [u8; 32],
+    plaintext: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for GuardianReplayRecordDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianReplayRecordDelivery")
+            .field("metadata", &self.metadata)
+            .field("plaintext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl GuardianReplayRecordDelivery {
+    pub fn new(
+        metadata: GuardianReplayRecordMetadataV1,
+        plaintext: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, GuardianProtocolError> {
+        metadata.validate()?;
+        if usize::try_from(metadata.payload_bytes).ok() != Some(plaintext.len()) {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let plaintext_digest = Sha256::digest(plaintext.as_slice()).into();
+        Ok(Self {
+            metadata,
+            plaintext_digest,
+            plaintext,
+        })
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> GuardianReplayRecordMetadataV1 {
+        self.metadata
+    }
+
+    pub fn write_all_bounded<W: std::io::Write>(
+        self,
+        writer: &mut W,
+        max_payload_bytes: u32,
+    ) -> Result<GuardianReplayRecordMetadataV1, GuardianReplayDeliveryError> {
+        if max_payload_bytes == 0
+            || self.metadata.payload_bytes > max_payload_bytes
+            || usize::try_from(self.metadata.payload_bytes).ok() != Some(self.plaintext.len())
+            || <[u8; 32]>::from(Sha256::digest(self.plaintext.as_slice()))
+                != self.plaintext_digest
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload.into());
+        }
+        writer
+            .write_all(self.plaintext.as_slice())
+            .map_err(GuardianReplayDeliveryError::Io)?;
+        Ok(self.metadata)
+    }
+}
+
+pub struct GuardianReplayOutputRecordsDelivery {
+    first_sequence: u64,
+    records: Vec<GuardianReplayRecordDelivery>,
+    plaintext_bytes: u32,
+}
+
+impl std::fmt::Debug for GuardianReplayOutputRecordsDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianReplayOutputRecordsDelivery")
+            .field("first_sequence", &self.first_sequence)
+            .field("record_count", &self.records.len())
+            .field("plaintext_bytes", &self.plaintext_bytes)
+            .finish()
+    }
+}
+
+impl GuardianReplayOutputRecordsDelivery {
+    pub fn new(
+        first_sequence: u64,
+        records: Vec<GuardianReplayRecordDelivery>,
+    ) -> Result<Self, GuardianProtocolError> {
+        let plaintext_bytes = validate_replay_records(first_sequence, &records)?;
+        Ok(Self {
+            first_sequence,
+            records,
+            plaintext_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn first_sequence(&self) -> u64 {
+        self.first_sequence
+    }
+
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    #[must_use]
+    pub const fn plaintext_bytes(&self) -> u32 {
+        self.plaintext_bytes
+    }
+
+    pub fn into_records(self) -> Vec<GuardianReplayRecordDelivery> {
+        self.records
+    }
+}
+
+fn validate_replay_records(
+    first_sequence: u64,
+    records: &[GuardianReplayRecordDelivery],
+) -> Result<u32, GuardianProtocolError> {
+    if first_sequence == 0
+        || records.is_empty()
+        || records.len() > usize::from(GUARDIAN_MAX_REPLAY_RECORDS)
+        || records.first().map(|record| record.metadata.sequence) != Some(first_sequence)
+    {
+        return Err(GuardianProtocolError::InvalidReplyPayload);
+    }
+    let mut plaintext_bytes = 0_u32;
+    let mut previous: Option<GuardianReplayRecordMetadataV1> = None;
+    for record in records {
+        let metadata = record.metadata;
+        metadata.validate()?;
+        if usize::try_from(metadata.payload_bytes).ok() != Some(record.plaintext.len())
+            || <[u8; 32]>::from(Sha256::digest(record.plaintext.as_slice()))
+                != record.plaintext_digest
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        plaintext_bytes = plaintext_bytes
+            .checked_add(metadata.payload_bytes)
+            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+        if plaintext_bytes > GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        if let Some(prior) = previous {
+            if prior.sequence.checked_add(1) != Some(metadata.sequence)
+                || prior
+                    .cumulative_plaintext_bytes
+                    .checked_add(u64::from(metadata.payload_bytes))
+                    != Some(metadata.cumulative_plaintext_bytes)
+            {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+            if prior.segment_id == metadata.segment_id {
+                if prior.segment_first_sequence != metadata.segment_first_sequence
+                    || prior.predecessor != metadata.predecessor
+                    || metadata.committed_log_bytes <= prior.committed_log_bytes
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+            } else {
+                let predecessor = metadata
+                    .predecessor
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                if metadata.segment_first_sequence != metadata.sequence
+                    || predecessor.segment_id != prior.segment_id
+                    || predecessor.last_sequence != prior.sequence
+                    || predecessor.terminal_record_digest != prior.record_digest
+                    || predecessor.cumulative_plaintext_bytes
+                        != prior.cumulative_plaintext_bytes
+                    || predecessor.committed_log_bytes != prior.committed_log_bytes
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+            }
+        } else if metadata.sequence == metadata.segment_first_sequence {
+            let prior_cumulative = metadata
+                .cumulative_plaintext_bytes
+                .checked_sub(u64::from(metadata.payload_bytes))
+                .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+            match metadata.predecessor {
+                None if metadata.sequence == 1 && prior_cumulative == 0 => {}
+                Some(predecessor)
+                    if predecessor.last_sequence.checked_add(1) == Some(metadata.sequence)
+                        && predecessor.cumulative_plaintext_bytes == prior_cumulative => {}
+                _ => return Err(GuardianProtocolError::InvalidReplyPayload),
+            }
+        }
+        previous = Some(metadata);
+    }
+    Ok(plaintext_bytes)
+}
+
+/// Single-use checkpoint chunk with the same zeroizing ownership contract as
+/// output-record delivery.
+pub struct GuardianCheckpointChunkDelivery {
+    descriptor: GuardianCheckpointDescriptorV1,
+    offset: u64,
+    chunk_digest: [u8; 32],
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for GuardianCheckpointChunkDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointChunkDelivery")
+            .field("descriptor", &self.descriptor)
+            .field("offset", &self.offset)
+            .field("chunk_bytes", &self.bytes.len())
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl GuardianCheckpointChunkDelivery {
+    pub fn new(
+        descriptor: GuardianCheckpointDescriptorV1,
+        offset: u64,
+        bytes: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, GuardianProtocolError> {
+        descriptor.validate()?;
+        let observed = u64::try_from(bytes.len())
+            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        if bytes.is_empty()
+            || observed > u64::from(GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES)
+            || offset
+                .checked_add(observed)
+                .is_none_or(|end| end > descriptor.total_bytes)
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let chunk_digest = Sha256::digest(bytes.as_slice()).into();
+        Ok(Self {
+            descriptor,
+            offset,
+            chunk_digest,
+            bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> GuardianCheckpointDescriptorV1 {
+        self.descriptor
+    }
+
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn chunk_digest(&self) -> [u8; 32] {
+        self.chunk_digest
+    }
+
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn write_all_bounded<W: std::io::Write>(
+        self,
+        writer: &mut W,
+        max_payload_bytes: u32,
+    ) -> Result<(GuardianCheckpointDescriptorV1, u64, u32), GuardianReplayDeliveryError> {
+        let observed = u32::try_from(self.bytes.len())
+            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        if max_payload_bytes == 0
+            || observed > max_payload_bytes
+            || <[u8; 32]>::from(Sha256::digest(self.bytes.as_slice())) != self.chunk_digest
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload.into());
+        }
+        writer
+            .write_all(self.bytes.as_slice())
+            .map_err(GuardianReplayDeliveryError::Io)?;
+        Ok((self.descriptor, self.offset, observed))
+    }
+}
+
 struct GuardianBoundedPayloadBuffer {
     bytes: Zeroizing<Vec<u8>>,
     max_bytes: usize,

@@ -8114,6 +8114,116 @@ mod tests {
         (dir, context, sink, wal, appended)
     }
 
+    fn publish_authenticated_v3_predecessor_fixture(
+        sink: &LiveScrollbackSpillSink,
+    ) -> LiveScrollbackManifestV1 {
+        let mut manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read v1-WAL predecessor manifest")
+            .expect("v1-WAL predecessor manifest exists");
+        manifest.schema = LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3.to_string();
+        manifest.chain_anchor_sha256 = None;
+        manifest.chain_tail_sha256 = None;
+        manifest.logical_ledger_sha256 = None;
+        manifest.guardian_manifest_authentication = None;
+        manifest.manifest_sha256.clear();
+        let ledger_pane_id = sink.active_ledger_pane_id();
+        let digest = {
+            let store = sink
+                .lock_store("construct v1-WAL v3 predecessor digest")
+                .expect("lock v1-WAL v3 predecessor store");
+            LiveScrollbackSpillSink::logical_ledger_digest_from_store(
+                &manifest,
+                ledger_pane_id,
+                &store,
+            )
+            .expect("construct v1-WAL v3 predecessor digest")
+        };
+        manifest.logical_ledger_sha256 = Some(hex::encode(digest));
+        let canonical = LiveScrollbackSpillSink::manifest_authentication_bytes(&manifest)
+            .expect("serialize v1-WAL v3 predecessor authority");
+        let mut keyring = sink
+            .lock_keyring("authenticate v1-WAL v3 predecessor")
+            .expect("lock v1-WAL v3 predecessor keyring");
+        let cipher = keyring
+            .latest_active_cipher()
+            .expect("load v1-WAL v3 predecessor key");
+        manifest.guardian_manifest_authentication = Some(
+            cipher
+                .authenticate_scrollback_manifest(&canonical)
+                .expect("authenticate v1-WAL v3 predecessor")
+                .encode(),
+        );
+        drop(keyring);
+        manifest.manifest_sha256 = LiveScrollbackSpillSink::manifest_checksum(&manifest)
+            .expect("checksum v1-WAL v3 predecessor");
+        overwrite_private_manifest_fixture(&sink.manifest_path, &manifest);
+        manifest
+    }
+
+    fn seal_append_wal_fixture(
+        sink: &LiveScrollbackSpillSink,
+        wal: &mut LiveScrollbackAppendWalV1,
+    ) {
+        wal.guardian_authentication = Some("pending".to_string());
+        wal.wal_sha256.clear();
+        LiveScrollbackSpillSink::validate_append_wal_identity(wal, sink.durable_pane_id)
+            .expect("validate unsealed append WAL fixture");
+        wal.guardian_authentication = None;
+        let canonical = LiveScrollbackSpillSink::append_wal_authentication_bytes(wal)
+            .expect("serialize append WAL fixture authority");
+        let mut keyring = sink
+            .lock_keyring("seal append WAL fixture")
+            .expect("lock append WAL fixture keyring");
+        let cipher = keyring
+            .latest_active_cipher()
+            .expect("load append WAL fixture key");
+        wal.guardian_authentication = Some(
+            cipher
+                .authenticate_scrollback_append_wal(&canonical)
+                .expect("authenticate append WAL fixture")
+                .encode(),
+        );
+        drop(keyring);
+        LiveScrollbackSpillSink::validate_append_wal_identity(wal, sink.durable_pane_id)
+            .expect("validate sealed append WAL fixture");
+        wal.wal_sha256 = LiveScrollbackSpillSink::append_wal_checksum(wal)
+            .expect("checksum append WAL fixture");
+    }
+
+    fn legacy_v1_append_wal_fixture(
+        identity_byte: u8,
+    ) -> (
+        tempfile::TempDir,
+        config::ScrollbackSpillSinkContext,
+        LiveScrollbackSpillSink,
+        LiveScrollbackAppendWalV1,
+        Line,
+    ) {
+        let (dir, context, sink, mut wal, appended) =
+            append_wal_fixture(identity_byte, 1);
+        let predecessor = publish_authenticated_v3_predecessor_fixture(&sink);
+        wal.schema = LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1.to_string();
+        wal.predecessor_manifest_sha256 = predecessor.manifest_sha256;
+        wal.predecessor_chain_anchor_sha256 = None;
+        wal.predecessor_chain_tail_sha256 = None;
+        wal.target_chain_anchor_sha256 = None;
+        wal.target_chain_tail_sha256 = None;
+        wal.evicted_record_count = None;
+        let (target_digest, retained_record_bytes) =
+            live_scrollback_append_wal_target_digest(&wal, |sequence| {
+                anyhow::ensure!(
+                    sequence == wal.appended_sequence,
+                    "single-row v1 WAL target requested an unexpected sequence"
+                );
+                Ok(wal.encrypted_record.clone())
+            })
+            .expect("construct v1 append WAL target-set digest");
+        assert_eq!(retained_record_bytes, wal.target_retained_record_bytes);
+        wal.target_record_set_sha256 = Some(hex::encode(target_digest));
+        seal_append_wal_fixture(&sink, &mut wal);
+        (dir, context, sink, wal, appended)
+    }
+
     fn reset_authority_record_reads() {
         LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(|reads| reads.set(0));
     }

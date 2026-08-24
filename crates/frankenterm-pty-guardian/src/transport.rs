@@ -190,6 +190,7 @@ pub struct GuardianProbeReport {
 #[derive(Clone, Copy)]
 struct ReadyEvent {
     token: Token,
+    connection_identity: Option<ConnectionIdentity>,
     readable: bool,
     writable: bool,
     closed: bool,
@@ -246,6 +247,13 @@ struct ConnectionIdentity {
 struct PendingMuxRetirementObservation {
     mux_incarnation: Uuid,
     disconnect_observation_epoch: u64,
+    unauthenticated_accept_cutoff_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrackedMuxConnection {
+    accepted_observation_epoch: u64,
+    mux_incarnation: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,7 +277,7 @@ enum MuxConnectionTrackingError {
 /// delayed valid Hello orders after an already-processed disconnect regardless
 /// of which connection happened to be accepted first.
 struct MuxConnectionTracker {
-    live_connections: HashMap<ConnectionIdentity, Option<Uuid>>,
+    live_connections: HashMap<ConnectionIdentity, TrackedMuxConnection>,
     pending_retirements: Vec<PendingMuxRetirementObservation>,
     max_connections: usize,
     observation_epoch: u64,
@@ -342,8 +350,14 @@ impl MuxConnectionTracker {
         if self.live_connections.len() >= self.max_connections {
             return Err(MuxConnectionTrackingError::CapacityExhausted);
         }
-        self.next_observation_epoch()?;
-        self.live_connections.insert(identity, None);
+        let accepted_observation_epoch = self.next_observation_epoch()?;
+        self.live_connections.insert(
+            identity,
+            TrackedMuxConnection {
+                accepted_observation_epoch,
+                mux_incarnation: None,
+            },
+        );
         Ok(())
     }
 
@@ -357,15 +371,24 @@ impl MuxConnectionTracker {
             return Err(MuxConnectionTrackingError::InvalidIdentity);
         }
         match self.live_connections.get(&identity) {
-            Some(None) => {}
-            Some(Some(_)) => {
+            Some(TrackedMuxConnection {
+                mux_incarnation: None,
+                ..
+            }) => {}
+            Some(TrackedMuxConnection {
+                mux_incarnation: Some(_),
+                ..
+            }) => {
                 return Err(MuxConnectionTrackingError::ConnectionAlreadyAuthenticated);
             }
             None => return Err(MuxConnectionTrackingError::StaleConnection),
         }
         let hello_observation_epoch = self.next_observation_epoch()?;
-        self.live_connections
-            .insert(identity, Some(mux_incarnation));
+        let Some(connection) = self.live_connections.get_mut(&identity) else {
+            self.poisoned = true;
+            return Err(MuxConnectionTrackingError::StaleConnection);
+        };
+        connection.mux_incarnation = Some(mux_incarnation);
         self.pending_retirements.retain(|retirement| {
             retirement.mux_incarnation != mux_incarnation
                 || retirement.disconnect_observation_epoch >= hello_observation_epoch
@@ -379,28 +402,28 @@ impl MuxConnectionTracker {
         connection_mux_incarnation: Option<Uuid>,
     ) -> Result<(), MuxConnectionTrackingError> {
         self.require_healthy()?;
-        let Some(tracked_mux_incarnation) = self.live_connections.get(&identity).copied() else {
+        let Some(tracked_connection) = self.live_connections.get(&identity).copied() else {
             return Err(MuxConnectionTrackingError::StaleConnection);
         };
-        if tracked_mux_incarnation != connection_mux_incarnation {
+        if tracked_connection.mux_incarnation != connection_mux_incarnation {
             self.poisoned = true;
             return Err(MuxConnectionTrackingError::MembershipMismatch);
         }
         let disconnect_observation_epoch = self.next_observation_epoch()?;
         self.live_connections.remove(&identity);
-        let Some(mux_incarnation) = tracked_mux_incarnation else {
+        let Some(mux_incarnation) = tracked_connection.mux_incarnation else {
             return Ok(());
         };
         if self.has_authenticated_membership(mux_incarnation) {
             return Ok(());
         }
-        if let Some(retirement) = self
+        if self
             .pending_retirements
-            .iter_mut()
-            .find(|retirement| retirement.mux_incarnation == mux_incarnation)
+            .iter()
+            .any(|retirement| retirement.mux_incarnation == mux_incarnation)
         {
-            retirement.disconnect_observation_epoch = disconnect_observation_epoch;
-            return Ok(());
+            self.poisoned = true;
+            return Err(MuxConnectionTrackingError::PendingRetirementMismatch);
         }
         if self.pending_retirements.len() >= self.max_connections {
             self.poisoned = true;
@@ -410,6 +433,13 @@ impl MuxConnectionTracker {
             .push(PendingMuxRetirementObservation {
                 mux_incarnation,
                 disconnect_observation_epoch,
+                // Listener accepts from this captured readiness batch are
+                // deliberately processed before any disconnect below.  This
+                // immutable cutoff therefore includes every connection that
+                // could already have a valid Hello buffered when the final
+                // disconnect was observed, without allowing later accepts to
+                // extend the retirement barrier indefinitely.
+                unauthenticated_accept_cutoff_epoch: disconnect_observation_epoch,
             });
         Ok(())
     }
@@ -417,7 +447,18 @@ impl MuxConnectionTracker {
     fn has_authenticated_membership(&self, mux_incarnation: Uuid) -> bool {
         self.live_connections
             .values()
-            .any(|membership| *membership == Some(mux_incarnation))
+            .any(|connection| connection.mux_incarnation == Some(mux_incarnation))
+    }
+
+    fn has_unresolved_unauthenticated_candidate(
+        &self,
+        retirement: PendingMuxRetirementObservation,
+    ) -> bool {
+        self.live_connections.values().any(|connection| {
+            connection.mux_incarnation.is_none()
+                && connection.accepted_observation_epoch
+                    <= retirement.unauthenticated_accept_cutoff_epoch
+        })
     }
 
     fn next_replayable_retirement(
@@ -430,6 +471,9 @@ impl MuxConnectionTracker {
         if self.has_authenticated_membership(retirement.mux_incarnation) {
             self.poisoned = true;
             return Err(MuxConnectionTrackingError::ActiveMembershipAtReplay);
+        }
+        if self.has_unresolved_unauthenticated_candidate(retirement) {
+            return Ok(None);
         }
         Ok(Some(retirement))
     }
@@ -757,20 +801,35 @@ impl GuardianService {
 
         self.ready.clear();
         for event in &self.events {
+            let token = event.token();
             self.ready.push(ReadyEvent {
-                token: event.token(),
+                token,
+                connection_identity: self
+                    .connections
+                    .get(&token)
+                    .map(|connection| connection.identity(token)),
                 readable: event.is_readable(),
                 writable: event.is_writable(),
                 closed: event.is_error() || event.is_read_closed() || event.is_write_closed(),
             });
         }
 
+        // Registration cannot add a child-socket event to the Events snapshot
+        // returned by the poll that exposed the listener. Accept every queued
+        // connection before processing any disconnect from this same batch, so
+        // its immutable accept epoch enters that disconnect's bounded candidate
+        // cutoff regardless of the selector's event ordering.
+        if self
+            .ready
+            .iter()
+            .any(|event| event.token == LISTENER_TOKEN && event.readable)
+        {
+            self.accept_connections()?;
+        }
         for index in 0..self.ready.len() {
             let event = self.ready[index];
             if event.token == LISTENER_TOKEN {
-                if event.readable {
-                    self.accept_connections()?;
-                }
+                continue;
             } else if event.token == self.output_completion_token {
                 // Drain worker completions only after every connection event
                 // in this readiness batch. A ready authenticated Hello must
@@ -790,13 +849,16 @@ impl GuardianService {
         // number of worker wake calls represented by one poll event.
         self.runtime.handle_output_completions();
         self.handle_input_completions();
+        // Authentication deadlines are the finite bound on a pre-disconnect
+        // unknown identity. Resolve expired candidates before the final
+        // membership recheck so they cannot add an unnecessary extra poll.
+        self.expire_unauthenticated_connections();
         // Replay only after every connection event in this readiness batch and
         // every available input-authority restoration has been observed.  In
         // particular, `finish_connection` must only queue: replaying from the
         // middle of the loop above could retire a mux before a co-ready delayed
         // Hello publishes its later lifecycle-observation epoch.
         self.replay_deferred_mux_retirements();
-        self.expire_unauthenticated_connections();
         self.runtime.reap_children_once();
         Ok(())
     }
@@ -853,7 +915,7 @@ impl GuardianService {
     }
 
     fn drive_connection(&mut self, event: ReadyEvent) {
-        let Some(mut connection) = self.connections.remove(&event.token) else {
+        let Some(mut connection) = take_exact_ready_connection(&mut self.connections, event) else {
             return;
         };
         if connection.pending_input.is_some() {
@@ -1232,6 +1294,7 @@ impl GuardianService {
             {
                 self.ready.push(ReadyEvent {
                     token: *token,
+                    connection_identity: Some(connection.identity(*token)),
                     readable: false,
                     writable: false,
                     closed: true,
@@ -1239,12 +1302,26 @@ impl GuardianService {
             }
         }
         for index in 0..self.ready.len() {
-            let token = self.ready[index].token;
-            if let Some(connection) = self.connections.remove(&token) {
-                self.finish_connection(token, connection);
+            let event = self.ready[index];
+            if let Some(connection) = take_exact_ready_connection(&mut self.connections, event) {
+                self.finish_connection(event.token, connection);
             }
         }
     }
+}
+
+fn take_exact_ready_connection(
+    connections: &mut HashMap<Token, Connection>,
+    event: ReadyEvent,
+) -> Option<Connection> {
+    let expected = event.connection_identity?;
+    let observed = connections
+        .get(&event.token)
+        .map(|connection| connection.identity(event.token))?;
+    if observed != expected {
+        return None;
+    }
+    connections.remove(&event.token)
 }
 
 fn monitor_pending_input_connection(
@@ -1298,6 +1375,7 @@ struct ClientRequestWipeProbe {
     drop_wipe: AtomicBool,
     authenticated_input_wipe: AtomicBool,
     encoded_frame_wipe: AtomicBool,
+    encoded_frame_drop_wipe: AtomicBool,
 }
 
 /// Owned client request whose plaintext is retired on every encoding exit.
@@ -1344,6 +1422,54 @@ impl Drop for OwnedClientRequest {
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe.drop_wipe.store(
                 self.request.payload().is_empty(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+}
+
+/// Encoded request bytes that remain wipe-on-drop across every socket error.
+struct OwnedEncodedFrame {
+    frame: Zeroizing<Vec<u8>>,
+    #[cfg(test)]
+    wipe_probe: Option<Arc<ClientRequestWipeProbe>>,
+}
+
+impl OwnedEncodedFrame {
+    fn new(
+        frame: Vec<u8>,
+        #[cfg(test)] wipe_probe: Option<Arc<ClientRequestWipeProbe>>,
+    ) -> Self {
+        Self {
+            frame: Zeroizing::new(frame),
+            #[cfg(test)]
+            wipe_probe,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.frame
+    }
+
+    fn zeroize_after_write(&mut self) {
+        self.frame.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe.encoded_frame_wipe.store(
+                self.frame.iter().all(|byte| *byte == 0),
+                Ordering::SeqCst,
+            );
+        }
+    }
+}
+
+impl Drop for OwnedEncodedFrame {
+    fn drop(&mut self) {
+        self.frame.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe.encoded_frame_drop_wipe.store(
+                self.frame.iter().all(|byte| *byte == 0),
                 Ordering::SeqCst,
             );
         }
@@ -1751,10 +1877,14 @@ impl GuardianClient {
         request.set_wipe_probe(self.request_wipe_probe.clone());
         let encoded = encode_guardian_request(&self.secret, request.envelope());
         request.zeroize_payload();
-        let mut frame = Zeroizing::new(encoded?);
+        let mut frame = OwnedEncodedFrame::new(
+            encoded?,
+            #[cfg(test)]
+            self.request_wipe_probe.clone(),
+        );
         drop(request);
         let mut authenticated: AuthenticatedGuardianRequest =
-            decode_guardian_request(&self.secret, &frame)?;
+            decode_guardian_request(&self.secret, frame.as_slice())?;
         retire_authenticated_input_plaintext(&mut authenticated);
         #[cfg(test)]
         if authenticated.header().operation == GuardianOperation::Input {
@@ -1765,14 +1895,8 @@ impl GuardianClient {
                 );
             }
         }
-        self.stream.write_all(&frame)?;
-        frame.as_mut_slice().zeroize();
-        #[cfg(test)]
-        if let Some(probe) = self.request_wipe_probe.as_ref() {
-            probe
-                .encoded_frame_wipe
-                .store(frame.iter().all(|byte| *byte == 0), Ordering::SeqCst);
-        }
+        self.stream.write_all(frame.as_slice())?;
+        frame.zeroize_after_write();
         let response_frame = read_blocking_frame(&mut self.stream)?;
         let response = decode_guardian_response(&self.secret, &response_frame)?;
         let correlated = response.correlate(authenticated.header())?;
