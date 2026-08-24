@@ -156,55 +156,48 @@ When both the maximum and minimum advance, use the maintenance window:
 
    ```bash
    SSH_HOST=trj
-   ~/.local/bin/ft setup --apply remote "$SSH_HOST" --yes \
-     --install-ft --ft-version "$NEW_TAG"
+   # Generate once, record it with the rollout, and reuse it after every retry.
+   TRANSACTION_ID=0123456789abcdef0123456789abcdef
+   ~/.local/bin/ft setup remote "$SSH_HOST" --apply --yes \
+     --install-ft --ft-version "$NEW_TAG" \
+     --transaction-id "$TRANSACTION_ID"
    ```
 
-   For a live mux, setup downloads and verifies the release pair into a unique
-   cache directory and publishes both files only as matching
-   `pending-<transaction-uuid>` paths. The printed transaction UUID and exact
-   activation receipt identify the pair without path globbing; retained
-   size/SHA-256 receipts are checked again while binding to the publication
-   stage and immediately before the pending renames. Publication, preservation,
-   quarantine, and rollback moves are themselves no-clobber, so a name occupied
-   after its precheck is retained rather than overwritten. Release-cache binding
-   holds the same installation-directory lock and restores the first component
-   on a failed second bind, with an explicit incomplete-rollback marker if that
-   restoration target was occupied. Local uploads additionally
-   require an exact nonexistence receipt before identity-fenced SSH upload and reject any staged or
-   canonical symlink/non-regular object. The live-process probe constructs its
-   search expression from split shell literals so `pgrep -f` cannot match the
-   probe command itself and turn an inactive host into a false live-owner result.
+   Setup downloads and verifies the exact release pair, copies both components
+   into one private destination-filesystem stage, synchronizes their bytes and
+   manifest, and publishes one immutable content-derived generation. The stable
+   caller transaction ID binds the exact component hashes, generation identity,
+   committed authorization records, and replayable `PendingLiveOwner` receipt.
+   Retrying that same ID revalidates or resumes the same claim; changing the
+   payload under it fails closed. Local uploads likewise admit only a missing
+   stage or an exact retained stage with the expected private regular-file
+   identity and checksum.
+
    Before that download, it also asks the currently installed remote CLI to
    create and verify a complete host-local dump when that legacy release
    supports the command; a supported dump failure stops staging.
-   It deliberately leaves `~/.local/bin/ft`, the service `ExecStart`, the active
-   mux inode, and its PTYs untouched. An inactive host may transactionally
-   activate the pair immediately, restoring the prior pair if publication
-   fails. A client-only or mixed-build archive fails closed.
-4. **Drain live PTYs and new connections.** For a single mux, finish or move all
-   sessions it owns. For a load-balanced fleet, drain one server at a time.
-   Do not restart a mux while it owns work that cannot be recreated.
-5. **Activate the staged pair only after the host is drained.** The current
-   release does not yet provide the guardian-backed activation transaction, so
-   pending paths are a non-activating safety boundary, not an instruction to
-   overwrite files ad hoc. Stop the now-empty mux, then rerun the same setup
-   command. The inactive-host branch verifies and transactionally publishes the
-   matched pair with rollback on partial publication, updates the unit, and
-   enables the new mux. Active client sockets drop at the stop; the old desktop
-   may reject the new disjoint window until the client rollout completes:
+   It deliberately leaves the `current` selector, `~/.local/bin/ft`, the service
+   `ExecStart`, the active mux inode, and its PTYs untouched. An inactive host is
+   also left pending: current source has no cross-launcher lifetime lease and
+   therefore no production activation path. A client-only or mixed-build
+   archive fails closed.
+4. **Keep the compatible mux and its PTYs live.** Do not drain or stop work merely
+   to run the current staging command. A future non-guardian migration may
+   require an explicit drain, but no restart is safe while the mux owns work
+   that cannot be recreated.
+5. **Do not activate with this release.** Draining a host does not manufacture
+   the missing lifetime lease, authenticated successor readiness proof, or
+   rollback transaction. Rerunning setup with the same transaction ID only
+   revalidates/replays the immutable pending generation; it does not change
+   `current`, rewrite the unit, start a successor, or restore domain reconnects.
+   Keep the compatible mux running until the guardian-backed activation command
+   is implemented and independently proven. Do not stop the mux and overwrite
+   either component by hand.
 
-   ```bash
-   ssh "$SSH_HOST" 'systemctl --user stop frankenterm-mux-server'
-   ~/.local/bin/ft setup --apply remote "$SSH_HOST" --yes \
-     --install-ft --ft-version "$NEW_TAG"
-   ssh "$SSH_HOST" 'systemctl --user status frankenterm-mux-server --no-pager'
-   ```
-
-6. **Verify the new server, then update the desktop app.** Confirm the server
-   identity through its service status first. Only after every target server is
-   activated should the exact installer replace the still-running compatible
-   GUI bundle:
+6. **Update the desktop app only after a separately proven server rollout.**
+   Current setup cannot supply that activation proof. Once a future
+   lease-authorized rollout has verified every exact running server generation,
+   the exact installer may replace the still-running compatible GUI bundle:
 
    ```bash
    bash install.sh --version "$NEW_TAG"
@@ -238,21 +231,22 @@ When both the maximum and minimum advance, use the maintenance window:
 
 `ft setup remote --install-ft` fences the same split-brain at deployment time.
 With a live mux, either a locally supplied exact process family or a verified
-release-tag family is written to unique `pending-*` paths and the active `ft`
-plus mux-server bytes remain unchanged. Release-tag bytes are first verified in
-a unique non-active cache directory. This prevents a newly activated client
-from becoming unable to speak to the still-running old mux; it does not claim
-to perform the later lossless mux handoff.
+release-tag family is published as one immutable content-derived generation and
+committed as `PendingLiveOwner`; the active selector and running bytes remain
+unchanged. This prevents setup itself from splitting a newly selected client
+from the still-running old mux. It does not perform the later lossless mux
+handoff.
 
 ### 3e. Rollback
 
 For an additive bump, roll components back within the retained compatibility
-window and verify they negotiate the lower dialect. For a breaking bump, reverse
-the breaking-deploy sequence: drain and stop the new server, restore the
-exact transaction-identified `frankenterm-mux-server.previous-*` binary and
-service unit, start the old server, and restore the preserved desktop app/CLI
-until both sides again share a window. Never restart either server generation
-until its live PTYs have been drained.
+window and verify they negotiate the lower dialect. Current remote setup does
+not activate its pending generation, so its safe rollback is simply to leave
+the old selector, service and mux untouched. A future breaking-deploy rollback
+must run under the same lifetime lease, revalidate the retained old immutable
+generation, atomically switch the selector, authenticate the old server's
+readiness, and preserve guardian-owned PTYs throughout. No current manual
+pathname replacement is an authorized substitute.
 
 ## 4. Window invariants
 

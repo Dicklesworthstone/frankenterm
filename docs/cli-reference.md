@@ -152,6 +152,25 @@ ft reproduce export [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
 ft reproduce replay <bundle_dir> [--mode <full|policy|rules>]
 ```
 
+### Session persistence and forensic export
+
+```bash
+ft session dump [--output <path>] [--allow-partial] [-f <auto|plain|json|toon>]
+ft session verify-dump <path> [-f <auto|plain|json|toon>]
+ft session list-durable [--max-entries <n>] [-f <auto|plain|json|toon>]
+ft session export-durable <32-hex-pane-id> [--output <path>] [--max-rows <n>] [--max-total-bytes <n>] [--max-physical-bytes <n>] [-f <auto|plain|json|toon>]
+ft session list-orphans [-f <auto|plain|json|toon>]
+ft session recover <64-hex-pane-uuid> [--output <path>] [--allow-partial] [-f <auto|plain|json|toon>]
+ft session discard <64-hex-pane-uuid> --force [-f <auto|plain|json|toon>]
+```
+
+`recover` is export-only and never writes archived output into a live PTY. It
+rejects an incomplete source or skipped record before creating an artifact
+unless `--allow-partial` is explicit; an opted-in salvage reports `complete:
+false` with the bounded stop reason. `discard` removes only the still-leased,
+identity-revalidated data leaf, synchronizes its pinned parent directory, and
+retains the lock inode to preserve one flock authority.
+
 ### Web server and streaming API
 
 Requires `--features web`.
@@ -206,7 +225,8 @@ ft setup [--list-hosts] [--dry-run] [--apply]
 ft setup local
 ft setup remote <host> [--yes] [--install-ft \
   (--ft-version <release-tag> | \
-   --ft-path <target-ft> --mux-server-path <target-mux-server>)]
+   --ft-path <target-ft> --mux-server-path <target-mux-server>) \
+  --transaction-id <32-lowercase-hex>]
 ft setup config
 ft setup patch [--remove]
 ft setup shell [--remove] [--shell <bash|zsh|fish>]
@@ -219,6 +239,11 @@ ft config set <key> <value> [--dry-run]
 ft config export [-o <path>] [--json]
 ft config import <path> [--dry-run] [--replace] [--yes]
 ```
+
+An applied remote `--install-ft` requires a caller-chosen stable transaction ID;
+reuse that exact ID after timeout or lost acknowledgement. The current command
+publishes a verified immutable pending process-family generation but does not
+activate it, rewrite/start the mux service, or stop a live mux.
 
 ### Data management
 

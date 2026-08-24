@@ -1046,7 +1046,9 @@ ft session dump                  # private, checksummed live pane-content/topolo
 ft session verify-dump <path>    # offline schema/checksum/private-file verification
 ft session list-durable          # discover continuously persisted cold-scrollback panes
 ft session export-durable <id>   # read-only export of one 32-hex durable pane ID
-ft session recover <pane_uuid>   # export an orphan transcript; never write it to a PTY
+ft session recover <pane_uuid>   # export a complete orphan transcript; never write it to a PTY
+ft session recover <pane_uuid> --allow-partial # explicitly retain a reported partial salvage
+ft session discard <pane_uuid> --force         # remove only the leased data leaf; retain its lock inode
 ft watch                         # start the persistence/observation lifecycle; may prune retained data
 ```
 
@@ -1089,7 +1091,15 @@ is not an executable process checkpoint.
 
 `ft session recover` is intentionally export-only. Historical terminal output
 is output, not shell input: recovery never creates or splits a live pane and
-never sends archive bytes through a PTY input channel.
+never sends archive bytes through a PTY input channel. It preserves the
+header-declared source-completeness result and refuses to publish an incomplete
+source or a transcript with skipped records unless `--allow-partial` is
+explicit. An authorized partial artifact reports `complete: false` and the
+finite terminal reason; it is never promoted to a complete recovery. `ft
+session discard --force` holds the same recovery lease through descriptor- and
+identity-checked unlink plus parent-directory synchronization. It deliberately
+retains the private lock inode so a competing writer cannot create a second
+flock authority while the operation is retiring.
 
 `ft snapshot restore <id> --dry-run` reads a bounded checkpoint descriptor and
 prints a metadata-only descriptor/status report. It does not load a full restorable projection and
@@ -2772,7 +2782,11 @@ The resource-cockpit conformance lane is the e2e script [`tests/e2e/test_ft_rz0e
 
 - **Command transport** — typed scope + kind enums (`CommandScope`, `CommandKind`), with deduplication on the wire (`CommandDeduplicator`) to avoid double-execution under retry.
 - **Topology orchestrator** — layout templates + template registry; the orchestrator decides where to place new panes based on the registered topology spec.
-- **Durable state checkpoints** — `DurableStateManager` snapshots topology + per-pane state to disk; rollback / diff operations are exposed for incident recovery.
+- **In-process federation checkpoints** — `DurableStateManager` keeps bounded
+  lifecycle-registry checkpoints and optional topology in memory for rollback
+  and diff operations. It can encode/decode checkpoint JSON, but no production
+  disk writer/loader is wired, and it does not preserve terminal bytes, PTYs,
+  or child processes.
 - **Federation router** — outbound mux events are routed to the right federated participant; inbound events are stamped with origin metadata.
 
 ### Why a separate headless server

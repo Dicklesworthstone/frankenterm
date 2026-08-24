@@ -266,15 +266,23 @@ legacy `ftsl1`/`ftsl2` redact-before-encode framing that is not cryptographicall
 authenticated, and raw legacy rows whose pre-persistence redaction is unknown;
 those categories account for every retained row. The older `ft session recover`
 command remains specific to the separate 64-hex flat mmap orphan format; format
-identity is never guessed from content.
+identity is never guessed from content. Recovery preserves whether decoding
+reached the header-declared committed cursor. By default an incomplete source
+or any skipped record is rejected before a transcript is created; an operator
+must pass `--allow-partial` to retain that explicitly incomplete salvage, whose
+structured result remains `complete: false` and includes the finite stop
+reason. `ft session discard --force` removes only the still-leased,
+identity-revalidated data leaf, synchronizes its pinned parent, and retains the
+private lock inode to prevent split flock authority.
 
 Guardian raw-output v3 uses a keyed authenticated 176-byte header. A complete
 legacy 160-byte v1 header is reported as unsupported and left byte-for-byte
 untouched; it is never treated as a torn v3 header or shifted in place. Any
 future legacy migration must conservatively read bounded legacy records into a
 fresh v3 successor or a separately verified serialized artifact while retaining
-the original evidence. The input journal similarly rejects ambiguous v1
-fieldless `Durable` records rather than inventing full-write certainty.
+the original evidence. Guardian input v3 similarly rejects ambiguous v1
+fieldless `Durable` records rather than inventing full-write certainty, and it
+rejects v2 logs because they lack the authenticated guardian-incarnation bind.
 
 This continuous spill is not yet a complete pane image: it covers cold/evicted
 rows, while the current hot viewport, terminal parser/render state, PTY handles,
@@ -621,10 +629,16 @@ partial input write is therefore committed as `accepted_not_durable` and
 reconciled by its exact effect UUID; it must never be reported as a safely
 retryable callback failure.
 
-The typed input and checkpoint transaction paths implement that stronger
-pre-reserved commit pattern. The generic in-memory transaction path for
-`Spawn`, `Resize`, `Signal`, live-pane `Close`, `Claim`, and `RetireLease` now
-pre-reserves its receipt maps, reverse indexes, protected identities, and
+The typed input and checkpoint protocol primitives implement that stronger
+pre-reserved commit pattern. Live guardian `Input` dispatch is nevertheless
+fail-closed before protocol admission, journal I/O, or a PTY write: the current
+transport requires an immediate response on its sole readiness thread and has
+no bounded delayed-response continuation owner. `GuardianService` exposes the
+content-free `input_activation_rejections` counter so operators and tests can
+distinguish this activation fence from transport loss. The generic in-memory
+transaction path for `Spawn`, `Resize`, `Signal`, live-pane `Close`, `Claim`,
+and `RetireLease` now pre-reserves its receipt maps, reverse indexes, protected
+identities, and
 queues and installs a conservative pane quarantine before invoking the external
 callback. A definitely-not-applied result restores the exact prior pane state;
 an applied result commits the already-reserved receipt; and a panic or
@@ -644,36 +658,57 @@ effect recovery, operation-specific reconciliation of ambiguous outcomes, and
 mutation-sensitive crash/fault cuts prove that no observable effect can execute
 twice across guardian restart.
 
-The guardian input-effect journal makes that callback rule crash-safe without
-persisting raw keystrokes. For each input it synchronizes the encrypted exact
-identity and then a conservative `accepted_not_durable` marker before calling
-any PTY write that could expose bytes. Only a newly committed Accepted record
-yields the opaque one-shot PTY-write permit; reconciliation of an exact, alias,
-or stale retry returns the current disposition and cannot authorize another
-write. A definitely zero-byte result may refine that marker to
-`known_not_applied`; a proven complete result becomes `durable_full`; a proven
-partial result records the exact nonzero `durable_prefix { applied_bytes }`;
+The guardian input-effect journal is a withheld storage primitive for making
+that callback rule crash-safe without persisting raw keystrokes. Before it can
+publish a new Intent, it reserves record, byte, and sequence capacity for the
+complete Intent + `accepted_not_durable` + terminal lifecycle, including every
+follow-up already promised to another incomplete effect. Capacity exhaustion
+therefore occurs before a write permit can exist. For each admitted input the
+primitive synchronizes the encrypted exact identity and then a conservative
+`accepted_not_durable` marker before any PTY write that could expose bytes. Only
+a newly committed Accepted record yields the opaque one-shot PTY-write permit;
+reconciliation of an exact, alias, or stale retry returns the current
+disposition and cannot authorize another write. Raw WAL append and
+permit-conversion APIs are mux-crate-private; the guardian uses only the public
+transaction and outcome-commit seams. A definitely zero-byte result
+may refine that marker to `known_not_applied`; a proven complete result becomes
+`durable_full`; a proven partial result records the exact nonzero
+`durable_prefix { applied_bytes }`;
 otherwise it remains conservatively pending. Total input length and applied
-count are authenticated and flow through an opaque terminal permit into the
-protocol, so journal and reply cannot disagree. The payload
+count are authenticated and flow through opaque journal-backed protocol
+completion authority, so journal and reply cannot disagree. The payload
 SHA-256 is encrypted rather than written as plaintext because low-entropy key
 events are dictionary-testable. The input log uses an input-domain-separated
 AEAD surface of the activated guardian journal key; rotation must retain an old
 key generation while either an output segment or input log still references
-it. Each fixed-size v2 record authenticates its clear framing and predecessor
-digest, and recovery enforces monotonic journal order,
+it. The v3 header binds the exact nonzero guardian incarnation, and every v3
+record includes that incarnation and durable pane in both its AEAD associated
+data and chained outer digest. A journal transplanted from another incarnation
+therefore fails before recovery. Each fixed-size v3 record authenticates its
+clear framing and predecessor digest, and scanning enforces monotonic journal
+order,
 lease-generation input order, exact legal transitions, bounded effect/record
 counts, and immutable torn-tail preservation. Per-phase synchronized receipts
 make an exact publication retry idempotent after acknowledgement loss. This is
-currently a storage primitive: until guardian runtime recovery rehydrates the
-protocol state and owns the PTY write sequence, it is not live input-durability
-or mux-crash continuity evidence.
+currently a storage primitive, not an active runtime path. Activation requires
+a bounded per-pane ordered worker/continuation pipeline that owns response
+correlation after the readiness callback returns. Restart recovery additionally
+requires a durable anti-rollback high-water authority: accepting only a valid
+file prefix is insufficient because removal of a terminal suffix could otherwise
+make executed input appear safely unapplied. Accordingly, a scanned Intent maps
+to `disposition_unavailable`, every reopened log (including a valid header-only
+prefix) withholds append authority, and only exact idempotent receipt reads
+remain available. Until both mechanisms land and mutation-sensitive crash cuts
+pass, the runtime rejects `Input`; this is not live input-durability or
+mux-crash continuity evidence.
 
 The older v1 journal first appeared after the latest tagged release and is not
-wired by any non-test runtime caller. Its fieldless `Durable` state cannot prove
-full versus partial application, so v2 recovery rejects it as ambiguous. If an
-untagged build produced such a file, it must be quarantined or migrated
-conservatively; it must never be promoted to `durable_full`.
+wired by any released runtime caller. Its fieldless `Durable` state cannot prove
+full versus partial application, so v3 scanning rejects it as ambiguous. The v2
+format has exact dispositions but no authenticated guardian-incarnation binding,
+so v3 also preserves and rejects it. If an untagged build produced either file,
+it must be quarantined or migrated conservatively under an offline authority;
+it must never be promoted to `durable_full` merely because its prefix parses.
 
 The per-pane protocol state machine is finite and explicit:
 
@@ -791,7 +826,9 @@ state, or running-agent continuity. Pane IDs are mux-incarnation-local unless a
 source supplies stronger domain authority; the artifact records that provenance
 instead of claiming stable cross-restart identity. `ft session recover
 <pane_uuid>` likewise exports a redacted orphan transcript to a new file; it
-does not replay archived output into a live pane or PTY.
+does not replay archived output into a live pane or PTY. It refuses an
+incomplete or record-skipping export unless `--allow-partial` is explicit and
+never labels an opted-in salvage complete.
 
 Use `--dry-run`; `--layout-only` is currently a reserved no-op and the output
 is only the bounded descriptor/status report:

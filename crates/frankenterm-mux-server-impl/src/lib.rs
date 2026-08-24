@@ -1106,6 +1106,34 @@ fn expected_live_scrollback_logical_ledger_digest(
     Ok(digest)
 }
 
+fn expected_live_scrollback_v4_chain(
+    manifest: &LiveScrollbackManifestV1,
+) -> anyhow::Result<([u8; 32], [u8; 32])> {
+    anyhow::ensure!(
+        manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4,
+        "incremental chain requires a v4 manifest"
+    );
+    let anchor = decode_live_scrollback_canonical_digest(
+        manifest
+            .chain_anchor_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("v4 chain anchor is missing"))?,
+        "v4 chain anchor",
+    )?;
+    let tail = decode_live_scrollback_canonical_digest(
+        manifest
+            .chain_tail_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("v4 chain tail is missing"))?,
+        "v4 chain tail",
+    )?;
+    anyhow::ensure!(
+        manifest.retained_rows != 0 || anchor == tail,
+        "empty v4 retained interval has unequal anchor and tail commitments"
+    );
+    Ok((anchor, tail))
+}
+
 fn live_scrollback_logical_ledger_digest_from_records(
     manifest: &LiveScrollbackManifestV1,
     ledger_pane_id: u64,
@@ -1160,21 +1188,54 @@ fn verify_live_scrollback_logical_ledger_digest_from_snapshot(
                 snapshot.records.as_slice(),
             )
         };
-    let observed = live_scrollback_logical_ledger_digest_from_records(
-        manifest,
-        ledger_pane_id,
-        oldest,
-        next,
-        retained_bytes,
-        committed_bytes,
-        sequence_bytes,
-        records,
-    )?;
+    if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 {
+        let observed = live_scrollback_logical_ledger_digest_from_records(
+            manifest,
+            ledger_pane_id,
+            oldest,
+            next,
+            retained_bytes,
+            committed_bytes,
+            sequence_bytes,
+            records,
+        )?;
+        anyhow::ensure!(
+            observed == expected_live_scrollback_logical_ledger_digest(manifest)?,
+            "authenticated v3 logical ledger digest mismatch"
+        );
+        return Ok(observed);
+    }
+
     anyhow::ensure!(
-        observed == expected_live_scrollback_logical_ledger_digest(manifest)?,
-        "authenticated v3 logical ledger digest mismatch"
+        manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
+            && manifest.oldest_seq == oldest
+            && manifest.next_seq == next
+            && manifest.retained_rows == u64::try_from(records.len())?
+            && manifest.retained_record_bytes == Some(retained_bytes)
+            && manifest.committed_log_bytes == Some(committed_bytes)
+            && manifest.committed_sequence_bytes == Some(sequence_bytes),
+        "v4 ledger facts disagree with the authenticated manifest"
     );
-    Ok(observed)
+    let (anchor, expected_tail) = expected_live_scrollback_v4_chain(manifest)?;
+    let mut observed_tail = anchor;
+    if let Some(oldest) = oldest {
+        for (offset, record) in records.iter().enumerate() {
+            let sequence = oldest
+                .checked_add(u64::try_from(offset)?)
+                .ok_or_else(|| anyhow::anyhow!("v4 snapshot sequence overflows"))?;
+            observed_tail = live_scrollback_incremental_chain_next(
+                observed_tail,
+                ledger_pane_id,
+                sequence,
+                record,
+            )?;
+        }
+    }
+    anyhow::ensure!(
+        observed_tail == expected_tail,
+        "authenticated v4 incremental-chain mismatch"
+    );
+    Ok(observed_tail)
 }
 
 fn live_scrollback_cleared_manifest_is_canonical(

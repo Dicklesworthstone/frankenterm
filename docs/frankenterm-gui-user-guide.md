@@ -193,20 +193,39 @@ The built-in reconnect supervisor applies three states:
 - remembered detached: do not auto-connect that domain, even when its
   `connect_automatically` setting is true.
 
-An explicit later attach or detach replaces the remembered choice before the
-mux mutation begins, so an unreachable domain can still retain the operator's
-desired state. A Lua script that later calls `domain:attach()` is itself an
+An explicit attach begins its requested transport first, then records the
+attached preference in a detached best-effort task after the transport outcome
+is known; that optional disk work does not block the requested pane spawn. A
+slow or contended manifest can therefore no longer make a direct `trj`/`csd`
+open appear inert on the normally admitted path. If the main-thread scheduler
+rejects the detached persistence task after transport has already succeeded,
+FrankenTerm uses an inline persistence fallback rather than silently losing
+the preference; only that saturation fallback can delay pane creation. This
+includes a tab, window, or split spawn that selects a
+detached client domain, any supported detachable-domain floating spawn, and
+the `frankenterm-gui start --domain`
+handoff to an already-running GUI. All of those implicit attach sites pass
+through the same mux-owned lifecycle hook. The same attached preference is
+attempted after a failed dial so a proven record can authorize retry. Detach uses the stricter
+opposite order: its detached preference must be durable before the live mux is
+mutated, preventing an older attached record from reconnecting behind the
+operator's back. A Lua script that later calls `domain:attach()` is itself an
 explicit attach and changes a remembered detached state back to attached; a
 periodic user-authored Lua watchdog therefore remains authoritative over its
-own actions. If a command-palette or Lua attach cannot reach the mux, the failed
-attempt releases its single-flight transport claim before FrankenTerm rebuilds
-the supervisor with that exact remembered domain in its retry frontier. A Lua
-detach fences the old supervisor generation immediately after the detached
-intent is durable, so a stale retry cannot undo the operator's choice. All
+own actions. If a command-palette or Lua attach cannot reach the mux,
+FrankenTerm advertises an exact automatic-retry handoff only when the requested
+domain is actually retained by durable/configured authority and an admitted
+supervisor frontier. A Lua detach fences the old supervisor generation
+immediately after the detached intent is durable, so a stale retry cannot undo
+the operator's choice. All
 attach, detach, startup, retry, and configuration-reload actions for the same
 domain alias are ticket-ordered through persistence, mux mutation, and retry
-handoff; cancelling a queued action cannot let its successor overtake the
-currently active action. Different domains remain independent, with separate
+handoff. An uncancellable persistence worker carries a shared hold on the
+exact lifecycle ticket. An implicit-spawn lease holds that ticket through the
+pane transaction while its detached persistence worker publishes or
+invalidates in-memory authority. Cancelling a queued or awaiting GUI/Lua/RPC
+action therefore cannot let its durable effect
+overtake a successor or leave a stale supervisor authorized. Different domains remain independent, with separate
 health discovery and backoff, so an unavailable domain cannot starve a newly
 detached peer. A successful explicit attach refreshes the remembered supervisor
 plan as well as the live connection, preserving automatic recovery if the
@@ -214,12 +233,22 @@ connection's internal retry budget is later exhausted.
 
 If an intent write reports a late failure, FrankenTerm reloads the replicated
 authority before deciding what happened. A two-replica commit is repaired and
-accepted only when the recovered quorum contains the exact requested intent; a
-pre-commit failure republishes the proven older quorum and leaves the requested
-live mutation unperformed. If the reload itself cannot establish a quorum, the
+accepted only when the recovered quorum contains the exact requested intent. A
+pre-commit detach failure republishes the proven older quorum and leaves the
+requested live detach unperformed; an explicit attach remains usable but is
+reported as not remembered. If the reload itself cannot establish a quorum, the
 in-memory snapshot is cleared and the reconnect supervisor is cancelled. An
 explicit attach may still continue as a direct operator action, but it is not
 advertised as remembered and cannot inherit stale automatic-reconnect state.
+Fresh authority is created in a dedicated owner-only
+`frankenterm-domain-reconnect-private-v1` leaf beneath the legacy data root, so
+installations whose shared data root has broader directory permissions can use
+automatic reconnect without weakening that parent mode. An existing schema-v1
+authority in the legacy data root is discovered before the private leaf is
+created and is migrated in place; this preserves the exact location that older
+FrankenTerm binaries used instead of silently abandoning remembered domains.
+If both namespaces contain slot evidence, startup fails closed before repairing
+or writing either one.
 
 Hot configuration reload retires an old exact client-domain generation before
 publishing its replacement, but continues adding unrelated domains and a safe
@@ -235,16 +264,24 @@ successfully reloading the configuration resumes it. Temporary main-thread
 scheduler saturation is retained by one serialized retry coordinator, and a
 thread that failed to start is never reported as a pending reconnect.
 
-The preference is stored under FrankenTerm's mode-0700 private data directory
-in three replicated, mode-0600 checksummed files. Schema v2 requires two exact
-replicas of the same complete generation before that state is authoritative. A
+The preference is stored in three replicated, mode-0600 checksummed files. New
+installations use the dedicated mode-0700 private leaf named above; an upgraded
+installation with legacy root-slot evidence keeps those files in the existing
+owner-only root namespace during and after migration. Schema v2 requires two
+exact replicas of the same complete generation before that state is authoritative. A
 higher-generation singleton is an interrupted publication and cannot displace
 the older two-replica quorum. A preference update reports success only after
 all three replicas have been written, synchronized, read back, and verified.
 On load, FrankenTerm repairs a missing, damaged, or stale replica only from an
 already authoritative quorum. If no quorum remains, reconnect is paused and
 the fault is reported; the loader does not select an older generation or fall
-back to `connect_automatically`.
+back to `connect_automatically`. Within one GUI lifetime it also retains the
+full content identity of the highest accepted generation. A lower quorum is
+rejected before replica repair or intent writes can overwrite surviving
+high-water evidence; the exact retained quorum may restore service. Two
+different quorums at the same generation poison that generation for the
+process lifetime, however, and reconnect stays paused until a strictly newer
+durable generation is proven.
 
 Existing schema-v1 two-slot state is migrated in place while holding the same
 exclusive authority lock. Migration accepts either two valid legacy slots (the

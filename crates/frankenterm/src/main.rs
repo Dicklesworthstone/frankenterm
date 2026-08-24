@@ -133,6 +133,9 @@ atomic-component: {}",
 #[cfg(feature = "mcp")]
 mod mcp;
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod remote_upgrade_ledger;
+
 static CLAP_VERSION: LazyLock<String> = LazyLock::new(build_meta::short_version);
 
 /// FrankenTerm - swarm-native terminal platform for AI agents
@@ -1301,6 +1304,7 @@ SEE ALSO:
     ft setup config --apply           Patch wezterm.lua with generated ft block
     ft setup shell --apply            Install OSC 133 shell markers
     ft setup font --apply             Install bundled Pragmasevka Nerd Font
+    ft setup remote host --apply --install-ft --ft-version v0.15.2 --transaction-id 0123456789abcdef0123456789abcdef
     ft setup --dry-run                Preview all setup changes
 
 SEE ALSO:
@@ -6144,6 +6148,10 @@ enum SetupCommands {
         #[arg(long)]
         ft_version: Option<String>,
 
+        /// Stable 32-lowercase-hex upgrade transaction ID (required for an applied install)
+        #[arg(long, requires = "install_ft")]
+        transaction_id: Option<String>,
+
         /// Timeout per remote command (seconds)
         #[arg(long, default_value = "30")]
         timeout_secs: u64,
@@ -6658,6 +6666,67 @@ enum SnapshotCommands {
     },
 }
 
+#[derive(Debug, Clone, Copy, Args)]
+struct LegacyRecoveryLimitArgs {
+    /// Maximum candidate data or unrelated leaves admitted during discovery
+    #[arg(
+        long,
+        default_value_t = frankenterm_core::scrollback_mmap_recovery::DEFAULT_MAX_RECOVERY_DIRECTORY_ENTRIES
+    )]
+    max_directory_entries: usize,
+
+    /// Maximum physical bytes admitted for one legacy scrollback file
+    #[arg(
+        long,
+        default_value_t = frankenterm_core::scrollback_mmap_recovery::DEFAULT_MAX_RECOVERY_FILE_BYTES
+    )]
+    max_file_bytes: u64,
+
+    /// Maximum records decoded from one legacy scrollback file
+    #[arg(
+        long,
+        default_value_t = frankenterm_core::scrollback_mmap_recovery::DEFAULT_MAX_RECOVERY_RECORDS
+    )]
+    max_records: usize,
+
+    /// Maximum UTF-8 replay chunks admitted to one recovery plan
+    #[arg(
+        long,
+        default_value_t = frankenterm_core::scrollback_mmap_recovery::DEFAULT_MAX_RECOVERY_REPLAY_CHUNKS
+    )]
+    max_replay_chunks: usize,
+
+    /// Maximum aggregate decoded payload bytes admitted to one recovery
+    #[arg(
+        long,
+        default_value_t = frankenterm_core::scrollback_mmap_recovery::DEFAULT_MAX_RECOVERY_PAYLOAD_BYTES
+    )]
+    max_payload_bytes: u64,
+
+    /// Maximum redacted transcript bytes retained by one recovery
+    #[arg(
+        long,
+        default_value_t = frankenterm_core::scrollback_mmap_recovery::DEFAULT_MAX_RECOVERY_TRANSCRIPT_BYTES
+    )]
+    max_transcript_bytes: usize,
+}
+
+impl LegacyRecoveryLimitArgs {
+    fn validate(
+        self,
+    ) -> std::io::Result<frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits> {
+        frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits {
+            max_directory_entries: self.max_directory_entries,
+            max_file_bytes: self.max_file_bytes,
+            max_records: self.max_records,
+            max_replay_chunks: self.max_replay_chunks,
+            max_payload_bytes: self.max_payload_bytes,
+            max_transcript_bytes: self.max_transcript_bytes,
+        }
+        .validate()
+    }
+}
+
 #[derive(Subcommand)]
 enum SessionCommands {
     /// List saved sessions with bounded pagination
@@ -6816,6 +6885,10 @@ enum SessionCommands {
 
     /// List crash-safe scrollback files not owned by a live process
     ListOrphans {
+        /// Finite discovery/read/replay resource envelope
+        #[command(flatten)]
+        recovery_limits: LegacyRecoveryLimitArgs,
+
         /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
@@ -6830,12 +6903,20 @@ enum SessionCommands {
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
+        /// Retain an explicitly incomplete transcript or one with skipped records
+        #[arg(long)]
+        allow_partial: bool,
+
+        /// Finite discovery/read/replay resource envelope
+        #[command(flatten)]
+        recovery_limits: LegacyRecoveryLimitArgs,
+
         /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
 
-    /// Discard an orphaned scrollback file and its advisory lock
+    /// Discard an orphaned scrollback file while retaining its advisory lock inode
     Discard {
         /// 64-character pane UUID / scrollback file stem
         pane_uuid: String,
@@ -6843,6 +6924,10 @@ enum SessionCommands {
         /// Skip confirmation
         #[arg(long)]
         force: bool,
+
+        /// Finite discovery/read/replay resource envelope
+        #[command(flatten)]
+        recovery_limits: LegacyRecoveryLimitArgs,
 
         /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
@@ -62051,6 +62136,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         ft_path,
                         mux_server_path,
                         ft_version,
+                        transaction_id,
                         timeout_secs,
                     } => {
                         let options = RemoteSetupOptions {
@@ -62061,6 +62147,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             ft_path: ft_path.as_deref(),
                             mux_server_path: mux_server_path.as_deref(),
                             ft_version: ft_version.as_deref(),
+                            transaction_id: transaction_id.as_deref(),
                             timeout_secs,
                             verbose: cli.verbose,
                         };
@@ -62092,6 +62179,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     },
                                 },
                                 transaction_id: &transaction_id,
+                                #[cfg(test)]
                                 activate_current: false,
                             },
                         )?;
@@ -74980,10 +75068,27 @@ async fn handle_session_command(
             }
         }
 
-        SessionCommands::ListOrphans { format } => {
+        SessionCommands::ListOrphans {
+            recovery_limits,
+            format,
+        } => {
             let output_format = resolve_session_orphan_output_format(&format);
+            let limits = recovery_limits.validate().unwrap_or_else(|error| {
+                exit_session_export_error(
+                    "session.orphan_invalid_limits",
+                    &format!("invalid legacy recovery resource limits: {error}"),
+                    output_format,
+                )
+            });
             let scrollback_dir = default_scrollback_recovery_dir();
-            let candidates = scan_session_orphans_for_cli(&scrollback_dir)?;
+            let candidates = scan_session_orphans_for_cli(&scrollback_dir, limits)
+                .unwrap_or_else(|error| {
+                    exit_session_export_error(
+                        "session.orphan_scan_failed",
+                        &format!("{error:#}"),
+                        output_format,
+                    )
+                });
             let items = session_orphan_candidates_json(&candidates);
 
             if output_format.is_structured() {
@@ -75036,45 +75141,113 @@ async fn handle_session_command(
         SessionCommands::Recover {
             pane_uuid,
             output,
+            allow_partial,
+            recovery_limits,
             format,
         } => {
             let output_format = resolve_session_orphan_output_format(&format);
+            let limits = recovery_limits.validate().unwrap_or_else(|error| {
+                exit_session_export_error(
+                    "session.orphan_invalid_limits",
+                    &format!("invalid legacy recovery resource limits: {error}"),
+                    output_format,
+                )
+            });
             let scrollback_dir = default_scrollback_recovery_dir();
-            let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid)
-                .unwrap_or_else(|err| exit_session_orphan_error(&err, output_format));
+            let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid, limits)
+                .unwrap_or_else(|error| exit_session_orphan_error(&error, output_format));
 
             if !matches!(
-                candidate.state,
+                &candidate.state,
                 frankenterm_core::scrollback_mmap_recovery::OrphanState::Orphaned
             ) {
                 let err = session_orphan_recoverability_error(&candidate, &pane_uuid)
                     .expect("non-orphaned candidate must not be recoverable");
-                exit_session_orphan_error(&err, output_format);
+                exit_session_export_error(
+                    "session.orphan_not_recoverable",
+                    &err,
+                    output_format,
+                );
             }
 
-            let replay_records =
-                frankenterm_core::scrollback_mmap_writer::read_linear_records(&candidate.path)
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "Failed to read scrollback mmap records from {}: {err}",
-                            candidate.path.display()
-                        )
-                    })?;
+            let snapshot = candidate.read_records(limits).unwrap_or_else(|error| {
+                exit_session_export_error(
+                    "session.orphan_read_failed",
+                    &format!(
+                        "failed to read bounded scrollback mmap records from {} under the retained recovery lease: {error}",
+                        candidate.path.display()
+                    ),
+                    output_format,
+                )
+            });
             let replay_plan =
-                frankenterm_core::scrollback_mmap_recovery::MmapReplayPlan::from_records(
-                    replay_records,
+                frankenterm_core::scrollback_mmap_recovery::MmapReplayPlan::from_snapshot(
+                    snapshot,
                     frankenterm_core::scrollback_mmap_recovery::DEFAULT_REPLAY_CHUNK_BYTES,
+                    limits,
+                )
+                .unwrap_or_else(|error| {
+                    exit_session_export_error(
+                        "session.orphan_plan_failed",
+                        &format!(
+                            "failed to build a bounded scrollback replay plan for {}: {error}",
+                            candidate.path.display()
+                        ),
+                        output_format,
+                    )
+                });
+            let recovery_complete = matches!(
+                replay_plan.status(),
+                frankenterm_core::scrollback_mmap_recovery::MmapReplayStatus::Empty
+                    | frankenterm_core::scrollback_mmap_recovery::MmapReplayStatus::Replayed
+            );
+            if !recovery_complete && !allow_partial {
+                let err = format!(
+                    "scrollback {pane_uuid} recovery is {} because the bounded source is {} or contains skipped records; no transcript was written (rerun with --allow-partial to retain the explicitly incomplete salvage)",
+                    replay_plan.status().as_str(),
+                    replay_plan.source_completeness.as_str(),
                 );
+                exit_session_export_error(
+                    "session.orphan_recovery_partial_requires_opt_in",
+                    &err,
+                    output_format,
+                );
+            }
 
             let output_path = output.unwrap_or_else(|| default_orphan_transcript_path(&pane_uuid));
-            let mut decoded_transcript = String::with_capacity(replay_plan.bytes_replayed);
+            let mut decoded_transcript = String::new();
+            decoded_transcript
+                .try_reserve_exact(replay_plan.bytes_replayed)
+                .unwrap_or_else(|_| {
+                    exit_session_export_error(
+                        "session.orphan_allocation_failed",
+                        "bounded scrollback transcript allocation failed",
+                        output_format,
+                    )
+                });
             for chunk in &replay_plan.chunks {
                 decoded_transcript.push_str(&chunk.text);
             }
             let transcript = frankenterm_core::redactor::Redactor::new()
                 .redact(&decoded_transcript)
                 .into_bytes();
-            write_new_private_artifact(&output_path, &transcript)?;
+            if transcript.len() > limits.max_transcript_bytes {
+                exit_session_export_error(
+                    "session.orphan_redacted_limit_exceeded",
+                    &format!(
+                        "redacted scrollback transcript exceeds the {} byte recovery cap",
+                        limits.max_transcript_bytes
+                    ),
+                    output_format,
+                );
+            }
+            write_new_private_artifact(&output_path, &transcript).unwrap_or_else(|error| {
+                exit_session_export_error(
+                    "session.orphan_artifact_write_failed",
+                    &format!("failed to write the private recovery artifact: {error:#}"),
+                    output_format,
+                )
+            });
             let transcript_sha256 = sha256_hex(&transcript);
             tracing::info!(
                 pane_uuid = %pane_uuid,
@@ -75087,6 +75260,8 @@ async fn handle_session_command(
                 "ok": true,
                 "action": "recover",
                 "mode": "export_only",
+                "complete": recovery_complete,
+                "partial_retention_authorized": !recovery_complete && allow_partial,
                 "pane_uuid": &pane_uuid,
                 "source_path": candidate.path.display().to_string(),
                 "output_path": output_path.display().to_string(),
@@ -75106,6 +75281,10 @@ async fn handle_session_command(
                 println!("  Output:  {}", output_path.display());
                 println!("  SHA-256: {transcript_sha256}");
                 println!("  Safety:  no live pane or PTY was mutated");
+                println!(
+                    "  Completeness: {}",
+                    replay_plan.source_completeness.as_str()
+                );
                 println!(
                     "  Export:  {} ({} of {} records, {} of {} bytes, {} chunks)",
                     replay_plan.status().as_str(),
@@ -75132,59 +75311,68 @@ async fn handle_session_command(
         SessionCommands::Discard {
             pane_uuid,
             force,
+            recovery_limits,
             format,
         } => {
             let output_format = resolve_session_orphan_output_format(&format);
+            let limits = recovery_limits.validate().unwrap_or_else(|error| {
+                exit_session_export_error(
+                    "session.orphan_invalid_limits",
+                    &format!("invalid legacy recovery resource limits: {error}"),
+                    output_format,
+                )
+            });
             if !force {
                 let err = format!("discard requires --force for scrollback {pane_uuid}");
-                exit_session_orphan_error(&err, output_format);
+                exit_session_export_error(
+                    "session.orphan_discard_confirmation_required",
+                    &err,
+                    output_format,
+                );
             }
 
             let scrollback_dir = default_scrollback_recovery_dir();
-            let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid)
-                .unwrap_or_else(|err| exit_session_orphan_error(&err, output_format));
+            let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid, limits)
+                .unwrap_or_else(|error| exit_session_orphan_error(&error, output_format));
             if let Some(err) = session_orphan_discardability_error(&candidate, &pane_uuid) {
-                exit_session_orphan_error(&err, output_format);
+                exit_session_export_error(
+                    "session.orphan_not_discardable",
+                    &err,
+                    output_format,
+                );
             }
-            let lock_path = candidate.path.with_extension("bin.lock");
-
-            std::fs::remove_file(&candidate.path).map_err(|err| {
-                anyhow::anyhow!(
-                    "Failed to remove scrollback file {}: {err}",
-                    candidate.path.display()
+            let receipt = candidate.discard().unwrap_or_else(|error| {
+                exit_session_export_error(
+                    "session.orphan_discard_failed",
+                    &format!(
+                        "failed to discard the identity-bound scrollback orphan: {error}"
+                    ),
+                    output_format,
                 )
-            })?;
-            let lock_removed = match std::fs::remove_file(&lock_path) {
-                Ok(()) => true,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-                Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to remove scrollback lock {}: {err}",
-                        lock_path.display()
-                    ));
-                }
-            };
+            });
 
             let payload = serde_json::json!({
                 "ok": true,
                 "action": "discard",
                 "pane_uuid": pane_uuid,
                 "removed": {
-                    "bin": candidate.path.display().to_string(),
-                    "lock": if lock_removed {
-                        Some(lock_path.display().to_string())
-                    } else {
-                        None
-                    },
+                    "bin": receipt.data_path.display().to_string(),
                 },
+                "retained": {
+                    "lock": receipt.retained_lock_path.display().to_string(),
+                    "reason": "preserve_single_flock_inode_authority",
+                },
+                "directory_synced": receipt.directory_synced,
             });
 
             if !print_snapshot_session_structured_output(&payload, output_format)? {
                 println!("Discarded scrollback orphan {pane_uuid}");
-                println!("  Removed: {}", candidate.path.display());
-                if lock_removed {
-                    println!("  Removed: {}", lock_path.display());
-                }
+                println!("  Removed:  {}", receipt.data_path.display());
+                println!(
+                    "  Retained: {} (preserves the single flock inode authority)",
+                    receipt.retained_lock_path.display()
+                );
+                println!("  Durable:  parent directory synchronized");
             }
         }
     }
@@ -77331,13 +77519,21 @@ fn resolve_session_orphan_output_format(format: &str) -> SnapshotSessionOutputFo
 
 fn scan_session_orphans_for_cli(
     scrollback_dir: &Path,
+    limits: frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits,
 ) -> anyhow::Result<Vec<frankenterm_core::scrollback_mmap_recovery::OrphanCandidate>> {
     use frankenterm_core::scrollback_mmap_recovery::{FlockLockProbe, scan_orphans};
 
-    if !scrollback_dir.exists() {
-        return Ok(Vec::new());
+    match std::fs::symlink_metadata(scrollback_dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "Failed to inspect scrollback recovery directory {}: {error}",
+                scrollback_dir.display()
+            ));
+        }
     }
-    scan_orphans(scrollback_dir, &FlockLockProbe).map_err(|err| {
+    scan_orphans(scrollback_dir, &FlockLockProbe, limits).map_err(|err| {
         anyhow::anyhow!(
             "Failed to scan scrollback directory {}: {err}",
             scrollback_dir.display()
@@ -77345,26 +77541,44 @@ fn scan_session_orphans_for_cli(
     })
 }
 
+#[derive(Debug)]
+struct SessionOrphanLookupError {
+    error_code: &'static str,
+    message: String,
+}
+
 fn find_session_orphan_candidate(
     scrollback_dir: &Path,
     pane_uuid: &str,
-) -> Result<frankenterm_core::scrollback_mmap_recovery::OrphanCandidate, String> {
+    limits: frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits,
+) -> Result<
+    frankenterm_core::scrollback_mmap_recovery::OrphanCandidate,
+    SessionOrphanLookupError,
+> {
     if !is_valid_scrollback_pane_uuid(pane_uuid) {
-        return Err(format!(
-            "invalid pane_uuid '{pane_uuid}' (expected 64 lowercase hex characters)"
-        ));
+        return Err(SessionOrphanLookupError {
+            error_code: "session.orphan_invalid_id",
+            message: format!(
+                "invalid pane_uuid '{pane_uuid}' (expected 64 lowercase hex characters)"
+            ),
+        });
     }
 
-    let candidates =
-        scan_session_orphans_for_cli(scrollback_dir).map_err(|err| format!("{err}"))?;
+    let candidates = scan_session_orphans_for_cli(scrollback_dir, limits).map_err(|error| {
+        SessionOrphanLookupError {
+            error_code: "session.orphan_scan_failed",
+            message: format!("{error:#}"),
+        }
+    })?;
     candidates
         .into_iter()
         .find(|candidate| session_orphan_candidate_uuid(candidate).as_deref() == Some(pane_uuid))
-        .ok_or_else(|| {
-            format!(
+        .ok_or_else(|| SessionOrphanLookupError {
+            error_code: "session.orphan_not_found",
+            message: format!(
                 "scrollback orphan {pane_uuid} not found in {}",
                 scrollback_dir.display()
-            )
+            ),
         })
 }
 
@@ -77373,15 +77587,19 @@ fn session_orphan_recoverability_error(
     pane_uuid: &str,
 ) -> Option<String> {
     if matches!(
-        candidate.state,
+        &candidate.state,
         frankenterm_core::scrollback_mmap_recovery::OrphanState::Orphaned
     ) {
         return None;
     }
 
     let state = session_orphan_state_label(&candidate.state);
+    let unsafe_reason = candidate
+        .unsafe_reason()
+        .map(|reason| format!(" ({})", reason.as_str()))
+        .unwrap_or_default();
     Some(format!(
-        "scrollback {pane_uuid} is {state}, not recoverable"
+        "scrollback {pane_uuid} is {state}{unsafe_reason}, not recoverable"
     ))
 }
 
@@ -77389,18 +77607,30 @@ fn session_orphan_discardability_error(
     candidate: &frankenterm_core::scrollback_mmap_recovery::OrphanCandidate,
     pane_uuid: &str,
 ) -> Option<String> {
-    if !matches!(
-        candidate.state,
-        frankenterm_core::scrollback_mmap_recovery::OrphanState::Locked
-    ) {
-        return None;
-    }
+    use frankenterm_core::scrollback_mmap_recovery::OrphanState;
 
-    Some(format!("scrollback {pane_uuid} is locked, not discardable"))
+    match &candidate.state {
+        OrphanState::Locked => Some(format!("scrollback {pane_uuid} is locked, not discardable")),
+        OrphanState::Unsafe => {
+            let reason = candidate
+                .unsafe_reason()
+                .map_or("unknown", |reason| reason.as_str());
+            Some(format!(
+                "scrollback {pane_uuid} is unsafe ({reason}), not discardable"
+            ))
+        }
+        OrphanState::Orphaned | OrphanState::Corrupt => None,
+        OrphanState::WrongShape => Some(format!(
+            "scrollback {pane_uuid} has the wrong file shape, not discardable"
+        )),
+    }
 }
 
-fn exit_session_orphan_error(message: &str, format: SnapshotSessionOutputFormat) -> ! {
-    exit_session_export_error("session.orphan_not_found", message, format)
+fn exit_session_orphan_error(
+    error: &SessionOrphanLookupError,
+    format: SnapshotSessionOutputFormat,
+) -> ! {
+    exit_session_export_error(error.error_code, &error.message, format)
 }
 
 fn exit_session_durable_error(message: &str, format: SnapshotSessionOutputFormat) -> ! {
@@ -77412,11 +77642,12 @@ fn exit_session_export_error(
     message: &str,
     format: SnapshotSessionOutputFormat,
 ) -> ! {
+    let message = bounded_terminal_diagnostic(message, 1_024, 4_096);
     if format.is_structured() {
-        let mut payload = serde_json::json!({
+        let payload = serde_json::json!({
             "ok": false,
             "error_code": error_code,
-            "error": message,
+            "error": &message,
         });
         let rendered = format_snapshot_session_structured_output(&payload, format)
             .ok()
@@ -77454,6 +77685,7 @@ fn session_orphan_state_label(
         OrphanState::Orphaned => "orphaned",
         OrphanState::Locked => "locked",
         OrphanState::Corrupt => "corrupt",
+        OrphanState::Unsafe => "unsafe",
         OrphanState::WrongShape => "wrong_shape",
     }
 }
@@ -77470,6 +77702,7 @@ fn session_orphan_candidates_json(
                 "pane_uuid": pane_uuid,
                 "state": state,
                 "path": candidate.path.display().to_string(),
+                "unsafe_reason": candidate.unsafe_reason().map(|reason| reason.as_str()),
             });
             match &candidate.header {
                 Some(Ok(header)) => {
@@ -77533,6 +77766,7 @@ fn session_mmap_export_json(
     serde_json::json!({
         "status": plan.status().as_str(),
         "mode": "mmap_linear_records_export",
+        "source_completeness": session_linear_record_completeness_json(plan.source_completeness),
         "records_read": plan.records_read,
         "records_replayed": plan.records_replayed,
         "bytes_read": plan.bytes_read,
@@ -77542,6 +77776,28 @@ fn session_mmap_export_json(
         "kind_counts": kind_counts,
         "skipped": skipped,
     })
+}
+
+fn session_linear_record_completeness_json(
+    completeness: frankenterm_core::scrollback_mmap_writer::LinearRecordCompleteness,
+) -> serde_json::Value {
+    use frankenterm_core::scrollback_mmap_writer::LinearRecordCompleteness;
+
+    match completeness {
+        LinearRecordCompleteness::Complete => serde_json::json!({
+            "status": "complete",
+        }),
+        LinearRecordCompleteness::Incomplete {
+            decoded_cursor_bytes,
+            declared_cursor_bytes,
+            reason,
+        } => serde_json::json!({
+            "status": "incomplete",
+            "decoded_cursor_bytes": decoded_cursor_bytes,
+            "declared_cursor_bytes": declared_cursor_bytes,
+            "reason": reason.as_str(),
+        }),
+    }
 }
 
 fn session_mmap_replay_skip_reason_json(
@@ -79344,6 +79600,7 @@ struct RemoteSetupOptions<'a> {
     ft_path: Option<&'a Path>,
     mux_server_path: Option<&'a Path>,
     ft_version: Option<&'a str>,
+    transaction_id: Option<&'a str>,
     timeout_secs: u64,
     verbose: u8,
 }
@@ -79437,6 +79694,8 @@ struct RemoteGenerationPublishRequest<'a> {
     mux_server_source: &'a Path,
     expected: ProcessFamilyByteReceipt,
     transaction_id: &'a str,
+    /// Private fixture-only seam for the future lifetime-lease owner.
+    #[cfg(test)]
     activate_current: bool,
 }
 
@@ -79859,7 +80118,6 @@ fn remote_generation_effective_uid() -> u32 {
     nix::unistd::geteuid().as_raw()
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn validate_remote_generation_transaction_id(transaction_id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         transaction_id.len() == 32
@@ -80783,16 +81041,74 @@ fn verify_remote_generation_selector(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn observe_remote_generation_selector_authority(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    effective_uid: u32,
+) -> anyhow::Result<remote_upgrade_ledger::SelectorAuthority> {
+    match root.symlink_metadata("current") {
+        Ok(_) => {
+            let selector = verify_remote_generation_selector(
+                root,
+                generations,
+                "current",
+                None,
+                effective_uid,
+            )?;
+            remote_upgrade_ledger::SelectorAuthority::selected(
+                &selector.generation_id,
+                &selector.target,
+                selector.device,
+                selector.inode,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(remote_upgrade_ledger::SelectorAuthority::Missing)
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "cannot inspect current selector authority: {error}"
+        )),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn activate_remote_generation_selector(
     root: &cap_std::fs::Dir,
     generations: &cap_std::fs::Dir,
     generation_id: &str,
-    transaction_id: &str,
+    permit: remote_upgrade_ledger::DurableEffectPermit,
+    expected_selector_before: &remote_upgrade_ledger::SelectorAuthority,
     effective_uid: u32,
 ) -> anyhow::Result<()> {
+    activate_remote_generation_selector_with(
+        root,
+        generations,
+        generation_id,
+        permit,
+        expected_selector_before,
+        effective_uid,
+        sync_capability_directory,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(clippy::too_many_arguments)]
+fn activate_remote_generation_selector_with<F>(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    permit: remote_upgrade_ledger::DurableEffectPermit,
+    expected_selector_before: &remote_upgrade_ledger::SelectorAuthority,
+    effective_uid: u32,
+    mut sync_root: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&cap_std::fs::Dir) -> std::io::Result<()>,
+{
     use nix::fcntl::{RenameFlags, renameat2};
 
-    validate_remote_generation_transaction_id(transaction_id)?;
+    let (transaction_id, allow_existing_artifact) = permit.consume_selector()?;
+    validate_remote_generation_transaction_id(&transaction_id)?;
     revalidate_remote_generations_binding(root, generations, effective_uid)?;
     let target = PathBuf::from("generations").join(generation_id);
     anyhow::ensure!(
@@ -80818,13 +81134,26 @@ fn activate_remote_generation_selector(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(anyhow::anyhow!("cannot inspect current selector: {error}")),
     };
+    let current_authority = match current_before.as_ref() {
+        Some(current) => remote_upgrade_ledger::SelectorAuthority::selected(
+            &current.generation_id,
+            &current.target,
+            current.device,
+            current.inode,
+        )?,
+        None => remote_upgrade_ledger::SelectorAuthority::Missing,
+    };
+    anyhow::ensure!(
+        &current_authority == expected_selector_before,
+        "current selector differs from the committed pre-effect authority"
+    );
     if current_before
         .as_ref()
         .is_some_and(|current| current.generation_id == generation_id)
     {
         // Acknowledgement-loss retry: re-synchronize and revalidate the exact
         // already-current selector rather than manufacturing another switch.
-        sync_capability_directory(root)?;
+        sync_root(root)?;
         verify_remote_generation_selector(
             root,
             generations,
@@ -80846,22 +81175,39 @@ fn activate_remote_generation_selector(
             && !path_contains_parent_component(Path::new(&staged_selector)),
         "transaction selector artifact name is not one bounded normalized component"
     );
-    anyhow::ensure!(
-        root.symlink_metadata(&staged_selector)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-        "transaction-unique staged selector already exists; refusing to overwrite or remove it"
-    );
-    root.symlink(&target, &staged_selector).map_err(|error| {
-        anyhow::anyhow!("cannot create transaction-unique generation selector: {error}")
-    })?;
-    sync_capability_directory(root)?;
-    let staged_before = verify_remote_generation_selector(
-        root,
-        generations,
-        &staged_selector,
-        Some(generation_id),
-        effective_uid,
-    )?;
+    let staged_before = match root.symlink_metadata(&staged_selector) {
+        Ok(_) => {
+            anyhow::ensure!(
+                allow_existing_artifact,
+                "transaction-unique staged selector already exists; refusing to overwrite or remove it"
+            );
+            verify_remote_generation_selector(
+                root,
+                generations,
+                &staged_selector,
+                Some(generation_id),
+                effective_uid,
+            )?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            root.symlink(&target, &staged_selector).map_err(|error| {
+                anyhow::anyhow!("cannot create transaction-unique generation selector: {error}")
+            })?;
+            sync_root(root)?;
+            verify_remote_generation_selector(
+                root,
+                generations,
+                &staged_selector,
+                Some(generation_id),
+                effective_uid,
+            )?
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cannot inspect transaction-unique staged selector: {error}"
+            ));
+        }
+    };
 
     match current_before {
         Some(old_current) => {
@@ -80895,7 +81241,7 @@ fn activate_remote_generation_selector(
                 RenameFlags::RENAME_EXCHANGE,
             )
             .map_err(|error| anyhow::anyhow!("atomic current-selector exchange failed: {error}"))?;
-            sync_capability_directory(root)?;
+            sync_root(root)?;
             let current_after = verify_remote_generation_selector(
                 root,
                 generations,
@@ -80947,7 +81293,7 @@ fn activate_remote_generation_selector(
                 RenameFlags::RENAME_NOREPLACE,
             )
             .map_err(|error| anyhow::anyhow!("atomic current-selector publication failed: {error}"))?;
-            sync_capability_directory(root)?;
+            sync_root(root)?;
             let current_after = verify_remote_generation_selector(
                 root,
                 generations,
@@ -80967,6 +81313,322 @@ fn activate_remote_generation_selector(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn redurabilize_remote_generation_selector_commit_evidence(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    transaction_id: &str,
+    selector_before: &remote_upgrade_ledger::SelectorAuthority,
+    effective_uid: u32,
+) -> anyhow::Result<remote_upgrade_ledger::SelectorAuthority> {
+    redurabilize_remote_generation_selector_commit_evidence_with(
+        root,
+        generations,
+        generation_id,
+        transaction_id,
+        selector_before,
+        effective_uid,
+        sync_capability_directory,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(clippy::too_many_arguments)]
+fn redurabilize_remote_generation_selector_commit_evidence_with<F>(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    transaction_id: &str,
+    selector_before: &remote_upgrade_ledger::SelectorAuthority,
+    effective_uid: u32,
+    sync_root: F,
+) -> anyhow::Result<remote_upgrade_ledger::SelectorAuthority>
+where
+    F: FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
+{
+    validate_remote_generation_transaction_id(transaction_id)?;
+    revalidate_remote_generations_binding(root, generations, effective_uid)?;
+    sync_root(root)
+        .context("cannot re-durabilize the process-family selector namespace")?;
+    let current = verify_remote_generation_selector(
+        root,
+        generations,
+        "current",
+        Some(generation_id),
+        effective_uid,
+    )?;
+    match selector_before {
+        remote_upgrade_ledger::SelectorAuthority::Missing => {
+            let staged_selector = format!(".selector-new-{transaction_id}");
+            anyhow::ensure!(
+                root.symlink_metadata(&staged_selector)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "initial selector reconciliation retained an unexpected staged selector"
+            );
+        }
+        remote_upgrade_ledger::SelectorAuthority::Selected {
+            generation_id: previous_generation,
+            target,
+            device,
+            inode,
+        } => {
+            if previous_generation == generation_id {
+                anyhow::ensure!(
+                    current.target == PathBuf::from(target.as_str())
+                        && current.device == *device
+                        && current.inode == *inode,
+                    "already-current selector evidence changed from the committed pre-effect authority"
+                );
+            } else {
+                let displaced_selector = format!(".selector-rollback-{transaction_id}");
+                let displaced = verify_remote_generation_selector(
+                    root,
+                    generations,
+                    &displaced_selector,
+                    Some(previous_generation),
+                    effective_uid,
+                )?;
+                anyhow::ensure!(
+                    displaced.target == PathBuf::from(target.as_str())
+                        && displaced.device == *device
+                        && displaced.inode == *inode,
+                    "displaced selector evidence does not match the committed pre-effect authority"
+                );
+            }
+        }
+        remote_upgrade_ledger::SelectorAuthority::Unresolved { .. } => {
+            anyhow::bail!("selector commit evidence has unresolved pre-effect authority");
+        }
+    }
+    revalidate_remote_generations_binding(root, generations, effective_uid)?;
+    remote_upgrade_ledger::SelectorAuthority::selected(
+        &current.generation_id,
+        &current.target,
+        current.device,
+        current.inode,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(clippy::too_many_arguments)]
+fn commit_remote_generation_selector_after_redurable_evidence(
+    root_path: &Path,
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    transaction_id: &str,
+    ledger: &mut remote_upgrade_ledger::RemoteUpgradeLedger<'_>,
+    selector_before: &remote_upgrade_ledger::SelectorAuthority,
+    effective_uid: u32,
+    receipt: String,
+) -> anyhow::Result<remote_upgrade_ledger::RemoteUpgradeRecord> {
+    commit_remote_generation_selector_after_redurable_evidence_with(
+        root_path,
+        root,
+        generations,
+        generation_id,
+        transaction_id,
+        ledger,
+        selector_before,
+        effective_uid,
+        receipt,
+        sync_capability_directory,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(clippy::too_many_arguments)]
+fn commit_remote_generation_selector_after_redurable_evidence_with<F>(
+    root_path: &Path,
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    transaction_id: &str,
+    ledger: &mut remote_upgrade_ledger::RemoteUpgradeLedger<'_>,
+    selector_before: &remote_upgrade_ledger::SelectorAuthority,
+    effective_uid: u32,
+    receipt: String,
+    sync_root: F,
+) -> anyhow::Result<remote_upgrade_ledger::RemoteUpgradeRecord>
+where
+    F: FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
+{
+    let selector_after = redurabilize_remote_generation_selector_commit_evidence_with(
+        root,
+        generations,
+        generation_id,
+        transaction_id,
+        selector_before,
+        effective_uid,
+        sync_root,
+    )?;
+    revalidate_remote_generation_root(root_path, root, effective_uid)?;
+    revalidate_remote_generations_binding(root, generations, effective_uid)?;
+    ledger.revalidate_authority()?;
+    ledger.commit_current(selector_after, receipt)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(clippy::too_many_arguments)]
+fn run_ledger_authorized_selector_effect(
+    root_path: &Path,
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    transaction_id: &str,
+    ledger: &mut remote_upgrade_ledger::RemoteUpgradeLedger<'_>,
+    permit: remote_upgrade_ledger::DurableEffectPermit,
+    selector_before: remote_upgrade_ledger::SelectorAuthority,
+    effective_uid: u32,
+) -> anyhow::Result<RemoteGenerationPublicationReceipt> {
+    run_ledger_authorized_selector_effect_with(
+        root_path,
+        root,
+        generations,
+        generation_id,
+        transaction_id,
+        ledger,
+        permit,
+        selector_before,
+        effective_uid,
+        activate_remote_generation_selector,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(clippy::too_many_arguments)]
+fn run_ledger_authorized_selector_effect_with<A>(
+    root_path: &Path,
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    transaction_id: &str,
+    ledger: &mut remote_upgrade_ledger::RemoteUpgradeLedger<'_>,
+    permit: remote_upgrade_ledger::DurableEffectPermit,
+    selector_before: remote_upgrade_ledger::SelectorAuthority,
+    effective_uid: u32,
+    activate_selector: A,
+) -> anyhow::Result<RemoteGenerationPublicationReceipt>
+where
+    A: FnOnce(
+        &cap_std::fs::Dir,
+        &cap_std::fs::Dir,
+        &str,
+        remote_upgrade_ledger::DurableEffectPermit,
+        &remote_upgrade_ledger::SelectorAuthority,
+        u32,
+    ) -> anyhow::Result<()>,
+{
+    revalidate_remote_generation_root(root_path, root, effective_uid)?;
+    revalidate_remote_generations_binding(root, generations, effective_uid)?;
+    ledger.revalidate_authority()?;
+    let activation = activate_selector(
+        root,
+        generations,
+        generation_id,
+        permit,
+        &selector_before,
+        effective_uid,
+    );
+    let selector_after = match observe_remote_generation_selector_authority(
+        root,
+        generations,
+        effective_uid,
+    ) {
+        Ok(authority) => authority,
+        Err(observation_error) => {
+            let receipt = format!(
+                "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
+            );
+            ledger.record_indeterminate(
+                selector_before,
+                remote_upgrade_ledger::SelectorAuthority::unresolved_post_effect(),
+                receipt,
+            )?;
+            return Err(observation_error.context(
+                "selector authority could not be reconciled after activation; transaction is Indeterminate",
+            ));
+        }
+    };
+    if let Err(binding_error) = revalidate_remote_generation_root(root_path, root, effective_uid)
+        .and_then(|()| {
+            revalidate_remote_generations_binding(root, generations, effective_uid)
+        })
+    {
+        let receipt = format!(
+            "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
+        );
+        ledger.record_indeterminate(
+            selector_before,
+            remote_upgrade_ledger::SelectorAuthority::unresolved_post_effect(),
+            receipt,
+        )?;
+        return Err(binding_error.context(
+            "generation namespace binding changed after selector activation; transaction is Indeterminate",
+        ));
+    }
+    if let Err(error) = activation {
+        if selector_after.generation_id() == Some(generation_id) {
+            return Err(error.context(
+                "selector target became visible after activation reported a durability/evidence failure; transaction remains Activating and only the same transaction ID may reconcile it",
+            ));
+        }
+        if selector_after == selector_before {
+            return Err(error.context(
+                "selector activation failed before changing authority; retry the same transaction ID",
+            ));
+        }
+        let receipt = format!(
+            "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
+        );
+        ledger.record_indeterminate(selector_before, selector_after, receipt)?;
+        return Err(error.context(
+            "selector activation failed with unexpected post-effect authority; transaction is Indeterminate",
+        ));
+    }
+    if selector_after.generation_id() == Some(generation_id) {
+        let receipt = RemoteGenerationPublicationReceipt {
+            generation_id: generation_id.to_string(),
+            activation: RemoteGenerationActivation::Current,
+        };
+        commit_remote_generation_selector_after_redurable_evidence(
+            root_path,
+            root,
+            generations,
+            generation_id,
+            transaction_id,
+            ledger,
+            &selector_before,
+            effective_uid,
+            receipt.canonical_line(),
+        )
+        .context(
+            "selector target is visible but its root/current/displaced evidence is not durable; transaction remains Activating",
+        )?;
+        return Ok(receipt);
+    }
+    let receipt = format!(
+        "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
+    );
+    ledger.record_indeterminate(selector_before, selector_after, receipt)?;
+    anyhow::bail!(
+        "selector activation returned success without the claimed post-effect authority; transaction is Indeterminate"
+    )
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn commit_pending_live_owner_after_selector_observation(
+    ledger: &mut remote_upgrade_ledger::RemoteUpgradeLedger<'_>,
+    selector_observation: anyhow::Result<remote_upgrade_ledger::SelectorAuthority>,
+    receipt: String,
+) -> anyhow::Result<remote_upgrade_ledger::RemoteUpgradeRecord> {
+    let selector_after = selector_observation.context(
+        "immutable generation is published, but selector authority could not be observed; the transaction remains Prepared and must be retried with the same transaction ID",
+    )?;
+    ledger.commit_pending_live_owner(selector_after, receipt)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn publish_remote_process_family_generation(
     request: &RemoteGenerationPublishRequest<'_>,
 ) -> anyhow::Result<RemoteGenerationPublicationReceipt> {
@@ -80977,6 +81639,16 @@ fn publish_remote_process_family_generation(
 
     validate_process_family_byte_receipt(&request.expected)?;
     validate_remote_generation_transaction_id(request.transaction_id)?;
+    let activation_requested = {
+        #[cfg(test)]
+        {
+            request.activate_current
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    };
     let effective_uid = remote_generation_effective_uid();
     let (root, generations) = open_remote_generation_root(request.root, effective_uid)?;
     let _publication_lock = acquire_remote_generation_publication_lock(&root, effective_uid)?;
@@ -81005,6 +81677,226 @@ fn publish_remote_process_family_generation(
     let manifest = RemoteGenerationManifest::from_process_family(&family)?;
     let generation_id = manifest.generation_id.clone();
 
+    let selector_before = observe_remote_generation_selector_authority(
+        &root,
+        &generations,
+        effective_uid,
+    )?;
+    let claim = remote_upgrade_ledger::RemoteUpgradeClaim::process_family_publication(
+        request.transaction_id,
+        &generation_id,
+        &request.expected.ft.sha256,
+        request.expected.ft.byte_len,
+        &request.expected.mux_server.sha256,
+        request.expected.mux_server.byte_len,
+    )?;
+    let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(
+        &root,
+        effective_uid,
+        claim,
+    )?;
+
+    if let Some(latest) = ledger.latest().cloned() {
+        use remote_upgrade_ledger::RemoteUpgradeState;
+
+        match latest.state() {
+            RemoteUpgradeState::PendingLiveOwner => {
+                verify_remote_generation_directory(
+                    &generations,
+                    &generation_id,
+                    true,
+                    Some(&manifest),
+                    effective_uid,
+                )?;
+                let receipt = parse_remote_generation_publication_receipt(latest.receipt())?;
+                anyhow::ensure!(
+                    receipt.generation_id == generation_id
+                        && receipt.activation == RemoteGenerationActivation::PendingLease
+                        && receipt.canonical_line() == latest.receipt(),
+                    "stored pending upgrade receipt does not match its immutable claim"
+                );
+                if !activation_requested {
+                    ledger.revalidate_authority()?;
+                    return Ok(receipt);
+                }
+                let selector_now = observe_remote_generation_selector_authority(
+                    &root,
+                    &generations,
+                    effective_uid,
+                )?;
+                if &selector_now != latest.selector_after() {
+                    let indeterminate_receipt = format!(
+                        "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                        request.transaction_id, generation_id
+                    );
+                    ledger.record_indeterminate(
+                        latest.selector_after().clone(),
+                        selector_now,
+                        indeterminate_receipt,
+                    )?;
+                    anyhow::bail!(
+                        "selector authority changed after PendingLiveOwner and before lease-authorized activation; transaction is Indeterminate"
+                    );
+                }
+                let selector_permit =
+                    ledger.authorize_selector_from_pending(selector_now.clone())?;
+                return run_ledger_authorized_selector_effect(
+                    request.root,
+                    &root,
+                    &generations,
+                    &generation_id,
+                    request.transaction_id,
+                    &mut ledger,
+                    selector_permit,
+                    selector_now,
+                    effective_uid,
+                );
+            }
+            RemoteUpgradeState::Committed => {
+                anyhow::ensure!(
+                    activation_requested,
+                    "committed selector receipt conflicts with a pending-only retry"
+                );
+                verify_remote_generation_directory(
+                    &generations,
+                    &generation_id,
+                    true,
+                    Some(&manifest),
+                    effective_uid,
+                )?;
+                let selector_after = redurabilize_remote_generation_selector_commit_evidence(
+                    &root,
+                    &generations,
+                    &generation_id,
+                    request.transaction_id,
+                    latest.selector_before(),
+                    effective_uid,
+                )?;
+                revalidate_remote_generation_root(request.root, &root, effective_uid)?;
+                revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
+                anyhow::ensure!(
+                    &selector_after == latest.selector_after(),
+                    "stored committed selector receipt differs from re-durabilized selector evidence"
+                );
+                ledger.revalidate_authority()?;
+                let receipt = parse_remote_generation_publication_receipt(latest.receipt())?;
+                anyhow::ensure!(
+                    receipt.generation_id == generation_id
+                        && receipt.activation == RemoteGenerationActivation::Current
+                        && receipt.canonical_line() == latest.receipt(),
+                    "stored committed upgrade receipt does not match its selector authority"
+                );
+                return Ok(receipt);
+            }
+            RemoteUpgradeState::RolledBack => {
+                ledger.revalidate_authority()?;
+                anyhow::bail!(
+                    "remote upgrade transaction is terminally RolledBack; receipt={}",
+                    latest.receipt().trim_end()
+                );
+            }
+            RemoteUpgradeState::Indeterminate => {
+                ledger.revalidate_authority()?;
+                anyhow::bail!(
+                    "remote upgrade transaction is terminally Indeterminate; receipt={}",
+                    latest.receipt().trim_end()
+                );
+            }
+            RemoteUpgradeState::Activating => {
+                anyhow::ensure!(
+                    activation_requested,
+                    "an activating transaction cannot be replayed as pending-only"
+                );
+                verify_remote_generation_directory(
+                    &generations,
+                    &generation_id,
+                    true,
+                    Some(&manifest),
+                    effective_uid,
+                )?;
+                let selector_now = match observe_remote_generation_selector_authority(
+                    &root,
+                    &generations,
+                    effective_uid,
+                ) {
+                    Ok(authority) => authority,
+                    Err(observation_error) => {
+                        let receipt = format!(
+                            "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                            request.transaction_id, generation_id
+                        );
+                        ledger.record_indeterminate(
+                            latest.selector_before().clone(),
+                            remote_upgrade_ledger::SelectorAuthority::unresolved_post_effect(),
+                            receipt,
+                        )?;
+                        return Err(observation_error.context(
+                            "selector authority cannot be reconciled after a committed activation authorization; transaction is Indeterminate",
+                        ));
+                    }
+                };
+                if selector_now.generation_id() == Some(generation_id.as_str()) {
+                    let receipt = RemoteGenerationPublicationReceipt {
+                        generation_id: generation_id.clone(),
+                        activation: RemoteGenerationActivation::Current,
+                    };
+                    let committed = commit_remote_generation_selector_after_redurable_evidence(
+                        request.root,
+                        &root,
+                        &generations,
+                        &generation_id,
+                        request.transaction_id,
+                        &mut ledger,
+                        latest.selector_before(),
+                        effective_uid,
+                        receipt.canonical_line(),
+                    )
+                    .context(
+                        "replayed selector target is visible but its root/current/displaced evidence is not durable; transaction remains Activating",
+                    )?;
+                    anyhow::ensure!(
+                        committed.receipt() == receipt.canonical_line(),
+                        "selector reconciliation did not persist the exact terminal receipt"
+                    );
+                    return Ok(receipt);
+                }
+                if &selector_now != latest.selector_before() {
+                    let receipt = format!(
+                        "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                        request.transaction_id, generation_id
+                    );
+                    ledger.record_indeterminate(
+                        latest.selector_before().clone(),
+                        selector_now,
+                        receipt,
+                    )?;
+                    anyhow::bail!(
+                        "current selector differs from both the committed pre-effect authority and claimed generation; transaction is Indeterminate"
+                    );
+                }
+                let selector_permit = ledger.reauthorize_selector(selector_now.clone())?;
+                return run_ledger_authorized_selector_effect(
+                    request.root,
+                    &root,
+                    &generations,
+                    &generation_id,
+                    request.transaction_id,
+                    &mut ledger,
+                    selector_permit,
+                    selector_now,
+                    effective_uid,
+                );
+            }
+            RemoteUpgradeState::Prepared => {}
+        }
+    }
+
+    let publication_permit = ledger.authorize_publication(selector_before.clone())?;
+    revalidate_remote_generation_root(request.root, &root, effective_uid)?;
+    revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
+    ledger.revalidate_authority()?;
+    let effect_transaction_id = publication_permit.consume_publication()?;
+
     let generation_exists = match generations.symlink_metadata(&generation_id) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -81026,7 +81918,7 @@ fn publish_remote_process_family_generation(
         )?;
         sync_capability_directory(&generations)?;
     } else {
-        let stage_name = format!(".stage-{generation_id}-{}", request.transaction_id);
+        let stage_name = format!(".stage-{generation_id}-{effect_transaction_id}");
         create_private_child_directory(&generations, Path::new(&stage_name)).map_err(|error| {
             anyhow::anyhow!(
                 "cannot create transaction-unique generation stage (stale stages are never removed): {error}"
@@ -81127,25 +82019,71 @@ fn publish_remote_process_family_generation(
         }
     }
 
-    let activation = if request.activate_current {
+    let receipt = if activation_requested {
+        let selector_after_publication = match observe_remote_generation_selector_authority(
+            &root,
+            &generations,
+            effective_uid,
+        ) {
+            Ok(authority) => authority,
+            Err(observation_error) => {
+                let indeterminate_receipt = format!(
+                    "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                    request.transaction_id, generation_id
+                );
+                ledger.record_indeterminate(
+                    selector_before,
+                    remote_upgrade_ledger::SelectorAuthority::unresolved_post_effect(),
+                    indeterminate_receipt,
+                )?;
+                return Err(observation_error.context(
+                    "selector authority could not be read before activation; transaction is Indeterminate",
+                ));
+            }
+        };
+        if selector_after_publication != selector_before {
+            let indeterminate_receipt = format!(
+                "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                request.transaction_id, generation_id
+            );
+            ledger.record_indeterminate(
+                selector_before,
+                selector_after_publication,
+                indeterminate_receipt,
+            )?;
+            anyhow::bail!(
+                "current selector changed while the immutable generation was published; refusing an unbound activation"
+            );
+        }
+        let selector_permit = ledger
+            .authorize_selector_after_publication(selector_after_publication.clone())?;
         revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
-        activate_remote_generation_selector(
+        run_ledger_authorized_selector_effect(
+            request.root,
             &root,
             &generations,
             &generation_id,
             request.transaction_id,
+            &mut ledger,
+            selector_permit,
+            selector_after_publication,
             effective_uid,
-        )?;
-        RemoteGenerationActivation::Current
+        )?
     } else {
-        RemoteGenerationActivation::PendingLease
+        let receipt = RemoteGenerationPublicationReceipt {
+            generation_id: generation_id.clone(),
+            activation: RemoteGenerationActivation::PendingLease,
+        };
+        commit_pending_live_owner_after_selector_observation(
+            &mut ledger,
+            observe_remote_generation_selector_authority(&root, &generations, effective_uid),
+            receipt.canonical_line(),
+        )?;
+        receipt
     };
     revalidate_remote_generation_root(request.root, &root, effective_uid)?;
     revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
-    Ok(RemoteGenerationPublicationReceipt {
-        generation_id,
-        activation,
-    })
+    Ok(receipt)
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -81267,27 +82205,75 @@ fn remote_release_installer_command_at_revision(
     );
     let destination = format!("$HOME/.cache/frankenterm/releases/{tag}-{staging_suffix}");
     Ok(format!(
-        "umask 077; \
-         installer_dir=\"$HOME/.cache/frankenterm/install-{tag}-{staging_suffix}\"; \
-         installer=\"$installer_dir/install.sh\"; \
-         destination=\"{destination}\"; \
-         mkdir -p \"$HOME/.cache/frankenterm\" \"$HOME/.local/bin\" && \
-         mkdir \"$installer_dir\" && \
-         mkdir \"$destination\" && \
-         curl --proto '=https' --tlsv1.2 -fsSL \
-         https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/{installer_revision}/install.sh \
-         -o \"$installer\" && \
-         bash \"$installer\" --version {tag} --dest \"$destination\" --no-app && \
-         ft_path=\"$destination/ft\" && \
-         mux_path=\"$destination/frankenterm-mux-server\" && \
-         test -f \"$ft_path\" && test ! -L \"$ft_path\" && \
-         test -f \"$mux_path\" && test ! -L \"$mux_path\" && \
-         ft_bytes=$(stat -c %s -- \"$ft_path\") && \
-         mux_bytes=$(stat -c %s -- \"$mux_path\") && \
-         ft_sha256=$(sha256sum -- \"$ft_path\" | cut -d ' ' -f 1) && \
-         mux_sha256=$(sha256sum -- \"$mux_path\" | cut -d ' ' -f 1) && \
-         printf 'FT_RELEASE_COMPONENT_RECEIPT_V1={tag}:ft:%s:%s:mux:%s:%s\\n' \
-           \"$ft_bytes\" \"$ft_sha256\" \"$mux_bytes\" \"$mux_sha256\""
+        r#"set -eu
+umask 077
+destination="{destination}"
+validate_destination() {{
+  test -d "$destination" && test ! -L "$destination" || return 1
+  test "$(stat -c %u -- "$destination")" = "$(id -u)" || return 1
+  test "$(stat -c %a -- "$destination")" = 700 || return 1
+}}
+emit_receipt() {{
+  validate_destination || return 1
+  ft_path="$destination/ft"
+  mux_path="$destination/frankenterm-mux-server"
+  test -f "$ft_path" && test ! -L "$ft_path" || return 1
+  test -f "$mux_path" && test ! -L "$mux_path" || return 1
+  test "$(stat -c %u -- "$ft_path")" = "$(id -u)" || return 1
+  test "$(stat -c %u -- "$mux_path")" = "$(id -u)" || return 1
+  test "$(stat -c %h -- "$ft_path")" = 1 || return 1
+  test "$(stat -c %h -- "$mux_path")" = 1 || return 1
+  ft_mode=$(stat -c %a -- "$ft_path") || return 1
+  mux_mode=$(stat -c %a -- "$mux_path") || return 1
+  test "$ft_mode" = 500 || test "$ft_mode" = 755 || return 1
+  test "$mux_mode" = 500 || test "$mux_mode" = 755 || return 1
+  ft_bytes=$(stat -c %s -- "$ft_path") || return 1
+  mux_bytes=$(stat -c %s -- "$mux_path") || return 1
+  test "$ft_bytes" -gt 0 && test "$ft_bytes" -le {component_max_bytes} || return 1
+  test "$mux_bytes" -gt 0 && test "$mux_bytes" -le {component_max_bytes} || return 1
+  ft_sha256=$(sha256sum -- "$ft_path" | cut -d ' ' -f 1) || return 1
+  mux_sha256=$(sha256sum -- "$mux_path" | cut -d ' ' -f 1) || return 1
+  test "${{#ft_sha256}}" = 64 || return 1
+  test "${{#mux_sha256}}" = 64 || return 1
+  case "$ft_sha256" in *[!0-9a-f]*) return 1 ;; esac
+  case "$mux_sha256" in *[!0-9a-f]*) return 1 ;; esac
+  printf 'FT_RELEASE_COMPONENT_RECEIPT_V1={tag}:ft:%s:%s:mux:%s:%s\n' \
+    "$ft_bytes" "$ft_sha256" "$mux_bytes" "$mux_sha256"
+}}
+destination_existed=0
+if test -e "$destination" || test -L "$destination"; then
+  validate_destination
+  if emit_receipt; then
+    exit 0
+  fi
+  destination_existed=1
+fi
+mkdir -p "$HOME/.cache/frankenterm" "$HOME/.local/bin"
+installer_dir=""
+installer_attempt=0
+while test "$installer_attempt" -lt 8; do
+  installer_candidate="$HOME/.cache/frankenterm/install-{tag}-{staging_suffix}-$$-$installer_attempt"
+  if mkdir "$installer_candidate" 2>/dev/null; then
+    installer_dir="$installer_candidate"
+    break
+  fi
+  installer_attempt=$((installer_attempt + 1))
+done
+test -n "$installer_dir"
+installer="$installer_dir/install.sh"
+if test "$destination_existed" = 0; then
+  mkdir "$destination"
+fi
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/{installer_revision}/install.sh \
+  -o "$installer"
+if test "$destination_existed" = 1; then
+  bash "$installer" --version {tag} --dest "$destination" --no-app --force
+else
+  bash "$installer" --version {tag} --dest "$destination" --no-app
+fi
+emit_receipt"#,
+        component_max_bytes = REMOTE_COMPONENT_MAX_BYTES,
     ))
 }
 
@@ -81384,7 +82370,8 @@ fn copy_remote_component(
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
         "component staging suffix must be 32 lowercase hex characters"
     );
-    let preflight_command = remote_component_upload_preflight_command(remote_name, staging_suffix);
+    let preflight_command =
+        remote_component_upload_preflight_command(remote_name, staging_suffix, expected);
     let preflight = run_remote_command(host, &preflight_command, timeout)?;
     anyhow::ensure!(
         preflight.status.success(),
@@ -81392,12 +82379,20 @@ fn copy_remote_component(
         preflight.status.code().unwrap_or(-1),
         bounded_terminal_diagnostic(&preflight.stderr, 512, 1024)
     );
-    let expected_preflight =
-        format!("FT_REMOTE_COMPONENT_UPLOAD_READY={remote_name}:{staging_suffix}\n");
-    anyhow::ensure!(
-        preflight.stdout == expected_preflight,
-        "remote upload preflight for staged {remote_name} returned no exact receipt"
+    let ready_receipt =
+        format!("FT_REMOTE_COMPONENT_UPLOAD_V1=ready:{remote_name}:{staging_suffix}\n");
+    let existing_receipt = format!(
+        "FT_REMOTE_COMPONENT_UPLOAD_V1=existing_exact:{remote_name}:{staging_suffix}\n"
     );
+    let upload_required = if preflight.stdout == ready_receipt {
+        true
+    } else if preflight.stdout == existing_receipt {
+        false
+    } else {
+        anyhow::bail!(
+            "remote upload preflight for staged {remote_name} returned no exact replay disposition"
+        );
+    };
 
     let source_file = open_local_component_nofollow(source)?;
     let source_before = DiagnosticFileSnapshot::capture(&source_file.metadata()?).map_err(|error| {
@@ -81411,46 +82406,48 @@ fn copy_remote_component(
         "component {} changed after process-family validation and before upload",
         source.display()
     );
-    let upload_file = source_file.try_clone().map_err(|error| {
-        anyhow::anyhow!(
-            "cannot retain component identity handle for {} during upload: {error}",
-            source.display()
-        )
-    })?;
-    let upload_command = remote_component_upload_command(remote_name, staging_suffix);
-    let mut ssh = std::process::Command::new("ssh");
-    ssh.arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg(format!("ConnectTimeout={}", timeout.as_secs()))
-        .arg(host)
-        .arg(upload_command);
-    let output = run_cmd_with_timeout_and_stdin(
-        &mut ssh,
-        std::process::Stdio::from(upload_file),
-        timeout,
-        REMOTE_SETUP_MAX_STDOUT_BYTES,
-        REMOTE_SETUP_MAX_STDERR_BYTES,
-    )?;
-    if output.stdout.overflowed || output.stderr.overflowed {
-        anyhow::bail!("component upload output exceeded the remote setup safety limit");
-    }
-    if !output.status.success() {
-        anyhow::bail!(
-            "identity-fenced upload of {} failed with status {}: {}",
-            source.display(),
-            output.status,
-            bounded_terminal_diagnostic(
-                &String::from_utf8_lossy(&output.stderr.bytes),
-                512,
-                1024
+    if upload_required {
+        let upload_file = source_file.try_clone().map_err(|error| {
+            anyhow::anyhow!(
+                "cannot retain component identity handle for {} during upload: {error}",
+                source.display()
             )
+        })?;
+        let upload_command = remote_component_upload_command(remote_name, staging_suffix);
+        let mut ssh = std::process::Command::new("ssh");
+        ssh.arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg(format!("ConnectTimeout={}", timeout.as_secs()))
+            .arg(host)
+            .arg(upload_command);
+        let output = run_cmd_with_timeout_and_stdin(
+            &mut ssh,
+            std::process::Stdio::from(upload_file),
+            timeout,
+            REMOTE_SETUP_MAX_STDOUT_BYTES,
+            REMOTE_SETUP_MAX_STDERR_BYTES,
+        )?;
+        if output.stdout.overflowed || output.stderr.overflowed {
+            anyhow::bail!("component upload output exceeded the remote setup safety limit");
+        }
+        if !output.status.success() {
+            anyhow::bail!(
+                "identity-fenced upload of {} failed with status {}: {}",
+                source.display(),
+                output.status,
+                bounded_terminal_diagnostic(
+                    &String::from_utf8_lossy(&output.stderr.bytes),
+                    512,
+                    1024
+                )
+            );
+        }
+        anyhow::ensure!(
+            output.stdout.bytes.is_empty(),
+            "identity-fenced component upload returned unexpected stdout"
         );
     }
-    anyhow::ensure!(
-        output.stdout.bytes.is_empty(),
-        "identity-fenced component upload returned unexpected stdout"
-    );
     let source_after = DiagnosticFileSnapshot::capture(&source_file.metadata()?).map_err(|error| {
         anyhow::anyhow!(
             "cannot recapture component identity for {} after upload: {error}",
@@ -81489,13 +82486,28 @@ fn copy_remote_component(
 fn remote_component_upload_preflight_command(
     remote_name: &str,
     staging_suffix: &str,
+    expected: &LocalComponentSnapshot,
 ) -> String {
     let remote_path = format!("$HOME/.local/bin/{remote_name}.installing-{staging_suffix}");
     format!(
         r#"set -eu
 path="{remote_path}"
-test ! -e "$path" && test ! -L "$path"
-printf 'FT_REMOTE_COMPONENT_UPLOAD_READY={remote_name}:{staging_suffix}\n'"#
+if test ! -e "$path" && test ! -L "$path"; then
+  printf 'FT_REMOTE_COMPONENT_UPLOAD_V1=ready:{remote_name}:{staging_suffix}\n'
+  exit 0
+fi
+test -f "$path" && test ! -L "$path"
+test "$(stat -c %u -- "$path")" = "$(id -u)"
+test "$(stat -c %h -- "$path")" = 1
+mode=$(stat -c %a -- "$path")
+test "$mode" = 500 || test "$mode" = 600
+test "$(stat -c %s -- "$path")" = "{expected_bytes}"
+actual_sha256=$(sha256sum -- "$path")
+actual_sha256=${{actual_sha256%% *}}
+test "$actual_sha256" = "{expected_sha256}"
+printf 'FT_REMOTE_COMPONENT_UPLOAD_V1=existing_exact:{remote_name}:{staging_suffix}\n'"#,
+        expected_bytes = expected.byte_len,
+        expected_sha256 = expected.sha256,
     )
 }
 
@@ -82177,9 +83189,24 @@ where
             );
         }
     };
-    let component_transaction = options
-        .install_ft
-        .then(|| uuid::Uuid::new_v4().simple().to_string());
+    if let Some(transaction_id) = options.transaction_id {
+        validate_remote_generation_transaction_id(transaction_id)?;
+    }
+    anyhow::ensure!(
+        options.install_ft || options.transaction_id.is_none(),
+        "--transaction-id requires --install-ft"
+    );
+    let component_transaction = if options.install_ft && apply_changes {
+        Some(
+            options.transaction_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "an applied --install-ft requires a stable --transaction-id of 32 lowercase hex characters; reuse that exact ID after acknowledgement loss"
+                )
+            })?,
+        )
+    } else {
+        options.transaction_id
+    };
 
     println!("ft setup remote - Remote Host Setup for '{host}'\n");
     if options.dry_run || !apply_changes {
@@ -82486,14 +83513,14 @@ fi"#,
                         "validated local process-family snapshot is missing before remote copy"
                     )
                 })?;
-                let staging_suffix = component_transaction.clone().ok_or_else(|| {
+                let staging_suffix = component_transaction.ok_or_else(|| {
                     anyhow::anyhow!("component transaction identity is missing before local copy")
                 })?;
                 copy_remote_component(
                     host,
                     ft_path,
                     "ft",
-                    &staging_suffix,
+                    staging_suffix,
                     timeout,
                     &process_family.ft,
                 )?;
@@ -82501,12 +83528,12 @@ fi"#,
                     host,
                     mux_server_path,
                     "frankenterm-mux-server",
-                    &staging_suffix,
+                    staging_suffix,
                     timeout,
                     &process_family.mux_server,
                 )?;
                 let publish_command = uploaded_process_family_generation_command(
-                    &staging_suffix,
+                    staging_suffix,
                     &ProcessFamilyByteReceipt::from(process_family),
                 )?;
                 let publication = run_remote_step(
@@ -82529,12 +83556,12 @@ fi"#,
                 println!("  component transaction id: {staging_suffix}");
             } else if let Some(tag) = options.ft_version {
                 let install_timeout = timeout.max(std::time::Duration::from_secs(600));
-                let staging_suffix = component_transaction.clone().ok_or_else(|| {
+                let staging_suffix = component_transaction.ok_or_else(|| {
                     anyhow::anyhow!(
                         "component transaction identity is missing before release staging"
                     )
                 })?;
-                let install_command = remote_release_installer_command(tag, &staging_suffix)?;
+                let install_command = remote_release_installer_command(tag, staging_suffix)?;
                 let installation = run_remote_step(
                     if active_mux_before_install {
                         "Download verified pending FrankenTerm release process family"
@@ -82552,7 +83579,7 @@ fi"#,
                 let receipt = parse_remote_release_component_receipt(&installation.stdout, tag)?;
                 let publish_command = remote_release_generation_publication_command(
                     tag,
-                    &staging_suffix,
+                    staging_suffix,
                     &receipt,
                 )?;
                 let publication = run_remote_step(
@@ -82752,6 +83779,15 @@ fi"#;
     if options.install_ft {
         println!("  Components: ft + frankenterm-mux-server (same release identity)");
         println!("  Activation: {activation_summary}");
+        if let (Some(transaction_id), Some(publication)) =
+            (options.transaction_id, remote_generation_publication.as_ref())
+        {
+            println!("  Upgrade transaction: {transaction_id}");
+            println!(
+                "  Publication receipt: {}",
+                publication.canonical_line().trim_end()
+            );
+        }
     }
     println!("  Next: verify with `ssh {host} 'systemctl --user status frankenterm-mux-server'`");
 
@@ -92545,7 +93581,11 @@ recorder_backend = "rusqlite"
         )
         .expect("open mmap scrollback writer");
 
-        let candidates = scan_session_orphans_for_cli(dir.path()).expect("scan while writer lives");
+        let candidates = scan_session_orphans_for_cli(
+            dir.path(),
+            frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits::DEFAULT,
+        )
+        .expect("scan while writer lives");
         let candidate = candidates
             .iter()
             .find(|candidate| {
@@ -92566,7 +93606,11 @@ recorder_backend = "rusqlite"
 
         drop(writer);
 
-        let candidates = scan_session_orphans_for_cli(dir.path()).expect("scan after writer drops");
+        let candidates = scan_session_orphans_for_cli(
+            dir.path(),
+            frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits::DEFAULT,
+        )
+        .expect("scan after writer drops");
         let candidate = candidates
             .iter()
             .find(|candidate| {
@@ -92578,30 +93622,113 @@ recorder_backend = "rusqlite"
         assert!(session_orphan_discardability_error(candidate, &pane_uuid).is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn session_orphan_cli_scan_rejects_a_dangling_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("create recovery parent");
+        let link = dir.path().join("scrollback");
+        symlink(dir.path().join("missing-target"), &link)
+            .expect("create dangling recovery-directory symlink");
+
+        let error = scan_session_orphans_for_cli(
+            &link,
+            frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits::DEFAULT,
+        )
+            .expect_err("a dangling recovery-directory symlink must not look like no state");
+        assert!(error.to_string().contains("scan scrollback directory"));
+    }
+
     #[test]
     fn session_mmap_export_json_reports_actual_counts() {
         use frankenterm_core::scrollback_mmap_format::RecordKind;
         use frankenterm_core::scrollback_mmap_recovery::{
             DEFAULT_REPLAY_CHUNK_BYTES, MmapReplayPlan,
         };
+        use frankenterm_core::scrollback_mmap_writer::{
+            LinearRecordCompleteness, LinearRecordSnapshot, LinearRecordSourceIdentity,
+        };
 
-        let plan = MmapReplayPlan::from_records(
-            vec![
-                (RecordKind::Text, b"hello".to_vec()),
-                (RecordKind::Csi, b"\x1b[0m".to_vec()),
-            ],
+        let plan = MmapReplayPlan::from_snapshot(
+            LinearRecordSnapshot {
+                header: frankenterm_core::scrollback_mmap_format::ScrollbackHeader::new(
+                    [0; 32], 1024, 0,
+                ),
+                records: vec![
+                    (RecordKind::Text, b"hello".to_vec()),
+                    (RecordKind::Csi, b"\x1b[0m".to_vec()),
+                ],
+                payload_bytes: 9,
+                source_identity: LinearRecordSourceIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+                completeness: LinearRecordCompleteness::Complete,
+            },
             DEFAULT_REPLAY_CHUNK_BYTES,
-        );
+            frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits::DEFAULT,
+        )
+        .expect("bounded replay plan");
         let payload = session_mmap_export_json(&plan, plan.chunks.len());
 
         assert_eq!(payload["status"], "replayed");
         assert_eq!(payload["mode"], "mmap_linear_records_export");
+        assert_eq!(payload["source_completeness"]["status"], "complete");
         assert_eq!(payload["records_read"], 2);
         assert_eq!(payload["records_replayed"], 2);
         assert_eq!(payload["bytes_read"], 9);
         assert_eq!(payload["bytes_replayed"], 9);
         assert_eq!(payload["chunks_exported"], 2);
         assert_eq!(payload["skipped"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn session_mmap_export_json_never_promotes_an_incomplete_source() {
+        use frankenterm_core::scrollback_mmap_format::{RecordKind, ScrollbackHeader};
+        use frankenterm_core::scrollback_mmap_recovery::{
+            DEFAULT_REPLAY_CHUNK_BYTES, LegacyRecoveryLimits, MmapReplayPlan,
+        };
+        use frankenterm_core::scrollback_mmap_writer::{
+            LinearRecordCompleteness, LinearRecordSnapshot, LinearRecordSourceIdentity,
+            LinearRecordTerminalReason,
+        };
+
+        let plan = MmapReplayPlan::from_snapshot(
+            LinearRecordSnapshot {
+                header: ScrollbackHeader::new([0; 32], 1024, 0),
+                records: vec![(RecordKind::Text, b"salvaged prefix".to_vec())],
+                payload_bytes: 15,
+                source_identity: LinearRecordSourceIdentity {
+                    device: 7,
+                    inode: 11,
+                },
+                completeness: LinearRecordCompleteness::Incomplete {
+                    decoded_cursor_bytes: 31,
+                    declared_cursor_bytes: 47,
+                    reason: LinearRecordTerminalReason::PhysicalRecordPayloadTruncated,
+                },
+            },
+            DEFAULT_REPLAY_CHUNK_BYTES,
+            LegacyRecoveryLimits::DEFAULT,
+        )
+        .expect("bounded incomplete replay plan");
+        let payload = session_mmap_export_json(&plan, plan.chunks.len());
+
+        assert_eq!(payload["status"], "partial");
+        assert_eq!(payload["source_completeness"]["status"], "incomplete");
+        assert_eq!(
+            payload["source_completeness"]["decoded_cursor_bytes"],
+            31
+        );
+        assert_eq!(
+            payload["source_completeness"]["declared_cursor_bytes"],
+            47
+        );
+        assert_eq!(
+            payload["source_completeness"]["reason"],
+            "physical_record_payload_truncated"
+        );
     }
 
     #[test]
@@ -98447,6 +99574,7 @@ log_level = "debug"
             ft_path: None,
             mux_server_path: None,
             ft_version: Some("v0.15.2"),
+            transaction_id: None,
             timeout_secs: 5,
             verbose: 0,
         };
@@ -98462,6 +99590,32 @@ log_level = "debug"
         assert!(!cmds.iter().any(|cmd| cmd.contains("apt-get install")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("cargo install")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("cat > \"$path\"")));
+    }
+
+    #[test]
+    fn applied_remote_install_requires_caller_stable_transaction_id_before_ssh() {
+        let runner = |_: &str,
+                      _: &str,
+                      _: std::time::Duration|
+         -> anyhow::Result<RemoteCommandOutput> {
+            panic!("missing transaction identity must fail before SSH")
+        };
+        let options = RemoteSetupOptions {
+            apply: true,
+            dry_run: false,
+            yes: true,
+            install_ft: true,
+            ft_path: None,
+            mux_server_path: None,
+            ft_version: Some("v0.15.2"),
+            transaction_id: None,
+            timeout_secs: 5,
+            verbose: 0,
+        };
+
+        let error = run_remote_setup_with_runner("example", &options, &runner)
+            .expect_err("applied install without stable transaction identity must fail");
+        assert!(error.to_string().contains("stable --transaction-id"));
     }
 
     #[cfg(unix)]
@@ -98488,6 +99642,7 @@ log_level = "debug"
             ft_path: None,
             mux_server_path: None,
             ft_version: None,
+            transaction_id: None,
             timeout_secs: 5,
             verbose: 0,
         };
@@ -98554,6 +99709,7 @@ log_level = "debug"
             ft_path: None,
             mux_server_path: None,
             ft_version: Some("v0.15.2"),
+            transaction_id: Some("0123456789abcdef0123456789abcdef"),
             timeout_secs: 5,
             verbose: 0,
         };
@@ -98601,6 +99757,9 @@ log_level = "debug"
         assert!(pending.contains("$HOME/.local/share/frankenterm/process-family"));
         assert!(pending.contains("--expected-ft-sha256"));
         assert!(pending.contains("--expected-mux-sha256"));
+        assert!(pending.contains(
+            "--transaction-id \"0123456789abcdef0123456789abcdef\""
+        ));
         assert!(!pending.contains("--activate-current"));
         assert!(pending.matches(&"b".repeat(64)).count() >= 2);
         assert!(pending.matches(&"c".repeat(64)).count() >= 2);
@@ -98677,6 +99836,7 @@ log_level = "debug"
             ft_path: None,
             mux_server_path: None,
             ft_version: Some("v0.15.2"),
+            transaction_id: Some("0123456789abcdef0123456789abcdef"),
             timeout_secs: 5,
             verbose: 0,
         };
@@ -98745,6 +99905,7 @@ log_level = "debug"
             ft_path: None,
             mux_server_path: None,
             ft_version: None,
+            transaction_id: None,
             timeout_secs: 5,
             verbose: 0,
         };
@@ -98797,6 +99958,7 @@ log_level = "debug"
             ft_path: None,
             mux_server_path: None,
             ft_version: None,
+            transaction_id: None,
             timeout_secs: 5,
             verbose: 0,
         };
@@ -98845,6 +100007,7 @@ log_level = "debug"
             ft_path: None,
             mux_server_path: None,
             ft_version: None,
+            transaction_id: None,
             timeout_secs: 5,
             verbose: 0,
         };
@@ -99070,6 +100233,253 @@ log_level = "debug"
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
+    fn activation_fsync_error_cannot_append_committed_outcome() {
+        let fixture = tempfile::tempdir().expect("create activation durability fixture");
+        let root_path = fixture.path().join("process-family");
+        let effective_uid = remote_generation_effective_uid();
+        let (root, generations) = open_remote_generation_root(&root_path, effective_uid)
+            .expect("open activation durability root");
+        let generation_id = "a".repeat(64);
+        let transaction_id = "0123456789abcdef0123456789abcdef";
+        let claim = remote_upgrade_ledger::RemoteUpgradeClaim::process_family_publication(
+            transaction_id,
+            &generation_id,
+            &"b".repeat(64),
+            101,
+            &"c".repeat(64),
+            202,
+        )
+        .expect("create activation durability claim");
+        let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(
+            &root,
+            effective_uid,
+            claim,
+        )
+        .expect("open activation durability ledger");
+        ledger
+            .authorize_publication(remote_upgrade_ledger::SelectorAuthority::Missing)
+            .expect("commit Prepared authorization")
+            .consume_publication()
+            .expect("consume publication permit");
+        let _selector_permit = ledger
+            .authorize_selector_after_publication(
+                remote_upgrade_ledger::SelectorAuthority::Missing,
+            )
+            .expect("commit Activating authorization");
+
+        let error = commit_remote_generation_selector_after_redurable_evidence_with(
+            &root_path,
+            &root,
+            &generations,
+            &generation_id,
+            transaction_id,
+            &mut ledger,
+            &remote_upgrade_ledger::SelectorAuthority::Missing,
+            effective_uid,
+            format!(
+                "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:generations/{generation_id}\n"
+            ),
+            |_| Err(std::io::Error::other("planted selector-root fsync failure")),
+        )
+        .expect_err("selector-root fsync failure must prevent Committed");
+        assert!(error.to_string().contains("re-durabilize"));
+        assert_eq!(
+            ledger.latest().expect("Activating record remains").state(),
+            remote_upgrade_ledger::RemoteUpgradeState::Activating
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn pending_publication_observation_failure_keeps_retryable_prepared_authority() {
+        let fixture = tempfile::tempdir().expect("create pending observation fixture");
+        let root_path = fixture.path().join("process-family");
+        let effective_uid = remote_generation_effective_uid();
+        let (root, _generations) = open_remote_generation_root(&root_path, effective_uid)
+            .expect("open pending observation root");
+        let generation_id = "a".repeat(64);
+        let transaction_id = "0123456789abcdef0123456789abcdef";
+        let claim = remote_upgrade_ledger::RemoteUpgradeClaim::process_family_publication(
+            transaction_id,
+            &generation_id,
+            &"b".repeat(64),
+            101,
+            &"c".repeat(64),
+            202,
+        )
+        .expect("create pending observation claim");
+        let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(
+            &root,
+            effective_uid,
+            claim,
+        )
+        .expect("open pending observation ledger");
+        ledger
+            .authorize_publication(remote_upgrade_ledger::SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization")
+            .consume_publication()
+            .expect("consume publication permit");
+        let transaction_path = root_path
+            .join("upgrade-transactions")
+            .join(transaction_id);
+        let entries_before = std::fs::read_dir(&transaction_path)
+            .expect("read transaction before failed observation")
+            .count();
+
+        let error = commit_pending_live_owner_after_selector_observation(
+            &mut ledger,
+            Err(anyhow::anyhow!("planted selector observation failure")),
+            format!(
+                "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
+            ),
+        )
+        .expect_err("unresolved selector authority must not be committed as pending");
+
+        assert!(format!("{error:#}").contains("planted selector observation failure"));
+        assert!(error.to_string().contains("transaction remains Prepared"));
+        assert_eq!(
+            ledger.latest().expect("Prepared record remains").state(),
+            remote_upgrade_ledger::RemoteUpgradeState::Prepared
+        );
+        assert_eq!(
+            std::fs::read_dir(transaction_path)
+                .expect("read transaction after failed observation")
+                .count(),
+            entries_before,
+            "a failed post-publication observation must not mint new transaction authority"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn post_rename_activation_fsync_error_requires_same_transaction_retry() {
+        let fixture = tempfile::tempdir().expect("create post-rename durability fixture");
+        let root_path = fixture.path().join("process-family");
+        let ft = fixture.path().join("ft");
+        let mux = fixture.path().join("frankenterm-mux-server");
+        let build_id = "d".repeat(64);
+        let transaction_id = "abcdef0123456789abcdef0123456789";
+        write_remote_generation_script_fixture(&ft, &build_id, "ft", "ft");
+        write_remote_generation_script_fixture(
+            &mux,
+            &build_id,
+            "frankenterm-mux-server",
+            "mux",
+        );
+        let family = validate_local_process_family(&ft, &mux)
+            .expect("validate post-rename process family");
+        let expected = ProcessFamilyByteReceipt::from(&family);
+        let pending = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root_path,
+            ft_source: &ft,
+            mux_server_source: &mux,
+            expected: expected.clone(),
+            transaction_id,
+            activate_current: false,
+        })
+        .expect("publish pending process family");
+        assert_eq!(pending.activation, RemoteGenerationActivation::PendingLease);
+
+        {
+            let effective_uid = remote_generation_effective_uid();
+            let (root, generations) = open_remote_generation_root(&root_path, effective_uid)
+                .expect("open post-rename durability root");
+            let claim = remote_upgrade_ledger::RemoteUpgradeClaim::process_family_publication(
+                transaction_id,
+                &pending.generation_id,
+                &expected.ft.sha256,
+                expected.ft.byte_len,
+                &expected.mux_server.sha256,
+                expected.mux_server.byte_len,
+            )
+            .expect("reconstruct exact pending claim");
+            let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(
+                &root,
+                effective_uid,
+                claim,
+            )
+            .expect("open pending transaction ledger");
+            let selector_before = observe_remote_generation_selector_authority(
+                &root,
+                &generations,
+                effective_uid,
+            )
+            .expect("observe missing selector authority");
+            assert_eq!(
+                selector_before,
+                remote_upgrade_ledger::SelectorAuthority::Missing
+            );
+            let permit = ledger
+                .authorize_selector_from_pending(selector_before.clone())
+                .expect("commit Activating before the selector effect");
+            let mut root_sync_calls = 0_u8;
+            let error = run_ledger_authorized_selector_effect_with(
+                &root_path,
+                &root,
+                &generations,
+                &pending.generation_id,
+                transaction_id,
+                &mut ledger,
+                permit,
+                selector_before,
+                effective_uid,
+                |root, generations, generation_id, permit, selector_before, effective_uid| {
+                    activate_remote_generation_selector_with(
+                        root,
+                        generations,
+                        generation_id,
+                        permit,
+                        selector_before,
+                        effective_uid,
+                        |root| {
+                            root_sync_calls = root_sync_calls
+                                .checked_add(1)
+                                .expect("test sync call count has headroom");
+                            if root_sync_calls == 2 {
+                                Err(std::io::Error::other(
+                                    "planted post-rename selector-root fsync failure",
+                                ))
+                            } else {
+                                sync_capability_directory(root)
+                            }
+                        },
+                    )
+                },
+            )
+            .expect_err("post-rename fsync failure must not commit in the same call");
+            assert_eq!(root_sync_calls, 2);
+            assert!(
+                format!("{error:#}")
+                    .contains("planted post-rename selector-root fsync failure")
+            );
+            assert!(error.to_string().contains("transaction remains Activating"));
+            assert_eq!(
+                std::fs::read_link(root_path.join("current"))
+                    .expect("rename made the target selector visible"),
+                PathBuf::from("generations").join(&pending.generation_id)
+            );
+            assert_eq!(
+                ledger.latest().expect("Activating record remains").state(),
+                remote_upgrade_ledger::RemoteUpgradeState::Activating
+            );
+        }
+
+        let recovered =
+            publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+                root: &root_path,
+                ft_source: &ft,
+                mux_server_source: &mux,
+                expected,
+                transaction_id,
+                activate_current: true,
+            })
+            .expect("the same transaction retry re-durabilizes and commits");
+        assert_eq!(recovered.generation_id, pending.generation_id);
+        assert_eq!(recovered.activation, RemoteGenerationActivation::Current);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
     fn remote_generation_publication_is_immutable_idempotent_and_selector_atomic() {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
@@ -99131,10 +100541,10 @@ log_level = "debug"
             ft_source: &ft_one,
             mux_server_source: &mux_one,
             expected: first_expected.clone(),
-            transaction_id: "22222222222222222222222222222222",
+            transaction_id: "11111111111111111111111111111111",
             activate_current: true,
         })
-        .expect("acknowledgement-loss retry must reopen and select exact generation");
+        .expect("a later private lease seam must advance the same pending transaction");
         assert_eq!(current.generation_id, pending.generation_id);
         assert_eq!(
             std::fs::read_link(root.join("current")).unwrap(),
@@ -99699,11 +101109,16 @@ log_level = "debug"
         );
 
         let staging_suffix = "0123456789abcdef0123456789abcdef";
-        let upload_preflight = remote_component_upload_preflight_command("ft", staging_suffix);
+        let upload_preflight =
+            remote_component_upload_preflight_command("ft", staging_suffix, &family.ft);
         assert!(upload_preflight.contains("test ! -e \"$path\" && test ! -L \"$path\""));
         assert!(upload_preflight.contains(&format!(
-            "FT_REMOTE_COMPONENT_UPLOAD_READY=ft:{staging_suffix}"
+            "FT_REMOTE_COMPONENT_UPLOAD_V1=ready:ft:{staging_suffix}"
         )));
+        assert!(upload_preflight.contains(&format!(
+            "FT_REMOTE_COMPONENT_UPLOAD_V1=existing_exact:ft:{staging_suffix}"
+        )));
+        assert!(upload_preflight.contains(&family.ft.sha256));
         let upload = remote_component_upload_command("ft", staging_suffix);
         assert!(upload.contains("set -euC"));
         assert!(upload.contains("test ! -e \"$path\" && test ! -L \"$path\""));
@@ -99753,6 +101168,23 @@ log_level = "debug"
             assert_eq!(
                 std::fs::read(&remote_stage).expect("read exact uploaded component"),
                 std::fs::read(&ft_path).expect("read local exact component")
+            );
+
+            let replay_preflight = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&upload_preflight)
+                .env("HOME", &remote_home)
+                .output()
+                .expect("execute exact upload replay preflight");
+            assert!(
+                replay_preflight.status.success(),
+                "an acknowledgement-loss retry must accept exact retained stage bytes"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&replay_preflight.stdout),
+                format!(
+                    "FT_REMOTE_COMPONENT_UPLOAD_V1=existing_exact:ft:{staging_suffix}\n"
+                )
             );
 
             let refused_overwrite = std::process::Command::new("sh")
@@ -100059,10 +101491,126 @@ log_level = "debug"
         assert!(!command.contains("--dest \"$HOME/.local/bin\""));
         assert!(!command.contains("/main/install.sh"));
         assert!(!command.contains("| bash"));
-        assert!(command.contains("mkdir \"$destination\" && curl"));
+        assert!(command.contains("if test -e \"$destination\" || test -L \"$destination\""));
+        assert!(command.contains("if emit_receipt; then"));
+        assert!(command.contains("destination_existed=1"));
+        assert!(command.contains("--no-app --force"));
+        assert!(command.contains("test \"$(stat -c %a -- \"$destination\")\" = 700"));
+        assert!(command.contains("install-v0.15.2-0123456789abcdef0123456789abcdef-$$"));
+        assert!(command.contains("mkdir \"$destination\""));
         assert!(command.contains("FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2"));
         assert!(command.contains("stat -c %s"));
         assert!(command.contains("sha256sum"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_release_installer_resumes_partial_destination_and_fast_paths_exact_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create release retry fixture");
+        let home = fixture.path().join("home");
+        let fake_bin = fixture.path().join("fake-bin");
+        std::fs::create_dir_all(&fake_bin).expect("create fake command directory");
+        let installer_source = fixture.path().join("fake-installer.sh");
+        std::fs::write(
+            &installer_source,
+            r#"#!/usr/bin/env bash
+set -eu
+destination=""
+saw_force=0
+while test "$#" -gt 0; do
+  case "$1" in
+    --dest) shift; destination=$1 ;;
+    --force) saw_force=1 ;;
+  esac
+  shift
+done
+test "$saw_force" = 1
+test -n "$destination"
+mkdir -p "$destination"
+printf '#!/bin/sh\nexit 0\n' > "$destination/ft"
+printf '#!/bin/sh\nexit 0\n' > "$destination/frankenterm-mux-server"
+chmod 0755 "$destination/ft" "$destination/frankenterm-mux-server"
+"#,
+        )
+        .expect("write fake release installer");
+        let curl = fake_bin.join("curl");
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+set -eu
+printf x >> "$FAKE_CURL_MARKER"
+output=""
+while test "$#" -gt 0; do
+  if test "$1" = -o; then
+    shift
+    output=$1
+  fi
+  shift
+done
+test -n "$output"
+cp "$FAKE_INSTALLER_SOURCE" "$output"
+"#,
+        )
+        .expect("write fake curl");
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake curl executable");
+
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let destination = home
+            .join(".cache/frankenterm/releases")
+            .join(format!("v0.15.2-{suffix}"));
+        std::fs::create_dir_all(&destination).expect("create partial destination");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make partial destination private");
+        std::fs::write(destination.join("ft"), b"partial")
+            .expect("plant incomplete prior ft");
+        std::fs::set_permissions(
+            destination.join("ft"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("set incomplete prior ft mode");
+        let marker = fixture.path().join("curl-invocations");
+        let command = remote_release_installer_command_at_revision(
+            "v0.15.2",
+            suffix,
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .expect("render retryable release installer command");
+        let inherited_path = std::env::var("PATH").expect("test PATH");
+        let test_path = format!("{}:{inherited_path}", fake_bin.display());
+        let run = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .env("HOME", &home)
+                .env("PATH", &test_path)
+                .env("FAKE_INSTALLER_SOURCE", &installer_source)
+                .env("FAKE_CURL_MARKER", &marker)
+                .output()
+                .expect("execute retryable release installer command")
+        };
+
+        let resumed = run();
+        assert!(
+            resumed.status.success(),
+            "partial destination retry failed: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        let resumed_stdout = String::from_utf8(resumed.stdout).expect("UTF-8 receipt");
+        parse_remote_release_component_receipt(&resumed_stdout, "v0.15.2")
+            .expect("resumed destination returns an exact receipt");
+        assert_eq!(std::fs::read(&marker).expect("curl marker"), b"x");
+
+        let replay = run();
+        assert!(replay.status.success(), "exact replay must fast-path");
+        assert_eq!(replay.stdout, resumed_stdout.as_bytes());
+        assert_eq!(
+            std::fs::read(marker).expect("unchanged curl marker"),
+            b"x",
+            "a complete exact retry must not redownload or rerun the installer"
+        );
     }
 
     #[test]

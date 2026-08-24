@@ -160,6 +160,13 @@ pub enum LinearRecordTerminalReason {
     ZeroFilledRecordHeader,
     RecordPayloadPastDeclaredCursor,
     PhysicalRecordPayloadTruncated,
+    /// A v1 writer has overwritten the beginning of its body, but v1 stores
+    /// neither the oldest-record offset nor a generation. Physical order is
+    /// therefore not logical order and cannot be exported exactly.
+    LegacyWrappedOrderUnknown,
+    /// A newer v2 state publication or one of its authenticated records was
+    /// torn/corrupt, so recovery fell back to an older valid state slot.
+    V2NewerStateInvalid,
 }
 
 impl LinearRecordTerminalReason {
@@ -171,6 +178,8 @@ impl LinearRecordTerminalReason {
             Self::ZeroFilledRecordHeader => "zero_filled_record_header",
             Self::RecordPayloadPastDeclaredCursor => "record_payload_past_declared_cursor",
             Self::PhysicalRecordPayloadTruncated => "physical_record_payload_truncated",
+            Self::LegacyWrappedOrderUnknown => "legacy_wrapped_order_unknown",
+            Self::V2NewerStateInvalid => "v2_newer_state_invalid",
         }
     }
 }
@@ -301,6 +310,11 @@ pub struct MmapScrollback {
     sync_interval: Duration,
     redactor: StreamingRedactor,
     pending_record_kind: Option<RecordKind>,
+    v2_state: V2RingState,
+    active_state_slot: usize,
+    used_bytes: u64,
+    #[cfg(test)]
+    sync_observer: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl MmapScrollback {

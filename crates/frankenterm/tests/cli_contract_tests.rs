@@ -29,12 +29,16 @@ use frankenterm_core::policy::{
 use frankenterm_core::scrollback_mmap_format::RecordKind;
 use frankenterm_core::scrollback_mmap_format::{FormatVersion, HeaderFlags, ScrollbackHeader};
 #[cfg(unix)]
-use frankenterm_core::scrollback_mmap_writer::{MmapScrollback, MmapScrollbackConfig};
+use frankenterm_core::scrollback_mmap_writer::{
+    LinearRecordReadLimits, MmapScrollback, MmapScrollbackConfig,
+};
 #[cfg(unix)]
 use frankenterm_core::tx_idempotency::{StepOutcome, TxExecutionLedger, TxPhase};
 use predicates::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt as _;
 #[cfg(unix)]
@@ -84,6 +88,15 @@ fn write_test_scrollback(
     uuid_byte: u8,
 ) -> (String, std::path::PathBuf) {
     std::fs::create_dir_all(scrollback_dir).expect("create scrollback dir");
+    #[cfg(unix)]
+    {
+        let mut permissions = std::fs::metadata(scrollback_dir)
+            .expect("read scrollback directory metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(scrollback_dir, permissions)
+            .expect("harden scrollback directory permissions");
+    }
     let pane_uuid = format!("{uuid_byte:02x}").repeat(32);
     let path = scrollback_dir.join(format!("{pane_uuid}.bin"));
     let header = ScrollbackHeader {
@@ -100,6 +113,16 @@ fn write_test_scrollback(
     let mut file = std::fs::File::create(&path).expect("create scrollback file");
     file.write_all(&header.encode())
         .expect("write scrollback header");
+    #[cfg(unix)]
+    {
+        let mut permissions = file
+            .metadata()
+            .expect("read scrollback file metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)
+            .expect("harden scrollback file permissions");
+    }
     (pane_uuid, path)
 }
 
@@ -4021,13 +4044,22 @@ fn session_list_orphans_defaults_to_json_when_stdout_is_piped() {
 }
 
 #[test]
-fn session_discard_removes_bin_and_lock_then_disappears_from_list() {
+fn session_discard_removes_bin_retains_lock_and_disappears_from_list() {
     let (dir, ws) = setup_workspace();
     let data_home = dir.path().join("data-home");
     let scrollback_dir = data_home.join("ft").join("scrollback");
     let (pane_uuid, path) = write_test_scrollback(&scrollback_dir, 0x7b);
     let lock_path = path.with_extension("bin.lock");
     std::fs::write(&lock_path, b"stale lock").expect("write stale lock");
+    #[cfg(unix)]
+    {
+        let mut permissions = std::fs::metadata(&lock_path)
+            .expect("read stale lock metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&lock_path, permissions)
+            .expect("harden stale lock permissions");
+    }
 
     let output = wa_cmd_for(&ws)
         .env("XDG_DATA_HOME", &data_home)
@@ -4047,10 +4079,20 @@ fn session_discard_removes_bin_and_lock_then_disappears_from_list() {
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["action"], "discard");
     assert_eq!(payload["pane_uuid"], pane_uuid);
+    assert_eq!(payload["removed"]["bin"], path.display().to_string());
+    assert_eq!(
+        payload["retained"]["lock"],
+        lock_path.display().to_string()
+    );
+    assert_eq!(
+        payload["retained"]["reason"],
+        "preserve_single_flock_inode_authority"
+    );
+    assert_eq!(payload["directory_synced"], true);
     assert!(!path.exists(), "discard should remove the .bin file");
     assert!(
-        !lock_path.exists(),
-        "discard should remove the .bin.lock file"
+        lock_path.is_file(),
+        "discard must retain the .bin.lock inode to preserve flock authority"
     );
 
     let listed = wa_cmd_for(&ws)
@@ -4089,6 +4131,70 @@ fn session_recover_unknown_uuid_returns_structured_exit_2() {
     );
 }
 
+#[test]
+fn session_recover_requires_explicit_opt_in_before_retaining_an_incomplete_source() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let scrollback_dir = data_home.join("ft").join("scrollback");
+    let (pane_uuid, _) = write_test_scrollback(&scrollback_dir, 0x8c);
+    let transcript_path = dir.path().join("incomplete-scrollback.txt");
+
+    let rejected = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args(["session", "recover", &pane_uuid, "--output"])
+        .arg(&transcript_path)
+        .args(["--format", "json"])
+        .output()
+        .expect("ft session recover should reject implicit partial salvage");
+
+    assert_eq!(rejected.status.code(), Some(2));
+    let rejected_payload: serde_json::Value = serde_json::from_slice(&rejected.stdout)
+        .expect("partial-recovery rejection stdout should be JSON");
+    assert_eq!(rejected_payload["ok"], false);
+    assert_eq!(
+        rejected_payload["error_code"],
+        "session.orphan_recovery_partial_requires_opt_in"
+    );
+    assert!(
+        !transcript_path.exists(),
+        "default recovery must reject before publishing an incomplete artifact"
+    );
+
+    let retained = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args([
+            "session",
+            "recover",
+            &pane_uuid,
+            "--allow-partial",
+            "--output",
+        ])
+        .arg(&transcript_path)
+        .args(["--format", "json"])
+        .output()
+        .expect("ft session recover should retain explicitly authorized partial salvage");
+
+    assert!(
+        retained.status.success(),
+        "explicit partial recovery failed: {}",
+        String::from_utf8_lossy(&retained.stderr)
+    );
+    let retained_payload: serde_json::Value = serde_json::from_slice(&retained.stdout)
+        .expect("partial-recovery stdout should be JSON");
+    assert_eq!(retained_payload["ok"], true);
+    assert_eq!(retained_payload["complete"], false);
+    assert_eq!(retained_payload["partial_retention_authorized"], true);
+    assert_eq!(retained_payload["scrollback_export"]["status"], "unreplayable");
+    assert_eq!(
+        retained_payload["scrollback_export"]["source_completeness"]["status"],
+        "incomplete"
+    );
+    assert_eq!(
+        std::fs::read(&transcript_path).expect("read retained partial transcript"),
+        Vec::<u8>::new()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn session_recover_exports_sigkill_orphan_without_mux_mutation() {
@@ -4096,15 +4202,31 @@ fn session_recover_exports_sigkill_orphan_without_mux_mutation() {
     let data_home = dir.path().join("data-home");
     let scrollback_dir = data_home.join("ft").join("scrollback");
     std::fs::create_dir_all(&scrollback_dir).expect("create scrollback dir");
+    let mut scrollback_permissions = std::fs::metadata(&scrollback_dir)
+        .expect("read scrollback directory metadata")
+        .permissions();
+    scrollback_permissions.set_mode(0o700);
+    std::fs::set_permissions(&scrollback_dir, scrollback_permissions)
+        .expect("harden scrollback directory permissions");
     let pane_uuid = "c3".repeat(32);
     let payload = "ft-rlvsz durable prefix line 1\nft-rlvsz durable prefix line 2\n";
     let ready_path = dir.path().join("sigkill-writer.ready");
 
     let mut child = spawn_sigkill_writer_child(&scrollback_dir, &pane_uuid, payload, &ready_path);
     let scrollback_path = wait_for_sigkill_writer_ready(&mut child, &ready_path);
-    let pre_kill_records =
-        frankenterm_core::scrollback_mmap_writer::read_linear_records(&scrollback_path)
-            .expect("read pre-kill linear records");
+    let max_file_bytes = std::fs::metadata(&scrollback_path)
+        .expect("read pre-kill scrollback metadata")
+        .len();
+    let pre_kill_records = frankenterm_core::scrollback_mmap_writer::read_linear_records(
+        &scrollback_path,
+        LinearRecordReadLimits {
+            max_file_bytes,
+            max_records: 16,
+            max_payload_bytes: max_file_bytes,
+        },
+    )
+    .expect("read pre-kill linear records")
+    .records;
     assert!(
         pre_kill_records.iter().any(|(_, bytes)| bytes
             .windows(payload.len())

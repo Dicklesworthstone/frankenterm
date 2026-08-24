@@ -43,11 +43,11 @@ Default behavior is dry-run with a full plan preview. No destructive actions are
 
 ### Command
 ```
-ft setup remote --host <ssh_host>
+ft setup remote <ssh_host>
 ```
 
 ### Flags
-- `--host <ssh_host>`: SSH alias from `~/.ssh/config` or explicit host.
+- `<ssh_host>`: positional SSH alias from `~/.ssh/config` or explicit host.
 - `--dry-run`: default; prints plan, does not modify remote.
 - `--apply`: executes the plan (non-destructive). Requires explicit confirmation.
 - `--install-ft`: stage the matching `ft` and `frankenterm-mux-server` binaries
@@ -61,6 +61,10 @@ ft setup remote --host <ssh_host>
 - `--ft-version <release-tag>`: install both binaries from the checksummed Unix
   archive for an immutable release tag. `git` is rejected because it cannot
   identify an atomic client/server build.
+- `--transaction-id <32-lowercase-hex>`: required for an applied
+  `--install-ft`. The caller chooses it once and must reuse that exact value
+  after timeout, disconnect, or lost acknowledgement. Setup never substitutes
+  a fresh UUID for an applied transaction.
 - `--yes`: skip interactive prompts (only allowed with `--apply`).
 - `--timeout-secs <n>`: per-command timeout (default 30s).
 - `--verbose`: emit step-by-step logs with timings and remote command outputs.
@@ -96,8 +100,10 @@ ft setup remote --host <ssh_host>
 ## Step Plan (Dry Run + Apply)
 
 ### 1) Host Selection
-- Accept `--host` or prompt from SSH config (if interactive).
-- Resolve to `ssh` target and report effective user/hostname/port.
+- Require one positional `<ssh_host>` and validate it as the exact SSH target
+  passed to subsequent setup probes and commands.
+- Interactive SSH-config selection and an effective user/hostname/port report
+  are not implemented by this command.
 
 ### 2) Connectivity Check
 Run:
@@ -208,14 +214,52 @@ it succeeds only after exact nofollow manifest, file, owner, mode, link-count,
 hash, and pathname/handle device+inode revalidation. A conflicting existing
 object fails closed. Transaction stages are never removed or overwritten, even
 after a failed or concurrent attempt. A crash before the final generation
-rename can therefore leave `.stage-<generation>-<transaction>` behind. Reusing
-that exact transaction ID fails closed on the collision; a fresh transaction
-may revalidate the sources and publish the same content-derived generation, but
-the stale stage remains. This is not durable same-transaction recovery and can
-accumulate residue. Bounded residue census plus a synchronized transaction
-journal that can prove and resume an exact prepared state remain required before
-claiming crash recovery; setup never guesses that a stale stage is safe to
-delete.
+rename can therefore leave an immutable `.stage-<generation>-<effect-id>`
+behind. The effect ID is derived from the stable caller transaction, committed
+authorization sequence, and bounded attempt number. A same-transaction retry
+uses a fresh derived effect ID, so it neither overwrites nor deletes the stale
+stage. If the content-derived generation already exists, the retry accepts it
+only after the complete exact revalidation above.
+
+The target-side ledger lives under:
+
+```
+upgrade-transactions/<32-lowercase-hex-transaction-id>/
+  claim-<domain-separated-payload-sha256>.v1
+  record-<sequence>-<domain-separated-record-sha256>-<attempt>.json
+  commit-<sequence>-<record-sha256>.v1
+```
+
+The zero-length claim name binds canonical JSON containing the exact generation,
+component lengths/hashes, and process-family upgrade operation. Every committed
+record embeds that full claim for offline audit. A record is canonical bounded
+JSON and has no authority by itself: only its
+matching zero-length, synchronized commit marker authorizes the next effect or
+records its outcome. Files are append-only, create-new, mode 0400, single-link,
+same-filesystem artifacts under descriptor-pinned owner-only directories. A
+corrupt or missing record for the newest commit poisons the transaction; the
+reader never falls back to an older apparently successful record.
+Before replaying authority or issuing an effect permit, the reader re-fsyncs
+the existing claim, every admitted record and marker, the transaction
+directory, the ledger directory, and their process-family parent, then repeats
+the descriptor/path identity checks. Existing bytes are never treated as
+durable merely because they survived in the page cache.
+
+The fixed bounds are 64 KiB per record, 32 committed records, 16 attempts,
+2 MiB of record bytes per transaction, and 4096 transaction directories. The
+writer preflights the resulting record-artifact count, total entry count,
+committed count, and byte total before creating either a record or marker. A
+crash after the canonical record is synchronized but before its marker may
+leave an outcome orphan. A retry adopts it only when the complete canonical
+bytes and bounded `(sequence, attempt)` identity are exactly the intended next
+record; a conflicting record for that identity poisons without further
+mutation.
+The state vocabulary is `Prepared`, `PendingLiveOwner`, `Activating`, `Committed`,
+`RolledBack`, and `Indeterminate`. Current applied setup commits `Prepared`,
+publishes/revalidates the immutable generation under a one-shot non-clone
+effect permit, then commits `PendingLiveOwner` with the exact stdout receipt.
+An acknowledgement-loss retry revalidates the claimed generation and replays
+that exact committed receipt.
 
 Merely replacing the client while the old mux remains alive is forbidden
 because a codec-window mismatch makes all configured domains unusable even
@@ -240,12 +284,22 @@ be reported as ambiguous merely because its activation receipt was polluted.
 Remote stdout and stderr diagnostics are terminal-sanitized, secret-redacted,
 and bounded before verbose display.
 
-Each local-component upload requires an exact stdout-clean nonexistence receipt
-for its randomized remote stage before streaming the already-open no-follow
-source descriptor over SSH, then rejects anything except the
-expected regular, non-symlink file with the retained byte length and SHA-256.
+Each local-component upload requires an exact stdout-clean disposition before
+streaming the already-open no-follow source descriptor over SSH. A missing
+stable transaction stage returns `ready`; an existing stage returns
+`existing_exact` only when it is the current user's regular non-symlink,
+single-link mode-0500/0600 file with the retained byte length and SHA-256.
+Anything else fails without overwrite. A release-cache retry likewise admits
+an existing transaction directory only after both bounded owner/single-link
+component files are present; the descriptor-confined publisher then repeats
+sealed-identity and exact hash admission before consulting the ledger.
 The upload paths and release-cache paths remain source artifacts; generation
 publication never moves, truncates, deletes, or overwrites them.
+An interruption while a component upload is still partial, or after a release
+transaction directory exists but before both release files are complete, fails
+closed on reuse of that transaction ID. The durable claim begins only after
+both exact source artifacts are admitted; recovering those pre-claim partial
+downloads without a new transaction remains outside this revision.
 
 The stored process-family selector is the relative symlink `current`, whose
 target must be the normalized path `generations/<content-derived-id>` with no
@@ -254,21 +308,28 @@ that selector. For a change, the publisher first validates the existing
 `current` selector and its complete generation, creates and synchronizes a
 transaction-unique candidate selector, and atomically exchanges it with
 `renameat2(RENAME_EXCHANGE)`. The displaced old selector remains under the
-transaction's `.selector-rollback-<uuid>` name. An initial selector uses
+transaction's `.selector-rollback-<transaction-id>` name. An initial selector uses
 `RENAME_NOREPLACE`. Stale selector artifacts are never removed or overwritten.
 The selector primitive remains source-owned for the future lease-authorized
 handoff and its direct fixture proofs; the remote publisher command exposed by
 setup has no activation flag, and `ft setup remote` does not call this
-primitive. A crash that leaves a transaction selector without a replayable
-journal makes the same transaction fail closed rather than infer whether a
-switch committed. Those residues have no automatic recovery in this revision.
+primitive. The ledger nevertheless pins the future handoff seam: a committed
+`Activating` record captures the exact pre-selector authority and issues one
+non-clone selector-effect permit. On retry, exact post-selector authority equal
+to the target may commit/replay `Committed` only after the process-family root
+is fsynced and both `current` and the exact displaced-selector evidence are
+revalidated against the committed pre-authority. An fsync or evidence failure
+leaves the transaction `Activating`; exact equality with the stored
+pre-authority permits one bounded reattempt and reuse of an exact staged
+selector; any third authority or unreadable post-state commits `Indeterminate`.
+This recovery seam is private source machinery, not an activation capability.
 
 One atomic selector makes readers see one complete old or new generation rather
-than a mixed ft/mux pair. Atomic visibility is not crash-outcome knowledge: an
-SSH acknowledgement loss or power loss around the switch still requires the
-durable transaction journal/replay layer to determine and replay the terminal
-result. This revision does not call activation crash-atomic and does not infer a
-result from the absence of an acknowledgement.
+than a mixed ft/mux pair. Atomic visibility is not crash-outcome knowledge: the
+ledger's committed pre-state and exact post-state reconciliation determine the
+recorded outcome. The source seam never infers success from absence of an SSH
+acknowledgement. Production activation remains withheld until the lifetime
+lease supplies the separate live-owner authority required to enter that seam.
 
 The top-level installer's already-current shortcut is serialized by its
 installer lock and requires the embedded sealed build marker to match across
@@ -501,6 +562,11 @@ ssh <host> "systemctl --user status frankenterm-mux-server"
   identity through the current path-based shell surface.
 - An exact existing content-derived generation is an idempotent retry only after
   complete nofollow revalidation. Conflicting bytes under that ID fail closed.
+- Applied process-family publication requires one caller-stable transaction ID.
+  Reuse replays the exact committed `PendingLiveOwner` receipt or resumes from
+  committed `Prepared`; changing the claimed generation or component payload
+  under that ID fails the immutable claim. A later lease holder may advance the
+  same claim from `PendingLiveOwner` rather than inventing a second upgrade.
 - Every install candidate remains pending until a cross-launcher startup lease
   exists. Setup does not change `current`, rewrite a current-bound unit, issue
   `daemon-reload`, enable the service, or start it.
@@ -525,6 +591,7 @@ ssh <host> "systemctl --user status frankenterm-mux-server"
 - Final summary includes:
   - what changed
   - immutable pending generations created (service backups are not created)
+  - stable transaction ID and exact pending generation receipt
   - next steps
 
 ---
@@ -544,7 +611,7 @@ ssh <host> "systemctl --user disable frankenterm-mux-server"
 - Only a future lease-authorized transaction, after an independently verified
   empty pane/PTY census, may stop the mux and atomically exchange `current` to a
   fully revalidated prior generation. The displaced selector retained under
-  `.selector-rollback-<transaction-uuid>` is evidence and a rollback input, not
+  `.selector-rollback-<transaction-id>` is evidence and a rollback input, not
   permission to bypass validation. The current setup command does not yet
   automate or certify the live handoff.
 - Setup does not mutate the service file, so it has no service-file rollback
@@ -569,15 +636,21 @@ ssh <host> "mv ~/.local/bin/ft ~/.local/bin/ft.disabled"
 ## Acceptance Criteria
 - A reviewer can implement remote setup without re-reading PLAN.md.
 - The spec enumerates commands, files, flags, logging, and rollback steps.
-- Exact-generation retry is idempotent after complete nofollow revalidation;
-  activation and service mutation are withheld by default. Full crash-cut
-  behavior remains an executable acceptance boundary below.
+- Same-transaction immutable-publication retry is source-complete: the exact
+  claim, committed authorization/outcome records, derived attempt artifacts,
+  complete nofollow generation revalidation, and exact receipt replay are
+  wired. Activation and service mutation remain withheld. Full power-loss
+  crash-cut behavior remains an executable acceptance boundary below.
 - Source tests pin canonical content-derived manifests, exact receipt parsing,
   same-filesystem immutable publication, exact EEXIST retry versus conflict,
   descriptor-pinned version execution, bootstrap descriptor publication,
   nofollow/link/mode rejection, named-`generations` rebinding rejection, bounded
-  collision-preserving rollback selectors, pending-only setup commands, absence
-  of service-unit mutation/start commands, and preservation of legacy bytes.
+  append-only ledger parsing, exact outcome-orphan adoption, conflicting-orphan
+  poisoning, near-cap preflight without mutation, existing-authority
+  re-durability, corrupt-newest-commit poisoning, stable-ID claim conflicts,
+  selector-fsync failure remaining non-committed, collision-preserving rollback
+  selectors, pending-only setup commands, absence of service-unit mutation/start
+  commands, and preservation of legacy bytes.
   Full power-loss crash-cut and real-service identity proof remain separate
   executable acceptance gates rather than claims inferred from source.
 - Source tests pin private guardian directories, ordinary-stop refusal,
