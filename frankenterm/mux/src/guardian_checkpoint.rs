@@ -33,6 +33,10 @@ const TERMINAL_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-terminal-payload.v1\0";
 const LIVE_PARSER_BOUNDARY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.live-parser-checkpoint-boundary.v1\0";
+const OUTPUT_BOUNDARY_IDENTITY_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-output-boundary-identity.v1\0";
+const CHECKPOINT_ARTIFACT_IDENTITY_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-artifact-identity.v1\0";
 
 /// Version of the cross-subsystem checkpoint-boundary contract.
 pub const GUARDIAN_CHECKPOINT_BOUNDARY_VERSION: u32 = 2;
@@ -154,15 +158,7 @@ impl GuardianCheckpointBoundary {
         {
             return Err(GuardianCheckpointBoundaryError::VerifiedOutputIdentityMismatch);
         }
-        let (observed_payload_bytes, observed_payload_digest) =
-            terminal_payload_identity(canonical_terminal_payload)?;
-        if self.terminal_payload_bytes != observed_payload_bytes {
-            return Err(GuardianCheckpointBoundaryError::TerminalPayloadLengthMismatch);
-        }
-        if self.terminal_payload_digest != observed_payload_digest {
-            return Err(GuardianCheckpointBoundaryError::TerminalPayloadDigestMismatch);
-        }
-        Ok(())
+        validate_terminal_payload_identity(self, canonical_terminal_payload)
     }
 
     #[must_use]
@@ -231,6 +227,30 @@ impl GuardianCheckpointBoundary {
     #[must_use]
     pub const fn terminal_payload_digest(&self) -> [u8; 32] {
         self.terminal_payload_digest
+    }
+
+    /// Stable identity of the authenticated output-journal boundary covered by
+    /// this checkpoint. Unlike the live-parser boundary digest, this excludes
+    /// process-local registration identity and remains stable across a mux
+    /// restart.
+    #[must_use]
+    pub fn output_boundary_identity_digest(&self) -> [u8; 32] {
+        output_boundary_identity_digest(self)
+    }
+
+    /// Stable identity of the complete durable checkpoint artifact.
+    ///
+    /// The supplied canonical payload is re-identified before the digest is
+    /// minted, so a caller cannot splice different terminal bytes onto this
+    /// boundary. The result is suitable for
+    /// `GuardianCheckpointIdentityDigest`; it deliberately excludes ephemeral
+    /// live-registration identity.
+    pub fn checkpoint_artifact_identity_digest(
+        &self,
+        canonical_terminal_payload: &[u8],
+    ) -> Result<[u8; 32], GuardianCheckpointBoundaryError> {
+        validate_terminal_payload_identity(self, canonical_terminal_payload)?;
+        Ok(checkpoint_artifact_identity_digest(self))
     }
 }
 
@@ -460,6 +480,22 @@ impl LiveParserCheckpointAck {
         self.boundary.terminal_payload_digest()
     }
 
+    /// Stable identity of the authenticated output boundary included by this
+    /// checkpoint. This remains stable across registration incarnations.
+    #[must_use]
+    pub fn output_boundary_identity_digest(&self) -> [u8; 32] {
+        self.boundary.output_boundary_identity_digest()
+    }
+
+    /// Stable identity of the complete canonical checkpoint artifact.
+    ///
+    /// Capture already proved the payload-to-boundary binding, so this
+    /// infallible accessor cannot be influenced by caller-supplied bytes.
+    #[must_use]
+    pub fn checkpoint_artifact_identity_digest(&self) -> [u8; 32] {
+        checkpoint_artifact_identity_digest(&self.boundary)
+    }
+
     /// Digest binding this boundary to the current registration wire identity.
     ///
     /// This value changes across registration incarnations and therefore must
@@ -569,6 +605,47 @@ fn live_parser_boundary_digest(
     hasher.update(boundary.terminal_payload_bytes().to_le_bytes());
     hasher.update(boundary.terminal_payload_digest());
     hasher.finalize().into()
+}
+
+fn output_boundary_identity_digest(boundary: &GuardianCheckpointBoundary) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(OUTPUT_BOUNDARY_IDENTITY_DIGEST_DOMAIN);
+    hasher.update(boundary.version().to_le_bytes());
+    hasher.update(boundary.durable_pane_id().as_bytes());
+    hasher.update(boundary.segment_id().as_bytes());
+    hasher.update(boundary.output_sequence().to_le_bytes());
+    hasher.update(boundary.output_record_digest());
+    hasher.update(boundary.output_committed_log_bytes().to_le_bytes());
+    hasher.update(boundary.journal_cumulative_plaintext_bytes().to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn checkpoint_artifact_identity_digest(boundary: &GuardianCheckpointBoundary) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(CHECKPOINT_ARTIFACT_IDENTITY_DIGEST_DOMAIN);
+    hasher.update(boundary.output_boundary_identity_digest());
+    hasher.update(boundary.parser_stream_bytes().to_le_bytes());
+    hasher.update(boundary.replay_identity_digest());
+    hasher.update(boundary.rows().to_le_bytes());
+    hasher.update(boundary.cols().to_le_bytes());
+    hasher.update(boundary.terminal_payload_bytes().to_le_bytes());
+    hasher.update(boundary.terminal_payload_digest());
+    hasher.finalize().into()
+}
+
+fn validate_terminal_payload_identity(
+    boundary: &GuardianCheckpointBoundary,
+    canonical_terminal_payload: &[u8],
+) -> Result<(), GuardianCheckpointBoundaryError> {
+    let (observed_payload_bytes, observed_payload_digest) =
+        terminal_payload_identity(canonical_terminal_payload)?;
+    if boundary.terminal_payload_bytes() != observed_payload_bytes {
+        return Err(GuardianCheckpointBoundaryError::TerminalPayloadLengthMismatch);
+    }
+    if boundary.terminal_payload_digest() != observed_payload_digest {
+        return Err(GuardianCheckpointBoundaryError::TerminalPayloadDigestMismatch);
+    }
+    Ok(())
 }
 
 fn validate_output_identity(
@@ -933,6 +1010,98 @@ mod tests {
                 checkpoint.canonical_payload(),
             ),
             Err(GuardianCheckpointBoundaryError::ReplayIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn durable_identities_exclude_registration_and_bind_checkpoint_semantics() {
+        let pane = Uuid::new_v4();
+        let (segment, output) = synchronized_output(pane);
+        let first_checkpoint = terminal_checkpoint();
+        let first_watermark = first_checkpoint.parser_stream_bytes();
+        let first = LiveParserCheckpointAck::capture(
+            [1_u8; 16],
+            pane,
+            segment,
+            output,
+            first_watermark,
+            first_checkpoint,
+        )
+        .expect("capture first registration-bound checkpoint");
+        let second_checkpoint = terminal_checkpoint();
+        let second_watermark = second_checkpoint.parser_stream_bytes();
+        let second = LiveParserCheckpointAck::capture(
+            [2_u8; 16],
+            pane,
+            segment,
+            output,
+            second_watermark,
+            second_checkpoint,
+        )
+        .expect("capture second registration-bound checkpoint");
+
+        assert_ne!(first.boundary_digest(), second.boundary_digest());
+        assert_eq!(
+            first.output_boundary_identity_digest(),
+            second.output_boundary_identity_digest(),
+            "durable output identity must exclude process-local registration identity"
+        );
+        assert_eq!(
+            first.checkpoint_artifact_identity_digest(),
+            second.checkpoint_artifact_identity_digest(),
+            "durable checkpoint identity must exclude process-local registration identity"
+        );
+        assert_ne!(first.output_boundary_identity_digest(), [0_u8; 32]);
+        assert_ne!(first.checkpoint_artifact_identity_digest(), [0_u8; 32]);
+        assert_eq!(
+            first
+                .boundary()
+                .checkpoint_artifact_identity_digest(
+                    first.terminal_checkpoint().canonical_payload(),
+                )
+                .expect("validate the captured canonical payload"),
+            first.checkpoint_artifact_identity_digest()
+        );
+
+        let boundary = *first.boundary();
+        let mut output_mutation = boundary;
+        output_mutation.output_record_digest[0] ^= 1;
+        assert_ne!(
+            output_mutation.output_boundary_identity_digest(),
+            boundary.output_boundary_identity_digest()
+        );
+        assert_ne!(
+            checkpoint_artifact_identity_digest(&output_mutation),
+            checkpoint_artifact_identity_digest(&boundary)
+        );
+
+        let mut parser_mutation = boundary;
+        parser_mutation.parser_stream_bytes = parser_mutation
+            .parser_stream_bytes
+            .checked_add(1)
+            .expect("fixture parser watermark has room");
+        assert_eq!(
+            parser_mutation.output_boundary_identity_digest(),
+            boundary.output_boundary_identity_digest(),
+            "parser state is not part of the durable journal boundary"
+        );
+        assert_ne!(
+            checkpoint_artifact_identity_digest(&parser_mutation),
+            checkpoint_artifact_identity_digest(&boundary)
+        );
+
+        let mut replay_mutation = boundary;
+        replay_mutation.replay_identity_digest[0] ^= 1;
+        assert_ne!(
+            checkpoint_artifact_identity_digest(&replay_mutation),
+            checkpoint_artifact_identity_digest(&boundary)
+        );
+
+        let mut payload_mutation = first.terminal_checkpoint().canonical_payload().to_vec();
+        payload_mutation[0] ^= 1;
+        assert_eq!(
+            boundary.checkpoint_artifact_identity_digest(&payload_mutation),
+            Err(GuardianCheckpointBoundaryError::TerminalPayloadDigestMismatch)
         );
     }
 

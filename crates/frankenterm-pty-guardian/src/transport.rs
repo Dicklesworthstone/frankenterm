@@ -1436,15 +1436,17 @@ struct OwnedEncodedFrame {
 }
 
 impl OwnedEncodedFrame {
-    fn new(
-        frame: Vec<u8>,
-        #[cfg(test)] wipe_probe: Option<Arc<ClientRequestWipeProbe>>,
-    ) -> Self {
+    fn new(frame: Vec<u8>) -> Self {
         Self {
             frame: Zeroizing::new(frame),
             #[cfg(test)]
-            wipe_probe,
+            wipe_probe: None,
         }
+    }
+
+    #[cfg(test)]
+    fn set_wipe_probe(&mut self, probe: Option<Arc<ClientRequestWipeProbe>>) {
+        self.wipe_probe = probe;
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -1877,11 +1879,9 @@ impl GuardianClient {
         request.set_wipe_probe(self.request_wipe_probe.clone());
         let encoded = encode_guardian_request(&self.secret, request.envelope());
         request.zeroize_payload();
-        let mut frame = OwnedEncodedFrame::new(
-            encoded?,
-            #[cfg(test)]
-            self.request_wipe_probe.clone(),
-        );
+        let mut frame = OwnedEncodedFrame::new(encoded?);
+        #[cfg(test)]
+        frame.set_wipe_probe(self.request_wipe_probe.clone());
         drop(request);
         let mut authenticated: AuthenticatedGuardianRequest =
             decode_guardian_request(&self.secret, frame.as_slice())?;

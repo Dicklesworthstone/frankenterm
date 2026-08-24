@@ -97,6 +97,7 @@ const REPLAY_PAGE_DIGEST_OFFSET: usize = 120;
 const REPLAY_PAGE_DIGEST_END: usize = REPLAY_PAGE_DIGEST_OFFSET + 32;
 const REPLAY_CHECKPOINT_DESCRIPTOR_BYTES: usize = 224;
 const REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES: usize = REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 44;
+const REPLAY_OUTPUT_RECORDS_HEADER_BYTES: usize = 48;
 const REPLAY_OUTPUT_RECORD_FIXED_BYTES: usize = 168;
 const REPLAY_COMPLETE_BYTES: usize = 80;
 const REPLAY_GAP_BYTES: usize = 32;
@@ -3041,6 +3042,7 @@ impl GuardianReplayRecordDelivery {
 
 pub struct GuardianReplayOutputRecordsDelivery {
     first_sequence: u64,
+    previous_record_digest: [u8; 32],
     records: Vec<GuardianReplayRecordDelivery>,
     plaintext_bytes: u32,
 }
@@ -3059,11 +3061,14 @@ impl std::fmt::Debug for GuardianReplayOutputRecordsDelivery {
 impl GuardianReplayOutputRecordsDelivery {
     pub fn new(
         first_sequence: u64,
+        previous_record_digest: [u8; 32],
         records: Vec<GuardianReplayRecordDelivery>,
     ) -> Result<Self, GuardianProtocolError> {
-        let plaintext_bytes = validate_replay_records(first_sequence, &records)?;
+        let plaintext_bytes =
+            validate_replay_records(first_sequence, previous_record_digest, &records)?;
         Ok(Self {
             first_sequence,
+            previous_record_digest,
             records,
             plaintext_bytes,
         })
@@ -3072,6 +3077,11 @@ impl GuardianReplayOutputRecordsDelivery {
     #[must_use]
     pub const fn first_sequence(&self) -> u64 {
         self.first_sequence
+    }
+
+    #[must_use]
+    pub const fn previous_record_digest(&self) -> [u8; 32] {
+        self.previous_record_digest
     }
 
     #[must_use]
@@ -3091,12 +3101,14 @@ impl GuardianReplayOutputRecordsDelivery {
 
 fn validate_replay_records(
     first_sequence: u64,
+    previous_record_digest: [u8; 32],
     records: &[GuardianReplayRecordDelivery],
 ) -> Result<u32, GuardianProtocolError> {
     if first_sequence == 0
         || records.is_empty()
         || records.len() > usize::from(GUARDIAN_MAX_REPLAY_RECORDS)
         || records.first().map(|record| record.metadata.sequence) != Some(first_sequence)
+        || (first_sequence == 1) != digest_is_zero(previous_record_digest)
     {
         return Err(GuardianProtocolError::InvalidReplyPayload);
     }
@@ -3157,7 +3169,8 @@ fn validate_replay_records(
                 None if metadata.sequence == 1 && prior_cumulative == 0 => {}
                 Some(predecessor)
                     if predecessor.last_sequence.checked_add(1) == Some(metadata.sequence)
-                        && predecessor.cumulative_plaintext_bytes == prior_cumulative => {}
+                        && predecessor.cumulative_plaintext_bytes == prior_cumulative
+                        && predecessor.terminal_record_digest == previous_record_digest => {}
                 _ => return Err(GuardianProtocolError::InvalidReplyPayload),
             }
         }

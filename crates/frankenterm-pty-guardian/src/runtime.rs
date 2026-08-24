@@ -210,10 +210,17 @@ pub(crate) enum GuardianRuntimeInputCompletionState {
 /// longer depends on reaching that manual fast path: busy rejection, queue
 /// failure, authority restoration, panic recovery, and ordinary drop all pass
 /// through this guard.
+#[cfg(test)]
+#[derive(Default)]
+struct InputRequestWipeProbe {
+    explicit_wipe: std::sync::atomic::AtomicBool,
+    drop_wipe: std::sync::atomic::AtomicBool,
+}
+
 struct OwnedInputRequest {
     request: AuthenticatedGuardianRequest,
     #[cfg(test)]
-    wipe_probe: Option<Arc<std::sync::atomic::AtomicBool>>,
+    wipe_probe: Option<Arc<InputRequestWipeProbe>>,
 }
 
 impl OwnedInputRequest {
@@ -226,8 +233,19 @@ impl OwnedInputRequest {
     }
 
     #[cfg(test)]
-    fn set_wipe_probe(&mut self, probe: Option<Arc<std::sync::atomic::AtomicBool>>) {
+    fn set_wipe_probe(&mut self, probe: Option<Arc<InputRequestWipeProbe>>) {
         self.wipe_probe = probe;
+    }
+
+    fn zeroize_payload(&mut self) {
+        self.request.zeroize_payload();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe.explicit_wipe.store(
+                self.request.payload().is_empty(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
     }
 }
 
@@ -250,7 +268,7 @@ impl Drop for OwnedInputRequest {
         self.request.zeroize_payload();
         #[cfg(test)]
         if let Some(probe) = self.wipe_probe.as_ref() {
-            probe.store(
+            probe.drop_wipe.store(
                 self.request.payload().is_empty(),
                 std::sync::atomic::Ordering::SeqCst,
             );
@@ -518,7 +536,7 @@ pub struct GuardianRuntime {
     indeterminate_effect: bool,
     counters: GuardianRuntimeCounters,
     #[cfg(test)]
-    input_request_wipe_probe: Option<Arc<std::sync::atomic::AtomicBool>>,
+    input_request_wipe_probe: Option<Arc<InputRequestWipeProbe>>,
 }
 
 impl GuardianRuntime {
@@ -2205,7 +2223,7 @@ mod tests {
     #[test]
     fn owned_input_guard_wipes_route_rejection_and_quarantine_exits() {
         let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
-        let route_probe = Arc::new(AtomicBool::new(false));
+        let route_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&route_probe));
         let request = authenticated_input_request_for(
             Uuid::from_u128(101),
@@ -2224,9 +2242,9 @@ mod tests {
             runtime.submit_input(request, mismatched_route),
             GuardianInputSubmission::Respond(_)
         ));
-        assert!(route_probe.load(Ordering::SeqCst));
+        assert!(route_probe.drop_wipe.load(Ordering::SeqCst));
 
-        let stale_pane_probe = Arc::new(AtomicBool::new(false));
+        let stale_pane_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&stale_pane_probe));
         let stale_pane = authenticated_input_request_for(
             Uuid::from_u128(117),
@@ -2239,9 +2257,9 @@ mod tests {
             runtime.submit_input(stale_pane, stale_pane_route),
             GuardianInputSubmission::Respond(_)
         ));
-        assert!(stale_pane_probe.load(Ordering::SeqCst));
+        assert!(stale_pane_probe.drop_wipe.load(Ordering::SeqCst));
 
-        let quarantine_probe = Arc::new(AtomicBool::new(false));
+        let quarantine_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&quarantine_probe));
         runtime.indeterminate_effect = true;
         let request = authenticated_input_request_for(
@@ -2255,7 +2273,7 @@ mod tests {
             runtime.submit_input(request, route),
             GuardianInputSubmission::CloseRetryably
         ));
-        assert!(quarantine_probe.load(Ordering::SeqCst));
+        assert!(quarantine_probe.drop_wipe.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -2285,7 +2303,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("first input owns protocol");
 
-        let busy_probe = Arc::new(AtomicBool::new(false));
+        let busy_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&busy_probe));
         let busy = authenticated_input_request_for(
             Uuid::from_u128(113),
@@ -2298,11 +2316,11 @@ mod tests {
             runtime.submit_input(busy, busy_route),
             GuardianInputSubmission::CloseRetryably
         ));
-        assert!(busy_probe.load(Ordering::SeqCst));
+        assert!(busy_probe.drop_wipe.load(Ordering::SeqCst));
         release_tx.send(()).expect("release first input");
         let _ = wait_for_input_completion(&mut runtime);
 
-        let unavailable_probe = Arc::new(AtomicBool::new(false));
+        let unavailable_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&unavailable_probe));
         drop(runtime.input_pipeline.jobs.take());
         let unavailable = authenticated_input_request_for(
@@ -2316,7 +2334,7 @@ mod tests {
             runtime.submit_input(unavailable, unavailable_route),
             GuardianInputSubmission::CloseRetryably
         ));
-        assert!(unavailable_probe.load(Ordering::SeqCst));
+        assert!(unavailable_probe.drop_wipe.load(Ordering::SeqCst));
         assert!(runtime.protocol.is_some());
         let pane = runtime.panes.get(&pane_id).expect("pane authority restored");
         assert!(pane.writer.is_some());

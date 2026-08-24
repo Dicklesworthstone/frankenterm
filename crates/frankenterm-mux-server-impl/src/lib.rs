@@ -9409,6 +9409,13 @@ mod tests {
         CompleteManifestBeforeWalRetirement,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum LegacyV1AppendWalCrashCut {
+        ActiveBeforeRow,
+        ActiveAfterRowBeforeRetention,
+        ActiveAfterRetentionBeforeManifest,
+    }
+
     #[test]
     fn authenticated_append_wal_recovers_every_durable_later_row_crash_cut() {
         let cuts = [
@@ -9567,6 +9574,170 @@ mod tests {
                 "{cut:?} duplicated or omitted the authenticated append"
             );
         }
+    }
+
+    #[test]
+    fn legacy_v1_append_wal_recovers_to_v4_across_crash_cuts_and_cold_reopens() {
+        let cuts = [
+            LegacyV1AppendWalCrashCut::ActiveBeforeRow,
+            LegacyV1AppendWalCrashCut::ActiveAfterRowBeforeRetention,
+            LegacyV1AppendWalCrashCut::ActiveAfterRetentionBeforeManifest,
+        ];
+        for (index, cut) in cuts.into_iter().enumerate() {
+            let identity_byte = u8::try_from(220 + index).expect("fixture identity fits u8");
+            let (dir, context, sink, wal, appended) =
+                legacy_v1_append_wal_fixture(identity_byte);
+            let ledger_pane_id = sink.active_ledger_pane_id();
+            sink.persist_authenticated_append_wal(&wal)
+                .expect("publish legacy v1 append WAL");
+            match cut {
+                LegacyV1AppendWalCrashCut::ActiveBeforeRow => {}
+                LegacyV1AppendWalCrashCut::ActiveAfterRowBeforeRetention => {
+                    assert_eq!(
+                        sink.lock_store("v1 WAL row-before-retention cut")
+                            .expect("lock v1 WAL row-before-retention store")
+                            .append_line(ledger_pane_id, &wal.encrypted_record)
+                            .expect("synchronize v1 WAL row-before-retention cut"),
+                        wal.appended_sequence
+                    );
+                }
+                LegacyV1AppendWalCrashCut::ActiveAfterRetentionBeforeManifest => {
+                    let mut store = sink
+                        .lock_store("v1 WAL post-retention cut")
+                        .expect("lock v1 WAL post-retention store");
+                    assert_eq!(
+                        store
+                            .append_line(ledger_pane_id, &wal.encrypted_record)
+                            .expect("synchronize v1 WAL post-retention row"),
+                        wal.appended_sequence
+                    );
+                    store
+                        .prune_before(ledger_pane_id, wal.target_oldest_sequence)
+                        .expect("synchronize v1 WAL retention cut");
+                    LiveScrollbackSpillSink::verify_append_wal_target_store(&wal, &store)
+                        .expect("v1 WAL retained target is exact");
+                }
+            }
+            let wal_path = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
+                .expect("derive legacy v1 WAL path");
+            drop(sink);
+
+            let first_reopen = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .unwrap_or_else(|error| panic!("recover {cut:?} legacy v1 WAL: {error:#}"));
+            assert_eq!(
+                first_reopen
+                    .load_scrollback_line(11)
+                    .unwrap_or_else(|| panic!("{cut:?} must recover the exact v1 WAL target"))
+                    .as_str()
+                    .as_ref(),
+                appended.as_str().as_ref()
+            );
+            assert!(first_reopen.load_scrollback_line(10).is_none());
+            let migrated = LiveScrollbackSpillSink::read_manifest(&first_reopen.manifest_path)
+                .expect("read v1-WAL migrated manifest")
+                .expect("v1-WAL migrated manifest exists");
+            assert_eq!(migrated.schema, LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
+            assert_eq!(migrated.revision, Some(wal.target_revision));
+            let acknowledged = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+                .expect("read acknowledged legacy v1 WAL")
+                .expect("acknowledged legacy v1 WAL remains present");
+            assert_eq!(acknowledged.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1);
+            assert!(LiveScrollbackSpillSink::append_wal_supersession_matches_manifest(
+                &acknowledged,
+                &migrated,
+            )
+            .expect("bind legacy v1 WAL migration acknowledgement"));
+
+            // Crash cut: the v4 target is durable but the same-generation
+            // migration acknowledgement did not replace the original v1 WAL.
+            overwrite_private_append_wal_fixture(&wal_path, &wal);
+            drop(first_reopen);
+            let second_reopen = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .unwrap_or_else(|error| {
+                    panic!("cold-reopen {cut:?} unacknowledged v1-to-v4 target: {error:#}")
+                });
+            assert_eq!(
+                second_reopen
+                    .load_scrollback_line(11)
+                    .expect("second cold reopen retains exact v1 WAL target")
+                    .as_str()
+                    .as_ref(),
+                appended.as_str().as_ref()
+            );
+            let reacknowledged = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+                .expect("read reacknowledged legacy v1 WAL")
+                .expect("reacknowledged legacy v1 WAL remains present");
+            let current = LiveScrollbackSpillSink::read_manifest(&second_reopen.manifest_path)
+                .expect("read second-reopen v4 manifest")
+                .expect("second-reopen v4 manifest exists");
+            assert!(LiveScrollbackSpillSink::append_wal_supersession_matches_manifest(
+                &reacknowledged,
+                &current,
+            )
+            .expect("bind second-reopen v1 WAL migration acknowledgement"));
+
+            let successor = Line::from_text(
+                "v2-successor-after-v1-migration",
+                &CellAttributes::blank(),
+                3,
+                None,
+            );
+            assert!(
+                second_reopen.store_scrollback_line(12, &successor, 1),
+                "a recovered v1 WAL must not strand later append authority"
+            );
+            let successor_wal = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+                .expect("read successor v2 WAL")
+                .expect("successor v2 WAL exists");
+            assert_eq!(successor_wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2);
+            drop(second_reopen);
+
+            let third_reopen = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .expect("reopen after replacing legacy v1 WAL with v2");
+            assert_eq!(
+                third_reopen
+                    .load_scrollback_line(12)
+                    .expect("v2 successor survives cold reopen")
+                    .as_str()
+                    .as_ref(),
+                successor.as_str().as_ref()
+            );
+            assert!(third_reopen.load_scrollback_line(11).is_none());
+        }
+    }
+
+    #[test]
+    fn authenticated_v1_append_wal_wrong_target_digest_fails_closed_before_v4_publication() {
+        let (dir, context, sink, mut wal, _appended) = legacy_v1_append_wal_fixture(219);
+        let predecessor = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read wrong-digest v3 predecessor")
+            .expect("wrong-digest v3 predecessor exists");
+        let wrong_digest = hex::encode([0x5a; 32]);
+        assert_ne!(
+            wal.target_record_set_sha256.as_deref(),
+            Some(wrong_digest.as_str())
+        );
+        wal.target_record_set_sha256 = Some(wrong_digest);
+        seal_append_wal_fixture(&sink, &mut wal);
+        sink.persist_authenticated_append_wal(&wal)
+            .expect("publish authenticated wrong-digest v1 WAL fixture");
+        drop(sink);
+
+        let error = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect_err("authenticated v1 WAL with the wrong target set must fail closed");
+        assert!(
+            format!("{error:#}").contains("digest"),
+            "wrong v1 target-set failure remains authority-specific: {error:#}"
+        );
+        let retained = LiveScrollbackSpillSink::read_manifest(
+            &dir.path()
+                .join(uuid::Uuid::from_bytes(context.durable_pane_id).simple().to_string())
+                .join("manifest.json"),
+        )
+        .expect("read retained wrong-digest predecessor")
+        .expect("wrong-digest predecessor remains present");
+        assert_eq!(retained, predecessor);
+        assert_eq!(retained.schema, LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3);
     }
 
     #[test]
