@@ -2061,7 +2061,7 @@ impl StorageBackend for RusqliteBackend {
                 }
             };
         let mut tx_handle = RusqliteTransactionHandle {
-            conn: &mut *guard,
+            conn: &mut guard,
             boundary_lost: false,
         };
         let callback_result =

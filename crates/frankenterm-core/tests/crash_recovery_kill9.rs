@@ -73,11 +73,12 @@ use frankenterm_core::scrollback_mmap_format::{
     RecordKind, ScrollbackHeader,
 };
 use frankenterm_core::scrollback_mmap_recovery::{
-    AlwaysOrphaned, OrphanState, classify_path, scan_orphans,
+    AlwaysOrphaned, LegacyRecoveryLimits, OrphanState, classify_path, scan_orphans,
 };
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 /// Build a header with deterministic field values keyed by `seed`
@@ -106,13 +107,24 @@ fn temp_dir(label: &str) -> PathBuf {
     ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .expect("set private scrollback directory permissions");
     dir
 }
 
 /// 64-hex-char filename keyed by `byte` (matches `is_scrollback_filename`).
 fn scrollback_path(dir: &Path, byte: u8) -> PathBuf {
-    let stem = format!("{byte:02x}").repeat(32);
+    scrollback_path_for_uuid(dir, &[byte; 32])
+}
+
+fn scrollback_path_for_uuid(dir: &Path, pane_uuid: &[u8; 32]) -> PathBuf {
+    let stem: String = pane_uuid.iter().map(|byte| format!("{byte:02x}")).collect();
     dir.join(format!("{stem}.bin"))
+}
+
+fn harden_scrollback_file(path: &Path) {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .expect("set private scrollback permissions");
 }
 
 /// Write a header + a sequence of fully-formed text records into
@@ -130,6 +142,7 @@ fn write_full_scrollback(path: &Path, header: &ScrollbackHeader, payloads: &[&[u
     }
     let mut f = fs::File::create(path).unwrap();
     f.write_all(&buf).unwrap();
+    harden_scrollback_file(path);
     buf.len()
 }
 
@@ -191,14 +204,13 @@ fn invariant_2_pane_uuid_byte_for_byte_continuity() {
     // must be byte-for-byte preserved across the kill so downstream
     // `ft session recover` can resolve the right slot.
     let dir = temp_dir("inv2");
-    let path = scrollback_path(&dir, 0x20);
-
     // Use a uuid with every byte distinct so any single-byte drift
     // is detectable.
     let mut uuid = [0u8; 32];
     for (i, byte) in uuid.iter_mut().enumerate() {
         *byte = i as u8;
     }
+    let path = scrollback_path_for_uuid(&dir, &uuid);
     let mut header = build_header(0x20);
     header.pane_uuid = uuid;
 
@@ -216,7 +228,7 @@ fn invariant_2_pane_uuid_byte_for_byte_continuity() {
     // The scanner must surface this file as Orphaned (header
     // decoded cleanly, no live owner) so the picker can offer it
     // for recovery.
-    let candidate = classify_path(&path, &AlwaysOrphaned);
+    let candidate = classify_path(&path, &AlwaysOrphaned, LegacyRecoveryLimits::DEFAULT);
     assert_eq!(candidate.state, OrphanState::Orphaned);
     let header_ref = candidate.header_ok().expect("header decodable");
     assert_eq!(header_ref.pane_uuid, uuid);
@@ -247,7 +259,12 @@ fn invariant_3_bounded_loss_surfaces_recoverable_tail() {
 
     // Scanner classifies as Orphaned — the in-flight tail does not
     // poison the header.
-    let out = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
+    let out = scan_orphans(
+        &dir,
+        &AlwaysOrphaned,
+        LegacyRecoveryLimits::DEFAULT,
+    )
+    .unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].state, OrphanState::Orphaned);
     assert!(out[0].header_ok().is_some());
@@ -265,7 +282,7 @@ fn invariant_4_mid_header_tear_surfaces_as_corrupt_truncated() {
     write_full_scrollback(&path, &header, &[b"x"]);
     simulate_kill_truncation(&path, HEADER_SIZE / 2);
 
-    let candidate = classify_path(&path, &AlwaysOrphaned);
+    let candidate = classify_path(&path, &AlwaysOrphaned, LegacyRecoveryLimits::DEFAULT);
     assert_eq!(candidate.state, OrphanState::Corrupt);
     let reason = candidate.corrupt_reason().expect("decode error attached");
     assert!(matches!(
@@ -288,8 +305,9 @@ fn invariant_5_mid_cursor_tear_surfaces_via_cursor_beyond_capacity() {
     // update.
     header.write_cursor_bytes = header.capacity_bytes + 64;
     fs::write(&path, header.encode()).unwrap();
+    harden_scrollback_file(&path);
 
-    let candidate = classify_path(&path, &AlwaysOrphaned);
+    let candidate = classify_path(&path, &AlwaysOrphaned, LegacyRecoveryLimits::DEFAULT);
     assert_eq!(candidate.state, OrphanState::Corrupt);
     let reason = candidate.corrupt_reason().expect("decode error attached");
     assert!(matches!(
@@ -313,7 +331,7 @@ fn regression_guard_kill_at_exact_msync_boundary_is_clean() {
     // Truncate at exactly total — i.e. don't truncate at all.
     simulate_kill_truncation(&path, total);
 
-    let candidate = classify_path(&path, &AlwaysOrphaned);
+    let candidate = classify_path(&path, &AlwaysOrphaned, LegacyRecoveryLimits::DEFAULT);
     assert_eq!(candidate.state, OrphanState::Orphaned);
     let h = candidate.header_ok().unwrap();
     assert_eq!(h.pane_uuid[0], 0x60);
@@ -331,8 +349,9 @@ fn regression_guard_kill_immediately_after_header_write() {
     header.write_cursor_bytes = 0;
     header.total_bytes_written = 0;
     fs::write(&path, header.encode()).unwrap();
+    harden_scrollback_file(&path);
 
-    let candidate = classify_path(&path, &AlwaysOrphaned);
+    let candidate = classify_path(&path, &AlwaysOrphaned, LegacyRecoveryLimits::DEFAULT);
     assert_eq!(candidate.state, OrphanState::Orphaned);
     let h = candidate.header_ok().unwrap();
     assert_eq!(h.write_cursor_bytes, 0);

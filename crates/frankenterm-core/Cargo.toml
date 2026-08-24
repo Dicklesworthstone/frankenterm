@@ -185,6 +185,7 @@ sysinfo = { version = "0.39.3", default-features = false, features = ["system", 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 nix = { workspace = true, optional = true, features = ["fs", "socket", "user"] }
+rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 xattr.workspace = true

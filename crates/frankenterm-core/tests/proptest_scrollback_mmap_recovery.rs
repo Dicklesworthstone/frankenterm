@@ -62,41 +62,42 @@ fn orphan_candidate(
     last_msync: u64,
     bytes: u64,
 ) -> OrphanCandidate {
-    OrphanCandidate {
-        path: path_for(label),
-        state: OrphanState::Orphaned,
-        header: Some(Ok(header(uuid_byte, created, last_msync, bytes))),
-    }
+    OrphanCandidate::for_picker(
+        path_for(label),
+        OrphanState::Orphaned,
+        Some(Ok(header(uuid_byte, created, last_msync, bytes))),
+    )
 }
 
 fn locked_candidate(
     label: impl AsRef<str>,
     uuid_byte: u8,
-    created: u64,
-    last_msync: u64,
-    bytes: u64,
+    _created: u64,
+    _last_msync: u64,
+    _bytes: u64,
 ) -> OrphanCandidate {
-    OrphanCandidate {
-        path: path_for(label),
-        state: OrphanState::Locked,
-        header: Some(Ok(header(uuid_byte, created, last_msync, bytes))),
-    }
+    let pane_uuid = format!("{uuid_byte:02x}").repeat(32);
+    OrphanCandidate::for_picker(
+        PathBuf::from(format!("/tmp/{}/{pane_uuid}.bin", label.as_ref())),
+        OrphanState::Locked,
+        None,
+    )
 }
 
 fn corrupt_candidate(label: impl AsRef<str>, err: HeaderDecodeError) -> OrphanCandidate {
-    OrphanCandidate {
-        path: path_for(label),
-        state: OrphanState::Corrupt,
-        header: Some(Err(err)),
-    }
+    OrphanCandidate::for_picker(
+        path_for(label),
+        OrphanState::Corrupt,
+        Some(Err(err)),
+    )
 }
 
 fn wrong_shape_candidate(label: impl AsRef<str>) -> OrphanCandidate {
-    OrphanCandidate {
-        path: PathBuf::from(format!("/tmp/{}.txt", label.as_ref())),
-        state: OrphanState::WrongShape,
-        header: None,
-    }
+    OrphanCandidate::for_picker(
+        PathBuf::from(format!("/tmp/{}.txt", label.as_ref())),
+        OrphanState::WrongShape,
+        None,
+    )
 }
 
 fn expected_uuid_short(uuid_byte: u8) -> String {
@@ -120,7 +121,7 @@ proptest! {
         let wrong_shape = wrong_shape_candidate("wrong_shape");
 
         prop_assert_eq!(orphan.header_ok(), Some(&header(uuid_byte, created, last_msync, bytes)));
-        prop_assert_eq!(locked.header_ok(), Some(&header(uuid_byte, created, last_msync, bytes)));
+        prop_assert_eq!(locked.header_ok(), None);
         prop_assert_eq!(orphan.corrupt_reason(), None);
         prop_assert_eq!(locked.corrupt_reason(), None);
         prop_assert_eq!(corrupt.header_ok(), None);

@@ -45,6 +45,7 @@
 #![forbid(unsafe_code)]
 #![recursion_limit = "256"]
 #![feature(stmt_expr_attributes)]
+#![allow(clippy::future_not_send)]
 // windows_by_handle: volume_serial_number()/file_index() power the
 // tx-contract-store filesystem-identity checks on Windows
 // (tx_execution::std_object_identity). Still unstable on the pinned

@@ -1,8 +1,10 @@
 use frankenterm_core::scrollback_mmap_format::{HEADER_SIZE, RECORD_HEADER_SIZE, RecordKind};
 use frankenterm_core::scrollback_mmap_writer::{
-    MmapScrollback, MmapScrollbackConfig, read_linear_records,
+    LinearRecordReadLimits, MmapScrollback, MmapScrollbackConfig, read_linear_records,
 };
 use proptest::prelude::*;
+use sha2::{Digest as _, Sha256};
+use std::path::Path;
 use std::time::Duration;
 
 fn record_kind_strategy() -> impl Strategy<Value = RecordKind> {
@@ -26,18 +28,6 @@ fn record_strategy(max_payload_len: usize) -> impl Strategy<Value = (RecordKind,
     )
 }
 
-fn sanitized_pane_uuid(raw: &str) -> String {
-    raw.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn config_for(dir: &tempfile::TempDir, pane_uuid: &str, cap_bytes: u64) -> MmapScrollbackConfig {
     MmapScrollbackConfig::new(dir.path(), pane_uuid)
         .with_cap_bytes(cap_bytes)
@@ -55,6 +45,17 @@ fn required_capacity(records: &[(RecordKind, Vec<u8>)]) -> u64 {
     payload_bytes
         .saturating_add(max_streaming_records.saturating_mul(RECORD_HEADER_SIZE as u64))
         .saturating_add(64)
+}
+
+fn read_limits(path: &Path) -> LinearRecordReadLimits {
+    let max_file_bytes = std::fs::metadata(path)
+        .expect("read mmap file metadata")
+        .len();
+    LinearRecordReadLimits {
+        max_file_bytes,
+        max_records: 1_024,
+        max_payload_bytes: max_file_bytes,
+    }
 }
 
 #[test]
@@ -96,7 +97,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
     #[test]
-    fn proptest_scrollback_mmap_writer_config_paths_sanitize_pane_uuid(
+    fn proptest_scrollback_mmap_writer_config_paths_bind_canonical_sha256_stem(
         pane_uuid in "[A-Za-z0-9_./:;\\\\ -]{0,80}",
         cap_mb in 0_u32..=8,
         sync_every in 0_u64..=128,
@@ -105,7 +106,15 @@ proptest! {
         let config = MmapScrollbackConfig::new(dir.path(), pane_uuid.clone())
             .with_cap_mb(cap_mb)
             .with_sync_every_appends(sync_every);
-        let sanitized = sanitized_pane_uuid(&pane_uuid);
+        let expected_stem = if pane_uuid.len() == 64
+            && pane_uuid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            pane_uuid.clone()
+        } else {
+            hex::encode(Sha256::digest(pane_uuid.as_bytes()))
+        };
         let expected_cap = if cap_mb == 0 {
             50 * 1024 * 1024
         } else {
@@ -116,8 +125,8 @@ proptest! {
         prop_assert_eq!(config.sync_every_appends, sync_every);
         prop_assert!(config.bin_path().starts_with(dir.path()));
         prop_assert!(config.lock_path().starts_with(dir.path()));
-        let expected_bin_suffix = format!("{sanitized}.bin");
-        let expected_lock_suffix = format!("{sanitized}.bin.lock");
+        let expected_bin_suffix = format!("{expected_stem}.bin");
+        let expected_lock_suffix = format!("{expected_stem}.bin.lock");
         prop_assert!(config.bin_path().ends_with(&expected_bin_suffix));
         prop_assert!(config.lock_path().ends_with(&expected_lock_suffix));
     }
@@ -145,8 +154,10 @@ proptest! {
         writer.sync().expect("sync writer");
         drop(writer);
 
-        let read_back = read_linear_records(&path).expect("read linear records");
+        let read_back = read_linear_records(&path, read_limits(&path))
+            .expect("read linear records");
         let actual_bytes: Vec<u8> = read_back
+            .records
             .iter()
             .flat_map(|(_, payload)| payload.iter().copied())
             .collect();
@@ -173,8 +184,9 @@ proptest! {
         let header = writer.header();
         drop(writer);
 
-        let persisted = read_linear_records(&path).expect("read records");
+        let persisted = read_linear_records(&path, read_limits(&path)).expect("read records");
         let expected_total: u64 = persisted
+            .records
             .iter()
             .map(|(_, payload)| RECORD_HEADER_SIZE as u64 + payload.len() as u64)
             .sum();
@@ -198,8 +210,8 @@ proptest! {
         let report = writer.append(RecordKind::Text, &payload).expect("append oversized payload");
 
         prop_assert_eq!(report.payload_bytes, max_payload);
-        prop_assert_eq!(report.write_cursor_bytes, 0);
-        prop_assert_eq!(writer.header().write_cursor_bytes, 0);
+        prop_assert_eq!(report.write_cursor_bytes, cap_bytes);
+        prop_assert_eq!(writer.header().write_cursor_bytes, cap_bytes);
         prop_assert_eq!(writer.header().total_bytes_written, cap_bytes);
         prop_assert_eq!(writer.header().capacity_bytes, cap_bytes);
     }
@@ -223,8 +235,9 @@ proptest! {
             writer.sync().expect("sync writer");
         }
 
-        let read_back = read_linear_records(&path).expect("read records");
+        let read_back = read_linear_records(&path, read_limits(&path)).expect("read records");
         let expected_cursor: u64 = read_back
+            .records
             .iter()
             .map(|(_, payload)| RECORD_HEADER_SIZE as u64 + payload.len() as u64)
             .sum();
@@ -235,6 +248,7 @@ proptest! {
         drop(reopened);
 
         let actual_bytes: Vec<u8> = read_back
+            .records
             .iter()
             .flat_map(|(_, payload)| payload.iter().copied())
             .collect();

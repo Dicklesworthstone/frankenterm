@@ -5060,8 +5060,19 @@ mod tests {
         let path = writer.path().to_path_buf();
         drop(writer);
 
-        let records =
-            crate::scrollback_mmap_writer::read_linear_records(&path).expect("read records");
+        let max_file_bytes = std::fs::metadata(&path)
+            .expect("read mmap file metadata")
+            .len();
+        let records = crate::scrollback_mmap_writer::read_linear_records(
+            &path,
+            crate::scrollback_mmap_writer::LinearRecordReadLimits {
+                max_file_bytes,
+                max_records: 16,
+                max_payload_bytes: max_file_bytes,
+            },
+        )
+        .expect("read records")
+        .records;
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].0,
