@@ -2588,6 +2588,23 @@ mod tests {
     }
 
     #[test]
+    fn generic_transaction_callback_second_invocation_forces_rollback() {
+        let backend = DoubleInvokeBackend {
+            inner: MockBackend::new(),
+        };
+        let result = backend.with_transaction(|tx| {
+            tx.set_user_version(41)?;
+            Ok::<(), BackendError>(())
+        });
+        assert!(matches!(
+            result,
+            Err(BackendError::TransactionCallbackInvokedMoreThanOnce)
+        ));
+        assert_eq!(backend.user_version().unwrap(), 0);
+        assert!(!backend.inner.last_tx_committed());
+    }
+
+    #[test]
     fn rusqlite_backend_executes_ddl_and_dml() {
         let backend = open_memory();
         backend
@@ -2801,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn rusqlite_backend_transaction_prevents_concurrent_interleaving() {
+    fn rusqlite_backend_transaction_rejects_concurrent_interleaving_then_reuses() {
         let backend = Arc::new(open_memory());
         backend
             .execute("CREATE TABLE t (id INTEGER, origin TEXT)")
@@ -2837,12 +2854,19 @@ mod tests {
         });
 
         t1.join().unwrap().unwrap();
-        t2.join().unwrap().unwrap();
+        let concurrent_result = t2.join().unwrap();
+        assert!(matches!(
+            concurrent_result,
+            Err(BackendError::TransactionBusy)
+        ));
 
         assert_eq!(
             backend.transaction_state().unwrap(),
             BackendTransactionState::Autocommit
         );
+        backend
+            .execute("INSERT INTO t VALUES (100, 'post_transaction')")
+            .unwrap();
 
         let rows = backend
             .query_map_strings("SELECT id, origin FROM t ORDER BY rowid", &[])
@@ -2853,7 +2877,7 @@ mod tests {
         assert_eq!(rows[1][0], "2");
         assert_eq!(rows[1][1], "tx1_step2");
         assert_eq!(rows[2][0], "100");
-        assert_eq!(rows[2][1], "concurrent_stmt");
+        assert_eq!(rows[2][1], "post_transaction");
     }
 
     #[test]
