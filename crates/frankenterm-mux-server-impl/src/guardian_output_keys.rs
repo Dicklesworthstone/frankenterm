@@ -20,9 +20,11 @@ use mux::guardian_output_journal::{
     GuardianOutputCipher, GuardianOutputJournalError, GuardianOutputKey,
 };
 use sha2::{Digest as _, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use thiserror::Error;
 
 const KEY_PREFIX: &str = "key-";
@@ -37,6 +39,25 @@ const ACTIVATION_BYTES: usize = 64;
 const ACTIVATION_BYTES_U32: u32 = 64;
 const ACTIVATION_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-key-activation.v1\0";
 const MAX_KEYRING_ENTRIES: usize = 4096;
+const SCROLLBACK_KEYRING_SIBLING: &str = "guardian-output-keys";
+const AUTHORITY_LOCK_NAME: &str = ".authority-lock.v1";
+static SCROLLBACK_KEYRING_PROVISION_GATE: Mutex<()> = Mutex::new(());
+static SHARED_SCROLLBACK_KEYRINGS: LazyLock<
+    Mutex<HashMap<GuardianOutputAuthorityIdentity, Weak<Mutex<GuardianOutputKeyring>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GuardianOutputAuthorityIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GuardianOutputAuthorityIdentity {
+    canonical_path: PathBuf,
+}
 
 #[derive(Debug, Error)]
 pub enum GuardianOutputKeyringError {
@@ -93,6 +114,7 @@ impl std::fmt::Debug for Activation {
 /// Pinned active key authority plus append-only historical key lookup.
 pub struct GuardianOutputKeyring {
     directory: CapDir,
+    use_authority_lock: bool,
     active: Activation,
     active_key: GuardianOutputKey,
 }
@@ -109,6 +131,81 @@ impl std::fmt::Debug for GuardianOutputKeyring {
 }
 
 impl GuardianOutputKeyring {
+    /// Return the process-wide guardian output authority for this securely
+    /// pinned scrollback store. All live pane sinks sharing the same authority
+    /// directory receive the same mutex-protected keyring, so an in-process
+    /// rotation becomes visible atomically to every sink.
+    pub fn shared_scrollback_sibling(
+        scrollback_base_dir: &Path,
+    ) -> Result<Arc<Mutex<Self>>, GuardianOutputKeyringError> {
+        let keyring = Self::open_or_provision_scrollback_sibling(scrollback_base_dir)?;
+        let identity = authority_identity(
+            &keyring.directory,
+            &scrollback_keyring_path(scrollback_base_dir)?,
+        )?;
+        let mut registry = SHARED_SCROLLBACK_KEYRINGS
+            .lock()
+            .map_err(|_| GuardianOutputKeyringError::AuthorityChanged)?;
+        registry.retain(|_, weak| weak.strong_count() != 0);
+        if let Some(existing) = registry.get(&identity).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        let shared = Arc::new(Mutex::new(keyring));
+        registry.insert(identity, Arc::downgrade(&shared));
+        Ok(shared)
+    }
+
+    /// Open the one guardian output keyring shared by encrypted scrollback and
+    /// guardian journals, provisioning it only in the deterministic private
+    /// sibling of the durable pane directories inside the scrollback store.
+    pub fn open_or_provision_scrollback_sibling(
+        scrollback_base_dir: &Path,
+    ) -> Result<Self, GuardianOutputKeyringError> {
+        let _provision_gate = SCROLLBACK_KEYRING_PROVISION_GATE
+            .lock()
+            .map_err(|_| GuardianOutputKeyringError::AuthorityChanged)?;
+        let path = scrollback_keyring_path(scrollback_base_dir)?;
+        match create_private_directory(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Synchronize even when another process created the directory. Its
+        // successful `mkdir` may have become visible before that creator was
+        // able to durably publish the parent-directory entry.
+        sync_parent_path(&path)?;
+        let directory = open_private_path(&path)?;
+        let _authority_lease = AuthorityFileLease::acquire(&directory, true, true)?;
+        let mut keyring = Self::open_or_provision(directory)?;
+        keyring.use_authority_lock = true;
+        Ok(keyring)
+    }
+
+    /// Open the existing shared keyring without creating filesystem state.
+    /// Read-only transcript export uses this path only after it encounters a
+    /// v3 encrypted row.
+    pub fn open_existing_scrollback_sibling(
+        scrollback_base_dir: &Path,
+    ) -> Result<Self, GuardianOutputKeyringError> {
+        let path = scrollback_keyring_path(scrollback_base_dir)?;
+        let directory = open_private_path(&path)?;
+        let _authority_lease = match AuthorityFileLease::acquire(&directory, false, false) {
+            Ok(lease) => lease,
+            Err(GuardianOutputKeyringError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                if inventory(&directory)?.entries == 0 {
+                    return Err(GuardianOutputKeyringError::MissingActivatedKey);
+                }
+                return Err(GuardianOutputKeyringError::AuthorityChanged);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut keyring = Self::open_existing(directory)?;
+        keyring.use_authority_lock = true;
+        Ok(keyring)
+    }
+
     /// Open a pinned key directory, provisioning its first key only when the
     /// directory is completely empty.
     pub fn open_or_provision(directory: CapDir) -> Result<Self, GuardianOutputKeyringError> {
@@ -118,23 +215,17 @@ impl GuardianOutputKeyring {
         if inventory.entries == 0 {
             return provision_first(directory);
         }
-        let active = inventory
-            .latest
-            .ok_or(GuardianOutputKeyringError::OrphanedKeyMaterial)?;
-        let active_key = load_key(&directory, active.key_id)
-            .map_err(|error| match error {
-                GuardianOutputKeyringError::Io(ref io)
-                    if io.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    GuardianOutputKeyringError::MissingActivatedKey
-                }
-                other => other,
-            })?;
-        Ok(Self {
-            directory,
-            active,
-            active_key,
-        })
+        open_inventory(directory, inventory)
+    }
+
+    fn open_existing(directory: CapDir) -> Result<Self, GuardianOutputKeyringError> {
+        validate_directory(&directory)?;
+        let inventory = inventory(&directory)?;
+        validate_directory(&directory)?;
+        if inventory.entries == 0 {
+            return Err(GuardianOutputKeyringError::MissingActivatedKey);
+        }
+        open_inventory(directory, inventory)
     }
 
     #[must_use]
@@ -148,7 +239,20 @@ impl GuardianOutputKeyring {
     }
 
     pub fn active_cipher(&self) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
+        let _authority_lease = self.acquire_authority_lease(false)?;
         verify_latest_authority(&self.directory, self.active, &self.active_key)?;
+        self.active_key.cipher().map_err(Into::into)
+    }
+
+    /// Refresh to the newest authenticated activation and return its cipher.
+    /// This is the production sealing path: a rotation published by another
+    /// mux process advances this process instead of making all of its live
+    /// pane sinks permanently fail with a stale cached activation.
+    pub fn latest_active_cipher(
+        &mut self,
+    ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
+        let _authority_lease = self.acquire_authority_lease(false)?;
+        self.refresh_latest_authority_unlocked()?;
         self.active_key.cipher().map_err(Into::into)
     }
 
@@ -157,10 +261,8 @@ impl GuardianOutputKeyring {
         &self,
         key_id: [u8; 8],
     ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
-        if key_id == self.active.key_id {
-            return self.active_cipher();
-        }
-        verify_latest_authority(&self.directory, self.active, &self.active_key)?;
+        let _authority_lease = self.acquire_authority_lease(false)?;
+        validate_directory(&self.directory)?;
         let inventory = inventory(&self.directory)?;
         if !inventory
             .activations
@@ -169,14 +271,17 @@ impl GuardianOutputKeyring {
         {
             return Err(GuardianOutputKeyringError::UnactivatedKey);
         }
-        load_key(&self.directory, key_id)?.cipher().map_err(Into::into)
+        let cipher = load_key(&self.directory, key_id)?.cipher()?;
+        validate_directory(&self.directory)?;
+        Ok(cipher)
     }
 
     /// Publish a new active key without altering any existing key or activation
     /// file.  A segment that already holds the prior cipher remains pinned to
     /// that key until rollover.
     pub fn rotate(&mut self) -> Result<[u8; 8], GuardianOutputKeyringError> {
-        verify_latest_authority(&self.directory, self.active, &self.active_key)?;
+        let _authority_lease = self.acquire_authority_lease(true)?;
+        self.refresh_latest_authority_unlocked()?;
         let generation = self
             .active
             .generation
@@ -195,6 +300,254 @@ impl GuardianOutputKeyring {
         self.active_key = new_key;
         Ok(key_id)
     }
+
+    fn acquire_authority_lease(
+        &self,
+        exclusive: bool,
+    ) -> Result<Option<AuthorityFileLease>, GuardianOutputKeyringError> {
+        self.use_authority_lock
+            .then(|| AuthorityFileLease::acquire(&self.directory, false, exclusive))
+            .transpose()
+    }
+
+    fn refresh_latest_authority_unlocked(
+        &mut self,
+    ) -> Result<(), GuardianOutputKeyringError> {
+        validate_directory(&self.directory)?;
+        let latest = inventory(&self.directory)?
+            .latest
+            .ok_or(GuardianOutputKeyringError::AuthorityChanged)?;
+        if latest.generation < self.active.generation {
+            return Err(GuardianOutputKeyringError::AuthorityChanged);
+        }
+        let latest_key = load_key(&self.directory, latest.key_id)?;
+        if latest == self.active {
+            if !self.active_key.has_same_material(&latest_key) {
+                return Err(GuardianOutputKeyringError::AuthorityChanged);
+            }
+        } else {
+            self.active = latest;
+            self.active_key = latest_key;
+        }
+        validate_directory(&self.directory)?;
+        Ok(())
+    }
+}
+
+fn open_inventory(
+    directory: CapDir,
+    inventory: Inventory,
+) -> Result<GuardianOutputKeyring, GuardianOutputKeyringError> {
+    let active = inventory
+        .latest
+        .ok_or(GuardianOutputKeyringError::OrphanedKeyMaterial)?;
+    let active_key = load_key(&directory, active.key_id).map_err(|error| match error {
+        GuardianOutputKeyringError::Io(ref io)
+            if io.kind() == std::io::ErrorKind::NotFound =>
+        {
+            GuardianOutputKeyringError::MissingActivatedKey
+        }
+        other => other,
+    })?;
+    Ok(GuardianOutputKeyring {
+        directory,
+        use_authority_lock: false,
+        active,
+        active_key,
+    })
+}
+
+fn scrollback_keyring_path(
+    scrollback_base_dir: &Path,
+) -> Result<PathBuf, GuardianOutputKeyringError> {
+    if scrollback_base_dir.as_os_str().is_empty() {
+        return Err(std::io::Error::other("scrollback storage path is empty").into());
+    }
+    Ok(scrollback_base_dir.join(SCROLLBACK_KEYRING_SIBLING))
+}
+
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn sync_parent_path(path: &Path) -> Result<(), GuardianOutputKeyringError> {
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("guardian keyring path has no parent"))?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn open_private_path(path: &Path) -> Result<CapDir, GuardianOutputKeyringError> {
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_dir() {
+        return Err(GuardianOutputKeyringError::DirectoryNotPrivate);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if before.permissions().mode() & 0o7777 != 0o700 {
+            return Err(GuardianOutputKeyringError::DirectoryNotPrivate);
+        }
+    }
+    let directory = CapDir::open_ambient_dir(path, cap_std::ambient_authority())?;
+    validate_directory(&directory)?;
+    let after = std::fs::symlink_metadata(path)?;
+    if !after.file_type().is_dir() {
+        return Err(GuardianOutputKeyringError::IdentityChanged);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let opened = directory.dir_metadata()?;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || opened.dev() != after.dev()
+            || opened.ino() != after.ino()
+        {
+            return Err(GuardianOutputKeyringError::IdentityChanged);
+        }
+    }
+    Ok(directory)
+}
+
+fn authority_identity(
+    directory: &CapDir,
+    _path: &Path,
+) -> Result<GuardianOutputAuthorityIdentity, GuardianOutputKeyringError> {
+    validate_directory(directory)?;
+    #[cfg(unix)]
+    {
+        let metadata = directory.dir_metadata()?;
+        return Ok(GuardianOutputAuthorityIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let canonical_path = std::fs::canonicalize(_path)?;
+        Ok(GuardianOutputAuthorityIdentity { canonical_path })
+    }
+}
+
+struct AuthorityFileLease {
+    file: std::fs::File,
+}
+
+impl AuthorityFileLease {
+    fn acquire(
+        directory: &CapDir,
+        create: bool,
+        exclusive: bool,
+    ) -> Result<Self, GuardianOutputKeyringError> {
+        let file = open_authority_lock_file(directory, create)?;
+        if exclusive {
+            fs2::FileExt::lock_exclusive(&file)?;
+        } else {
+            fs2::FileExt::lock_shared(&file)?;
+        }
+        if let Err(error) = validate_open_authority_lock_file(directory, &file) {
+            let _ = fs2::FileExt::unlock(&file);
+            return Err(error);
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for AuthorityFileLease {
+    fn drop(&mut self) {
+        // Closing the freshly opened descriptor also releases the lease. The
+        // explicit unlock makes the lifetime obvious and avoids retaining a
+        // process-scoped lock if this type is later given another owner.
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn open_authority_lock_file(
+    directory: &CapDir,
+    create: bool,
+) -> Result<std::fs::File, GuardianOutputKeyringError> {
+    let before = match directory.symlink_metadata(AUTHORITY_LOCK_NAME) {
+        Ok(metadata) => Some(validate_file_metadata(directory, metadata, 0)?),
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = directory.open_with(AUTHORITY_LOCK_NAME, &options)?;
+    let opened = validate_opened_metadata(directory, &file, 0)?;
+    let named = validate_named_file(directory, OsStr::new(AUTHORITY_LOCK_NAME), 0)?;
+    if !same_file_identity(&opened, &named)
+        || before
+            .as_ref()
+            .is_some_and(|before| !same_file_identity(before, &opened))
+    {
+        return Err(GuardianOutputKeyringError::IdentityChanged);
+    }
+    if before.is_none() {
+        // The lock inode is itself part of the authority. Make both its empty
+        // contents and its directory entry durable before any process relies
+        // on its lease to serialize key publication.
+        file.sync_all()?;
+        sync_directory(directory)?;
+        validate_opened_file(
+            directory,
+            OsStr::new(AUTHORITY_LOCK_NAME),
+            &file,
+            0,
+        )?;
+    }
+    Ok(file.into_std())
+}
+
+fn validate_open_authority_lock_file(
+    directory: &CapDir,
+    file: &std::fs::File,
+) -> Result<(), GuardianOutputKeyringError> {
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != 0 {
+        return Err(GuardianOutputKeyringError::UnsafeKeyFile);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory_metadata = directory.dir_metadata()?;
+        if opened.permissions().mode() & 0o7777 != 0o600
+            || opened.nlink() != 1
+            || opened.uid() != directory_metadata.uid()
+        {
+            return Err(GuardianOutputKeyringError::UnsafeKeyFile);
+        }
+        let named = validate_named_file(directory, OsStr::new(AUTHORITY_LOCK_NAME), 0)?;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(GuardianOutputKeyringError::IdentityChanged);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _named = validate_named_file(directory, OsStr::new(AUTHORITY_LOCK_NAME), 0)?;
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -209,11 +562,15 @@ fn inventory(directory: &CapDir) -> Result<Inventory, GuardianOutputKeyringError
     let mut inventory = Inventory::default();
     for entry in directory.entries()? {
         let entry = entry?;
+        let name = entry.file_name();
+        if name == OsStr::new(AUTHORITY_LOCK_NAME) {
+            let _lock = validate_named_file(directory, &name, 0)?;
+            continue;
+        }
         inventory.entries = inventory.entries.saturating_add(1);
         if inventory.entries > MAX_KEYRING_ENTRIES {
             return Err(GuardianOutputKeyringError::EntryLimit);
         }
-        let name = entry.file_name();
         let name = name
             .to_str()
             .ok_or(GuardianOutputKeyringError::UnrecognizedEntry)?;
@@ -297,6 +654,7 @@ fn provision_first(directory: CapDir) -> Result<GuardianOutputKeyring, GuardianO
     verify_latest_authority(&directory, active, &active_key)?;
     Ok(GuardianOutputKeyring {
         directory,
+        use_authority_lock: false,
         active,
         active_key,
     })
@@ -644,6 +1002,41 @@ fn read_activation(mut file: CapFile) -> Result<Activation, GuardianOutputKeyrin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mux::guardian_output_journal::{
+        GuardianEncryptedScrollbackRow, GuardianScrollbackRowIdentity,
+    };
+
+    const MULTIPROCESS_KEYRING_MODE: &str = "FT_TEST_GUARDIAN_KEYRING_CHILD_MODE";
+    const MULTIPROCESS_KEYRING_BASE: &str = "FT_TEST_GUARDIAN_KEYRING_CHILD_BASE";
+    const MULTIPROCESS_KEYRING_START: &str = "FT_TEST_GUARDIAN_KEYRING_CHILD_START";
+    const MULTIPROCESS_KEYRING_TEST: &str =
+        "guardian_output_keys::tests::scrollback_sibling_interprocess_provision_and_rotation_are_serialized";
+
+    fn wait_for_multiprocess_start(path: &Path) {
+        for _ in 0..2_000 {
+            if path.is_file() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("timed out waiting for guardian keyring child start marker");
+    }
+
+    fn spawn_keyring_child(
+        base: &Path,
+        start: &Path,
+        mode: &str,
+    ) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("resolve test executable"))
+            .arg(MULTIPROCESS_KEYRING_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(MULTIPROCESS_KEYRING_MODE, mode)
+            .env(MULTIPROCESS_KEYRING_BASE, base)
+            .env(MULTIPROCESS_KEYRING_START, start)
+            .spawn()
+            .expect("spawn guardian keyring child process")
+    }
 
     #[cfg(unix)]
     fn open_private_directory(path: &std::path::Path) -> CapDir {
@@ -668,6 +1061,185 @@ mod tests {
             parse_activation_name(&activation_name(expected)),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn scrollback_sibling_reuses_rotated_historical_guardian_authority() {
+        let root = tempfile::tempdir().expect("create private storage root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let mut keyring = GuardianOutputKeyring::open_or_provision_scrollback_sibling(&scrollback)
+            .expect("provision shared sibling keyring");
+        let first_cipher = keyring.active_cipher().expect("derive first cipher");
+        let first_key_id = first_cipher.key_id();
+        let identity = GuardianScrollbackRowIdentity::new([7; 16], [8; 16], 1, 9, 0)
+            .expect("construct exact row identity");
+        let record = first_cipher
+            .seal_scrollback_row(identity, b"historical semantic secret")
+            .expect("seal historical row")
+            .encode()
+            .expect("encode historical row");
+        assert!(!record.contains("historical semantic secret"));
+
+        let second_key_id = keyring.rotate().expect("rotate shared keyring");
+        assert_ne!(first_key_id, second_key_id);
+        drop(keyring);
+
+        let reopened = GuardianOutputKeyring::open_existing_scrollback_sibling(&scrollback)
+            .expect("reopen rotated sibling keyring");
+        let parsed = GuardianEncryptedScrollbackRow::parse(&record)
+            .expect("parse historical encrypted row");
+        assert_eq!(parsed.key_id(), first_key_id);
+        let historical_cipher = reopened
+            .cipher_for_key_id(parsed.key_id())
+            .expect("load historical activated key");
+        let plaintext = historical_cipher
+            .open_scrollback_row(&parsed, [7; 16], [8; 16], 9, 0, 1024)
+            .expect("authenticate historical row after rotation");
+        assert_eq!(plaintext, b"historical semantic secret");
+    }
+
+    #[test]
+    fn scrollback_sibling_interprocess_provision_and_rotation_are_serialized() {
+        if let Some(mode) = std::env::var_os(MULTIPROCESS_KEYRING_MODE) {
+            let mode = mode
+                .to_str()
+                .expect("guardian keyring child mode is valid UTF-8");
+            let base = PathBuf::from(
+                std::env::var_os(MULTIPROCESS_KEYRING_BASE)
+                    .expect("guardian keyring child base path"),
+            );
+            let start = PathBuf::from(
+                std::env::var_os(MULTIPROCESS_KEYRING_START)
+                    .expect("guardian keyring child start path"),
+            );
+            wait_for_multiprocess_start(&start);
+            let mut keyring =
+                GuardianOutputKeyring::open_or_provision_scrollback_sibling(&base)
+                    .expect("child opens shared guardian keyring");
+            if mode == "rotate" {
+                keyring.rotate().expect("child rotates guardian keyring");
+            } else {
+                assert_eq!(mode, "provision");
+            }
+            return;
+        }
+
+        const CHILDREN: usize = 4;
+        let root = tempfile::tempdir().expect("create multiprocess storage root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create multiprocess scrollback directory");
+
+        let provision_start = root.path().join("start-provision");
+        let mut provisioners = (0..CHILDREN)
+            .map(|_| spawn_keyring_child(&scrollback, &provision_start, "provision"))
+            .collect::<Vec<_>>();
+        std::fs::File::create(&provision_start).expect("release provisioning children");
+        for child in &mut provisioners {
+            assert!(
+                child.wait().expect("wait for provisioning child").success(),
+                "concurrent guardian keyring provisioner failed"
+            );
+        }
+        let provisioned = GuardianOutputKeyring::open_existing_scrollback_sibling(&scrollback)
+            .expect("open interprocess-provisioned guardian keyring");
+        assert_eq!(provisioned.active_generation(), 1);
+        drop(provisioned);
+
+        let rotation_start = root.path().join("start-rotation");
+        let mut rotators = (0..CHILDREN)
+            .map(|_| spawn_keyring_child(&scrollback, &rotation_start, "rotate"))
+            .collect::<Vec<_>>();
+        std::fs::File::create(&rotation_start).expect("release rotation children");
+        for child in &mut rotators {
+            assert!(
+                child.wait().expect("wait for rotation child").success(),
+                "concurrent guardian keyring rotator failed"
+            );
+        }
+        let rotated = GuardianOutputKeyring::open_existing_scrollback_sibling(&scrollback)
+            .expect("open interprocess-rotated guardian keyring");
+        assert_eq!(
+            rotated.active_generation(),
+            1 + u64::try_from(CHILDREN).expect("child count fits u64")
+        );
+    }
+
+    #[test]
+    fn read_only_sibling_open_never_provisions_an_empty_authority() {
+        let root = tempfile::tempdir().expect("create private storage root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let keyring_path = scrollback.join(SCROLLBACK_KEYRING_SIBLING);
+        create_private_directory(&keyring_path).expect("create empty keyring directory");
+
+        assert!(matches!(
+            GuardianOutputKeyring::open_existing_scrollback_sibling(&scrollback),
+            Err(GuardianOutputKeyringError::MissingActivatedKey)
+        ));
+        assert_eq!(
+            std::fs::read_dir(&keyring_path)
+                .expect("enumerate empty keyring")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn authority_lock_is_the_only_safe_inventory_exemption() {
+        let accepted_root = tempfile::tempdir().expect("create accepted lock storage root");
+        let accepted_scrollback = accepted_root.path().join("scrollback-lines");
+        std::fs::create_dir(&accepted_scrollback).expect("create accepted scrollback directory");
+        let accepted = GuardianOutputKeyring::open_or_provision_scrollback_sibling(
+            &accepted_scrollback,
+        )
+        .expect("provision authority with durable lock file");
+        let accepted_inventory = inventory(&accepted.directory).expect("inventory safe authority");
+        assert_eq!(accepted_inventory.entries, 2);
+        assert_eq!(
+            std::fs::read_dir(accepted_scrollback.join(SCROLLBACK_KEYRING_SIBLING))
+                .expect("enumerate accepted authority")
+                .count(),
+            3,
+            "one key, one activation, and only the exempt authority lock are present"
+        );
+
+        let unknown_root = tempfile::tempdir().expect("create unknown-entry storage root");
+        let unknown_scrollback = unknown_root.path().join("scrollback-lines");
+        std::fs::create_dir(&unknown_scrollback).expect("create unknown scrollback directory");
+        let unknown =
+            GuardianOutputKeyring::open_or_provision_scrollback_sibling(&unknown_scrollback)
+                .expect("provision authority for unknown-entry test");
+        create_private_file(&unknown.directory, ".another-lock.v1")
+            .expect("create private but unrecognized authority entry")
+            .sync_all()
+            .expect("sync unrecognized authority entry");
+        assert!(matches!(
+            GuardianOutputKeyring::open_existing_scrollback_sibling(&unknown_scrollback),
+            Err(GuardianOutputKeyringError::UnrecognizedEntry)
+        ));
+
+        let nonempty_root = tempfile::tempdir().expect("create nonempty-lock storage root");
+        let nonempty_scrollback = nonempty_root.path().join("scrollback-lines");
+        std::fs::create_dir(&nonempty_scrollback).expect("create nonempty scrollback directory");
+        let nonempty =
+            GuardianOutputKeyring::open_or_provision_scrollback_sibling(&nonempty_scrollback)
+                .expect("provision authority for nonempty-lock test");
+        drop(nonempty);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(
+                nonempty_scrollback
+                    .join(SCROLLBACK_KEYRING_SIBLING)
+                    .join(AUTHORITY_LOCK_NAME),
+            )
+            .expect("open authority lock for corruption")
+            .write_all(b"unsafe")
+            .expect("write unsafe authority lock content");
+        assert!(matches!(
+            GuardianOutputKeyring::open_existing_scrollback_sibling(&nonempty_scrollback),
+            Err(GuardianOutputKeyringError::UnsafeKeyFile)
+        ));
     }
 
     #[test]
