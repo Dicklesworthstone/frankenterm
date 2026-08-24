@@ -1553,14 +1553,21 @@ fn mint_auto_connect_supervisor_generation() -> Option<u64> {
 }
 
 fn fence_auto_connect_supervisor_authority(context: &str) -> bool {
+    let request_fenced = mint_auto_connect_admission_retry_generation().is_some();
     let supervisor_fenced = mint_auto_connect_supervisor_generation().is_some();
-    if supervisor_fenced {
+    if request_fenced && supervisor_fenced {
         return true;
     }
 
     AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
+    let exhausted = match (request_fenced, supervisor_fenced) {
+        (false, false) => "request and supervisor generations",
+        (false, true) => "request generation",
+        (true, false) => "supervisor generation",
+        (true, true) => unreachable!("both successful fences returned above"),
+    };
     let message = format!(
-        "automatic domain connection supervisor generation exhausted while fencing {context}; automatic connection is disabled for this process"
+        "automatic domain connection {exhausted} exhausted while fencing {context}; automatic connection is disabled for this process"
     );
     frankenterm_gui::gui_debug_log::record(
         log::Level::Error,
@@ -1573,17 +1580,6 @@ fn fence_auto_connect_supervisor_authority(context: &str) -> bool {
 }
 
 fn cancel_auto_connect_supervisor() {
-    if mint_auto_connect_admission_retry_generation().is_none() {
-        AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
-        let message = "automatic domain admission request generation exhausted while fencing a cancelled supervisor; automatic connection is disabled for this process";
-        frankenterm_gui::gui_debug_log::record(
-            log::Level::Error,
-            "frankenterm_gui::auto_connect",
-            message,
-        );
-        log::error!("{message}");
-        persistent_toast_notification("Domain auto-connect unavailable", message);
-    }
     fence_auto_connect_supervisor_authority("a cancelled supervisor");
     let previous = AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take());
     // Drop only after releasing the RefCell borrow. Cancellation may dispose
@@ -1697,6 +1693,7 @@ fn try_admit_auto_connect_supervisor(
 
     if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
         != request_generation
+        || MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) != 0
     {
         return AutoConnectSupervisorAdmission::Superseded;
     }
@@ -1718,6 +1715,7 @@ fn try_admit_auto_connect_supervisor(
     };
     if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
         != request_generation
+        || MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) != 0
     {
         drop(reservation);
         return AutoConnectSupervisorAdmission::Superseded;
@@ -1725,6 +1723,7 @@ fn try_admit_auto_connect_supervisor(
     let spawned = reservation.handoff_to_main_thread_local(move |reservation| {
         if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
             != request_generation
+            || MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) != 0
             || !AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
             || !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &mux))
         {
@@ -1773,6 +1772,7 @@ fn try_admit_auto_connect_supervisor(
     spawned.detach();
     if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
         == request_generation
+        && MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) == 0
     {
         AutoConnectSupervisorAdmission::Scheduled
     } else {
