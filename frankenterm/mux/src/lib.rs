@@ -61,8 +61,8 @@ use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
 use crate::guardian_checkpoint::{
-    GuardianCheckpointBoundary, LiveParserCaptureAndBindError, LiveParserCheckpointAck,
-    capture_and_bind_live_parser_checkpoint,
+    GuardianCheckpointBoundary, GuardianCheckpointBoundaryError,
+    LiveParserCaptureAndBindError, LiveParserCheckpointAck, capture_and_bind_live_parser_checkpoint,
 };
 use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalError,
