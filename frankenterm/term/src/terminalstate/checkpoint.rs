@@ -1801,7 +1801,7 @@ impl CheckpointUnicodeVersion {
     }
 }
 
-const CHECKPOINT_REPLAY_CONFIG_VERSION: u32 = 1;
+const CHECKPOINT_REPLAY_CONFIG_VERSION: u32 = 2;
 
 /// Immutable, capability-free values that can change the terminal model while
 /// authenticated raw output is replayed. Operational tier placement, spill

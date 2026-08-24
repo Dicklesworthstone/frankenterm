@@ -390,6 +390,7 @@ impl InertTerminal {
         let mut action_limit_exceeded = false;
         let mut action_memory_limit_exceeded = None;
         let max_actions = self.checkpoint_limits.max_replay_actions_per_record;
+        let max_action_batch_bytes = self.checkpoint_limits.max_retained_capture_bytes;
         const ACTION_RESERVE_CHUNK: usize = 256;
         self.terminal.parser.parse(bytes, |action| {
             if allocation_failed
@@ -414,7 +415,7 @@ impl InertTerminal {
                     .capacity()
                     .checked_mul(std::mem::size_of::<Action>())
                     .unwrap_or(usize::MAX);
-                if retained_bytes > self.checkpoint_limits.max_retained_capture_bytes {
+                if retained_bytes > max_action_batch_bytes {
                     action_memory_limit_exceeded = Some(retained_bytes);
                     return;
                 }
@@ -434,7 +435,7 @@ impl InertTerminal {
             return Err(InertTerminalError::ReplayResourceLimit {
                 resource: "action_batch_bytes",
                 observed,
-                maximum: self.checkpoint_limits.max_retained_capture_bytes,
+                maximum: max_action_batch_bytes,
             });
         }
         if action_limit_exceeded {
