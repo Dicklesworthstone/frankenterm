@@ -555,6 +555,27 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_overlay_revision_refuses_mutation_before_value_changes() {
+        let term_config = TermConfig::new();
+        term_config
+            .overlay_generation
+            .store(usize::MAX, Ordering::Relaxed);
+
+        let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            term_config.set_client_palette(ColorPalette::default());
+        }));
+        assert!(attempted.is_err());
+        assert!(
+            lock_terminal_mutex(
+                &term_config.client_palette,
+                "terminal client palette exhaustion test",
+            )
+            .is_none(),
+            "revision exhaustion must leave the prior semantic value untouched",
+        );
+    }
+
+    #[test]
     fn term_config_maps_terminal_state_limits() {
         let mut overrides = BTreeMap::new();
         overrides.insert(Value::String("max_user_vars".into()), Value::U64(1024));
