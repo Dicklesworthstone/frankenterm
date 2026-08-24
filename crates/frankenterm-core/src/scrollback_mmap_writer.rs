@@ -189,6 +189,10 @@ pub enum LinearRecordTerminalReason {
     /// neither the oldest-record offset nor a generation. Physical order is
     /// therefore not logical order and cannot be exported exactly.
     LegacyWrappedOrderUnknown,
+    /// A v1 header's monotone byte counter is behind its committed cursor.
+    /// This cannot describe a complete non-wrapped v1 prefix and is therefore
+    /// fail-closed even when every cursor-declared record is physically valid.
+    LegacyWriteAccountingInconsistent,
     /// A newer v2 state publication or one of its authenticated records was
     /// torn/corrupt, so recovery fell back to an older valid state slot.
     V2NewerStateInvalid,
@@ -204,6 +208,9 @@ impl LinearRecordTerminalReason {
             Self::RecordPayloadPastDeclaredCursor => "record_payload_past_declared_cursor",
             Self::PhysicalRecordPayloadTruncated => "physical_record_payload_truncated",
             Self::LegacyWrappedOrderUnknown => "legacy_wrapped_order_unknown",
+            Self::LegacyWriteAccountingInconsistent => {
+                "legacy_write_accounting_inconsistent"
+            }
             Self::V2NewerStateInvalid => "v2_newer_state_invalid",
         }
     }
@@ -242,7 +249,7 @@ impl LinearRecordReadLimits {
                 actual: self.max_payload_bytes,
             });
         }
-        if self.max_payload_bytes == 0 || self.max_payload_bytes > self.max_file_bytes {
+        if self.max_payload_bytes == 0 {
             return Err(MmapScrollbackError::InvalidReadLimit {
                 limit_name: "payload_bytes",
             });
@@ -2132,16 +2139,7 @@ fn read_linear_records_from_file(
         cursor = payload_end;
     }
 
-    let legacy_wrapped = header.total_bytes_written > header.write_cursor_bytes;
-    let completeness = if legacy_wrapped {
-        LinearRecordCompleteness::Incomplete {
-            decoded_cursor_bytes: cursor,
-            declared_cursor_bytes: header.write_cursor_bytes,
-            reason: LinearRecordTerminalReason::LegacyWrappedOrderUnknown,
-        }
-    } else if cursor == header.write_cursor_bytes {
-        LinearRecordCompleteness::Complete
-    } else {
+    let completeness = if cursor != header.write_cursor_bytes {
         LinearRecordCompleteness::Incomplete {
             decoded_cursor_bytes: cursor,
             declared_cursor_bytes: header.write_cursor_bytes,
@@ -2149,6 +2147,20 @@ fn read_linear_records_from_file(
                 LinearRecordTerminalReason::DeclaredTailTooShortForHeader,
             ),
         }
+    } else if header.total_bytes_written > header.write_cursor_bytes {
+        LinearRecordCompleteness::Incomplete {
+            decoded_cursor_bytes: cursor,
+            declared_cursor_bytes: header.write_cursor_bytes,
+            reason: LinearRecordTerminalReason::LegacyWrappedOrderUnknown,
+        }
+    } else if header.total_bytes_written < header.write_cursor_bytes {
+        LinearRecordCompleteness::Incomplete {
+            decoded_cursor_bytes: cursor,
+            declared_cursor_bytes: header.write_cursor_bytes,
+            reason: LinearRecordTerminalReason::LegacyWriteAccountingInconsistent,
+        }
+    } else {
+        LinearRecordCompleteness::Complete
     };
 
     Ok(LinearRecordSnapshot {
@@ -3771,6 +3783,45 @@ mod tests {
                     if limit_name == expected_name
             ));
         }
+
+        for (limits, expected_name) in [
+            (
+                LinearRecordReadLimits {
+                    max_file_bytes: HEADER_SIZE as u64 - 1,
+                    ..test_read_limits()
+                },
+                "file_bytes",
+            ),
+            (
+                LinearRecordReadLimits {
+                    max_records: 0,
+                    ..test_read_limits()
+                },
+                "records",
+            ),
+            (
+                LinearRecordReadLimits {
+                    max_payload_bytes: 0,
+                    ..test_read_limits()
+                },
+                "payload_bytes",
+            ),
+        ] {
+            let error = limits.validate().unwrap_err();
+            assert!(matches!(
+                error,
+                MmapScrollbackError::InvalidReadLimit { limit_name }
+                    if limit_name == expected_name
+            ));
+        }
+
+        LinearRecordReadLimits {
+            max_file_bytes: HEADER_SIZE as u64,
+            max_records: 1,
+            max_payload_bytes: HARD_MAX_LINEAR_RECORD_PAYLOAD_BYTES,
+        }
+        .validate()
+        .expect("independent finite limits need not be ordered by magnitude");
     }
 
     #[cfg(unix)]
@@ -3956,6 +4007,39 @@ mod tests {
                 decoded_cursor_bytes: cursor,
                 declared_cursor_bytes: cursor,
                 reason: LinearRecordTerminalReason::LegacyWrappedOrderUnknown,
+            }
+        );
+    }
+
+    #[test]
+    fn v1_reader_never_claims_complete_when_total_bytes_trails_valid_cursor() {
+        let dir = test_dir("v1-accounting-inconsistent");
+        create_private_dir(&dir);
+        let path = dir.join("inconsistent-v1.bin");
+        let payload = b"physically-complete";
+        let record = RecordHeader {
+            record_len: payload.len() as u32,
+            record_kind: RecordKind::Text,
+        };
+        let cursor = RECORD_HEADER_SIZE as u64 + payload.len() as u64;
+        let mut header = ScrollbackHeader::new([0x45; 32], 128, 0);
+        header.write_cursor_bytes = cursor;
+        header.total_bytes_written = cursor - 1;
+        let mut bytes = header.encode().to_vec();
+        bytes.extend_from_slice(&record.encode());
+        bytes.extend_from_slice(payload);
+        bytes.resize(HEADER_SIZE + 128, 0);
+        write_private(&path, &bytes);
+
+        let snapshot = read_linear_records(&path, test_read_limits()).unwrap();
+
+        assert_eq!(snapshot.records, vec![(RecordKind::Text, payload.to_vec())]);
+        assert_eq!(
+            snapshot.completeness,
+            LinearRecordCompleteness::Incomplete {
+                decoded_cursor_bytes: cursor,
+                declared_cursor_bytes: cursor,
+                reason: LinearRecordTerminalReason::LegacyWriteAccountingInconsistent,
             }
         );
     }

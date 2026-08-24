@@ -1626,6 +1626,336 @@ mod tests {
     }
 
     #[test]
+    fn canonical_record_descriptor_matches_the_existing_live_identity() {
+        let (descriptor, segment, output, capture) = record_descriptor();
+        let origin = descriptor.origin();
+
+        assert!(!origin.is_genesis());
+        assert_eq!(origin.spawn_effect_id(), None);
+        assert_eq!(origin.durable_pane_id(), Some(capture.durable_pane_id()));
+        assert_eq!(origin.segment_id(), Some(capture.segment_id()));
+        assert_eq!(origin.output_sequence(), Some(capture.output_sequence()));
+        assert_eq!(
+            origin.output_record_digest(),
+            Some(capture.output_record_digest())
+        );
+        assert_eq!(
+            origin.output_committed_log_bytes(),
+            Some(capture.output_committed_log_bytes())
+        );
+        assert_eq!(
+            origin.journal_cumulative_plaintext_bytes(),
+            Some(capture.journal_cumulative_plaintext_bytes())
+        );
+        assert_eq!(
+            descriptor
+                .recompute_boundary_identity_digest()
+                .expect("recompute record boundary"),
+            capture.output_boundary_identity_digest()
+        );
+        assert_eq!(
+            descriptor
+                .recompute_checkpoint_identity_digest()
+                .expect("recompute record artifact"),
+            capture.checkpoint_artifact_identity_digest()
+        );
+        descriptor
+            .validate_record_authority(segment, output)
+            .expect("accept exact verified output receipt");
+    }
+
+    #[test]
+    fn record_descriptor_hashes_every_boundary_and_artifact_preimage() {
+        let (descriptor, _, _, _) = record_descriptor();
+        let boundary_identity = descriptor
+            .recompute_boundary_identity_digest()
+            .expect("baseline boundary identity");
+        let artifact_identity = descriptor
+            .recompute_checkpoint_identity_digest()
+            .expect("baseline artifact identity");
+
+        let mut pane_mutation = descriptor;
+        let GuardianCheckpointOriginKindV1::Record {
+            durable_pane_id, ..
+        } = &mut pane_mutation.origin.kind
+        else {
+            panic!("fixture descriptor must be record-backed");
+        };
+        *durable_pane_id = Uuid::new_v4();
+
+        let mut segment_mutation = descriptor;
+        let GuardianCheckpointOriginKindV1::Record { segment_id, .. } =
+            &mut segment_mutation.origin.kind
+        else {
+            panic!("fixture descriptor must be record-backed");
+        };
+        *segment_id = Uuid::new_v4();
+
+        let mut sequence_mutation = descriptor;
+        let GuardianCheckpointOriginKindV1::Record {
+            output_sequence, ..
+        } = &mut sequence_mutation.origin.kind
+        else {
+            panic!("fixture descriptor must be record-backed");
+        };
+        *output_sequence = output_sequence
+            .checked_add(1)
+            .expect("fixture sequence has mutation room");
+
+        let mut record_digest_mutation = descriptor;
+        let GuardianCheckpointOriginKindV1::Record {
+            output_record_digest,
+            ..
+        } = &mut record_digest_mutation.origin.kind
+        else {
+            panic!("fixture descriptor must be record-backed");
+        };
+        output_record_digest[0] ^= 1;
+
+        let mut committed_bytes_mutation = descriptor;
+        let GuardianCheckpointOriginKindV1::Record {
+            output_committed_log_bytes,
+            ..
+        } = &mut committed_bytes_mutation.origin.kind
+        else {
+            panic!("fixture descriptor must be record-backed");
+        };
+        *output_committed_log_bytes = output_committed_log_bytes
+            .checked_add(1)
+            .expect("fixture committed endpoint has mutation room");
+
+        let mut cumulative_bytes_mutation = descriptor;
+        let GuardianCheckpointOriginKindV1::Record {
+            journal_cumulative_plaintext_bytes,
+            ..
+        } = &mut cumulative_bytes_mutation.origin.kind
+        else {
+            panic!("fixture descriptor must be record-backed");
+        };
+        *journal_cumulative_plaintext_bytes = journal_cumulative_plaintext_bytes
+            .checked_add(1)
+            .expect("fixture plaintext endpoint has mutation room");
+
+        for (field, mutation) in [
+            ("durable pane", pane_mutation),
+            ("segment", segment_mutation),
+            ("output sequence", sequence_mutation),
+            ("output record digest", record_digest_mutation),
+            ("committed log bytes", committed_bytes_mutation),
+            ("journal plaintext bytes", cumulative_bytes_mutation),
+        ] {
+            assert_ne!(
+                mutation
+                    .recompute_boundary_identity_digest()
+                    .expect("mutated record boundary remains structurally valid"),
+                boundary_identity,
+                "{field} must affect the record boundary identity"
+            );
+            assert_ne!(
+                mutation
+                    .recompute_checkpoint_identity_digest()
+                    .expect("mutated record artifact remains structurally valid"),
+                artifact_identity,
+                "{field} must affect the complete artifact identity"
+            );
+        }
+
+        let mut parser_mutation = descriptor;
+        parser_mutation.parser_stream_bytes = parser_mutation
+            .parser_stream_bytes
+            .checked_add(1)
+            .expect("fixture parser watermark has mutation room");
+
+        let mut replay_mutation = descriptor;
+        replay_mutation.replay_identity_digest[0] ^= 1;
+
+        let mut rows_mutation = descriptor;
+        rows_mutation.rows = rows_mutation
+            .rows
+            .checked_add(1)
+            .expect("fixture rows have mutation room");
+
+        let mut columns_mutation = descriptor;
+        columns_mutation.cols = columns_mutation
+            .cols
+            .checked_add(1)
+            .expect("fixture columns have mutation room");
+
+        let mut payload_bytes_mutation = descriptor;
+        payload_bytes_mutation.terminal_payload_bytes = payload_bytes_mutation
+            .terminal_payload_bytes
+            .checked_add(1)
+            .expect("fixture payload length has mutation room");
+
+        let mut payload_digest_mutation = descriptor;
+        payload_digest_mutation.terminal_payload_digest[0] ^= 1;
+
+        for (field, mutation) in [
+            ("parser stream bytes", parser_mutation),
+            ("replay identity", replay_mutation),
+            ("rows", rows_mutation),
+            ("columns", columns_mutation),
+            ("terminal payload bytes", payload_bytes_mutation),
+            ("terminal payload digest", payload_digest_mutation),
+        ] {
+            assert_eq!(
+                mutation
+                    .recompute_boundary_identity_digest()
+                    .expect("artifact-only mutation preserves valid boundary"),
+                boundary_identity,
+                "{field} must not change the underlying output boundary"
+            );
+            assert_ne!(
+                mutation
+                    .recompute_checkpoint_identity_digest()
+                    .expect("artifact-only mutation remains structurally valid"),
+                artifact_identity,
+                "{field} must affect the complete artifact identity"
+            );
+        }
+    }
+
+    #[test]
+    fn genesis_identity_is_bound_to_the_exact_spawn_effect() {
+        let terminal = terminal_checkpoint();
+        let first_effect = Uuid::new_v4();
+        let second_effect = Uuid::new_v4();
+        let first = GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
+            first_effect,
+            &terminal,
+        )
+        .expect("construct first Genesis descriptor");
+        let second = GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
+            second_effect,
+            &terminal,
+        )
+        .expect("construct second Genesis descriptor");
+
+        assert!(first.origin().is_genesis());
+        assert_eq!(first.origin().spawn_effect_id(), Some(first_effect));
+        assert_eq!(first.origin().durable_pane_id(), None);
+        assert_eq!(first.parser_stream_bytes(), 0);
+        let mut expected = Sha256::new();
+        expected.update(GENESIS_BOUNDARY_IDENTITY_DIGEST_DOMAIN);
+        expected.update(first_effect.as_bytes());
+        assert_eq!(
+            first
+                .recompute_boundary_identity_digest()
+                .expect("recompute Genesis boundary"),
+            <[u8; 32]>::from(expected.finalize())
+        );
+        assert_ne!(
+            first
+                .recompute_boundary_identity_digest()
+                .expect("first Genesis boundary"),
+            second
+                .recompute_boundary_identity_digest()
+                .expect("second Genesis boundary")
+        );
+        assert_ne!(
+            first
+                .recompute_checkpoint_identity_digest()
+                .expect("first Genesis artifact"),
+            second
+                .recompute_checkpoint_identity_digest()
+                .expect("second Genesis artifact")
+        );
+        let (segment, receipt) = synchronized_output(Uuid::new_v4());
+        assert_eq!(
+            first.validate_record_authority(segment, receipt),
+            Err(GuardianCheckpointBoundaryError::GenesisHasNoRecordAuthority)
+        );
+    }
+
+    #[test]
+    fn descriptor_identity_is_independent_of_live_registration() {
+        let pane = Uuid::new_v4();
+        let (segment, output) = synchronized_output(pane);
+        let first = live_capture([1; 16], pane, segment, output, terminal_checkpoint());
+        let second = live_capture([2; 16], pane, segment, output, terminal_checkpoint());
+        let first_descriptor = GuardianCheckpointArtifactDescriptorV1::from_live_capture(&first)
+            .expect("construct first descriptor");
+        let second_descriptor = GuardianCheckpointArtifactDescriptorV1::from_live_capture(&second)
+            .expect("construct second descriptor");
+
+        assert_ne!(first.boundary_digest(), second.boundary_digest());
+        assert_eq!(first_descriptor, second_descriptor);
+        assert_eq!(
+            first_descriptor
+                .recompute_checkpoint_identity_digest()
+                .expect("first stable identity"),
+            second_descriptor
+                .recompute_checkpoint_identity_digest()
+                .expect("second stable identity")
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_unsupported_replay_identity() {
+        let (mut descriptor, _, _, capture) = record_descriptor();
+        descriptor.replay_identity_digest[0] ^= 1;
+
+        assert_eq!(
+            descriptor.validate_canonical_payload(
+                capture.terminal_checkpoint().canonical_payload(),
+                TerminalCheckpointLimits::default(),
+            ),
+            Err(GuardianCheckpointBoundaryError::ReplayIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_canonical_geometry_and_content_splices() {
+        let (descriptor, _, _, capture) = record_descriptor();
+        let mut geometry_splice = descriptor;
+        geometry_splice.rows = geometry_splice
+            .rows
+            .checked_add(1)
+            .expect("fixture rows have mutation room");
+        assert_eq!(
+            geometry_splice.validate_canonical_payload(
+                capture.terminal_checkpoint().canonical_payload(),
+                TerminalCheckpointLimits::default(),
+            ),
+            Err(GuardianCheckpointBoundaryError::TerminalGeometryMismatch)
+        );
+
+        let content_splice = terminal_checkpoint_with(24, 80, "guardian-checkpoint-tesz");
+        assert_eq!(
+            content_splice.canonical_payload().len(),
+            capture.terminal_checkpoint().canonical_payload().len(),
+            "content-splice fixture must isolate the payload digest"
+        );
+        assert_eq!(
+            descriptor.validate_canonical_payload(
+                content_splice.canonical_payload(),
+                TerminalCheckpointLimits::default(),
+            ),
+            Err(GuardianCheckpointBoundaryError::TerminalPayloadDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn descriptor_requires_the_exact_guardian_verified_receipt() {
+        let pane = Uuid::new_v4();
+        let (segment, receipts) =
+            synchronized_outputs(pane, &[b"first record", b"second record"]);
+        let first = receipts[0];
+        let second = receipts[1];
+        let capture = live_capture([1; 16], pane, segment, first, terminal_checkpoint());
+        let descriptor = GuardianCheckpointArtifactDescriptorV1::from_live_capture(&capture)
+            .expect("construct first-record descriptor");
+
+        descriptor
+            .validate_record_authority(segment, first)
+            .expect("accept exact verified receipt");
+        assert_eq!(
+            descriptor.validate_record_authority(segment, second),
+            Err(GuardianCheckpointBoundaryError::VerifiedOutputIdentityMismatch)
+        );
+    }
+
+    #[test]
     fn opaque_terminal_checkpoint_debug_is_content_free() {
         let checkpoint = terminal_checkpoint();
         let debug = format!("{checkpoint:?}");

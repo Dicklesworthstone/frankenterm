@@ -9454,6 +9454,87 @@ mod tests {
         .unwrap()
     }
 
+    fn replay_output_page(
+        pane_id: Uuid,
+        generation: u64,
+        snapshot_id: Uuid,
+        snapshot_digest: [u8; 32],
+    ) -> GuardianReplayPageDelivery {
+        let predecessor = GuardianReplayPredecessorV1::new(
+            id(90),
+            7,
+            [0x55; 32],
+            512,
+            4_096,
+        )
+        .unwrap();
+        let first_plaintext = b"first\n";
+        let first_metadata = GuardianReplayRecordMetadataV1::new(
+            id(91),
+            8,
+            Some(predecessor),
+            8,
+            u32::try_from(first_plaintext.len()).unwrap(),
+            518,
+            5_000,
+            [0x61; 32],
+        )
+        .unwrap();
+        let second_plaintext = b"last\n";
+        let second_metadata = GuardianReplayRecordMetadataV1::new(
+            id(91),
+            8,
+            Some(predecessor),
+            9,
+            u32::try_from(second_plaintext.len()).unwrap(),
+            523,
+            5_100,
+            [0x62; 32],
+        )
+        .unwrap();
+        let records = GuardianReplayOutputRecordsDelivery::new(
+            8,
+            [0x55; 32],
+            vec![
+                GuardianReplayRecordDelivery::new(
+                    first_metadata,
+                    Zeroizing::new(first_plaintext.to_vec()),
+                )
+                .unwrap(),
+                GuardianReplayRecordDelivery::new(
+                    second_metadata,
+                    Zeroizing::new(second_plaintext.to_vec()),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let next_cursor = GuardianReplayCursorV1::new(
+            snapshot_id,
+            snapshot_digest,
+            GuardianReplayPhaseV1::Output,
+            1,
+            0,
+            10,
+            [0x62; 32],
+            1,
+            4_096,
+            4,
+        )
+        .unwrap();
+        GuardianReplayPageDelivery::new(
+            pane_id,
+            generation,
+            snapshot_id,
+            snapshot_digest,
+            [0; 32],
+            0,
+            Some(next_cursor),
+            GuardianReplayPageBodyDelivery::OutputRecords(records),
+        )
+        .unwrap()
+    }
+
     fn spawn_request(guardian: Uuid, mux: Uuid, pane: Uuid) -> GuardianRequestEnvelope {
         let payload = spawn_payload("bounded-command");
         request(
@@ -11192,7 +11273,10 @@ mod tests {
             Err(GuardianProtocolError::InvalidRejectionPayload)
         );
 
-        let mut mismatched_status = terminal.clone();
+        let mut mismatched_status = GuardianResponseEnvelope::rejection(
+            &authenticated_request,
+            GuardianRejectionCode::StaleLease,
+        );
         mismatched_status.header.status = GuardianResponseStatus::Rejected;
         assert_eq!(
             encode_guardian_response(&secret(), &mismatched_status),
