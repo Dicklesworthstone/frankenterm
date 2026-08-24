@@ -1868,7 +1868,7 @@ mod tests {
     use std::io;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     fn runtime_for_input_rejection() -> (std::path::PathBuf, Poll, GuardianRuntime) {
@@ -2182,6 +2182,21 @@ mod tests {
         }
     }
 
+    fn assert_worker_request_wiped_before_completion(probe: &InputRequestWipeProbe) {
+        assert!(
+            probe.explicit_wipe.load(Ordering::SeqCst),
+            "worker must explicitly wipe plaintext before publishing completion"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !probe.drop_wipe.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            probe.drop_wipe.load(Ordering::SeqCst),
+            "owned request must also execute its wipe-on-drop fallback"
+        );
+    }
+
     fn input_reply_state(response: &GuardianResponseEnvelope) -> InputEffectState {
         let reply = GuardianReply::decode_for_operation(
             GuardianOperation::Input,
@@ -2350,6 +2365,8 @@ mod tests {
                 mode: TestWriteMode::Full,
             },
         ));
+        let first_probe = Arc::new(InputRequestWipeProbe::default());
+        runtime.input_request_wipe_probe = Some(Arc::clone(&first_probe));
         let request_id = Uuid::from_u128(41);
         let effect_id = Uuid::from_u128(42);
         let request = authenticated_input_request_for(
@@ -2366,6 +2383,7 @@ mod tests {
         assert!(runtime.protocol.is_none());
 
         let first = wait_for_input_completion(&mut runtime);
+        assert_worker_request_wiped_before_completion(&first_probe);
         assert_eq!(first.route, route);
         let first_response = first.response.expect("durable input response");
         assert_eq!(first_response.header().status, GuardianResponseStatus::Success);
@@ -2373,6 +2391,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(runtime.protocol.is_some());
 
+        let retry_probe = Arc::new(InputRequestWipeProbe::default());
+        runtime.input_request_wipe_probe = Some(Arc::clone(&retry_probe));
         let retry = authenticated_input_request_for(
             request_id,
             pane_id,
@@ -2385,6 +2405,7 @@ mod tests {
             GuardianInputSubmission::Pending
         ));
         let replay = wait_for_input_completion(&mut runtime);
+        assert_worker_request_wiped_before_completion(&retry_probe);
         assert_eq!(replay.route, retry_route);
         assert_eq!(replay.response, Some(first_response));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2399,6 +2420,8 @@ mod tests {
                 mode: TestWriteMode::Zero,
             },
         ));
+        let first_probe = Arc::new(InputRequestWipeProbe::default());
+        runtime.input_request_wipe_probe = Some(Arc::clone(&first_probe));
         let request_id = Uuid::from_u128(51);
         let effect_id = Uuid::from_u128(52);
         let request = authenticated_input_request_for(
@@ -2413,6 +2436,7 @@ mod tests {
             GuardianInputSubmission::Pending
         ));
         let first = wait_for_input_completion(&mut runtime);
+        assert_worker_request_wiped_before_completion(&first_probe);
         let first_response = first.response.expect("known-zero terminal response");
         assert_eq!(first_response.header().status, GuardianResponseStatus::Terminal);
         assert_eq!(
@@ -2425,6 +2449,8 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+        let retry_probe = Arc::new(InputRequestWipeProbe::default());
+        runtime.input_request_wipe_probe = Some(Arc::clone(&retry_probe));
         let retry = authenticated_input_request_for(
             request_id,
             pane_id,
@@ -2437,6 +2463,7 @@ mod tests {
             GuardianInputSubmission::Pending
         ));
         let replay = wait_for_input_completion(&mut runtime);
+        assert_worker_request_wiped_before_completion(&retry_probe);
         assert_eq!(replay.response, Some(first_response));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -2450,6 +2477,8 @@ mod tests {
                 mode: TestWriteMode::Prefix(3),
             },
         ));
+        let first_probe = Arc::new(InputRequestWipeProbe::default());
+        runtime.input_request_wipe_probe = Some(Arc::clone(&first_probe));
         let request_id = Uuid::from_u128(61);
         let effect_id = Uuid::from_u128(62);
         let request = authenticated_input_request_for(
@@ -2464,12 +2493,15 @@ mod tests {
             GuardianInputSubmission::Pending
         ));
         let first = wait_for_input_completion(&mut runtime);
+        assert_worker_request_wiped_before_completion(&first_probe);
         let first_response = first.response.expect("durable prefix response");
         assert_eq!(
             input_reply_state(&first_response),
             InputEffectState::DurablePrefix { applied_bytes: 3 }
         );
 
+        let retry_probe = Arc::new(InputRequestWipeProbe::default());
+        runtime.input_request_wipe_probe = Some(Arc::clone(&retry_probe));
         let retry = authenticated_input_request_for(
             request_id,
             pane_id,
@@ -2482,6 +2514,7 @@ mod tests {
             GuardianInputSubmission::Pending
         ));
         let replay = wait_for_input_completion(&mut runtime);
+        assert_worker_request_wiped_before_completion(&retry_probe);
         assert_eq!(replay.response, Some(first_response));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -2555,6 +2588,8 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
         ));
+        let panic_probe = Arc::new(InputRequestWipeProbe::default());
+        runtime.input_request_wipe_probe = Some(Arc::clone(&panic_probe));
         let request_id = Uuid::from_u128(77);
         let effect_id = Uuid::from_u128(78);
         let request = authenticated_input_request_for(
@@ -2570,6 +2605,7 @@ mod tests {
         ));
 
         let completion = wait_for_input_completion(&mut runtime);
+        assert_worker_request_wiped_before_completion(&panic_probe);
         assert_eq!(completion.route, route);
         assert!(completion.response.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2580,6 +2616,8 @@ mod tests {
         assert!(runtime.indeterminate_effect);
         assert_eq!(runtime.counters().input_worker_panics, 1);
 
+        let retry_probe = Arc::new(InputRequestWipeProbe::default());
+        runtime.input_request_wipe_probe = Some(Arc::clone(&retry_probe));
         let retry = authenticated_input_request_for(
             request_id,
             pane_id,
@@ -2591,6 +2629,7 @@ mod tests {
             runtime.submit_input(retry, retry_route),
             GuardianInputSubmission::CloseRetryably
         ));
+        assert!(retry_probe.drop_wipe.load(Ordering::SeqCst));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

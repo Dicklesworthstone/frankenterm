@@ -9856,6 +9856,21 @@ mod tests {
         );
         assert_eq!(second_retired.encrypted_record, original.encrypted_record);
 
+        drop(reopened);
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("cold-reopen successive WAL supersession replacement");
+        let cold_second_manifest =
+            LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+                .expect("read cold-reopened successive manifest")
+                .expect("cold-reopened successive manifest exists");
+        assert_eq!(cold_second_manifest, second_manifest);
+        assert_eq!(
+            reopened.active_ledger_pane_id(),
+            LiveScrollbackSpillSink::manifest_ledger_pane_id(&cold_second_manifest)
+                .expect("decode cold-reopened successive ledger")
+        );
+        assert_ne!(reopened.active_ledger_pane_id(), original.ledger_pane_id);
+
         reopened
             .clear_scrollback()
             .expect("publish clear across retained WAL evidence");
@@ -9875,11 +9890,20 @@ mod tests {
             .expect("retained WAL evidence path remains published")
             .is_file());
 
-        assert!(reopened.store_scrollback_line(
-            20,
-            &Line::from_text("post-clear-successor", &attributes, 3, None),
-            8,
-        ));
+        drop(reopened);
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("cold-reopen clear across retained WAL evidence");
+        let cold_cleared_manifest =
+            LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+                .expect("read cold-reopened clear manifest")
+                .expect("cold-reopened clear manifest exists");
+        assert_eq!(cold_cleared_manifest, cleared_manifest);
+        assert_eq!(reopened.retained_scrollback_rows(), 0);
+        assert!(reopened.load_scrollback_line(10).is_none());
+
+        let post_clear_successor =
+            Line::from_text("post-clear-successor", &attributes, 3, None);
+        assert!(reopened.store_scrollback_line(20, &post_clear_successor, 8));
         let post_clear_manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
             .expect("read post-clear successor manifest")
             .expect("post-clear successor manifest exists");
@@ -9892,6 +9916,130 @@ mod tests {
         )
         .expect("bind post-clear WAL retirement marker"));
         assert_eq!(post_clear_retired.encrypted_record, original.encrypted_record);
+
+        drop(reopened);
+        let final_reopen = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("cold-reopen post-clear WAL successor");
+        let cold_post_clear_manifest =
+            LiveScrollbackSpillSink::read_manifest(&final_reopen.manifest_path)
+                .expect("read cold-reopened post-clear manifest")
+                .expect("cold-reopened post-clear manifest exists");
+        assert_eq!(cold_post_clear_manifest, post_clear_manifest);
+        assert_eq!(
+            final_reopen
+                .load_scrollback_line(20)
+                .expect("post-clear successor survives cold reopen")
+                .as_str()
+                .as_ref(),
+            post_clear_successor.as_str().as_ref()
+        );
+        assert!(final_reopen.load_scrollback_line(10).is_none());
+    }
+
+    #[test]
+    fn retained_append_wal_cannot_skip_two_authenticated_manifest_generations() {
+        let dir = tempfile::tempdir().expect("create two-generation WAL skip fixture");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 41_002,
+            domain_id: 3,
+            durable_pane_id: [208; 16],
+            command_description: "append-wal-two-generation-skip".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create two-generation WAL skip sink");
+        let attributes = CellAttributes::blank();
+        let rows = vec![
+            Line::from_text("two-generation-row-a", &attributes, 1, None),
+            Line::from_text("two-generation-row-b", &attributes, 2, None),
+        ];
+        assert!(sink.store_scrollback_line(10, &rows[0], 8));
+        assert!(sink.store_scrollback_line(11, &rows[1], 8));
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
+            .expect("derive two-generation WAL path");
+        let original = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .expect("read two-generation original WAL")
+            .expect("two-generation original WAL exists");
+        let original_generation = sink
+            .lock_state("read two-generation original state")
+            .expect("lock two-generation original state")
+            .snapshot_generation();
+
+        let first_prefix = wezterm_term::config::ScrollbackPrefix::from_slices(
+            Some(10),
+            12,
+            &rows,
+            &[],
+        )
+        .expect("construct first two-generation replacement");
+        let first = sink
+            .replace_scrollback_prefix(Some(original_generation), first_prefix, 8)
+            .expect("publish first two-generation replacement");
+        let second_prefix = wezterm_term::config::ScrollbackPrefix::from_slices(
+            Some(10),
+            12,
+            &rows,
+            &[],
+        )
+        .expect("construct second two-generation replacement");
+        sink.replace_scrollback_prefix(Some(first.generation()), second_prefix, 8)
+            .expect("publish second two-generation replacement");
+        let current = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read two-generation current manifest")
+            .expect("two-generation current manifest exists");
+        assert_ne!(
+            live_scrollback_manifest_predecessor(&current)
+                .expect("decode two-generation current predecessor"),
+            Some(
+                LiveScrollbackSpillSink::append_wal_effective_generation(&original)
+                    .expect("decode two-generation original WAL target")
+            )
+        );
+        let manifest_bytes_before =
+            std::fs::read(&sink.manifest_path).expect("read two-generation manifest bytes");
+        let pane_dir = sink
+            .manifest_path
+            .parent()
+            .expect("two-generation manifest has parent");
+        let log_path = pane_dir.join(&current.content_log);
+        let sequence_path = pane_dir.join(
+            current
+                .content_sequence
+                .as_deref()
+                .expect("two-generation current manifest names a sequence journal"),
+        );
+        let log_bytes_before =
+            std::fs::read(&log_path).expect("read two-generation current log bytes");
+        let sequence_bytes_before = std::fs::read(&sequence_path)
+            .expect("read two-generation current sequence bytes");
+
+        // Restore valid but two-generations-stale WAL evidence. The current
+        // manifest is not its target, marker, or immediate successor.
+        overwrite_private_append_wal_fixture(&wal_path, &original);
+        drop(sink);
+        let error = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect_err("a retained WAL must not skip two authenticated generations");
+        assert!(
+            format!("{error:#}").contains("neither adjacent"),
+            "two-generation skip rejection remains chain-specific: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(
+                dir.path()
+                    .join(uuid::Uuid::from_bytes(context.durable_pane_id).simple().to_string())
+                    .join("manifest.json")
+            )
+            .expect("re-read two-generation manifest bytes"),
+            manifest_bytes_before
+        );
+        assert_eq!(
+            std::fs::read(&log_path).expect("re-read two-generation current log bytes"),
+            log_bytes_before
+        );
+        assert_eq!(
+            std::fs::read(&sequence_path)
+                .expect("re-read two-generation current sequence bytes"),
+            sequence_bytes_before
+        );
     }
 
     #[test]
