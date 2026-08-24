@@ -688,7 +688,7 @@ impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1 {
 ///
 /// The identity is content-stable across encryption nonces and process
 /// restarts. Its sole preimage is
-/// `SHA256("frankenterm.guardian-checkpoint-phase-a-candidate.v1\\0" ||
+/// `SHA256("frankenterm.guardian-checkpoint-phase-a-candidate.v1\0" ||
 /// exact_336_byte_canonical_begin_plaintext)`. Construction decodes the
 /// plaintext as a Begin request and requires byte-for-byte canonical
 /// re-encoding. The borrowed [`Zeroizing`] owner can subsequently be consumed
@@ -1554,8 +1554,7 @@ impl GuardianCheckpointManifestSealCapabilitiesV1 {
         if seal_request.upload_id().is_nil() || publication_id.is_nil() {
             return Err(GuardianCheckpointCipherError::InvalidSealRequest);
         }
-        if candidate_identity.is_zero() || ordered_chunk_set_identity.is_zero()
-        {
+        if candidate_identity.is_zero() || ordered_chunk_set_identity.is_zero() {
             return Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest);
         }
         let encoded_request = Zeroizing::new(
@@ -5452,6 +5451,27 @@ mod tests {
         .collect::<Vec<_>>();
         expected_methods.sort();
         assert_eq!(inventory.inherent_methods, expected_methods);
+
+        inventory.cipher_methods.sort();
+        let mut expected_cipher_methods = vec![
+            "from_output_cipher:pub:GuardianOutputCipher",
+            "key_id:pub:",
+            "open:pub:GuardianCheckpointStageRecordContextV1,GuardianEncryptedCheckpointStageRecordV1,u32",
+            "open_exact_payload:private:GuardianCheckpointStageRecordContextV1,GuardianEncryptedCheckpointStageRecordV1,u32",
+            "open_manifest:pub:GuardianCheckpointValidatedManifestOperationV1,GuardianEncryptedCheckpointStageRecordV1",
+            "open_validated_manifest:private:GuardianCheckpointValidatedManifestOperationV1,GuardianEncryptedCheckpointStageRecordV1",
+            "retry_open_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1,GuardianEncryptedCheckpointStageRecordV1",
+            "retry_seal_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1",
+            "seal:pub:GuardianCheckpointStageSealIntentV1",
+            "seal_exact_payload:private:GuardianCheckpointStageRecordContextV1,u8,u8",
+            "seal_manifest:pub:GuardianCheckpointValidatedManifestOperationV1",
+            "seal_validated_manifest:private:GuardianCheckpointValidatedManifestOperationV1",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_cipher_methods.sort();
+        assert_eq!(inventory.cipher_methods, expected_cipher_methods);
 
         inventory.return_sites.sort();
         let mut expected_return_sites = vec![
