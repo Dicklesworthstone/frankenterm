@@ -53,6 +53,12 @@ const CHECKPOINT_SEAL_MANIFEST_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-canonical-seal-manifest.v1\0";
 const CHECKPOINT_SEAL_OPERATION_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-seal-operation.v1\0";
+const CHECKPOINT_CANDIDATE_IDENTITY_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-phase-a-candidate.v1\0";
+const CHECKPOINT_CHUNK_IDENTITY_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-phase-a-chunk.v1\0";
+const CHECKPOINT_ORDERED_CHUNK_SET_IDENTITY_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-phase-a-chunk-set.v1\0";
 const CHECKPOINT_STAGE_RECORD_MAGIC: [u8; 8] = *b"FTGCPA03";
 const CHECKPOINT_STAGE_INNER_TRAILER_MAGIC: [u8; 8] = *b"FTGCPI01";
 
@@ -68,6 +74,8 @@ pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES: usize = 232;
 pub const GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES: u32 = 256 * 1024;
 /// Exact canonical Seal-request bytes bound into the encrypted manifest.
 pub const GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES: u32 = 336;
+/// Exact authenticated canonical Begin plaintext used for candidate identity.
+pub const GUARDIAN_CHECKPOINT_BEGIN_REQUEST_BYTES: u32 = 336;
 /// Exact canonical final-manifest bytes: Seal request plus two digests.
 pub const GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES: u32 = 400;
 /// Capture generation reserved for a pre-spawn Genesis checkpoint.
@@ -676,6 +684,206 @@ impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1 {
     }
 }
 
+/// Opaque logical identity of the exact authenticated canonical Begin record.
+///
+/// The identity is content-stable across encryption nonces and process
+/// restarts. Its sole preimage is
+/// `SHA256("frankenterm.guardian-checkpoint-phase-a-candidate.v1\\0" ||
+/// exact_336_byte_canonical_begin_plaintext)`. Construction decodes the
+/// plaintext as a Begin request and requires byte-for-byte canonical
+/// re-encoding. The borrowed [`Zeroizing`] owner can subsequently be consumed
+/// by the staging cipher without making a second plaintext allocation.
+#[must_use = "candidate identity must be retained for validated stage assembly"]
+pub struct GuardianCheckpointCandidateIdentityV1 {
+    digest: Zeroizing<[u8; 32]>,
+}
+
+impl GuardianCheckpointCandidateIdentityV1 {
+    pub fn from_canonical_begin_plaintext(
+        plaintext: &Zeroizing<Vec<u8>>,
+    ) -> Result<Self, GuardianCheckpointCipherError> {
+        Ok(Self {
+            digest: checkpoint_candidate_identity(plaintext.as_slice())?,
+        })
+    }
+
+    fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    fn is_zero(&self) -> bool {
+        self.digest.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl PartialEq for GuardianCheckpointCandidateIdentityV1 {
+    fn eq(&self, other: &Self) -> bool {
+        checkpoint_stage_digests_match(self.digest(), other.digest())
+    }
+}
+
+impl Eq for GuardianCheckpointCandidateIdentityV1 {}
+
+impl std::fmt::Debug for GuardianCheckpointCandidateIdentityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointCandidateIdentityV1")
+            .field("digest", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque logical identity of one complete, ordered canonical chunk set.
+///
+/// The digest preimage is exactly the v1 chunk-set domain followed by
+/// `total_bytes` (LE u64), `chunk_bytes` (LE u32), `total_chunks` (LE u32),
+/// then, for every contiguous chunk in index order: index (LE u32), offset
+/// (LE u64), plaintext length (LE u32), and the logical chunk digest. Each
+/// logical chunk digest is SHA256 of the v1 chunk domain, those same index,
+/// offset, and length fields, then the exact authenticated plaintext bytes.
+#[must_use = "ordered chunk-set identity must be retained for validated stage assembly"]
+pub struct GuardianCheckpointOrderedChunkSetIdentityV1 {
+    digest: Zeroizing<[u8; 32]>,
+}
+
+impl GuardianCheckpointOrderedChunkSetIdentityV1 {
+    fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    fn is_zero(&self) -> bool {
+        self.digest.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl PartialEq for GuardianCheckpointOrderedChunkSetIdentityV1 {
+    fn eq(&self, other: &Self) -> bool {
+        checkpoint_stage_digests_match(self.digest(), other.digest())
+    }
+}
+
+impl Eq for GuardianCheckpointOrderedChunkSetIdentityV1 {}
+
+impl std::fmt::Debug for GuardianCheckpointOrderedChunkSetIdentityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointOrderedChunkSetIdentityV1")
+            .field("digest", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Stateful authority for deriving one exact ordered chunk-set identity.
+///
+/// Construction validates the canonical upload geometry. Each push borrows
+/// the same [`Zeroizing`] plaintext allocation that authenticated storage can
+/// subsequently consume, and enforces exact contiguous index, offset, and
+/// terminal-chunk length. `finish` fails closed until every byte and chunk has
+/// been observed exactly once.
+#[must_use = "ordered chunk-set builders must be completed or discarded"]
+pub struct GuardianCheckpointOrderedChunkSetBuilderV1 {
+    total_bytes: u64,
+    chunk_bytes: u32,
+    total_chunks: u32,
+    next_index: u32,
+    committed_bytes: u64,
+    hasher: Sha256,
+}
+
+impl GuardianCheckpointOrderedChunkSetBuilderV1 {
+    pub fn new(
+        total_bytes: u64,
+        chunk_bytes: u32,
+        total_chunks: u32,
+    ) -> Result<Self, GuardianCheckpointCipherError> {
+        checkpoint_validate_chunk_set_geometry(total_bytes, chunk_bytes, total_chunks)?;
+        let mut hasher = Sha256::new();
+        hasher.update(CHECKPOINT_ORDERED_CHUNK_SET_IDENTITY_DOMAIN);
+        hasher.update(total_bytes.to_le_bytes());
+        hasher.update(chunk_bytes.to_le_bytes());
+        hasher.update(total_chunks.to_le_bytes());
+        Ok(Self {
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+            next_index: 0,
+            committed_bytes: 0,
+            hasher,
+        })
+    }
+
+    pub fn push_authenticated_chunk(
+        &mut self,
+        index: u32,
+        offset: u64,
+        plaintext: &Zeroizing<Vec<u8>>,
+    ) -> Result<(), GuardianCheckpointCipherError> {
+        if index != self.next_index || index >= self.total_chunks {
+            return Err(GuardianCheckpointCipherError::InvalidChunkSetSequence);
+        }
+        let expected_offset = u64::from(index)
+            .checked_mul(u64::from(self.chunk_bytes))
+            .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+        if offset != expected_offset || offset != self.committed_bytes {
+            return Err(GuardianCheckpointCipherError::InvalidChunkSetSequence);
+        }
+        let remaining = self
+            .total_bytes
+            .checked_sub(offset)
+            .ok_or(GuardianCheckpointCipherError::InvalidChunkSetSequence)?;
+        let expected_bytes = remaining.min(u64::from(self.chunk_bytes));
+        let plaintext_bytes = u32::try_from(plaintext.len())
+            .map_err(|_| GuardianCheckpointCipherError::InvalidChunkSetSequence)?;
+        if u64::from(plaintext_bytes) != expected_bytes || plaintext_bytes == 0 {
+            return Err(GuardianCheckpointCipherError::InvalidChunkSetSequence);
+        }
+
+        let chunk_identity = checkpoint_chunk_identity(index, offset, plaintext.as_slice())?;
+        self.hasher.update(index.to_le_bytes());
+        self.hasher.update(offset.to_le_bytes());
+        self.hasher.update(plaintext_bytes.to_le_bytes());
+        self.hasher.update(chunk_identity.as_slice());
+        self.committed_bytes = self
+            .committed_bytes
+            .checked_add(u64::from(plaintext_bytes))
+            .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    pub fn finish(
+        self,
+    ) -> Result<GuardianCheckpointOrderedChunkSetIdentityV1, GuardianCheckpointCipherError> {
+        if self.next_index != self.total_chunks || self.committed_bytes != self.total_bytes {
+            return Err(GuardianCheckpointCipherError::IncompleteChunkSet);
+        }
+        let identity = GuardianCheckpointOrderedChunkSetIdentityV1 {
+            digest: Zeroizing::new(self.hasher.finalize().into()),
+        };
+        if identity.is_zero() {
+            return Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest);
+        }
+        Ok(identity)
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointOrderedChunkSetBuilderV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointOrderedChunkSetBuilderV1")
+            .field("total_bytes", &self.total_bytes)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("total_chunks", &self.total_chunks)
+            .field("next_index", &self.next_index)
+            .field("committed_bytes", &self.committed_bytes)
+            .field("hasher", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Opaque proof that Phase-A storage inspected one exact authenticated
 /// candidate plus its complete ordered chunk set and derived the two manifest
 /// component identities from those records.
@@ -690,8 +898,8 @@ impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1 {
 pub struct GuardianCheckpointValidatedStageAssemblyV1 {
     seal_request: GuardianCheckpointStageRequestV1,
     publication_id: Uuid,
-    candidate_record_digest: Zeroizing<[u8; 32]>,
-    ordered_chunk_set_digest: Zeroizing<[u8; 32]>,
+    candidate_identity: GuardianCheckpointCandidateIdentityV1,
+    ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1,
     _private: (),
 }
 
@@ -700,14 +908,14 @@ impl GuardianCheckpointValidatedStageAssemblyV1 {
     fn issue_for_test(
         seal_request: GuardianCheckpointStageRequestV1,
         publication_id: Uuid,
-        candidate_record_digest: [u8; 32],
-        ordered_chunk_set_digest: [u8; 32],
+        candidate_identity: GuardianCheckpointCandidateIdentityV1,
+        ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1,
     ) -> Result<Self, GuardianCheckpointCipherError> {
         if seal_request.kind() != GuardianCheckpointStageKindV1::Seal
             || seal_request.upload_id().is_nil()
             || publication_id.is_nil()
-            || candidate_record_digest == [0; 32]
-            || ordered_chunk_set_digest == [0; 32]
+            || candidate_identity.is_zero()
+            || ordered_chunk_set_identity.is_zero()
             || seal_request
                 .encode()
                 .map_err(|_| GuardianCheckpointCipherError::InvalidSealRequest)?
@@ -720,8 +928,8 @@ impl GuardianCheckpointValidatedStageAssemblyV1 {
         Ok(Self {
             seal_request,
             publication_id,
-            candidate_record_digest: Zeroizing::new(candidate_record_digest),
-            ordered_chunk_set_digest: Zeroizing::new(ordered_chunk_set_digest),
+            candidate_identity,
+            ordered_chunk_set_identity,
             _private: (),
         })
     }
@@ -733,8 +941,8 @@ impl std::fmt::Debug for GuardianCheckpointValidatedStageAssemblyV1 {
             .debug_struct("GuardianCheckpointValidatedStageAssemblyV1")
             .field("seal_request", &"[REDACTED]")
             .field("publication_id", &self.publication_id)
-            .field("candidate_record_digest", &"[REDACTED]")
-            .field("ordered_chunk_set_digest", &"[REDACTED]")
+            .field("candidate_identity", &"[REDACTED]")
+            .field("ordered_chunk_set_identity", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -1338,16 +1546,15 @@ impl GuardianCheckpointManifestSealCapabilitiesV1 {
         let GuardianCheckpointValidatedStageAssemblyV1 {
             seal_request,
             publication_id,
-            candidate_record_digest,
-            ordered_chunk_set_digest,
+            candidate_identity,
+            ordered_chunk_set_identity,
             _private: (),
         } = assembly;
         authority.binding.validate_seal_request(&seal_request)?;
         if seal_request.upload_id().is_nil() || publication_id.is_nil() {
             return Err(GuardianCheckpointCipherError::InvalidSealRequest);
         }
-        if candidate_record_digest.iter().all(|byte| *byte == 0)
-            || ordered_chunk_set_digest.iter().all(|byte| *byte == 0)
+        if candidate_identity.is_zero() || ordered_chunk_set_identity.is_zero()
         {
             return Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest);
         }
@@ -1364,8 +1571,8 @@ impl GuardianCheckpointManifestSealCapabilitiesV1 {
         }
         let canonical_manifest = checkpoint_canonical_seal_manifest(
             &encoded_request,
-            &candidate_record_digest,
-            &ordered_chunk_set_digest,
+            &candidate_identity,
+            &ordered_chunk_set_identity,
         )?;
         let retry_manifest = checkpoint_zeroizing_copy(&canonical_manifest)?;
         let primary = GuardianCheckpointValidatedManifestOperationV1::from_validated_parts(
@@ -2039,6 +2246,14 @@ pub enum GuardianCheckpointCipherError {
     InvalidSealRequest,
     #[error("checkpoint final-manifest component digest is invalid")]
     InvalidManifestComponentDigest,
+    #[error("checkpoint candidate identity preimage is not one exact canonical Begin request")]
+    InvalidCandidateIdentityPreimage,
+    #[error("checkpoint ordered chunk-set geometry is invalid")]
+    InvalidChunkSetGeometry,
+    #[error("checkpoint ordered chunk-set sequence is invalid")]
+    InvalidChunkSetSequence,
+    #[error("checkpoint ordered chunk set is incomplete")]
+    IncompleteChunkSet,
     #[error("checkpoint final-manifest length is invalid")]
     InvalidSealManifestLength,
     #[error("checkpoint canonical final-manifest identity mismatch")]
@@ -2109,6 +2324,85 @@ fn checkpoint_stage_plaintext_identity(
     ))
 }
 
+fn checkpoint_candidate_identity(
+    plaintext: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointCipherError> {
+    if plaintext.len()
+        != usize::try_from(GUARDIAN_CHECKPOINT_BEGIN_REQUEST_BYTES)
+            .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?
+    {
+        return Err(GuardianCheckpointCipherError::InvalidCandidateIdentityPreimage);
+    }
+    let request = GuardianCheckpointStageRequestV1::decode(plaintext)
+        .map_err(|_| GuardianCheckpointCipherError::InvalidCandidateIdentityPreimage)?;
+    if request.kind() != GuardianCheckpointStageKindV1::Begin {
+        return Err(GuardianCheckpointCipherError::InvalidCandidateIdentityPreimage);
+    }
+    let canonical = Zeroizing::new(
+        request
+            .encode()
+            .map_err(|_| GuardianCheckpointCipherError::InvalidCandidateIdentityPreimage)?,
+    );
+    if !checkpoint_stage_bytes_match(canonical.as_slice(), plaintext) {
+        return Err(GuardianCheckpointCipherError::InvalidCandidateIdentityPreimage);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(CHECKPOINT_CANDIDATE_IDENTITY_DOMAIN);
+    hasher.update(plaintext);
+    let digest = Zeroizing::new(hasher.finalize().into());
+    if digest.iter().all(|byte| *byte == 0) {
+        return Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest);
+    }
+    Ok(digest)
+}
+
+fn checkpoint_validate_chunk_set_geometry(
+    total_bytes: u64,
+    chunk_bytes: u32,
+    total_chunks: u32,
+) -> Result<(), GuardianCheckpointCipherError> {
+    if total_bytes == 0
+        || total_bytes > CHECKPOINT_STAGE_MAX_ARTIFACT_BYTES
+        || chunk_bytes == 0
+        || chunk_bytes > GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES
+        || total_chunks == 0
+        || total_chunks > CHECKPOINT_STAGE_MAX_CHUNKS
+    {
+        return Err(GuardianCheckpointCipherError::InvalidChunkSetGeometry);
+    }
+    let expected_chunks = total_bytes
+        .checked_sub(1)
+        .ok_or(GuardianCheckpointCipherError::InvalidChunkSetGeometry)?
+        .checked_div(u64::from(chunk_bytes))
+        .and_then(|chunks| chunks.checked_add(1))
+        .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+    if u64::from(total_chunks) != expected_chunks {
+        return Err(GuardianCheckpointCipherError::InvalidChunkSetGeometry);
+    }
+    Ok(())
+}
+
+fn checkpoint_chunk_identity(
+    index: u32,
+    offset: u64,
+    plaintext: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointCipherError> {
+    let plaintext_bytes = u32::try_from(plaintext.len())
+        .map_err(|_| GuardianCheckpointCipherError::InvalidChunkSetSequence)?;
+    if plaintext_bytes == 0
+        || plaintext_bytes > GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES
+    {
+        return Err(GuardianCheckpointCipherError::InvalidChunkSetSequence);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(CHECKPOINT_CHUNK_IDENTITY_DOMAIN);
+    hasher.update(index.to_le_bytes());
+    hasher.update(offset.to_le_bytes());
+    hasher.update(plaintext_bytes.to_le_bytes());
+    hasher.update(plaintext);
+    Ok(Zeroizing::new(hasher.finalize().into()))
+}
+
 fn checkpoint_stage_scope_from_protocol(
     scope: GuardianCheckpointScopeV1,
 ) -> Result<GuardianCheckpointStageScopeV1, GuardianCheckpointCipherError> {
@@ -2135,19 +2429,19 @@ fn checkpoint_zeroizing_copy(
 
 fn checkpoint_canonical_seal_manifest(
     encoded_seal_request: &[u8],
-    candidate_record_digest: &[u8; 32],
-    ordered_chunk_set_digest: &[u8; 32],
+    candidate_identity: &GuardianCheckpointCandidateIdentityV1,
+    ordered_chunk_set_identity: &GuardianCheckpointOrderedChunkSetIdentityV1,
 ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError> {
     let request_bytes = usize::try_from(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
         .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?;
     let manifest_bytes = usize::try_from(GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)
         .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?;
     if encoded_seal_request.len() != request_bytes
-        || candidate_record_digest.iter().all(|byte| *byte == 0)
-        || ordered_chunk_set_digest.iter().all(|byte| *byte == 0)
+        || candidate_identity.is_zero()
+        || ordered_chunk_set_identity.is_zero()
         || request_bytes
-            .checked_add(candidate_record_digest.len())
-            .and_then(|bytes| bytes.checked_add(ordered_chunk_set_digest.len()))
+            .checked_add(candidate_identity.digest().len())
+            .and_then(|bytes| bytes.checked_add(ordered_chunk_set_identity.digest().len()))
             != Some(manifest_bytes)
     {
         return Err(GuardianCheckpointCipherError::InvalidSealManifestLength);
@@ -2157,8 +2451,8 @@ fn checkpoint_canonical_seal_manifest(
         .try_reserve_exact(manifest_bytes)
         .map_err(|_| GuardianCheckpointCipherError::PlaintextAllocationFailed)?;
     manifest.extend_from_slice(encoded_seal_request);
-    manifest.extend_from_slice(candidate_record_digest);
-    manifest.extend_from_slice(ordered_chunk_set_digest);
+    manifest.extend_from_slice(candidate_identity.digest());
+    manifest.extend_from_slice(ordered_chunk_set_identity.digest());
     if manifest.len() != manifest_bytes {
         return Err(GuardianCheckpointCipherError::InvalidSealManifestLength);
     }
@@ -3156,21 +3450,48 @@ mod tests {
         capture: LiveParserCheckpointAck,
         upload_id: Uuid,
         publication_id: Uuid,
-        candidate_record_digest: [u8; 32],
-        ordered_chunk_set_digest: [u8; 32],
     ) -> GuardianCheckpointManifestSealCapabilitiesV1 {
+        let begin_request = record_begin_request(binding, &capture, upload_id);
+        let (candidate_identity, ordered_chunk_set_identity) = manifest_component_identities(
+            &begin_request,
+            capture.terminal_checkpoint().canonical_payload(),
+        );
         let seal_request = record_seal_request(binding, &capture, upload_id);
         let assembly = GuardianCheckpointValidatedStageAssemblyV1::issue_for_test(
             seal_request,
             publication_id,
-            candidate_record_digest,
-            ordered_chunk_set_digest,
+            candidate_identity,
+            ordered_chunk_set_identity,
         )
         .expect("issue test-only validated stage assembly");
         GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(binding, capture)
             .expect("consume exact record-backed seal authority")
             .bind_seal_operation(assembly)
             .expect("bind exact canonical manifest operation")
+    }
+
+    fn record_begin_request(
+        binding: &GuardianCheckpointStageBindingV1,
+        capture: &LiveParserCheckpointAck,
+        upload_id: Uuid,
+    ) -> GuardianCheckpointStageRequestV1 {
+        let (pane_id, generation) = binding
+            .scope()
+            .pane_identity()
+            .expect("record manifest fixture uses pane scope");
+        let protocol_descriptor =
+            GuardianCheckpointDescriptorV1::from_live_capture(capture, generation)
+                .expect("construct authoritative protocol descriptor");
+        GuardianCheckpointStageRequestV1::begin(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id,
+                generation,
+            },
+            upload_id,
+            protocol_descriptor,
+            4_096,
+        )
+        .expect("construct canonical protocol Begin request")
     }
 
     fn record_seal_request(
@@ -3203,14 +3524,49 @@ mod tests {
         upload_id: Uuid,
         publication_id: Uuid,
     ) -> GuardianCheckpointManifestSealCapabilitiesV1 {
-        record_manifest_capabilities(
-            binding,
-            capture,
-            upload_id,
-            publication_id,
-            [0xa1; 32],
-            [0xb2; 32],
+        record_manifest_capabilities(binding, capture, upload_id, publication_id)
+    }
+
+    fn manifest_component_identities(
+        begin_request: &GuardianCheckpointStageRequestV1,
+        canonical_payload: &[u8],
+    ) -> (
+        GuardianCheckpointCandidateIdentityV1,
+        GuardianCheckpointOrderedChunkSetIdentityV1,
+    ) {
+        assert_eq!(begin_request.kind(), GuardianCheckpointStageKindV1::Begin);
+        let begin_plaintext = Zeroizing::new(
+            begin_request
+                .encode()
+                .expect("encode canonical Begin plaintext"),
+        );
+        let candidate_identity =
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+                &begin_plaintext,
+            )
+            .expect("derive canonical candidate identity");
+        let mut chunks = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+            begin_request.total_bytes(),
+            begin_request.chunk_bytes(),
+            begin_request.total_chunks(),
         )
+        .expect("construct exact ordered chunk-set builder");
+        let chunk_bytes = usize::try_from(begin_request.chunk_bytes())
+            .expect("fixture chunk size fits usize");
+        for (index, bytes) in canonical_payload.chunks(chunk_bytes).enumerate() {
+            let index = u32::try_from(index).expect("fixture chunk index fits u32");
+            let offset = u64::from(index)
+                .checked_mul(u64::from(begin_request.chunk_bytes()))
+                .expect("fixture chunk offset fits u64");
+            let plaintext = Zeroizing::new(bytes.to_vec());
+            chunks
+                .push_authenticated_chunk(index, offset, &plaintext)
+                .expect("derive exact authenticated chunk identity");
+        }
+        let ordered_chunk_set_identity = chunks
+            .finish()
+            .expect("finish complete ordered chunk-set identity");
+        (candidate_identity, ordered_chunk_set_identity)
     }
 
     fn stage_plaintext(plaintext: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -4745,12 +5101,18 @@ mod tests {
             output,
             terminal_checkpoint(),
         );
+        let target_begin = record_begin_request(&binding, &target_capture, upload_id);
+        let (target_candidate_identity, target_chunk_set_identity) =
+            manifest_component_identities(
+                &target_begin,
+                target_capture.terminal_checkpoint().canonical_payload(),
+            );
         let target_request = record_seal_request(&binding, &target_capture, upload_id);
         let target_assembly = GuardianCheckpointValidatedStageAssemblyV1::issue_for_test(
             target_request,
             publication_id,
-            [0xa1; 32],
-            [0xb2; 32],
+            target_candidate_identity,
+            target_chunk_set_identity,
         )
         .expect("issue mismatched test stage assembly");
         assert!(matches!(
@@ -4947,18 +5309,30 @@ mod tests {
                 &genesis_terminal,
             )
             .expect("construct authoritative Genesis protocol descriptor");
-        let genesis_request = GuardianCheckpointStageRequestV1::seal(
+        let genesis_begin_request = GuardianCheckpointStageRequestV1::begin(
             GuardianCheckpointScopeV1::Genesis { spawn_effect_id },
             genesis_upload_id,
             genesis_protocol_descriptor,
+            4_096,
+        )
+        .expect("construct canonical Genesis Begin request");
+        let (genesis_candidate_identity, genesis_chunk_set_identity) =
+            manifest_component_identities(
+                &genesis_begin_request,
+                genesis_terminal.canonical_payload(),
+            );
+        let genesis_request = GuardianCheckpointStageRequestV1::seal(
+            GuardianCheckpointScopeV1::Genesis { spawn_effect_id },
+            genesis_upload_id,
+            genesis_begin_request.descriptor(),
             4_096,
         )
         .expect("construct canonical Genesis Seal request");
         let genesis_assembly = GuardianCheckpointValidatedStageAssemblyV1::issue_for_test(
             genesis_request,
             genesis_publication_id,
-            [0xc3; 32],
-            [0xd4; 32],
+            genesis_candidate_identity,
+            genesis_chunk_set_identity,
         )
         .expect("issue test-only Genesis stage assembly");
         let genesis_capabilities = genesis_authority
