@@ -11,7 +11,7 @@
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{
     RecoveryTerminalCheckpointV2,
-    terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2},
+    terminalstate::checkpoint::TerminalCheckpointLimits,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use portable_pty::{PtySize, cmdbuilder::CommandBuilder};
@@ -25,7 +25,6 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::guardian_checkpoint::{
     GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointOriginV1, LiveParserCheckpointAck,
-    current_replay_identity_digest,
 };
 
 pub const GUARDIAN_PROTOCOL_VERSION: u16 = 4;
@@ -2989,6 +2988,7 @@ impl GuardianCheckpointDescriptorV1 {
                 self.durable_pane_id.is_nil()
                     && !spawn_effect_id.is_nil()
                     && parser_stream_bytes == 0
+                    && self.capture_generation == GUARDIAN_GENESIS_CAPTURE_GENERATION
             }
             GuardianCheckpointOutputBoundaryV1::Record {
                 segment_id,
@@ -3008,35 +3008,63 @@ impl GuardianCheckpointDescriptorV1 {
             }
         };
         if self.capture_generation == 0
-            || self.replay_semantics_id != current_replay_identity_digest()
-            || self.rows == 0
-            || self.cols == 0
-            || self.total_bytes == 0
             || self.total_bytes > GUARDIAN_MAX_CHECKPOINT_BYTES
-            || digest_is_zero(self.terminal_payload_digest)
             || !boundary_valid
             || self.suffix_start().is_none()
         {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
-        let expected_boundary = checkpoint_output_boundary_identity(
-            self.durable_pane_id,
-            self.output_boundary,
-        )?;
-        let expected_checkpoint = checkpoint_artifact_identity(
-            expected_boundary,
+        self.canonical_descriptor().map(|_| ())
+    }
+
+    /// Reconstruct the one canonical identity authority from an untrusted
+    /// fixed-width wire descriptor. No digest formula lives in this protocol
+    /// module: the checkpoint module validates the complete claimed preimage
+    /// and both stable identities.
+    fn canonical_descriptor(
+        self,
+    ) -> Result<GuardianCheckpointArtifactDescriptorV1, GuardianProtocolError> {
+        let (origin, parser_stream_bytes) = match self.output_boundary {
+            GuardianCheckpointOutputBoundaryV1::Genesis {
+                spawn_effect_id,
+                parser_stream_bytes,
+            } => (
+                GuardianCheckpointOriginV1::from_genesis_effect(spawn_effect_id)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                parser_stream_bytes,
+            ),
+            GuardianCheckpointOutputBoundaryV1::Record {
+                segment_id,
+                sequence,
+                record_digest,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                parser_stream_bytes,
+            } => (
+                GuardianCheckpointOriginV1::from_record_parts(
+                    self.durable_pane_id,
+                    segment_id,
+                    sequence,
+                    record_digest,
+                    committed_log_bytes,
+                    cumulative_plaintext_bytes,
+                )
+                .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                parser_stream_bytes,
+            ),
+        };
+        GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+            self.boundary_id.into_bytes(),
+            self.checkpoint_id.into_bytes(),
+            origin,
+            parser_stream_bytes,
             self.replay_semantics_id,
             self.rows,
             self.cols,
             self.total_bytes,
             self.terminal_payload_digest,
-            self.output_boundary,
-        )?;
-        if expected_boundary != self.boundary_id || expected_checkpoint != self.checkpoint_id {
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        } else {
-            Ok(())
-        }
+        )
+        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)
     }
 
     fn validate_stage_scope(
@@ -3085,137 +3113,13 @@ impl GuardianCheckpointDescriptorV1 {
         // verifies canonical bytes, digest, and geometry. A record-backed
         // store must additionally reconcile the descriptor's exact output
         // boundary against its guardian-owned journal before publication.
-        let validated = TerminalCheckpointV2::decode_canonical_json(
-            canonical_terminal_payload,
-            TerminalCheckpointLimits::default(),
-        )
-        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
-        if validated.rows() != self.rows || validated.cols() != self.cols {
-            return Err(GuardianProtocolError::InvalidOperationPayload);
-        }
-        drop(validated);
-        let observed_bytes = u64::try_from(canonical_terminal_payload.len())
-            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
-        let observed_digest = checkpoint_terminal_payload_digest(
-            observed_bytes,
-            canonical_terminal_payload,
-        )?;
-        if observed_bytes == self.total_bytes && observed_digest == self.terminal_payload_digest {
-            Ok(())
-        } else {
-            Err(GuardianProtocolError::InvalidOperationPayload)
-        }
+        self.canonical_descriptor()?
+            .validate_canonical_payload(
+                canonical_terminal_payload,
+                TerminalCheckpointLimits::default(),
+            )
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)
     }
-}
-
-fn checkpoint_terminal_payload_digest(
-    total_bytes: u64,
-    canonical_terminal_payload: &[u8],
-) -> Result<[u8; 32], GuardianProtocolError> {
-    if total_bytes == 0
-        || total_bytes > GUARDIAN_MAX_CHECKPOINT_BYTES
-        || u64::try_from(canonical_terminal_payload.len()).ok() != Some(total_bytes)
-    {
-        return Err(GuardianProtocolError::InvalidReplyPayload);
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(CHECKPOINT_TERMINAL_PAYLOAD_DIGEST_DOMAIN);
-    hasher.update(total_bytes.to_le_bytes());
-    hasher.update(canonical_terminal_payload);
-    Ok(hasher.finalize().into())
-}
-
-fn checkpoint_output_boundary_identity(
-    durable_pane_id: Uuid,
-    output_boundary: GuardianCheckpointOutputBoundaryV1,
-) -> Result<GuardianOutputBoundaryIdentityDigest, GuardianProtocolError> {
-    let mut hasher = Sha256::new();
-    match output_boundary {
-        GuardianCheckpointOutputBoundaryV1::Genesis {
-            spawn_effect_id,
-            parser_stream_bytes,
-        } if durable_pane_id.is_nil()
-            && !spawn_effect_id.is_nil()
-            && parser_stream_bytes == 0 =>
-        {
-            hasher.update(CHECKPOINT_GENESIS_BOUNDARY_DIGEST_DOMAIN);
-            hasher.update(spawn_effect_id.as_bytes());
-        }
-        GuardianCheckpointOutputBoundaryV1::Record {
-            segment_id,
-            sequence,
-            record_digest,
-            committed_log_bytes,
-            cumulative_plaintext_bytes,
-            ..
-        } if !durable_pane_id.is_nil()
-            && !segment_id.is_nil()
-            && sequence > 0
-            && !digest_is_zero(record_digest)
-            && committed_log_bytes > 0
-            && cumulative_plaintext_bytes > 0 =>
-        {
-            // This is byte-for-byte the stable boundary identity used by
-            // guardian_checkpoint.rs. Keep the version and little-endian
-            // integer encoding explicit in the wire contract.
-            hasher.update(CHECKPOINT_OUTPUT_BOUNDARY_DIGEST_DOMAIN);
-            hasher.update(CHECKPOINT_BOUNDARY_IDENTITY_VERSION.to_le_bytes());
-            hasher.update(durable_pane_id.as_bytes());
-            hasher.update(segment_id.as_bytes());
-            hasher.update(sequence.to_le_bytes());
-            hasher.update(record_digest);
-            hasher.update(committed_log_bytes.to_le_bytes());
-            hasher.update(cumulative_plaintext_bytes.to_le_bytes());
-        }
-        _ => return Err(GuardianProtocolError::InvalidReplyPayload),
-    }
-    GuardianOutputBoundaryIdentityDigest::from_bytes(hasher.finalize().into())
-        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn checkpoint_artifact_identity(
-    boundary_id: GuardianOutputBoundaryIdentityDigest,
-    replay_semantics_id: [u8; 32],
-    rows: u32,
-    cols: u32,
-    total_bytes: u64,
-    terminal_payload_digest: [u8; 32],
-    output_boundary: GuardianCheckpointOutputBoundaryV1,
-) -> Result<GuardianCheckpointIdentityDigest, GuardianProtocolError> {
-    let parser_stream_bytes = match output_boundary {
-        GuardianCheckpointOutputBoundaryV1::Genesis {
-            parser_stream_bytes,
-            ..
-        }
-        | GuardianCheckpointOutputBoundaryV1::Record {
-            parser_stream_bytes,
-            ..
-        } => parser_stream_bytes,
-    };
-    if digest_is_zero(replay_semantics_id)
-        || rows == 0
-        || cols == 0
-        || total_bytes == 0
-        || total_bytes > GUARDIAN_MAX_CHECKPOINT_BYTES
-        || digest_is_zero(terminal_payload_digest)
-    {
-        return Err(GuardianProtocolError::InvalidReplyPayload);
-    }
-    let mut hasher = Sha256::new();
-    // This is byte-for-byte the stable artifact identity used by
-    // guardian_checkpoint.rs for record-backed checkpoints. Genesis uses the
-    // same artifact identity over its separately domain-separated boundary.
-    hasher.update(CHECKPOINT_ARTIFACT_DIGEST_DOMAIN);
-    hasher.update(boundary_id.0);
-    hasher.update(parser_stream_bytes.to_le_bytes());
-    hasher.update(replay_semantics_id);
-    hasher.update(rows.to_le_bytes());
-    hasher.update(cols.to_le_bytes());
-    hasher.update(total_bytes.to_le_bytes());
-    hasher.update(terminal_payload_digest);
-    GuardianCheckpointIdentityDigest::from_bytes(hasher.finalize().into())
-        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9259,6 +9163,7 @@ fn require_reply_len(payload: &[u8], expected: usize) -> Result<(), GuardianProt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guardian_checkpoint::current_replay_identity_digest;
     use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
     use std::sync::Arc;
 
@@ -9293,6 +9198,89 @@ mod tests {
         .expect("capture canonical protocol checkpoint fixture")
     }
 
+    fn checkpoint_terminal_payload_digest_oracle(canonical_payload: &[u8]) -> [u8; 32] {
+        let total_bytes = u64::try_from(canonical_payload.len()).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankenterm.guardian-checkpoint-terminal-payload.v1\0");
+        hasher.update(total_bytes.to_le_bytes());
+        hasher.update(canonical_payload);
+        hasher.finalize().into()
+    }
+
+    fn checkpoint_boundary_identity_oracle(
+        pane_id: Uuid,
+        output_boundary: GuardianCheckpointOutputBoundaryV1,
+    ) -> [u8; 32] {
+        let GuardianCheckpointOutputBoundaryV1::Record {
+            segment_id,
+            sequence,
+            record_digest,
+            committed_log_bytes,
+            cumulative_plaintext_bytes,
+            ..
+        } = output_boundary
+        else {
+            panic!("record checkpoint fixture requires a record boundary");
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankenterm.guardian-checkpoint-output-boundary-identity.v1\0");
+        hasher.update(2_u32.to_le_bytes());
+        hasher.update(pane_id.as_bytes());
+        hasher.update(segment_id.as_bytes());
+        hasher.update(sequence.to_le_bytes());
+        hasher.update(record_digest);
+        hasher.update(committed_log_bytes.to_le_bytes());
+        hasher.update(cumulative_plaintext_bytes.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_artifact_identity_oracle(
+        boundary_id: [u8; 32],
+        parser_stream_bytes: u64,
+        replay_semantics_id: [u8; 32],
+        rows: u32,
+        cols: u32,
+        total_bytes: u64,
+        terminal_payload_digest: [u8; 32],
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankenterm.guardian-checkpoint-artifact-identity.v1\0");
+        hasher.update(boundary_id);
+        hasher.update(parser_stream_bytes.to_le_bytes());
+        hasher.update(replay_semantics_id);
+        hasher.update(rows.to_le_bytes());
+        hasher.update(cols.to_le_bytes());
+        hasher.update(total_bytes.to_le_bytes());
+        hasher.update(terminal_payload_digest);
+        hasher.finalize().into()
+    }
+
+    fn recompute_descriptor_checkpoint_id_oracle(
+        descriptor: GuardianCheckpointDescriptorV1,
+    ) -> GuardianCheckpointIdentityDigest {
+        let parser_stream_bytes = match descriptor.output_boundary {
+            GuardianCheckpointOutputBoundaryV1::Genesis {
+                parser_stream_bytes,
+                ..
+            }
+            | GuardianCheckpointOutputBoundaryV1::Record {
+                parser_stream_bytes,
+                ..
+            } => parser_stream_bytes,
+        };
+        GuardianCheckpointIdentityDigest::from_bytes(checkpoint_artifact_identity_oracle(
+            descriptor.boundary_id.into_bytes(),
+            parser_stream_bytes,
+            descriptor.replay_semantics_id,
+            descriptor.rows,
+            descriptor.cols,
+            descriptor.total_bytes,
+            descriptor.terminal_payload_digest,
+        ))
+        .unwrap()
+    }
+
     fn record_checkpoint_descriptor(
         pane_id: Uuid,
         generation: u64,
@@ -9300,25 +9288,47 @@ mod tests {
     ) -> GuardianCheckpointDescriptorV1 {
         let total_bytes = u64::try_from(canonical_payload.len()).unwrap();
         let terminal_payload_digest =
-            checkpoint_terminal_payload_digest(total_bytes, canonical_payload).unwrap();
-        GuardianCheckpointDescriptorV1::from_artifact_parts(
-            pane_id,
-            generation,
-            current_replay_identity_digest(),
+            checkpoint_terminal_payload_digest_oracle(canonical_payload);
+        let output_boundary = GuardianCheckpointOutputBoundaryV1::Record {
+            segment_id: id(90),
+            sequence: 7,
+            record_digest: [0x55; 32],
+            committed_log_bytes: 4_096,
+            cumulative_plaintext_bytes: 512,
+            parser_stream_bytes: 512,
+        };
+        let boundary_id = checkpoint_boundary_identity_oracle(pane_id, output_boundary);
+        let replay_semantics_id = current_replay_identity_digest();
+        let checkpoint_id = checkpoint_artifact_identity_oracle(
+            boundary_id,
+            512,
+            replay_semantics_id,
             24,
             80,
             total_bytes,
             terminal_payload_digest,
-            GuardianCheckpointOutputBoundaryV1::Record {
-                segment_id: id(90),
-                sequence: 7,
-                record_digest: [0x55; 32],
-                committed_log_bytes: 4_096,
-                cumulative_plaintext_bytes: 512,
-                parser_stream_bytes: 512,
-            },
+        );
+        let canonical = GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+            boundary_id,
+            checkpoint_id,
+            GuardianCheckpointOriginV1::from_record_parts(
+                pane_id,
+                id(90),
+                7,
+                [0x55; 32],
+                4_096,
+                512,
+            )
+            .unwrap(),
+            512,
+            replay_semantics_id,
+            24,
+            80,
+            total_bytes,
+            terminal_payload_digest,
         )
-        .unwrap()
+        .unwrap();
+        GuardianCheckpointDescriptorV1::from_canonical_descriptor(canonical, generation).unwrap()
     }
 
     fn request(
@@ -13617,16 +13627,8 @@ mod tests {
 
         let mut recomputed_geometry_splice = descriptor;
         recomputed_geometry_splice.rows += 1;
-        recomputed_geometry_splice.checkpoint_id = checkpoint_artifact_identity(
-            recomputed_geometry_splice.boundary_id,
-            recomputed_geometry_splice.replay_semantics_id,
-            recomputed_geometry_splice.rows,
-            recomputed_geometry_splice.cols,
-            recomputed_geometry_splice.total_bytes,
-            recomputed_geometry_splice.terminal_payload_digest,
-            recomputed_geometry_splice.output_boundary,
-        )
-        .unwrap();
+        recomputed_geometry_splice.checkpoint_id =
+            recompute_descriptor_checkpoint_id_oracle(recomputed_geometry_splice);
         assert_eq!(recomputed_geometry_splice.validate(), Ok(()));
         assert_eq!(
             recomputed_geometry_splice.validate_canonical_payload(canonical),
@@ -13886,16 +13888,8 @@ mod tests {
 
         let mut unsupported_semantics = descriptor;
         unsupported_semantics.replay_semantics_id[0] ^= 1;
-        unsupported_semantics.checkpoint_id = checkpoint_artifact_identity(
-            unsupported_semantics.boundary_id,
-            unsupported_semantics.replay_semantics_id,
-            unsupported_semantics.rows,
-            unsupported_semantics.cols,
-            unsupported_semantics.total_bytes,
-            unsupported_semantics.terminal_payload_digest,
-            unsupported_semantics.output_boundary,
-        )
-        .unwrap();
+        unsupported_semantics.checkpoint_id =
+            recompute_descriptor_checkpoint_id_oracle(unsupported_semantics);
         assert_eq!(
             unsupported_semantics.validate(),
             Err(GuardianProtocolError::InvalidReplyPayload),
