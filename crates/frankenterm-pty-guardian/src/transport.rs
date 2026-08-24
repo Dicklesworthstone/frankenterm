@@ -3217,11 +3217,39 @@ mod tests {
             .split("/// Blocking client used by mux integration")
             .next()
             .expect("service implementation precedes client implementation");
+        let poll_once_source = service_source
+            .split("    pub fn poll_once")
+            .nth(1)
+            .and_then(|source| source.split("    fn accept_connections").next())
+            .expect("poll_once production body is present");
+        let handle_input_completions = poll_once_source
+            .find("self.handle_input_completions();")
+            .expect("input authority restoration is wired into poll_once");
+        let retirement_replay = poll_once_source
+            .find("self.replay_deferred_mux_retirements();")
+            .expect("retirement replay is wired into poll_once");
+        let finish_connection_source = service_source
+            .split("    fn finish_connection")
+            .nth(1)
+            .and_then(|source| {
+                source.split("    /// Replay only a readiness-loop-owned").next()
+            })
+            .expect("finish_connection production body is present");
 
         assert!(service_source.contains("self.mux_connections.observe_accept(identity)"));
         assert!(service_source.contains(".observe_authenticated_hello(\n                            connection.identity(token),\n                            mux_incarnation,"));
-        assert!(service_source.contains(".observe_disconnect(identity, connection.mux_incarnation)"));
-        assert!(service_source.contains("self.replay_deferred_mux_retirements();"));
+        assert!(
+            service_source
+                .contains(".observe_disconnect(identity, connection.mux_incarnation)")
+        );
+        assert!(retirement_replay > handle_input_completions);
+        assert_eq!(
+            poll_once_source
+                .matches("self.replay_deferred_mux_retirements();")
+                .count(),
+            1
+        );
+        assert!(!finish_connection_source.contains("replay_deferred_mux_retirements"));
         assert!(service_source.contains(".next_replayable_retirement()"));
         assert!(service_source.contains(".retire_disconnected_mux(retirement.mux_incarnation)"));
         assert!(!service_source.contains("active_mux_connections"));

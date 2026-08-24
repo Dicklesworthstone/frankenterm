@@ -2226,6 +2226,21 @@ mod tests {
         ));
         assert!(route_probe.load(Ordering::SeqCst));
 
+        let stale_pane_probe = Arc::new(AtomicBool::new(false));
+        runtime.input_request_wipe_probe = Some(Arc::clone(&stale_pane_probe));
+        let stale_pane = authenticated_input_request_for(
+            Uuid::from_u128(117),
+            Uuid::from_u128(118),
+            Uuid::from_u128(119),
+            &[0x96; 23],
+        );
+        let stale_pane_route = input_route(9, 3, &stale_pane);
+        assert!(matches!(
+            runtime.submit_input(stale_pane, stale_pane_route),
+            GuardianInputSubmission::Respond(_)
+        ));
+        assert!(stale_pane_probe.load(Ordering::SeqCst));
+
         let quarantine_probe = Arc::new(AtomicBool::new(false));
         runtime.input_request_wipe_probe = Some(Arc::clone(&quarantine_probe));
         runtime.indeterminate_effect = true;

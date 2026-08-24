@@ -9479,6 +9479,24 @@ mod tests {
         assert!(std::fs::symlink_metadata(&wal_path)
             .expect("retained WAL evidence path remains published")
             .is_file());
+
+        assert!(reopened.store_scrollback_line(
+            20,
+            &Line::from_text("post-clear-successor", &attributes, 3, None),
+            8,
+        ));
+        let post_clear_manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+            .expect("read post-clear successor manifest")
+            .expect("post-clear successor manifest exists");
+        let post_clear_retired = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .expect("read post-clear retired WAL")
+            .expect("post-clear retired WAL evidence remains present");
+        assert!(LiveScrollbackSpillSink::append_wal_supersession_matches_manifest(
+            &post_clear_retired,
+            &post_clear_manifest,
+        )
+        .expect("bind post-clear WAL retirement marker"));
+        assert_eq!(post_clear_retired.encrypted_record, original.encrypted_record);
     }
 
     #[test]
