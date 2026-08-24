@@ -676,6 +676,69 @@ impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1 {
     }
 }
 
+/// Opaque proof that Phase-A storage inspected one exact authenticated
+/// candidate plus its complete ordered chunk set and derived the two manifest
+/// component identities from those records.
+///
+/// There is intentionally no production constructor in this module. The
+/// upcoming guardian-runtime/journal integration must mint this witness only
+/// after authenticating the exact Seal request, fencing the live incarnation,
+/// and inspecting the complete stored assembly. Until then final publication
+/// is fail-closed. In particular, raw request fields or digest arrays cannot
+/// construct this type.
+#[must_use = "validated stage assembly authority must be consumed by final sealing"]
+pub struct GuardianCheckpointValidatedStageAssemblyV1 {
+    seal_request: GuardianCheckpointStageRequestV1,
+    publication_id: Uuid,
+    candidate_record_digest: Zeroizing<[u8; 32]>,
+    ordered_chunk_set_digest: Zeroizing<[u8; 32]>,
+    _private: (),
+}
+
+impl GuardianCheckpointValidatedStageAssemblyV1 {
+    #[cfg(test)]
+    fn issue_for_test(
+        seal_request: GuardianCheckpointStageRequestV1,
+        publication_id: Uuid,
+        candidate_record_digest: [u8; 32],
+        ordered_chunk_set_digest: [u8; 32],
+    ) -> Result<Self, GuardianCheckpointCipherError> {
+        if seal_request.kind() != GuardianCheckpointStageKindV1::Seal
+            || seal_request.upload_id().is_nil()
+            || publication_id.is_nil()
+            || candidate_record_digest == [0; 32]
+            || ordered_chunk_set_digest == [0; 32]
+            || seal_request
+                .encode()
+                .map_err(|_| GuardianCheckpointCipherError::InvalidSealRequest)?
+                .len()
+                != usize::try_from(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
+                    .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?
+        {
+            return Err(GuardianCheckpointCipherError::InvalidSealRequest);
+        }
+        Ok(Self {
+            seal_request,
+            publication_id,
+            candidate_record_digest: Zeroizing::new(candidate_record_digest),
+            ordered_chunk_set_digest: Zeroizing::new(ordered_chunk_set_digest),
+            _private: (),
+        })
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointValidatedStageAssemblyV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointValidatedStageAssemblyV1")
+            .field("seal_request", &"[REDACTED]")
+            .field("publication_id", &self.publication_id)
+            .field("candidate_record_digest", &"[REDACTED]")
+            .field("ordered_chunk_set_digest", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Nonconstructible authority proving that one complete checkpoint payload is
 /// eligible for final publication.
 ///
@@ -683,8 +746,9 @@ impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1 {
 /// [`LiveParserCheckpointAck`], never from a claimed descriptor, caller bytes,
 /// or a receipt supplied beside those bytes. Genesis authority additionally
 /// consumes the guardian's exact retained Spawn-effect permit. The authority
-/// is intentionally neither `Clone` nor `Copy` and is consumed by the one
-/// manifest sealing intent.
+/// is intentionally neither `Clone` nor `Copy`. It is necessary but not
+/// sufficient for final sealing: binding also consumes one independently
+/// validated Phase-A assembly witness.
 ///
 /// A future cross-process constructor may safely consume an opaque
 /// guardian-runtime attestation that proves the same facts. Keeping that
@@ -707,7 +771,6 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
         if binding.descriptor != captured_descriptor {
             return Err(GuardianCheckpointBoundaryError::LiveCaptureAuthorityMismatch);
         }
-        drop(capture);
         Ok(Self { binding: *binding })
     }
 
@@ -740,18 +803,9 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
     /// capability for this same operation; it cannot be reminted or retargeted.
     pub fn bind_seal_operation(
         self,
-        seal_request: GuardianCheckpointStageRequestV1,
-        publication_id: Uuid,
-        candidate_record_digest: [u8; 32],
-        ordered_chunk_set_digest: [u8; 32],
+        assembly: GuardianCheckpointValidatedStageAssemblyV1,
     ) -> Result<GuardianCheckpointManifestSealCapabilitiesV1, GuardianCheckpointCipherError> {
-        GuardianCheckpointManifestSealCapabilitiesV1::from_authority(
-            self,
-            seal_request,
-            publication_id,
-            candidate_record_digest,
-            ordered_chunk_set_digest,
-        )
+        GuardianCheckpointManifestSealCapabilitiesV1::from_authority(self, assembly)
     }
 }
 
@@ -1237,9 +1291,15 @@ impl std::fmt::Debug for GuardianCheckpointValidatedManifestOperationV1 {
     }
 }
 
-/// Separately bounded, one-shot capability for the exact same Seal operation.
-/// It can neither be cloned nor retargeted; consuming it yields the sole retry
-/// operation, suitable for exact record adoption or one exact reseal attempt.
+/// Non-retargetable capability for bounded repeated attempts of the exact same
+/// Seal operation.
+///
+/// The capability is neither `Clone` nor `Copy` and exposes no operation or
+/// manifest bytes. Cipher retry methods borrow it, so transient read/fsync/ACK
+/// failures do not consume the authority. The guardian worker/protocol owns
+/// the retry/time budget. A process restart deliberately loses this in-memory
+/// authority and remains fail-closed until the future authenticated
+/// runtime/journal remint seam reconstructs the exact operation.
 #[must_use = "a checkpoint manifest retry capability must be consumed or discarded"]
 pub struct GuardianCheckpointManifestRetryCapabilityV1 {
     operation: GuardianCheckpointValidatedManifestOperationV1,
@@ -1251,10 +1311,6 @@ impl GuardianCheckpointManifestRetryCapabilityV1 {
         self.operation.context
     }
 
-    #[must_use]
-    pub fn into_operation(self) -> GuardianCheckpointValidatedManifestOperationV1 {
-        self.operation
-    }
 }
 
 impl std::fmt::Debug for GuardianCheckpointManifestRetryCapabilityV1 {
@@ -1276,16 +1332,22 @@ pub struct GuardianCheckpointManifestSealCapabilitiesV1 {
 impl GuardianCheckpointManifestSealCapabilitiesV1 {
     fn from_authority(
         authority: GuardianCheckpointValidatedManifestAuthorityV1,
-        seal_request: GuardianCheckpointStageRequestV1,
-        publication_id: Uuid,
-        candidate_record_digest: [u8; 32],
-        ordered_chunk_set_digest: [u8; 32],
+        assembly: GuardianCheckpointValidatedStageAssemblyV1,
     ) -> Result<Self, GuardianCheckpointCipherError> {
+        let GuardianCheckpointValidatedStageAssemblyV1 {
+            seal_request,
+            publication_id,
+            candidate_record_digest,
+            ordered_chunk_set_digest,
+            _private: (),
+        } = assembly;
         authority.binding.validate_seal_request(&seal_request)?;
         if seal_request.upload_id().is_nil() || publication_id.is_nil() {
             return Err(GuardianCheckpointCipherError::InvalidSealRequest);
         }
-        if candidate_record_digest == [0; 32] || ordered_chunk_set_digest == [0; 32] {
+        if candidate_record_digest.iter().all(|byte| *byte == 0)
+            || ordered_chunk_set_digest.iter().all(|byte| *byte == 0)
+        {
             return Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest);
         }
         let encoded_request = Zeroizing::new(
@@ -1301,8 +1363,8 @@ impl GuardianCheckpointManifestSealCapabilitiesV1 {
         }
         let canonical_manifest = checkpoint_canonical_seal_manifest(
             &encoded_request,
-            candidate_record_digest,
-            ordered_chunk_set_digest,
+            &candidate_record_digest,
+            &ordered_chunk_set_digest,
         )?;
         let retry_manifest = checkpoint_zeroizing_copy(&canonical_manifest)?;
         let primary = GuardianCheckpointValidatedManifestOperationV1::from_validated_parts(
@@ -1624,6 +1686,22 @@ impl GuardianCheckpointCipher {
         &self,
         operation: GuardianCheckpointValidatedManifestOperationV1,
     ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
+        self.seal_validated_manifest(&operation)
+    }
+
+    /// Repeat only the exact operation frozen into a separately issued retry
+    /// capability. The caller owns the bounded retry/time policy.
+    pub fn retry_seal_manifest(
+        &self,
+        retry: &GuardianCheckpointManifestRetryCapabilityV1,
+    ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
+        self.seal_validated_manifest(&retry.operation)
+    }
+
+    fn seal_validated_manifest(
+        &self,
+        operation: &GuardianCheckpointValidatedManifestOperationV1,
+    ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
         operation.validate()?;
         self.seal_exact_payload(
             operation.context,
@@ -1676,8 +1754,26 @@ impl GuardianCheckpointCipher {
         operation: GuardianCheckpointValidatedManifestOperationV1,
         record: &GuardianEncryptedCheckpointStageRecordV1,
     ) -> Result<(), GuardianCheckpointCipherError> {
+        self.open_validated_manifest(&operation, record)
+    }
+
+    /// Reconcile an existing final record under a reusable but immutable exact
+    /// retry capability. No decrypted manifest bytes escape this method.
+    pub fn retry_open_manifest(
+        &self,
+        retry: &GuardianCheckpointManifestRetryCapabilityV1,
+        record: &GuardianEncryptedCheckpointStageRecordV1,
+    ) -> Result<(), GuardianCheckpointCipherError> {
+        self.open_validated_manifest(&retry.operation, record)
+    }
+
+    fn open_validated_manifest(
+        &self,
+        operation: &GuardianCheckpointValidatedManifestOperationV1,
+        record: &GuardianEncryptedCheckpointStageRecordV1,
+    ) -> Result<(), GuardianCheckpointCipherError> {
         operation.validate()?;
-        let opened = self.open(
+        let opened = self.open_exact_payload(
             &operation.context,
             record,
             GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
@@ -1691,6 +1787,18 @@ impl GuardianCheckpointCipher {
     /// Authenticate and open one record only under the caller's exact expected
     /// context and an explicit per-call plaintext ceiling.
     pub fn open(
+        &self,
+        expected_context: &GuardianCheckpointStageRecordContextV1,
+        record: &GuardianEncryptedCheckpointStageRecordV1,
+        max_plaintext_bytes: u32,
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError> {
+        if expected_context.kind == GuardianCheckpointStageRecordKindV1::SealManifest {
+            return Err(GuardianCheckpointCipherError::InvalidKindAuthority);
+        }
+        self.open_exact_payload(expected_context, record, max_plaintext_bytes)
+    }
+
+    fn open_exact_payload(
         &self,
         expected_context: &GuardianCheckpointStageRecordContextV1,
         record: &GuardianEncryptedCheckpointStageRecordV1,
@@ -2026,16 +2134,16 @@ fn checkpoint_zeroizing_copy(
 
 fn checkpoint_canonical_seal_manifest(
     encoded_seal_request: &[u8],
-    candidate_record_digest: [u8; 32],
-    ordered_chunk_set_digest: [u8; 32],
+    candidate_record_digest: &[u8; 32],
+    ordered_chunk_set_digest: &[u8; 32],
 ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError> {
     let request_bytes = usize::try_from(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
         .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?;
     let manifest_bytes = usize::try_from(GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)
         .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?;
     if encoded_seal_request.len() != request_bytes
-        || candidate_record_digest == [0; 32]
-        || ordered_chunk_set_digest == [0; 32]
+        || candidate_record_digest.iter().all(|byte| *byte == 0)
+        || ordered_chunk_set_digest.iter().all(|byte| *byte == 0)
         || request_bytes
             .checked_add(candidate_record_digest.len())
             .and_then(|bytes| bytes.checked_add(ordered_chunk_set_digest.len()))
@@ -2048,8 +2156,8 @@ fn checkpoint_canonical_seal_manifest(
         .try_reserve_exact(manifest_bytes)
         .map_err(|_| GuardianCheckpointCipherError::PlaintextAllocationFailed)?;
     manifest.extend_from_slice(encoded_seal_request);
-    manifest.extend_from_slice(&candidate_record_digest);
-    manifest.extend_from_slice(&ordered_chunk_set_digest);
+    manifest.extend_from_slice(candidate_record_digest);
+    manifest.extend_from_slice(ordered_chunk_set_digest);
     if manifest.len() != manifest_bytes {
         return Err(GuardianCheckpointCipherError::InvalidSealManifestLength);
     }
@@ -3051,14 +3159,16 @@ mod tests {
         ordered_chunk_set_digest: [u8; 32],
     ) -> GuardianCheckpointManifestSealCapabilitiesV1 {
         let seal_request = record_seal_request(binding, &capture, upload_id);
+        let assembly = GuardianCheckpointValidatedStageAssemblyV1::issue_for_test(
+            seal_request,
+            publication_id,
+            candidate_record_digest,
+            ordered_chunk_set_digest,
+        )
+        .expect("issue test-only validated stage assembly");
         GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(binding, capture)
             .expect("consume exact record-backed seal authority")
-            .bind_seal_operation(
-                seal_request,
-                publication_id,
-                candidate_record_digest,
-                ordered_chunk_set_digest,
-            )
+            .bind_seal_operation(assembly)
             .expect("bind exact canonical manifest operation")
     }
 
@@ -4153,8 +4263,16 @@ mod tests {
         )
         .expect("reconstruct bounded final manifest record");
         assert_eq!(reconstructed.context(), manifest_context);
+        assert!(matches!(
+            cipher.open(
+                &manifest_context,
+                &reconstructed,
+                GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidKindAuthority)
+        ));
         cipher
-            .open_manifest(retry.into_operation(), &reconstructed)
+            .retry_open_manifest(&retry, &reconstructed)
             .expect("adopt only the exact canonical final manifest");
     }
 
@@ -4169,6 +4287,9 @@ mod tests {
         >());
         assert!(std::mem::needs_drop::<
             GuardianCheckpointManifestSealCapabilitiesV1
+        >());
+        assert!(std::mem::needs_drop::<
+            GuardianCheckpointValidatedStageAssemblyV1
         >());
         assert!(!std::mem::needs_drop::<
             GuardianCheckpointStageRecordContextV1
@@ -4201,6 +4322,26 @@ mod tests {
         assert!(!intent_implementation.contains("pub fn plaintext("));
         assert!(!intent_implementation.contains("plaintext_digest(&self"));
 
+        let assembly_start = production
+            .find("pub struct GuardianCheckpointValidatedStageAssemblyV1 {")
+            .expect("find validated stage-assembly declaration");
+        let assembly_impl_start = production[assembly_start..]
+            .find("impl GuardianCheckpointValidatedStageAssemblyV1 {")
+            .map(|offset| assembly_start + offset)
+            .expect("find validated stage-assembly implementation");
+        let assembly_debug_start = production[assembly_impl_start..]
+            .find("impl std::fmt::Debug for GuardianCheckpointValidatedStageAssemblyV1")
+            .map(|offset| assembly_impl_start + offset)
+            .expect("find validated stage-assembly Debug implementation");
+        let assembly_declaration = &production[assembly_start..assembly_impl_start];
+        let assembly_implementation = &production[assembly_impl_start..assembly_debug_start];
+        assert!(!assembly_declaration.contains("#[derive(Clone"));
+        assert!(assembly_declaration.contains("candidate_record_digest: Zeroizing<[u8; 32]>"));
+        assert!(assembly_declaration.contains("ordered_chunk_set_digest: Zeroizing<[u8; 32]>"));
+        assert!(assembly_implementation.contains("#[cfg(test)]"));
+        assert!(assembly_implementation.contains("fn issue_for_test("));
+        assert!(!assembly_implementation.contains("pub fn "));
+
         let authority_start = production
             .find("pub struct GuardianCheckpointValidatedManifestAuthorityV1 {")
             .expect("find manifest authority declaration");
@@ -4221,6 +4362,9 @@ mod tests {
         assert!(authority_implementation.contains("permit: GuardianCheckpointGenesisSpawnPermitV1,"));
         assert!(!authority_implementation.contains("from_claimed"));
         assert!(authority_implementation.contains("pub fn bind_seal_operation("));
+        assert!(authority_implementation.contains("assembly: GuardianCheckpointValidatedStageAssemblyV1,"));
+        assert!(!authority_implementation.contains("candidate_record_digest: [u8; 32]"));
+        assert!(!authority_implementation.contains("ordered_chunk_set_digest: [u8; 32]"));
 
         let operation_start = production
             .find("pub struct GuardianCheckpointValidatedManifestOperationV1 {")
@@ -4243,8 +4387,14 @@ mod tests {
             .map(|offset| retry_start + offset)
             .expect("find retry capability implementation");
         let retry_declaration = &production[retry_start..retry_impl_start];
+        let retry_debug_start = production[retry_impl_start..]
+            .find("impl std::fmt::Debug for GuardianCheckpointManifestRetryCapabilityV1")
+            .map(|offset| retry_impl_start + offset)
+            .expect("find retry capability Debug implementation");
+        let retry_implementation = &production[retry_impl_start..retry_debug_start];
         assert!(!retry_declaration.contains("#[derive(Clone"));
         assert!(retry_declaration.contains("operation: GuardianCheckpointValidatedManifestOperationV1"));
+        assert!(!retry_implementation.contains("into_operation"));
 
         let cipher_impl_start = production
             .find("impl GuardianCheckpointCipher {")
@@ -4256,6 +4406,7 @@ mod tests {
         let cipher_implementation = &production[cipher_impl_start..cipher_debug_start];
         assert!(cipher_implementation.contains("intent: GuardianCheckpointStageSealIntentV1,"));
         assert!(cipher_implementation.contains("operation: GuardianCheckpointValidatedManifestOperationV1,"));
+        assert!(cipher_implementation.contains("retry: &GuardianCheckpointManifestRetryCapabilityV1,"));
         let manifest_method_start = cipher_implementation
             .find("    pub fn seal_manifest(")
             .expect("find typed manifest cipher method");
@@ -4573,7 +4724,7 @@ mod tests {
             .seal_manifest(primary)
             .expect("seal internally constructed canonical manifest");
         cipher
-            .open_manifest(retry.into_operation(), &record)
+            .retry_open_manifest(&retry, &record)
             .expect("adopt only the separately bound exact retry");
 
         let (other_descriptor, _, _, other_capture) = record_descriptor();
@@ -4594,13 +4745,15 @@ mod tests {
             terminal_checkpoint(),
         );
         let target_request = record_seal_request(&binding, &target_capture, upload_id);
+        let target_assembly = GuardianCheckpointValidatedStageAssemblyV1::issue_for_test(
+            target_request,
+            publication_id,
+            [0xa1; 32],
+            [0xb2; 32],
+        )
+        .expect("issue mismatched test stage assembly");
         assert!(matches!(
-            other_authority.bind_seal_operation(
-                target_request,
-                publication_id,
-                [0xa1; 32],
-                [0xb2; 32],
-            ),
+            other_authority.bind_seal_operation(target_assembly),
             Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch)
         ));
 
@@ -4785,13 +4938,15 @@ mod tests {
             4_096,
         )
         .expect("construct canonical Genesis Seal request");
+        let genesis_assembly = GuardianCheckpointValidatedStageAssemblyV1::issue_for_test(
+            genesis_request,
+            genesis_publication_id,
+            [0xc3; 32],
+            [0xd4; 32],
+        )
+        .expect("issue test-only Genesis stage assembly");
         let genesis_capabilities = genesis_authority
-            .bind_seal_operation(
-                genesis_request,
-                genesis_publication_id,
-                [0xc3; 32],
-                [0xd4; 32],
-            )
+            .bind_seal_operation(genesis_assembly)
             .expect("bind exact Genesis manifest operation");
         let (genesis_primary, genesis_retry) =
             genesis_capabilities.into_primary_and_retry();
@@ -4799,7 +4954,7 @@ mod tests {
             .seal_manifest(genesis_primary)
             .expect("seal Genesis manifest under retained Spawn authority");
         cipher
-            .open_manifest(genesis_retry.into_operation(), &genesis_record)
+            .retry_open_manifest(&genesis_retry, &genesis_record)
             .expect("adopt exact Genesis manifest retry");
     }
 
@@ -5148,15 +5303,33 @@ mod tests {
             .seal_manifest(primary)
             .expect("seal primary manifest record");
         let second = cipher
-            .seal_manifest(retry.into_operation())
-            .expect("seal the one exact retry manifest record");
+            .retry_seal_manifest(&retry)
+            .expect("seal first exact retry manifest record");
+        let third = cipher
+            .retry_seal_manifest(&retry)
+            .expect("seal second exact retry after another transient failure");
         let first_header = first.fixed_header();
         let second_header = second.fixed_header();
+        let third_header = third.fixed_header();
 
         assert_ne!(&first_header[24..48], &second_header[24..48]);
+        assert_ne!(&first_header[24..48], &third_header[24..48]);
+        assert_ne!(&second_header[24..48], &third_header[24..48]);
         assert_ne!(first.ciphertext(), second.ciphertext());
+        assert_ne!(first.ciphertext(), third.ciphertext());
+        assert_ne!(second.ciphertext(), third.ciphertext());
         assert_eq!(first.context(), context);
         assert_eq!(second.context(), context);
+        assert_eq!(third.context(), context);
+        cipher
+            .retry_open_manifest(&retry, &first)
+            .expect("reconcile primary under exact retry capability");
+        cipher
+            .retry_open_manifest(&retry, &second)
+            .expect("reconcile first retry under the same exact capability");
+        cipher
+            .retry_open_manifest(&retry, &third)
+            .expect("reconcile second retry under the same exact capability");
     }
 
     #[test]
