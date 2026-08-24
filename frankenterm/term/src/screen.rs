@@ -1157,6 +1157,19 @@ impl Screen {
                 maximum: limits.max_keyboard_stack_depth,
             });
         }
+        let keyboard_stack_bytes = self
+            .keyboard_stack
+            .len()
+            .checked_mul(std::mem::size_of::<KeyboardEncoding>())
+            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                "retained_capture_bytes",
+            ))?;
+        accumulate_checkpoint_usage(
+            &mut usage.retained_capture_bytes,
+            keyboard_stack_bytes,
+            limits.max_retained_capture_bytes,
+            "retained_capture_bytes",
+        )?;
         for line in &self.lines {
             inspect_checkpoint_line(line, limits, usage)?;
         }
@@ -1264,12 +1277,19 @@ impl Screen {
             .map_err(|_| ScreenCheckpointCaptureError::ResourceAllocation("screen_lines"))?;
         lines.append(&mut cold_lines);
         lines.extend(self.lines.iter().map(Line::semantic_checkpoint_clone));
+        let mut keyboard_stack = Vec::new();
+        keyboard_stack
+            .try_reserve_exact(self.keyboard_stack.len())
+            .map_err(|_| {
+                ScreenCheckpointCaptureError::ResourceAllocation("keyboard_stack")
+            })?;
+        keyboard_stack.extend(self.keyboard_stack.iter().cloned());
 
         Ok(ScreenCheckpointParts {
             lines,
             stable_row_index_offset: oldest,
             allow_scrollback: self.allow_scrollback,
-            keyboard_stack: self.keyboard_stack.clone(),
+            keyboard_stack,
             physical_rows: self.physical_rows,
             physical_cols: self.physical_cols,
             dpi: self.dpi,

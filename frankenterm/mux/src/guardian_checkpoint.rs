@@ -11,7 +11,7 @@ use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
 };
 use frankenterm_term::{
-    RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID, RecoveryTerminalCheckpointV1,
+    RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID, RecoveryTerminalCheckpointV2,
 };
 use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
@@ -52,7 +52,7 @@ impl GuardianCheckpointBoundary {
         expected_durable_pane_id: Uuid,
         segment: GuardianOutputSegmentIdentity,
         output: GuardianOutputAppendReceipt,
-        terminal_checkpoint: &RecoveryTerminalCheckpointV1,
+        terminal_checkpoint: &RecoveryTerminalCheckpointV2,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
         validate_output_identity(expected_durable_pane_id, segment, output)?;
         let rows = u32::try_from(terminal_checkpoint.rows())
@@ -300,7 +300,7 @@ mod tests {
     };
     use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
     use frankenterm_term::{
-        RecoveryTerminalCheckpointV1, Terminal, TerminalConfiguration, TerminalSize,
+        RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
     };
     use std::fs::File;
     use std::sync::Arc;
@@ -311,7 +311,7 @@ mod tests {
 
     impl TerminalConfiguration for CheckpointTerminalConfig {}
 
-    fn terminal_checkpoint() -> RecoveryTerminalCheckpointV1 {
+    fn terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
         Terminal::new(
             TerminalSize {
                 rows: 24,

@@ -1,13 +1,15 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
 use frankenterm_escape_parser::parser::Parser;
+#[cfg(feature = "use_serde")]
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Versioned identity for terminal-model semantics used by guardian suffix
 /// replay. Bump this whenever Performer, width, eviction, reset, or checkpoint
 /// semantics can map the same parsed actions to different terminal state.
 pub const RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID: &str =
-    "frankenterm.term.recovery-replay-semantics.v1";
+    "frankenterm.term.recovery-replay-semantics.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -128,14 +130,14 @@ pub struct Terminal {
 /// was recovery-ground.  The fields are deliberately private so a guardian
 /// cannot pair state bytes with an unrelated parser instance.
 #[cfg(feature = "use_serde")]
-pub struct RecoveryTerminalCheckpointV1 {
+pub struct RecoveryTerminalCheckpointV2 {
     canonical_payload: Vec<u8>,
     rows: usize,
     cols: usize,
 }
 
 #[cfg(feature = "use_serde")]
-impl RecoveryTerminalCheckpointV1 {
+impl RecoveryTerminalCheckpointV2 {
     #[must_use]
     pub fn canonical_payload(&self) -> &[u8] {
         &self.canonical_payload
@@ -158,10 +160,10 @@ impl RecoveryTerminalCheckpointV1 {
 }
 
 #[cfg(feature = "use_serde")]
-impl std::fmt::Debug for RecoveryTerminalCheckpointV1 {
+impl std::fmt::Debug for RecoveryTerminalCheckpointV2 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RecoveryTerminalCheckpointV1")
+            .debug_struct("RecoveryTerminalCheckpointV2")
             .field("canonical_payload", &"[REDACTED]")
             .field("payload_bytes", &self.canonical_payload.len())
             .field("rows", &self.rows)
@@ -198,7 +200,8 @@ impl std::error::Error for RecoveryTerminalCheckpointError {}
 #[cfg(feature = "use_serde")]
 pub struct InertTerminal {
     terminal: Terminal,
-    replay_projection: crate::terminalstate::checkpoint::CheckpointReplayConfigV1,
+    replay_projection: crate::terminalstate::checkpoint::CheckpointReplayConfigV2,
+    custom_cell_width_maps: Vec<Arc<HashMap<u32, u8>>>,
     intended_live_config: Arc<dyn TerminalConfiguration>,
     intended_live_config_revision: crate::config::TerminalConfigurationRevision,
     checkpoint_limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
@@ -296,7 +299,8 @@ impl std::fmt::Debug for InertTerminal {
 impl InertTerminal {
     pub(crate) fn from_restored_state(
         state: TerminalState,
-        replay_projection: crate::terminalstate::checkpoint::CheckpointReplayConfigV1,
+        replay_projection: crate::terminalstate::checkpoint::CheckpointReplayConfigV2,
+        custom_cell_width_maps: Vec<Arc<HashMap<u32, u8>>>,
         intended_live_config: Arc<dyn TerminalConfiguration>,
         intended_live_config_revision: crate::config::TerminalConfigurationRevision,
         checkpoint_limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
@@ -307,6 +311,7 @@ impl InertTerminal {
         Self {
             terminal: Terminal::from_restored_state(state, parser_string_limit),
             replay_projection,
+            custom_cell_width_maps,
             intended_live_config,
             intended_live_config_revision,
             checkpoint_limits,
@@ -383,18 +388,36 @@ impl InertTerminal {
         let mut actions = Vec::new();
         let mut allocation_failed = false;
         let mut action_limit_exceeded = false;
+        let mut action_memory_limit_exceeded = None;
         let max_actions = self.checkpoint_limits.max_replay_actions_per_record;
+        const ACTION_RESERVE_CHUNK: usize = 256;
         self.terminal.parser.parse(bytes, |action| {
-            if allocation_failed || action_limit_exceeded {
+            if allocation_failed
+                || action_limit_exceeded
+                || action_memory_limit_exceeded.is_some()
+            {
                 return;
             }
             if actions.len() >= max_actions {
                 action_limit_exceeded = true;
                 return;
             }
-            if actions.try_reserve(1).is_err() {
-                allocation_failed = true;
-                return;
+            if actions.len() == actions.capacity() {
+                let additional = max_actions
+                    .saturating_sub(actions.len())
+                    .min(ACTION_RESERVE_CHUNK);
+                if actions.try_reserve_exact(additional).is_err() {
+                    allocation_failed = true;
+                    return;
+                }
+                let retained_bytes = actions
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Action>())
+                    .unwrap_or(usize::MAX);
+                if retained_bytes > self.checkpoint_limits.max_retained_capture_bytes {
+                    action_memory_limit_exceeded = Some(retained_bytes);
+                    return;
+                }
             }
             actions.push(action);
         });
@@ -405,6 +428,14 @@ impl InertTerminal {
         if allocation_failed {
             self.replay_failed = true;
             return Err(InertTerminalError::ReplayActionAllocation);
+        }
+        if let Some(observed) = action_memory_limit_exceeded {
+            self.replay_failed = true;
+            return Err(InertTerminalError::ReplayResourceLimit {
+                resource: "action_batch_bytes",
+                observed,
+                maximum: self.checkpoint_limits.max_retained_capture_bytes,
+            });
         }
         if action_limit_exceeded {
             self.replay_failed = true;
@@ -432,9 +463,10 @@ impl InertTerminal {
             return Err(InertTerminalError::UnsupportedGraphicsAction);
         }
         self.terminal.perform_actions(actions);
-        if let Err(error) = crate::terminalstate::checkpoint::TerminalCheckpointV1::validate_inert_replay_resources(
+        if let Err(error) = crate::terminalstate::checkpoint::TerminalCheckpointV2::validate_inert_replay_resources(
             &self.terminal,
             &self.replay_projection,
+            &self.custom_cell_width_maps,
             self.checkpoint_limits,
         ) {
             self.replay_failed = true;
@@ -447,14 +479,14 @@ impl InertTerminal {
 
     pub fn checkpoint(
         &self,
-    ) -> Result<crate::terminalstate::checkpoint::TerminalCheckpointV1, InertTerminalError> {
+    ) -> Result<crate::terminalstate::checkpoint::TerminalCheckpointV2, InertTerminalError> {
         if self.replay_failed {
             return Err(InertTerminalError::ReplayPoisoned);
         }
         if !self.terminal.parser.is_recovery_ground() {
             return Err(InertTerminalError::ParserNotRecoveryGround);
         }
-        crate::terminalstate::checkpoint::TerminalCheckpointV1::capture_with_limits(
+        crate::terminalstate::checkpoint::TerminalCheckpointV2::capture_with_limits(
             &self.terminal,
             self.checkpoint_limits,
         )
@@ -485,6 +517,7 @@ impl InertTerminal {
             .matches_stable(
                 self.intended_live_config.as_ref(),
                 self.checkpoint_limits,
+                &self.custom_cell_width_maps,
             )
             .map_err(InertTerminalError::Checkpoint)?;
         if self.intended_live_config.revision() != self.intended_live_config_revision {
@@ -501,6 +534,7 @@ impl InertTerminal {
             .matches_stable(
                 self.terminal.state.get_config().as_ref(),
                 self.checkpoint_limits,
+                &self.custom_cell_width_maps,
             )
             .map_err(InertTerminalError::Checkpoint)?;
         if self.intended_live_config.revision() != self.intended_live_config_revision {
@@ -571,12 +605,12 @@ impl Terminal {
     pub fn capture_recovery_checkpoint(
         &self,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
-    ) -> Result<RecoveryTerminalCheckpointV1, RecoveryTerminalCheckpointError> {
+    ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
         if !self.parser.is_recovery_ground() {
             return Err(RecoveryTerminalCheckpointError::ParserNotRecoveryGround);
         }
         let checkpoint =
-            crate::terminalstate::checkpoint::TerminalCheckpointV1::capture_with_limits(
+            crate::terminalstate::checkpoint::TerminalCheckpointV2::capture_with_limits(
                 &self.state,
                 limits,
             )
@@ -585,7 +619,7 @@ impl Terminal {
             .to_canonical_json(limits)
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
         let size = self.state.get_size();
-        Ok(RecoveryTerminalCheckpointV1 {
+        Ok(RecoveryTerminalCheckpointV2 {
             canonical_payload,
             rows: size.rows,
             cols: size.cols,
@@ -723,6 +757,45 @@ mod tests {
                 Err(RecoveryTerminalCheckpointError::ParserNotRecoveryGround)
             ));
         }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn inert_replay_bounds_actions_flushed_by_a_split_csi_record() {
+        let limits = crate::terminalstate::checkpoint::TerminalCheckpointLimits {
+            max_replay_actions_per_record: 4,
+            ..crate::terminalstate::checkpoint::TerminalCheckpointLimits::default()
+        };
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(PropTermConfig);
+        let terminal = Terminal::new(
+            TerminalSize::default(),
+            Arc::clone(&config),
+            "FrankenTerm",
+            "split-csi-replay-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let checkpoint = terminal
+            .capture_recovery_checkpoint(limits)
+            .expect("capture recovery checkpoint");
+        let mut inert = crate::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+            checkpoint.canonical_payload(),
+            limits,
+        )
+        .expect("validate recovery checkpoint")
+        .restore_inert(config)
+        .expect("restore inert terminal");
+
+        inert
+            .replay_bytes(b"\x1b[1;2;3;4;5")
+            .expect("retain incomplete CSI in parser");
+        assert!(matches!(
+            inert.replay_bytes(b"m"),
+            Err(InertTerminalError::ReplayResourceLimit {
+                resource: "actions_per_record",
+                observed: 5,
+                maximum: 4,
+            })
+        ));
     }
 
     #[derive(Debug, Clone, PartialEq)]

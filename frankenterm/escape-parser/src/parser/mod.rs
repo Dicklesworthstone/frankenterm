@@ -304,7 +304,7 @@ pub struct Parser {
 /// change that alters the interpretation of retained raw terminal bytes must
 /// change this value so an older checkpoint fails closed instead of silently
 /// reconstructing different terminal state.
-pub const RECOVERY_CHECKPOINT_PARSER_ID: &str = "frankenterm.escape-parser.recovery-ground.v2";
+pub const RECOVERY_CHECKPOINT_PARSER_ID: &str = "frankenterm.escape-parser.recovery-ground.v3";
 
 impl Default for Parser {
     fn default() -> Self {
@@ -1032,7 +1032,7 @@ mod test {
     fn recovery_checkpoint_parser_identity_is_versioned_and_nonempty() {
         assert_eq!(
             RECOVERY_CHECKPOINT_PARSER_ID,
-            "frankenterm.escape-parser.recovery-ground.v2"
+            "frankenterm.escape-parser.recovery-ground.v3"
         );
     }
 

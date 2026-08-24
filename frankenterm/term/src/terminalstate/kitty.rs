@@ -97,7 +97,7 @@ impl KittyImageState {
     }
 
     /// Return the image-ID allocation high-water mark only when no active
-    /// out-of-band Kitty state would be lost by checkpoint v1. Screen-attached
+    /// out-of-band Kitty state would be lost by checkpointing. Screen-attached
     /// image cells are checked separately; this covers incomplete
     /// transmissions, reusable image IDs, and placement bookkeeping that line
     /// serialization alone cannot reconstruct.
