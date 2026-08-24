@@ -233,6 +233,11 @@ addresses, usernames, socket
 paths, or credentials. If neither slot is valid, FrankenTerm reports the fault
 and falls back only to explicit `connect_automatically = true` configuration;
 damaged optional preference state cannot silently broaden connection authority.
+An explicit operator-requested attach still proceeds when this optional
+preference cannot be written, with a persistent warning that restart recovery
+was not remembered. An explicit detach remains fail-closed until its durable
+negative intent commits, preventing an older `Attached` record from reconnecting
+behind the operator's request.
 
 ### Accessibility Timing
 
