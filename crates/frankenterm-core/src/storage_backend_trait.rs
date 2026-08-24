@@ -2456,7 +2456,7 @@ mod tests {
         let backend = open_memory();
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = backend.with_transaction(|tx| {
+            let _ = backend.with_transaction::<(), _>(|tx| {
                 tx.execute("INSERT INTO t VALUES (99)")?;
                 panic!("mutation panic inside transaction");
             });

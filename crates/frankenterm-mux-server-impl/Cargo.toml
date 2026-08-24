@@ -58,7 +58,6 @@ wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds = { workspace = true, default-features = false, features = ["async-asupersync"] }
 zeroize.workspace = true
 zstd.workspace = true
-thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["process"] }

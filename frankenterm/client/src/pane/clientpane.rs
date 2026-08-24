@@ -635,7 +635,7 @@ impl ReliableInputQueue {
             None,
             None,
         )
-            .map(|_| ())
+        .map(|_| ())
     }
 
     fn enqueue_with_trace_context(
@@ -1113,9 +1113,7 @@ impl ReliableInputQueue {
                 if transport.delivery_certainty()
                     == crate::client::RpcDeliveryCertainty::DefinitelyNotSent
                 {
-                    if !queue.restore_front_trace_context(entry, consumed_trace_context)
-                        || !queue.set_front_key_ambiguity(entry, false)
-                    {
+                    if !queue.restore_front_trace_context(entry, consumed_trace_context) {
                         return ReliableInputAttempt::AbortLane(
                             "trace_context_restore_conflict",
                         );
@@ -1131,9 +1129,7 @@ impl ReliableInputQueue {
                 );
             }
             Err(error) if error.root_cause().is::<ClientOutboundAdmissionError>() => {
-                if !queue.restore_front_trace_context(entry, consumed_trace_context)
-                    || !queue.set_front_key_ambiguity(entry, false)
-                {
+                if !queue.restore_front_trace_context(entry, consumed_trace_context) {
                     return ReliableInputAttempt::AbortLane("trace_context_restore_conflict");
                 }
                 return ReliableInputAttempt::Retry(
@@ -1146,9 +1142,7 @@ impl ReliableInputQueue {
                     &error,
                 ) =>
             {
-                if !queue.restore_front_trace_context(entry, consumed_trace_context)
-                    || !queue.set_front_key_ambiguity(entry, false)
-                {
+                if !queue.restore_front_trace_context(entry, consumed_trace_context) {
                     return ReliableInputAttempt::AbortLane("trace_context_restore_conflict");
                 }
                 return ReliableInputAttempt::Retry(
@@ -1305,9 +1299,7 @@ impl ReliableInputQueue {
                 if transport.delivery_certainty()
                     == crate::client::RpcDeliveryCertainty::DefinitelyNotSent
                 {
-                    if !queue.restore_front_trace_context(entry, consumed_trace_context)
-                        || !queue.set_front_key_ambiguity(entry, false)
-                    {
+                    if !queue.restore_front_trace_context(entry, consumed_trace_context) {
                         return ReliableInputAttempt::AbortLane(
                             "trace_context_restore_conflict",
                         );
@@ -1324,9 +1316,7 @@ impl ReliableInputQueue {
                 }
             }
             Err(error) if error.root_cause().is::<ClientOutboundAdmissionError>() => {
-                if !queue.restore_front_trace_context(entry, consumed_trace_context)
-                    || !queue.set_front_key_ambiguity(entry, false)
-                {
+                if !queue.restore_front_trace_context(entry, consumed_trace_context) {
                     return ReliableInputAttempt::AbortLane("trace_context_restore_conflict");
                 }
                 ReliableInputAttempt::Retry(
