@@ -143,6 +143,8 @@ anyhow.workspace = true
 base64.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 chrono.workspace = true
 clap.workspace = true
 colorgrad.workspace = true
@@ -170,6 +172,7 @@ ordered-float.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
 regex.workspace = true
+rustix.workspace = true
 serde = { workspace = true, features = ["rc", "derive"] }
 serde_json.workspace = true
 sha2.workspace = true

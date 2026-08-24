@@ -229,8 +229,13 @@ thread that failed to start is never reported as a pending reconnect.
 The preference is stored under FrankenTerm's mode-0700 private data directory
 in two alternating, mode-0600 checksummed files. It stores only
 domain-separated SHA-256 fingerprints of domain aliases, never raw aliases,
-addresses, usernames, socket
-paths, or credentials. If neither slot is valid, FrankenTerm reports the fault
+addresses, usernames, socket paths, or credentials. The directory is pinned as
+a capability before the lock or either slot is opened; every leaf is opened
+relative to that descriptor without following symlinks, constrained to one
+private regular-file link owned by the same account, and revalidated against
+its name after I/O. Replacing the directory, lock, or slot therefore fails the
+operation instead of splitting lock authority or falsely reporting a durable
+preference. If neither slot is valid, FrankenTerm reports the fault
 and falls back only to explicit `connect_automatically = true` configuration;
 damaged optional preference state cannot silently broaden connection authority.
 An explicit operator-requested attach still proceeds when this optional

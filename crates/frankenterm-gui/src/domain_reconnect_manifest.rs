@@ -6,14 +6,21 @@
 //! record overrides the configured auto-connect bit until the operator makes
 //! the opposite choice.
 
-use fs2::FileExt as _;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::fs::{Dir as CapDir, File as CapFile, Metadata as CapMetadata};
+use cap_std::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt as _};
+#[cfg(unix)]
+use cap_std::fs::{MetadataExt as CapUnixMetadataExt, PermissionsExt as _};
+#[cfg(windows)]
+use cap_std::fs::MetadataExt as CapWindowsMetadataExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{File, Metadata, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -27,6 +34,11 @@ const MAX_MANIFEST_BYTES: u64 =
     (HEADER_BYTES + MAX_DOMAIN_INTENTS * ENTRY_BYTES + DIGEST_BYTES) as u64;
 const FINGERPRINT_DOMAIN: &[u8] = b"frankenterm.gui.domain-reconnect-name.v1\0";
 const CHECKSUM_DOMAIN: &[u8] = b"frankenterm.gui.domain-reconnect-manifest.v1\0";
+const SLOT_NAMES: [&str; 2] = [
+    "domain-reconnect-manifest.slot-0",
+    "domain-reconnect-manifest.slot-1",
+];
+const LOCK_NAME: &str = "domain-reconnect-manifest.lock";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +87,8 @@ pub enum DomainReconnectManifestError {
     UnsafeFile { reason: &'static str },
     #[error("domain reconnect manifest directory is not private")]
     DirectoryNotPrivate,
+    #[error("domain reconnect manifest authority identity changed during {operation}")]
+    IdentityChanged { operation: &'static str },
 }
 
 impl DomainReconnectManifestError {
@@ -141,18 +155,29 @@ pub fn fingerprint_domain_name(domain_name: &str) -> [u8; 32] {
     digest.finalize().into()
 }
 
+#[cfg(test)]
 fn manifest_paths(directory: &Path) -> [PathBuf; 2] {
-    [
-        directory.join("domain-reconnect-manifest.slot-0"),
-        directory.join("domain-reconnect-manifest.slot-1"),
-    ]
+    [directory.join(SLOT_NAMES[0]), directory.join(SLOT_NAMES[1])]
 }
 
+#[cfg(test)]
 fn lock_path(directory: &Path) -> PathBuf {
-    directory.join("domain-reconnect-manifest.lock")
+    directory.join(LOCK_NAME)
 }
 
-fn ensure_manifest_directory(directory: &Path) -> Result<(), DomainReconnectManifestError> {
+#[cfg(test)]
+fn private_open_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+}
+
+fn open_manifest_directory(directory: &Path) -> Result<CapDir, DomainReconnectManifestError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -174,35 +199,22 @@ fn ensure_manifest_directory(directory: &Path) -> Result<(), DomainReconnectMani
         });
     }
     #[cfg(unix)]
-    if metadata.permissions().mode() & 0o7777 != 0o700 {
-        return Err(DomainReconnectManifestError::DirectoryNotPrivate);
-    }
-    Ok(())
-}
-
-fn private_open_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
     {
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        if metadata.permissions().mode() & 0o7777 != 0o700
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err(DomainReconnectManifestError::DirectoryNotPrivate);
+        }
     }
-    options
-}
-
-fn read_open_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    options
+    let pinned = CapDir::open_ambient_dir(directory, cap_std::ambient_authority())
+        .map_err(|error| DomainReconnectManifestError::io("open manifest directory", error))?;
+    validate_pinned_directory(directory, &pinned)?;
+    Ok(pinned)
 }
 
 fn validate_private_file(
-    metadata: &Metadata,
-    directory_metadata: &Metadata,
+    metadata: &CapMetadata,
+    directory: &CapDir,
 ) -> Result<(), DomainReconnectManifestError> {
     if !metadata.is_file() {
         return Err(DomainReconnectManifestError::UnsafeFile {
@@ -211,7 +223,12 @@ fn validate_private_file(
     }
     #[cfg(unix)]
     {
-        if metadata.permissions().mode() & 0o777 != 0o600 {
+        let directory_metadata = directory
+            .dir_metadata()
+            .map_err(|error| {
+                DomainReconnectManifestError::io("inspect manifest directory", error)
+            })?;
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
             return Err(DomainReconnectManifestError::UnsafeFile {
                 reason: "authority file mode is not 0600",
             });
@@ -227,49 +244,237 @@ fn validate_private_file(
             });
         }
     }
-    Ok(())
-}
-
-fn open_lock_file(directory: &Path) -> Result<File, DomainReconnectManifestError> {
-    ensure_manifest_directory(directory)?;
-    let path = lock_path(directory);
-    if std::fs::symlink_metadata(&path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
+    #[cfg(windows)]
+    if metadata.number_of_links() != Some(1) {
         return Err(DomainReconnectManifestError::UnsafeFile {
-            reason: "lock path is a symbolic link",
+            reason: "authority file has multiple hard links",
         });
     }
-    let existed = path.exists();
-    let file = private_open_options()
-        .open(&path)
-        .map_err(|error| DomainReconnectManifestError::io("open lock", error))?;
-    let directory_metadata = std::fs::metadata(directory)
-        .map_err(|error| DomainReconnectManifestError::io("inspect directory owner", error))?;
-    validate_private_file(
-        &file
-            .metadata()
-            .map_err(|error| DomainReconnectManifestError::io("inspect lock", error))?,
-        &directory_metadata,
-    )?;
-    if !existed {
-        file.sync_all()
-            .map_err(|error| DomainReconnectManifestError::io("sync lock", error))?;
-        sync_directory(directory)?;
-    }
-    Ok(file)
+    Ok(())
 }
 
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<(), DomainReconnectManifestError> {
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| DomainReconnectManifestError::io("sync directory", error))
+fn same_file_identity(left: &CapMetadata, right: &CapMetadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> Result<(), DomainReconnectManifestError> {
+#[cfg(windows)]
+fn same_file_identity(left: &CapMetadata, right: &CapMetadata) -> bool {
+    match (
+        left.volume_serial_number(),
+        left.file_index(),
+        right.volume_serial_number(),
+        right.file_index(),
+    ) {
+        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index)) => {
+            left_volume == right_volume && left_index == right_index
+        }
+        _ => false,
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn same_file_identity(_left: &CapMetadata, _right: &CapMetadata) -> bool {
+    false
+}
+
+fn validate_pinned_directory(
+    path: &Path,
+    directory: &CapDir,
+) -> Result<(), DomainReconnectManifestError> {
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|error| DomainReconnectManifestError::io("reinspect manifest directory", error))?;
+    if named.file_type().is_symlink() || !named.is_dir() {
+        return Err(DomainReconnectManifestError::IdentityChanged {
+            operation: "directory revalidation",
+        });
+    }
+    #[cfg(unix)]
+    if named.permissions().mode() & 0o7777 != 0o700
+        || named.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(DomainReconnectManifestError::DirectoryNotPrivate);
+    }
+    let reopened = CapDir::open_ambient_dir(path, cap_std::ambient_authority())
+        .map_err(|error| DomainReconnectManifestError::io("reopen manifest directory", error))?;
+    let pinned_metadata = directory
+        .dir_metadata()
+        .map_err(|error| DomainReconnectManifestError::io("inspect pinned directory", error))?;
+    let reopened_metadata = reopened
+        .dir_metadata()
+        .map_err(|error| DomainReconnectManifestError::io("inspect reopened directory", error))?;
+    if !pinned_metadata.is_dir()
+        || !reopened_metadata.is_dir()
+        || !same_file_identity(&pinned_metadata, &reopened_metadata)
+    {
+        return Err(DomainReconnectManifestError::IdentityChanged {
+            operation: "directory revalidation",
+        });
+    }
+    validate_private_file_owner(&pinned_metadata)?;
     Ok(())
+}
+
+fn validate_private_file_owner(
+    directory_metadata: &CapMetadata,
+) -> Result<(), DomainReconnectManifestError> {
+    #[cfg(not(unix))]
+    let _ = directory_metadata;
+    #[cfg(unix)]
+    if directory_metadata.permissions().mode() & 0o7777 != 0o700
+        || directory_metadata.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(DomainReconnectManifestError::DirectoryNotPrivate);
+    }
+    Ok(())
+}
+
+fn named_private_file(
+    directory: &CapDir,
+    name: &OsStr,
+) -> Result<CapMetadata, DomainReconnectManifestError> {
+    let metadata = directory
+        .symlink_metadata(name)
+        .map_err(|error| DomainReconnectManifestError::io("inspect authority name", error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(DomainReconnectManifestError::UnsafeFile {
+            reason: "authority path is a symbolic link",
+        });
+    }
+    validate_private_file(&metadata, directory)?;
+    Ok(metadata)
+}
+
+fn validate_opened_name(
+    directory: &CapDir,
+    name: &OsStr,
+    file: &CapFile,
+    operation: &'static str,
+) -> Result<CapMetadata, DomainReconnectManifestError> {
+    let opened = file
+        .metadata()
+        .map_err(|error| DomainReconnectManifestError::io("inspect opened authority", error))?;
+    validate_private_file(&opened, directory)?;
+    let named = named_private_file(directory, name)?;
+    if !same_file_identity(&opened, &named) {
+        return Err(DomainReconnectManifestError::IdentityChanged { operation });
+    }
+    Ok(opened)
+}
+
+fn sync_directory(directory: &CapDir) -> Result<(), DomainReconnectManifestError> {
+    #[cfg(unix)]
+    directory
+        .open(".")
+        .and_then(|file| file.sync_all())
+        .map_err(|error| DomainReconnectManifestError::io("sync directory", error))?;
+    Ok(())
+}
+
+struct ManifestLease {
+    path: PathBuf,
+    directory: CapDir,
+    lock_authority: CapFile,
+    lock: File,
+}
+
+impl ManifestLease {
+    fn acquire(
+        path: &Path,
+        exclusive: bool,
+    ) -> Result<Self, DomainReconnectManifestError> {
+        let directory = open_manifest_directory(path)?;
+        let name = OsStr::new(LOCK_NAME);
+        let before = match directory.symlink_metadata(name) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(DomainReconnectManifestError::UnsafeFile {
+                        reason: "lock path is a symbolic link",
+                    });
+                }
+                validate_private_file(&metadata, &directory)?;
+                Some(metadata)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(DomainReconnectManifestError::io(
+                    "inspect lock",
+                    error,
+                ));
+            }
+        };
+        let mut options = CapOpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let lock_authority = directory
+            .open_with(name, &options)
+            .map_err(|error| DomainReconnectManifestError::io("open lock", error))?;
+        let opened = validate_opened_name(
+            &directory,
+            name,
+            &lock_authority,
+            "lock open",
+        )?;
+        if opened.len() != 0
+            || before
+                .as_ref()
+                .is_some_and(|before| !same_file_identity(before, &opened))
+        {
+            return Err(DomainReconnectManifestError::IdentityChanged {
+                operation: "lock open",
+            });
+        }
+        lock_authority
+            .sync_all()
+            .map_err(|error| DomainReconnectManifestError::io("sync lock", error))?;
+        sync_directory(&directory)?;
+        let lock = lock_authority
+            .try_clone()
+            .map(CapFile::into_std)
+            .map_err(|error| DomainReconnectManifestError::io("clone lock", error))?;
+        if exclusive {
+            fs2::FileExt::lock_exclusive(&lock)
+                .map_err(|error| DomainReconnectManifestError::io("lock for update", error))?;
+        } else {
+            fs2::FileExt::lock_shared(&lock)
+                .map_err(|error| DomainReconnectManifestError::io("lock for reading", error))?;
+        }
+        let lease = Self {
+            path: path.to_path_buf(),
+            directory,
+            lock_authority,
+            lock,
+        };
+        lease.validate()?;
+        Ok(lease)
+    }
+
+    fn validate(&self) -> Result<(), DomainReconnectManifestError> {
+        validate_pinned_directory(&self.path, &self.directory)?;
+        let metadata = validate_opened_name(
+            &self.directory,
+            OsStr::new(LOCK_NAME),
+            &self.lock_authority,
+            "locked authority revalidation",
+        )?;
+        if metadata.len() != 0 {
+            return Err(DomainReconnectManifestError::UnsafeFile {
+                reason: "lock authority is not empty",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ManifestLease {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.lock);
+    }
 }
 
 fn encode_manifest(
@@ -413,10 +618,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<DomainReconnectManifest, DomainReconn
 }
 
 fn read_slot(
-    path: &Path,
-    directory_metadata: &Metadata,
+    directory: &CapDir,
+    name: &OsStr,
 ) -> Result<SlotRead, DomainReconnectManifestError> {
-    match std::fs::symlink_metadata(path) {
+    let before = match directory.symlink_metadata(name) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Ok(SlotRead::Invalid(
                 DomainReconnectManifestError::UnsafeFile {
@@ -424,7 +629,12 @@ fn read_slot(
                 },
             ));
         }
-        Ok(_) => {}
+        Ok(metadata) => {
+            if let Err(error) = validate_private_file(&metadata, directory) {
+                return Ok(SlotRead::Invalid(error));
+            }
+            metadata
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SlotRead::Missing),
         Err(error) => {
             return Err(DomainReconnectManifestError::io(
@@ -432,8 +642,18 @@ fn read_slot(
                 error,
             ));
         }
+    };
+    if before.len() > MAX_MANIFEST_BYTES {
+        return Ok(SlotRead::Invalid(
+            DomainReconnectManifestError::Oversized {
+                actual: before.len(),
+                maximum: MAX_MANIFEST_BYTES,
+            },
+        ));
     }
-    let mut file = match read_open_options().open(path) {
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = match directory.open_with(name, &options) {
         Ok(file) => file,
         Err(error) => {
             return Ok(SlotRead::Invalid(DomainReconnectManifestError::io(
@@ -442,38 +662,53 @@ fn read_slot(
             )));
         }
     };
-    let metadata = file
-        .metadata()
-        .map_err(|error| DomainReconnectManifestError::io("inspect authority slot", error))?;
-    if let Err(error) = validate_private_file(&metadata, directory_metadata) {
-        return Ok(SlotRead::Invalid(error));
-    }
-    if metadata.len() == 0 {
-        return Ok(SlotRead::Empty);
-    }
-    if metadata.len() > MAX_MANIFEST_BYTES {
-        return Ok(SlotRead::Invalid(
-            DomainReconnectManifestError::Oversized {
-                actual: metadata.len(),
-                maximum: MAX_MANIFEST_BYTES,
-            },
-        ));
-    }
-    let capacity = usize::try_from(metadata.len()).map_err(|_| {
+    let opened = match validate_opened_name(directory, name, &file, "slot read open") {
+        Ok(metadata) if same_file_identity(&before, &metadata) => metadata,
+        Ok(_) => {
+            return Ok(SlotRead::Invalid(
+                DomainReconnectManifestError::IdentityChanged {
+                    operation: "slot read open",
+                },
+            ));
+        }
+        Err(error) => return Ok(SlotRead::Invalid(error)),
+    };
+    let capacity = usize::try_from(opened.len()).map_err(|_| {
         DomainReconnectManifestError::Oversized {
-            actual: metadata.len(),
+            actual: opened.len(),
             maximum: MAX_MANIFEST_BYTES,
         }
     })?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes)
+    (&mut file)
+        .take(MAX_MANIFEST_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|error| DomainReconnectManifestError::io("read authority slot", error))?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len() {
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual > MAX_MANIFEST_BYTES {
+        return Ok(SlotRead::Invalid(
+            DomainReconnectManifestError::Oversized {
+                actual,
+                maximum: MAX_MANIFEST_BYTES,
+            },
+        ));
+    }
+    let after = match validate_opened_name(directory, name, &file, "slot read completion") {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(SlotRead::Invalid(error)),
+    };
+    if actual != opened.len()
+        || actual != after.len()
+        || !same_file_identity(&opened, &after)
+    {
         return Ok(SlotRead::Invalid(
             DomainReconnectManifestError::Invalid {
                 reason: "authority slot length changed while reading",
             },
         ));
+    }
+    if bytes.is_empty() {
+        return Ok(SlotRead::Empty);
     }
     Ok(match decode_manifest(&bytes) {
         Ok(manifest) => SlotRead::Valid(manifest),
@@ -526,23 +761,20 @@ fn select_manifest(
     }
 }
 
-fn load_locked(directory: &Path) -> Result<LoadedManifest, DomainReconnectManifestError> {
-    let directory_metadata = std::fs::metadata(directory)
-        .map_err(|error| DomainReconnectManifestError::io("inspect directory owner", error))?;
-    let paths = manifest_paths(directory);
+fn load_locked(directory: &CapDir) -> Result<LoadedManifest, DomainReconnectManifestError> {
     select_manifest(
-        read_slot(&paths[0], &directory_metadata)?,
-        read_slot(&paths[1], &directory_metadata)?,
+        read_slot(directory, OsStr::new(SLOT_NAMES[0]))?,
+        read_slot(directory, OsStr::new(SLOT_NAMES[1]))?,
     )
 }
 
 pub fn load_from(
     directory: &Path,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
-    let lock = open_lock_file(directory)?;
-    lock.lock_shared()
-        .map_err(|error| DomainReconnectManifestError::io("lock for reading", error))?;
-    Ok(load_locked(directory)?.manifest)
+    let lease = ManifestLease::acquire(directory, false)?;
+    let loaded = load_locked(&lease.directory)?;
+    lease.validate()?;
+    Ok(loaded.manifest)
 }
 
 pub fn load() -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
@@ -550,30 +782,49 @@ pub fn load() -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
 }
 
 fn write_slot(
-    directory: &Path,
-    path: &Path,
+    directory: &CapDir,
+    name: &OsStr,
     manifest: &DomainReconnectManifest,
 ) -> Result<(), DomainReconnectManifestError> {
-    if std::fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    let encoded = encode_manifest(manifest)?;
+    let before = match directory.symlink_metadata(name) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(DomainReconnectManifestError::UnsafeFile {
+                    reason: "authority slot is a symbolic link",
+                });
+            }
+            validate_private_file(&metadata, directory)?;
+            Some(metadata)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(DomainReconnectManifestError::io(
+                "inspect authority slot",
+                error,
+            ));
+        }
+    };
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = directory
+        .open_with(name, &options)
+        .map_err(|error| DomainReconnectManifestError::io("open authority slot", error))?;
+    let opened = validate_opened_name(directory, name, &file, "slot write open")?;
+    if before
+        .as_ref()
+        .is_some_and(|before| !same_file_identity(before, &opened))
     {
-        return Err(DomainReconnectManifestError::UnsafeFile {
-            reason: "authority slot is a symbolic link",
+        return Err(DomainReconnectManifestError::IdentityChanged {
+            operation: "slot write open",
         });
     }
-    let existed = path.exists();
-    let mut file = private_open_options()
-        .open(path)
-        .map_err(|error| DomainReconnectManifestError::io("open authority slot", error))?;
-    let directory_metadata = std::fs::metadata(directory)
-        .map_err(|error| DomainReconnectManifestError::io("inspect directory owner", error))?;
-    validate_private_file(
-        &file
-            .metadata()
-            .map_err(|error| DomainReconnectManifestError::io("inspect authority slot", error))?,
-        &directory_metadata,
-    )?;
-    let encoded = encode_manifest(manifest)?;
     file.set_len(0)
         .map_err(|error| DomainReconnectManifestError::io("truncate authority slot", error))?;
     file.seek(SeekFrom::Start(0))
@@ -584,16 +835,32 @@ fn write_slot(
         .map_err(|error| DomainReconnectManifestError::io("sync authority slot", error))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| DomainReconnectManifestError::io("seek authority slot", error))?;
+    let after = validate_opened_name(directory, name, &file, "slot write completion")?;
+    if after.len() != u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+        || !same_file_identity(&opened, &after)
+    {
+        return Err(DomainReconnectManifestError::IdentityChanged {
+            operation: "slot write completion",
+        });
+    }
     let mut persisted = Vec::with_capacity(encoded.len());
-    file.read_to_end(&mut persisted)
+    (&mut file)
+        .take(MAX_MANIFEST_BYTES.saturating_add(1))
+        .read_to_end(&mut persisted)
         .map_err(|error| DomainReconnectManifestError::io("verify authority slot", error))?;
     if decode_manifest(&persisted)? != *manifest {
         return Err(DomainReconnectManifestError::Invalid {
             reason: "persisted authority does not match the intended generation",
         });
     }
-    if !existed {
-        sync_directory(directory)?;
+    sync_directory(directory)?;
+    let published = validate_opened_name(directory, name, &file, "slot publication")?;
+    if published.len() != u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+        || !same_file_identity(&opened, &published)
+    {
+        return Err(DomainReconnectManifestError::IdentityChanged {
+            operation: "slot publication",
+        });
     }
     Ok(())
 }
@@ -603,13 +870,12 @@ pub fn set_intent_at(
     domain_name: &str,
     intent: DomainAttachmentIntent,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
-    let lock = open_lock_file(directory)?;
-    lock.lock_exclusive()
-        .map_err(|error| DomainReconnectManifestError::io("lock for update", error))?;
-    let loaded = load_locked(directory)?;
+    let lease = ManifestLease::acquire(directory, true)?;
+    let loaded = load_locked(&lease.directory)?;
     let fingerprint = fingerprint_domain_name(domain_name);
     let mut next = loaded.manifest;
     if next.intents.get(&fingerprint).copied() == Some(intent) {
+        lease.validate()?;
         return Ok(next);
     }
     if !next.intents.contains_key(&fingerprint) && next.intents.len() == MAX_DOMAIN_INTENTS {
@@ -628,10 +894,11 @@ pub fn set_intent_at(
         Some(_) => unreachable!("manifest has exactly two slots"),
     };
     write_slot(
-        directory,
-        &manifest_paths(directory)[target_slot],
+        &lease.directory,
+        OsStr::new(SLOT_NAMES[target_slot]),
         &next,
     )?;
+    lease.validate()?;
     Ok(next)
 }
 
@@ -819,6 +1086,115 @@ mod tests {
             .expect("create slot symlink");
         assert!(matches!(
             load_from(other.path()),
+            Err(DomainReconnectManifestError::UnsafeFile { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_locked_authority_is_detected_before_success() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let lease = ManifestLease::acquire(temp.path(), true).expect("acquire manifest lease");
+        let original_lock = lock_path(temp.path());
+        let displaced_lock = temp.path().join("displaced-lock");
+        std::fs::rename(&original_lock, displaced_lock).expect("displace locked authority");
+        let replacement = private_open_options()
+            .open(&original_lock)
+            .expect("create replacement lock");
+        replacement.sync_all().expect("sync replacement lock");
+
+        assert!(matches!(
+            lease.validate(),
+            Err(DomainReconnectManifestError::IdentityChanged {
+                operation: "locked authority revalidation"
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_an_open_slot_is_detected_by_descriptor_identity() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let manifest = set_intent_at(
+            temp.path(),
+            "trj",
+            DomainAttachmentIntent::Attached,
+        )
+        .expect("persist manifest");
+        let directory = open_manifest_directory(temp.path()).expect("open manifest directory");
+        let name = OsStr::new(SLOT_NAMES[0]);
+        let mut options = CapOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let opened = directory
+            .open_with(name, &options)
+            .expect("open authoritative slot");
+        let slot_path = manifest_paths(temp.path())[0].clone();
+        std::fs::rename(&slot_path, temp.path().join("displaced-slot"))
+            .expect("displace authoritative slot");
+        let mut replacement = private_open_options()
+            .open(&slot_path)
+            .expect("create replacement slot");
+        replacement
+            .write_all(&encode_manifest(&manifest).expect("encode replacement"))
+            .expect("write replacement slot");
+        replacement.sync_all().expect("sync replacement slot");
+
+        assert!(matches!(
+            validate_opened_name(&directory, name, &opened, "test slot replacement"),
+            Err(DomainReconnectManifestError::IdentityChanged {
+                operation: "test slot replacement"
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_manifest_directory_is_detected_by_pinned_identity() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let parent = tempfile::tempdir().expect("temporary parent directory");
+        let authority_path = parent.path().join("authority");
+        set_intent_at(
+            &authority_path,
+            "trj",
+            DomainAttachmentIntent::Attached,
+        )
+        .expect("persist manifest");
+        let lease = ManifestLease::acquire(&authority_path, true).expect("acquire manifest lease");
+        std::fs::rename(&authority_path, parent.path().join("displaced-authority"))
+            .expect("displace manifest directory");
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(&authority_path)
+            .expect("create replacement manifest directory");
+
+        assert!(matches!(
+            lease.validate(),
+            Err(DomainReconnectManifestError::IdentityChanged {
+                operation: "directory revalidation"
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_authority_slot_is_rejected() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        set_intent_at(
+            temp.path(),
+            "trj",
+            DomainAttachmentIntent::Attached,
+        )
+        .expect("persist manifest");
+        std::fs::hard_link(
+            &manifest_paths(temp.path())[0],
+            temp.path().join("unexpected-hard-link"),
+        )
+        .expect("create hard-link negative control");
+
+        assert!(matches!(
+            load_from(temp.path()),
             Err(DomainReconnectManifestError::UnsafeFile { .. })
         ));
     }
