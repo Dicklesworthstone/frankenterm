@@ -936,6 +936,14 @@ impl GuardianCheckpointStageRecordContextV1 {
             .recompute_checkpoint_identity_digest()
             .map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)?;
         let (plaintext_bytes, plaintext_digest) = checkpoint_stage_plaintext_identity(plaintext)?;
+        if let Some((_, offset)) = chunk_position {
+            let end = offset
+                .checked_add(u64::from(plaintext_bytes))
+                .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+            if end > descriptor.terminal_payload_bytes() {
+                return Err(GuardianCheckpointCipherError::InvalidChunkIdentity);
+            }
+        }
         Self::from_persisted_parts(
             kind,
             scope,
@@ -3055,6 +3063,627 @@ mod tests {
             descriptor.validate_record_authority(segment, second),
             Err(GuardianCheckpointBoundaryError::VerifiedOutputIdentityMismatch)
         );
+    }
+
+    fn checkpoint_stage_cipher(seed: u8) -> GuardianCheckpointCipher {
+        let output_cipher = GuardianOutputCipher::try_from_key_slice(
+            &[seed; GuardianOutputCipher::KEY_BYTES],
+        )
+        .expect("construct checkpoint staging key fixture");
+        GuardianCheckpointCipher::from_output_cipher(&output_cipher)
+    }
+
+    fn assert_authenticated_header_mutation_fails(
+        cipher: &GuardianCheckpointCipher,
+        original_header: [u8; GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES],
+        original_ciphertext: &[u8],
+        mutate: impl FnOnce(
+            &mut [u8; GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES],
+            &mut Vec<u8>,
+        ),
+    ) {
+        let mut header = original_header;
+        let mut ciphertext = original_ciphertext.to_vec();
+        mutate(&mut header, &mut ciphertext);
+        let record = GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+            &header,
+            ciphertext,
+            GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+        )
+        .expect("AAD mutation fixture must remain structurally valid");
+        let expected_context = record.context();
+        assert!(matches!(
+            cipher.open(
+                &expected_context,
+                &record,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_cipher_round_trips_every_typed_record_and_fixed_header() {
+        let plaintext = b"bounded checkpoint staging plaintext";
+        let (descriptor, _, _, _) = record_descriptor();
+        let scope = GuardianCheckpointStageScopeV1::pane(
+            descriptor
+                .origin()
+                .durable_pane_id()
+                .expect("record descriptor pane"),
+            7,
+        )
+        .expect("construct pane staging scope");
+        let upload_id = Uuid::new_v4();
+        let publication_id = Uuid::new_v4();
+        let contexts = [
+            GuardianCheckpointStageRecordContextV1::candidate_metadata(
+                scope,
+                upload_id,
+                &descriptor,
+                publication_id,
+                plaintext,
+            )
+            .expect("construct candidate metadata context"),
+            GuardianCheckpointStageRecordContextV1::chunk(
+                scope,
+                upload_id,
+                &descriptor,
+                publication_id,
+                0,
+                0,
+                plaintext,
+            )
+            .expect("construct chunk context"),
+            GuardianCheckpointStageRecordContextV1::seal_manifest(
+                scope,
+                upload_id,
+                &descriptor,
+                publication_id,
+                plaintext,
+            )
+            .expect("construct seal-manifest context"),
+        ];
+        let cipher = checkpoint_stage_cipher(0x31);
+
+        for context in contexts {
+            let record = cipher
+                .seal(context, plaintext)
+                .expect("seal typed checkpoint staging record");
+            assert_eq!(record.version(), GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION);
+            assert_eq!(record.key_id(), cipher.key_id());
+            assert_eq!(record.context(), context);
+            assert_eq!(
+                record.plaintext_bytes(),
+                u32::try_from(plaintext.len()).expect("fixture plaintext length fits u32")
+            );
+            let header = record.fixed_header();
+            let reconstructed = GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &header,
+                record.ciphertext().to_vec(),
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            )
+            .expect("reconstruct bounded fixed-layout record");
+            let opened: Zeroizing<Vec<u8>> = cipher
+                .open(
+                    &context,
+                    &reconstructed,
+                    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+                )
+                .expect("open exact typed checkpoint staging record");
+            assert!(checkpoint_stage_bytes_match(opened.as_slice(), plaintext));
+            drop(opened);
+        }
+    }
+
+    #[test]
+    fn checkpoint_stage_scope_is_exact_for_pane_and_genesis_descriptors() {
+        let plaintext = b"scope-bound metadata";
+        let (record_descriptor, _, _, _) = record_descriptor();
+        let wrong_pane_scope = GuardianCheckpointStageScopeV1::pane(Uuid::new_v4(), 7)
+            .expect("construct wrong pane scope");
+        assert!(matches!(
+            GuardianCheckpointStageRecordContextV1::candidate_metadata(
+                wrong_pane_scope,
+                Uuid::new_v4(),
+                &record_descriptor,
+                Uuid::new_v4(),
+                plaintext,
+            ),
+            Err(GuardianCheckpointCipherError::DescriptorScopeMismatch)
+        ));
+
+        let spawn_effect_id = Uuid::new_v4();
+        let terminal = terminal_checkpoint();
+        let genesis_descriptor =
+            GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
+                spawn_effect_id,
+                &terminal,
+            )
+            .expect("construct Genesis descriptor");
+        let genesis_scope = GuardianCheckpointStageScopeV1::genesis(spawn_effect_id)
+            .expect("construct Genesis scope");
+        let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            genesis_scope,
+            Uuid::new_v4(),
+            &genesis_descriptor,
+            Uuid::new_v4(),
+            plaintext,
+        )
+        .expect("construct Genesis candidate context");
+        let cipher = checkpoint_stage_cipher(0x32);
+        let record = cipher
+            .seal(context, plaintext)
+            .expect("seal Genesis candidate metadata");
+        let opened = cipher
+            .open(&context, &record, context.plaintext_bytes())
+            .expect("open Genesis candidate metadata");
+        assert!(checkpoint_stage_bytes_match(opened.as_slice(), plaintext));
+        drop(opened);
+
+        let wrong_genesis_scope = GuardianCheckpointStageScopeV1::genesis(Uuid::new_v4())
+            .expect("construct wrong Genesis scope");
+        assert!(matches!(
+            GuardianCheckpointStageRecordContextV1::candidate_metadata(
+                wrong_genesis_scope,
+                Uuid::new_v4(),
+                &genesis_descriptor,
+                Uuid::new_v4(),
+                plaintext,
+            ),
+            Err(GuardianCheckpointCipherError::DescriptorScopeMismatch)
+        ));
+    }
+
+    #[test]
+    fn every_checkpoint_stage_aad_field_is_mutation_sensitive() {
+        const HEADER_CONTEXT_OFFSET: usize = 48;
+        const CONTEXT_KIND_OFFSET: usize = HEADER_CONTEXT_OFFSET;
+        const CONTEXT_SCOPE_TAG_OFFSET: usize = HEADER_CONTEXT_OFFSET + 1;
+        const CONTEXT_SCOPE_ID_OFFSET: usize = HEADER_CONTEXT_OFFSET + 8;
+        const CONTEXT_GENERATION_OFFSET: usize = HEADER_CONTEXT_OFFSET + 24;
+        const CONTEXT_UPLOAD_OFFSET: usize = HEADER_CONTEXT_OFFSET + 32;
+        const CONTEXT_BOUNDARY_OFFSET: usize = HEADER_CONTEXT_OFFSET + 48;
+        const CONTEXT_CHECKPOINT_OFFSET: usize = HEADER_CONTEXT_OFFSET + 80;
+        const CONTEXT_PUBLICATION_OFFSET: usize = HEADER_CONTEXT_OFFSET + 112;
+        const CONTEXT_CHUNK_INDEX_OFFSET: usize = HEADER_CONTEXT_OFFSET + 128;
+        const CONTEXT_CHUNK_OFFSET_OFFSET: usize = HEADER_CONTEXT_OFFSET + 136;
+        const CONTEXT_PLAINTEXT_BYTES_OFFSET: usize = HEADER_CONTEXT_OFFSET + 144;
+        const CONTEXT_PLAINTEXT_DIGEST_OFFSET: usize = HEADER_CONTEXT_OFFSET + 152;
+
+        let plaintext = b"phase-a AAD mutation fixture";
+        let (descriptor, _, _, _) = record_descriptor();
+        let scope = GuardianCheckpointStageScopeV1::pane(
+            descriptor
+                .origin()
+                .durable_pane_id()
+                .expect("record descriptor pane"),
+            7,
+        )
+        .expect("construct pane scope");
+        let context = GuardianCheckpointStageRecordContextV1::chunk(
+            scope,
+            Uuid::new_v4(),
+            &descriptor,
+            Uuid::new_v4(),
+            0,
+            0,
+            plaintext,
+        )
+        .expect("construct chunk context");
+        let cipher = checkpoint_stage_cipher(0x33);
+        let record = cipher.seal(context, plaintext).expect("seal AAD fixture");
+        let header = record.fixed_header();
+        let aad = checkpoint_stage_record_aad(cipher.key_id(), &context);
+        let expected_domain = b"frankenterm.guardian-checkpoint-phase-a-record.v1\0";
+        assert_eq!(&aad[..expected_domain.len()], expected_domain);
+        assert_eq!(
+            &aad[expected_domain.len()..expected_domain.len() + 4],
+            &GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION.to_le_bytes()
+        );
+        assert_eq!(
+            &aad[expected_domain.len() + 4..expected_domain.len() + 12],
+            &cipher.key_id()
+        );
+
+        for offset in [
+            CONTEXT_KIND_OFFSET,
+            CONTEXT_SCOPE_ID_OFFSET,
+            CONTEXT_GENERATION_OFFSET,
+            CONTEXT_UPLOAD_OFFSET,
+            CONTEXT_BOUNDARY_OFFSET,
+            CONTEXT_CHECKPOINT_OFFSET,
+            CONTEXT_PUBLICATION_OFFSET,
+            CONTEXT_CHUNK_INDEX_OFFSET,
+            CONTEXT_CHUNK_OFFSET_OFFSET,
+            CONTEXT_PLAINTEXT_DIGEST_OFFSET,
+        ] {
+            assert_authenticated_header_mutation_fails(
+                &cipher,
+                header,
+                record.ciphertext(),
+                |mutated_header, _| mutated_header[offset] ^= 1,
+            );
+        }
+
+        assert_authenticated_header_mutation_fails(
+            &cipher,
+            header,
+            record.ciphertext(),
+            |mutated_header, _| {
+                mutated_header[CONTEXT_SCOPE_TAG_OFFSET] = 2;
+                mutated_header[CONTEXT_GENERATION_OFFSET..CONTEXT_GENERATION_OFFSET + 8].fill(0);
+            },
+        );
+        assert_authenticated_header_mutation_fails(
+            &cipher,
+            header,
+            record.ciphertext(),
+            |mutated_header, mutated_ciphertext| {
+                let shorter = context
+                    .plaintext_bytes()
+                    .checked_sub(1)
+                    .expect("fixture plaintext has more than one byte");
+                mutated_header
+                    [CONTEXT_PLAINTEXT_BYTES_OFFSET..CONTEXT_PLAINTEXT_BYTES_OFFSET + 4]
+                    .copy_from_slice(&shorter.to_le_bytes());
+                mutated_ciphertext.truncate(
+                    usize::try_from(shorter).expect("fixture length fits usize")
+                        + CHECKPOINT_STAGE_AEAD_TAG_BYTES,
+                );
+            },
+        );
+
+        let mut wrong_version = header;
+        wrong_version[8..12].copy_from_slice(
+            &GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION
+                .checked_add(1)
+                .expect("format version has mutation room")
+                .to_le_bytes(),
+        );
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &wrong_version,
+                record.ciphertext().to_vec(),
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::UnsupportedVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn checkpoint_cipher_rejects_wrong_key_context_nonce_and_ciphertext() {
+        let plaintext = b"authenticated checkpoint record";
+        let (descriptor, _, _, _) = record_descriptor();
+        let scope = GuardianCheckpointStageScopeV1::pane(
+            descriptor
+                .origin()
+                .durable_pane_id()
+                .expect("record descriptor pane"),
+            9,
+        )
+        .expect("construct pane scope");
+        let upload_id = Uuid::new_v4();
+        let context = GuardianCheckpointStageRecordContextV1::chunk(
+            scope,
+            upload_id,
+            &descriptor,
+            Uuid::new_v4(),
+            0,
+            0,
+            plaintext,
+        )
+        .expect("construct authenticated chunk context");
+        let cipher = checkpoint_stage_cipher(0x41);
+        let wrong_cipher = checkpoint_stage_cipher(0x42);
+        let record = cipher
+            .seal(context, plaintext)
+            .expect("seal authenticated fixture");
+
+        assert!(matches!(
+            wrong_cipher.open(
+                &context,
+                &record,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::KeyIdentityMismatch)
+        ));
+
+        let wrong_context = GuardianCheckpointStageRecordContextV1::chunk(
+            scope,
+            Uuid::new_v4(),
+            &descriptor,
+            context.publication_id(),
+            0,
+            0,
+            plaintext,
+        )
+        .expect("construct wrong expected context");
+        assert!(matches!(
+            cipher.open(
+                &wrong_context,
+                &record,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::ContextMismatch)
+        ));
+
+        let header = record.fixed_header();
+        assert_authenticated_header_mutation_fails(
+            &cipher,
+            header,
+            record.ciphertext(),
+            |mutated_header, _| mutated_header[24] ^= 1,
+        );
+        assert_authenticated_header_mutation_fails(
+            &cipher,
+            header,
+            record.ciphertext(),
+            |_, mutated_ciphertext| mutated_ciphertext[0] ^= 1,
+        );
+
+        let mut wrong_key_header = header;
+        wrong_key_header[16..24].copy_from_slice(&wrong_cipher.key_id());
+        let wrong_key_record = GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+            &wrong_key_header,
+            record.ciphertext().to_vec(),
+            GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+        )
+        .expect("reconstruct record under claimed wrong key identity");
+        assert!(matches!(
+            wrong_cipher.open(
+                &context,
+                &wrong_key_record,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_record_reconstruction_is_strictly_bounded() {
+        let plaintext = b"bounded persisted checkpoint record";
+        let (descriptor, _, _, _) = record_descriptor();
+        let scope = GuardianCheckpointStageScopeV1::pane(
+            descriptor
+                .origin()
+                .durable_pane_id()
+                .expect("record descriptor pane"),
+            11,
+        )
+        .expect("construct pane scope");
+        let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            scope,
+            Uuid::new_v4(),
+            &descriptor,
+            Uuid::new_v4(),
+            plaintext,
+        )
+        .expect("construct candidate context");
+        let cipher = checkpoint_stage_cipher(0x51);
+        let record = cipher
+            .seal(context, plaintext)
+            .expect("seal reconstruction fixture");
+        let header = record.fixed_header();
+
+        let mut truncated_ciphertext = record.ciphertext().to_vec();
+        truncated_ciphertext.pop();
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &header,
+                truncated_ciphertext,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::CiphertextLengthMismatch)
+        ));
+        let mut extended_ciphertext = record.ciphertext().to_vec();
+        extended_ciphertext.push(0);
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &header,
+                extended_ciphertext,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::CiphertextLengthMismatch)
+        ));
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &header[..header.len() - 1],
+                record.ciphertext().to_vec(),
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidFixedHeader)
+        ));
+        let mut extended_header = header.to_vec();
+        extended_header.push(0);
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &extended_header,
+                record.ciphertext().to_vec(),
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidFixedHeader)
+        ));
+
+        let too_small = context
+            .plaintext_bytes()
+            .checked_sub(1)
+            .expect("fixture plaintext has more than one byte");
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &header,
+                record.ciphertext().to_vec(),
+                too_small,
+            ),
+            Err(GuardianCheckpointCipherError::PlaintextByteLimit)
+        ));
+        assert!(matches!(
+            cipher.open(&context, &record, too_small),
+            Err(GuardianCheckpointCipherError::PlaintextByteLimit)
+        ));
+        assert!(matches!(
+            cipher.open(
+                &context,
+                &record,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES + 1,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidCallerLimit)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_cipher_uses_fresh_random_nonces() {
+        let plaintext = b"random nonce checkpoint fixture";
+        let (descriptor, _, _, _) = record_descriptor();
+        let scope = GuardianCheckpointStageScopeV1::pane(
+            descriptor
+                .origin()
+                .durable_pane_id()
+                .expect("record descriptor pane"),
+            13,
+        )
+        .expect("construct pane scope");
+        let context = GuardianCheckpointStageRecordContextV1::seal_manifest(
+            scope,
+            Uuid::new_v4(),
+            &descriptor,
+            Uuid::new_v4(),
+            plaintext,
+        )
+        .expect("construct manifest context");
+        let cipher = checkpoint_stage_cipher(0x61);
+        let first = cipher.seal(context, plaintext).expect("seal first record");
+        let second = cipher
+            .seal(context, plaintext)
+            .expect("seal retry record");
+        let first_header = first.fixed_header();
+        let second_header = second.fixed_header();
+
+        assert_ne!(&first_header[24..48], &second_header[24..48]);
+        assert_ne!(first.ciphertext(), second.ciphertext());
+        for record in [&first, &second] {
+            let opened = cipher
+                .open(
+                    &context,
+                    record,
+                    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+                )
+                .expect("open independently randomized record");
+            assert!(checkpoint_stage_bytes_match(opened.as_slice(), plaintext));
+            drop(opened);
+        }
+    }
+
+    #[test]
+    fn checkpoint_record_debug_is_content_free() {
+        let plaintext = b"CHECKPOINT-PLAINTEXT-MUST-NOT-APPEAR";
+        let (descriptor, _, _, _) = record_descriptor();
+        let scope = GuardianCheckpointStageScopeV1::pane(
+            descriptor
+                .origin()
+                .durable_pane_id()
+                .expect("record descriptor pane"),
+            15,
+        )
+        .expect("construct pane scope");
+        let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            scope,
+            Uuid::new_v4(),
+            &descriptor,
+            Uuid::new_v4(),
+            plaintext,
+        )
+        .expect("construct debug context");
+        let cipher = checkpoint_stage_cipher(0x71);
+        let record = cipher.seal(context, plaintext).expect("seal debug fixture");
+        let header = record.fixed_header();
+        let debug = format!("{record:?} {context:?} {cipher:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("CHECKPOINT-PLAINTEXT-MUST-NOT-APPEAR"));
+        assert!(!debug.contains(&hex::encode(context.plaintext_digest())));
+        assert!(!debug.contains(&hex::encode(record.ciphertext())));
+        assert!(!debug.contains(&hex::encode(&header[24..48])));
+    }
+
+    #[test]
+    fn checkpoint_open_returns_zeroizing_and_reidentifies_decrypted_plaintext() {
+        fn require_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+
+        let expected_plaintext = b"alpha-secret";
+        let substituted_plaintext = b"omega-secret";
+        assert_eq!(expected_plaintext.len(), substituted_plaintext.len());
+        let (descriptor, _, _, _) = record_descriptor();
+        let scope = GuardianCheckpointStageScopeV1::pane(
+            descriptor
+                .origin()
+                .durable_pane_id()
+                .expect("record descriptor pane"),
+            17,
+        )
+        .expect("construct pane scope");
+        let candidate_context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            scope,
+            Uuid::new_v4(),
+            &descriptor,
+            Uuid::new_v4(),
+            expected_plaintext,
+        )
+        .expect("construct candidate context");
+        let manifest_context = GuardianCheckpointStageRecordContextV1::seal_manifest(
+            scope,
+            candidate_context.upload_id(),
+            &descriptor,
+            candidate_context.publication_id(),
+            expected_plaintext,
+        )
+        .expect("construct manifest context");
+        let cipher = checkpoint_stage_cipher(0x72);
+
+        for context in [candidate_context, manifest_context] {
+            assert!(matches!(
+                cipher.seal(context, substituted_plaintext),
+                Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
+            ));
+        }
+
+        let valid_record = cipher
+            .seal(candidate_context, expected_plaintext)
+            .expect("seal exact candidate plaintext");
+        let opened: Zeroizing<Vec<u8>> = cipher
+            .open(
+                &candidate_context,
+                &valid_record,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            )
+            .expect("open exact candidate plaintext");
+        require_zeroizing(&opened);
+        assert!(checkpoint_stage_bytes_match(
+            opened.as_slice(),
+            expected_plaintext
+        ));
+        drop(opened);
+
+        let aad = checkpoint_stage_record_aad(cipher.key_id(), &candidate_context);
+        let (nonce, ciphertext) = cipher
+            .output_cipher
+            .seal_guardian_metadata(substituted_plaintext, &aad)
+            .expect("construct authenticated substituted-plaintext fixture");
+        let substituted_record = GuardianEncryptedCheckpointStageRecordV1 {
+            version: GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION,
+            key_id: cipher.key_id(),
+            nonce,
+            context: candidate_context,
+            ciphertext,
+        };
+        assert!(matches!(
+            cipher.open(
+                &candidate_context,
+                &substituted_record,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
+        ));
     }
 
     #[test]
