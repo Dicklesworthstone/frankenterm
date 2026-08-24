@@ -40,6 +40,7 @@ use termwiz::escape::{Action, DeviceControlMode};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
 use url::Url;
+use uuid::Uuid;
 
 #[cfg(feature = "disruptor-pane-io")]
 use crossbeam::queue::ArrayQueue;
@@ -98,6 +99,187 @@ enum ProcessState {
         killed: bool,
     },
     Dead,
+}
+
+/// Immutable authority identifying one guardian lease held by this mux.
+///
+/// The mutation sequence is deliberately not exposed here: the concrete
+/// guardian proxy owns and serializes that moving fence.  LocalPane retains
+/// only the stable identity needed to ensure that a stale generation cannot
+/// accidentally target a same-UUID successor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianPaneLeaseIdentity {
+    guardian_incarnation: Uuid,
+    mux_incarnation: Uuid,
+    pane_id: Uuid,
+    generation: u64,
+}
+
+impl GuardianPaneLeaseIdentity {
+    pub fn new(
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+    ) -> Result<Self, Error> {
+        if guardian_incarnation.is_nil() {
+            anyhow::bail!("guardian pane lease has a nil guardian incarnation");
+        }
+        if mux_incarnation.is_nil() {
+            anyhow::bail!("guardian pane lease has a nil mux incarnation");
+        }
+        if pane_id.is_nil() {
+            anyhow::bail!("guardian pane lease has a nil durable pane id");
+        }
+        if generation == 0 {
+            anyhow::bail!("guardian pane lease generation must be nonzero");
+        }
+        Ok(Self {
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+            generation,
+        })
+    }
+
+    #[must_use]
+    pub const fn guardian_incarnation(self) -> Uuid {
+        self.guardian_incarnation
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(self) -> Uuid {
+        self.mux_incarnation
+    }
+
+    #[must_use]
+    pub const fn pane_id(self) -> Uuid {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Exact lifetime operations for a guardian-backed LocalPane.
+///
+/// Implementations must bind `identity` to the same guardian lease actor used
+/// by the supplied `MasterPty`, writer, `Child`, and `ChildKiller` proxies.
+/// They must serialize the current mutation sequence and use stable
+/// request/effect identities so an ambiguous retry is idempotent.  `retire`
+/// releases only the mux lease; it must never signal or close the child.
+pub trait GuardianPaneLeaseControl: Send + Sync {
+    fn close(&self, identity: GuardianPaneLeaseIdentity) -> Result<(), Error>;
+    fn retire(&self, identity: GuardianPaneLeaseIdentity) -> Result<(), Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianLeaseDisposition {
+    Attached,
+    ExplicitCloseRequested,
+    RetirementRequested,
+}
+
+struct GuardianPaneOwnership {
+    identity: GuardianPaneLeaseIdentity,
+    control: Arc<dyn GuardianPaneLeaseControl>,
+    disposition: Mutex<GuardianLeaseDisposition>,
+}
+
+enum LocalPaneOwnership {
+    LegacyMuxOwned,
+    Guardian(GuardianPaneOwnership),
+}
+
+impl LocalPaneOwnership {
+    fn guardian(
+        identity: GuardianPaneLeaseIdentity,
+        control: Arc<dyn GuardianPaneLeaseControl>,
+    ) -> Self {
+        Self::Guardian(GuardianPaneOwnership {
+            identity,
+            control,
+            disposition: Mutex::new(GuardianLeaseDisposition::Attached),
+        })
+    }
+
+    /// Return true when guardian ownership handled the explicit close path.
+    /// The local transition happens before the fallible transport call so an
+    /// indeterminate close can never be followed by lease retirement or a
+    /// second, differently identified close from this LocalPane.
+    fn request_explicit_close(&self, pane_id: PaneId) -> bool {
+        let Self::Guardian(ownership) = self else {
+            return false;
+        };
+        let should_close = {
+            let mut disposition = ownership.disposition.lock();
+            if *disposition == GuardianLeaseDisposition::Attached {
+                *disposition = GuardianLeaseDisposition::ExplicitCloseRequested;
+                true
+            } else {
+                false
+            }
+        };
+        if should_close {
+            match catch_recoverable(
+                RecoverablePanicSite::MuxPaneCallback,
+                AssertUnwindSafe(|| ownership.control.close(ownership.identity)),
+            ) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::error!(
+                    "guardian close failed for local pane {pane_id}, durable pane {}, generation {}: {error:#}",
+                    ownership.identity.pane_id(),
+                    ownership.identity.generation(),
+                ),
+                Err(_) => log::error!(
+                    "guardian close panicked for local pane {pane_id}, durable pane {}, generation {}; preserving the close fence",
+                    ownership.identity.pane_id(),
+                    ownership.identity.generation(),
+                ),
+            }
+        }
+        true
+    }
+
+    /// Return true for every guardian-owned pane, including one whose close is
+    /// already pending.  That lets Drop unconditionally skip the legacy child
+    /// killer while sending at most one lease-retirement request for a merely
+    /// attached pane.
+    fn retire_on_drop(&self, pane_id: PaneId) -> bool {
+        let Self::Guardian(ownership) = self else {
+            return false;
+        };
+        let should_retire = {
+            let mut disposition = ownership.disposition.lock();
+            if *disposition == GuardianLeaseDisposition::Attached {
+                *disposition = GuardianLeaseDisposition::RetirementRequested;
+                true
+            } else {
+                false
+            }
+        };
+        if should_retire {
+            match catch_recoverable(
+                RecoverablePanicSite::MuxPaneCallback,
+                AssertUnwindSafe(|| ownership.control.retire(ownership.identity)),
+            ) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::error!(
+                    "guardian lease retirement failed for local pane {pane_id}, durable pane {}, generation {}: {error:#}",
+                    ownership.identity.pane_id(),
+                    ownership.identity.generation(),
+                ),
+                Err(_) => log::error!(
+                    "guardian lease retirement panicked for local pane {pane_id}, durable pane {}, generation {}; child ownership remains with the guardian",
+                    ownership.identity.pane_id(),
+                    ownership.identity.generation(),
+                ),
+            }
+        }
+        true
+    }
 }
 
 struct CachedProcInfo {
@@ -826,6 +1008,7 @@ where
 pub struct LocalPane {
     pane_id: PaneId,
     durable_pane_id: [u8; 16],
+    ownership: LocalPaneOwnership,
     terminal: Arc<Mutex<Terminal>>,
     process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
@@ -1017,6 +1200,21 @@ impl Pane for LocalPane {
     }
 
     fn kill(&self) {
+        if self.ownership.request_explicit_close(self.pane_id) {
+            let mut proc = self.process.lock();
+            log::debug!(
+                "explicitly closing guardian-backed process in pane {}, state is {:?}",
+                self.pane_id,
+                proc
+            );
+            match &mut *proc {
+                ProcessState::Running { killed, .. }
+                | ProcessState::DeadPendingClose { killed } => *killed = true,
+                ProcessState::Dead => {}
+            }
+            return;
+        }
+
         let mut proc = self.process.lock();
         log::debug!(
             "killing process in pane {}, state is {:?}",
@@ -2612,6 +2810,64 @@ impl LocalPane {
 
     pub fn new(
         pane_id: PaneId,
+        terminal: Terminal,
+        process: Box<dyn Child + Send>,
+        pty: Box<dyn MasterPty>,
+        writer: Box<dyn Write + Send>,
+        domain_id: DomainId,
+        durable_pane_id: [u8; 16],
+        command_description: String,
+    ) -> Self {
+        Self::new_with_ownership(
+            pane_id,
+            terminal,
+            process,
+            pty,
+            writer,
+            domain_id,
+            durable_pane_id,
+            command_description,
+            LocalPaneOwnership::LegacyMuxOwned,
+        )
+    }
+
+    /// Construct a LocalPane over guardian-backed PTY/process proxy objects.
+    ///
+    /// Read, write, resize, status, and signal operations continue through the
+    /// existing object-safe portable-pty interfaces supplied by the caller.
+    /// The explicit ownership value changes only lifetime behavior: `kill`
+    /// performs one fenced guardian close, while dropping the mux-side pane
+    /// retires only its lease and never invokes the child killer. This
+    /// constructor does not create those transport proxies or claim that
+    /// guardian input/output/checkpoint recovery is already implemented.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_guardian_proxy(
+        pane_id: PaneId,
+        terminal: Terminal,
+        process: Box<dyn Child + Send>,
+        pty: Box<dyn MasterPty>,
+        writer: Box<dyn Write + Send>,
+        domain_id: DomainId,
+        lease_identity: GuardianPaneLeaseIdentity,
+        lease_control: Arc<dyn GuardianPaneLeaseControl>,
+        command_description: String,
+    ) -> Self {
+        Self::new_with_ownership(
+            pane_id,
+            terminal,
+            process,
+            pty,
+            writer,
+            domain_id,
+            *lease_identity.pane_id().as_bytes(),
+            command_description,
+            LocalPaneOwnership::guardian(lease_identity, lease_control),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_ownership(
+        pane_id: PaneId,
         mut terminal: Terminal,
         process: Box<dyn Child + Send>,
         pty: Box<dyn MasterPty>,
@@ -2619,6 +2875,7 @@ impl LocalPane {
         domain_id: DomainId,
         durable_pane_id: [u8; 16],
         command_description: String,
+        ownership: LocalPaneOwnership,
     ) -> Self {
         let mux_registration = Arc::new(PaneRegistrationSlot::default());
         let child_exit_prune = ChildExitPruneState::new(Arc::clone(&mux_registration));
@@ -2647,6 +2904,7 @@ impl LocalPane {
         Self {
             pane_id,
             durable_pane_id,
+            ownership,
             terminal: Arc::new(Mutex::new(terminal)),
             process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),
@@ -2936,6 +3194,10 @@ impl Drop for LocalPane {
             tmux.transition_to_exit_and_schedule_detach();
         }
 
+        if self.ownership.retire_on_drop(self.pane_id) {
+            return;
+        }
+
         // Avoid lingering zombies if we can, but don't block forever.
         // <https://github.com/wezterm/wezterm/issues/558>
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
@@ -2947,6 +3209,7 @@ impl Drop for LocalPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn term_size(cols: usize, rows: usize) -> TerminalSize {
         TerminalSize {
@@ -2965,6 +3228,322 @@ mod tests {
             pixel_width: cols,
             pixel_height: rows,
         }
+    }
+
+    #[derive(Debug)]
+    struct GuardianLifetimeTestTermConfig;
+
+    impl TerminalConfiguration for GuardianLifetimeTestTermConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    struct GuardianLifetimeTestMasterPty;
+
+    impl MasterPty for GuardianLifetimeTestMasterPty {
+        fn resize(&self, _size: PtySize) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> Result<PtySize, Error> {
+            Ok(PtySize::default())
+        }
+
+        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, Error> {
+            Ok(Box::new(std::io::Cursor::new(Vec::new())))
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error> {
+            Ok(Box::new(Vec::<u8>::new()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct KillCountingChild {
+        kills: Arc<AtomicUsize>,
+    }
+
+    impl ChildKiller for KillCountingChild {
+        fn kill(&mut self) -> IoResult<()> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl Child for KillCountingChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(Some(ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    struct FencedGuardianLeaseControl {
+        current: Mutex<GuardianPaneLeaseIdentity>,
+        close_attempts: AtomicUsize,
+        close_effects: AtomicUsize,
+        retirement_attempts: AtomicUsize,
+        retirement_effects: AtomicUsize,
+    }
+
+    impl FencedGuardianLeaseControl {
+        fn new(current: GuardianPaneLeaseIdentity) -> Self {
+            Self {
+                current: Mutex::new(current),
+                close_attempts: AtomicUsize::new(0),
+                close_effects: AtomicUsize::new(0),
+                retirement_attempts: AtomicUsize::new(0),
+                retirement_effects: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl GuardianPaneLeaseControl for FencedGuardianLeaseControl {
+        fn close(&self, identity: GuardianPaneLeaseIdentity) -> Result<(), Error> {
+            self.close_attempts.fetch_add(1, Ordering::SeqCst);
+            if identity != *self.current.lock() {
+                anyhow::bail!("stale guardian close lease");
+            }
+            self.close_effects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn retire(&self, identity: GuardianPaneLeaseIdentity) -> Result<(), Error> {
+            self.retirement_attempts.fetch_add(1, Ordering::SeqCst);
+            if identity != *self.current.lock() {
+                anyhow::bail!("stale guardian retirement lease");
+            }
+            self.retirement_effects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn guardian_lifetime_test_terminal() -> Terminal {
+        Terminal::new(
+            term_size(80, 24),
+            Arc::new(GuardianLifetimeTestTermConfig),
+            "FrankenTerm",
+            "guardian-lifetime-test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn guardian_lifetime_test_identity(generation: u64) -> GuardianPaneLeaseIdentity {
+        GuardianPaneLeaseIdentity::new(
+            Uuid::from_bytes([0x11; 16]),
+            Uuid::from_bytes([0x22; 16]),
+            Uuid::from_bytes([0x33; 16]),
+            generation,
+        )
+        .expect("nonzero guardian lease fixture")
+    }
+
+    fn guardian_lifetime_test_pane(
+        pane_id: PaneId,
+        identity: GuardianPaneLeaseIdentity,
+        control: Arc<dyn GuardianPaneLeaseControl>,
+        kills: Arc<AtomicUsize>,
+    ) -> LocalPane {
+        LocalPane::new_guardian_proxy(
+            pane_id,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild { kills }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            identity,
+            control,
+            "guardian-lifetime-test".to_string(),
+        )
+    }
+
+    #[test]
+    fn guardian_lease_identity_rejects_reserved_zero_fences() {
+        let valid = guardian_lifetime_test_identity(1);
+        assert!(GuardianPaneLeaseIdentity::new(
+            Uuid::nil(),
+            valid.mux_incarnation(),
+            valid.pane_id(),
+            valid.generation(),
+        )
+        .is_err());
+        assert!(GuardianPaneLeaseIdentity::new(
+            valid.guardian_incarnation(),
+            Uuid::nil(),
+            valid.pane_id(),
+            valid.generation(),
+        )
+        .is_err());
+        assert!(GuardianPaneLeaseIdentity::new(
+            valid.guardian_incarnation(),
+            valid.mux_incarnation(),
+            Uuid::nil(),
+            valid.generation(),
+        )
+        .is_err());
+        assert!(GuardianPaneLeaseIdentity::new(
+            valid.guardian_incarnation(),
+            valid.mux_incarnation(),
+            valid.pane_id(),
+            0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_local_pane_drop_retains_child_kill_contract() {
+        let kills = Arc::new(AtomicUsize::new(0));
+        let pane = LocalPane::new(
+            700,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::clone(&kills),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x70; 16],
+            "legacy-lifetime-test".to_string(),
+        );
+
+        drop(pane);
+
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            1,
+            "removing the legacy Drop kill would leak its mux-owned child",
+        );
+    }
+
+    #[test]
+    fn guardian_local_pane_drop_retires_only_lease_and_never_kills_child() {
+        let identity = guardian_lifetime_test_identity(1);
+        let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let pane = guardian_lifetime_test_pane(
+            701,
+            identity,
+            control.clone(),
+            Arc::clone(&kills),
+        );
+        assert_eq!(
+            Pane::durable_pane_id(&pane),
+            Some(*identity.pane_id().as_bytes()),
+            "guardian proxy must derive durable identity from the fenced lease",
+        );
+
+        drop(pane);
+
+        assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(control.retirement_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(control.close_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "guardian ownership must make the legacy LocalPane Drop killer unreachable",
+        );
+    }
+
+    #[test]
+    fn guardian_explicit_close_is_single_shot_and_suppresses_drop_retirement() {
+        let identity = guardian_lifetime_test_identity(1);
+        let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let pane = guardian_lifetime_test_pane(
+            702,
+            identity,
+            control.clone(),
+            Arc::clone(&kills),
+        );
+
+        Pane::kill(&pane);
+        Pane::kill(&pane);
+        drop(pane);
+
+        assert_eq!(control.close_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(control.close_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stale_guardian_generation_cannot_mutate_or_retire_same_id_successor() {
+        let stale_identity = guardian_lifetime_test_identity(1);
+        let successor_identity = guardian_lifetime_test_identity(2);
+        assert_eq!(stale_identity.pane_id(), successor_identity.pane_id());
+        let control = Arc::new(FencedGuardianLeaseControl::new(successor_identity));
+
+        let stale_close_kills = Arc::new(AtomicUsize::new(0));
+        let stale_close = guardian_lifetime_test_pane(
+            703,
+            stale_identity,
+            control.clone(),
+            Arc::clone(&stale_close_kills),
+        );
+        Pane::kill(&stale_close);
+        drop(stale_close);
+        assert_eq!(
+            control.retirement_attempts.load(Ordering::SeqCst),
+            0,
+            "an indeterminate or rejected close must not be followed by takeover-enabling retirement",
+        );
+
+        let stale_retire_kills = Arc::new(AtomicUsize::new(0));
+        drop(guardian_lifetime_test_pane(
+            704,
+            stale_identity,
+            control.clone(),
+            Arc::clone(&stale_retire_kills),
+        ));
+
+        assert_eq!(control.close_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(control.close_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(control.retirement_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(stale_close_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(stale_retire_kills.load(Ordering::SeqCst), 0);
+
+        let successor_kills = Arc::new(AtomicUsize::new(0));
+        let successor = guardian_lifetime_test_pane(
+            705,
+            successor_identity,
+            control.clone(),
+            Arc::clone(&successor_kills),
+        );
+        Pane::kill(&successor);
+        drop(successor);
+
+        assert_eq!(control.close_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(control.close_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(control.retirement_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(successor_kills.load(Ordering::SeqCst), 0);
     }
 
     #[test]

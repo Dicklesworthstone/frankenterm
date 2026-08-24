@@ -17,7 +17,7 @@ use std::convert::TryFrom;
 use std::panic::AssertUnwindSafe;
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const GUARDIAN_PROTOCOL_VERSION: u16 = 3;
 pub const GUARDIAN_AUTH_TOKEN_BYTES: usize = 32;
@@ -129,6 +129,12 @@ pub enum GuardianOperation {
     /// Authenticated bootstrap that discovers the current guardian
     /// incarnation before any pane-scoped request can be formed.
     Hello = 13,
+    /// Authenticated process-scoped request to stop an empty guardian.
+    ///
+    /// Admission and response-flush ordering are owned by the guardian
+    /// transport; the pane protocol state machine deliberately cannot apply
+    /// this effect.
+    GuardedStop = 14,
 }
 
 impl GuardianOperation {
@@ -147,6 +153,7 @@ impl GuardianOperation {
             11 => Ok(Self::QueryInputEffect),
             12 => Ok(Self::RetireLease),
             13 => Ok(Self::Hello),
+            14 => Ok(Self::GuardedStop),
             other => Err(GuardianProtocolError::UnknownOperation(other)),
         }
     }
@@ -162,6 +169,19 @@ impl GuardianOperation {
                 | Self::Signal
                 | Self::Close
                 | Self::Checkpoint
+                | Self::RetireLease
+                | Self::GuardedStop
+        )
+    }
+
+    const fn supports_generic_effect_indeterminate(self) -> bool {
+        matches!(
+            self,
+            Self::Spawn
+                | Self::Claim
+                | Self::Resize
+                | Self::Signal
+                | Self::Close
                 | Self::RetireLease
         )
     }
@@ -276,6 +296,12 @@ impl GuardianRequestEnvelope {
     }
 }
 
+impl Drop for GuardianRequestEnvelope {
+    fn drop(&mut self) {
+        self.payload.zeroize();
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct AuthenticatedGuardianRequest(GuardianRequestEnvelope);
 
@@ -345,6 +371,7 @@ pub enum GuardianRejectionCode {
     InternalInvariant = 21,
     CheckpointOutcomeIndeterminate = 22,
     CheckpointIdentityMismatch = 23,
+    OwnedPanesPresent = 24,
 }
 
 impl GuardianRejectionCode {
@@ -356,7 +383,8 @@ impl GuardianRejectionCode {
             | Self::CapacityExhausted
             | Self::RequestAliasCapacityExhausted
             | Self::InputDurabilityPending
-            | Self::CheckpointOutcomeIndeterminate => GuardianResponseStatus::Rejected,
+            | Self::CheckpointOutcomeIndeterminate
+            | Self::OwnedPanesPresent => GuardianResponseStatus::Rejected,
             _ => GuardianResponseStatus::Terminal,
         }
     }
@@ -406,6 +434,7 @@ impl GuardianRejectionCode {
             21 => Self::InternalInvariant,
             22 => Self::CheckpointOutcomeIndeterminate,
             23 => Self::CheckpointIdentityMismatch,
+            24 => Self::OwnedPanesPresent,
             _ => return Err(GuardianProtocolError::InvalidRejectionPayload),
         };
         if code.status() != status {
@@ -1288,6 +1317,19 @@ impl AuthenticatedGuardianRequest {
     pub const fn envelope(&self) -> &GuardianRequestEnvelope {
         &self.0
     }
+
+    /// Wipe the authenticated request payload as soon as its operation has
+    /// consumed it. The authenticated header and payload commitment remain
+    /// available for response correlation.
+    pub fn zeroize_payload(&mut self) {
+        self.0.payload.zeroize();
+    }
+
+    /// Consume the authenticated envelope and transfer its sensitive payload
+    /// into an allocation that remains zeroizing at the next ownership layer.
+    pub fn into_zeroizing_payload(mut self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(std::mem::take(&mut self.0.payload))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1660,6 +1702,7 @@ pub enum GuardianReply {
     Hello {
         guardian_incarnation: Uuid,
     },
+    GuardedStopAccepted,
     Spawned { pane_id: Uuid, generation: u64 },
     CensusPage {
         snapshot_id: Uuid,
@@ -1681,6 +1724,16 @@ pub enum GuardianReply {
     LeaseRetired { pane_id: Uuid, generation: u64 },
     InputEffect { effect_id: Uuid, state: InputEffectState },
     ReplayReady { pane_id: Uuid, generation: u64 },
+    /// The exact authenticated effect identity was committed, but its external
+    /// callback may or may not have applied. The pane is permanently
+    /// quarantined; this receipt is diagnostic/reconciliation authority, never
+    /// permission to retry the external effect.
+    EffectOutcomeIndeterminate {
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        effect_id: Uuid,
+    },
 }
 
 impl GuardianReply {
@@ -1691,8 +1744,58 @@ impl GuardianReply {
                     receipt.disposition,
                     GuardianCheckpointDisposition::OutcomeIndeterminate
                 ) => GuardianResponseStatus::Indeterminate,
+            Self::EffectOutcomeIndeterminate { .. } => GuardianResponseStatus::Indeterminate,
             _ => GuardianResponseStatus::Success,
         }
+    }
+
+    pub fn effect_outcome_indeterminate(
+        request: &AuthenticatedGuardianRequest,
+        intended_reply: &Self,
+    ) -> Result<Self, GuardianProtocolError> {
+        if !request.header.operation.supports_generic_effect_indeterminate() {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        intended_reply.require_response_identity(&GuardianResponseHeader::new(
+            &request.header,
+            GuardianResponseStatus::Success,
+            &intended_reply.encode_for_operation(request.header.operation)?,
+        ))?;
+        let effect_id = request
+            .header
+            .effect_id
+            .ok_or(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            })?;
+        let (pane_id, generation, sequence) = match intended_reply {
+            Self::Spawned {
+                pane_id,
+                generation,
+            } => (*pane_id, *generation, 0),
+            Self::Claimed {
+                pane_id,
+                generation,
+                next_sequence,
+            } => (*pane_id, *generation, *next_sequence),
+            Self::MutationApplied {
+                pane_id,
+                generation,
+                sequence,
+            } => (*pane_id, *generation, *sequence),
+            Self::LeaseRetired {
+                pane_id,
+                generation,
+            } => (*pane_id, *generation, request.header.lease_sequence),
+            _ => return Err(GuardianProtocolError::InvalidReplyPayload),
+        };
+        let receipt = Self::EffectOutcomeIndeterminate {
+            pane_id,
+            generation,
+            sequence,
+            effect_id,
+        };
+        receipt.require_operation(request.header.operation)?;
+        Ok(receipt)
     }
 
     pub fn encode_for_operation(
@@ -1702,6 +1805,7 @@ impl GuardianReply {
         self.require_operation(operation)?;
         let capacity = match self {
             Self::Hello { .. } => 16,
+            Self::GuardedStopAccepted => 0,
             Self::CensusPage { entries, .. } => usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES)
                 .ok()
                 .and_then(|header| {
@@ -1718,6 +1822,7 @@ impl GuardianReply {
             Self::InputReceipt { .. } => INPUT_RECEIPT_PAYLOAD_BYTES,
             Self::CheckpointReceipt(..) => GUARDIAN_CHECKPOINT_RECEIPT_BYTES,
             Self::InputEffect { .. } => INPUT_EFFECT_REPLY_PAYLOAD_BYTES,
+            Self::EffectOutcomeIndeterminate { .. } => 48,
         };
         if capacity > GUARDIAN_MAX_PAYLOAD_BYTES {
             return Err(GuardianProtocolError::PayloadTooLarge);
@@ -1727,6 +1832,7 @@ impl GuardianReply {
             Self::Hello {
                 guardian_incarnation,
             } => push_uuid(&mut payload, *guardian_incarnation),
+            Self::GuardedStopAccepted => {}
             Self::Spawned {
                 pane_id,
                 generation,
@@ -1811,6 +1917,17 @@ impl GuardianReply {
                 payload.push(disposition);
                 payload.extend_from_slice(&applied_bytes.to_be_bytes());
             }
+            Self::EffectOutcomeIndeterminate {
+                pane_id,
+                generation,
+                sequence,
+                effect_id,
+            } => {
+                push_uuid(&mut payload, *pane_id);
+                payload.extend_from_slice(&generation.to_be_bytes());
+                payload.extend_from_slice(&sequence.to_be_bytes());
+                push_uuid(&mut payload, *effect_id);
+            }
         }
         if payload.len() != capacity {
             return Err(GuardianProtocolError::StateInvariantViolation(
@@ -1827,12 +1944,26 @@ impl GuardianReply {
         if payload.len() > GUARDIAN_MAX_PAYLOAD_BYTES {
             return Err(GuardianProtocolError::PayloadTooLarge);
         }
+        if operation.supports_generic_effect_indeterminate() && payload.len() == 48 {
+            let reply = Self::EffectOutcomeIndeterminate {
+                pane_id: read_required_uuid(payload, 0)?,
+                generation: read_u64(payload, 16)?,
+                sequence: read_u64(payload, 24)?,
+                effect_id: read_required_uuid(payload, 32)?,
+            };
+            reply.require_operation(operation)?;
+            return Ok(reply);
+        }
         let reply = match operation {
             GuardianOperation::Hello => {
                 require_reply_len(payload, 16)?;
                 Self::Hello {
                     guardian_incarnation: read_required_uuid(payload, 0)?,
                 }
+            }
+            GuardianOperation::GuardedStop => {
+                require_reply_len(payload, 0)?;
+                Self::GuardedStopAccepted
             }
             GuardianOperation::Spawn => {
                 require_reply_len(payload, 24)?;
@@ -1965,6 +2096,10 @@ impl GuardianReply {
         let matches = matches!(
             (operation, self),
             (GuardianOperation::Hello, Self::Hello { .. })
+                | (
+                    GuardianOperation::GuardedStop,
+                    Self::GuardedStopAccepted
+                )
                 | (GuardianOperation::Spawn, Self::Spawned { .. })
                 | (GuardianOperation::Census, Self::CensusPage { .. })
                 | (GuardianOperation::Claim, Self::Claimed { .. })
@@ -1986,12 +2121,22 @@ impl GuardianReply {
                     Self::InputEffect { .. }
                 )
                 | (GuardianOperation::RetireLease, Self::LeaseRetired { .. })
+                | (
+                    GuardianOperation::Spawn
+                        | GuardianOperation::Claim
+                        | GuardianOperation::Resize
+                        | GuardianOperation::Signal
+                        | GuardianOperation::Close
+                        | GuardianOperation::RetireLease,
+                    Self::EffectOutcomeIndeterminate { .. }
+                )
         );
         if matches {
             let valid = match self {
                 Self::Hello {
                     guardian_incarnation,
                 } => !guardian_incarnation.is_nil(),
+                Self::GuardedStopAccepted => true,
                 Self::Spawned {
                     pane_id,
                     generation,
@@ -2064,6 +2209,28 @@ impl GuardianReply {
                     !effect_id.is_nil() && state.has_canonical_wire_count()
                 }
                 Self::ReplayReady { pane_id, .. } => !pane_id.is_nil(),
+                Self::EffectOutcomeIndeterminate {
+                    pane_id,
+                    generation,
+                    sequence,
+                    effect_id,
+                } => {
+                    !pane_id.is_nil()
+                        && !effect_id.is_nil()
+                        && match operation {
+                            GuardianOperation::Spawn => *generation == 0 && *sequence == 0,
+                            GuardianOperation::Claim => *generation > 0 && *sequence > 0,
+                            GuardianOperation::Resize
+                            | GuardianOperation::Signal
+                            | GuardianOperation::RetireLease => {
+                                *generation > 0 && *sequence > 0
+                            }
+                            GuardianOperation::Close => {
+                                (*generation > 0 && *sequence > 0) || *sequence == 0
+                            }
+                            _ => false,
+                        }
+                }
             };
             if valid {
                 Ok(())
@@ -2085,6 +2252,12 @@ impl GuardianReply {
                 header.guardian_incarnation.is_nil()
                     && header.pane_id.is_none()
                     && header.effect_id.is_none()
+            }
+            Self::GuardedStopAccepted => {
+                header.pane_id.is_none()
+                    && header.effect_id.is_some()
+                    && header.lease_generation == 0
+                    && header.lease_sequence == 0
             }
             Self::Spawned {
                 pane_id,
@@ -2144,6 +2317,39 @@ impl GuardianReply {
                 generation,
             } => header.pane_id == Some(*pane_id) && header.lease_generation == *generation,
             Self::InputEffect { effect_id, .. } => header.effect_id == Some(*effect_id),
+            Self::EffectOutcomeIndeterminate {
+                pane_id,
+                generation,
+                sequence,
+                effect_id,
+            } => {
+                header.pane_id == Some(*pane_id)
+                    && header.effect_id == Some(*effect_id)
+                    && match header.operation {
+                        GuardianOperation::Spawn => {
+                            header.lease_generation == 0
+                                && header.lease_sequence == 0
+                                && *generation == 0
+                                && *sequence == 0
+                        }
+                        GuardianOperation::Claim => {
+                            header
+                                .lease_generation
+                                .checked_add(1)
+                                .is_some_and(|expected| expected == *generation)
+                                && header.lease_sequence == 0
+                                && *sequence == 1
+                        }
+                        GuardianOperation::Resize
+                        | GuardianOperation::Signal
+                        | GuardianOperation::Close
+                        | GuardianOperation::RetireLease => {
+                            header.lease_generation == *generation
+                                && header.lease_sequence == *sequence
+                        }
+                        _ => false,
+                    }
+            }
         };
         if matches {
             Ok(())
@@ -2471,6 +2677,7 @@ impl GuardianCensusEntry {
 pub enum GuardianQuarantineReason {
     GenerationExhausted,
     SequenceExhausted,
+    EffectOutcomeIndeterminate,
 }
 
 impl GuardianCensusPaneStatus {
@@ -2501,6 +2708,7 @@ impl GuardianQuarantineReason {
         match self {
             Self::GenerationExhausted => 1,
             Self::SequenceExhausted => 2,
+            Self::EffectOutcomeIndeterminate => 3,
         }
     }
 
@@ -2509,6 +2717,7 @@ impl GuardianQuarantineReason {
             0 => Ok(None),
             1 => Ok(Some(Self::GenerationExhausted)),
             2 => Ok(Some(Self::SequenceExhausted)),
+            3 => Ok(Some(Self::EffectOutcomeIndeterminate)),
             _ => Err(GuardianProtocolError::InvalidReplyPayload),
         }
     }
@@ -2689,9 +2898,32 @@ impl GuardianRejectionCode {
     }
 }
 
+/// Explicit outcome of one externally observable guardian runtime operation.
+///
+/// Callers may report `DefinitelyNotApplied` only when they can prove that no
+/// externally visible effect occurred. Every ambiguous error path must use
+/// `OutcomeIndeterminate`, which permanently fences the pane and exact effect
+/// identity until an operation-specific reconciliation mechanism is added.
+pub enum GuardianEffectOutcome<E> {
+    Applied,
+    DefinitelyNotApplied(E),
+    OutcomeIndeterminate,
+}
+
+impl<E> GuardianEffectOutcome<E> {
+    #[must_use]
+    pub fn from_definite_result(result: Result<(), E>) -> Self {
+        match result {
+            Ok(()) => Self::Applied,
+            Err(error) => Self::DefinitelyNotApplied(error),
+        }
+    }
+}
+
 pub enum GuardianEffectTransactionError<E> {
     Protocol(GuardianProtocolError),
     Effect(E),
+    OutcomeIndeterminate(GuardianReply),
 }
 
 impl<E> std::fmt::Debug for GuardianEffectTransactionError<E> {
@@ -2699,6 +2931,7 @@ impl<E> std::fmt::Debug for GuardianEffectTransactionError<E> {
         match self {
             Self::Protocol(error) => formatter.debug_tuple("Protocol").field(error).finish(),
             Self::Effect(_) => formatter.debug_tuple("Effect").field(&"[REDACTED]").finish(),
+            Self::OutcomeIndeterminate(_) => formatter.write_str("OutcomeIndeterminate"),
         }
     }
 }
@@ -2714,6 +2947,9 @@ impl<E> std::fmt::Display for GuardianEffectTransactionError<E> {
         match self {
             Self::Protocol(error) => std::fmt::Display::fmt(error, formatter),
             Self::Effect(_) => formatter.write_str("guardian runtime effect failed"),
+            Self::OutcomeIndeterminate(_) => {
+                formatter.write_str("guardian runtime effect outcome is indeterminate")
+            }
         }
     }
 }
@@ -2722,7 +2958,7 @@ impl<E: std::error::Error + 'static> std::error::Error for GuardianEffectTransac
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Protocol(error) => Some(error),
-            Self::Effect(_) => None,
+            Self::Effect(_) | Self::OutcomeIndeterminate(_) => None,
         }
     }
 }
@@ -2738,6 +2974,38 @@ struct EffectFingerprint {
     payload_sha256: [u8; 32],
 }
 
+impl EffectFingerprint {
+    fn from_authenticated_request(
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<Self, GuardianProtocolError> {
+        let pane_id = request
+            .header
+            .pane_id
+            .ok_or(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            })?;
+        Ok(Self {
+            operation: request.header.operation,
+            pane_id,
+            mux_incarnation: request.header.mux_incarnation,
+            lease_generation: request.header.lease_generation,
+            lease_sequence: request.header.lease_sequence,
+            payload_bytes: u32::try_from(request.payload.len())
+                .map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
+            payload_sha256: request.header.payload_sha256,
+        })
+    }
+
+    fn matches_input_identity(&self, identity: GuardianInputEffectIdentity) -> bool {
+        self.operation == GuardianOperation::Input
+            && self.pane_id == identity.pane_id()
+            && self.mux_incarnation == identity.mux_incarnation()
+            && self.lease_generation == identity.generation()
+            && self.lease_sequence == identity.sequence()
+            && self.payload_bytes == identity.input_bytes()
+            && self.payload_sha256 == identity.payload_sha256()
+    }
+}
 impl std::fmt::Debug for EffectFingerprint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -2755,6 +3023,7 @@ impl std::fmt::Debug for EffectFingerprint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoredEffectState {
     Applied,
+    OutcomeIndeterminate,
     Input(InputEffectState),
     Checkpoint {
         disposition: GuardianCheckpointDisposition,
@@ -2766,7 +3035,8 @@ impl StoredEffectState {
     const fn is_pending(&self) -> bool {
         matches!(
             self,
-            Self::Input(InputEffectState::AcceptedNotDurable)
+            Self::OutcomeIndeterminate
+                | Self::Input(InputEffectState::AcceptedNotDurable)
                 | Self::Checkpoint {
                     disposition: GuardianCheckpointDisposition::OutcomeIndeterminate,
                     ..
@@ -2868,6 +3138,84 @@ impl GuardianProtocolState {
     #[must_use]
     pub fn pane_state(&self, pane_id: Uuid) -> Option<&GuardianPaneState> {
         self.panes.get(&pane_id)
+    }
+
+    /// Return the authenticated diagnostic receipt for an exact effect whose
+    /// callback outcome is already retained as indeterminate.
+    ///
+    /// This read-only path never invokes the callback, advances protocol state,
+    /// or installs a request alias. It exists so a quarantined runtime can
+    /// answer an exact identity retry without either misclassifying the effect
+    /// as a terminal rejection or admitting another external mutation.
+    pub fn indeterminate_effect_reply(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<Option<GuardianReply>, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+        }
+        if !request.header.operation.supports_generic_effect_indeterminate() {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            });
+        }
+        let fingerprint = EffectFingerprint::from_authenticated_request(request)?;
+        let effect_id = request
+            .header
+            .effect_id
+            .ok_or(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            })?;
+
+        let intended_reply = if let Some(stored_request) =
+            self.requests.get(&request.header.request_id)
+        {
+            if stored_request.fingerprint != fingerprint
+                || stored_request.effect_id != effect_id
+            {
+                return Err(GuardianProtocolError::RequestIdentityConflict);
+            }
+            let stored_effect = self.effects.get(&effect_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
+                    "indeterminate-request-effect-reverse-index",
+                ),
+            )?;
+            if stored_effect.fingerprint != fingerprint
+                || stored_effect.reply != stored_request.reply
+            {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "indeterminate-request-effect-identity",
+                ));
+            }
+            if stored_effect.state != StoredEffectState::OutcomeIndeterminate {
+                return Ok(None);
+            }
+            &stored_request.reply
+        } else if let Some(stored_effect) = self.effects.get(&effect_id) {
+            if stored_effect.fingerprint != fingerprint {
+                return Err(GuardianProtocolError::EffectIdentityConflict);
+            }
+            if stored_effect.state != StoredEffectState::OutcomeIndeterminate {
+                return Ok(None);
+            }
+            &stored_effect.reply
+        } else {
+            return Ok(None);
+        };
+
+        if !matches!(
+            self.panes.get(&fingerprint.pane_id),
+            Some(GuardianPaneState::Quarantined {
+                reason: GuardianQuarantineReason::EffectOutcomeIndeterminate,
+                ..
+            })
+        ) {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "indeterminate-effect-without-pane-quarantine",
+            ));
+        }
+        GuardianReply::effect_outcome_indeterminate(request, intended_reply).map(Some)
     }
 
     /// Retire every unambiguous live lease owned by one disconnected mux.
@@ -2988,25 +3336,183 @@ impl GuardianProtocolState {
         }
     }
 
+    /// Journal, authorize, and reconcile one authenticated input write.
+    ///
+    /// For a new identity this method synchronizes `Intent` and then
+    /// `AcceptedNotDurable` inside the protocol's preflight callback. Only
+    /// after the protocol has committed that conservative receipt does the
+    /// supplied writer receive a non-cloneable permit. The writer must consume
+    /// the permit to return a full, exact-prefix, or known-zero completion.
+    /// Writer error or recovered panic is deliberately reduced to the retained
+    /// `AcceptedNotDurable` receipt: it can never roll the sequence back or
+    /// authorize replay. A terminal journal marker is synchronized before the
+    /// same identity-bound permit reconciles the protocol receipt.
+    ///
+    /// Exact request/effect retries return their retained receipt without
+    /// invoking `attempt_write`. A terminal journal record whose protocol
+    /// acknowledgement was lost is reconciled without issuing a new permit.
+    pub fn apply_input_transactionally<E>(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+        journal: &mut GuardianInputJournal,
+        attempt_write: impl FnOnce(
+            GuardianInputWritePermit,
+        ) -> Result<GuardianInputWriteCompletion, E>,
+    ) -> Result<GuardianReply, GuardianInputTransactionError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch.into());
+        }
+        if request.header.operation != GuardianOperation::Input {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            }
+            .into());
+        }
+        let identity = GuardianInputEffectIdentity::from_authenticated_request(request)?;
+        let retained_input_state = match self.effects.get(&identity.effect_id()) {
+            Some(stored) if stored.fingerprint.matches_input_identity(identity) => {
+                let StoredEffectState::Input(state) = stored.state else {
+                    return Err(GuardianProtocolError::StateInvariantViolation(
+                        "input-identity-retained-with-noninput-state",
+                    )
+                    .into());
+                };
+                Some(state)
+            }
+            _ => None,
+        };
+        if let Some(protocol_state) = retained_input_state {
+            let journal_disposition = journal.disposition_for_identity(identity)?;
+            let terminal = journal.terminal_protocol_permit(identity)?;
+            let terminal_state = terminal.as_ref().map(|permit| permit.protocol_state());
+            match (protocol_state, journal_disposition, terminal_state) {
+                (
+                    InputEffectState::AcceptedNotDurable,
+                    GuardianInputDisposition::AcceptedNotDurable,
+                    None,
+                ) => {}
+                (InputEffectState::AcceptedNotDurable, _, Some(_)) => {
+                    terminal
+                        .expect("terminal permit exists after read-only preflight")
+                        .reconcile_protocol(self)?;
+                }
+                (protocol_state, _, Some(journal_state)) if protocol_state == journal_state => {
+                    terminal
+                        .expect("terminal permit exists after read-only preflight")
+                        .reconcile_protocol(self)?;
+                }
+                _ => {
+                    return Err(GuardianProtocolError::StateInvariantViolation(
+                        "input-protocol-journal-disposition-mismatch",
+                    )
+                    .into());
+                }
+            }
+        }
+        let mut write_permit = None;
+        let accepted_or_replay = match self.apply_effect_transaction_inner(request, |_| {
+            GuardianEffectOutcome::from_definite_result((|| {
+                journal.append_intent_and_sync(identity)?;
+                write_permit = journal
+                    .append_acceptance_and_sync(identity)?
+                    .into_first_pty_write_permit();
+                Ok::<(), GuardianInputJournalError>(())
+            })())
+        }) {
+            Ok(reply) => reply,
+            Err(GuardianEffectTransactionError::Protocol(error)) => {
+                return Err(GuardianInputTransactionError::Protocol(error));
+            }
+            Err(GuardianEffectTransactionError::Effect(error)) => {
+                return Err(GuardianInputTransactionError::Journal(error));
+            }
+            Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => {
+                return Err(GuardianInputTransactionError::Protocol(
+                    GuardianProtocolError::StateInvariantViolation(
+                        "input-admission-outcome-indeterminate",
+                    ),
+                ));
+            }
+        };
+
+        if let Some(terminal) = journal.terminal_protocol_permit(identity)? {
+            return terminal.reconcile_protocol(self).map_err(Into::into);
+        }
+        let Some(write_permit) = write_permit else {
+            // Either the protocol returned an exact replay without invoking
+            // the admission callback, or recovery found an already accepted
+            // marker that must remain ambiguous. Neither path may write.
+            if !matches!(
+                accepted_or_replay,
+                GuardianReply::InputReceipt {
+                    state: InputEffectState::AcceptedNotDurable,
+                    ..
+                }
+            ) || journal.disposition_for_identity(identity)?
+                != GuardianInputDisposition::AcceptedNotDurable
+            {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "input-replay-without-matching-journal-disposition",
+                )
+                .into());
+            }
+            return Ok(accepted_or_replay);
+        };
+        if !matches!(
+            accepted_or_replay,
+            GuardianReply::InputReceipt {
+                state: InputEffectState::AcceptedNotDurable,
+                ..
+            }
+        ) {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "input-write-permit-without-accepted-receipt",
+            )
+            .into());
+        }
+
+        let completion = match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| attempt_write(write_permit)),
+        ) {
+            Ok(Ok(completion)) => completion,
+            Ok(Err(error)) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| drop(error)),
+                );
+                return Ok(accepted_or_replay);
+            }
+            Err(_) => return Ok(accepted_or_replay),
+        };
+        let terminal = journal
+            .append_write_completion_and_sync(completion)?
+            .into_terminal_protocol_permit()
+            .ok_or(GuardianProtocolError::StateInvariantViolation(
+                "input-write-completion-without-terminal-permit",
+            ))?;
+        terminal.reconcile_protocol(self).map_err(Into::into)
+    }
+
     /// Fence, execute, and commit one effect-producing request.
     ///
     /// The callback is invoked only for a new effect identity, after authentication,
     /// generation, sequence, capacity, and idempotency validation. Exact request/effect
     /// replays return their original receipt without invoking it. A successful pane transition
-    /// and its new receipts are committed only after the callback returns `Ok(())`. Exhausted
+    /// and its new receipts are committed only after the callback reports `Applied`. Exhausted
     /// generation/sequence counters are the deliberate exception: preflight rejects the effect
     /// and terminally quarantines the pane so wrapped authority can never be revived.
     ///
-    /// A callback error MUST mean that the runtime effect was not externally observable.
-    /// In particular, an input write that may have written any bytes must return `Ok(())` so
-    /// the protocol records `AcceptedNotDurable`; the runtime must then reconcile that exact
-    /// effect through `mark_input_durable_full`, `mark_input_durable_prefix`, or
-    /// `mark_input_known_not_applied`. Blindly treating a partial/ambiguous input write as
-    /// `Err` would make retry duplication possible.
+    /// `DefinitelyNotApplied` restores the pre-effect pane state and leaves the
+    /// identity retryable. `OutcomeIndeterminate` and recovered callback panics
+    /// retain an exact receipt plus a quarantined pane fence, so retries never
+    /// invoke the callback. Input is excluded from this generic surface because
+    /// it has its own durable typed transaction.
     pub fn apply_effect_transactionally<E>(
         &mut self,
         request: &AuthenticatedGuardianRequest,
-        perform_effect: impl FnOnce(&GuardianReply) -> Result<(), E>,
+        perform_effect: impl FnOnce(&GuardianReply) -> GuardianEffectOutcome<E>,
     ) -> Result<GuardianReply, GuardianEffectTransactionError<E>> {
         validate_request_envelope(request)?;
         if request.header.guardian_incarnation != self.incarnation {
@@ -3535,13 +4041,35 @@ impl GuardianProtocolState {
         if request.header.operation == GuardianOperation::Checkpoint {
             self.apply_checkpoint_transactionally(request, |_| Ok::<(), std::convert::Infallible>(()))
                 .map(GuardianReply::CheckpointReceipt)
-        } else if request.header.operation.creates_effect() {
-            match self.apply_effect_transactionally(request, |_| {
-                Ok::<(), std::convert::Infallible>(())
+        } else if request.header.operation == GuardianOperation::Input {
+            // Pure protocol fixtures deliberately bypass the descriptor-backed
+            // journal. Production callers cannot: the public generic effect
+            // surface rejects Input and the typed input transaction owns the
+            // only write permit.
+            match self.apply_effect_transaction_inner(request, |_| {
+                GuardianEffectOutcome::<std::convert::Infallible>::Applied
             }) {
                 Ok(reply) => Ok(reply),
                 Err(GuardianEffectTransactionError::Protocol(error)) => Err(error),
                 Err(GuardianEffectTransactionError::Effect(never)) => match never {},
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => Err(
+                    GuardianProtocolError::StateInvariantViolation(
+                        "pure-input-effect-outcome-indeterminate",
+                    ),
+                ),
+            }
+        } else if request.header.operation.creates_effect() {
+            match self.apply_effect_transactionally(request, |_| {
+                GuardianEffectOutcome::<std::convert::Infallible>::Applied
+            }) {
+                Ok(reply) => Ok(reply),
+                Err(GuardianEffectTransactionError::Protocol(error)) => Err(error),
+                Err(GuardianEffectTransactionError::Effect(never)) => match never {},
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => Err(
+                    GuardianProtocolError::StateInvariantViolation(
+                        "pure-effect-outcome-indeterminate",
+                    ),
+                ),
             }
         } else {
             self.apply_observation(request)
@@ -4033,7 +4561,7 @@ impl GuardianProtocolState {
     fn apply_effect_transaction_inner<E>(
         &mut self,
         request: &AuthenticatedGuardianRequest,
-        perform_effect: impl FnOnce(&GuardianReply) -> Result<(), E>,
+        perform_effect: impl FnOnce(&GuardianReply) -> GuardianEffectOutcome<E>,
     ) -> Result<GuardianReply, GuardianEffectTransactionError<E>> {
         let pane_id = request
             .header
@@ -4047,19 +4575,20 @@ impl GuardianProtocolState {
             .ok_or(GuardianProtocolError::InvalidOperationScope {
                 operation: request.header.operation,
             })?;
-        let fingerprint = EffectFingerprint {
-            operation: request.header.operation,
-            pane_id,
-            mux_incarnation: request.header.mux_incarnation,
-            lease_generation: request.header.lease_generation,
-            lease_sequence: request.header.lease_sequence,
-            payload_bytes: u32::try_from(request.payload.len())
-                .map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
-            payload_sha256: request.header.payload_sha256,
-        };
+        let fingerprint = EffectFingerprint::from_authenticated_request(request)?;
 
         if let Some(stored) = self.requests.get(&request.header.request_id) {
             if stored.fingerprint == fingerprint && stored.effect_id == effect_id {
+                let effect = self.effects.get(&effect_id).ok_or(
+                    GuardianProtocolError::StateInvariantViolation(
+                        "effect-request-replay-reverse-index",
+                    ),
+                )?;
+                if effect.state == StoredEffectState::OutcomeIndeterminate {
+                    return Err(GuardianEffectTransactionError::OutcomeIndeterminate(
+                        stored.reply.clone(),
+                    ));
+                }
                 return Ok(stored.reply.clone());
             }
             return Err(GuardianProtocolError::RequestIdentityConflict.into());
@@ -4068,6 +4597,8 @@ impl GuardianProtocolState {
             if stored.fingerprint == fingerprint {
                 let reply = stored.reply.clone();
                 let disposition_is_pending = stored.state.is_pending();
+                let outcome_is_indeterminate =
+                    stored.state == StoredEffectState::OutcomeIndeterminate;
                 if disposition_is_pending
                     && self
                         .effect_request_ids
@@ -4082,6 +4613,21 @@ impl GuardianProtocolState {
                     .into());
                 }
                 let capacity = self.plan_receipt_capacity(true, false)?;
+                self.requests
+                    .try_reserve(1)
+                    .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+                self.effect_request_ids
+                    .get_mut(&effect_id)
+                    .ok_or(GuardianProtocolError::StateInvariantViolation(
+                        "effect-request-alias-set",
+                    ))?
+                    .try_reserve(1)
+                    .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+                if !disposition_is_pending {
+                    self.transient_request_order
+                        .try_reserve(1)
+                        .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+                }
                 self.commit_receipt_capacity(capacity);
                 self.requests.insert(
                     request.header.request_id,
@@ -4092,34 +4638,139 @@ impl GuardianProtocolState {
                     },
                 );
                 self.effect_request_ids
-                    .entry(effect_id)
-                    .or_default()
+                    .get_mut(&effect_id)
+                    .expect("effect alias set exists after capacity preflight")
                     .insert(request.header.request_id);
                 if !disposition_is_pending {
                     self.transient_request_order
                         .push_back(request.header.request_id);
                 }
+                if outcome_is_indeterminate {
+                    return Err(GuardianEffectTransactionError::OutcomeIndeterminate(reply));
+                }
                 return Ok(reply);
             }
             return Err(GuardianProtocolError::EffectIdentityConflict.into());
         }
+
         let (reply, next_pane_state) =
             self.plan_new_effect(pane_id, effect_id, request)?;
         let capacity = self.plan_receipt_capacity(true, true)?;
+        self.requests
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.effects
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.effect_request_ids
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        if request.header.operation == GuardianOperation::Spawn {
+            self.protected_spawn_requests
+                .try_reserve(1)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+            self.protected_spawn_effects
+                .try_reserve(1)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        } else if request.header.operation != GuardianOperation::Input {
+            self.transient_request_order
+                .try_reserve(1)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+            self.transient_effect_order
+                .try_reserve(1)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        }
+        let mut request_ids = HashSet::new();
+        request_ids
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        request_ids.insert(request.header.request_id);
+        let effect_fingerprint = fingerprint.clone();
+        let effect_reply = reply.clone();
+        let request_reply = reply.clone();
 
-        perform_effect(&reply).map_err(GuardianEffectTransactionError::Effect)?;
+        // BTreeMap cannot reserve a node. Install a conservative quarantine
+        // before invoking the callback: this performs the only possibly
+        // allocating pane insertion for Spawn and leaves a non-retryable fence
+        // if the callback panics. A typed definite failure restores the exact
+        // prior state without allocating.
+        let prior_pane_state = self.panes.get(&pane_id).cloned();
+        let quarantine = GuardianPaneState::Quarantined {
+            generation: next_pane_state.generation(),
+            reason: GuardianQuarantineReason::EffectOutcomeIndeterminate,
+            exit_status: prior_pane_state.as_ref().and_then(|state| match state {
+                GuardianPaneState::ExitedUnclaimed { exit_status, .. } => Some(*exit_status),
+                GuardianPaneState::ClosedTerminal { exit_status, .. }
+                | GuardianPaneState::Quarantined { exit_status, .. } => *exit_status,
+                GuardianPaneState::LiveUnclaimed { .. }
+                | GuardianPaneState::LiveClaimed { .. } => None,
+            }),
+        };
+        if request.header.operation == GuardianOperation::Spawn {
+            if let Some(unexpected_pane_state) = self.panes.insert(pane_id, quarantine) {
+                // `plan_new_effect` established that this pane ID was absent,
+                // and no external callback has run since that preflight.  If
+                // the invariant is ever violated, restore the displaced state
+                // before failing closed.  The key is already present, so this
+                // replacement does not need to allocate a new BTreeMap node.
+                let displaced_quarantine = self.panes.insert(pane_id, unexpected_pane_state);
+                debug_assert!(displaced_quarantine.is_some());
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "spawn-pane-appeared-after-preflight",
+                )
+                .into());
+            }
+        } else {
+            let pane = self.panes.get_mut(&pane_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
+                    "effect-pane-disappeared-after-preflight",
+                ),
+            )?;
+            *pane = quarantine;
+        }
 
-        // The exact eviction set was proven before the callback, but historical receipts
-        // remain untouched until the runtime effect succeeds. Committing the precomputed
-        // plan cannot fail, so a callback error leaves every protocol map and queue intact.
+        let outcome = match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| perform_effect(&reply)),
+        ) {
+            Ok(outcome) => outcome,
+            Err(_) => GuardianEffectOutcome::OutcomeIndeterminate,
+        };
+        let outcome_is_indeterminate = match outcome {
+            GuardianEffectOutcome::Applied => false,
+            GuardianEffectOutcome::OutcomeIndeterminate => true,
+            GuardianEffectOutcome::DefinitelyNotApplied(error) => {
+                if let Some(prior) = prior_pane_state {
+                    *self
+                        .panes
+                        .get_mut(&pane_id)
+                        .expect("existing effect pane remains installed after callback") = prior;
+                } else {
+                    let removed = self.panes.remove(&pane_id);
+                    debug_assert!(removed.is_some());
+                }
+                return Err(GuardianEffectTransactionError::Effect(error));
+            }
+        };
+
+        // Every allocation and the conservative pane fence were completed
+        // before the callback. From here the exact receipt can be committed
+        // without a retryable branch.
         self.commit_receipt_capacity(capacity);
-        self.panes.insert(pane_id, next_pane_state);
+        if !outcome_is_indeterminate {
+            *self
+                .panes
+                .get_mut(&pane_id)
+                .expect("effect pane remains installed after callback") = next_pane_state;
+        }
         self.effects.insert(
             effect_id,
             StoredEffect {
-                fingerprint: fingerprint.clone(),
-                reply: reply.clone(),
-                state: if request.header.operation == GuardianOperation::Input {
+                fingerprint: effect_fingerprint,
+                reply: effect_reply,
+                state: if outcome_is_indeterminate {
+                    StoredEffectState::OutcomeIndeterminate
+                } else if request.header.operation == GuardianOperation::Input {
                     StoredEffectState::Input(InputEffectState::AcceptedNotDurable)
                 } else {
                     StoredEffectState::Applied
@@ -4131,23 +4782,26 @@ impl GuardianProtocolState {
             StoredRequest {
                 fingerprint,
                 effect_id,
-                reply: reply.clone(),
+                reply: request_reply,
             },
         );
-        self.effect_request_ids
-            .entry(effect_id)
-            .or_default()
-            .insert(request.header.request_id);
+        self.effect_request_ids.insert(effect_id, request_ids);
         if request.header.operation == GuardianOperation::Spawn {
             self.protected_spawn_requests
                 .insert(request.header.request_id);
             self.protected_spawn_effects.insert(effect_id);
-        } else if request.header.operation != GuardianOperation::Input {
+        } else if !outcome_is_indeterminate
+            && request.header.operation != GuardianOperation::Input
+        {
             self.transient_request_order
                 .push_back(request.header.request_id);
             self.transient_effect_order.push_back(effect_id);
         }
-        Ok(reply)
+        if outcome_is_indeterminate {
+            Err(GuardianEffectTransactionError::OutcomeIndeterminate(reply))
+        } else {
+            Ok(reply)
+        }
     }
 
     fn plan_new_effect(
@@ -4412,6 +5066,9 @@ impl GuardianProtocolState {
         let mut plan = ReceiptCapacityPlan::default();
         if new_request && self.requests.len() >= self.receipt_capacity {
             let needed = self.requests.len() - self.receipt_capacity + 1;
+            plan.request_ids
+                .try_reserve(needed)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
             for (index, request_id) in self.transient_request_order.iter().enumerate() {
                 if self.requests.contains_key(request_id) && !plan.request_ids.contains(request_id) {
                     plan.request_ids.push(*request_id);
@@ -4427,6 +5084,9 @@ impl GuardianProtocolState {
         }
         if new_effect && self.effects.len() >= self.receipt_capacity {
             let needed = self.effects.len() - self.receipt_capacity + 1;
+            plan.effect_ids
+                .try_reserve(needed)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
             for (index, effect_id) in self.transient_effect_order.iter().enumerate() {
                 if self.effects.contains_key(effect_id) && !plan.effect_ids.contains(effect_id) {
                     plan.effect_ids.push(*effect_id);
@@ -4797,15 +5457,27 @@ fn validate_operation_scope(
     lease_generation: u64,
     lease_sequence: u64,
 ) -> Result<(), GuardianProtocolError> {
-    let pane_required = !matches!(operation, GuardianOperation::Census | GuardianOperation::Hello);
+    let pane_required = !matches!(
+        operation,
+        GuardianOperation::Census
+            | GuardianOperation::Hello
+            | GuardianOperation::GuardedStop
+    );
     let lease_required = operation.requires_lease();
     let effect_required =
         operation.creates_effect() || operation == GuardianOperation::QueryInputEffect;
     let spawn_scope_ok = operation != GuardianOperation::Spawn
         || (lease_generation == 0 && lease_sequence == 0);
-    let observation_scope_ok = !matches!(operation, GuardianOperation::Census | GuardianOperation::Hello)
+    let observation_scope_ok = !matches!(
+        operation,
+        GuardianOperation::Census | GuardianOperation::Hello
+    ) || (pane_id.is_none()
+        && effect_id.is_none()
+        && lease_generation == 0
+        && lease_sequence == 0);
+    let guarded_stop_scope_ok = operation != GuardianOperation::GuardedStop
         || (pane_id.is_none()
-            && effect_id.is_none()
+            && effect_id.is_some()
             && lease_generation == 0
             && lease_sequence == 0);
     let claim_scope_ok = operation != GuardianOperation::Claim || lease_sequence == 0;
@@ -4817,6 +5489,7 @@ fn validate_operation_scope(
             && (lease_generation != 0 || lease_sequence != 0))
         || !spawn_scope_ok
         || !observation_scope_ok
+        || !guarded_stop_scope_ok
         || !claim_scope_ok
         || !sequence_scope_ok
     {
@@ -4890,6 +5563,7 @@ fn validate_request_envelope(
             GuardianCheckpointIntent::decode(&request.payload)?;
         }
         GuardianOperation::Hello
+        | GuardianOperation::GuardedStop
         | GuardianOperation::Claim
         | GuardianOperation::Attach
         | GuardianOperation::Close
@@ -5257,6 +5931,32 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_request_payload_can_be_wiped_or_transferred_without_plain_drop() {
+        let sensitive = b"input-secret-owned-by-the-request-envelope".to_vec();
+        let header = GuardianRequestHeader::new(
+            GuardianOperation::Input,
+            id(1),
+            id(2),
+            id(3),
+            Some(id(4)),
+            1,
+            1,
+            Some(id(5)),
+            &sensitive,
+        );
+        let mut envelope = GuardianRequestEnvelope::new(header, sensitive.clone());
+        assert_eq!(envelope.payload(), sensitive.as_slice());
+
+        let authenticated = authenticate(&envelope);
+        let transferred = authenticated.into_zeroizing_payload();
+        assert_eq!(transferred.as_slice(), sensitive.as_slice());
+
+        envelope.zeroize_payload();
+        assert!(envelope.payload().is_empty());
+        assert_eq!(envelope.header.payload_sha256, Sha256::digest(&sensitive).into());
+    }
+
+    #[test]
     fn checkpoint_intent_is_versioned_fixed_width_canonical_and_content_free() {
         let checkpoint_bytes = [0x41; 32];
         let output_boundary_bytes = [0x52; 32];
@@ -5475,6 +6175,125 @@ mod tests {
     }
 
     #[test]
+    fn guarded_stop_is_authenticated_process_scoped_and_exactly_correlated() {
+        let guardian = id(1);
+        let mux = id(2);
+        let request_id = id(3);
+        let effect_id = id(4);
+        let stop = request(
+            GuardianOperation::GuardedStop,
+            guardian,
+            mux,
+            request_id,
+            None,
+            0,
+            0,
+            Some(effect_id),
+            b"",
+        );
+        let authenticated = authenticate(&stop);
+        let response = GuardianResponseEnvelope::success(
+            &authenticated,
+            &GuardianReply::GuardedStopAccepted,
+        )
+        .unwrap();
+        let response_frame = encode_guardian_response(&secret(), &response).unwrap();
+        let decoded = decode_guardian_response(&secret(), &response_frame).unwrap();
+        let correlated = decoded.clone().correlate(authenticated.header()).unwrap();
+        assert_eq!(
+            correlated.success_reply(&authenticated).unwrap(),
+            GuardianReply::GuardedStopAccepted
+        );
+
+        let different_effect = request(
+            GuardianOperation::GuardedStop,
+            guardian,
+            mux,
+            request_id,
+            None,
+            0,
+            0,
+            Some(id(5)),
+            b"",
+        );
+        assert_eq!(
+            decoded.correlate(authenticate(&different_effect).header()),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+
+        let mut tampered = response_frame;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            decode_guardian_response(&secret(), &tampered),
+            Err(GuardianProtocolError::AuthenticationFailed)
+        );
+
+        for invalid in [
+            request(
+                GuardianOperation::GuardedStop,
+                guardian,
+                mux,
+                id(6),
+                None,
+                0,
+                0,
+                None,
+                b"",
+            ),
+            request(
+                GuardianOperation::GuardedStop,
+                guardian,
+                mux,
+                id(7),
+                Some(id(8)),
+                0,
+                0,
+                Some(id(9)),
+                b"",
+            ),
+            request(
+                GuardianOperation::GuardedStop,
+                guardian,
+                mux,
+                id(10),
+                None,
+                1,
+                0,
+                Some(id(11)),
+                b"",
+            ),
+        ] {
+            assert_eq!(
+                encode_guardian_request(&secret(), &invalid),
+                Err(GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::GuardedStop,
+                })
+            );
+        }
+        let trailing = request(
+            GuardianOperation::GuardedStop,
+            guardian,
+            mux,
+            id(12),
+            None,
+            0,
+            0,
+            Some(id(13)),
+            b"not-empty",
+        );
+        assert_eq!(
+            encode_guardian_request(&secret(), &trailing),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        let owned = GuardianRejectionCode::OwnedPanesPresent;
+        assert_eq!(owned.status(), GuardianResponseStatus::Rejected);
+        assert_eq!(
+            GuardianRejectionCode::decode(owned.status(), &owned.encode()),
+            Ok(owned)
+        );
+    }
+
+    #[test]
     fn failed_runtime_effect_does_not_publish_spawn_or_consume_replay_identity() {
         let sensitive_effect_error = GuardianEffectTransactionError::Effect(
             std::io::Error::other("raw-input-or-dictionary-testable-digest"),
@@ -5499,7 +6318,7 @@ mod tests {
 
         let failed = state.apply_effect_transactionally(&request, |_| {
             invocations.set(invocations.get() + 1);
-            Err("injected spawn failure")
+            GuardianEffectOutcome::DefinitelyNotApplied("injected spawn failure")
         });
         assert!(!format!("{failed:?}").contains("injected spawn failure"));
         assert!(
@@ -5519,7 +6338,7 @@ mod tests {
         let first = state
             .apply_effect_transactionally(&request, |_| {
                 invocations.set(invocations.get() + 1);
-                Ok::<(), &str>(())
+                GuardianEffectOutcome::<&str>::Applied
             })
             .unwrap();
         assert_eq!(invocations.get(), 2);
@@ -5531,7 +6350,7 @@ mod tests {
         let replay = state
             .apply_effect_transactionally(&request, |_| {
                 invocations.set(invocations.get() + 1);
-                Ok::<(), &str>(())
+                GuardianEffectOutcome::<&str>::Applied
             })
             .unwrap();
         assert_eq!(replay, first);
@@ -5543,7 +6362,7 @@ mod tests {
         let alias_reply = state
             .apply_effect_transactionally(&alias, |_| {
                 invocations.set(invocations.get() + 1);
-                Ok::<(), &str>(())
+                GuardianEffectOutcome::<&str>::Applied
             })
             .unwrap();
         assert_eq!(alias_reply, first);
@@ -5552,6 +6371,121 @@ mod tests {
             2,
             "same-effect request alias must not respawn"
         );
+    }
+
+    #[test]
+    fn indeterminate_effect_and_callback_panic_quarantine_exact_identity_without_retry() {
+        let guardian = id(1);
+        let mux = id(2);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+
+        for (pane, request_byte, effect_byte, panic_in_callback) in
+            [(id(40), 41_u8, 42_u8, false), (id(43), 44_u8, 45_u8, true)]
+        {
+            let request = authenticate(&request(
+                GuardianOperation::Spawn,
+                guardian,
+                mux,
+                id(request_byte),
+                Some(pane),
+                0,
+                0,
+                Some(id(effect_byte)),
+                &spawn_payload("indeterminate-effect-fixture"),
+            ));
+            let invocations = std::cell::Cell::new(0_usize);
+            let first = state.apply_effect_transactionally(&request, |_| {
+                invocations.set(invocations.get() + 1);
+                if panic_in_callback {
+                    panic!("injected guardian effect callback panic");
+                }
+                GuardianEffectOutcome::<&str>::OutcomeIndeterminate
+            });
+            let intended_reply = match first {
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(reply)) => reply,
+                other => panic!("expected indeterminate transaction, got {other:?}"),
+            };
+            assert_eq!(invocations.get(), 1);
+            assert_eq!(
+                state.pane_state(pane),
+                Some(&GuardianPaneState::Quarantined {
+                    generation: 0,
+                    reason: GuardianQuarantineReason::EffectOutcomeIndeterminate,
+                    exit_status: None,
+                })
+            );
+            let indeterminate_reply =
+                GuardianReply::effect_outcome_indeterminate(&request, &intended_reply).unwrap();
+            assert_eq!(
+                indeterminate_reply,
+                GuardianReply::EffectOutcomeIndeterminate {
+                    pane_id: pane,
+                    generation: 0,
+                    sequence: 0,
+                    effect_id: id(effect_byte),
+                }
+            );
+            assert_eq!(
+                state.indeterminate_effect_reply(&request).unwrap(),
+                Some(indeterminate_reply.clone())
+            );
+            let response = GuardianResponseEnvelope::reply(&request, &indeterminate_reply).unwrap();
+            assert_eq!(response.header().status, GuardianResponseStatus::Indeterminate);
+            let frame = encode_guardian_response(&secret(), &response).unwrap();
+            let correlated = decode_guardian_response(&secret(), &frame)
+                .unwrap()
+                .correlate(request.header())
+                .unwrap();
+            assert_eq!(
+                correlated.typed_reply(&request).unwrap(),
+                indeterminate_reply
+            );
+            assert_eq!(
+                correlated.success_reply(&request),
+                Err(GuardianProtocolError::NonSuccessResponse)
+            );
+
+            let replay = state.apply_effect_transactionally(&request, |_| {
+                invocations.set(invocations.get() + 1);
+                GuardianEffectOutcome::<&str>::Applied
+            });
+            assert!(matches!(
+                replay,
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_))
+            ));
+            assert_eq!(
+                invocations.get(),
+                1,
+                "an indeterminate exact identity must never invoke the effect again"
+            );
+
+            let mut alias_envelope = request.envelope().clone();
+            alias_envelope.header.request_id = id(effect_byte + 20);
+            let alias = authenticate(&alias_envelope);
+            assert_eq!(
+                state.indeterminate_effect_reply(&alias).unwrap(),
+                Some(
+                    GuardianReply::effect_outcome_indeterminate(&alias, &intended_reply).unwrap()
+                )
+            );
+            assert!(matches!(
+                state.apply_effect_transactionally(&alias, |_| {
+                    invocations.set(invocations.get() + 1);
+                    GuardianEffectOutcome::<&str>::Applied
+                }),
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_))
+            ));
+            assert_eq!(invocations.get(), 1);
+            assert!(state.requests.contains_key(&alias.header().request_id));
+
+            let mut conflicting_envelope = request.envelope().clone();
+            conflicting_envelope.header.effect_id = Some(id(effect_byte + 40));
+            let conflicting = authenticate(&conflicting_envelope);
+            assert_eq!(
+                state.indeterminate_effect_reply(&conflicting),
+                Err(GuardianProtocolError::RequestIdentityConflict)
+            );
+        }
     }
 
     #[test]
@@ -5578,7 +6512,9 @@ mod tests {
             &resize_payload(25, 81),
         ));
         assert!(matches!(
-            state.apply_effect_transactionally(&resize, |_| Err("injected resize failure")),
+            state.apply_effect_transactionally(&resize, |_| {
+                GuardianEffectOutcome::DefinitelyNotApplied("injected resize failure")
+            }),
             Err(GuardianEffectTransactionError::Effect(
                 "injected resize failure"
             ))
@@ -5594,7 +6530,7 @@ mod tests {
         let replay = state
             .apply_effect_transactionally(&authenticate(&claim), |_| {
                 replay_callback_invoked.set(true);
-                Ok::<(), &str>(())
+                GuardianEffectOutcome::<&str>::Applied
             })
             .unwrap();
         assert_eq!(replay, claimed);
@@ -5683,7 +6619,7 @@ mod tests {
         let generic_invocations = std::cell::Cell::new(0_usize);
         let generic = state.apply_effect_transactionally(&authenticated_checkpoint, |_| {
             generic_invocations.set(generic_invocations.get() + 1);
-            Ok::<(), &str>(())
+            GuardianEffectOutcome::<&str>::Applied
         });
         assert!(matches!(
             generic,
@@ -5979,7 +6915,7 @@ mod tests {
             assert!(matches!(
                 state.apply_effect_transactionally(&authenticated_blocked, |_| {
                     blocked_callbacks.set(blocked_callbacks.get() + 1);
-                    Ok::<(), &str>(())
+                    GuardianEffectOutcome::<&str>::Applied
                 }),
                 Err(GuardianEffectTransactionError::Protocol(
                     GuardianProtocolError::CheckpointOutcomeIndeterminate
@@ -8505,7 +9441,7 @@ mod tests {
         assert!(matches!(
             state.apply_effect_transactionally(&authenticate(&input), |_| {
                 stale_retry_callback.set(true);
-                Ok::<(), std::convert::Infallible>(())
+                GuardianEffectOutcome::<std::convert::Infallible>::Applied
             }),
             Err(GuardianEffectTransactionError::Protocol(
                 GuardianProtocolError::RepeatedSequence {

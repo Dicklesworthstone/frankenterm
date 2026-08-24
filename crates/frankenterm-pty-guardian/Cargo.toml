@@ -1,0 +1,40 @@
+[package]
+name = "frankenterm-pty-guardian"
+description = "Opt-in standalone Unix PTY lifetime guardian for FrankenTerm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "pty", "multiplexer"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[[bin]]
+name = "frankenterm-pty-guardian"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+getrandom.workspace = true
+libc.workspace = true
+mio = { workspace = true, features = ["net", "os-ext", "os-poll"] }
+mux.workspace = true
+nix = { workspace = true, features = ["fs", "process", "signal", "user"] }
+portable-pty = { workspace = true, features = ["serde_support"] }
+rustix.workspace = true
+sha2.workspace = true
+uuid = { workspace = true, features = ["rng", "v4"] }
+
+[dev-dependencies]
+tempfile.workspace = true

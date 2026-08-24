@@ -22,11 +22,13 @@ use codec::{
     ReliableInputSchedulerPressureV1, ReliableKeyEventKindV1, ReliableKeyEventOutcomeV1,
     ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventTracedV1,
     ReliableKeyEventV1, ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1,
-    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
-    SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SendPasteTracedV1,
-    SetActiveWorkspace, SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
-    SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
-    TabTitleChanged, ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
+    ReliablePaneWriteOutcomeV1, ReliablePaneWriteRejectionV1, ReliablePaneWriteRetryV1,
+    ReliablePaneWriteV1, ReliablePaneWriteV1Response, RemoveFloatingPane, RenameWorkspace, Resize,
+    SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp,
+    SendMouseEvent, SendPaste, SendPasteTracedV1, SetActiveWorkspace, SetClientId,
+    SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
+    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
+    ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
@@ -53,7 +55,7 @@ use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::{
     ClientOperationGuard, CurrentPane, Mux, PaneOperationGuard, PaneRegistrationHandle,
-    ReliableInputClaimOutcome, ReliableInputKeyKind,
+    ReliableInputAppliedEffect, ReliableInputClaimOutcome, ReliableInputKeyKind,
 };
 #[cfg(test)]
 use promise::spawn::block_on;
@@ -329,6 +331,22 @@ fn reliable_input_scheduler_rejection(
     }
 }
 
+fn reliable_pane_write_scheduler_rejection(
+    outcome: MainThreadReservationOutcome,
+) -> ReliablePaneWriteOutcomeV1 {
+    match reliable_input_scheduler_rejection(outcome) {
+        ReliableKeyEventOutcomeV1::Retry(retry) => ReliablePaneWriteOutcomeV1::Retry(
+            ReliablePaneWriteRetryV1::Input(retry),
+        ),
+        ReliableKeyEventOutcomeV1::Rejected(rejection) => {
+            ReliablePaneWriteOutcomeV1::Rejected(ReliablePaneWriteRejectionV1::Input(rejection))
+        }
+        ReliableKeyEventOutcomeV1::Applied | ReliableKeyEventOutcomeV1::DuplicateApplied => {
+            unreachable!("scheduler rejection cannot report applied input")
+        }
+    }
+}
+
 fn reliable_key_response(request: &ReliableKeyEventV1, outcome: ReliableKeyEventOutcomeV1) -> Pdu {
     Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
         pane_id: request.pane_id,
@@ -337,14 +355,19 @@ fn reliable_key_response(request: &ReliableKeyEventV1, outcome: ReliableKeyEvent
     })
 }
 
-fn reliable_input_claim_outcome(
+fn reliable_key_claim_outcome(
     outcome: ReliableInputClaimOutcome,
 ) -> Result<mux::ReliableInputCommitPermit, ReliableKeyEventOutcomeV1> {
     match outcome {
         ReliableInputClaimOutcome::Execute(permit) => Ok(permit),
-        ReliableInputClaimOutcome::DuplicateApplied => {
+        ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent) => {
             Err(ReliableKeyEventOutcomeV1::DuplicateApplied)
         }
+        ReliableInputClaimOutcome::DuplicateApplied(
+            ReliableInputAppliedEffect::PaneWritePrefix { .. },
+        ) => Err(ReliableKeyEventOutcomeV1::Rejected(
+            ReliableKeyEventRejectionV1::IdentityConflict,
+        )),
         ReliableInputClaimOutcome::DuplicatePending => Err(ReliableKeyEventOutcomeV1::Retry(
             ReliableKeyEventRetryV1::DuplicatePending {
                 retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
@@ -375,6 +398,72 @@ fn reliable_input_claim_outcome(
             ReliableKeyEventRejectionV1::StaleSerial,
         )),
         ReliableInputClaimOutcome::IdentityConflict => Err(ReliableKeyEventOutcomeV1::Rejected(
+            ReliableKeyEventRejectionV1::IdentityConflict,
+        )),
+    }
+}
+
+fn reliable_pane_write_response(
+    pane_id: PaneId,
+    input_serial: InputSerial,
+    outcome: ReliablePaneWriteOutcomeV1,
+) -> Pdu {
+    Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+        pane_id,
+        input_serial,
+        outcome,
+    })
+}
+
+fn reliable_pane_write_claim_outcome(
+    outcome: ReliableInputClaimOutcome,
+) -> Result<mux::ReliableInputCommitPermit, ReliablePaneWriteOutcomeV1> {
+    let input_rejection = |rejection| {
+        ReliablePaneWriteOutcomeV1::Rejected(ReliablePaneWriteRejectionV1::Input(rejection))
+    };
+    match outcome {
+        ReliableInputClaimOutcome::Execute(permit) => Ok(permit),
+        ReliableInputClaimOutcome::DuplicateApplied(
+            ReliableInputAppliedEffect::PaneWritePrefix { bytes },
+        ) => match u32::try_from(bytes) {
+            Ok(bytes) => Err(ReliablePaneWriteOutcomeV1::DuplicateAppliedPrefix { bytes }),
+            Err(_) => Err(ReliablePaneWriteOutcomeV1::Indeterminate),
+        },
+        ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent) => {
+            Err(input_rejection(
+                ReliableKeyEventRejectionV1::IdentityConflict,
+            ))
+        }
+        ReliableInputClaimOutcome::DuplicatePending => {
+            Err(ReliablePaneWriteOutcomeV1::Retry(
+                ReliablePaneWriteRetryV1::Input(ReliableKeyEventRetryV1::DuplicatePending {
+                    retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                }),
+            ))
+        }
+        ReliableInputClaimOutcome::OutcomeUnknown => {
+            Err(ReliablePaneWriteOutcomeV1::Indeterminate)
+        }
+        ReliableInputClaimOutcome::ClientNotRegistered
+        | ReliableInputClaimOutcome::ClientRegistrationRetired => {
+            Err(ReliablePaneWriteOutcomeV1::Retry(
+                ReliablePaneWriteRetryV1::Input(
+                    ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                        retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                    },
+                ),
+            ))
+        }
+        ReliableInputClaimOutcome::ClientLedgerUnavailable => Err(input_rejection(
+            ReliableKeyEventRejectionV1::ClientLedgerUnavailable,
+        )),
+        ReliableInputClaimOutcome::IdentityAuthorityExhausted => Err(input_rejection(
+            ReliableKeyEventRejectionV1::IdentityAuthorityExhausted,
+        )),
+        ReliableInputClaimOutcome::StaleSerial => {
+            Err(input_rejection(ReliableKeyEventRejectionV1::StaleSerial))
+        }
+        ReliableInputClaimOutcome::IdentityConflict => Err(input_rejection(
             ReliableKeyEventRejectionV1::IdentityConflict,
         )),
     }
@@ -7382,6 +7471,231 @@ impl SessionHandler {
                 );
             }
 
+            Pdu::ReliablePaneWriteV1(request) => {
+                let pane_id = request.pane_id;
+                let input_serial = request.input_serial;
+                let pane_authority = match request_authority.capture_pane(pane_id) {
+                    Ok(authority) => authority,
+                    Err(_) => {
+                        send_response(Ok(reliable_pane_write_response(
+                            pane_id,
+                            input_serial,
+                            ReliablePaneWriteOutcomeV1::Rejected(
+                                ReliablePaneWriteRejectionV1::Input(
+                                    ReliableKeyEventRejectionV1::PaneUnavailable,
+                                ),
+                            ),
+                        )));
+                        return;
+                    }
+                };
+                let registration = pane_authority.registration();
+                let current_pane_registration =
+                    ReliablePaneRegistrationIdentityV1::from_bytes(registration.wire_identity());
+                match request.pane_registration {
+                    None => {
+                        send_response(Ok(reliable_pane_write_response(
+                            pane_id,
+                            input_serial,
+                            ReliablePaneWriteOutcomeV1::Retry(
+                                ReliablePaneWriteRetryV1::Input(
+                                    ReliableKeyEventRetryV1::PaneAuthorityRequired {
+                                        pane_registration: current_pane_registration,
+                                    },
+                                ),
+                            ),
+                        )));
+                        return;
+                    }
+                    Some(expected) if expected != current_pane_registration => {
+                        send_response(Ok(reliable_pane_write_response(
+                            pane_id,
+                            input_serial,
+                            ReliablePaneWriteOutcomeV1::Rejected(
+                                ReliablePaneWriteRejectionV1::Input(
+                                    ReliableKeyEventRejectionV1::PaneRegistrationMismatch,
+                                ),
+                            ),
+                        )));
+                        return;
+                    }
+                    Some(_) => {}
+                }
+                let (request_authority, pane_operation) = pane_authority.into_parts();
+                let Some(client) = request_authority.client() else {
+                    send_response(Ok(reliable_pane_write_response(
+                        pane_id,
+                        input_serial,
+                        ReliablePaneWriteOutcomeV1::Retry(ReliablePaneWriteRetryV1::Input(
+                            ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                                retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                            },
+                        )),
+                    )));
+                    return;
+                };
+                let data: Arc<[u8]> = request.data.into();
+                let claim = request_authority.claim_reliable_pane_write_guarded(
+                    client,
+                    &registration,
+                    input_serial.get(),
+                    data.as_ref(),
+                );
+                let mut permit = match reliable_pane_write_claim_outcome(claim) {
+                    Ok(permit) => permit,
+                    Err(outcome) => {
+                        send_response(Ok(reliable_pane_write_response(
+                            pane_id,
+                            input_serial,
+                            outcome,
+                        )));
+                        return;
+                    }
+                };
+                let reservation = match try_reserve_main_thread(
+                    MainThreadServiceClass::Input,
+                    main_thread_rpc_estimated_bytes(data.len()),
+                ) {
+                    MainThreadReservationOutcome::Reserved(reservation) => reservation,
+                    rejected => {
+                        let outcome = reliable_pane_write_scheduler_rejection(rejected);
+                        drop(permit);
+                        send_response(Ok(reliable_pane_write_response(
+                            pane_id,
+                            input_serial,
+                            outcome,
+                        )));
+                        return;
+                    }
+                };
+                let sender = self.to_write_tx.clone();
+                let per_pane = self.per_pane_for_registration(&registration);
+                #[cfg(test)]
+                let force_begin_side_effect_failure =
+                    self.reliable_input_test_fault == ReliableInputTestFault::BeginSideEffectFalse;
+                #[cfg(not(test))]
+                let force_begin_side_effect_failure = false;
+                #[cfg(test)]
+                let force_commit_applied_failure =
+                    self.reliable_input_test_fault == ReliableInputTestFault::CommitAppliedFalse;
+                #[cfg(not(test))]
+                let force_commit_applied_failure = false;
+                #[cfg(test)]
+                let cancel_after_enqueue =
+                    self.reliable_input_test_fault == ReliableInputTestFault::CancelAfterEnqueue;
+                #[cfg(not(test))]
+                let cancel_after_enqueue = false;
+                let spawned = reservation.spawn_local(async move {
+                    let outcome = match request_authority.ensure_effect_admitted() {
+                        Err(_) => ReliablePaneWriteOutcomeV1::Retry(
+                            ReliablePaneWriteRetryV1::Input(
+                                ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                                    retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                                },
+                            ),
+                        ),
+                        Ok(()) if request_authority.client().is_none() => {
+                            ReliablePaneWriteOutcomeV1::Retry(ReliablePaneWriteRetryV1::Input(
+                                ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                                    retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                                },
+                            ))
+                        }
+                        Ok(())
+                            if force_begin_side_effect_failure
+                                || !permit.begin_side_effect() =>
+                        {
+                            ReliablePaneWriteOutcomeV1::Indeterminate
+                        }
+                        Ok(()) => {
+                            let callback = pane_operation.with_current_pane(|pane| {
+                                catch_recoverable(
+                                    RecoverablePanicSite::MuxPaneCallback,
+                                    AssertUnwindSafe(|| pane.write_once(&data)),
+                                )
+                            });
+                            match callback {
+                                Ok(Ok(bytes)) if bytes > 0 && bytes <= data.len() => {
+                                    if force_commit_applied_failure
+                                        || !permit.commit_pane_write_applied_prefix(bytes)
+                                    {
+                                        ReliablePaneWriteOutcomeV1::Indeterminate
+                                    } else {
+                                        match u32::try_from(bytes) {
+                                            Ok(bytes) => {
+                                                ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes }
+                                            }
+                                            Err(_) => ReliablePaneWriteOutcomeV1::Indeterminate,
+                                        }
+                                    }
+                                }
+                                Ok(Ok(0)) => {
+                                    if permit.commit_definitely_not_applied() {
+                                        ReliablePaneWriteOutcomeV1::Retry(
+                                            ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+                                                retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                                            },
+                                        )
+                                    } else {
+                                        ReliablePaneWriteOutcomeV1::Indeterminate
+                                    }
+                                }
+                                Ok(Ok(bytes)) => {
+                                    log::warn!(
+                                        "reliable pane writer returned invalid applied prefix {bytes} for {} admitted bytes",
+                                        data.len()
+                                    );
+                                    ReliablePaneWriteOutcomeV1::Indeterminate
+                                }
+                                Ok(Err(error)) => {
+                                    log::warn!(
+                                        "reliable pane writer rejected an exact request without applying bytes: {error}"
+                                    );
+                                    if permit.commit_definitely_not_applied() {
+                                        ReliablePaneWriteOutcomeV1::Rejected(
+                                            ReliablePaneWriteRejectionV1::DefinitelyNotApplied,
+                                        )
+                                    } else {
+                                        ReliablePaneWriteOutcomeV1::Indeterminate
+                                    }
+                                }
+                                Err(_panic) => {
+                                    log::warn!(
+                                        "reliable pane writer panicked after invocation; quarantining its identity"
+                                    );
+                                    ReliablePaneWriteOutcomeV1::Indeterminate
+                                }
+                            }
+                        }
+                    };
+                    let applied = matches!(
+                        outcome,
+                        ReliablePaneWriteOutcomeV1::AppliedPrefix { .. }
+                    );
+                    send_response(Ok(reliable_pane_write_response(
+                        pane_id,
+                        input_serial,
+                        outcome,
+                    )));
+                    if applied {
+                        let _ = registration.try_with_current(|pane| {
+                            push_input_dispatch_changes_after_committed_input(
+                                &pane,
+                                sender,
+                                per_pane,
+                                input_serial,
+                                "reliable-pane-write",
+                            );
+                        });
+                    }
+                });
+                if cancel_after_enqueue {
+                    drop(spawned);
+                    return;
+                }
+                spawned.detach();
+            }
+
             Pdu::ReliableKeyEventV1(request) => {
                 let pane_authority = match request_authority.capture_pane(request.pane_id) {
                     Ok(authority) => authority,
@@ -7452,7 +7766,7 @@ impl SessionHandler {
                     mux_kind,
                     &request.event,
                 );
-                let mut permit = match reliable_input_claim_outcome(claim) {
+                let mut permit = match reliable_key_claim_outcome(claim) {
                     Ok(permit) => permit,
                     Err(outcome) => {
                         send_response(Ok(reliable_key_response(&request, outcome)));
@@ -7564,7 +7878,7 @@ impl SessionHandler {
                                     match callback {
                                         Ok(Ok(()))
                                             if !force_commit_applied_failure
-                                                && permit.commit_applied() =>
+                                                && permit.commit_key_applied() =>
                                         {
                                             if let (
                                                 Some(producer),
@@ -8549,6 +8863,7 @@ impl SessionHandler {
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
             | Pdu::GetPaneTieredScrollbackStatusesV1Response { .. }
             | Pdu::ReliableKeyEventV1Response { .. }
+            | Pdu::ReliablePaneWriteV1Response { .. }
             | Pdu::ErrorResponse { .. }) => {
                 let _ = unexpected;
                 send_response(Err(MuxServerRejection::invalid_request().into()));
@@ -10262,6 +10577,400 @@ mod tests {
     }
 
     #[test]
+    fn reliable_pane_write_partial_ack_loss_replays_prefix_without_a_second_write() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new_with_id(7_120, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register reliable pane-write test pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        handler.process_one(DecodedPdu {
+            serial: 1,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("reliable-pane-partial", 41_120),
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(take_response(&captured).pdu, Pdu::UnitResponse(UnitResponse {}));
+
+        let mut request = ReliablePaneWriteV1 {
+            pane_id: pane.pane_id(),
+            pane_registration: None,
+            input_serial: InputSerial::from_millis_since_epoch(120),
+            data: b"abcdef".to_vec(),
+        };
+        handler.process_one(DecodedPdu {
+            serial: 2,
+            pdu: Pdu::ReliablePaneWriteV1(request.clone()),
+        });
+        let authority = take_response(&captured);
+        let Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+            outcome:
+                ReliablePaneWriteOutcomeV1::Retry(ReliablePaneWriteRetryV1::Input(
+                    ReliableKeyEventRetryV1::PaneAuthorityRequired { pane_registration },
+                )),
+            ..
+        }) = authority.pdu
+        else {
+            panic!("first pane-write request must probe exact pane authority");
+        };
+        request.pane_registration = Some(pane_registration);
+        pane.set_writer_behavior(FakePaneWriteBehavior::ApplyPrefix(3));
+
+        handler.process_one(DecodedPdu {
+            serial: 3,
+            pdu: Pdu::ReliablePaneWriteV1(request.clone()),
+        });
+        tick_until_response(&executor, &captured, 1);
+        drain_simple_executor(&executor);
+        {
+            let mut responses = captured.lock().unwrap();
+            assert!(responses.iter().any(|response| {
+                response.serial == 3
+                    && matches!(
+                        &response.pdu,
+                        Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                            outcome: ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 3 },
+                            ..
+                        })
+                    )
+            }));
+            responses.clear();
+        }
+        assert_eq!(pane.writer_calls(), 1);
+        assert_eq!(pane.written_bytes(), b"abc");
+
+        // Model loss of response serial 3: the client retries the exact request.
+        handler.process_one(DecodedPdu {
+            serial: 4,
+            pdu: Pdu::ReliablePaneWriteV1(request.clone()),
+        });
+        let replay = take_response(&captured);
+        assert!(matches!(
+            replay.pdu,
+            Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                outcome: ReliablePaneWriteOutcomeV1::DuplicateAppliedPrefix { bytes: 3 },
+                ..
+            })
+        ));
+        assert_eq!(pane.writer_calls(), 1, "ACK replay must not invoke Write again");
+        assert_eq!(pane.written_bytes(), b"abc");
+
+        let mut wrong_registration = request;
+        wrong_registration.input_serial = InputSerial::from_millis_since_epoch(121);
+        wrong_registration.pane_registration = Some(
+            ReliablePaneRegistrationIdentityV1::from_bytes([0x77; 16]),
+        );
+        handler.process_one(DecodedPdu {
+            serial: 5,
+            pdu: Pdu::ReliablePaneWriteV1(wrong_registration),
+        });
+        assert!(matches!(
+            take_response(&captured).pdu,
+            Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                outcome: ReliablePaneWriteOutcomeV1::Rejected(
+                    ReliablePaneWriteRejectionV1::Input(
+                        ReliableKeyEventRejectionV1::PaneRegistrationMismatch
+                    )
+                ),
+                ..
+            })
+        ));
+        assert_eq!(pane.writer_calls(), 1);
+    }
+
+    #[test]
+    fn reliable_pane_write_zero_error_and_panic_have_distinct_retry_authority() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new_with_id(7_121, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register reliable pane-write outcome pane");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("capture exact pane-write authority");
+        let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes(
+            registration.wire_identity(),
+        );
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        handler.process_one(DecodedPdu {
+            serial: 1,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("reliable-pane-outcomes", 41_121),
+                is_proxy: false,
+            }),
+        });
+        take_response(&captured);
+
+        let request = ReliablePaneWriteV1 {
+            pane_id: pane.pane_id(),
+            pane_registration: Some(pane_registration),
+            input_serial: InputSerial::from_millis_since_epoch(130),
+            data: b"retry-me".to_vec(),
+        };
+        pane.set_writer_behavior(FakePaneWriteBehavior::Zero);
+        handler.process_one(DecodedPdu {
+            serial: 2,
+            pdu: Pdu::ReliablePaneWriteV1(request.clone()),
+        });
+        tick_until_response(&executor, &captured, 1);
+        assert!(matches!(
+            take_response(&captured).pdu,
+            Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                outcome: ReliablePaneWriteOutcomeV1::Retry(
+                    ReliablePaneWriteRetryV1::DefinitelyNotApplied { .. }
+                ),
+                ..
+            })
+        ));
+        assert_eq!(pane.writer_calls(), 1);
+        assert!(pane.written_bytes().is_empty());
+
+        pane.set_writer_behavior(FakePaneWriteBehavior::ApplyAll);
+        handler.process_one(DecodedPdu {
+            serial: 3,
+            pdu: Pdu::ReliablePaneWriteV1(request),
+        });
+        tick_until_response(&executor, &captured, 1);
+        drain_simple_executor(&executor);
+        {
+            let mut responses = captured.lock().unwrap();
+            assert!(responses.iter().any(|response| {
+                response.serial == 3
+                    && matches!(
+                        &response.pdu,
+                        Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                            outcome: ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 8 },
+                            ..
+                        })
+                    )
+            }));
+            responses.clear();
+        }
+        assert_eq!(pane.writer_calls(), 2);
+        assert_eq!(pane.written_bytes(), b"retry-me");
+
+        let error_request = ReliablePaneWriteV1 {
+            input_serial: InputSerial::from_millis_since_epoch(131),
+            data: b"error".to_vec(),
+            pane_id: pane.pane_id(),
+            pane_registration: Some(pane_registration),
+        };
+        pane.set_writer_behavior(FakePaneWriteBehavior::Error);
+        handler.process_one(DecodedPdu {
+            serial: 4,
+            pdu: Pdu::ReliablePaneWriteV1(error_request),
+        });
+        tick_until_response(&executor, &captured, 1);
+        assert!(matches!(
+            take_response(&captured).pdu,
+            Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                outcome: ReliablePaneWriteOutcomeV1::Rejected(
+                    ReliablePaneWriteRejectionV1::DefinitelyNotApplied
+                ),
+                ..
+            })
+        ));
+        assert_eq!(pane.writer_calls(), 3);
+        assert_eq!(pane.written_bytes(), b"retry-me");
+
+        let panic_request = ReliablePaneWriteV1 {
+            input_serial: InputSerial::from_millis_since_epoch(132),
+            data: b"panic".to_vec(),
+            pane_id: pane.pane_id(),
+            pane_registration: Some(pane_registration),
+        };
+        pane.set_writer_behavior(FakePaneWriteBehavior::Panic);
+        handler.process_one(DecodedPdu {
+            serial: 5,
+            pdu: Pdu::ReliablePaneWriteV1(panic_request.clone()),
+        });
+        tick_until_response(&executor, &captured, 1);
+        assert!(matches!(
+            take_response(&captured).pdu,
+            Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                outcome: ReliablePaneWriteOutcomeV1::Indeterminate,
+                ..
+            })
+        ));
+        assert_eq!(pane.writer_calls(), 4);
+
+        pane.set_writer_behavior(FakePaneWriteBehavior::ApplyAll);
+        handler.process_one(DecodedPdu {
+            serial: 6,
+            pdu: Pdu::ReliablePaneWriteV1(panic_request),
+        });
+        assert!(matches!(
+            take_response(&captured).pdu,
+            Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                outcome: ReliablePaneWriteOutcomeV1::Indeterminate,
+                ..
+            })
+        ));
+        assert_eq!(pane.writer_calls(), 4, "ambiguous panic must quarantine replay");
+    }
+
+    #[test]
+    fn reliable_pane_write_cancel_before_effect_allows_exact_retry() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new_with_id(7_122, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux).expect("register cancellation pane");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("capture cancellation pane authority");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        handler.process_one(DecodedPdu {
+            serial: 1,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("reliable-pane-cancel", 41_122),
+                is_proxy: false,
+            }),
+        });
+        take_response(&captured);
+        let request = ReliablePaneWriteV1 {
+            pane_id: pane.pane_id(),
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes(
+                registration.wire_identity(),
+            )),
+            input_serial: InputSerial::from_millis_since_epoch(140),
+            data: b"cancel-safe".to_vec(),
+        };
+
+        handler.reliable_input_test_fault = ReliableInputTestFault::CancelAfterEnqueue;
+        handler.process_one(DecodedPdu {
+            serial: 2,
+            pdu: Pdu::ReliablePaneWriteV1(request.clone()),
+        });
+        assert!(captured.lock().unwrap().is_empty());
+        assert_eq!(pane.writer_calls(), 0);
+        assert_eq!(executor.queue_snapshot().depth, 1);
+        assert!(executor
+            .try_tick()
+            .expect("cancelled pane-write runnable must remain serviceable"));
+        assert_eq!(executor.queue_snapshot().depth, 0);
+
+        handler.reliable_input_test_fault = ReliableInputTestFault::None;
+        handler.process_one(DecodedPdu {
+            serial: 3,
+            pdu: Pdu::ReliablePaneWriteV1(request),
+        });
+        tick_until_response(&executor, &captured, 1);
+        drain_simple_executor(&executor);
+        assert!(captured.lock().unwrap().iter().any(|response| {
+            response.serial == 3
+                && matches!(
+                    &response.pdu,
+                    Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                        outcome: ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 11 },
+                        ..
+                    })
+                )
+        }));
+        assert_eq!(pane.writer_calls(), 1);
+        assert_eq!(pane.written_bytes(), b"cancel-safe");
+    }
+
+    #[test]
+    fn reliable_pane_write_saturation_retries_exact_identity_without_effect() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let blocker = match try_spawn_with_admission(
+            MainThreadServiceClass::Topology,
+            4 * 1024,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected test blocker admission, got {outcome:?}"),
+        };
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new_with_id(7_123, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux).expect("register saturation pane");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("capture saturation pane authority");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        handler.process_one(DecodedPdu {
+            serial: 1,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("reliable-pane-saturation", 41_123),
+                is_proxy: false,
+            }),
+        });
+        take_response(&captured);
+        let request = ReliablePaneWriteV1 {
+            pane_id: pane.pane_id(),
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes(
+                registration.wire_identity(),
+            )),
+            input_serial: InputSerial::from_millis_since_epoch(150),
+            data: b"saturated".to_vec(),
+        };
+
+        handler.process_one(DecodedPdu {
+            serial: 2,
+            pdu: Pdu::ReliablePaneWriteV1(request.clone()),
+        });
+        assert!(matches!(
+            take_response(&captured).pdu,
+            Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                outcome: ReliablePaneWriteOutcomeV1::Retry(
+                    ReliablePaneWriteRetryV1::Input(ReliableKeyEventRetryV1::SchedulerFull(_))
+                ),
+                ..
+            })
+        ));
+        assert_eq!(pane.writer_calls(), 0);
+
+        drop(blocker);
+        assert!(executor.try_tick().unwrap());
+        handler.process_one(DecodedPdu {
+            serial: 3,
+            pdu: Pdu::ReliablePaneWriteV1(request),
+        });
+        tick_until_response(&executor, &captured, 1);
+        drain_simple_executor(&executor);
+        assert!(captured.lock().unwrap().iter().any(|response| {
+            response.serial == 3
+                && matches!(
+                    &response.pdu,
+                    Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                        outcome: ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 9 },
+                        ..
+                    })
+                )
+        }));
+        assert_eq!(pane.writer_calls(), 1);
+        assert_eq!(pane.written_bytes(), b"saturated");
+    }
+
+    #[test]
     fn server_trace_dispatch_retirement_records_no_pair_or_key_side_effect() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
@@ -10415,6 +11124,44 @@ mod tests {
         lines: Vec<Line>,
     }
 
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum FakePaneWriteBehavior {
+        #[default]
+        ApplyAll,
+        ApplyPrefix(usize),
+        Zero,
+        Error,
+        Panic,
+    }
+
+    #[derive(Default)]
+    struct FakePaneWriter {
+        behavior: FakePaneWriteBehavior,
+        calls: usize,
+        applied: Vec<u8>,
+    }
+
+    impl std::io::Write for FakePaneWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.calls = self.calls.saturating_add(1);
+            let applied = match self.behavior {
+                FakePaneWriteBehavior::ApplyAll => data.len(),
+                FakePaneWriteBehavior::ApplyPrefix(maximum) => data.len().min(maximum),
+                FakePaneWriteBehavior::Zero => 0,
+                FakePaneWriteBehavior::Error => {
+                    return Err(std::io::Error::other("injected pane-writer rejection"));
+                }
+                FakePaneWriteBehavior::Panic => panic!("injected pane-writer panic"),
+            };
+            self.applied.extend_from_slice(&data[..applied]);
+            Ok(applied)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct FakePane {
         pane_id: PaneId,
         state: Mutex<FakePaneState>,
@@ -10427,14 +11174,7 @@ mod tests {
         tiered_scrollback_status_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         seqno_on_dimensions: Option<SequenceNo>,
         cursor_line_start_override: Option<StableRowIndex>,
-        // Writer sink for the Pane::writer() trait obligation. FakePane
-        // has no PTY; bytes written here are discarded. Keeping a real
-        // writable buffer behind a parking_lot mutex (rather than
-        // panicking via unimplemented!) means tests that exercise
-        // writer() — e.g., paste handlers, scripted-input drivers —
-        // don't crash the test binary on a code path that's
-        // semantically a no-op for a fake pane. (br-ft-35yac.3)
-        writer_sink: ParkingMutex<std::io::Sink>,
+        writer_sink: ParkingMutex<FakePaneWriter>,
         mux_registration: Arc<mux::PaneRegistrationSlot>,
     }
 
@@ -10453,7 +11193,7 @@ mod tests {
                 tiered_scrollback_status_probe: None,
                 seqno_on_dimensions: None,
                 cursor_line_start_override: None,
-                writer_sink: ParkingMutex::new(std::io::sink()),
+                writer_sink: ParkingMutex::new(FakePaneWriter::default()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 changed_lines: Mutex::new(RangeSet::new()),
                 changed_since_seqnos: Mutex::new(Vec::new()),
@@ -10537,6 +11277,18 @@ mod tests {
 
         fn paste_count(&self) -> usize {
             self.paste_count.load(Ordering::Relaxed)
+        }
+
+        fn set_writer_behavior(&self, behavior: FakePaneWriteBehavior) {
+            self.writer_sink.lock().behavior = behavior;
+        }
+
+        fn writer_calls(&self) -> usize {
+            self.writer_sink.lock().calls
+        }
+
+        fn written_bytes(&self) -> Vec<u8> {
+            self.writer_sink.lock().applied.clone()
         }
     }
 
@@ -10639,13 +11391,8 @@ mod tests {
         }
 
         fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
-            // Discarding sink: FakePane has no underlying PTY, so any
-            // bytes written are dropped on the floor. This replaces a
-            // prior `unimplemented!()` panic-bomb (br-ft-35yac.3) so
-            // test code that walks Pane::writer() without first
-            // checking the pane's class doesn't crash the test binary.
-            ParkingMutexGuard::map(self.writer_sink.lock(), |sink| {
-                let writer: &mut dyn std::io::Write = sink;
+            ParkingMutexGuard::map(self.writer_sink.lock(), |writer| {
+                let writer: &mut dyn std::io::Write = writer;
                 writer
             })
         }

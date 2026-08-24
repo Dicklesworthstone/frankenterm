@@ -25,7 +25,6 @@ use portable_pty::{
     native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem,
 };
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -525,10 +524,7 @@ impl LocalDomain {
         let port = serial_domain.port.as_ref().unwrap_or(&serial_domain.name);
         let mut serial = portable_pty::serial::SerialTty::new(&port);
         if let Some(baud) = serial_domain.baud {
-            let baud_u32: u32 = baud
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("baud rate {} exceeds u32::MAX", baud))?;
-            serial.set_baud_rate(baud_u32);
+            serial.set_baud_rate(baud);
         }
         let pty_system = Box::new(serial);
         Ok(Self::with_pty_system_and_configuration(
@@ -1324,8 +1320,10 @@ mod tests {
         let serial = SerialDomain {
             name: "provenance-serial".to_string(),
             port: Some("provenance-test-port".to_string()),
-            baud: Some(38_400),
+            baud: Some(u32::MAX),
         };
+        let exact_backend_baud: u32 = serial.baud.expect("test baud is present");
+        assert_eq!(exact_backend_baud, u32::MAX);
         let runtime = LocalDomain::new_serial_domain(serial.clone())?;
         assert!(!runtime.is_configuration_owned());
         assert!(!runtime.matches_serial_configuration(&serial));

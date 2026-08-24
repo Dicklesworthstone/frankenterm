@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, MutexGuard};
+use zeroize::Zeroizing;
 
 pub mod delivery_ledger;
 pub mod delivery_scheduler;
@@ -76,6 +77,7 @@ const LIVE_SCROLLBACK_APPEND_WAL_RECORD_DIGEST_DOMAIN: &[u8] =
 const LIVE_SCROLLBACK_APPEND_WAL_TARGET_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.live-scrollback-append-wal-target.v1\0";
 const LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const LIVE_SCROLLBACK_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const LIVE_SCROLLBACK_MUTATION_LOCK_NAME: &str = ".mutation-lock.v3";
 
 fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
@@ -1078,6 +1080,34 @@ struct LiveScrollbackManifestPublishError {
     source: anyhow::Error,
 }
 
+#[derive(Debug)]
+struct LiveScrollbackAppendWalPublishError {
+    outcome_indeterminate: bool,
+    source: anyhow::Error,
+}
+
+impl LiveScrollbackAppendWalPublishError {
+    fn outcome_indeterminate(&self) -> bool {
+        self.outcome_indeterminate
+    }
+}
+
+impl std::fmt::Display for LiveScrollbackAppendWalPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.outcome_indeterminate {
+            formatter.write_str("scrollback append WAL publication outcome is indeterminate")
+        } else {
+            formatter.write_str("scrollback append WAL was not published")
+        }
+    }
+}
+
+impl std::error::Error for LiveScrollbackAppendWalPublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 impl LiveScrollbackManifestPublishError {
     fn before_publication(source: anyhow::Error) -> Self {
         Self {
@@ -1535,6 +1565,7 @@ impl LiveScrollbackSpillSink {
                 && wal.target_record_count != 0
                 && wal.target_record_count <= wal.max_retained_rows
                 && wal.target_retained_record_bytes != 0
+                && wal.target_record_count <= wal.target_retained_record_bytes
                 && wal.target_retained_record_bytes
                     <= LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES,
             "append WAL target retention bounds are invalid"
@@ -1607,6 +1638,500 @@ impl LiveScrollbackSpillSink {
                 &Self::append_wal_authentication_bytes(wal)?,
             )
             .context("authenticate exact-row append WAL")
+    }
+
+    fn append_wal_matches_predecessor_manifest(
+        wal: &LiveScrollbackAppendWalV1,
+        manifest: &LiveScrollbackManifestV1,
+    ) -> anyhow::Result<bool> {
+        let generation = live_scrollback_manifest_generation(manifest)?;
+        Ok(manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3
+            && manifest.publication_state == "complete"
+            && manifest.manifest_sha256 == wal.predecessor_manifest_sha256
+            && generation
+                == Some((
+                    decode_live_scrollback_epoch(
+                        &wal.predecessor_content_epoch,
+                        "append WAL predecessor epoch",
+                    )?,
+                    wal.predecessor_revision,
+                ))
+            && Self::manifest_ledger_pane_id(manifest)? == wal.ledger_pane_id)
+    }
+
+    fn append_wal_matches_target_manifest(
+        wal: &LiveScrollbackAppendWalV1,
+        manifest: &LiveScrollbackManifestV1,
+    ) -> anyhow::Result<bool> {
+        let target_epoch = decode_live_scrollback_epoch(
+            &wal.target_content_epoch,
+            "append WAL target epoch",
+        )?;
+        let predecessor_epoch = decode_live_scrollback_epoch(
+            &wal.predecessor_content_epoch,
+            "append WAL predecessor epoch",
+        )?;
+        Ok(manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3
+            && manifest.publication_state == "complete"
+            && live_scrollback_manifest_generation(manifest)?
+                == Some((target_epoch, wal.target_revision))
+            && live_scrollback_manifest_predecessor(manifest)?
+                == Some(wezterm_term::config::ScrollbackSnapshotGeneration::new(
+                    predecessor_epoch,
+                    wal.predecessor_revision,
+                ))
+            && Self::manifest_ledger_pane_id(manifest)? == wal.ledger_pane_id
+            && manifest.initial_stable_row == Some(wal.initial_stable_row)
+            && manifest.newest_stable_row_exclusive == Some(wal.newest_stable_row_exclusive)
+            && manifest.max_retained_rows == wal.max_retained_rows
+            && manifest.oldest_seq == Some(wal.target_oldest_sequence)
+            && manifest.retained_rows == wal.target_record_count
+            && manifest.next_seq == wal.target_next_sequence
+            && manifest.retained_record_bytes == Some(wal.target_retained_record_bytes))
+    }
+
+    fn verify_append_wal_target_store(
+        wal: &LiveScrollbackAppendWalV1,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            store.oldest_seq(wal.ledger_pane_id) == Some(wal.target_oldest_sequence)
+                && store.next_seq(wal.ledger_pane_id)? == wal.target_next_sequence
+                && u64::try_from(store.line_count(wal.ledger_pane_id))?
+                    == wal.target_record_count,
+            "append WAL target ledger range mismatch"
+        );
+        let (digest, retained_record_bytes) = live_scrollback_append_wal_target_digest(
+            wal,
+            |sequence| {
+                store
+                    .line_at(wal.ledger_pane_id, sequence)?
+                    .ok_or_else(|| anyhow::anyhow!("append WAL target row is missing"))
+            },
+        )?;
+        anyhow::ensure!(
+            digest
+                == decode_live_scrollback_canonical_digest(
+                    &wal.target_record_set_sha256,
+                    "append WAL target record-set digest",
+                )?
+                && retained_record_bytes == wal.target_retained_record_bytes
+                && store.retained_record_bytes(wal.ledger_pane_id)
+                    == wal.target_retained_record_bytes,
+            "append WAL target ledger digest or byte count mismatch"
+        );
+        Ok(())
+    }
+
+    fn reconcile_authenticated_append_wal(
+        wal: &LiveScrollbackAppendWalV1,
+        manifest: &LiveScrollbackManifestV1,
+        store: &mut frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        keyring: &guardian_output_keys::GuardianOutputKeyring,
+        durable_pane_id: [u8; 16],
+    ) -> anyhow::Result<Option<LiveScrollbackSpillState>> {
+        Self::validate_append_wal_identity(wal, durable_pane_id)?;
+        Self::authenticate_append_wal(wal, keyring)?;
+
+        if Self::append_wal_matches_target_manifest(wal, manifest)? {
+            Self::verify_append_wal_target_store(wal, store)?;
+            Self::verify_logical_ledger_digest_from_store(
+                manifest,
+                wal.ledger_pane_id,
+                store,
+            )
+            .context("bind consumed append WAL to its authenticated target manifest")?;
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            Self::append_wal_matches_predecessor_manifest(wal, manifest)?,
+            "append WAL does not follow the published manifest"
+        );
+
+        let observed_next = store.next_seq(wal.ledger_pane_id)?;
+        match observed_next.cmp(&wal.appended_sequence) {
+            std::cmp::Ordering::Equal => {
+                Self::verify_logical_ledger_digest_from_store(
+                    manifest,
+                    wal.ledger_pane_id,
+                    store,
+                )
+                .context("verify append WAL predecessor ledger before recovery")?;
+                let appended = store
+                    .append_line(wal.ledger_pane_id, &wal.encrypted_record)
+                    .context("recover append WAL exact row")?;
+                anyhow::ensure!(
+                    appended == wal.appended_sequence,
+                    "append WAL recovery wrote the wrong sequence"
+                );
+            }
+            std::cmp::Ordering::Greater => {
+                anyhow::ensure!(
+                    observed_next == wal.target_next_sequence
+                        && store.line_at(wal.ledger_pane_id, wal.appended_sequence)?.as_deref()
+                            == Some(wal.encrypted_record.as_str()),
+                    "append WAL recovery found conflicting synchronized content"
+                );
+            }
+            std::cmp::Ordering::Less => {
+                anyhow::bail!("append WAL recovery found a gap before its target sequence");
+            }
+        }
+
+        let observed_oldest = store
+            .oldest_seq(wal.ledger_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("append WAL recovery ledger is unexpectedly empty"))?;
+        anyhow::ensure!(
+            observed_oldest <= wal.target_oldest_sequence,
+            "append WAL recovery ledger pruned beyond its authenticated target"
+        );
+        if observed_oldest < wal.target_oldest_sequence {
+            store
+                .prune_before(wal.ledger_pane_id, wal.target_oldest_sequence)
+                .context("recover append WAL retention cut")?;
+        }
+        Self::verify_append_wal_target_store(wal, store)?;
+        let target_epoch = decode_live_scrollback_epoch(
+            &wal.target_content_epoch,
+            "append WAL target epoch",
+        )?;
+        Self::validate_persisted_records(
+            store,
+            wal.ledger_pane_id,
+            keyring,
+            durable_pane_id,
+            target_epoch,
+            wal.initial_stable_row,
+            true,
+        )?;
+        let predecessor_epoch = decode_live_scrollback_epoch(
+            &wal.predecessor_content_epoch,
+            "append WAL predecessor epoch",
+        )?;
+        Ok(Some(LiveScrollbackSpillState {
+            initial_stable_row: Some(wal.initial_stable_row),
+            newest_stable_row_exclusive: Some(wal.newest_stable_row_exclusive),
+            max_retained_rows: usize::try_from(wal.max_retained_rows)?,
+            content_epoch: target_epoch,
+            revision: wal.target_revision,
+            authenticated_manifest: true,
+            predecessor_generation: Some(
+                wezterm_term::config::ScrollbackSnapshotGeneration::new(
+                    predecessor_epoch,
+                    wal.predecessor_revision,
+                ),
+            ),
+            clear_manifest_published: false,
+            clear_pending_physical_reclamation: false,
+            transaction_quarantined: false,
+        }))
+    }
+
+    fn prepare_authenticated_append_wal(
+        &self,
+        predecessor_manifest: &LiveScrollbackManifestV1,
+        previous_state: LiveScrollbackSpillState,
+        proposed_state: LiveScrollbackSpillState,
+        ledger_pane_id: u64,
+        stable_row: wezterm_term::StableRowIndex,
+        desired_sequence: u64,
+        max_retained_rows: usize,
+        encrypted_record: &str,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ) -> anyhow::Result<LiveScrollbackAppendWalV1> {
+        anyhow::ensure!(
+            predecessor_manifest.publication_state == "complete"
+                && predecessor_manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3
+                && Self::manifest_ledger_pane_id(predecessor_manifest)? == ledger_pane_id
+                && live_scrollback_manifest_generation(predecessor_manifest)?
+                    == Some((previous_state.content_epoch, previous_state.revision)),
+            "append WAL predecessor manifest does not match live state"
+        );
+        Self::verify_logical_ledger_digest_from_store(
+            predecessor_manifest,
+            ledger_pane_id,
+            store,
+        )?;
+        anyhow::ensure!(
+            store.next_seq(ledger_pane_id)? == desired_sequence,
+            "append WAL must be prepared at the exact next sequence"
+        );
+        let current_record_count = u64::try_from(store.line_count(ledger_pane_id))?;
+        anyhow::ensure!(
+            current_record_count != 0,
+            "first-row publication must use the prepared-manifest protocol"
+        );
+        let target_next_sequence = desired_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("append WAL target sequence is exhausted"))?;
+        let max_retained_rows_u64 = u64::try_from(max_retained_rows)?;
+        let target_record_count = current_record_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("append WAL target row count overflows"))?
+            .min(max_retained_rows_u64);
+        anyhow::ensure!(target_record_count != 0, "append WAL retention is empty");
+        let target_oldest_sequence = target_next_sequence
+            .checked_sub(target_record_count)
+            .ok_or_else(|| anyhow::anyhow!("append WAL target range underflows"))?;
+        let initial_stable_row = proposed_state
+            .initial_stable_row
+            .ok_or_else(|| anyhow::anyhow!("append WAL target has no stable-row origin"))?;
+        let newest_stable_row_exclusive = proposed_state
+            .newest_stable_row_exclusive
+            .ok_or_else(|| anyhow::anyhow!("append WAL target has no stable-row endpoint"))?;
+        let mut wal = LiveScrollbackAppendWalV1 {
+            schema: LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1.to_string(),
+            durable_pane_id: uuid::Uuid::from_bytes(self.durable_pane_id)
+                .simple()
+                .to_string(),
+            ledger_pane_id,
+            predecessor_content_epoch: hex::encode(previous_state.content_epoch),
+            predecessor_revision: previous_state.revision,
+            predecessor_manifest_sha256: predecessor_manifest.manifest_sha256.clone(),
+            target_content_epoch: hex::encode(proposed_state.content_epoch),
+            target_revision: proposed_state.revision,
+            initial_stable_row,
+            newest_stable_row_exclusive,
+            appended_stable_row: stable_row,
+            appended_sequence: desired_sequence,
+            max_retained_rows: max_retained_rows_u64,
+            target_oldest_sequence,
+            target_next_sequence,
+            target_record_count,
+            target_retained_record_bytes: 0,
+            encrypted_record_bytes: u64::try_from(encrypted_record.len())?,
+            encrypted_record_sha256: hex::encode(live_scrollback_append_wal_record_digest(
+                encrypted_record,
+            )?),
+            target_record_set_sha256: String::new(),
+            encrypted_record: encrypted_record.to_string(),
+            guardian_authentication: None,
+            wal_sha256: String::new(),
+        };
+        let (target_digest, target_retained_record_bytes) =
+            live_scrollback_append_wal_target_digest(&wal, |sequence| {
+                if sequence == desired_sequence {
+                    Ok(encrypted_record.to_string())
+                } else {
+                    store
+                        .line_at(ledger_pane_id, sequence)?
+                        .ok_or_else(|| anyhow::anyhow!("append WAL predecessor row is missing"))
+                }
+            })?;
+        wal.target_record_set_sha256 = hex::encode(target_digest);
+        wal.target_retained_record_bytes = target_retained_record_bytes;
+        // Authentication is intentionally absent until every other canonical
+        // field is frozen. Validate the non-auth fields with a private marker,
+        // then remove it before sealing the canonical authentication bytes.
+        wal.guardian_authentication = Some("pending".to_string());
+        Self::validate_append_wal_identity(&wal, self.durable_pane_id)?;
+        wal.guardian_authentication = None;
+        let canonical = Self::append_wal_authentication_bytes(&wal)?;
+        let mut keyring = self
+            .lock_keyring("prepare append WAL authentication")
+            .map_err(anyhow::Error::new)?;
+        let cipher = keyring
+            .latest_active_cipher()
+            .context("load guardian append-WAL authentication key")?;
+        wal.guardian_authentication = Some(
+            cipher
+                .authenticate_scrollback_append_wal(&canonical)
+                .context("authenticate append WAL target")?
+                .encode(),
+        );
+        Self::validate_append_wal_identity(&wal, self.durable_pane_id)?;
+        wal.wal_sha256 = Self::append_wal_checksum(&wal)?;
+        Ok(wal)
+    }
+
+    fn persist_authenticated_append_wal(
+        &self,
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> Result<(), LiveScrollbackAppendWalPublishError> {
+        let mut publication_attempted = false;
+        let result = (|| -> anyhow::Result<()> {
+            Self::validate_append_wal_identity(wal, self.durable_pane_id)?;
+            {
+                let keyring = self
+                    .lock_keyring("persist append WAL authentication")
+                    .map_err(anyhow::Error::new)?;
+                Self::authenticate_append_wal(wal, &keyring)?;
+            }
+            anyhow::ensure!(
+                wal.wal_sha256 == Self::append_wal_checksum(wal)?,
+                "append WAL checksum changed before publication"
+            );
+            let active_path = Self::append_wal_path(&self.manifest_path)?;
+            let stage_path = Self::append_wal_stage_path(&self.manifest_path)?;
+            let parent = active_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("append WAL path has no parent"))?;
+
+            if let Some(active) = Self::read_append_wal(&active_path)? {
+                let manifest = Self::read_manifest(&self.manifest_path)?
+                    .ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
+                {
+                    let keyring = self
+                        .lock_keyring("replace consumed append WAL authentication")
+                        .map_err(anyhow::Error::new)?;
+                    Self::validate_append_wal_identity(&active, self.durable_pane_id)?;
+                    Self::authenticate_append_wal(&active, &keyring)?;
+                }
+                anyhow::ensure!(
+                    Self::append_wal_matches_target_manifest(&active, &manifest)?,
+                    "refusing to replace an unconsumed append WAL"
+                );
+                let store = self
+                    .lock_store("replace consumed append WAL target")
+                    .map_err(anyhow::Error::new)?;
+                Self::verify_append_wal_target_store(&active, &store)?;
+                Self::verify_logical_ledger_digest_from_store(
+                    &manifest,
+                    active.ledger_pane_id,
+                    &store,
+                )
+                .context("bind consumed append WAL before bounded-slot replacement")?;
+            }
+
+            let mut bytes = serde_json::to_vec_pretty(wal)?;
+            bytes.push(b'\n');
+            anyhow::ensure!(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                    <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+                "append WAL serialization exceeds its byte ceiling"
+            );
+            let stage_is_exact = match Self::read_append_wal(&stage_path) {
+                Ok(Some(staged)) => {
+                    anyhow::ensure!(
+                        staged == *wal,
+                        "deterministic append WAL stage belongs to another transaction"
+                    );
+                    true
+                }
+                Ok(None) => false,
+                Err(_)
+                    if Self::append_wal_stage_is_recoverably_incomplete(&stage_path)? =>
+                {
+                    false
+                }
+                Err(error) => return Err(error),
+            };
+            if stage_is_exact {
+                let path_metadata = std::fs::symlink_metadata(&stage_path)?;
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                let file = options.open(&stage_path)?;
+                let handle_metadata = file.metadata()?;
+                anyhow::ensure!(
+                    path_metadata.file_type().is_file()
+                        && path_metadata.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
+                        && handle_metadata.is_file()
+                        && handle_metadata.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+                    "opened exact append WAL stage is not a bounded regular file"
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+
+                    anyhow::ensure!(
+                        handle_metadata.dev() == path_metadata.dev()
+                            && handle_metadata.ino() == path_metadata.ino(),
+                        "exact append WAL stage changed identity before synchronization"
+                    );
+                }
+                file.sync_all()?;
+            } else {
+                let stage_exists = std::fs::symlink_metadata(&stage_path).is_ok();
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true).write(true);
+                let expected_stage_metadata = if stage_exists {
+                    Some(std::fs::symlink_metadata(&stage_path)?)
+                } else {
+                    None
+                };
+                if !stage_exists {
+                    options.create_new(true);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+
+                    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                }
+                let mut file = options.open(&stage_path).with_context(|| {
+                    format!("open deterministic append WAL stage {}", stage_path.display())
+                })?;
+                anyhow::ensure!(
+                    file.metadata()?.is_file(),
+                    "opened append WAL stage is not a regular file"
+                );
+                if let Some(expected) = expected_stage_metadata {
+                    let observed = file.metadata()?;
+                    anyhow::ensure!(
+                        expected.file_type().is_file()
+                            && expected.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+                        "incomplete append WAL stage is not a bounded regular file"
+                    );
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+                        let parent_metadata = std::fs::symlink_metadata(parent)?;
+                        anyhow::ensure!(
+                            expected.permissions().mode() & 0o077 == 0
+                                && expected.nlink() == 1
+                                && expected.uid() == parent_metadata.uid()
+                                && observed.dev() == expected.dev()
+                                && observed.ino() == expected.ino(),
+                            "incomplete append WAL stage changed identity before rewrite"
+                        );
+                        let path_metadata = std::fs::symlink_metadata(&stage_path)?;
+                        anyhow::ensure!(
+                            path_metadata.file_type().is_file()
+                                && path_metadata.dev() == observed.dev()
+                                && path_metadata.ino() == observed.ino(),
+                            "incomplete append WAL stage changed path before rewrite"
+                        );
+                    }
+                    // Do not truncate during path resolution: only the exact
+                    // private, single-link inode pinned above may be rewritten.
+                    file.set_len(0)?;
+                }
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+            }
+            anyhow::ensure!(
+                Self::read_append_wal(&stage_path)?.as_ref() == Some(wal),
+                "deterministic append WAL stage changed before publication"
+            );
+            #[cfg(not(windows))]
+            std::fs::File::open(parent)?.sync_all()?;
+
+            publication_attempted = true;
+            std::fs::rename(&stage_path, &active_path).with_context(|| {
+                format!("publish append WAL {}", active_path.display())
+            })?;
+            #[cfg(not(windows))]
+            std::fs::File::open(parent)?.sync_all()?;
+            let published = Self::read_append_wal(&active_path)?
+                .ok_or_else(|| anyhow::anyhow!("published append WAL disappeared"))?;
+            anyhow::ensure!(published == *wal, "published append WAL changed");
+            let keyring = self
+                .lock_keyring("acknowledge append WAL authentication")
+                .map_err(anyhow::Error::new)?;
+            Self::authenticate_append_wal(&published, &keyring)?;
+            Ok(())
+        })();
+        result.map_err(|source| LiveScrollbackAppendWalPublishError {
+            outcome_indeterminate: publication_attempted,
+            source,
+        })
     }
 
     fn manifest_ledger_pane_id(manifest: &LiveScrollbackManifestV1) -> anyhow::Result<u64> {
@@ -2095,9 +2620,37 @@ impl LiveScrollbackSpillSink {
             Some(_) => store.open_existing_pane(ledger_pane_id)?,
             None => store.ensure_pane(ledger_pane_id)?,
         }
+        let append_wal_path = Self::append_wal_path(&manifest_path)?;
+        let append_wal_stage_path = Self::append_wal_stage_path(&manifest_path)?;
+        let active_append_wal = Self::read_append_wal(&append_wal_path)?;
+        if let Some(wal) = active_append_wal.as_ref() {
+            let published_manifest = persisted_manifest.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("scrollback append WAL has no published predecessor manifest")
+            })?;
+            let keyring_guard = keyring
+                .lock()
+                .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
+            Self::validate_append_wal_identity(wal, context.durable_pane_id)?;
+            Self::authenticate_append_wal(wal, &keyring_guard)?;
+            anyhow::ensure!(
+                Self::append_wal_matches_predecessor_manifest(wal, published_manifest)?
+                    || Self::append_wal_matches_target_manifest(wal, published_manifest)?,
+                "active append WAL is not adjacent to the published manifest"
+            );
+        }
         if authenticated_manifest {
             let stage_path = Self::deterministic_manifest_stage_path(&manifest_path)?;
-            if let Some(staged_manifest) = Self::read_manifest(&stage_path)? {
+            let retained_manifest_stage = match Self::read_manifest(&stage_path) {
+                Ok(stage) => stage,
+                Err(error) if Self::manifest_stage_is_recoverably_incomplete(&stage_path)? => {
+                    log::warn!(
+                        "retaining a securely pinned incomplete scrollback manifest stage for deterministic recovery: {error}"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(staged_manifest) = retained_manifest_stage {
                 if staged_manifest.publication_state == "complete" {
                     validate_live_scrollback_manifest_identity(
                         &staged_manifest,
@@ -2240,7 +2793,148 @@ impl LiveScrollbackSpillSink {
                 }
             }
         }
-        let (state, repair_manifest_publication) = match persisted_manifest {
+        let mut wal_recovered_state = match (
+            active_append_wal.as_ref(),
+            persisted_manifest.as_ref(),
+        ) {
+            (Some(wal), Some(manifest)) => {
+                let keyring_guard = keyring
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
+                Self::reconcile_authenticated_append_wal(
+                    wal,
+                    manifest,
+                    &mut store,
+                    &keyring_guard,
+                    context.durable_pane_id,
+                )?
+            }
+            (Some(_), None) => {
+                anyhow::bail!("scrollback append WAL has no published predecessor manifest")
+            }
+            (None, _) => None,
+        };
+
+        if wal_recovered_state.is_some() {
+            anyhow::ensure!(
+                std::fs::symlink_metadata(&append_wal_stage_path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "an unconsumed append WAL conflicts with a second staged transaction"
+            );
+        } else {
+            let staged_append_wal = match Self::read_append_wal(&append_wal_stage_path) {
+                Ok(wal) => wal,
+                Err(error)
+                    if Self::append_wal_stage_is_recoverably_incomplete(
+                        &append_wal_stage_path,
+                    )? =>
+                {
+                    let authoritative_state_is_intact = match persisted_manifest.as_ref() {
+                        Some(manifest)
+                            if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 =>
+                        {
+                            Self::verify_logical_ledger_digest_from_store(
+                                manifest,
+                                ledger_pane_id,
+                                &store,
+                            )
+                            .is_ok()
+                        }
+                        None => {
+                            store.line_count(ledger_pane_id) == 0
+                                && store.oldest_seq(ledger_pane_id).is_none()
+                                && store.next_seq(ledger_pane_id)? == 0
+                        }
+                        _ => false,
+                    };
+                    anyhow::ensure!(
+                        authoritative_state_is_intact,
+                        "an incomplete append WAL stage accompanies non-authoritative ledger state: {error}"
+                    );
+                    log::warn!(
+                        "ignoring a securely pinned incomplete scrollback append-WAL stage; no ledger mutation was authorized"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(staged_wal) = staged_append_wal {
+                let published_manifest = persisted_manifest.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("staged scrollback append WAL has no predecessor manifest")
+                })?;
+                {
+                    let keyring_guard = keyring
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
+                    Self::validate_append_wal_identity(&staged_wal, context.durable_pane_id)?;
+                    Self::authenticate_append_wal(&staged_wal, &keyring_guard)?;
+                    if let Some(active_wal) = active_append_wal.as_ref() {
+                        anyhow::ensure!(
+                            Self::append_wal_matches_target_manifest(
+                                active_wal,
+                                published_manifest,
+                            )?,
+                            "staged append WAL conflicts with an unconsumed active transaction"
+                        );
+                        Self::verify_append_wal_target_store(active_wal, &store)?;
+                        Self::verify_logical_ledger_digest_from_store(
+                            published_manifest,
+                            active_wal.ledger_pane_id,
+                            &store,
+                        )
+                        .context("bind consumed append WAL before staged successor recovery")?;
+                    }
+                    anyhow::ensure!(
+                        Self::append_wal_matches_predecessor_manifest(
+                            &staged_wal,
+                            published_manifest,
+                        )? || Self::append_wal_matches_target_manifest(
+                            &staged_wal,
+                            published_manifest,
+                        )?,
+                        "staged append WAL is not adjacent to the published generation"
+                    );
+                }
+                match std::fs::rename(&append_wal_stage_path, &append_wal_path) {
+                    Ok(()) => {}
+                    Err(rename_error) => {
+                        let observed = Self::read_append_wal(&append_wal_path)?;
+                        anyhow::ensure!(
+                            observed.as_ref() == Some(&staged_wal),
+                            "publish retained append WAL stage: {rename_error}"
+                        );
+                    }
+                }
+                #[cfg(not(windows))]
+                std::fs::File::open(
+                    append_wal_path.parent().ok_or_else(|| {
+                        anyhow::anyhow!("scrollback append WAL has no parent")
+                    })?,
+                )?
+                .sync_all()?;
+                let published_wal = Self::read_append_wal(&append_wal_path)?
+                    .ok_or_else(|| anyhow::anyhow!("published append WAL disappeared"))?;
+                anyhow::ensure!(
+                    published_wal == staged_wal,
+                    "published append WAL changed during acknowledgement"
+                );
+                let keyring_guard = keyring
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
+                wal_recovered_state = Self::reconcile_authenticated_append_wal(
+                    &published_wal,
+                    published_manifest,
+                    &mut store,
+                    &keyring_guard,
+                    context.durable_pane_id,
+                )?;
+            }
+        }
+
+        let (state, repair_manifest_publication) = if let Some(state) = wal_recovered_state {
+            (state, Some("complete"))
+        } else {
+            match persisted_manifest {
             Some(manifest) => {
                 let persisted_generation = live_scrollback_manifest_generation(&manifest)
                     .with_context(|| {
@@ -2496,6 +3190,7 @@ impl LiveScrollbackSpillSink {
                 }
                 (LiveScrollbackSpillState::empty(content_epoch, true), None)
             }
+            }
         };
         let sink = Self {
             pane_id,
@@ -2533,7 +3228,7 @@ impl LiveScrollbackSpillSink {
         if !path_metadata_before.file_type().is_file() {
             anyhow::bail!("scrollback manifest is not a regular file: {}", path.display());
         }
-        if path_metadata_before.len() > 1024 * 1024 {
+        if path_metadata_before.len() > LIVE_SCROLLBACK_MANIFEST_MAX_BYTES {
             anyhow::bail!("scrollback manifest exceeds 1 MiB: {}", path.display());
         }
         #[cfg(unix)]
@@ -2580,10 +3275,13 @@ impl LiveScrollbackSpillSink {
             }
         }
         let mut bytes = Vec::new();
-        (&file).take(1024 * 1024 + 1)
+        (&file)
+            .take(LIVE_SCROLLBACK_MANIFEST_MAX_BYTES.saturating_add(1))
             .read_to_end(&mut bytes)
             .with_context(|| format!("read scrollback manifest {}", path.display()))?;
-        if bytes.len() > 1024 * 1024 {
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+            > LIVE_SCROLLBACK_MANIFEST_MAX_BYTES
+        {
             anyhow::bail!("scrollback manifest exceeds 1 MiB: {}", path.display());
         }
         let handle_metadata_after = file
@@ -2619,6 +3317,338 @@ impl LiveScrollbackSpillSink {
             anyhow::bail!("scrollback manifest checksum failed at {}", path.display());
         }
         Ok(Some(manifest))
+    }
+
+    fn read_append_wal(
+        path: &std::path::Path,
+    ) -> anyhow::Result<Option<LiveScrollbackAppendWalV1>> {
+        let path_metadata_before = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect scrollback append WAL {}", path.display()));
+            }
+        };
+        anyhow::ensure!(
+            path_metadata_before.file_type().is_file(),
+            "scrollback append WAL is not a regular file: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            path_metadata_before.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+            "scrollback append WAL exceeds its byte ceiling: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+            let parent = path.parent().ok_or_else(|| {
+                anyhow::anyhow!("scrollback append WAL path has no parent")
+            })?;
+            let parent_metadata = std::fs::symlink_metadata(parent)?;
+            anyhow::ensure!(
+                path_metadata_before.permissions().mode() & 0o077 == 0
+                    && path_metadata_before.nlink() == 1
+                    && path_metadata_before.uid() == parent_metadata.uid(),
+                "scrollback append WAL is not private: {}",
+                path.display()
+            );
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("open scrollback append WAL {}", path.display()))?;
+        let handle_metadata_before = file
+            .metadata()
+            .with_context(|| format!("inspect opened scrollback append WAL {}", path.display()))?;
+        anyhow::ensure!(
+            handle_metadata_before.is_file(),
+            "opened scrollback append WAL is not a regular file: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            anyhow::ensure!(
+                handle_metadata_before.dev() == path_metadata_before.dev()
+                    && handle_metadata_before.ino() == path_metadata_before.ino(),
+                "scrollback append WAL changed identity before read: {}",
+                path.display()
+            );
+        }
+        let mut bytes = Vec::new();
+        (&file)
+            .take(LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read scrollback append WAL {}", path.display()))?;
+        anyhow::ensure!(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+            "scrollback append WAL exceeds its byte ceiling: {}",
+            path.display()
+        );
+        let handle_metadata_after = file.metadata().with_context(|| {
+            format!("reinspect opened scrollback append WAL {}", path.display())
+        })?;
+        anyhow::ensure!(
+            !filesystem_metadata_changed(&handle_metadata_before, &handle_metadata_after)?,
+            "scrollback append WAL changed while being read: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let path_metadata_after = std::fs::symlink_metadata(path)?;
+            anyhow::ensure!(
+                path_metadata_after.file_type().is_file()
+                    && path_metadata_after.dev() == handle_metadata_before.dev()
+                    && path_metadata_after.ino() == handle_metadata_before.ino(),
+                "scrollback append WAL changed identity during read: {}",
+                path.display()
+            );
+        }
+        let wal: LiveScrollbackAppendWalV1 = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode scrollback append WAL {}", path.display()))?;
+        anyhow::ensure!(
+            wal.wal_sha256.len() == 64
+                && wal
+                    .wal_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                && wal.wal_sha256 == Self::append_wal_checksum(&wal)?,
+            "scrollback append WAL checksum failed at {}",
+            path.display()
+        );
+        Ok(Some(wal))
+    }
+
+    /// A deterministic stage is not authoritative until its complete,
+    /// authenticated bytes are renamed to the active WAL slot. A crash may
+    /// leave a short/invalid JSON prefix here. Accept only a securely pinned,
+    /// private regular file as a recoverably incomplete stage; unsafe path
+    /// types and metadata still fail closed.
+    fn append_wal_stage_is_recoverably_incomplete(
+        path: &std::path::Path,
+    ) -> anyhow::Result<bool> {
+        let path_metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            path_metadata.file_type().is_file()
+                && path_metadata.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+            "incomplete append WAL stage is not a bounded regular file"
+        );
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("append WAL stage has no parent"))?;
+            let parent_metadata = std::fs::symlink_metadata(parent)?;
+            anyhow::ensure!(
+                path_metadata.permissions().mode() & 0o077 == 0
+                    && path_metadata.nlink() == 1
+                    && path_metadata.uid() == parent_metadata.uid(),
+                "incomplete append WAL stage is not private"
+            );
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        let handle_metadata = file.metadata()?;
+        anyhow::ensure!(handle_metadata.is_file(), "append WAL stage handle is not a file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            anyhow::ensure!(
+                handle_metadata.dev() == path_metadata.dev()
+                    && handle_metadata.ino() == path_metadata.ino(),
+                "incomplete append WAL stage changed identity"
+            );
+        }
+        Ok(true)
+    }
+
+    /// A deterministic manifest stage is not authoritative until its complete
+    /// bytes have passed checksum and guardian authentication and are renamed
+    /// over the published manifest. A crash may leave an arbitrary prefix in
+    /// this bounded slot. Only a private, single-link regular inode owned by
+    /// the surrounding capability directory is safe to retain and rewrite.
+    fn manifest_stage_is_recoverably_incomplete(
+        path: &std::path::Path,
+    ) -> anyhow::Result<bool> {
+        let path_metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            path_metadata.file_type().is_file()
+                && path_metadata.len() <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+            "incomplete manifest stage is not a bounded regular file"
+        );
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("manifest stage has no parent"))?;
+            let parent_metadata = std::fs::symlink_metadata(parent)?;
+            anyhow::ensure!(
+                path_metadata.permissions().mode() & 0o077 == 0
+                    && path_metadata.nlink() == 1
+                    && path_metadata.uid() == parent_metadata.uid(),
+                "incomplete manifest stage is not private"
+            );
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        let handle_metadata = file.metadata()?;
+        anyhow::ensure!(
+            handle_metadata.is_file()
+                && handle_metadata.len() <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+            "manifest stage handle is not a bounded file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            anyhow::ensure!(
+                handle_metadata.dev() == path_metadata.dev()
+                    && handle_metadata.ino() == path_metadata.ino(),
+                "incomplete manifest stage changed identity"
+            );
+        }
+        Ok(true)
+    }
+
+    fn rewrite_incomplete_manifest_stage(
+        path: &std::path::Path,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+            "manifest stage serialization exceeds its byte ceiling"
+        );
+        anyhow::ensure!(
+            Self::manifest_stage_is_recoverably_incomplete(path)?,
+            "manifest stage disappeared before deterministic rewrite"
+        );
+        let expected = std::fs::symlink_metadata(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(path)?;
+        let observed = file.metadata()?;
+        anyhow::ensure!(
+            expected.file_type().is_file()
+                && expected.len() <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES
+                && observed.is_file()
+                && observed.len() <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+            "manifest stage handle is not a bounded file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("manifest stage has no parent"))?;
+            let parent_metadata = std::fs::symlink_metadata(parent)?;
+            anyhow::ensure!(
+                expected.file_type().is_file()
+                    && expected.permissions().mode() & 0o077 == 0
+                    && expected.nlink() == 1
+                    && expected.uid() == parent_metadata.uid()
+                    && observed.dev() == expected.dev()
+                    && observed.ino() == expected.ino(),
+                "manifest stage changed identity before deterministic rewrite"
+            );
+            let path_metadata = std::fs::symlink_metadata(path)?;
+            anyhow::ensure!(
+                path_metadata.file_type().is_file()
+                    && path_metadata.dev() == observed.dev()
+                    && path_metadata.ino() == observed.ino(),
+                "manifest stage changed path before deterministic rewrite"
+            );
+        }
+        file.set_len(0)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn sync_private_manifest_stage(path: &std::path::Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Self::manifest_stage_is_recoverably_incomplete(path)?,
+            "manifest stage disappeared before synchronization"
+        );
+        let expected = std::fs::symlink_metadata(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        let observed = file.metadata()?;
+        anyhow::ensure!(
+            expected.file_type().is_file()
+                && expected.len() <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES
+                && observed.is_file()
+                && observed.len() <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+            "manifest stage handle is not a bounded file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            anyhow::ensure!(
+                observed.dev() == expected.dev() && observed.ino() == expected.ino(),
+                "manifest stage changed identity before synchronization"
+            );
+        }
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let path_metadata = std::fs::symlink_metadata(path)?;
+            anyhow::ensure!(
+                path_metadata.file_type().is_file()
+                    && path_metadata.dev() == observed.dev()
+                    && path_metadata.ino() == observed.ino(),
+                "manifest stage changed path during synchronization"
+            );
+        }
+        Ok(())
     }
 
     fn deterministic_manifest_stage_path(
@@ -2781,6 +3811,11 @@ impl LiveScrollbackSpillSink {
 
         let mut bytes = serde_json::to_vec_pretty(&manifest)?;
         bytes.push(b'\n');
+        anyhow::ensure!(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+            "scrollback manifest serialization exceeds its byte ceiling"
+        );
         let parent = self
             .manifest_path
             .parent()
@@ -2809,9 +3844,30 @@ impl LiveScrollbackSpillSink {
                 std::fs::File::open(parent)?.sync_all()?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let staged = Self::read_manifest(&temp_path)?.ok_or_else(|| {
-                    anyhow::anyhow!("deterministic scrollback manifest stage disappeared")
-                })?;
+                let staged = match Self::read_manifest(&temp_path) {
+                    Ok(Some(staged)) => staged,
+                    Ok(None) => anyhow::bail!(
+                        "deterministic scrollback manifest stage disappeared"
+                    ),
+                    Err(read_error)
+                        if Self::manifest_stage_is_recoverably_incomplete(&temp_path)? =>
+                    {
+                        Self::rewrite_incomplete_manifest_stage(&temp_path, &bytes).with_context(
+                            || {
+                                format!(
+                                    "rewrite incomplete scrollback manifest stage {} after {read_error}",
+                                    temp_path.display()
+                                )
+                            },
+                        )?;
+                        Self::read_manifest(&temp_path)?.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "rewritten deterministic scrollback manifest stage disappeared"
+                            )
+                        })?
+                    }
+                    Err(read_error) => return Err(read_error),
+                };
                 anyhow::ensure!(
                     Self::manifest_authentication_bytes(&staged)?
                         == Self::manifest_authentication_bytes(&manifest)?,
@@ -2832,6 +3888,9 @@ impl LiveScrollbackSpillSink {
                 // than comparing the renamed stage against the newly sealed
                 // equivalent constructed for this retry.
                 manifest = staged;
+                Self::sync_private_manifest_stage(&temp_path)?;
+                #[cfg(not(windows))]
+                std::fs::File::open(parent)?.sync_all()?;
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -3256,7 +4315,9 @@ fn encode_exact_scrollback_line_record(
         .ok()
 }
 
-fn serialize_exact_semantic_scrollback_line(line: &wezterm_term::Line) -> Option<Vec<u8>> {
+fn serialize_exact_semantic_scrollback_line(
+    line: &wezterm_term::Line,
+) -> Option<Zeroizing<Vec<u8>>> {
     let mut semantic_line = line.clone();
     let cells = semantic_line.cells_mut();
     if cells.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
@@ -3298,7 +4359,7 @@ struct ExactSemanticScrollbackLineV1 {
 }
 
 struct BoundedScrollbackPlaintext {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
     max_bytes: usize,
     exceeded: bool,
 }
@@ -3306,7 +4367,7 @@ struct BoundedScrollbackPlaintext {
 impl BoundedScrollbackPlaintext {
     fn new(max_bytes: usize) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Zeroizing::new(Vec::new()),
             max_bytes,
             exceeded: false,
         }
@@ -3696,7 +4757,12 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             }
             Ok(Some(_)) => return false,
             Ok(None) => {}
-            Err(_) => return false,
+            Err(error) => match Self::manifest_stage_is_recoverably_incomplete(&stage_path) {
+                Ok(true) => log::warn!(
+                    "retaining a securely pinned incomplete manifest stage for deterministic retry: {error}"
+                ),
+                Ok(false) | Err(_) => return false,
+            },
         }
         if self
             .verify_current_published_state_before_mutation(
@@ -3723,6 +4789,60 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                 return false;
             };
             state.clear_pending_physical_reclamation = false;
+        }
+
+        // Resolve exact retries before minting a successor generation. A row
+        // that is already durable (or has already aged out) is an
+        // acknowledgement of the existing generation, not a new mutation.
+        let retry_state = match self.lock_state("store_scrollback_line retry preflight") {
+            Ok(state) => *state,
+            Err(_) => return false,
+        };
+        let retry_initial = retry_state.initial_stable_row.unwrap_or(stable_row);
+        if stable_row < retry_initial {
+            return false;
+        }
+        let Ok(retry_sequence) = u64::try_from(stable_row - retry_initial) else {
+            return false;
+        };
+        {
+            let Ok(store) = self.lock_store("store_scrollback_line retry preflight") else {
+                return false;
+            };
+            let Ok(next_sequence) = store.next_seq(ledger_pane_id) else {
+                return false;
+            };
+            if retry_sequence < next_sequence {
+                match store.line_at(ledger_pane_id, retry_sequence) {
+                    Ok(Some(existing)) => {
+                        let Ok(keyring) =
+                            self.lock_keyring("store_scrollback_line exact retry")
+                        else {
+                            return false;
+                        };
+                        return exact_scrollback_line_record_is_equivalent(
+                            &existing,
+                            line,
+                            &keyring,
+                            self.durable_pane_id,
+                            retry_state.content_epoch,
+                            stable_row,
+                            retry_sequence,
+                        );
+                    }
+                    Ok(None)
+                        if store
+                            .oldest_seq(ledger_pane_id)
+                            .is_some_and(|oldest| retry_sequence < oldest) =>
+                    {
+                        return true;
+                    }
+                    _ => return false,
+                }
+            }
+            if retry_sequence > next_sequence {
+                return false;
+            }
         }
 
         let (
@@ -3796,6 +4916,44 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             };
             record
         };
+        let append_wal = if manifest_prepare_required {
+            None
+        } else {
+            let predecessor_manifest = match Self::read_manifest(&self.manifest_path) {
+                Ok(Some(manifest)) => manifest,
+                _ => return false,
+            };
+            let wal = {
+                let Ok(store) = self.lock_store("store_scrollback_line prepare append WAL") else {
+                    return false;
+                };
+                match self.prepare_authenticated_append_wal(
+                    &predecessor_manifest,
+                    previous_state,
+                    proposed_state,
+                    ledger_pane_id,
+                    stable_row,
+                    desired_seq,
+                    max_retained_rows,
+                    &record,
+                    &store,
+                ) {
+                    Ok(wal) => wal,
+                    Err(_) => return false,
+                }
+            };
+            if let Err(error) = self.persist_authenticated_append_wal(&wal) {
+                if error.outcome_indeterminate() {
+                    if let Ok(mut state) =
+                        self.lock_state("store_scrollback_line append WAL quarantine")
+                    {
+                        state.transaction_quarantined = true;
+                    }
+                }
+                return false;
+            }
+            Some(wal)
+        };
         let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state") else {
             return false;
         };
@@ -3815,86 +4973,48 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             }
         }
 
-        {
-            let Ok(mut store) = self.lock_store("store_scrollback_line append") else {
-                return false;
-            };
-            let Ok(next_seq) = store.next_seq(ledger_pane_id) else {
-                return false;
-            };
-            if desired_seq < next_seq {
-                match store.line_at(ledger_pane_id, desired_seq) {
-                    Ok(Some(existing)) => {
-                        let Ok(keyring) =
-                            self.lock_keyring("store_scrollback_line idempotent retry")
-                        else {
-                            return false;
-                        };
-                        if !exact_scrollback_line_record_is_equivalent(
-                            &existing,
-                            line,
-                            &keyring,
-                            self.durable_pane_id,
-                            proposed_state.content_epoch,
-                            stable_row,
-                            desired_seq,
-                        ) {
-                            return false;
-                        }
-                        // Idempotent retry after exact content durability
-                        // succeeded but a later manifest publication failed.
-                    }
-                    Ok(None)
-                        if store
-                            .oldest_seq(ledger_pane_id)
-                            .is_some_and(|oldest| desired_seq < oldest) =>
-                    {
-                        // The stable row was already acknowledged and has
-                        // since aged out under the configured retention bound.
-                        // This is a no-op acknowledgement: restore the prior
-                        // in-memory generation because no content or manifest
-                        // transaction was performed for this retry.
-                        let Ok(mut state) =
-                            self.lock_state("store_scrollback_line aged-out retry rollback")
-                        else {
-                            return false;
-                        };
-                        *state = previous_state;
-                        return true;
-                    }
-                    _ => return false,
-                }
-            } else if desired_seq == next_seq {
-                match store.append_line(ledger_pane_id, &record) {
-                    Ok(appended_seq) if appended_seq == desired_seq => {}
-                    _ => return false,
-                }
-            } else {
-                // Refuse to manufacture a gap: ordered stable-row identity is
-                // more important than admitting a later line out of sequence.
-                return false;
-            }
+        let content_result = (|| -> anyhow::Result<()> {
+            let mut store = self
+                .lock_store("store_scrollback_line append")
+                .map_err(anyhow::Error::new)?;
+            anyhow::ensure!(
+                store.next_seq(ledger_pane_id)? == desired_seq,
+                "scrollback append sequence changed after serialized preflight"
+            );
+            let appended_seq = store.append_line(ledger_pane_id, &record)?;
+            anyhow::ensure!(
+                appended_seq == desired_seq,
+                "scrollback append returned the wrong sequence"
+            );
 
             let retained = store.line_count(ledger_pane_id);
             if retained > max_retained_rows {
-                let oldest_seq = store.oldest_seq(ledger_pane_id).unwrap_or(0);
-                let drop_count = retained - max_retained_rows;
-                let Ok(drop_count) = u64::try_from(drop_count) else {
-                    return false;
-                };
-                let Some(prune_before_seq) = oldest_seq.checked_add(drop_count) else {
-                    return false;
-                };
-                if store.prune_before(ledger_pane_id, prune_before_seq).is_err() {
-                    return false;
-                }
-                if store
-                    .compact_pane_if_stale(ledger_pane_id, LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES)
-                    .is_err()
-                {
-                    return false;
-                }
+                let oldest_seq = store.oldest_seq(ledger_pane_id).ok_or_else(|| {
+                    anyhow::anyhow!("nonempty scrollback ledger has no oldest sequence")
+                })?;
+                let drop_count = u64::try_from(retained - max_retained_rows)?;
+                let prune_before_seq = oldest_seq
+                    .checked_add(drop_count)
+                    .ok_or_else(|| anyhow::anyhow!("scrollback retention cut overflows"))?;
+                store.prune_before(ledger_pane_id, prune_before_seq)?;
+                store.compact_pane_if_stale(
+                    ledger_pane_id,
+                    LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
+                )?;
             }
+            if let Some(wal) = append_wal.as_ref() {
+                Self::verify_append_wal_target_store(wal, &store)?;
+            }
+            Ok(())
+        })();
+        if content_result.is_err() {
+            if let Ok(mut state) = self.lock_state("store_scrollback_line content quarantine") {
+                // A synchronized prepared manifest or active WAL may already
+                // authorize recovery. Never roll the generation back after
+                // entering either durable transaction.
+                state.transaction_quarantined = true;
+            }
+            return false;
         }
 
         let Ok(mut state) = self.lock_state("store_scrollback_line retention") else {
@@ -3906,7 +5026,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         match self.persist_manifest("complete") {
             Ok(()) => true,
             Err(error) => {
-                if error.outcome_indeterminate() {
+                if append_wal.is_some() || error.outcome_indeterminate() {
                     if let Ok(mut state) =
                         self.lock_state("store_scrollback_line quarantine publication")
                     {
@@ -5833,6 +6953,193 @@ mod tests {
         Mux::shutdown();
     }
 
+    fn prepare_later_row_append_wal_for_test(
+        sink: &LiveScrollbackSpillSink,
+        stable_row: wezterm_term::StableRowIndex,
+        line: &Line,
+        max_retained_rows: usize,
+    ) -> (LiveScrollbackAppendWalV1, LiveScrollbackSpillState) {
+        let previous_state = *sink
+            .lock_state("prepare test append WAL predecessor")
+            .expect("lock test append WAL predecessor state");
+        let initial_stable_row = previous_state
+            .initial_stable_row
+            .expect("later-row WAL fixture has a stable-row origin");
+        let desired_sequence = u64::try_from(
+            stable_row
+                .checked_sub(initial_stable_row)
+                .expect("test later row follows the stable-row origin"),
+        )
+        .expect("test stable-row offset fits u64");
+        let mut proposed_state = previous_state;
+        proposed_state
+            .advance_revision()
+            .expect("advance test append WAL generation");
+        proposed_state.clear_manifest_published = false;
+        proposed_state.newest_stable_row_exclusive = Some(
+            stable_row
+                .checked_add(1)
+                .expect("test append WAL stable-row endpoint fits"),
+        );
+        proposed_state.max_retained_rows = max_retained_rows;
+        let row_identity =
+            mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+                sink.durable_pane_id,
+                proposed_state.content_epoch,
+                proposed_state.revision,
+                i64::try_from(stable_row).expect("test stable row fits i64"),
+                desired_sequence,
+            )
+            .expect("construct test append WAL row identity");
+        let record = {
+            let mut keyring = sink
+                .lock_keyring("prepare test append WAL row")
+                .expect("lock test append WAL keyring");
+            let cipher = keyring
+                .latest_active_cipher()
+                .expect("load test append WAL key");
+            encode_exact_scrollback_line_record(line, &cipher, row_identity)
+                .expect("seal test append WAL row")
+        };
+        let predecessor_manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read test append WAL predecessor")
+            .expect("test append WAL predecessor exists");
+        let store = sink
+            .lock_store("prepare test append WAL target")
+            .expect("lock test append WAL store");
+        let wal = sink
+            .prepare_authenticated_append_wal(
+                &predecessor_manifest,
+                previous_state,
+                proposed_state,
+                sink.active_ledger_pane_id(),
+                stable_row,
+                desired_sequence,
+                max_retained_rows,
+                &record,
+                &store,
+            )
+            .expect("prepare authenticated test append WAL");
+        (wal, proposed_state)
+    }
+
+    fn append_wal_fixture(
+        identity_byte: u8,
+        max_retained_rows: usize,
+    ) -> (
+        tempfile::TempDir,
+        config::ScrollbackSpillSinkContext,
+        LiveScrollbackSpillSink,
+        LiveScrollbackAppendWalV1,
+        Line,
+    ) {
+        let dir = tempfile::tempdir().expect("create append WAL fixture directory");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: u64::from(identity_byte) + 20_000,
+            domain_id: 3,
+            durable_pane_id: [identity_byte; 16],
+            command_description: "append-wal-crash-fixture".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create append WAL fixture sink");
+        let attrs = CellAttributes::blank();
+        assert!(sink.store_scrollback_line(
+            10,
+            &Line::from_text("append-wal-predecessor", &attrs, 1, None),
+            max_retained_rows.max(1),
+        ));
+        let appended = Line::from_text("append-wal-recovered-target", &attrs, 2, None);
+        let (wal, _) =
+            prepare_later_row_append_wal_for_test(&sink, 11, &appended, max_retained_rows);
+        (dir, context, sink, wal, appended)
+    }
+
+    fn write_private_stage_fixture(path: &std::path::Path, bytes: &[u8]) {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .expect("create private stage fixture");
+        file.write_all(bytes)
+            .expect("write private stage fixture");
+        file.sync_all()
+            .expect("synchronize private stage fixture");
+        #[cfg(not(windows))]
+        std::fs::File::open(
+            path.parent()
+                .expect("stage fixture path has a parent"),
+        )
+        .expect("open stage fixture parent")
+        .sync_all()
+        .expect("synchronize stage fixture parent");
+    }
+
+    fn write_complete_append_wal_fixture(
+        path: &std::path::Path,
+        wal: &LiveScrollbackAppendWalV1,
+    ) {
+        let mut bytes = serde_json::to_vec_pretty(wal)
+            .expect("serialize complete append WAL fixture");
+        bytes.push(b'\n');
+        write_private_stage_fixture(path, &bytes);
+    }
+
+    fn materialize_append_wal_target_for_test(
+        sink: &LiveScrollbackSpillSink,
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> LiveScrollbackSpillState {
+        let predecessor = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read append WAL predecessor manifest")
+            .expect("append WAL predecessor manifest exists");
+        let mut store = sink
+            .lock_store("materialize append WAL test target")
+            .expect("lock append WAL test store");
+        let keyring = sink
+            .lock_keyring("materialize append WAL test authentication")
+            .expect("lock append WAL test keyring");
+        LiveScrollbackSpillSink::reconcile_authenticated_append_wal(
+            wal,
+            &predecessor,
+            &mut store,
+            &keyring,
+            sink.durable_pane_id,
+        )
+        .expect("materialize exact append WAL test target")
+        .expect("predecessor manifest requires append WAL recovery")
+    }
+
+    fn overwrite_private_manifest_fixture(
+        path: &std::path::Path,
+        manifest: &LiveScrollbackManifestV1,
+    ) {
+        let mut bytes = serde_json::to_vec_pretty(manifest)
+            .expect("serialize private manifest fixture");
+        bytes.push(b'\n');
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open private manifest fixture for overwrite");
+        file.write_all(&bytes)
+            .expect("overwrite private manifest fixture");
+        file.sync_all()
+            .expect("synchronize private manifest fixture");
+        #[cfg(not(windows))]
+        std::fs::File::open(
+            path.parent()
+                .expect("manifest fixture path has a parent"),
+        )
+        .expect("open manifest fixture parent")
+        .sync_all()
+        .expect("synchronize manifest fixture parent");
+    }
+
     #[test]
     fn live_scrollback_atomic_replacement_cas_reopen_and_empty_range_are_exact() {
         let dir = tempfile::tempdir().expect("temp scrollback dir");
@@ -6726,6 +8033,475 @@ mod tests {
         assert_eq!(manifest.oldest_seq, Some(0));
         assert_eq!(manifest.retained_rows, 1);
         assert_eq!(manifest.next_seq, 1);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AppendWalCrashCut {
+        CompleteStageBeforeRename,
+        ActiveBeforeRow,
+        ActiveAfterRowBeforeRetention,
+        ActiveAfterRetentionBeforeManifest,
+        IncompleteManifestStageAfterRetention,
+        CompleteManifestStageBeforeRename,
+        CompleteManifestBeforeWalRetirement,
+    }
+
+    #[test]
+    fn authenticated_append_wal_recovers_every_durable_later_row_crash_cut() {
+        let cuts = [
+            AppendWalCrashCut::CompleteStageBeforeRename,
+            AppendWalCrashCut::ActiveBeforeRow,
+            AppendWalCrashCut::ActiveAfterRowBeforeRetention,
+            AppendWalCrashCut::ActiveAfterRetentionBeforeManifest,
+            AppendWalCrashCut::IncompleteManifestStageAfterRetention,
+            AppendWalCrashCut::CompleteManifestStageBeforeRename,
+            AppendWalCrashCut::CompleteManifestBeforeWalRetirement,
+        ];
+        for (index, cut) in cuts.into_iter().enumerate() {
+            let identity_byte = u8::try_from(120 + index).expect("fixture identity fits u8");
+            let (dir, context, sink, wal, appended) = append_wal_fixture(identity_byte, 1);
+            let ledger_pane_id = sink.active_ledger_pane_id();
+            match cut {
+                AppendWalCrashCut::CompleteStageBeforeRename => {
+                    let stage_path = LiveScrollbackSpillSink::append_wal_stage_path(
+                        &sink.manifest_path,
+                    )
+                    .expect("derive complete append WAL stage path");
+                    write_complete_append_wal_fixture(&stage_path, &wal);
+                }
+                AppendWalCrashCut::ActiveBeforeRow => sink
+                    .persist_authenticated_append_wal(&wal)
+                    .expect("publish active append WAL before row"),
+                AppendWalCrashCut::ActiveAfterRowBeforeRetention => {
+                    sink.persist_authenticated_append_wal(&wal)
+                        .expect("publish active append WAL before row");
+                    assert_eq!(
+                        sink.lock_store("append WAL row-before-retention cut")
+                            .expect("lock row-before-retention store")
+                            .append_line(ledger_pane_id, &wal.encrypted_record)
+                            .expect("synchronize row-before-retention cut"),
+                        wal.appended_sequence
+                    );
+                }
+                AppendWalCrashCut::ActiveAfterRetentionBeforeManifest => {
+                    sink.persist_authenticated_append_wal(&wal)
+                        .expect("publish active append WAL before target ledger");
+                    let mut store = sink
+                        .lock_store("append WAL post-retention cut")
+                        .expect("lock post-retention store");
+                    assert_eq!(
+                        store
+                            .append_line(ledger_pane_id, &wal.encrypted_record)
+                            .expect("synchronize post-retention row"),
+                        wal.appended_sequence
+                    );
+                    store
+                        .prune_before(ledger_pane_id, wal.target_oldest_sequence)
+                        .expect("synchronize append WAL retention cut");
+                    LiveScrollbackSpillSink::verify_append_wal_target_store(&wal, &store)
+                        .expect("retained append WAL target is exact");
+                }
+                AppendWalCrashCut::IncompleteManifestStageAfterRetention => {
+                    sink.persist_authenticated_append_wal(&wal)
+                        .expect("publish append WAL before incomplete manifest stage");
+                    let recovered_state = materialize_append_wal_target_for_test(&sink, &wal);
+                    *sink
+                        .lock_state("incomplete manifest-stage test state")
+                        .expect("lock incomplete manifest-stage state") = recovered_state;
+                    let stage_path = LiveScrollbackSpillSink::deterministic_manifest_stage_path(
+                        &sink.manifest_path,
+                    )
+                    .expect("derive incomplete manifest-stage path");
+                    write_private_stage_fixture(&stage_path, br#"{"schema":"#);
+                }
+                AppendWalCrashCut::CompleteManifestStageBeforeRename => {
+                    let predecessor = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+                        .expect("read complete-stage predecessor")
+                        .expect("complete-stage predecessor exists");
+                    sink.persist_authenticated_append_wal(&wal)
+                        .expect("publish append WAL before complete manifest stage");
+                    let recovered_state = materialize_append_wal_target_for_test(&sink, &wal);
+                    *sink
+                        .lock_state("complete manifest-stage test state")
+                        .expect("lock complete manifest-stage state") = recovered_state;
+                    sink.persist_manifest("complete")
+                        .expect("construct authenticated complete manifest target");
+                    let target = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+                        .expect("read complete manifest target")
+                        .expect("complete manifest target exists");
+                    overwrite_private_manifest_fixture(&sink.manifest_path, &predecessor);
+                    let stage_path = LiveScrollbackSpillSink::deterministic_manifest_stage_path(
+                        &sink.manifest_path,
+                    )
+                    .expect("derive complete manifest-stage path");
+                    let mut target_bytes = serde_json::to_vec_pretty(&target)
+                        .expect("serialize complete manifest-stage target");
+                    target_bytes.push(b'\n');
+                    write_private_stage_fixture(&stage_path, &target_bytes);
+                }
+                AppendWalCrashCut::CompleteManifestBeforeWalRetirement => {
+                    sink.persist_authenticated_append_wal(&wal)
+                        .expect("publish append WAL before complete manifest");
+                    let recovered_state = materialize_append_wal_target_for_test(&sink, &wal);
+                    *sink
+                        .lock_state("append WAL complete-manifest state")
+                        .expect("lock complete-manifest state") = recovered_state;
+                    sink.persist_manifest("complete")
+                        .expect("publish complete manifest while retaining consumed WAL");
+                }
+            }
+            drop(sink);
+
+            let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .unwrap_or_else(|error| panic!("recover {cut:?}: {error:#}"));
+            assert_eq!(
+                reopened
+                    .load_scrollback_line(11)
+                    .unwrap_or_else(|| panic!("{cut:?} must recover the exact appended row"))
+                    .as_str()
+                    .as_ref(),
+                appended.as_str().as_ref(),
+                "{cut:?} changed the recovered semantic row"
+            );
+            assert!(
+                reopened.load_scrollback_line(10).is_none(),
+                "{cut:?} did not finish the authenticated retention cut"
+            );
+            assert_eq!(reopened.retained_scrollback_rows(), 1);
+            let manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+                .expect("read recovered append WAL manifest")
+                .expect("recovered append WAL manifest exists");
+            assert_eq!(manifest.publication_state, "complete");
+            assert_eq!(manifest.revision, Some(wal.target_revision));
+            assert_eq!(manifest.oldest_seq, Some(wal.target_oldest_sequence));
+            assert_eq!(manifest.next_seq, wal.target_next_sequence);
+            assert_eq!(manifest.retained_rows, wal.target_record_count);
+            assert!(
+                std::fs::symlink_metadata(
+                    LiveScrollbackSpillSink::deterministic_manifest_stage_path(
+                        &reopened.manifest_path,
+                    )
+                    .expect("derive recovered manifest stage path")
+                )
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "{cut:?} left an unfinalized manifest stage"
+            );
+            assert!(
+                std::fs::symlink_metadata(
+                    LiveScrollbackSpillSink::append_wal_stage_path(&reopened.manifest_path)
+                        .expect("derive recovered append WAL stage path")
+                )
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "{cut:?} left an unfinalized append WAL stage"
+            );
+            assert_eq!(
+                reopened
+                    .lock_store("verify append WAL reopen range")
+                    .expect("lock recovered append WAL store")
+                    .next_seq(reopened.active_ledger_pane_id())
+                    .expect("read recovered append WAL next sequence"),
+                wal.target_next_sequence,
+                "{cut:?} duplicated or omitted the authenticated append"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_append_wal_recovers_with_its_historical_guardian_key() {
+        let (dir, context, sink, wal, appended) = append_wal_fixture(133, 1);
+        let original_key_id = sink
+            .lock_keyring("inspect append WAL guardian key")
+            .expect("lock append WAL keyring")
+            .active_key_id();
+        let authentication =
+            mux::guardian_output_journal::GuardianScrollbackAppendWalAuthentication::parse(
+                wal.guardian_authentication
+                    .as_deref()
+                    .expect("append WAL carries guardian authentication"),
+            )
+            .expect("parse append WAL authentication");
+        assert_eq!(authentication.key_id(), original_key_id);
+        sink.persist_authenticated_append_wal(&wal)
+            .expect("publish append WAL under original guardian key");
+        let persisted_wal_bytes = std::fs::read(
+            LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
+                .expect("derive persisted append WAL path"),
+        )
+        .expect("read persisted encrypted append WAL");
+        assert!(
+            !persisted_wal_bytes
+                .windows(b"append-wal-recovered-target".len())
+                .any(|window| window == b"append-wal-recovered-target"),
+            "the recovery WAL must never persist exact semantic plaintext"
+        );
+        let rotated_key_id = sink
+            .lock_keyring("rotate after append WAL publication")
+            .expect("lock append WAL keyring for rotation")
+            .rotate()
+            .expect("rotate guardian key after durable WAL publication");
+        assert_ne!(rotated_key_id, original_key_id);
+        drop(sink);
+
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("recover append WAL through historical guardian key lookup");
+        assert_eq!(
+            reopened
+                .load_scrollback_line(11)
+                .expect("historical-key WAL restores its exact row")
+                .as_str()
+                .as_ref(),
+            appended.as_str().as_ref()
+        );
+        assert!(reopened.load_scrollback_line(10).is_none());
+        let persisted = LiveScrollbackSpillSink::read_append_wal(
+            &LiveScrollbackSpillSink::append_wal_path(&reopened.manifest_path)
+                .expect("derive historical-key append WAL path"),
+        )
+        .expect("read historical-key append WAL")
+        .expect("consumed historical-key append WAL remains in its bounded slot");
+        let keyring = reopened
+            .lock_keyring("verify historical append WAL after reopen")
+            .expect("lock reopened append WAL keyring");
+        assert_eq!(keyring.active_key_id(), rotated_key_id);
+        LiveScrollbackSpillSink::authenticate_append_wal(&persisted, &keyring)
+            .expect("historical append WAL remains guardian-authenticated after rotation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_wal_publication_rejects_symlink_stage_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, _context, sink, wal, _appended) = append_wal_fixture(134, 1);
+        let attacker_target = dir.path().join("append-wal-attacker-target");
+        std::fs::write(&attacker_target, b"attacker-content")
+            .expect("write append-WAL attacker target");
+        let stage_path = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path)
+            .expect("derive unsafe append WAL stage path");
+        symlink(&attacker_target, &stage_path).expect("create append WAL stage symlink");
+
+        let error = sink
+            .persist_authenticated_append_wal(&wal)
+            .expect_err("append WAL publication must reject a symlink stage");
+        assert!(
+            !error.outcome_indeterminate(),
+            "stage-path rejection occurs before any WAL publication attempt"
+        );
+        assert_eq!(
+            std::fs::read(&attacker_target).expect("reread append-WAL attacker target"),
+            b"attacker-content"
+        );
+        assert!(
+            LiveScrollbackSpillSink::read_append_wal(
+                &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
+                    .expect("derive active append WAL path")
+            )
+            .expect("inspect active append WAL slot")
+            .is_none()
+        );
+        assert!(sink.load_scrollback_line(11).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_manifest_stage_rewrite_rejects_unsafe_path_authority() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().expect("create unsafe manifest-stage fixtures");
+        let attacker_target = directory.path().join("attacker-target");
+        std::fs::write(&attacker_target, b"attacker-content")
+            .expect("write manifest-stage attacker target");
+        let symlink_stage = directory.path().join("symlink-stage");
+        symlink(&attacker_target, &symlink_stage).expect("create manifest-stage symlink");
+        assert!(
+            LiveScrollbackSpillSink::rewrite_incomplete_manifest_stage(
+                &symlink_stage,
+                b"replacement"
+            )
+            .is_err(),
+            "a symlink must never become deterministic manifest-stage authority"
+        );
+        assert_eq!(
+            std::fs::read(&attacker_target).expect("reread symlink target"),
+            b"attacker-content"
+        );
+
+        let hard_link_target = directory.path().join("hard-link-target");
+        std::fs::write(&hard_link_target, b"hard-link-content")
+            .expect("write manifest-stage hard-link target");
+        std::fs::set_permissions(&hard_link_target, std::fs::Permissions::from_mode(0o600))
+            .expect("make hard-link fixture otherwise private");
+        let hard_link_stage = directory.path().join("hard-link-stage");
+        std::fs::hard_link(&hard_link_target, &hard_link_stage)
+            .expect("create manifest-stage hard link");
+        assert!(
+            LiveScrollbackSpillSink::rewrite_incomplete_manifest_stage(
+                &hard_link_stage,
+                b"replacement"
+            )
+            .is_err(),
+            "a multiply linked inode must never be truncated as a manifest stage"
+        );
+        assert_eq!(
+            std::fs::read(&hard_link_target).expect("reread hard-link target"),
+            b"hard-link-content"
+        );
+
+        let public_stage = directory.path().join("public-stage");
+        std::fs::write(&public_stage, b"public-content")
+            .expect("write non-private manifest stage");
+        std::fs::set_permissions(&public_stage, std::fs::Permissions::from_mode(0o644))
+            .expect("make manifest-stage fixture non-private");
+        assert!(
+            LiveScrollbackSpillSink::rewrite_incomplete_manifest_stage(
+                &public_stage,
+                b"replacement"
+            )
+            .is_err(),
+            "a non-private file must never become manifest-stage authority"
+        );
+        assert_eq!(
+            std::fs::read(&public_stage).expect("reread non-private stage"),
+            b"public-content"
+        );
+    }
+
+    #[test]
+    fn incomplete_append_wal_stage_is_non_authoritative_bounded_and_reusable() {
+        let (dir, context, sink, _wal, appended) = append_wal_fixture(131, 1);
+        let stage_path =
+            LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path)
+                .expect("derive incomplete append WAL stage path");
+        write_private_stage_fixture(&stage_path, br#"{"schema":"#);
+        drop(sink);
+
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("ignore securely pinned incomplete append WAL stage");
+        assert_eq!(
+            reopened
+                .load_scrollback_line(10)
+                .expect("predecessor survives incomplete append WAL stage")
+                .as_str()
+                .as_ref(),
+            "append-wal-predecessor"
+        );
+        assert!(reopened.load_scrollback_line(11).is_none());
+        assert!(
+            reopened.store_scrollback_line(11, &appended, 1),
+            "the deterministic incomplete stage must be safely reusable"
+        );
+        assert_eq!(
+            reopened
+                .load_scrollback_line(11)
+                .expect("row stored through reused append WAL stage")
+                .as_str()
+                .as_ref(),
+            appended.as_str().as_ref()
+        );
+        let pane_dir = reopened
+            .manifest_path
+            .parent()
+            .expect("append WAL manifest has a parent");
+        let wal_entries = std::fs::read_dir(pane_dir)
+            .expect("list bounded append WAL directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("append-wal"))
+            .count();
+        assert_eq!(
+            wal_entries, 1,
+            "retries must retain only the one deterministic active/stage WAL slot"
+        );
+    }
+
+    #[test]
+    fn append_wal_authentication_rejects_same_length_ciphertext_and_metadata_mutation() {
+        let (_dir, _context, sink, wal, _appended) = append_wal_fixture(132, 8);
+        let mut tampered = wal.clone();
+        let mut record_bytes = tampered.encrypted_record.into_bytes();
+        let mutation_index = record_bytes
+            .len()
+            .checked_sub(8)
+            .expect("encrypted row has a complete interior base64 quantum");
+        record_bytes[mutation_index] = if record_bytes[mutation_index] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        tampered.encrypted_record =
+            String::from_utf8(record_bytes).expect("ciphertext mutation stays ASCII");
+        tampered.encrypted_record_sha256 = hex::encode(
+            live_scrollback_append_wal_record_digest(&tampered.encrypted_record)
+                .expect("digest mutated encrypted record"),
+        );
+        let store = sink
+            .lock_store("recompute tampered append WAL target")
+            .expect("lock tampered append WAL store");
+        let (target_digest, target_bytes) = live_scrollback_append_wal_target_digest(
+            &tampered,
+            |sequence| {
+                if sequence == tampered.appended_sequence {
+                    Ok(tampered.encrypted_record.clone())
+                } else {
+                    store
+                        .line_at(tampered.ledger_pane_id, sequence)?
+                        .ok_or_else(|| anyhow::anyhow!("tampered WAL predecessor row is missing"))
+                }
+            },
+        )
+        .expect("recompute attacker-controlled target digest");
+        tampered.target_record_set_sha256 = hex::encode(target_digest);
+        tampered.target_retained_record_bytes = target_bytes;
+        tampered.wal_sha256 = LiveScrollbackSpillSink::append_wal_checksum(&tampered)
+            .expect("recompute attacker-controlled public WAL checksum");
+        LiveScrollbackSpillSink::validate_append_wal_identity(
+            &tampered,
+            sink.durable_pane_id,
+        )
+        .expect("same-length ciphertext mutation remains structurally canonical");
+        let keyring = sink
+            .lock_keyring("authenticate tampered append WAL")
+            .expect("lock tampered append WAL keyring");
+        assert!(
+            LiveScrollbackSpillSink::authenticate_append_wal(&tampered, &keyring).is_err(),
+            "recomputed public digests cannot replace guardian authentication"
+        );
+
+        let mut wrong_row = wal.clone();
+        wrong_row.appended_stable_row = wrong_row
+            .appended_stable_row
+            .checked_add(1)
+            .expect("wrong-row test value fits");
+        wrong_row.wal_sha256 = LiveScrollbackSpillSink::append_wal_checksum(&wrong_row)
+            .expect("recompute wrong-row public checksum");
+        assert!(
+            LiveScrollbackSpillSink::validate_append_wal_identity(
+                &wrong_row,
+                sink.durable_pane_id,
+            )
+            .is_err(),
+            "a WAL cannot move its exact row identity"
+        );
+
+        let mut impossible_record_bound = wal.clone();
+        impossible_record_bound.target_retained_record_bytes = impossible_record_bound
+            .target_record_count
+            .checked_sub(1)
+            .expect("multi-row WAL fixture has a smaller nonzero byte bound");
+        impossible_record_bound.wal_sha256 =
+            LiveScrollbackSpillSink::append_wal_checksum(&impossible_record_bound)
+                .expect("recompute impossible-bound public checksum");
+        assert!(
+            LiveScrollbackSpillSink::validate_append_wal_identity(
+                &impossible_record_bound,
+                sink.durable_pane_id,
+            )
+            .is_err(),
+            "every retained record must consume at least one authenticated stored byte"
+        );
+        let debug = format!("{wal:?}");
+        assert!(!debug.contains("append-wal-recovered-target"));
+        assert!(!debug.contains(&wal.encrypted_record));
+        assert!(!debug.contains(&wal.guardian_authentication.clone().unwrap()));
     }
 
     #[test]

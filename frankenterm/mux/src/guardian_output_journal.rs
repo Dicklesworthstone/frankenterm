@@ -31,7 +31,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const FILE_MAGIC: [u8; 8] = *b"FTGOUT01";
 const RECORD_MAGIC: [u8; 8] = *b"FTGOR001";
@@ -653,10 +653,20 @@ impl GuardianOutputKey {
 
     /// Return the nonsecret fingerprint used to bind segments to this key.
     pub fn key_id(&self) -> [u8; KEY_ID_BYTES] {
-        let digest = Sha256::digest(&self.bytes);
+        let digest = self.material_sha256();
         let mut key_id = [0_u8; KEY_ID_BYTES];
         key_id.copy_from_slice(&digest[..KEY_ID_BYTES]);
         key_id
+    }
+
+    /// Return the full SHA-256 commitment to this uniformly random key.
+    ///
+    /// This commitment is used only by private key-publication records to
+    /// distinguish a complete staged key from a conflicting same-prefix key.
+    /// It is not key material and must not be used as an encryption key.
+    #[must_use]
+    pub fn material_sha256(&self) -> [u8; 32] {
+        Sha256::digest(self.bytes).into()
     }
 
     /// Compare two in-memory authorities without exposing either key.
@@ -766,7 +776,7 @@ impl GuardianOutputCipher {
         expected_stable_row: i64,
         expected_sequence: u64,
         max_plaintext_bytes: u32,
-    ) -> Result<Vec<u8>, GuardianScrollbackRowError> {
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianScrollbackRowError> {
         if record.key_id != self.key_id {
             return Err(GuardianScrollbackRowError::KeyIdentityMismatch);
         }
@@ -790,16 +800,17 @@ impl GuardianOutputCipher {
             return Err(GuardianScrollbackRowError::CiphertextLengthMismatch);
         }
         let aad = scrollback_row_aad(record.key_id, identity, record.plaintext_bytes);
-        let plaintext = self
-            .cipher
-            .decrypt(
-                XNonce::from_slice(&record.nonce),
-                Payload {
-                    msg: &record.ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| GuardianScrollbackRowError::DecryptionFailed)?;
+        let plaintext = Zeroizing::new(
+            self.cipher
+                .decrypt(
+                    XNonce::from_slice(&record.nonce),
+                    Payload {
+                        msg: &record.ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| GuardianScrollbackRowError::DecryptionFailed)?,
+        );
         if plaintext.len()
             != usize::try_from(record.plaintext_bytes)
                 .map_err(|_| GuardianScrollbackRowError::ArithmeticOverflow)?
@@ -991,7 +1002,7 @@ impl GuardianOutputCipher {
         nonce_bytes: &[u8; NONCE_BYTES],
         ciphertext: &[u8],
         aad: &[u8],
-    ) -> Result<Vec<u8>, GuardianOutputJournalError> {
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianOutputJournalError> {
         self.cipher
             .decrypt(
                 XNonce::from_slice(nonce_bytes),
@@ -1000,6 +1011,7 @@ impl GuardianOutputCipher {
                     aad,
                 },
             )
+            .map(Zeroizing::new)
             .map_err(|_| GuardianOutputJournalError::DecryptionFailed)
     }
 
@@ -1294,6 +1306,70 @@ impl GuardianOutputSegmentIdentity {
     }
 }
 
+/// Structurally parsed, deliberately unauthenticated key-selection hint.
+///
+/// This type carries no pane, segment, predecessor, sequence, or delivery
+/// authority.  Its sole purpose is to let a caller choose a candidate
+/// historical key from a bounded keyring before calling
+/// [`GuardianOutputJournal::open`], which independently authenticates the
+/// complete header and record chain.  A successfully parsed hint must never be
+/// treated as proof that the file belongs to that key.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianOutputUntrustedHeaderHint {
+    key_id: [u8; KEY_ID_BYTES],
+}
+
+impl GuardianOutputUntrustedHeaderHint {
+    /// Read only the fixed-size current-format header from an already opened
+    /// regular-file descriptor.  Magic/version/length checks are structural;
+    /// no cryptographic authority is established here.
+    pub fn read_from(file: &File) -> Result<Self, GuardianOutputJournalError> {
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(GuardianOutputJournalError::NotRegularFile);
+        }
+        if metadata.len() < FILE_HEADER_BYTES_U64 {
+            return Err(GuardianOutputJournalError::TornFileHeader {
+                expected: FILE_HEADER_BYTES,
+                actual: metadata.len(),
+            });
+        }
+        let mut header = [0_u8; FILE_HEADER_BYTES];
+        read_exact_file_at(file, &mut header, 0)?;
+        if header[0..8] != FILE_MAGIC {
+            return Err(GuardianOutputJournalError::InvalidFileMagic);
+        }
+        let version = read_u32(&header[8..12]);
+        if version != FORMAT_VERSION {
+            return Err(GuardianOutputJournalError::UnsupportedVersion { observed: version });
+        }
+        let header_bytes = read_u32(&header[12..16]);
+        if header_bytes != FILE_HEADER_BYTES_U32 {
+            return Err(GuardianOutputJournalError::InvalidFileHeaderLength {
+                observed: header_bytes,
+            });
+        }
+        let mut key_id = [0_u8; KEY_ID_BYTES];
+        key_id.copy_from_slice(&header[112..120]);
+        Ok(Self { key_id })
+    }
+
+    /// Unauthenticated key fingerprint used only to select a candidate key.
+    #[must_use]
+    pub const fn untrusted_key_id(self) -> [u8; KEY_ID_BYTES] {
+        self.key_id
+    }
+}
+
+impl std::fmt::Debug for GuardianOutputUntrustedHeaderHint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianOutputUntrustedHeaderHint")
+            .field("key_id", &"[UNTRUSTED REDACTED]")
+            .finish()
+    }
+}
+
 /// Recovery status for bytes after the last verified record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuardianOutputJournalTail {
@@ -1449,7 +1525,7 @@ impl GuardianOutputRecoveryLimits {
 /// One exact plaintext record recovered only after digest and AEAD validation.
 pub struct GuardianRecoveredOutputRecord {
     receipt: GuardianOutputAppendReceipt,
-    plaintext: Vec<u8>,
+    plaintext: Zeroizing<Vec<u8>>,
 }
 
 impl GuardianRecoveredOutputRecord {
@@ -1458,20 +1534,38 @@ impl GuardianRecoveredOutputRecord {
         self.receipt
     }
 
+    /// Content-free confirmation that the opaque recovered plaintext still
+    /// matches the constructor-only delivery digest in its authenticated
+    /// receipt. This never returns plaintext or accepts caller-chosen bytes,
+    /// so it is not a reusable digest oracle.
     #[must_use]
-    pub(crate) fn delivery_parts(&self) -> (GuardianOutputAppendReceipt, &[u8]) {
-        (self.receipt, &self.plaintext)
+    pub fn authenticated_payload_is_receipt_bound(&self) -> bool {
+        self.receipt.matches_payload(self.plaintext.as_slice())
+    }
+
+    /// Consume this recovered record and promote it to the only public
+    /// plaintext-delivery capability.
+    ///
+    /// Promotion rechecks the constructor-private receipt binding before any
+    /// writer can observe a byte.  The resulting capability is non-cloneable,
+    /// writes at most once, and continues to own the plaintext in a zeroizing
+    /// allocation until that write completes or unwinds.
+    pub fn into_authenticated_delivery(
+        self,
+    ) -> Result<GuardianAuthenticatedOutputDelivery, GuardianOutputJournalError> {
+        if !self.receipt.matches_payload(self.plaintext.as_slice()) {
+            return Err(GuardianOutputJournalError::RecoveryPayloadBindingMismatch);
+        }
+        Ok(GuardianAuthenticatedOutputDelivery {
+            receipt: self.receipt,
+            plaintext: self.plaintext,
+        })
     }
 
     #[cfg(test)]
     #[must_use]
     pub(crate) fn plaintext(&self) -> &[u8] {
-        &self.plaintext
-    }
-
-    #[must_use]
-    pub(crate) fn into_delivery_parts(self) -> (GuardianOutputAppendReceipt, Vec<u8>) {
-        (self.receipt, self.plaintext)
+        self.plaintext.as_slice()
     }
 }
 
@@ -1479,6 +1573,60 @@ impl std::fmt::Debug for GuardianRecoveredOutputRecord {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GuardianRecoveredOutputRecord")
+            .field("receipt", &self.receipt)
+            .field("plaintext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Single-use authenticated plaintext-delivery capability.
+///
+/// There is intentionally no payload getter, clone implementation, or public
+/// constructor.  Callers can only consume a recovered record into this type
+/// and then write its exact receipt-bound payload through
+/// [`Self::write_all_bounded`].
+pub struct GuardianAuthenticatedOutputDelivery {
+    receipt: GuardianOutputAppendReceipt,
+    plaintext: Zeroizing<Vec<u8>>,
+}
+
+impl GuardianAuthenticatedOutputDelivery {
+    #[must_use]
+    pub const fn receipt(&self) -> GuardianOutputAppendReceipt {
+        self.receipt
+    }
+
+    /// Write the complete authenticated payload exactly once.
+    ///
+    /// The caller's bound is checked before the writer observes any byte.  A
+    /// returned receipt therefore means `write_all` accepted the complete
+    /// payload; an I/O error is an ambiguous downstream-delivery disposition
+    /// and does not return a replayable plaintext capability.
+    pub fn write_all_bounded<W: Write>(
+        self,
+        writer: &mut W,
+        max_payload_bytes: u32,
+    ) -> Result<GuardianOutputAppendReceipt, GuardianOutputJournalError> {
+        let observed = u64::try_from(self.plaintext.len())
+            .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+        if max_payload_bytes == 0 || observed > u64::from(max_payload_bytes) {
+            return Err(GuardianOutputJournalError::DeliveryPayloadByteLimit {
+                observed,
+                maximum: max_payload_bytes,
+            });
+        }
+        if !self.receipt.matches_payload(self.plaintext.as_slice()) {
+            return Err(GuardianOutputJournalError::RecoveryPayloadBindingMismatch);
+        }
+        writer.write_all(self.plaintext.as_slice())?;
+        Ok(self.receipt)
+    }
+}
+
+impl std::fmt::Debug for GuardianAuthenticatedOutputDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianAuthenticatedOutputDelivery")
             .field("receipt", &self.receipt)
             .field("plaintext", &"[REDACTED]")
             .finish()
@@ -1512,33 +1660,6 @@ impl GuardianOutputRecoveryBatch {
     #[must_use]
     pub fn records(&self) -> &[GuardianRecoveredOutputRecord] {
         &self.records
-    }
-
-    #[must_use]
-    pub(crate) fn into_delivery_parts(
-        self,
-    ) -> (
-        GuardianOutputSegmentIdentity,
-        u64,
-        Vec<GuardianRecoveredOutputRecord>,
-        Option<u64>,
-        Option<u64>,
-        u64,
-        u64,
-        Option<GuardianOutputAppendReceipt>,
-        GuardianOutputJournalTail,
-    ) {
-        (
-            self.segment_identity,
-            self.requested_first_sequence,
-            self.records,
-            self.next_recovery_sequence,
-            self.committed_next_sequence,
-            self.committed_log_bytes,
-            self.cumulative_plaintext_bytes,
-            self.terminal_receipt,
-            self.tail,
-        )
     }
 
     #[must_use]
@@ -1606,6 +1727,319 @@ impl std::fmt::Debug for GuardianOutputRecoveryBatch {
     }
 }
 
+/// Stateful, bounded, single-pass authenticated recovery cursor.
+///
+/// The cursor owns a cloned descriptor and a frozen copy of the exact segment
+/// authority established by [`GuardianOutputJournal::open`].  It uses
+/// positional reads, so advancing it cannot disturb the append descriptor's
+/// shared file offset.  Each physical record is parsed, digest-checked, and
+/// AEAD-opened at most once by this cursor.  One bounded zeroizing plaintext
+/// allocation is produced per advance, and the cursor retains no emitted
+/// plaintext.
+pub struct GuardianOutputRecoveryCursor {
+    file: File,
+    identity: GuardianOutputSegmentIdentity,
+    cipher: GuardianOutputCipher,
+    journal_limits: GuardianOutputJournalLimits,
+    requested_first_sequence: u64,
+    max_record_plaintext_bytes: u32,
+    committed_bytes: u64,
+    expected_record_count: u64,
+    expected_cumulative_plaintext_bytes: u64,
+    expected_next_sequence: Option<u64>,
+    expected_terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    tail: GuardianOutputJournalTail,
+    offset: u64,
+    record_count: u64,
+    cumulative_plaintext_bytes: u64,
+    next_sequence: Option<u64>,
+    terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    exhausted: bool,
+    failed: bool,
+    #[cfg(test)]
+    verified_record_count: u64,
+}
+
+impl GuardianOutputRecoveryCursor {
+    #[must_use]
+    pub const fn segment_identity(&self) -> GuardianOutputSegmentIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn requested_first_sequence(&self) -> u64 {
+        self.requested_first_sequence
+    }
+
+    #[must_use]
+    pub const fn max_record_plaintext_bytes(&self) -> u32 {
+        self.max_record_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn committed_log_bytes(&self) -> u64 {
+        self.committed_bytes
+    }
+
+    #[must_use]
+    pub const fn tail(&self) -> GuardianOutputJournalTail {
+        self.tail
+    }
+
+    #[must_use]
+    pub const fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Authenticate and return the next complete record at or after the
+    /// requested first sequence.
+    ///
+    /// Records before the requested sequence are still authenticated in order
+    /// because their chain state is the authority for every later receipt.
+    /// The fixed per-record bound is checked from the canonical header before
+    /// ciphertext allocation or AEAD opening.  Once `None` is returned, later
+    /// calls deterministically return `None` without rereading the file.
+    pub fn next_record(
+        &mut self,
+    ) -> Result<Option<GuardianRecoveredOutputRecord>, GuardianOutputJournalError> {
+        if self.failed {
+            return Err(GuardianOutputJournalError::RecoveryCursorFailed);
+        }
+        let result = self.next_record_inner();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn next_record_inner(
+        &mut self,
+    ) -> Result<Option<GuardianRecoveredOutputRecord>, GuardianOutputJournalError> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        let physical_bytes = self.file.metadata()?.len();
+        if physical_bytes < self.committed_bytes {
+            return Err(GuardianOutputJournalError::ExternalLengthChange {
+                expected: self.committed_bytes,
+                observed: physical_bytes,
+            });
+        }
+
+        loop {
+            if self.offset == self.committed_bytes {
+                if self.record_count != self.expected_record_count
+                    || self.cumulative_plaintext_bytes
+                        != self.expected_cumulative_plaintext_bytes
+                    || self.next_sequence != self.expected_next_sequence
+                    || self.terminal_receipt != self.expected_terminal_receipt
+                {
+                    return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+                }
+                self.exhausted = true;
+                return Ok(None);
+            }
+            if self.offset > self.committed_bytes {
+                return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+            }
+            if self.record_count >= self.journal_limits.max_records {
+                return Err(GuardianOutputJournalError::RecordLimit {
+                    maximum: self.journal_limits.max_records,
+                });
+            }
+            let remaining = self
+                .committed_bytes
+                .checked_sub(self.offset)
+                .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+            if remaining < RECORD_HEADER_BYTES_U64 {
+                return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+            }
+
+            let record_offset = self.offset;
+            let mut record_header = [0_u8; RECORD_HEADER_BYTES];
+            read_exact_file_at(&self.file, &mut record_header, record_offset)?;
+            if record_header[0..8] != RECORD_MAGIC {
+                return Err(GuardianOutputJournalError::InvalidRecordMagic {
+                    offset: record_offset,
+                });
+            }
+            let sequence = read_u64(&record_header[8..16]);
+            let expected_sequence = self
+                .next_sequence
+                .ok_or(GuardianOutputJournalError::SequenceExhausted)?;
+            if sequence != expected_sequence {
+                return Err(GuardianOutputJournalError::SequenceMismatch {
+                    offset: record_offset,
+                    expected: expected_sequence,
+                    observed: sequence,
+                });
+            }
+            let plaintext_bytes = read_u32(&record_header[16..20]);
+            let ciphertext_bytes = read_u32(&record_header[20..24]);
+            let record_header_bytes = read_u32(&record_header[24..28]);
+            if record_header_bytes != RECORD_HEADER_BYTES_U32 {
+                return Err(GuardianOutputJournalError::InvalidRecordHeaderLength {
+                    offset: record_offset,
+                    observed: record_header_bytes,
+                });
+            }
+            if record_header[28..32] != [0_u8; 4]
+                || record_header[88..96] != [0_u8; 8]
+            {
+                return Err(GuardianOutputJournalError::NonCanonicalRecordHeader {
+                    offset: record_offset,
+                });
+            }
+            if plaintext_bytes == 0 {
+                return Err(GuardianOutputJournalError::EmptyRecord {
+                    offset: record_offset,
+                });
+            }
+            if plaintext_bytes > self.journal_limits.max_record_bytes {
+                return Err(GuardianOutputJournalError::RecordByteLimit {
+                    observed: u64::from(plaintext_bytes),
+                    maximum: self.journal_limits.max_record_bytes,
+                });
+            }
+            if plaintext_bytes > self.max_record_plaintext_bytes {
+                return Err(GuardianOutputJournalError::RecoveryPlaintextByteLimit {
+                    observed: u64::from(plaintext_bytes),
+                    maximum: u64::from(self.max_record_plaintext_bytes),
+                });
+            }
+            let expected_ciphertext_bytes = plaintext_bytes
+                .checked_add(AEAD_TAG_BYTES)
+                .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+            if ciphertext_bytes != expected_ciphertext_bytes {
+                return Err(GuardianOutputJournalError::CiphertextLengthMismatch {
+                    expected: expected_ciphertext_bytes,
+                    observed: ciphertext_bytes,
+                });
+            }
+            let frame_bytes = RECORD_HEADER_BYTES_U64
+                .checked_add(u64::from(ciphertext_bytes))
+                .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+            if remaining < frame_bytes {
+                return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+            }
+            let ciphertext_capacity = usize::try_from(ciphertext_bytes)
+                .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+            let mut ciphertext = Vec::new();
+            ciphertext
+                .try_reserve_exact(ciphertext_capacity)
+                .map_err(|_| GuardianOutputJournalError::RecoveryAllocationFailed)?;
+            ciphertext.resize(ciphertext_capacity, 0);
+            let ciphertext_offset = record_offset
+                .checked_add(RECORD_HEADER_BYTES_U64)
+                .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+            read_exact_file_at(&self.file, &mut ciphertext, ciphertext_offset)?;
+            let mut nonce = [0_u8; NONCE_BYTES];
+            nonce.copy_from_slice(&record_header[32..56]);
+            let expected_digest = record_digest(
+                self.identity,
+                sequence,
+                plaintext_bytes,
+                ciphertext_bytes,
+                &nonce,
+                &ciphertext,
+            );
+            if record_header[56..88] != expected_digest {
+                return Err(GuardianOutputJournalError::RecordDigestMismatch { sequence });
+            }
+            let plaintext = Zeroizing::new(self.cipher.open(
+                self.identity,
+                sequence,
+                plaintext_bytes,
+                &nonce,
+                &ciphertext,
+            )?);
+            if plaintext.len()
+                != usize::try_from(plaintext_bytes)
+                    .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?
+            {
+                return Err(GuardianOutputJournalError::PlaintextLengthMismatch {
+                    expected: plaintext_bytes,
+                    observed: u32::try_from(plaintext.len())
+                        .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?,
+                });
+            }
+
+            let committed_log_bytes = record_offset
+                .checked_add(frame_bytes)
+                .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+            let record_count = self
+                .record_count
+                .checked_add(1)
+                .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+            let cumulative_plaintext_bytes = self
+                .cumulative_plaintext_bytes
+                .checked_add(u64::from(plaintext_bytes))
+                .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+            let receipt = GuardianOutputAppendReceipt {
+                segment_id: self.identity.segment_id,
+                sequence,
+                payload_bytes: plaintext_bytes,
+                cumulative_plaintext_bytes,
+                committed_log_bytes,
+                record_digest: expected_digest,
+                plaintext_delivery_digest: plaintext_delivery_digest(
+                    self.identity.segment_id,
+                    sequence,
+                    plaintext.as_slice(),
+                ),
+            };
+
+            self.offset = committed_log_bytes;
+            self.record_count = record_count;
+            self.cumulative_plaintext_bytes = cumulative_plaintext_bytes;
+            self.next_sequence = sequence.checked_add(1);
+            self.terminal_receipt = Some(receipt);
+            #[cfg(test)]
+            {
+                self.verified_record_count = self
+                    .verified_record_count
+                    .checked_add(1)
+                    .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+            }
+
+            if sequence >= self.requested_first_sequence {
+                return Ok(Some(GuardianRecoveredOutputRecord {
+                    receipt,
+                    plaintext,
+                }));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn verified_record_count(&self) -> u64 {
+        self.verified_record_count
+    }
+}
+
+impl std::fmt::Debug for GuardianOutputRecoveryCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianOutputRecoveryCursor")
+            .field("identity", &self.identity)
+            .field("requested_first_sequence", &self.requested_first_sequence)
+            .field(
+                "max_record_plaintext_bytes",
+                &self.max_record_plaintext_bytes,
+            )
+            .field("committed_bytes", &self.committed_bytes)
+            .field("offset", &self.offset)
+            .field("record_count", &self.record_count)
+            .field("next_sequence", &self.next_sequence)
+            .field("terminal_receipt", &self.terminal_receipt)
+            .field("tail", &self.tail)
+            .field("exhausted", &self.exhausted)
+            .field("failed", &self.failed)
+            .finish()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GuardianOutputJournalError {
     #[error("invalid guardian output journal limits: {0}")]
@@ -1620,6 +2054,16 @@ pub enum GuardianOutputJournalError {
     RecoveryPlaintextByteLimit { observed: u64, maximum: u64 },
     #[error("guardian output recovery allocation failed")]
     RecoveryAllocationFailed,
+    #[error("guardian output recovery cursor no longer matches its frozen segment authority")]
+    RecoveryAuthorityMismatch,
+    #[error("guardian output recovery cursor is terminal after a prior failure")]
+    RecoveryCursorFailed,
+    #[error("guardian output recovery receipt does not match its plaintext payload")]
+    RecoveryPayloadBindingMismatch,
+    #[error(
+        "guardian output delivery plaintext bound exceeded: {observed} > {maximum}"
+    )]
+    DeliveryPayloadByteLimit { observed: u64, maximum: u32 },
     #[error("invalid guardian output encryption key: {0}")]
     InvalidEncryptionKey(&'static str),
     #[error("operating system entropy is unavailable for guardian output encryption")]
@@ -1739,7 +2183,7 @@ impl RecoveryCollector {
     fn observe(
         &mut self,
         receipt: GuardianOutputAppendReceipt,
-        plaintext: Vec<u8>,
+        plaintext: Zeroizing<Vec<u8>>,
     ) -> Result<(), GuardianOutputJournalError> {
         // The scanner intentionally authenticates the complete committed
         // prefix even after the requested page saturates. At that point this
@@ -1948,6 +2392,95 @@ impl GuardianOutputJournal {
         parent_directory.sync_all()?;
         self.directory_entry_sync_required = false;
         Ok(())
+    }
+
+    /// Create a frozen, stateful, single-pass recovery cursor.
+    ///
+    /// `max_record_plaintext_bytes` is a per-record allocation and delivery
+    /// bound, not a page total.  This lets a caller stream the entire committed
+    /// segment with constant resident plaintext memory and without rescanning
+    /// the prefix between records.  The hard recovery cap still applies even
+    /// when the journal was opened with a larger append limit.
+    pub fn recovery_cursor(
+        &self,
+        first_sequence: u64,
+        max_record_plaintext_bytes: u32,
+    ) -> Result<GuardianOutputRecoveryCursor, GuardianOutputJournalError> {
+        if self.poisoned {
+            return Err(GuardianOutputJournalError::Poisoned);
+        }
+        if self.directory_entry_sync_required {
+            return Err(GuardianOutputJournalError::DirectoryEntryNotDurable);
+        }
+        if max_record_plaintext_bytes == 0
+            || u64::from(max_record_plaintext_bytes) > RECOVERY_MAX_PLAINTEXT_BYTES
+        {
+            return Err(GuardianOutputJournalError::InvalidRecoveryLimits(
+                "max_record_plaintext_bytes is zero or exceeds the hard recovery cap",
+            ));
+        }
+        if first_sequence < self.identity.first_sequence {
+            return Err(GuardianOutputJournalError::RecoveryRangeMismatch);
+        }
+        if self
+            .next_sequence
+            .is_some_and(|next_sequence| first_sequence > next_sequence)
+        {
+            return Err(GuardianOutputJournalError::RecoveryRangeMismatch);
+        }
+
+        let expected_physical_bytes = match self.tail {
+            GuardianOutputJournalTail::Clean => self.committed_bytes,
+            GuardianOutputJournalTail::Incomplete {
+                committed_bytes,
+                trailing_bytes,
+            } => {
+                if committed_bytes != self.committed_bytes {
+                    return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+                }
+                committed_bytes
+                    .checked_add(trailing_bytes)
+                    .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?
+            }
+        };
+        let file = self.file.try_clone()?;
+        let observed_physical_bytes = file.metadata()?.len();
+        if observed_physical_bytes != expected_physical_bytes {
+            return Err(GuardianOutputJournalError::ExternalLengthChange {
+                expected: expected_physical_bytes,
+                observed: observed_physical_bytes,
+            });
+        }
+        let mut file_header = [0_u8; FILE_HEADER_BYTES];
+        read_exact_file_at(&file, &mut file_header, 0)?;
+        validate_file_header(&file_header, self.identity, &self.cipher)?;
+
+        Ok(GuardianOutputRecoveryCursor {
+            file,
+            identity: self.identity,
+            cipher: self.cipher.clone(),
+            journal_limits: self.limits,
+            requested_first_sequence: first_sequence,
+            max_record_plaintext_bytes,
+            committed_bytes: self.committed_bytes,
+            expected_record_count: self.record_count,
+            expected_cumulative_plaintext_bytes: self.cumulative_plaintext_bytes,
+            expected_next_sequence: self.next_sequence,
+            expected_terminal_receipt: self.terminal_receipt,
+            tail: self.tail,
+            offset: FILE_HEADER_BYTES_U64,
+            record_count: 0,
+            cumulative_plaintext_bytes: self
+                .identity
+                .predecessor
+                .map_or(0, |predecessor| predecessor.cumulative_plaintext_bytes),
+            next_sequence: Some(self.identity.first_sequence),
+            terminal_receipt: None,
+            exhausted: false,
+            failed: false,
+            #[cfg(test)]
+            verified_record_count: 0,
+        })
     }
 
     /// Re-read and authenticate a bounded contiguous page of the committed
@@ -2486,13 +3019,15 @@ fn scan_journal_with_recovery<R: Read + Seek>(
         if record_header[56..88] != expected_digest {
             return Err(GuardianOutputJournalError::RecordDigestMismatch { sequence });
         }
-        let plaintext = cipher.open(
+        // Own decrypted terminal content in a zeroizing buffer immediately,
+        // before any later validation or arithmetic can return early.
+        let plaintext = Zeroizing::new(cipher.open(
             identity,
             sequence,
             plaintext_bytes,
             &nonce,
             &ciphertext,
-        )?;
+        )?);
         if plaintext.len()
             != usize::try_from(plaintext_bytes)
                 .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?
@@ -2522,7 +3057,7 @@ fn scan_journal_with_recovery<R: Read + Seek>(
             plaintext_delivery_digest: plaintext_delivery_digest(
                 identity.segment_id,
                 sequence,
-                &plaintext,
+                plaintext.as_slice(),
             ),
         };
         if let Some(collector) = recovery.as_deref_mut() {
@@ -2562,10 +3097,78 @@ fn read_i64(bytes: &[u8]) -> i64 {
     i64::from_le_bytes(fixed)
 }
 
+fn read_exact_file_at(
+    file: &File,
+    mut buffer: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        match read_file_at(file, buffer, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "guardian output journal positional read reached EOF",
+                ));
+            }
+            Ok(read) => {
+                offset = offset
+                    .checked_add(u64::try_from(read).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "guardian output journal positional read length overflow",
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "guardian output journal positional read offset overflow",
+                        )
+                    })?;
+                let (_, remaining) = buffer.split_at_mut(read);
+                buffer = remaining;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt as _;
+
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt as _;
+
+    file.seek_read(buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    let mut clone = file.try_clone()?;
+    clone.seek(SeekFrom::Start(offset))?;
+    clone.read(buffer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Seek as _, Write as _};
+    use std::io::Cursor;
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        encoded
+    }
 
     #[cfg(unix)]
     fn create_journal_file(path: &std::path::Path) -> File {
@@ -2615,13 +3218,13 @@ mod tests {
         assert!(!encoded.contains("semantic-row-secret"));
         let debug = format!("{sealed:?}");
         assert!(!debug.contains("semantic-row-secret"));
-        assert!(!debug.contains(&hex::encode(cipher.key_id())));
+        assert!(!debug.contains(&hex_encode(&cipher.key_id())));
 
         let parsed = GuardianEncryptedScrollbackRow::parse(&encoded).expect("parse exact row");
         let opened = cipher
             .open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 1024)
             .expect("authenticate exact row");
-        assert_eq!(opened, plaintext);
+        assert_eq!(opened.as_slice(), plaintext);
     }
 
     #[test]
@@ -2710,7 +3313,7 @@ mod tests {
         let encoded = authentication.encode();
         assert!(!encoded.contains("FT-MANIFEST-SECRET"));
         assert!(!format!("{authentication:?}").contains("FT-MANIFEST-SECRET"));
-        assert!(!format!("{authentication:?}").contains(&hex::encode(cipher.key_id())));
+        assert!(!format!("{authentication:?}").contains(&hex_encode(&cipher.key_id())));
 
         let parsed = GuardianScrollbackManifestAuthentication::parse(&encoded)
             .expect("parse canonical authentication seal");
@@ -2774,6 +3377,78 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn scrollback_append_wal_authentication_roundtrips_without_content_disclosure() {
+        let canonical = br#"{"schema":"frankenterm.live-scrollback-append-wal.v1","record_sha256":"FT-WAL-SECRET"}"#;
+        let cipher = cipher();
+        let authentication = cipher
+            .authenticate_scrollback_append_wal(canonical)
+            .expect("authenticate canonical append WAL");
+        let encoded = authentication.encode();
+        assert!(!encoded.contains("FT-WAL-SECRET"));
+        let debug = format!("{authentication:?}");
+        assert!(!debug.contains("FT-WAL-SECRET"));
+        assert!(!debug.contains(&hex_encode(&cipher.key_id())));
+
+        let parsed = GuardianScrollbackAppendWalAuthentication::parse(&encoded)
+            .expect("parse canonical append WAL authentication");
+        assert_eq!(parsed.encode(), encoded);
+        cipher
+            .verify_scrollback_append_wal(&parsed, canonical)
+            .expect("verify canonical append WAL");
+    }
+
+    #[test]
+    fn scrollback_append_wal_authentication_rejects_tamper_wrong_wal_and_wrong_key() {
+        let canonical = br#"{"schema":"frankenterm.live-scrollback-append-wal.v1","revision":9}"#;
+        let cipher = cipher();
+        let mut authentication = cipher
+            .authenticate_scrollback_append_wal(canonical)
+            .expect("authenticate canonical append WAL");
+        assert!(matches!(
+            cipher.verify_scrollback_append_wal(
+                &authentication,
+                br#"{"schema":"frankenterm.live-scrollback-append-wal.v1","revision":8}"#,
+            ),
+            Err(GuardianScrollbackAppendWalError::AuthenticationFailed)
+        ));
+        let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x73; 32])
+            .expect("wrong append-WAL key is structurally valid");
+        assert!(matches!(
+            wrong_cipher.verify_scrollback_append_wal(&authentication, canonical),
+            Err(GuardianScrollbackAppendWalError::KeyIdentityMismatch)
+        ));
+        authentication.authentication_tag[0] ^= 0x40;
+        assert!(matches!(
+            cipher.verify_scrollback_append_wal(&authentication, canonical),
+            Err(GuardianScrollbackAppendWalError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn scrollback_append_wal_authentication_enforces_bounded_canonical_framing() {
+        let cipher = cipher();
+        assert!(matches!(
+            cipher.authenticate_scrollback_append_wal(b""),
+            Err(GuardianScrollbackAppendWalError::CanonicalByteLimit)
+        ));
+        assert!(matches!(
+            GuardianScrollbackAppendWalAuthentication::parse(&format!(
+                "{SCROLLBACK_APPEND_WAL_AUTH_PREFIX}{}",
+                "A".repeat(SCROLLBACK_APPEND_WAL_AUTH_ENCODED_BYTES + 1)
+            )),
+            Err(GuardianScrollbackAppendWalError::MalformedRecord)
+        ));
+        let encoded = cipher
+            .authenticate_scrollback_append_wal(b"bounded append WAL")
+            .expect("authenticate bounded append WAL")
+            .encode();
+        assert!(matches!(
+            GuardianScrollbackAppendWalAuthentication::parse(&format!("{encoded}=")),
+            Err(GuardianScrollbackAppendWalError::MalformedRecord)
+        ));
+    }
+
     fn journal_bytes_for(
         identity: GuardianOutputSegmentIdentity,
         records: &[&[u8]],
@@ -2815,6 +3490,43 @@ mod tests {
 
     fn journal_bytes(records: &[&[u8]]) -> Vec<u8> {
         journal_bytes_for(identity(), records)
+    }
+
+    #[cfg(unix)]
+    fn real_journal_with_records(
+        file_name: &str,
+        payloads: &[&[u8]],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        GuardianOutputJournal,
+        Vec<GuardianOutputAppendReceipt>,
+    ) {
+        let directory = tempfile::tempdir().expect("create cursor journal directory");
+        let path = directory.path().join(file_name);
+        let parent = File::open(directory.path()).expect("open cursor journal parent");
+        let mut journal = GuardianOutputJournal::open(
+            create_journal_file(&path),
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize cursor journal");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate cursor journal");
+        let mut receipts = Vec::new();
+        receipts
+            .try_reserve_exact(payloads.len())
+            .expect("reserve fixture receipts");
+        for payload in payloads {
+            receipts.push(
+                journal
+                    .append_and_sync(*payload)
+                    .expect("append cursor fixture record"),
+            );
+        }
+        (directory, path, journal, receipts)
     }
 
     #[test]
@@ -3303,6 +4015,351 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn recovery_cursor_is_linear_ordered_and_never_repeats_after_loss_or_eof() {
+        let payloads: [&[u8]; 3] = [
+            b"FT-CURSOR-FIRST-SECRET",
+            b"FT-CURSOR-SECOND-SECRET",
+            b"FT-CURSOR-THIRD-SECRET",
+        ];
+        let (_directory, _path, journal, receipts) =
+            real_journal_with_records("linear-cursor.ftgout", &payloads);
+
+        let mut cursor = journal
+            .recovery_cursor(1, 1024)
+            .expect("create bounded recovery cursor");
+        assert_eq!(cursor.verified_record_count(), 0);
+
+        let lost_first = cursor
+            .next_record()
+            .expect("authenticate first cursor record")
+            .expect("first cursor record exists");
+        assert_eq!(lost_first.receipt(), receipts[0]);
+        assert_eq!(lost_first.plaintext(), payloads[0]);
+        assert_eq!(cursor.verified_record_count(), 1);
+        drop(lost_first);
+
+        let second = cursor
+            .next_record()
+            .expect("authenticate second cursor record")
+            .expect("second cursor record exists");
+        assert_eq!(second.receipt(), receipts[1]);
+        assert_eq!(second.plaintext(), payloads[1]);
+        assert_eq!(cursor.verified_record_count(), 2);
+        let delivery = second
+            .into_authenticated_delivery()
+            .expect("promote bound second record to delivery capability");
+        assert_eq!(delivery.receipt(), receipts[1]);
+        let delivery_debug = format!("{delivery:?}");
+        assert!(!delivery_debug.contains("FT-CURSOR-SECOND-SECRET"));
+        let mut encoded = Vec::new();
+        let exact_delivery_bound =
+            u32::try_from(payloads[1].len()).expect("fixture payload length fits u32");
+        let delivered_receipt = delivery
+            .write_all_bounded(&mut encoded, exact_delivery_bound)
+            .expect("write the complete bounded authenticated payload");
+        assert_eq!(delivered_receipt, receipts[1]);
+        assert_eq!(encoded.as_slice(), payloads[1]);
+
+        let third = cursor
+            .next_record()
+            .expect("authenticate third cursor record")
+            .expect("third cursor record exists");
+        assert_eq!(third.receipt(), receipts[2]);
+        assert_eq!(third.plaintext(), payloads[2]);
+        assert_eq!(cursor.verified_record_count(), 3);
+        drop(third);
+
+        assert!(cursor
+            .next_record()
+            .expect("finish exact cursor authority")
+            .is_none());
+        assert!(cursor.is_exhausted());
+        assert_eq!(cursor.verified_record_count(), 3);
+        assert!(cursor
+            .next_record()
+            .expect("repeated EOF is stable")
+            .is_none());
+        assert_eq!(cursor.verified_record_count(), 3);
+
+        let mut explicit_replay = journal
+            .recovery_cursor(2, 1024)
+            .expect("create an explicit fresh cursor at sequence two");
+        let replayed_second = explicit_replay
+            .next_record()
+            .expect("authenticate skipped prefix and requested record")
+            .expect("explicitly requested record exists");
+        assert_eq!(replayed_second.receipt(), receipts[1]);
+        assert_eq!(replayed_second.plaintext(), payloads[1]);
+        assert_eq!(explicit_replay.verified_record_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_cursor_is_pinned_to_its_frozen_prefix_while_append_authority_advances() {
+        let (_directory, _path, mut journal, receipts) = real_journal_with_records(
+            "frozen-cursor.ftgout",
+            &[b"frozen-first", b"frozen-second"],
+        );
+        let mut cursor = journal
+            .recovery_cursor(1, 1024)
+            .expect("create frozen-prefix cursor");
+        assert_eq!(
+            cursor
+                .next_record()
+                .expect("authenticate frozen first record")
+                .expect("frozen first record exists")
+                .receipt(),
+            receipts[0]
+        );
+
+        let appended_after_cursor = journal
+            .append_and_sync(b"appended-after-cursor")
+            .expect("append authority remains independent of positional cursor reads");
+        assert_eq!(appended_after_cursor.sequence(), 3);
+        assert_eq!(
+            cursor
+                .next_record()
+                .expect("authenticate frozen second record")
+                .expect("frozen second record exists")
+                .receipt(),
+            receipts[1]
+        );
+        assert!(cursor
+            .next_record()
+            .expect("frozen cursor ignores later append")
+            .is_none());
+        assert_eq!(cursor.verified_record_count(), 2);
+
+        let mut later_cursor = journal
+            .recovery_cursor(3, 1024)
+            .expect("new cursor sees the advanced append authority");
+        assert_eq!(
+            later_cursor
+                .next_record()
+                .expect("authenticate advanced cursor record")
+                .expect("advanced cursor record exists")
+                .receipt(),
+            appended_after_cursor
+        );
+        assert_eq!(later_cursor.verified_record_count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_cursor_and_delivery_enforce_bounds_binding_and_zeroization() {
+        let payload: &[u8] = b"FT-CURSOR-ZEROIZE-SECRET";
+        let (_directory, _path, journal, _receipts) =
+            real_journal_with_records("bounded-cursor.ftgout", &[payload]);
+
+        assert!(matches!(
+            journal.recovery_cursor(1, 0),
+            Err(GuardianOutputJournalError::InvalidRecoveryLimits(_))
+        ));
+        let above_hard_cap = u32::try_from(RECOVERY_MAX_PLAINTEXT_BYTES + 1)
+            .expect("hard recovery cap plus one fits u32");
+        assert!(matches!(
+            journal.recovery_cursor(1, above_hard_cap),
+            Err(GuardianOutputJournalError::InvalidRecoveryLimits(_))
+        ));
+
+        let too_small = u32::try_from(payload.len() - 1).expect("fixture bound fits u32");
+        let mut bounded_cursor = journal
+            .recovery_cursor(1, too_small)
+            .expect("create cursor with a deliberately small record bound");
+        assert!(matches!(
+            bounded_cursor.next_record(),
+            Err(GuardianOutputJournalError::RecoveryPlaintextByteLimit {
+                observed,
+                maximum,
+            }) if observed == u64::try_from(payload.len()).expect("fixture length fits u64")
+                && maximum == u64::from(too_small)
+        ));
+        assert_eq!(bounded_cursor.verified_record_count(), 0);
+        assert!(matches!(
+            bounded_cursor.next_record(),
+            Err(GuardianOutputJournalError::RecoveryCursorFailed)
+        ));
+        assert_eq!(bounded_cursor.verified_record_count(), 0);
+
+        let mut forged_cursor = journal
+            .recovery_cursor(1, 1024)
+            .expect("create cursor for binding mutation plant");
+        let mut forged = forged_cursor
+            .next_record()
+            .expect("authenticate binding mutation record")
+            .expect("binding mutation record exists");
+        forged.plaintext[0] ^= 0x01;
+        assert!(matches!(
+            forged.into_authenticated_delivery(),
+            Err(GuardianOutputJournalError::RecoveryPayloadBindingMismatch)
+        ));
+
+        let mut zeroize_cursor = journal
+            .recovery_cursor(1, 1024)
+            .expect("create cursor for zeroization plant");
+        let record = zeroize_cursor
+            .next_record()
+            .expect("authenticate zeroization record")
+            .expect("zeroization record exists");
+        let mut delivery = record
+            .into_authenticated_delivery()
+            .expect("promote zeroization record");
+        fn require_zeroizing_payload(_: &Zeroizing<Vec<u8>>) {}
+        require_zeroizing_payload(&delivery.plaintext);
+        assert!(!format!("{delivery:?}").contains("FT-CURSOR-ZEROIZE-SECRET"));
+        delivery.plaintext.zeroize();
+        assert!(delivery.plaintext.iter().all(|byte| *byte == 0));
+
+        let mut delivery_bound_cursor = journal
+            .recovery_cursor(1, 1024)
+            .expect("create cursor for delivery bound plant");
+        let delivery = delivery_bound_cursor
+            .next_record()
+            .expect("authenticate delivery bound record")
+            .expect("delivery bound record exists")
+            .into_authenticated_delivery()
+            .expect("promote delivery bound record");
+        let mut writer = Vec::new();
+        assert!(matches!(
+            delivery.write_all_bounded(&mut writer, too_small),
+            Err(GuardianOutputJournalError::DeliveryPayloadByteLimit {
+                observed,
+                maximum,
+            }) if observed == u64::try_from(payload.len()).expect("fixture length fits u64")
+                && maximum == too_small
+        ));
+        assert!(writer.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_cursor_rejects_sequence_gap_and_same_length_aead_tamper() {
+        let (_gap_directory, gap_path, gap_journal, gap_receipts) =
+            real_journal_with_records("cursor-gap.ftgout", &[b"first", b"second"]);
+        let second_header = gap_receipts[0]
+            .committed_log_bytes()
+            .checked_add(8)
+            .expect("fixture second sequence offset fits u64");
+        let mut gap_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&gap_path)
+            .expect("open cursor gap journal for mutation");
+        gap_writer
+            .seek(SeekFrom::Start(second_header))
+            .and_then(|_| gap_writer.write_all(&3_u64.to_le_bytes()))
+            .and_then(|_| gap_writer.sync_all())
+            .expect("persist cursor sequence gap");
+        drop(gap_writer);
+
+        let mut gap_cursor = gap_journal
+            .recovery_cursor(1, 1024)
+            .expect("create cursor over same-length sequence gap");
+        assert_eq!(
+            gap_cursor
+                .next_record()
+                .expect("first record before gap authenticates")
+                .expect("first record before gap exists")
+                .receipt(),
+            gap_receipts[0]
+        );
+        assert!(matches!(
+            gap_cursor.next_record(),
+            Err(GuardianOutputJournalError::SequenceMismatch {
+                expected: 2,
+                observed: 3,
+                ..
+            })
+        ));
+
+        let (_tamper_directory, tamper_path, tamper_journal, _tamper_receipts) =
+            real_journal_with_records("cursor-tamper.ftgout", &[b"authenticated cursor data"]);
+        let segment_identity = identity();
+        let mut bytes = std::fs::read(&tamper_path).expect("read cursor tamper journal");
+        let header_offset = FILE_HEADER_BYTES;
+        let ciphertext_offset = header_offset + RECORD_HEADER_BYTES;
+        bytes[ciphertext_offset] ^= 0x80;
+        let sequence = read_u64(&bytes[header_offset + 8..header_offset + 16]);
+        let plaintext_bytes = read_u32(&bytes[header_offset + 16..header_offset + 20]);
+        let ciphertext_bytes = read_u32(&bytes[header_offset + 20..header_offset + 24]);
+        let mut nonce = [0_u8; NONCE_BYTES];
+        nonce.copy_from_slice(&bytes[header_offset + 32..header_offset + 56]);
+        let digest = record_digest(
+            segment_identity,
+            sequence,
+            plaintext_bytes,
+            ciphertext_bytes,
+            &nonce,
+            &bytes[ciphertext_offset..],
+        );
+        bytes[header_offset + 56..header_offset + 88].copy_from_slice(&digest);
+        let mut tamper_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tamper_path)
+            .expect("open cursor tamper journal for mutation");
+        tamper_writer
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| tamper_writer.write_all(&bytes))
+            .and_then(|_| tamper_writer.sync_all())
+            .expect("persist same-length cursor ciphertext tamper");
+        drop(tamper_writer);
+
+        let mut tamper_cursor = tamper_journal
+            .recovery_cursor(1, 1024)
+            .expect("create cursor over same-length ciphertext tamper");
+        assert!(matches!(
+            tamper_cursor.next_record(),
+            Err(GuardianOutputJournalError::DecryptionFailed)
+        ));
+        assert_eq!(tamper_cursor.verified_record_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_header_hint_selects_only_a_candidate_key_and_never_authorizes_open() {
+        let (_directory, path, journal, _receipts) =
+            real_journal_with_records("untrusted-hint.ftgout", &[b"hint payload"]);
+        let hint = GuardianOutputUntrustedHeaderHint::read_from(&journal.file)
+            .expect("read structurally valid untrusted header hint");
+        assert_eq!(hint.untrusted_key_id(), cipher().key_id());
+        let hint_debug = format!("{hint:?}");
+        assert!(hint_debug.contains("UNTRUSTED"));
+        assert!(!hint_debug.contains(&hex_encode(&cipher().key_id())));
+        drop(journal);
+
+        let mut bytes = std::fs::read(&path).expect("read hint mutation journal");
+        bytes[112] ^= 0x80;
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open hint mutation journal");
+        writer
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| writer.write_all(&bytes))
+            .and_then(|_| writer.sync_all())
+            .expect("persist forged unauthenticated key hint");
+        drop(writer);
+
+        let forged_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open forged hint journal");
+        let forged_hint = GuardianOutputUntrustedHeaderHint::read_from(&forged_file)
+            .expect("structural hint deliberately accepts unauthenticated key bytes");
+        assert_ne!(forged_hint.untrusted_key_id(), cipher().key_id());
+        assert!(matches!(
+            GuardianOutputJournal::open(
+                forged_file,
+                identity(),
+                cipher(),
+                GuardianOutputJournalLimits::default(),
+            ),
+            Err(GuardianOutputJournalError::KeyIdentityMismatch)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn authenticated_recovery_is_bounded_contiguous_and_reconstructs_terminal_authority() {
         let directory = tempfile::tempdir().expect("create recovery journal directory");
         let path = directory.path().join("recovery.ftgout");
@@ -3360,6 +4417,7 @@ mod tests {
         assert_eq!(page.records().len(), 1);
         assert_eq!(page.records()[0].receipt(), second);
         assert_eq!(page.records()[0].plaintext(), payloads[1]);
+        assert!(page.records()[0].authenticated_payload_is_receipt_bound());
         assert!(page.records()[0].receipt().matches_payload(payloads[1]));
         let mut same_length_wrong_payload = payloads[1].to_vec();
         same_length_wrong_payload[0] ^= 0x01;
@@ -3589,6 +4647,25 @@ mod tests {
         assert_eq!(page.next_recovery_sequence(), None);
         assert_eq!(page.committed_next_sequence(), None);
         assert_eq!(page.terminal_predecessor(), Some(terminal.into_predecessor()));
+
+        let mut cursor = reopened
+            .recovery_cursor(u64::MAX, 1024)
+            .expect("create maximal nonwrapping stateful cursor");
+        let cursor_terminal = cursor
+            .next_record()
+            .expect("authenticate maximal cursor record")
+            .expect("maximal cursor record exists");
+        assert_eq!(cursor_terminal.receipt(), terminal);
+        assert_eq!(cursor_terminal.plaintext(), b"terminal");
+        assert!(cursor
+            .next_record()
+            .expect("maximal cursor reaches a terminal EOF")
+            .is_none());
+        assert!(cursor
+            .next_record()
+            .expect("maximal cursor cannot wrap after EOF")
+            .is_none());
+        assert_eq!(cursor.verified_record_count(), 1);
     }
 
     #[cfg(unix)]
@@ -3823,6 +4900,28 @@ mod tests {
         assert_eq!(recovery.terminal_receipt(), Some(receipt));
         assert!(matches!(
             recovery.tail(),
+            GuardianOutputJournalTail::Incomplete {
+                trailing_bytes: 3,
+                ..
+            }
+        ));
+        let mut cursor = reopened
+            .recovery_cursor(1, 1024)
+            .expect("create cursor over authenticated prefix and torn tail");
+        assert_eq!(
+            cursor
+                .next_record()
+                .expect("authenticate whole record before torn tail")
+                .expect("whole record before torn tail exists")
+                .receipt(),
+            receipt
+        );
+        assert!(cursor
+            .next_record()
+            .expect("cursor excludes the uncommitted torn tail")
+            .is_none());
+        assert!(matches!(
+            cursor.tail(),
             GuardianOutputJournalTail::Incomplete {
                 trailing_bytes: 3,
                 ..

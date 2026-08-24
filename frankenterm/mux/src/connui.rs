@@ -2,11 +2,9 @@ use crate::termwiztermtab;
 use crate::Mux;
 use anyhow::{anyhow, bail, Context as _};
 use config::configuration;
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_term::TerminalSize;
-use promise::spawn::block_on;
-use promise::Promise;
 use std::convert::TryFrom;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -49,13 +47,13 @@ pub enum UIRequest {
     Input {
         prompt: String,
         echo: bool,
-        respond: Promise<String>,
+        respond: Sender<anyhow::Result<String>>,
     },
     /// Sleep with a progress bar
     Sleep {
         reason: String,
         duration: Duration,
-        respond: Promise<()>,
+        respond: Sender<anyhow::Result<()>>,
     },
     Close,
 }
@@ -81,23 +79,23 @@ impl ConnectionUIImpl {
                 Ok(UIRequest::Input {
                     prompt,
                     echo: true,
-                    mut respond,
+                    respond,
                 }) => {
-                    respond.result(self.input_prompt(&prompt));
+                    let _ = respond.send(self.input_prompt(&prompt));
                 }
                 Ok(UIRequest::Input {
                     prompt,
                     echo: false,
-                    mut respond,
+                    respond,
                 }) => {
-                    respond.result(self.password_prompt(&prompt));
+                    let _ = respond.send(self.password_prompt(&prompt));
                 }
                 Ok(UIRequest::Sleep {
                     reason,
                     duration,
-                    mut respond,
+                    respond,
                 }) => {
-                    respond.result(self.sleep(&reason, duration));
+                    let _ = respond.send(self.sleep(&reason, duration));
                 }
                 Err(err) if err.is_timeout() => {}
                 Err(err) => bail!("recv_timeout: {}", err),
@@ -252,17 +250,17 @@ impl HeadlessImpl {
                 Ok(UIRequest::Output(changes)) => {
                     log::trace!("Output: {:?}", changes);
                 }
-                Ok(UIRequest::Input { mut respond, .. }) => {
-                    respond.result(Err(anyhow!("Input requested from headless context")));
+                Ok(UIRequest::Input { respond, .. }) => {
+                    let _ = respond.send(Err(anyhow!("Input requested from headless context")));
                 }
                 Ok(UIRequest::Sleep {
-                    mut respond,
+                    respond,
                     reason,
                     duration,
                 }) => {
                     log::error!("{} (sleeping for {:?})", reason, duration);
                     std::thread::sleep(duration);
-                    respond.result(Ok(()));
+                    let _ = respond.send(Ok(()));
                 }
                 Err(err) if err.is_timeout() => {}
                 Err(err) => bail!("recv_timeout: {}", err),
@@ -283,6 +281,7 @@ pub struct ConnectionUIParams {
 #[derive(Clone)]
 pub struct ConnectionUI {
     tx: Sender<UIRequest>,
+    response_requires_main_thread: bool,
 }
 
 impl ConnectionUI {
@@ -341,7 +340,10 @@ impl ConnectionUI {
                 }
             })
             .detach();
-        Self { tx }
+        Self {
+            tx,
+            response_requires_main_thread: true,
+        }
     }
 
     pub fn new_with_no_close_delay() -> Self {
@@ -364,7 +366,10 @@ impl ConnectionUI {
             log::error!("failed to spawn headless ConnectionUI thread: {err:#}");
         }
 
-        Self { tx }
+        Self {
+            tx,
+            response_requires_main_thread: false,
+        }
     }
 
     pub fn run_and_log_error<T, F>(&self, f: F) -> anyhow::Result<T>
@@ -409,21 +414,41 @@ impl ConnectionUI {
         self.output(vec![Change::Text(s)]);
     }
 
+    fn ensure_blocking_response_is_safe(&self, operation: &str) -> anyhow::Result<()> {
+        let on_mux_main_thread = Mux::try_get().is_some_and(|mux| mux.is_main_thread());
+        if self.response_requires_main_thread
+            && (promise::spawn::is_in_main_thread_dispatch() || on_mux_main_thread)
+        {
+            bail!(
+                "ConnectionUI::{operation} cannot block on the mux main thread: \
+                 the GUI must service the response"
+            );
+        }
+        Ok(())
+    }
+
     /// Sleep (blocking!) for the specified duration, but updates
     /// the UI with the reason and a count down during that time.
+    ///
+    /// The reply deliberately uses a blocking channel rather than
+    /// `promise::spawn::block_on`. Reconnect workers spend their backoff here;
+    /// entering the shared asupersync runtime once per disconnected domain
+    /// turns an otherwise idle retry fleet into a yield-heavy CPU loop.
     pub fn sleep_with_reason(&self, reason: &str, duration: Duration) -> anyhow::Result<()> {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        self.ensure_blocking_response_is_safe("sleep_with_reason")?;
+        let (respond, response) = bounded(1);
 
         self.tx
             .send(UIRequest::Sleep {
                 reason: reason.to_string(),
                 duration,
-                respond: promise,
+                respond,
             })
             .context("send to ConnectionUI failed")?;
 
-        block_on(future)
+        response
+            .recv()
+            .context("ConnectionUI closed before completing sleep")?
     }
 
     /// Crack a multi-line prompt into an optional preamble and the prompt
@@ -442,8 +467,8 @@ impl ConnectionUI {
     }
 
     pub fn input(&self, prompt: &str) -> anyhow::Result<String> {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        self.ensure_blocking_response_is_safe("input")?;
+        let (respond, response) = bounded(1);
 
         let (preamble, prompt) = Self::split_multi_line_prompt(prompt);
         if let Some(preamble) = preamble {
@@ -454,16 +479,18 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: true,
-                respond: promise,
+                respond,
             })
             .context("send to ConnectionUI failed")?;
 
-        block_on(future)
+        response
+            .recv()
+            .context("ConnectionUI closed before completing input")?
     }
 
     pub fn password(&self, prompt: &str) -> anyhow::Result<String> {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        self.ensure_blocking_response_is_safe("password")?;
+        let (respond, response) = bounded(1);
 
         let (preamble, prompt) = Self::split_multi_line_prompt(prompt);
         if let Some(preamble) = preamble {
@@ -474,15 +501,34 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: false,
-                respond: promise,
+                respond,
             })
             .context("send to ConnectionUI failed")?;
 
-        block_on(future)
+        response
+            .recv()
+            .context("ConnectionUI closed before completing password input")?
     }
 
     pub fn close(&self) {
         self.tx.send(UIRequest::Close).ok();
+    }
+
+    /// Return whether the request receiver still owns this exact UI channel.
+    ///
+    /// The empty output is deliberately nonblocking. Background connection
+    /// supervisors use this to replace a user-closed prompt surface on the
+    /// next retry without creating more than one live window per domain.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.tx.send(UIRequest::Output(Vec::new())).is_ok()
+    }
+
+    /// Whether this UI can service operator input rather than rejecting it as
+    /// a headless diagnostic sink.
+    #[must_use]
+    pub fn is_interactive(&self) -> bool {
+        self.response_requires_main_thread
     }
 
     pub fn test_alive(&self) -> bool {
@@ -511,7 +557,7 @@ fn get_error_window() -> ConnectionUI {
     }
 
     let ui = ConnectionUI::new_with_no_close_delay();
-    ui.title("wezterm Configuration Error");
+    ui.title("FrankenTerm Configuration Error");
     err.replace(ui.clone());
     ui
 }
@@ -638,5 +684,32 @@ mod tests {
         let params = ConnectionUIParams::default();
         assert!(!params.disable_close_delay);
         assert!(params.window_id.is_none());
+    }
+
+    #[test]
+    fn main_thread_serviced_blocking_reply_fails_before_enqueue() {
+        let (tx, rx) = unbounded();
+        let ui = ConnectionUI {
+            tx,
+            response_requires_main_thread: true,
+        };
+        let _dispatch = promise::spawn::enter_main_thread_dispatch_scope();
+
+        let error = ui
+            .sleep_with_reason("must not enqueue", Duration::ZERO)
+            .expect_err("a GUI-serviced reply cannot block its own dispatcher");
+
+        assert!(error.to_string().contains("mux main thread"));
+        assert!(rx.is_empty(), "rejected work must not reach the GUI queue");
+    }
+
+    #[test]
+    fn headless_blocking_sleep_does_not_depend_on_main_thread_progress() {
+        let ui = ConnectionUI::new_headless();
+        let _dispatch = promise::spawn::enter_main_thread_dispatch_scope();
+
+        ui.sleep_with_reason("headless", Duration::ZERO)
+            .expect("the headless worker owns its reply progress");
+        ui.close();
     }
 }

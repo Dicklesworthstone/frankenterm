@@ -30,6 +30,7 @@ frankenterm-flight-recorder = { path = "../frankenterm-flight-recorder" }
 frankenterm-sigpipe.workspace = true
 futures.workspace = true
 fs2.workspace = true
+getrandom.workspace = true
 hostname.workspace = true
 io-uring = { version = "0.7.12", optional = true }
 lazy_static.workspace = true
@@ -52,10 +53,15 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4", "rng"] }
 varbincode.workspace = true
 frankenterm-client.workspace = true
+thiserror.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds = { workspace = true, default-features = false, features = ["async-asupersync"] }
+zeroize.workspace = true
 zstd.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [ "winuser" ]}

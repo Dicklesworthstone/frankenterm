@@ -61,13 +61,17 @@ use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
 use crate::guardian_checkpoint::{
-    GuardianCheckpointBoundary, GuardianCheckpointBoundaryError,
     LiveParserCaptureAndBindError, LiveParserCheckpointAck, capture_and_bind_live_parser_checkpoint,
 };
 use crate::guardian_output_journal::{
-    GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalError,
-    GuardianOutputJournalTail, GuardianOutputPredecessor, GuardianOutputRecoveryLimits,
-    GuardianOutputSegmentIdentity, GuardianRecoveredOutputRecord,
+    GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
+};
+#[cfg(test)]
+use crate::guardian_checkpoint::{GuardianCheckpointBoundary, GuardianCheckpointBoundaryError};
+#[cfg(test)]
+use crate::guardian_output_journal::{
+    GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalTail,
+    GuardianOutputPredecessor, GuardianOutputRecoveryBatch, GuardianOutputRecoveryLimits,
 };
 use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
@@ -1876,8 +1880,6 @@ pub enum LiveParserCheckpointError {
     GuardianDeliveryWatermarkMismatch,
     #[error("guardian output delivery cannot start after unjournaled parser bytes")]
     GuardianDeliveryStartedLate,
-    #[error("guardian output recovery page does not continue the authenticated parser cursor")]
-    GuardianRecoveryRangeMismatch,
     #[error("guardian output delivery byte accounting overflowed")]
     GuardianDeliveryOverflow,
     #[error("raw parser delivery attempted bytes without an authenticated guardian receipt")]
@@ -1909,7 +1911,7 @@ pub enum LiveParserCheckpointError {
     #[error("live parser is inside synchronized-output hold at the exact boundary")]
     SynchronizedOutputHold,
     #[error("live parser terminal capture and identity binding failed")]
-    CaptureAndBind(#[source] LiveParserCaptureAndBindError),
+    CaptureAndBind,
     #[error("live parser delivery fence is poisoned: {0}")]
     Poisoned(&'static str),
     #[error("timed out waiting for the exact live parser checkpoint boundary")]
@@ -1918,103 +1920,108 @@ pub enum LiveParserCheckpointError {
     CompletionDisconnected,
 }
 
-/// Content-free acknowledgement for one authenticated journal recovery page
-/// delivered through the exact live parser registration.
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub struct GuardianOutputRecoveryDelivery {
-    segment_identity: GuardianOutputSegmentIdentity,
-    requested_first_sequence: u64,
-    delivered_records: u64,
-    delivered_plaintext_bytes: u64,
-    next_recovery_sequence: Option<u64>,
-    committed_next_sequence: Option<u64>,
-    committed_log_bytes: u64,
-    cumulative_plaintext_bytes: u64,
-    terminal_predecessor: Option<GuardianOutputPredecessor>,
-    tail: GuardianOutputJournalTail,
+/// Authenticated, bounded output-journal page prepared for a future
+/// off-topology terminal replay transaction.
+///
+/// This type deliberately exposes only content-free facts. It is not proof
+/// that a checkpoint model was installed, has no live-parser activation
+/// method, and never delivers suffix bytes by itself. The future activation
+/// transaction must decode and restore the canonical checkpoint into an inert
+/// terminal, replay the private suffix there, verify the resulting model, and
+/// only then consume a separate typed model-installed authority while the pane
+/// reader start gate remains held.
+#[cfg(test)]
+struct GuardianOutputReplayPreparation {
+    batch: GuardianOutputRecoveryBatch,
+    checkpoint_receipt: GuardianOutputAppendReceipt,
 }
 
-impl GuardianOutputRecoveryDelivery {
+#[cfg(test)]
+impl GuardianOutputReplayPreparation {
     #[must_use]
-    pub const fn segment_identity(self) -> GuardianOutputSegmentIdentity {
-        self.segment_identity
+    fn segment_identity(&self) -> GuardianOutputSegmentIdentity {
+        self.batch.segment_identity()
     }
 
     #[must_use]
-    pub const fn requested_first_sequence(self) -> u64 {
-        self.requested_first_sequence
+    fn requested_first_sequence(&self) -> u64 {
+        self.batch.requested_first_sequence()
     }
 
     #[must_use]
-    pub const fn delivered_records(self) -> u64 {
-        self.delivered_records
+    fn checkpoint_receipt(&self) -> GuardianOutputAppendReceipt {
+        self.checkpoint_receipt
     }
 
     #[must_use]
-    pub const fn delivered_plaintext_bytes(self) -> u64 {
-        self.delivered_plaintext_bytes
+    fn suffix_record_count(&self) -> usize {
+        self.batch.records().len().saturating_sub(1)
     }
 
     #[must_use]
-    pub const fn next_recovery_sequence(self) -> Option<u64> {
-        self.next_recovery_sequence
+    fn next_recovery_sequence(&self) -> Option<u64> {
+        self.batch.next_recovery_sequence()
     }
 
     #[must_use]
-    pub const fn committed_next_sequence(self) -> Option<u64> {
-        self.committed_next_sequence
+    fn committed_next_sequence(&self) -> Option<u64> {
+        self.batch.committed_next_sequence()
     }
 
     #[must_use]
-    pub const fn committed_log_bytes(self) -> u64 {
-        self.committed_log_bytes
+    fn committed_log_bytes(&self) -> u64 {
+        self.batch.committed_log_bytes()
     }
 
     #[must_use]
-    pub const fn cumulative_plaintext_bytes(self) -> u64 {
-        self.cumulative_plaintext_bytes
+    fn cumulative_plaintext_bytes(&self) -> u64 {
+        self.batch.cumulative_plaintext_bytes()
     }
 
     #[must_use]
-    pub const fn terminal_predecessor(self) -> Option<GuardianOutputPredecessor> {
-        self.terminal_predecessor
+    fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
+        self.batch.terminal_predecessor()
     }
 
     #[must_use]
-    pub const fn tail(self) -> GuardianOutputJournalTail {
-        self.tail
+    fn tail(&self) -> GuardianOutputJournalTail {
+        self.batch.tail()
     }
 }
 
-impl std::fmt::Debug for GuardianOutputRecoveryDelivery {
+#[cfg(test)]
+impl std::fmt::Debug for GuardianOutputReplayPreparation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("GuardianOutputRecoveryDelivery")
-            .field("segment_identity", &self.segment_identity)
-            .field("requested_first_sequence", &self.requested_first_sequence)
-            .field("delivered_records", &self.delivered_records)
-            .field("delivered_plaintext_bytes", &self.delivered_plaintext_bytes)
-            .field("next_recovery_sequence", &self.next_recovery_sequence)
-            .field("committed_next_sequence", &self.committed_next_sequence)
-            .field("committed_log_bytes", &self.committed_log_bytes)
-            .field("cumulative_plaintext_bytes", &self.cumulative_plaintext_bytes)
-            .field("terminal_predecessor", &self.terminal_predecessor)
-            .field("tail", &self.tail)
+            .debug_struct("GuardianOutputReplayPreparation")
+            .field("segment_identity", &self.batch.segment_identity())
+            .field(
+                "requested_first_sequence",
+                &self.batch.requested_first_sequence(),
+            )
+            .field("checkpoint_receipt", &self.checkpoint_receipt)
+            .field("suffix_record_count", &self.suffix_record_count())
+            .field("next_recovery_sequence", &self.batch.next_recovery_sequence())
+            .field("committed_next_sequence", &self.batch.committed_next_sequence())
+            .field("committed_log_bytes", &self.batch.committed_log_bytes())
+            .field(
+                "cumulative_plaintext_bytes",
+                &self.batch.cumulative_plaintext_bytes(),
+            )
+            .field("terminal_predecessor", &self.batch.terminal_predecessor())
+            .field("tail", &self.batch.tail())
             .finish()
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Error)]
-pub enum GuardianOutputRecoveryDeliveryError {
+enum GuardianOutputReplayPreparationError {
     #[error("authenticated guardian output journal recovery failed")]
     Journal(#[from] GuardianOutputJournalError),
     #[error("guardian checkpoint boundary did not match authenticated journal recovery")]
     CheckpointBoundary(#[from] GuardianCheckpointBoundaryError),
-    #[error("guardian output recovery could not be admitted to the exact live parser")]
-    LiveParser(#[from] LiveParserCheckpointError),
-    #[error("guardian output recovery could not publish exact bytes to the live parser")]
-    ParserDelivery(#[source] std::io::Error),
-    #[error("guardian output recovery page is internally inconsistent: {0}")]
+    #[error("guardian output replay preparation is internally inconsistent: {0}")]
     InvalidPage(&'static str),
 }
 
@@ -2034,6 +2041,7 @@ struct LiveParserAuthorizedDelivery {
 }
 
 impl LiveParserGuardianCursor {
+    #[cfg(test)]
     fn matches_receipt(
         self,
         segment: GuardianOutputSegmentIdentity,
@@ -2075,6 +2083,7 @@ struct LiveParserCheckpointState {
     guardian_mode: bool,
     guardian_cursor: Option<LiveParserGuardianCursor>,
     authorized_delivery: Option<LiveParserAuthorizedDelivery>,
+    #[cfg(test)]
     next_request_id: u64,
     pending: Option<PendingLiveParserCheckpoint>,
 }
@@ -2094,6 +2103,7 @@ impl LiveParserCheckpointState {
             guardian_mode: false,
             guardian_cursor: None,
             authorized_delivery: None,
+            #[cfg(test)]
             next_request_id: 1,
             pending: None,
         }
@@ -2178,6 +2188,33 @@ struct LiveParserWorkerGuard {
     dead: Arc<AtomicBool>,
 }
 
+struct LiveParserDataWriterGuard {
+    control: Arc<LiveParserCheckpointControl>,
+    active: bool,
+}
+
+impl LiveParserDataWriterGuard {
+    fn new(control: &Arc<LiveParserCheckpointControl>) -> Self {
+        Self {
+            control: Arc::clone(control),
+            active: true,
+        }
+    }
+
+    fn close(mut self) {
+        self.control.close_data_writer();
+        self.active = false;
+    }
+}
+
+impl Drop for LiveParserDataWriterGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.control.close_data_writer();
+        }
+    }
+}
+
 impl Drop for LiveParserWorkerGuard {
     fn drop(&mut self) {
         self.dead.store(true, Ordering::Release);
@@ -2217,6 +2254,11 @@ impl LiveParserCheckpointControl {
 
     fn close_data_writer(&self) {
         self.data_writer.lock().take();
+    }
+
+    fn close_reader_channels(&self) {
+        self.data_writer.lock().take();
+        self.wake_writer.lock().take();
     }
 
     fn wake_parser(&self) {
@@ -2550,6 +2592,7 @@ impl LiveParserCheckpointControl {
                 Self::fail_pending_locked(&mut state, error);
             }
         }
+        self.close_reader_channels();
         self.delivery_gate.notify_all();
     }
 
@@ -2569,78 +2612,6 @@ impl LiveParserCheckpointControl {
             }
         }
         self.delivery_gate.notify_all();
-    }
-
-    fn seed_guardian_recovery_cursor(
-        &self,
-        durable_pane_id: uuid::Uuid,
-        segment: GuardianOutputSegmentIdentity,
-        output: GuardianOutputAppendReceipt,
-    ) -> Result<(), LiveParserCheckpointError> {
-        let mut state = self.state.lock();
-        if !state.attached {
-            return Err(LiveParserCheckpointError::ReaderUnavailable);
-        }
-        if state.dead {
-            return Err(LiveParserCheckpointError::ReaderDead);
-        }
-        if let Some(reason) = state.poison {
-            return Err(LiveParserCheckpointError::Poisoned(reason));
-        }
-        if state.delivery_call_in_flight || state.socket_write_in_flight {
-            return Err(LiveParserCheckpointError::DeliveryWriteInFlight);
-        }
-        if state.pending.is_some() {
-            return Err(LiveParserCheckpointError::CheckpointBusy);
-        }
-        if state.guardian_mode
-            || state.guardian_cursor.is_some()
-            || state.authorized_delivery.is_some()
-            || state.delivered_bytes != 0
-            || state.parsed_bytes != 0
-        {
-            return Err(LiveParserCheckpointError::GuardianDeliveryStartedLate);
-        }
-        if segment.durable_pane_id() != durable_pane_id
-            || segment.segment_id() != output.segment_id()
-            || output.sequence() < segment.first_sequence()
-        {
-            return Err(LiveParserCheckpointError::GuardianDeliveryIdentityMismatch);
-        }
-        state.guardian_mode = true;
-        state.guardian_cursor = Some(LiveParserGuardianCursor {
-            segment_id: output.segment_id(),
-            output_sequence: output.sequence(),
-            output_record_digest: output.record_digest(),
-            output_committed_log_bytes: output.committed_log_bytes(),
-            journal_cumulative_plaintext_bytes: output.cumulative_plaintext_bytes(),
-            // A restored terminal begins a fresh external parser incarnation.
-            // Its parser watermark is therefore zero at the checkpoint even
-            // though the pane-lifetime journal watermark remains monotonic.
-            parser_global_endpoint: 0,
-        });
-        Ok(())
-    }
-
-    fn guardian_recovery_cursor(
-        &self,
-    ) -> Result<LiveParserGuardianCursor, LiveParserCheckpointError> {
-        let state = self.state.lock();
-        if state.dead {
-            return Err(LiveParserCheckpointError::ReaderDead);
-        }
-        if let Some(reason) = state.poison {
-            return Err(LiveParserCheckpointError::Poisoned(reason));
-        }
-        if state.delivery_call_in_flight || state.socket_write_in_flight {
-            return Err(LiveParserCheckpointError::DeliveryWriteInFlight);
-        }
-        if state.authorized_delivery.is_some() {
-            return Err(LiveParserCheckpointError::GuardianDeliveryBusy);
-        }
-        state
-            .guardian_cursor
-            .ok_or(LiveParserCheckpointError::GuardianDeliveryUnavailable)
     }
 
     fn authorize_guardian_delivery(
@@ -2765,6 +2736,7 @@ impl LiveParserCheckpointControl {
         Ok(parser_global_endpoint)
     }
 
+    #[cfg(test)]
     fn register_checkpoint(
         &self,
         pane: &Arc<dyn Pane>,
@@ -2856,6 +2828,7 @@ impl LiveParserCheckpointControl {
         Ok((request_id, receiver))
     }
 
+    #[cfg(test)]
     fn cancel_checkpoint(&self, request_id: u64) {
         {
             let mut state = self.state.lock();
@@ -3424,10 +3397,22 @@ mod pane_registration_handle {
             self.pane.writer().write_all(data)
         }
 
+        /// Perform exactly one bounded writer call and return its authoritative
+        /// applied-prefix length. Reliable pane-input delivery must not hide a
+        /// partial effect behind `write_all`.
+        pub fn write_once(&self, data: &[u8]) -> std::io::Result<usize> {
+            self.pane.writer().write(data)
+        }
+
         pub fn write_all_and_flush(&self, data: &[u8]) -> std::io::Result<()> {
             let mut writer = self.pane.writer();
             writer.write_all(data)?;
             writer.flush()
+        }
+
+        #[must_use]
+        pub fn owner_is_main_thread(&self) -> bool {
+            self.owner.is_main_thread()
         }
 
         pub fn erase_scrollback(&self, erase_mode: config::keyassignment::ScrollbackEraseMode) {
@@ -4090,407 +4075,173 @@ mod pane_registration_handle {
             }
         }
 
-        fn validate_guardian_recovery_page(
+        #[cfg(test)]
+        fn validate_guardian_replay_page(
             segment: GuardianOutputSegmentIdentity,
-            requested_first_sequence: u64,
-            records: &[GuardianRecoveredOutputRecord],
-            previous: Option<LiveParserGuardianCursor>,
-            next_recovery_sequence: Option<u64>,
-            committed_next_sequence: Option<u64>,
-            committed_log_bytes: u64,
-            cumulative_plaintext_bytes: u64,
-            terminal_receipt: Option<GuardianOutputAppendReceipt>,
-        ) -> Result<(), GuardianOutputRecoveryDeliveryError> {
+            batch: &GuardianOutputRecoveryBatch,
+        ) -> Result<(), GuardianOutputReplayPreparationError> {
+            let requested_first_sequence = batch.requested_first_sequence();
+            let records = batch.records();
             let base_cumulative = segment
                 .predecessor()
                 .map_or(0, GuardianOutputPredecessor::cumulative_plaintext_bytes);
-            let expected_first = match previous {
-                Some(previous) => {
-                    let expected = previous.output_sequence.checked_add(1).ok_or(
-                        GuardianOutputRecoveryDeliveryError::InvalidPage(
-                            "the current parser cursor exhausted output sequence space",
-                        ),
-                    )?;
-                    if previous.segment_id != segment.segment_id() {
-                        let predecessor = segment.predecessor().ok_or(
-                            GuardianOutputRecoveryDeliveryError::InvalidPage(
-                                "a recovery segment rollover omitted its predecessor",
-                            ),
-                        )?;
-                        if predecessor.segment_id() != previous.segment_id
-                            || predecessor.last_sequence() != previous.output_sequence
-                            || predecessor.terminal_record_digest()
-                                != previous.output_record_digest
-                            || predecessor.committed_log_bytes()
-                                != previous.output_committed_log_bytes
-                            || predecessor.cumulative_plaintext_bytes()
-                                != previous.journal_cumulative_plaintext_bytes
-                            || segment.first_sequence() != expected
-                        {
-                            return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                                "the recovery segment predecessor does not match the live cursor",
-                            ));
-                        }
-                    }
-                    expected
-                }
-                None => requested_first_sequence,
-            };
-            if requested_first_sequence != expected_first {
-                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                    "the requested recovery sequence does not continue the live cursor",
+            let first = records
+                .first()
+                .ok_or(GuardianOutputReplayPreparationError::InvalidPage(
+                    "checkpoint replay preparation omitted its checkpoint record",
+                ))?
+                .receipt();
+            let mut expected_sequence = Some(requested_first_sequence);
+            let mut previous_sequence = None;
+            let mut previous_cumulative = first
+                .cumulative_plaintext_bytes()
+                .checked_sub(u64::from(first.payload_bytes()))
+                .ok_or(GuardianOutputReplayPreparationError::InvalidPage(
+                    "the first replay receipt underflows its plaintext watermark",
+                ))?;
+            if previous_cumulative < base_cumulative
+                || (requested_first_sequence == segment.first_sequence()
+                    && previous_cumulative != base_cumulative)
+            {
+                return Err(GuardianOutputReplayPreparationError::InvalidPage(
+                    "the first replay receipt has an invalid prior watermark",
                 ));
             }
-
-            let mut expected_sequence = expected_first;
-            let mut previous_sequence = None;
-            let mut previous_cumulative = match previous {
-                Some(cursor) => cursor.journal_cumulative_plaintext_bytes,
-                None => match records.first() {
-                    Some(first) => {
-                        let first = first.receipt();
-                        let before_first = first
-                            .cumulative_plaintext_bytes()
-                            .checked_sub(u64::from(first.payload_bytes()))
-                            .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                                "the first recovery receipt underflows its plaintext watermark",
-                            ))?;
-                        if before_first < base_cumulative
-                            || (requested_first_sequence == segment.first_sequence()
-                                && before_first != base_cumulative)
-                        {
-                            return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                                "the first recovery receipt has an invalid prior watermark",
-                            ));
-                        }
-                        before_first
-                    }
-                    None => base_cumulative,
-                },
-            };
-            let mut previous_log_bytes = previous
-                .filter(|cursor| cursor.segment_id == segment.segment_id())
-                .map(|cursor| cursor.output_committed_log_bytes);
+            let mut previous_log_bytes = None;
             for record in records {
-                let (receipt, plaintext) = record.delivery_parts();
+                let receipt = record.receipt();
                 if receipt.segment_id() != segment.segment_id()
-                    || receipt.sequence() != expected_sequence
-                    || !receipt.matches_payload(plaintext)
+                    || Some(receipt.sequence()) != expected_sequence
+                    || !record.authenticated_payload_is_receipt_bound()
                 {
-                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "a recovered record does not match its authenticated sequence or payload",
+                    return Err(GuardianOutputReplayPreparationError::InvalidPage(
+                        "a replay record does not match its authenticated sequence or payload",
                     ));
                 }
                 let expected_cumulative = previous_cumulative
                     .checked_add(u64::from(receipt.payload_bytes()))
-                    .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "recovery plaintext accounting overflowed",
+                    .ok_or(GuardianOutputReplayPreparationError::InvalidPage(
+                        "replay plaintext accounting overflowed",
                     ))?;
                 if receipt.cumulative_plaintext_bytes() != expected_cumulative {
-                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "a recovered record breaks the pane-lifetime plaintext watermark",
+                    return Err(GuardianOutputReplayPreparationError::InvalidPage(
+                        "a replay record breaks the pane-lifetime plaintext watermark",
                     ));
                 }
-                if previous_log_bytes.is_some_and(|previous| {
-                    receipt.committed_log_bytes() <= previous
-                }) {
-                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "a recovered record does not advance the segment log endpoint",
+                if previous_log_bytes
+                    .is_some_and(|previous| receipt.committed_log_bytes() <= previous)
+                {
+                    return Err(GuardianOutputReplayPreparationError::InvalidPage(
+                        "a replay record does not advance the segment log endpoint",
                     ));
                 }
                 previous_sequence = Some(receipt.sequence());
                 previous_cumulative = receipt.cumulative_plaintext_bytes();
                 previous_log_bytes = Some(receipt.committed_log_bytes());
-                expected_sequence = receipt.sequence().checked_add(1).unwrap_or(0);
+                expected_sequence = receipt.sequence().checked_add(1);
             }
 
-            if let Some(next) = next_recovery_sequence {
+            if let Some(next) = batch.next_recovery_sequence() {
                 let last = previous_sequence.ok_or(
-                    GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "an empty recovery page cannot advertise a continuation",
+                    GuardianOutputReplayPreparationError::InvalidPage(
+                        "an empty replay page cannot advertise a continuation",
                     ),
                 )?;
                 if last.checked_add(1) != Some(next)
-                    || committed_next_sequence.is_some_and(|committed| next >= committed)
+                    || batch
+                        .committed_next_sequence()
+                        .is_some_and(|committed| next >= committed)
                 {
-                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "the recovery page continuation is not an exact interior cursor",
+                    return Err(GuardianOutputReplayPreparationError::InvalidPage(
+                        "the replay continuation is not an exact interior cursor",
                     ));
                 }
-            } else if let Some(last) = previous_sequence {
-                if last.checked_add(1) != committed_next_sequence {
-                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "a terminal recovery page does not reach the committed endpoint",
-                    ));
-                }
-            } else if committed_next_sequence != Some(requested_first_sequence) {
-                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                    "an empty recovery page is not positioned at the committed endpoint",
+            } else if previous_sequence.and_then(|last| last.checked_add(1))
+                != batch.committed_next_sequence()
+            {
+                return Err(GuardianOutputReplayPreparationError::InvalidPage(
+                    "the terminal replay page does not reach the committed endpoint",
                 ));
             }
 
-            match terminal_receipt {
-                Some(terminal) => {
-                    if terminal.segment_id() != segment.segment_id()
-                        || terminal.sequence().checked_add(1) != committed_next_sequence
-                        || terminal.committed_log_bytes() != committed_log_bytes
-                        || terminal.cumulative_plaintext_bytes() != cumulative_plaintext_bytes
-                    {
-                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                            "the recovery page aggregate does not match its terminal receipt",
-                        ));
-                    }
-                    let terminal_was_already_delivered = records.is_empty()
-                        && previous.is_some_and(|cursor| {
-                            cursor.segment_id == terminal.segment_id()
-                                && cursor.output_sequence == terminal.sequence()
-                                && cursor.output_record_digest == terminal.record_digest()
-                                && cursor.output_committed_log_bytes
-                                    == terminal.committed_log_bytes()
-                                && cursor.journal_cumulative_plaintext_bytes
-                                    == terminal.cumulative_plaintext_bytes()
-                        });
-                    if next_recovery_sequence.is_none()
-                        && previous_sequence != Some(terminal.sequence())
-                        && !terminal_was_already_delivered
-                    {
-                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                            "a terminal recovery page omits its authenticated terminal record",
-                        ));
-                    }
-                }
-                None => {
-                    if committed_next_sequence != Some(segment.first_sequence())
-                        || cumulative_plaintext_bytes != base_cumulative
-                    {
-                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                            "an empty segment recovery aggregate is inconsistent",
-                        ));
-                    }
-                }
+            let terminal = batch
+                .terminal_receipt()
+                .ok_or(GuardianOutputReplayPreparationError::InvalidPage(
+                    "a nonempty replay page has no authenticated terminal receipt",
+                ))?;
+            if terminal.segment_id() != segment.segment_id()
+                || terminal.sequence().checked_add(1) != batch.committed_next_sequence()
+                || terminal.committed_log_bytes() != batch.committed_log_bytes()
+                || terminal.cumulative_plaintext_bytes()
+                    != batch.cumulative_plaintext_bytes()
+                || (batch.next_recovery_sequence().is_none()
+                    && previous_sequence != Some(terminal.sequence()))
+            {
+                return Err(GuardianOutputReplayPreparationError::InvalidPage(
+                    "the replay aggregate does not match its terminal receipt",
+                ));
             }
             Ok(())
         }
 
-        fn deliver_guardian_recovery_records(
-            &self,
-            segment: GuardianOutputSegmentIdentity,
-            records: Vec<GuardianRecoveredOutputRecord>,
-            skip_records: usize,
-        ) -> Result<(u64, u64), GuardianOutputRecoveryDeliveryError> {
-            let mut delivered_records = 0_u64;
-            let mut delivered_plaintext_bytes = 0_u64;
-            for record in records.into_iter().skip(skip_records) {
-                let (receipt, plaintext) = record.into_delivery_parts();
-                let plaintext_bytes = u64::try_from(plaintext.len()).map_err(|_| {
-                    GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "recovered plaintext length does not fit delivery accounting",
-                    )
-                })?;
-                let payload = Arc::<[u8]>::from(plaintext);
-                self.authorize_guardian_output_delivery(
-                    segment,
-                    receipt,
-                    Arc::clone(&payload),
-                )?;
-                self.generation
-                    .live_parser_checkpoint
-                    .write_delivered_bytes(payload.as_ref())
-                    .map_err(GuardianOutputRecoveryDeliveryError::ParserDelivery)?;
-                delivered_records = delivered_records.checked_add(1).ok_or(
-                    GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "recovery record delivery count overflowed",
-                    ),
-                )?;
-                delivered_plaintext_bytes = delivered_plaintext_bytes
-                    .checked_add(plaintext_bytes)
-                    .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                        "recovery plaintext delivery count overflowed",
-                    ))?;
-            }
-            Ok((delivered_records, delivered_plaintext_bytes))
-        }
-
-        fn recovery_delivery_receipt(
-            segment_identity: GuardianOutputSegmentIdentity,
-            requested_first_sequence: u64,
-            delivered_records: u64,
-            delivered_plaintext_bytes: u64,
-            next_recovery_sequence: Option<u64>,
-            committed_next_sequence: Option<u64>,
-            committed_log_bytes: u64,
-            cumulative_plaintext_bytes: u64,
-            terminal_receipt: Option<GuardianOutputAppendReceipt>,
-            tail: GuardianOutputJournalTail,
-        ) -> GuardianOutputRecoveryDelivery {
-            GuardianOutputRecoveryDelivery {
-                segment_identity,
-                requested_first_sequence,
-                delivered_records,
-                delivered_plaintext_bytes,
-                next_recovery_sequence,
-                committed_next_sequence,
-                committed_log_bytes,
-                cumulative_plaintext_bytes,
-                terminal_predecessor: terminal_receipt
-                    .map(GuardianOutputAppendReceipt::into_predecessor)
-                    .or(segment_identity.predecessor()),
-                tail,
-            }
-        }
-
-        /// Authenticate the checkpoint record from a reopened journal, seed a
-        /// fresh parser incarnation at that exact model boundary, and deliver
-        /// only the later records in the first bounded recovery page. Callers
-        /// must retain the pane-reader start gate until this method and every
-        /// required continuation page have committed.
-        pub fn recover_guardian_output_from_checkpoint(
+        /// Authenticate and bind a bounded journal page to a canonical
+        /// checkpoint boundary without mutating the live parser or pane model.
+        ///
+        /// This is suffix/replay preparation only, never checkpoint restore.
+        /// The returned opaque value cannot expose or deliver plaintext. A
+        /// separate future transaction must install the checkpoint model into
+        /// an inert terminal, replay the private suffix off topology, verify
+        /// the result, and mint a typed model-installed authority before any
+        /// live parser can be activated.
+        #[cfg(test)]
+        fn prepare_guardian_output_replay_from_checkpoint(
             &self,
             journal: &GuardianOutputJournal,
             boundary: &GuardianCheckpointBoundary,
             canonical_terminal_payload: &[u8],
             limits: GuardianOutputRecoveryLimits,
-        ) -> Result<GuardianOutputRecoveryDelivery, GuardianOutputRecoveryDeliveryError> {
+        ) -> Result<GuardianOutputReplayPreparation, GuardianOutputReplayPreparationError> {
             let batch = journal.recover_committed_range(boundary.output_sequence(), limits)?;
-            let (
-                segment_identity,
-                requested_first_sequence,
-                records,
-                next_recovery_sequence,
-                committed_next_sequence,
-                committed_log_bytes,
-                cumulative_plaintext_bytes,
-                terminal_receipt,
-                tail,
-            ) = batch.into_delivery_parts();
+            let segment_identity = batch.segment_identity();
             if segment_identity != journal.identity()
-                || requested_first_sequence != boundary.output_sequence()
+                || batch.requested_first_sequence() != boundary.output_sequence()
             {
-                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                    "checkpoint recovery did not begin at the requested journal identity",
+                return Err(GuardianOutputReplayPreparationError::InvalidPage(
+                    "checkpoint replay did not begin at the requested journal identity",
                 ));
             }
-            Self::validate_guardian_recovery_page(
-                segment_identity,
-                requested_first_sequence,
-                &records,
-                None,
-                next_recovery_sequence,
-                committed_next_sequence,
-                committed_log_bytes,
-                cumulative_plaintext_bytes,
-                terminal_receipt,
-            )?;
-            let checkpoint_receipt = records
+            Self::validate_guardian_replay_page(segment_identity, &batch)?;
+            let checkpoint_receipt = batch
+                .records()
                 .first()
-                .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                    "checkpoint recovery omitted the authenticated checkpoint record",
+                .ok_or(GuardianOutputReplayPreparationError::InvalidPage(
+                    "checkpoint replay preparation omitted the authenticated checkpoint record",
                 ))?
                 .receipt();
             let durable_pane_id = self
                 .pane
                 .durable_pane_id()
                 .map(uuid::Uuid::from_bytes)
-                .ok_or(LiveParserCheckpointError::MissingDurablePaneIdentity)?;
+                .ok_or(GuardianOutputReplayPreparationError::InvalidPage(
+                    "the replay target has no durable pane identity",
+                ))?;
             boundary.validate_for_restore(
                 durable_pane_id,
                 segment_identity,
                 checkpoint_receipt,
                 canonical_terminal_payload,
             )?;
-            self.generation
-                .live_parser_checkpoint
-                .seed_guardian_recovery_cursor(
-                    durable_pane_id,
-                    segment_identity,
-                    checkpoint_receipt,
-                )?;
-            let (delivered_records, delivered_plaintext_bytes) = self
-                .deliver_guardian_recovery_records(segment_identity, records, 1)?;
-            Ok(Self::recovery_delivery_receipt(
-                segment_identity,
-                requested_first_sequence,
-                delivered_records,
-                delivered_plaintext_bytes,
-                next_recovery_sequence,
-                committed_next_sequence,
-                committed_log_bytes,
-                cumulative_plaintext_bytes,
-                terminal_receipt,
-                tail,
-            ))
-        }
-
-        /// Reopen, authenticate, and deliver one exact continuation page after
-        /// `recover_guardian_output_from_checkpoint` seeded this parser.
-        pub fn recover_and_deliver_guardian_output_page(
-            &self,
-            journal: &GuardianOutputJournal,
-            first_sequence: u64,
-            limits: GuardianOutputRecoveryLimits,
-        ) -> Result<GuardianOutputRecoveryDelivery, GuardianOutputRecoveryDeliveryError> {
-            let previous = self
-                .generation
-                .live_parser_checkpoint
-                .guardian_recovery_cursor()?;
-            let expected_first = previous.output_sequence.checked_add(1).ok_or(
-                LiveParserCheckpointError::GuardianRecoveryRangeMismatch,
-            )?;
-            if first_sequence != expected_first {
-                return Err(LiveParserCheckpointError::GuardianRecoveryRangeMismatch.into());
-            }
-            let batch = journal.recover_committed_range(first_sequence, limits)?;
-            let (
-                segment_identity,
-                requested_first_sequence,
-                records,
-                next_recovery_sequence,
-                committed_next_sequence,
-                committed_log_bytes,
-                cumulative_plaintext_bytes,
-                terminal_receipt,
-                tail,
-            ) = batch.into_delivery_parts();
-            if segment_identity != journal.identity() {
-                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
-                    "continuation recovery changed journal identity",
-                ));
-            }
-            Self::validate_guardian_recovery_page(
-                segment_identity,
-                requested_first_sequence,
-                &records,
-                Some(previous),
-                next_recovery_sequence,
-                committed_next_sequence,
-                committed_log_bytes,
-                cumulative_plaintext_bytes,
-                terminal_receipt,
-            )?;
-            let (delivered_records, delivered_plaintext_bytes) = self
-                .deliver_guardian_recovery_records(segment_identity, records, 0)?;
-            Ok(Self::recovery_delivery_receipt(
-                segment_identity,
-                requested_first_sequence,
-                delivered_records,
-                delivered_plaintext_bytes,
-                next_recovery_sequence,
-                committed_next_sequence,
-                committed_log_bytes,
-                cumulative_plaintext_bytes,
-                terminal_receipt,
-                tail,
-            ))
+            Ok(GuardianOutputReplayPreparation {
+                batch,
+                checkpoint_receipt,
+            })
         }
 
         /// Freeze this exact live parser registration at the authenticated
         /// receipt already registered by `authorize_guardian_output_delivery`.
         /// The operation lease spans registration, bounded wait, capture, and
         /// final registry revalidation.
-        #[allow(
-            dead_code,
-            reason = "production guardian checkpoint caller lands after the protocol effect"
-        )]
+        #[cfg(test)]
         pub(crate) fn capture_live_parser_checkpoint(
             &self,
             segment: GuardianOutputSegmentIdentity,
@@ -9198,12 +8949,30 @@ pub enum ReliableInputKeyKind {
     KeyUp,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReliableInputPayloadFingerprint {
+    KeyEvent {
+        kind: ReliableInputKeyKind,
+        event: KeyEvent,
+    },
+    PaneWrite {
+        payload_sha256: [u8; 32],
+        data_len: usize,
+    },
+}
+
+fn reliable_pane_write_payload_fingerprint(data: &[u8]) -> ReliableInputPayloadFingerprint {
+    ReliableInputPayloadFingerprint::PaneWrite {
+        payload_sha256: Sha256::digest(data).into(),
+        data_len: data.len(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReliableInputFingerprint {
     registration: PaneRegistrationHandle,
     input_serial: u64,
-    kind: ReliableInputKeyKind,
-    event: KeyEvent,
+    payload: ReliableInputPayloadFingerprint,
 }
 
 impl ReliableInputFingerprint {
@@ -9211,21 +8980,25 @@ impl ReliableInputFingerprint {
         &self,
         registration: &PaneRegistrationHandle,
         input_serial: u64,
-        kind: ReliableInputKeyKind,
-        event: &KeyEvent,
+        payload: &ReliableInputPayloadFingerprint,
     ) -> bool {
         self.registration.same_registration(registration)
             && self.input_serial == input_serial
-            && self.kind == kind
-            && self.event == *event
+            && self.payload == *payload
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReliableInputTerminalOutcome {
     NotApplied,
-    Applied,
+    Applied(ReliableInputAppliedEffect),
     OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliableInputAppliedEffect {
+    KeyEvent,
+    PaneWritePrefix { bytes: usize },
 }
 
 #[derive(Debug)]
@@ -9288,7 +9061,7 @@ impl ReliableInputLedger {
 #[derive(Debug)]
 pub enum ReliableInputClaimOutcome {
     Execute(ReliableInputCommitPermit),
-    DuplicateApplied,
+    DuplicateApplied(ReliableInputAppliedEffect),
     DuplicatePending,
     OutcomeUnknown,
     ClientNotRegistered,
@@ -9299,13 +9072,13 @@ pub enum ReliableInputClaimOutcome {
     IdentityConflict,
 }
 
-/// Armed ownership of one client's sole pending reliable key transition.
+/// Armed ownership of one client's sole pending reliable input effect.
 ///
 /// Dropping before [`Self::begin_side_effect`] records the exact request as not
 /// applied so only an identical retry may execute. Dropping after the pane
 /// callback begins records an outcome-unknown terminal state: replay is then
-/// refused rather than risking a duplicate key effect after a panic or callback
-/// error.
+/// refused rather than risking a duplicate effect after a panic or any callback
+/// outcome that did not prove an exact applied prefix or definitely-zero write.
 pub struct ReliableInputCommitPermit {
     client: Arc<Mutex<ReliableInputClientLedger>>,
     claim_id: NonZeroU64,
@@ -9337,8 +9110,58 @@ impl ReliableInputCommitPermit {
         true
     }
 
-    /// Commit successful application without allocation.
-    pub fn commit_applied(mut self) -> bool {
+    fn commit_applied_effect(mut self, effect: ReliableInputAppliedEffect) -> bool {
+        let committed = {
+            let mut client = self.client.lock();
+            let Some(pending) = client.pending.take() else {
+                return false;
+            };
+            if pending.claim_id != self.claim_id || !pending.side_effect_started {
+                client.pending = Some(pending);
+                return false;
+            }
+            let effect_matches_payload = match (&pending.fingerprint.payload, effect) {
+                (
+                    ReliableInputPayloadFingerprint::KeyEvent { .. },
+                    ReliableInputAppliedEffect::KeyEvent,
+                ) => true,
+                (
+                    ReliableInputPayloadFingerprint::PaneWrite { data_len, .. },
+                    ReliableInputAppliedEffect::PaneWritePrefix { bytes },
+                ) => bytes > 0 && bytes <= *data_len,
+                _ => false,
+            };
+            if !effect_matches_payload {
+                client.pending = Some(pending);
+                return false;
+            }
+            client.terminal = Some(ReliableInputTerminal {
+                fingerprint: pending.fingerprint,
+                outcome: ReliableInputTerminalOutcome::Applied(effect),
+            });
+            true
+        };
+        if committed {
+            self.armed = false;
+        }
+        committed
+    }
+
+    /// Commit one reliable key transition after its callback succeeds.
+    pub fn commit_key_applied(self) -> bool {
+        self.commit_applied_effect(ReliableInputAppliedEffect::KeyEvent)
+    }
+
+    /// Commit the exact nonzero prefix reported by one bounded pane-writer
+    /// call. The retained fingerprint lets a response-loss retry recover this
+    /// same prefix without invoking the writer again.
+    pub fn commit_pane_write_applied_prefix(self, bytes: usize) -> bool {
+        self.commit_applied_effect(ReliableInputAppliedEffect::PaneWritePrefix { bytes })
+    }
+
+    /// Publish a callback result that proves no input byte or key effect was
+    /// applied. The identical request may subsequently claim another attempt.
+    pub fn commit_definitely_not_applied(mut self) -> bool {
         let committed = {
             let mut client = self.client.lock();
             let Some(pending) = client.pending.take() else {
@@ -9350,7 +9173,7 @@ impl ReliableInputCommitPermit {
             }
             client.terminal = Some(ReliableInputTerminal {
                 fingerprint: pending.fingerprint,
-                outcome: ReliableInputTerminalOutcome::Applied,
+                outcome: ReliableInputTerminalOutcome::NotApplied,
             });
             true
         };
@@ -9777,7 +9600,7 @@ fn attempt_live_parser_checkpoint(
             if matches!(&error, LiveParserCaptureAndBindError::Pane(_)) {
                 control.complete_capture(
                     request.request_id(),
-                    Err(LiveParserCheckpointError::CaptureAndBind(error)),
+                    Err(LiveParserCheckpointError::CaptureAndBind),
                 );
                 return LiveParserAttemptOutcome::Completed;
             }
@@ -10249,6 +10072,8 @@ fn read_from_pane_pty(
     dead: Arc<AtomicBool>,
     parser_done: std::sync::mpsc::Receiver<()>,
 ) {
+    let data_writer_guard =
+        LiveParserDataWriterGuard::new(&generation.live_parser_checkpoint);
     let mut buf = vec![0; mux_socket_buffer_size()];
 
     let pane_for_lifecycle = Weak::clone(&pane);
@@ -10302,7 +10127,7 @@ fn read_from_pane_pty(
     // buffered actions. Do not retire the generation until that final flush
     // completes; otherwise very short-lived commands can lose their last
     // frame when EOF races exact-generation cleanup.
-    generation.live_parser_checkpoint.close_data_writer();
+    data_writer_guard.close();
     let _ = parser_done.recv();
 
     let exit_behavior = exit_behavior.unwrap_or_else(|| configuration().exit_behavior);
@@ -11348,15 +11173,49 @@ impl Mux {
         kind: ReliableInputKeyKind,
         event: &KeyEvent,
     ) -> ReliableInputClaimOutcome {
+        self.claim_reliable_input_guarded(
+            client,
+            registration,
+            input_serial,
+            ReliableInputPayloadFingerprint::KeyEvent {
+                kind,
+                event: event.clone(),
+            },
+        )
+    }
+
+    /// Claim one bounded pane-byte effect through the same exact client lane
+    /// used by reliable key transitions.
+    pub fn claim_reliable_pane_write_guarded(
+        &self,
+        client: &ClientOperationGuard,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        data: &[u8],
+    ) -> ReliableInputClaimOutcome {
+        self.claim_reliable_input_guarded(
+            client,
+            registration,
+            input_serial,
+            reliable_pane_write_payload_fingerprint(data),
+        )
+    }
+
+    fn claim_reliable_input_guarded(
+        &self,
+        client: &ClientOperationGuard,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        payload: ReliableInputPayloadFingerprint,
+    ) -> ReliableInputClaimOutcome {
         if !self.client_operation_is_current(client) {
             return ReliableInputClaimOutcome::ClientRegistrationRetired;
         }
-        self.claim_reliable_key_event(
+        self.claim_reliable_input(
             Some(client.client_id()),
             registration,
             input_serial,
-            kind,
-            event,
+            payload,
         )
     }
 
@@ -11370,6 +11229,40 @@ impl Mux {
         input_serial: u64,
         kind: ReliableInputKeyKind,
         event: &KeyEvent,
+    ) -> ReliableInputClaimOutcome {
+        self.claim_reliable_input(
+            client_id,
+            registration,
+            input_serial,
+            ReliableInputPayloadFingerprint::KeyEvent {
+                kind,
+                event: event.clone(),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn claim_reliable_pane_write(
+        &self,
+        client_id: Option<&Arc<ClientId>>,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        data: &[u8],
+    ) -> ReliableInputClaimOutcome {
+        self.claim_reliable_input(
+            client_id,
+            registration,
+            input_serial,
+            reliable_pane_write_payload_fingerprint(data),
+        )
+    }
+
+    fn claim_reliable_input(
+        &self,
+        client_id: Option<&Arc<ClientId>>,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        payload: ReliableInputPayloadFingerprint,
     ) -> ReliableInputClaimOutcome {
         if input_serial == 0 {
             return ReliableInputClaimOutcome::IdentityConflict;
@@ -11397,7 +11290,7 @@ impl Mux {
                 ReliableInputClaimOutcome::StaleSerial
             } else if pending
                 .fingerprint
-                .matches(registration, input_serial, kind, event)
+                .matches(registration, input_serial, &payload)
             {
                 ReliableInputClaimOutcome::DuplicatePending
             } else {
@@ -11411,7 +11304,7 @@ impl Mux {
             if terminal.fingerprint.input_serial == input_serial {
                 if !terminal
                     .fingerprint
-                    .matches(registration, input_serial, kind, event)
+                    .matches(registration, input_serial, &payload)
                 {
                     return ReliableInputClaimOutcome::IdentityConflict;
                 }
@@ -11421,8 +11314,8 @@ impl Mux {
                         // pre-callback cancellation, but allow that identical
                         // request to claim a new attempt below.
                     }
-                    ReliableInputTerminalOutcome::Applied => {
-                        return ReliableInputClaimOutcome::DuplicateApplied;
+                    ReliableInputTerminalOutcome::Applied(effect) => {
+                        return ReliableInputClaimOutcome::DuplicateApplied(effect);
                     }
                     ReliableInputTerminalOutcome::OutcomeUnknown => {
                         return ReliableInputClaimOutcome::OutcomeUnknown;
@@ -11439,8 +11332,7 @@ impl Mux {
             fingerprint: ReliableInputFingerprint {
                 registration: registration.clone(),
                 input_serial,
-                kind,
-                event: event.clone(),
+                payload,
             },
             side_effect_started: false,
         });
@@ -20095,6 +19987,7 @@ mod tests {
     use crate::tab::{DomainFloatingPaneReconcileReceipt, DomainFloatingPaneState};
     use crate::guardian_output_journal::{
         GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
+        GuardianOutputRecoveryLimits,
     };
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{
@@ -21196,6 +21089,121 @@ mod tests {
             second_ack.journal_cumulative_plaintext_bytes(),
             u64::try_from(first_payload.len() + second_payload.len()).unwrap(),
             "journal watermark remains pane-lifetime cumulative across rollover"
+        );
+    }
+
+    #[test]
+    fn checkpoint_replay_preparation_authenticates_without_mutating_live_parser() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payloads: [&[u8]; 3] = [
+            b"checkpoint-record",
+            b"recovered-suffix-two",
+            b"recovered-suffix-three",
+        ];
+        let directory = tempdir().expect("create recovery journal directory");
+        let file = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("recovery.segment"))
+            .expect("create recovery journal");
+        let segment = GuardianOutputSegmentIdentity::new(
+            durable_pane_id,
+            uuid::Uuid::new_v4(),
+            1,
+            None,
+        )
+        .expect("valid recovery segment");
+        let cipher = GuardianOutputCipher::try_from_key_slice(&[0x6d; 32])
+            .expect("valid recovery cipher");
+        let mut journal = GuardianOutputJournal::open(
+            file,
+            segment,
+            cipher,
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("open recovery journal");
+        let directory_file = File::open(directory.path()).expect("open recovery parent");
+        journal
+            .sync_parent_directory_and_activate(&directory_file)
+            .expect("activate recovery journal");
+        let receipts = payloads
+            .iter()
+            .map(|payload| {
+                journal
+                    .append_and_sync(payload)
+                    .expect("append exact recovery payload")
+            })
+            .collect::<Vec<_>>();
+
+        let source = LiveParserTestHarness::new(619, durable_pane_id, None);
+        let checkpoint_target = source.authorize(segment, receipts[0], payloads[0]);
+        source.write(payloads[0]).expect("deliver checkpoint record");
+        source.wait_until_parsed(checkpoint_target);
+        let checkpoint = source
+            .capture(segment, receipts[0], Duration::from_secs(2))
+            .expect("capture exact checkpoint record");
+
+        let target = LiveParserTestHarness::new(620, durable_pane_id, None);
+        let operation = target
+            .registration
+            .operation_guard(&target.mux)
+            .expect("acquire target recovery operation");
+        let page_limits = GuardianOutputRecoveryLimits::new(2, 1024 * 1024)
+            .expect("valid bounded recovery limits");
+        let mut corrupted_checkpoint = checkpoint
+            .terminal_checkpoint()
+            .canonical_payload()
+            .to_vec();
+        *corrupted_checkpoint
+            .last_mut()
+            .expect("checkpoint payload is nonempty") ^= 1;
+        assert!(matches!(
+            operation.prepare_guardian_output_replay_from_checkpoint(
+                &journal,
+                checkpoint.boundary(),
+                &corrupted_checkpoint,
+                page_limits,
+            ),
+            Err(GuardianOutputReplayPreparationError::CheckpointBoundary(_))
+        ));
+
+        let preparation = operation
+            .prepare_guardian_output_replay_from_checkpoint(
+                &journal,
+                checkpoint.boundary(),
+                checkpoint.terminal_checkpoint().canonical_payload(),
+                page_limits,
+            )
+            .expect("prepare bounded authenticated checkpoint suffix");
+        assert_eq!(preparation.segment_identity(), segment);
+        assert_eq!(preparation.requested_first_sequence(), 1);
+        assert_eq!(preparation.checkpoint_receipt(), receipts[0]);
+        assert_eq!(preparation.suffix_record_count(), 1);
+        assert_eq!(preparation.next_recovery_sequence(), Some(3));
+        assert_eq!(preparation.committed_next_sequence(), Some(4));
+        assert_eq!(
+            preparation.committed_log_bytes(),
+            receipts[2].committed_log_bytes()
+        );
+        assert_eq!(preparation.tail(), GuardianOutputJournalTail::Clean);
+        assert_eq!(
+            preparation.terminal_predecessor(),
+            Some(receipts[2].into_predecessor())
+        );
+        let target_state = target.generation.live_parser_checkpoint.state.lock();
+        assert_eq!(target_state.delivered_bytes, 0);
+        assert_eq!(target_state.parsed_bytes, 0);
+        assert!(!target_state.guardian_mode);
+        assert!(target_state.guardian_cursor.is_none());
+        assert!(target_state.authorized_delivery.is_none());
+        drop(target_state);
+        let preparation_debug = format!("{preparation:?}");
+        assert!(!preparation_debug.contains("checkpoint-record"));
+        assert!(!preparation_debug.contains("recovered-suffix"));
+        assert_eq!(
+            preparation.cumulative_plaintext_bytes(),
+            receipts[2].cumulative_plaintext_bytes()
         );
     }
 
@@ -22313,7 +22321,7 @@ mod tests {
             ReliableInputClaimOutcome::DuplicatePending
         ));
         assert!(permit.begin_side_effect());
-        assert!(permit.commit_applied());
+        assert!(permit.commit_key_applied());
         assert!(matches!(
             mux.claim_reliable_key_event(
                 Some(&original_client),
@@ -22322,7 +22330,7 @@ mod tests {
                 ReliableInputKeyKind::KeyDown,
                 &event,
             ),
-            ReliableInputClaimOutcome::DuplicateApplied
+            ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent)
         ));
 
         let replacement_client = Arc::new(original_client.as_ref().clone());
@@ -22345,7 +22353,7 @@ mod tests {
                 ReliableInputKeyKind::KeyDown,
                 &event,
             ),
-            ReliableInputClaimOutcome::DuplicateApplied
+            ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent)
         ));
     }
 
@@ -22465,6 +22473,118 @@ mod tests {
                 &event,
             ),
             ReliableInputClaimOutcome::Execute(_)
+        ));
+    }
+
+    #[test]
+    fn reliable_pane_write_ledger_replays_the_exact_committed_prefix_after_ack_loss() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(305, test_size());
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable pane-write registration");
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        let data: Arc<[u8]> = Arc::from(&b"abcdef"[..]);
+
+        let ReliableInputClaimOutcome::Execute(mut permit) = mux.claim_reliable_pane_write(
+            Some(&client),
+            &registration,
+            31,
+            data.as_ref(),
+        ) else {
+            panic!("first exact pane-write identity must own execution");
+        };
+        assert!(permit.begin_side_effect());
+        assert!(permit.commit_pane_write_applied_prefix(2));
+        assert!(matches!(
+            mux.claim_reliable_pane_write(
+                Some(&client),
+                &registration,
+                31,
+                data.as_ref(),
+            ),
+            ReliableInputClaimOutcome::DuplicateApplied(
+                ReliableInputAppliedEffect::PaneWritePrefix { bytes: 2 }
+            )
+        ));
+        assert!(matches!(
+            mux.claim_reliable_pane_write(
+                Some(&client),
+                &registration,
+                31,
+                b"abcdeg",
+            ),
+            ReliableInputClaimOutcome::IdentityConflict
+        ));
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&client),
+                &registration,
+                31,
+                ReliableInputKeyKind::KeyDown,
+                &reliable_input_test_event('a'),
+            ),
+            ReliableInputClaimOutcome::IdentityConflict
+        ));
+    }
+
+    #[test]
+    fn reliable_pane_write_ledger_retries_only_proven_zero_effect_and_quarantines_ambiguity() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(306, test_size());
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable pane-write registration");
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        let data: Arc<[u8]> = Arc::from(&b"zero-or-unknown"[..]);
+
+        let ReliableInputClaimOutcome::Execute(cancelled) = mux.claim_reliable_pane_write(
+            Some(&client),
+            &registration,
+            41,
+            data.as_ref(),
+        ) else {
+            panic!("first pane write must own execution");
+        };
+        drop(cancelled);
+        assert!(matches!(
+            mux.claim_reliable_pane_write(
+                Some(&client),
+                &registration,
+                41,
+                b"different",
+            ),
+            ReliableInputClaimOutcome::IdentityConflict
+        ));
+        let ReliableInputClaimOutcome::Execute(mut retry) = mux.claim_reliable_pane_write(
+            Some(&client),
+            &registration,
+            41,
+            data.as_ref(),
+        ) else {
+            panic!("pre-effect cancellation must allow only the exact retry");
+        };
+        assert!(retry.begin_side_effect());
+        assert!(retry.commit_definitely_not_applied());
+        let ReliableInputClaimOutcome::Execute(mut ambiguous) = mux.claim_reliable_pane_write(
+            Some(&client),
+            &registration,
+            41,
+            data.as_ref(),
+        ) else {
+            panic!("proven-zero callback result must allow the exact retry");
+        };
+        assert!(ambiguous.begin_side_effect());
+        drop(ambiguous);
+        assert!(matches!(
+            mux.claim_reliable_pane_write(Some(&client), &registration, 41, data.as_ref()),
+            ReliableInputClaimOutcome::OutcomeUnknown
         ));
     }
 
