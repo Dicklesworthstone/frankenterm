@@ -2953,6 +2953,20 @@ mod tests {
             .expect("append test payload")
     }
 
+    fn v2_state_slot_bytes(bytes: &[u8], slot_index: usize) -> &[u8] {
+        let offset = V2_STATE_SLOTS_OFFSET + slot_index * V2_STATE_SLOT_SIZE;
+        &bytes[offset..offset + V2_STATE_SLOT_SIZE]
+    }
+
+    fn changed_v2_state_slots(before: &[u8], after: &[u8]) -> Vec<usize> {
+        (0..V2_STATE_SLOT_COUNT)
+            .filter(|slot_index| {
+                v2_state_slot_bytes(before, *slot_index)
+                    != v2_state_slot_bytes(after, *slot_index)
+            })
+            .collect()
+    }
+
     /// Regression: a corrupt/oversized header must not drive an unbounded
     /// payload allocation. We hand-craft a 264-byte file whose header claims a
     /// ~5 GB write cursor and whose single record header claims a u32::MAX
@@ -3886,6 +3900,229 @@ mod tests {
         assert_eq!(sync_count.load(Ordering::SeqCst), 1);
         writer.sync().unwrap();
         assert_eq!(sync_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn configured_time_sync_cadence_uses_a_monotonic_deadline() {
+        let dir = test_dir("sync-time-cadence");
+        let mut writer = MmapScrollback::open(
+            MmapScrollbackConfig::new(&dir, "sync-time-cadence")
+                .with_cap_bytes(4096)
+                .with_sync_every_appends(0)
+                .with_sync_interval(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let sync_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        writer.sync_observer = Some(sync_count.clone());
+        writer.last_sync_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test monotonic instant supports a short subtraction");
+
+        let report = append_test_payload(&mut writer, RecordKind::Text, b"time-due");
+
+        assert!(report.synced);
+        assert_eq!(sync_count.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.appends_since_sync, 0);
+        assert!(!writer.state_slot_dirty);
+    }
+
+    #[test]
+    fn empty_append_is_a_true_noop_and_cannot_evict_scrollback() {
+        let dir = test_dir("empty-append-noop");
+        let config = MmapScrollbackConfig::new(&dir, "empty-append-noop")
+            .with_cap_bytes(V2_RECORD_HEADER_SIZE as u64 + 1)
+            .with_sync_every_appends(1);
+        let path = config.bin_path();
+        let mut writer = MmapScrollback::open(config).unwrap();
+        let before_bytes = std::fs::read(&path).unwrap();
+        let before_header = writer.header();
+        let before_state = writer.v2_state;
+
+        for kind in [
+            RecordKind::Text,
+            RecordKind::Osc,
+            RecordKind::Csi,
+            RecordKind::Cursor,
+            RecordKind::Clear,
+        ] {
+            let report = writer.append(kind, &[]).unwrap();
+            assert_eq!(report.payload_bytes, 0);
+            assert_eq!(report.write_cursor_bytes, 0);
+            assert!(!report.synced);
+            assert_eq!(report.redaction.original_input_bytes, 0);
+        }
+
+        assert_eq!(writer.header(), before_header);
+        assert_eq!(writer.v2_state, before_state);
+        assert_eq!(writer.appends_since_sync, 0);
+        assert!(!writer.state_slot_dirty);
+        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+        drop(writer);
+
+        let snapshot = read_linear_records(&path, test_read_limits()).unwrap();
+        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.completeness, LinearRecordCompleteness::Complete);
+    }
+
+    #[test]
+    fn debug_surfaces_omit_pending_and_recovered_plaintext() {
+        let dir = test_dir("content-free-debug");
+        let config = MmapScrollbackConfig::new(&dir, "writer-debug").with_cap_bytes(4096);
+        let mut writer = MmapScrollback::open(config).unwrap();
+        let pending_canary = b"sk-ant-api03-debug-secr";
+        let report = writer.append(RecordKind::Text, pending_canary).unwrap();
+        assert_eq!(report.payload_bytes, 0, "canary must remain in the redactor tail");
+
+        let writer_debug = format!("{writer:?}");
+        assert!(writer_debug.contains("pending_redaction_bytes"));
+        assert!(!writer_debug.contains(std::str::from_utf8(pending_canary).unwrap()));
+        drop(writer);
+
+        let snapshot_config =
+            MmapScrollbackConfig::new(&dir, "snapshot-debug").with_cap_bytes(4096);
+        let snapshot_path = snapshot_config.bin_path();
+        let mut snapshot_writer = MmapScrollback::open(snapshot_config).unwrap();
+        let payload = b"raw-terminal-debug-canary";
+        append_test_payload(&mut snapshot_writer, RecordKind::Text, payload);
+        snapshot_writer.sync().unwrap();
+        drop(snapshot_writer);
+
+        let snapshot = read_linear_records(&snapshot_path, test_read_limits()).unwrap();
+        let raw_payload_debug = format!("{:?}", payload.to_vec());
+        let snapshot_debug = format!("{snapshot:?}");
+        assert!(snapshot_debug.contains("record_count: 1"));
+        assert!(!snapshot_debug.contains(&raw_payload_debug));
+    }
+
+    #[test]
+    fn replacing_sidecar_after_open_cannot_admit_a_second_writer_to_the_data_inode() {
+        let dir = test_dir("replace-sidecar-after-open");
+        let config = MmapScrollbackConfig::new(&dir, "replace-sidecar-after-open")
+            .with_cap_bytes(4096);
+        let first = MmapScrollback::open(config.clone()).unwrap();
+        let before_data = std::fs::read(config.bin_path()).unwrap();
+        let saved_lock = dir.join("saved-original-lock");
+        std::fs::rename(config.lock_path(), &saved_lock).unwrap();
+        write_private(&config.lock_path(), b"replacement lock");
+
+        let error = MmapScrollback::open(config.clone()).unwrap_err();
+
+        assert!(matches!(error, MmapScrollbackError::WriterBusy { .. }));
+        assert_eq!(std::fs::read(config.bin_path()).unwrap(), before_data);
+        drop(first);
+    }
+
+    #[test]
+    fn unsynced_publications_reuse_one_slot_across_successive_sync_generations() {
+        let dir = test_dir("durable-slot-crash-cuts");
+        let config = MmapScrollbackConfig::new(&dir, "durable-slot-crash-cuts")
+            .with_cap_bytes(4096)
+            .with_sync_every_appends(0)
+            .with_sync_interval(Duration::from_secs(3600));
+        let path = config.bin_path();
+        let mut writer = MmapScrollback::open(config.clone()).unwrap();
+
+        append_test_payload(&mut writer, RecordKind::Text, b"durable-zero");
+        writer.sync().unwrap();
+        let generation_zero = std::fs::read(&path).unwrap();
+
+        for payload in [b"durable-one".as_slice(), b"durable-two", b"durable-three"] {
+            let report = append_test_payload(&mut writer, RecordKind::Text, payload);
+            assert!(!report.synced);
+        }
+        let generation_one_dirty = std::fs::read(&path).unwrap();
+        let first_dirty_slots = changed_v2_state_slots(&generation_zero, &generation_one_dirty);
+        assert_eq!(
+            first_dirty_slots.len(),
+            1,
+            "all unsynced publications must preserve the other state slot"
+        );
+        writer.sync().unwrap();
+        let generation_one = std::fs::read(&path).unwrap();
+
+        for payload in [b"volatile-one".as_slice(), b"volatile-two", b"volatile-three"] {
+            let report = append_test_payload(&mut writer, RecordKind::Osc, payload);
+            assert!(!report.synced);
+        }
+        let generation_two_dirty = std::fs::read(&path).unwrap();
+        let second_dirty_slots = changed_v2_state_slots(&generation_one, &generation_two_dirty);
+        assert_eq!(second_dirty_slots.len(), 1);
+        assert_ne!(
+            second_dirty_slots, first_dirty_slots,
+            "a successful sync must rotate which slot protects the durable generation"
+        );
+        drop(writer);
+
+        // Model the worst cut for every state publication after the last
+        // successful sync: the one dirty slot tears, while its record bodies
+        // may have reached the file. The untouched slot must still recover the
+        // exact prior synced generation, even though three epochs were skipped.
+        let dirty_slot = second_dirty_slots[0];
+        let mut crash_image = generation_two_dirty;
+        let checksum_byte = V2_STATE_SLOTS_OFFSET
+            + dirty_slot * V2_STATE_SLOT_SIZE
+            + V2_STATE_CHECKSUM_OFFSET;
+        crash_image[checksum_byte] ^= 0x80;
+        write_private(&path, &crash_image);
+
+        let recovered = read_linear_records(&path, test_read_limits()).unwrap();
+        assert_eq!(
+            recovered.records,
+            vec![
+                (RecordKind::Text, b"durable-zero".to_vec()),
+                (RecordKind::Text, b"durable-one".to_vec()),
+                (RecordKind::Text, b"durable-two".to_vec()),
+                (RecordKind::Text, b"durable-three".to_vec()),
+            ]
+        );
+        assert!(matches!(
+            recovered.completeness,
+            LinearRecordCompleteness::Incomplete {
+                reason: LinearRecordTerminalReason::V2NewerStateInvalid,
+                ..
+            }
+        ));
+
+        let before_failed_reopen = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            MmapScrollback::open(config),
+            Err(MmapScrollbackError::V2Integrity { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before_failed_reopen);
+    }
+
+    #[test]
+    fn exhausted_authenticated_epoch_fails_before_any_file_mutation() {
+        let dir = test_dir("exhausted-state-epoch");
+        let config =
+            MmapScrollbackConfig::new(&dir, "exhausted-state-epoch").with_cap_bytes(4096);
+        let path = config.bin_path();
+        drop(MmapScrollback::open(config.clone()).unwrap());
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let header: [u8; HEADER_SIZE] = bytes[..HEADER_SIZE].try_into().unwrap();
+        let decoded_header = ScrollbackHeader::decode(&header).unwrap();
+        let exhausted_state = V2RingState {
+            slot_epoch: u64::MAX,
+            ..V2RingState::fresh(decoded_header.capacity_bytes).unwrap()
+        };
+        bytes[V2_STATE_SLOTS_OFFSET
+            ..V2_STATE_SLOTS_OFFSET + V2_STATE_SLOT_SIZE * V2_STATE_SLOT_COUNT]
+            .fill(0);
+        let encoded = encode_v2_state_slot(&header, exhausted_state);
+        bytes[V2_STATE_SLOTS_OFFSET..V2_STATE_SLOTS_OFFSET + V2_STATE_SLOT_SIZE]
+            .copy_from_slice(&encoded);
+        write_private(&path, &bytes);
+
+        let mut writer = MmapScrollback::open(config).unwrap();
+        let pending = writer.append(RecordKind::Text, b"x").unwrap();
+        assert_eq!(pending.payload_bytes, 0);
+        let before_append = std::fs::read(&path).unwrap();
+
+        let error = writer.flush_pending_redaction().unwrap_err();
+
+        assert!(matches!(error, MmapScrollbackError::V2Integrity { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), before_append);
     }
 
     #[test]

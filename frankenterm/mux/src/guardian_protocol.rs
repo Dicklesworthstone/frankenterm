@@ -105,7 +105,7 @@ const REPLAY_PAGE_DIGEST_END: usize = REPLAY_PAGE_DIGEST_OFFSET + 32;
 const REPLAY_CHECKPOINT_DESCRIPTOR_BYTES: usize = 272;
 const REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES: usize = REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 44;
 const REPLAY_OUTPUT_RECORDS_HEADER_BYTES: usize = 48;
-const REPLAY_OUTPUT_RECORD_FIXED_BYTES: usize = 168;
+const REPLAY_OUTPUT_RECORD_FIXED_BYTES: usize = 200;
 const REPLAY_COMPLETE_BYTES: usize = 80;
 const REPLAY_GAP_BYTES: usize = 32;
 const REPLAY_COMPACTED_BYTES: usize = 32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 16;
@@ -114,6 +114,9 @@ const CHECKPOINT_STAGE_WIRE_VERSION: u16 = 1;
 const REPLAY_WIRE_VERSION: u16 = 1;
 const REPLAY_CURSOR_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-cursor.v1";
 const REPLAY_PAGE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-page.v1";
+const REPLAY_RECORD_PLAINTEXT_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-output-plaintext-delivery.v3\0";
+const REPLAY_RECORD_PLAINTEXT_DIGEST_VERSION: u32 = 3;
 const CHECKPOINT_TERMINAL_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-terminal-payload.v1\0";
 const CHECKPOINT_OUTPUT_BOUNDARY_DIGEST_DOMAIN: &[u8] =
@@ -3034,7 +3037,7 @@ impl GuardianCheckpointDescriptorV1 {
             }
         };
         if self.capture_generation == 0
-            || digest_is_zero(self.replay_semantics_id)
+            || self.replay_semantics_id != current_replay_identity_digest()
             || self.rows == 0
             || self.cols == 0
             || self.total_bytes == 0
@@ -3108,12 +3111,17 @@ impl GuardianCheckpointDescriptorV1 {
         // byte-for-byte canonical re-encoding before a staged payload may be
         // sealed. The descriptor itself can only be minted in production from
         // an opaque live-capture or genesis terminal authority, which binds
-        // its geometry and parser watermark to these same canonical bytes.
+        // its parser watermark to these same canonical bytes. Wire admission
+        // still verifies the decoded geometry explicitly and the store must
+        // reconcile record boundaries against its guardian-owned journal.
         let validated = TerminalCheckpointV2::decode_canonical_json(
             canonical_terminal_payload,
             TerminalCheckpointLimits::default(),
         )
         .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        if validated.rows() != self.rows || validated.cols() != self.cols {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
         drop(validated);
         let observed_bytes = u64::try_from(canonical_terminal_payload.len())
             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
@@ -3444,7 +3452,7 @@ impl GuardianReplayRecordDelivery {
         if usize::try_from(metadata.payload_bytes).ok() != Some(plaintext.len()) {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
-        let plaintext_digest = Sha256::digest(plaintext.as_slice()).into();
+        let plaintext_digest = replay_record_plaintext_digest(metadata, plaintext.as_slice())?;
         Ok(Self {
             metadata,
             plaintext_digest,
@@ -3465,7 +3473,7 @@ impl GuardianReplayRecordDelivery {
         if max_payload_bytes == 0
             || self.metadata.payload_bytes > max_payload_bytes
             || usize::try_from(self.metadata.payload_bytes).ok() != Some(self.plaintext.len())
-            || <[u8; 32]>::from(Sha256::digest(self.plaintext.as_slice()))
+            || replay_record_plaintext_digest(self.metadata, self.plaintext.as_slice())?
                 != self.plaintext_digest
         {
             return Err(GuardianProtocolError::InvalidReplyPayload.into());
@@ -3475,6 +3483,23 @@ impl GuardianReplayRecordDelivery {
             .map_err(GuardianReplayDeliveryError::Io)?;
         Ok(self.metadata)
     }
+}
+
+fn replay_record_plaintext_digest(
+    metadata: GuardianReplayRecordMetadataV1,
+    plaintext: &[u8],
+) -> Result<[u8; 32], GuardianProtocolError> {
+    if usize::try_from(metadata.payload_bytes).ok() != Some(plaintext.len()) {
+        return Err(GuardianProtocolError::InvalidReplyPayload);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(REPLAY_RECORD_PLAINTEXT_DIGEST_DOMAIN);
+    hasher.update(REPLAY_RECORD_PLAINTEXT_DIGEST_VERSION.to_le_bytes());
+    hasher.update(metadata.segment_id.as_bytes());
+    hasher.update(metadata.sequence.to_le_bytes());
+    hasher.update(u64::from(metadata.payload_bytes).to_le_bytes());
+    hasher.update(plaintext);
+    Ok(hasher.finalize().into())
 }
 
 pub struct GuardianReplayOutputRecordsDelivery {
@@ -3555,7 +3580,7 @@ fn validate_replay_records(
         let metadata = record.metadata;
         metadata.validate()?;
         if usize::try_from(metadata.payload_bytes).ok() != Some(record.plaintext.len())
-            || <[u8; 32]>::from(Sha256::digest(record.plaintext.as_slice()))
+            || replay_record_plaintext_digest(metadata, record.plaintext.as_slice())?
                 != record.plaintext_digest
         {
             return Err(GuardianProtocolError::InvalidReplyPayload);
@@ -4126,6 +4151,7 @@ impl GuardianReplayPageDelivery {
                     body.extend_from_slice(&metadata.cumulative_plaintext_bytes.to_be_bytes());
                     body.extend_from_slice(&metadata.committed_log_bytes.to_be_bytes());
                     body.extend_from_slice(&metadata.record_digest);
+                    body.extend_from_slice(&record.plaintext_digest);
                     body.extend_from_slice(record.plaintext.as_slice());
                 }
             }
@@ -4572,6 +4598,8 @@ fn decode_replay_page_body(
                     .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
                 let mut record_digest = [0; 32];
                 record_digest.copy_from_slice(&fixed[136..168]);
+                let mut plaintext_digest = [0; 32];
+                plaintext_digest.copy_from_slice(&fixed[168..200]);
                 let metadata = GuardianReplayRecordMetadataV1::new(
                     read_required_uuid(fixed, 0)?,
                     read_u64(fixed, 16)?,
@@ -4582,10 +4610,14 @@ fn decode_replay_page_body(
                     read_u64(fixed, 128)?,
                     record_digest,
                 )?;
-                records.push(GuardianReplayRecordDelivery::new(
+                let record = GuardianReplayRecordDelivery::new(
                     metadata,
                     Zeroizing::new(plaintext.to_vec()),
-                )?);
+                )?;
+                if record.plaintext_digest != plaintext_digest {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                records.push(record);
                 offset = plaintext_end;
             }
             if offset != payload.len() {
