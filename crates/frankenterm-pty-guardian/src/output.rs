@@ -84,6 +84,9 @@ const CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES: usize = 400;
 const CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES: u64 = 296;
 const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize = 1_026;
 const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = 268_739_888;
+// Phase A has no deletion or ACK-backed reclamation. Keep this deliberately
+// finite; whole-fleet activation remains disabled until the catalog layer can
+// retain one proven generation per pane without exhausting this quarantine.
 const CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS: usize = 8;
 const CHECKPOINT_STAGE_MAX_FILES: usize = 8_208;
 const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_919_104;
@@ -401,6 +404,12 @@ struct GuardianCheckpointStageStoreInner {
     gate: Mutex<()>,
 }
 
+/// Descriptor-relative, synchronously durable Phase-A checkpoint staging.
+///
+/// These methods perform bounded filesystem and AEAD work and therefore must
+/// run only on the dedicated checkpoint worker, never on the Mio readiness
+/// loop. Clones share one process-local gate; a directory `flock` coordinates
+/// cooperating guardian processes before deterministic `O_EXCL` publication.
 #[derive(Clone)]
 pub(crate) struct GuardianCheckpointStageStore {
     inner: Arc<GuardianCheckpointStageStoreInner>,
@@ -5411,6 +5420,82 @@ mod tests {
             Err(GuardianCheckpointStageStoreError::Poisoned)
         ));
         assert_eq!(std::fs::metadata(path)?.len(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_stage_torn_seal_is_quarantined_without_hiding_other_uploads(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-seal-cut-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let spawn_effect_id = Uuid::from_u128(0xb01);
+        let upload_id = Uuid::from_u128(0xb02);
+        let payload = b"torn-seal-fixture";
+        let chunk_bytes = 8_u32;
+        let begin = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            None,
+        )?;
+        store.apply_begin(&begin)?;
+        for (index, bytes) in payload.chunks(usize::try_from(chunk_bytes)?).enumerate() {
+            store.apply_chunk(checkpoint_test_genesis_request(
+                GuardianCheckpointStageKindV1::Chunk,
+                spawn_effect_id,
+                upload_id,
+                payload,
+                chunk_bytes,
+                Some((u32::try_from(index)?, bytes)),
+            )?)?;
+        }
+        let shape = CheckpointStageRequestShape::from_request(&begin)?;
+        let census = checkpoint_stage_census(&store.inner)?;
+        let inspection = checkpoint_inspect_upload(&store.inner, &census, &shape)?
+            .ok_or("durable candidate disappeared")?;
+        let seal_path = checkpoint_seal_path(
+            &store.inner,
+            shape.key(),
+            inspection.publication_id,
+        )?;
+        let mut torn = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &seal_path,
+        )?;
+        torn.write_all(b"FTGC")?;
+        torn.sync_all()?;
+        store.inner.directory.sync_all()?;
+        drop(torn);
+        assert!(matches!(
+            store.apply_begin(&begin),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        assert_eq!(std::fs::metadata(&seal_path)?.len(), 4);
+
+        let fresh_upload_id = Uuid::from_u128(0xb03);
+        let fresh = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            fresh_upload_id,
+            payload,
+            chunk_bytes,
+            None,
+        )?;
+        assert!(matches!(
+            store.apply_begin(&fresh)?,
+            GuardianCheckpointStageReplyV1::Ready {
+                upload_id,
+                next_index: 0,
+                committed_bytes: 0,
+            } if upload_id == fresh_upload_id
+        ));
+        assert_eq!(std::fs::metadata(seal_path)?.len(), 4);
         Ok(())
     }
 
