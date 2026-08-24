@@ -213,14 +213,21 @@ terminal-state snapshot and are never sent through PTY input.
 
 The mux server continuously persists rows that leave the hot terminal viewport
 under a per-pane durable UUID. Each acknowledged row is synchronized before its
-offset becomes visible, v2 row records bind the exact serialized payload with
-SHA-256, and logical retention pruning is recorded in a synchronized sequence
-journal so stable row numbers survive a crash even before byte compaction.
+offset becomes visible. Current v3 row records encrypt exact terminal semantics
+and bind their framing and payload under guardian key authority; logical
+retention pruning is recorded in a synchronized sequence journal so stable row
+numbers survive a crash even before byte compaction.
 Compaction writes the retained suffix plus its base-sequence header to a sibling
 file, synchronizes it, atomically publishes it, and then collapses the journal.
-The identity manifest binds its own canonical fields with SHA-256 and records
-the next sequence explicitly, including when retention leaves zero rows. Reopen
-ignores torn content/journal tails, rejects complete malformed records,
+The v3 identity manifest is AEAD-authenticated and records the next sequence
+explicitly, including when retention leaves zero rows. Its canonical logical-
+ledger SHA-256 binds generation and predecessor identity, durable pane and
+versioned ledger identity, the exact sequence, row, and byte facts, and every
+ordered length-delimited record. Constructor, reopen, snapshot, list, export,
+replacement, and publication paths recompute the selected ledger before
+trusting that digest. A private cross-process mutation lease and an on-disk
+generation/digest compare-and-swap prevent two writers from replacing the same
+authority. Reopen ignores torn content/journal tails, rejects complete malformed records,
 validates every retained serialized row, and resumes at the next exact sequence.
 If the sink cannot acknowledge a row, the terminal now keeps that row in its
 in-memory deque, does not advance the stable-row offset, and does not count a
@@ -253,8 +260,21 @@ concurrent publication. It excludes and reports a final unterminated record,
 decodes styled rows through the bounded codec, reapplies the current redactor,
 and publishes a new mode-0600 transcript with file-and-directory synchronization.
 It neither repairs nor deletes the source and never sends recovered output into
-a PTY. The older `ft session recover` command remains specific to the separate
-64-hex flat mmap orphan format; format identity is never guessed from content.
+a PTY. Export provenance distinguishes authenticated exact-semantic rows that
+were intentionally encrypted without pre-persistence redaction, recognized
+legacy `ftsl1`/`ftsl2` redact-before-encode framing that is not cryptographically
+authenticated, and raw legacy rows whose pre-persistence redaction is unknown;
+those categories account for every retained row. The older `ft session recover`
+command remains specific to the separate 64-hex flat mmap orphan format; format
+identity is never guessed from content.
+
+Guardian raw-output v3 uses a keyed authenticated 176-byte header. A complete
+legacy 160-byte v1 header is reported as unsupported and left byte-for-byte
+untouched; it is never treated as a torn v3 header or shifted in place. Any
+future legacy migration must conservatively read bounded legacy records into a
+fresh v3 successor or a separately verified serialized artifact while retaining
+the original evidence. The input journal similarly rejects ambiguous v1
+fieldless `Durable` records rather than inventing full-write certainty.
 
 This continuous spill is not yet a complete pane image: it covers cold/evicted
 rows, while the current hot viewport, terminal parser/render state, PTY handles,
@@ -371,12 +391,12 @@ proven:
    keeps the live writer unreachable and quarantines the pane for transcript
    recovery instead of presenting invented state.
 
-#### Canonical terminal checkpoint v1 inventory
+#### Canonical terminal checkpoint inventory (current v2)
 
 The terminal payload is a semantic model, not a dump of Rust struct memory.
 Its canonical encoding uses fixed field order and sorted map keys so equivalent
-state has one byte representation and one digest. Version 1 must cover all of
-the following before it can be published:
+state has one byte representation and one digest. The current version must
+cover all of the following before it can be published:
 
 | Class | Required state |
 |---|---|
@@ -420,7 +440,7 @@ must stop reads rather than allocate an unbounded per-pane backlog. A platform
 without a safe supported readiness/child-reaping implementation remains on the
 explicit legacy mux-owned path; it must not silently claim guardian continuity.
 
-#### Guardian protocol v1 freeze
+#### Guardian protocol v3 freeze
 
 The first implementation must use one length-delimited binary frame with a
 fixed protocol version and a hard encoded-frame ceiling. Authentication is an
@@ -528,13 +548,15 @@ terminal-state exception: it requires the exact retained generation and
 sequence zero, cannot signal the already-exited child, and only seals the
 retained record. The guardian rejects a stale generation, wrong live mux
 incarnation, duplicate mutation sequence with different bytes, mutation
-sequence gap, or exhausted sequence before performing an effect. Input
-effect queries distinguish `not_seen`, `accepted_not_durable`,
-`durable_effect`, `terminal_rejected`, and `disposition_unavailable`; only
-`not_seen` permits a resend of the same idempotency UUID, while
-`disposition_unavailable` requires operator/runtime reconciliation without
-replay. A newly accepted input acknowledgement can contain only one of the
-three applied-effect states, never either query-only state. Resize, signal,
+sequence gap, or exhausted sequence before performing an effect. Input effect
+queries distinguish `not_seen`, `accepted_not_durable`, `durable_full`,
+`durable_prefix { applied_bytes }`, `known_not_applied`, and
+`disposition_unavailable`. `NotSeen` alone authorizes the original first
+attempt; `KnownNotApplied` is a terminal proof that zero bytes were applied,
+while `disposition_unavailable` requires operator/runtime reconciliation
+without replay. A newly accepted input acknowledgement can contain only
+`accepted_not_durable`, `durable_full`, a valid exact `durable_prefix`, or
+`known_not_applied`, never either query-only state. Resize, signal,
 close, and checkpoint operations
 have the same request-digest replay rule, so an ambiguous response is queried
 or replayed by identity rather than converted into a second effect.
@@ -556,21 +578,33 @@ reported as a safely retryable callback failure.
 The guardian input-effect journal makes that callback rule crash-safe without
 persisting raw keystrokes. For each input it synchronizes the encrypted exact
 identity and then a conservative `accepted_not_durable` marker before calling
-any PTY write that could expose bytes. A definitely zero-byte result may refine
-that marker to `known_not_applied`; a successful or possibly partial result may
-only refine it to `durable`, or remain conservatively pending. The payload
+any PTY write that could expose bytes. Only a newly committed Accepted record
+yields the opaque one-shot PTY-write permit; reconciliation of an exact, alias,
+or stale retry returns the current disposition and cannot authorize another
+write. A definitely zero-byte result may refine that marker to
+`known_not_applied`; a proven complete result becomes `durable_full`; a proven
+partial result records the exact nonzero `durable_prefix { applied_bytes }`;
+otherwise it remains conservatively pending. Total input length and applied
+count are authenticated and flow through an opaque terminal permit into the
+protocol, so journal and reply cannot disagree. The payload
 SHA-256 is encrypted rather than written as plaintext because low-entropy key
 events are dictionary-testable. The input log uses an input-domain-separated
 AEAD surface of the activated guardian journal key; rotation must retain an old
 key generation while either an output segment or input log still references
-it. Each fixed-size record authenticates its clear
-framing and predecessor digest, and recovery enforces monotonic journal order,
+it. Each fixed-size v2 record authenticates its clear framing and predecessor
+digest, and recovery enforces monotonic journal order,
 lease-generation input order, exact legal transitions, bounded effect/record
 counts, and immutable torn-tail preservation. Per-phase synchronized receipts
 make an exact publication retry idempotent after acknowledgement loss. This is
 currently a storage primitive: until guardian runtime recovery rehydrates the
 protocol state and owns the PTY write sequence, it is not live input-durability
 or mux-crash continuity evidence.
+
+The older v1 journal first appeared after the latest tagged release and is not
+wired by any non-test runtime caller. Its fieldless `Durable` state cannot prove
+full versus partial application, so v2 recovery rejects it as ambiguous. If an
+untagged build produced such a file, it must be quarantined or migrated
+conservatively; it must never be promoted to `durable_full`.
 
 The per-pane protocol state machine is finite and explicit:
 
