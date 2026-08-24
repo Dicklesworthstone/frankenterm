@@ -1394,18 +1394,28 @@ enum GuardianCheckpointStageBodyV1 {
 
 fn zeroizing_sha256_digest(bytes: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut digest = Zeroizing::new([0_u8; 32]);
+    // Finalize directly into the zeroizing owner. Converting `finalize()` into
+    // an array first would leave an additional raw digest temporary to drop.
     let output: &mut sha2::digest::Output<Sha256> = (&mut *digest).into();
     Sha256::new_with_prefix(bytes).finalize_into(output);
     digest
 }
 
-fn checkpoint_chunk_digest_matches(observed: &[u8; 32], expected: &[u8; 32]) -> bool {
+fn checkpoint_chunk_digest_matches(observed: &[u8], expected: &[u8]) -> bool {
+    if observed.len() != 32 || expected.len() != 32 {
+        return false;
+    }
     observed
         .iter()
         .zip(expected)
         .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
         == 0
 }
+
+/// Compiler-level tripwire against accidentally deriving `Clone` or `Copy` on
+/// plaintext-bearing checkpoint chunk capabilities, including under cfg-only
+/// production attributes that ordinary unit-test assertions cannot observe.
+struct GuardianCheckpointChunkNonDuplicable;
 
 /// Single-use ownership for a validated staging chunk. The digest and bytes
 /// stay in zeroizing storage until the store consumes this capability; neither
@@ -1415,6 +1425,7 @@ pub struct GuardianCheckpointStageChunkDeliveryV1 {
     offset: u64,
     chunk_digest: Zeroizing<[u8; 32]>,
     bytes: Zeroizing<Vec<u8>>,
+    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
 }
 
 impl std::fmt::Debug for GuardianCheckpointStageChunkDeliveryV1 {
@@ -1427,6 +1438,15 @@ impl std::fmt::Debug for GuardianCheckpointStageChunkDeliveryV1 {
             .field("chunk_digest", &"[REDACTED]")
             .field("bytes", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl ZeroizeOnDrop for GuardianCheckpointStageChunkDeliveryV1 {}
+
+impl Drop for GuardianCheckpointStageChunkDeliveryV1 {
+    fn drop(&mut self) {
+        self.chunk_digest.zeroize();
+        self.bytes.zeroize();
     }
 }
 
@@ -1447,8 +1467,10 @@ impl GuardianCheckpointStageChunkDeliveryV1 {
     }
 
     #[must_use]
-    pub fn into_bytes(self) -> Zeroizing<Vec<u8>> {
-        self.bytes
+    pub fn into_bytes(mut self) -> Zeroizing<Vec<u8>> {
+        // Taking the byte owner lets `self` drop here, wiping the authenticated
+        // digest before the plaintext allocation continues into durable store.
+        std::mem::take(&mut self.bytes)
     }
 }
 
@@ -1516,6 +1538,7 @@ impl GuardianCheckpointStageRequestV1 {
                 offset,
                 chunk_digest,
                 bytes,
+                _nonduplicable: GuardianCheckpointChunkNonDuplicable,
             }),
         )
     }
@@ -1726,6 +1749,7 @@ impl GuardianCheckpointStageRequestV1 {
                     offset,
                     chunk_digest,
                     bytes,
+                    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
                 })
             }
             3 if payload.len() == CHECKPOINT_STAGE_COMMON_BYTES => {
@@ -3566,6 +3590,7 @@ pub struct GuardianCheckpointChunkDelivery {
     offset: u64,
     chunk_digest: Zeroizing<[u8; 32]>,
     bytes: Zeroizing<Vec<u8>>,
+    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
 }
 
 impl std::fmt::Debug for GuardianCheckpointChunkDelivery {
@@ -3577,6 +3602,15 @@ impl std::fmt::Debug for GuardianCheckpointChunkDelivery {
             .field("chunk_bytes", &self.bytes.len())
             .field("bytes", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl ZeroizeOnDrop for GuardianCheckpointChunkDelivery {}
+
+impl Drop for GuardianCheckpointChunkDelivery {
+    fn drop(&mut self) {
+        self.chunk_digest.zeroize();
+        self.bytes.zeroize();
     }
 }
 
@@ -3603,6 +3637,7 @@ impl GuardianCheckpointChunkDelivery {
             offset,
             chunk_digest,
             bytes,
+            _nonduplicable: GuardianCheckpointChunkNonDuplicable,
         })
     }
 
@@ -4503,6 +4538,7 @@ fn decode_replay_page_body(
                 offset,
                 chunk_digest,
                 bytes,
+                _nonduplicable: GuardianCheckpointChunkNonDuplicable,
             };
             GuardianReplayPageBodyDelivery::CheckpointChunk(chunk)
         }
@@ -9216,6 +9252,13 @@ mod tests {
     use crate::guardian_checkpoint::current_replay_identity_digest;
     use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
     use std::sync::Arc;
+
+    static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);
+    static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);
+    static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);
+    static_assertions::assert_not_impl_any!(GuardianCheckpointChunkNonDuplicable: Clone, Copy);
+    static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: ZeroizeOnDrop);
+    static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: ZeroizeOnDrop);
 
     #[derive(Debug)]
     struct ProtocolCheckpointConfig;
@@ -14582,6 +14625,8 @@ mod tests {
             panic!("exact checkpoint replay must begin with checkpoint bytes");
         };
         let expected_chunk = canonical[..chunk.byte_len()].to_vec();
+        let expected_chunk_digest = zeroizing_sha256_digest(&expected_chunk);
+        assert_eq!(chunk.chunk_digest(), expected_chunk_digest.as_slice());
         let mut delivered_chunk = Vec::new();
         let (_, offset, delivered_bytes) = chunk
             .write_all_bounded(&mut delivered_chunk, 4_096)

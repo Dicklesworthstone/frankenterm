@@ -2309,6 +2309,8 @@ fn checkpoint_bytes_match(left: &[u8], right: &[u8]) -> bool {
 
 fn checkpoint_zeroizing_sha256_digest(bytes: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut digest = Zeroizing::new([0_u8; 32]);
+    // Finalize directly into the zeroizing owner rather than producing a raw
+    // array temporary between the SHA-256 state and its lifetime wrapper.
     let output: &mut sha2::digest::Output<Sha256> = (&mut *digest).into();
     Sha256::new_with_prefix(bytes).finalize_into(output);
     digest

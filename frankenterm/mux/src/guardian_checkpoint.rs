@@ -2348,7 +2348,7 @@ fn checkpoint_candidate_identity(
     let mut hasher = Sha256::new();
     hasher.update(CHECKPOINT_CANDIDATE_IDENTITY_DOMAIN);
     hasher.update(plaintext);
-    let digest = Zeroizing::new(hasher.finalize().into());
+    let digest = Zeroizing::new(<[u8; 32]>::from(hasher.finalize()));
     if digest.iter().all(|byte| *byte == 0) {
         return Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest);
     }
@@ -3353,7 +3353,10 @@ mod tests {
     use crate::guardian_output_journal::{
         GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
     };
-    use crate::guardian_protocol::GuardianCheckpointDescriptorV1;
+    use crate::guardian_protocol::{
+        GuardianCheckpointChunkDelivery, GuardianCheckpointDescriptorV1,
+        GuardianCheckpointStageChunkDeliveryV1,
+    };
     use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
     use frankenterm_term::{
         RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
@@ -3376,6 +3379,7 @@ mod tests {
         "GuardianCheckpointValidatedManifestOperationV1",
         "GuardianCheckpointManifestRetryCapabilityV1",
         "GuardianCheckpointManifestSealCapabilitiesV1",
+        "LiveParserCaptureAuthority",
         "LiveParserCheckpointAck",
     ];
 
@@ -3389,11 +3393,20 @@ mod tests {
     assert_not_impl_any!(GuardianCheckpointValidatedManifestOperationV1: Clone, Copy);
     assert_not_impl_any!(GuardianCheckpointManifestRetryCapabilityV1: Clone, Copy);
     assert_not_impl_any!(GuardianCheckpointManifestSealCapabilitiesV1: Clone, Copy);
+    assert_not_impl_any!(LiveParserCaptureAuthority: Clone, Copy);
     assert_not_impl_any!(LiveParserCheckpointAck: Clone, Copy);
+    // These protocol-owned plaintext holders have their complete field and
+    // constructor inventory in guardian_protocol.rs. This module adds a
+    // compiler-grounded boundary assertion because both are consumed by the
+    // checkpoint storage/cipher path whose authority surface is frozen below.
+    assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);
     assert_impl_all!(Sha256: zeroize::ZeroizeOnDrop);
     assert_impl_all!(Zeroizing<[u8; 32]>: zeroize::ZeroizeOnDrop);
     assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);
     assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);
+    assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);
+    assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::ZeroizeOnDrop);
 
     #[derive(Clone, Debug, PartialEq)]
     struct AuthorityFieldSurface {
@@ -3776,7 +3789,9 @@ mod tests {
             const INERT_ATTRIBUTES: &[&str] = &[
                 "allow", "cfg", "derive", "doc", "error", "must_use", "repr", "source",
             ];
-            if !INERT_ATTRIBUTES.contains(&name.as_str()) {
+            if attribute.path().segments.len() != 1
+                || !INERT_ATTRIBUTES.contains(&name.as_str())
+            {
                 self.unexpected_attributes.push(name);
             }
             if name == "derive" {
@@ -4106,6 +4121,17 @@ mod tests {
             }
             visit::visit_type_path(self, path);
         }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path.qself.is_some() {
+                self.projection_sites.push(format!(
+                    "{}::{}",
+                    self.current_impl_owner.as_deref().unwrap_or("<free>"),
+                    self.current_function.as_deref().unwrap_or("<item>")
+                ));
+            }
+            visit::visit_expr_path(self, path);
+        }
     }
 
     #[derive(Debug)]
@@ -4251,7 +4277,7 @@ mod tests {
         let protocol_descriptor =
             GuardianCheckpointDescriptorV1::from_live_capture(&capture, generation)
                 .expect("construct authoritative protocol descriptor");
-        let seal_request = GuardianCheckpointStageRequestV1::seal(
+        GuardianCheckpointStageRequestV1::seal(
             GuardianCheckpointScopeV1::Pane {
                 pane_id,
                 generation,
@@ -5755,6 +5781,7 @@ mod tests {
         assert!(std::mem::needs_drop::<
             GuardianCheckpointOrderedChunkSetBuilderV1
         >());
+        assert!(std::mem::needs_drop::<LiveParserCheckpointAck>());
 
         let syntax = syn::parse_file(include_str!("guardian_checkpoint.rs"))
             .expect("parse the complete checkpoint module as Rust syntax");
@@ -5794,6 +5821,7 @@ mod tests {
             "GuardianCheckpointValidatedStageAssemblyV1:ordered_chunk_set_identity:private",
             "GuardianCheckpointValidatedStageAssemblyV1:publication_id:private",
             "GuardianCheckpointValidatedStageAssemblyV1:seal_request:private",
+            "LiveParserCaptureAuthority:_private:private",
             "LiveParserCheckpointAck:boundary:private",
             "LiveParserCheckpointAck:boundary_digest:private",
             "LiveParserCheckpointAck:registration_wire_identity:private",
@@ -5947,6 +5975,7 @@ mod tests {
                 "seal_request",
                 "GuardianCheckpointStageRequestV1",
             ),
+            expected_authority_field("LiveParserCaptureAuthority", "_private", "()"),
             expected_authority_field(
                 "LiveParserCheckpointAck",
                 "boundary",
@@ -5997,6 +6026,7 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1:Debug",
             "GuardianCheckpointValidatedStageAssemblyV1:<inherent>",
             "GuardianCheckpointValidatedStageAssemblyV1:Debug",
+            "LiveParserCaptureAuthority:<inherent>",
             "LiveParserCheckpointAck:<inherent>",
             "LiveParserCheckpointAck:Debug",
         ]
@@ -6031,6 +6061,8 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
             "GuardianCheckpointValidatedManifestOperationV1::validate:private:production",
             "GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
+            "LiveParserCaptureAuthority::issue:private:production",
+            "LiveParserCaptureAuthority::issue_for_test:pub(crate):test",
             "LiveParserCheckpointAck::boundary:pub:production",
             "LiveParserCheckpointAck::boundary_digest:pub:production",
             "LiveParserCheckpointAck::capture:private:production",
@@ -6194,6 +6226,18 @@ mod tests {
                 "pub",
                 false,
                 "fn into_primary_and_retry(self) -> (GuardianCheckpointValidatedManifestOperationV1, GuardianCheckpointManifestRetryCapabilityV1)",
+            ),
+            expected_authority_method(
+                "LiveParserCaptureAuthority",
+                "private",
+                false,
+                "const fn issue() -> Self",
+            ),
+            expected_authority_method(
+                "LiveParserCaptureAuthority",
+                "pub(crate)",
+                true,
+                "const fn issue_for_test() -> Self",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
@@ -6521,6 +6565,8 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
+            "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue:private:production",
+            "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue_for_test:pub(crate):test",
             "LiveParserCheckpointAck@<free>::capture_and_bind_live_parser_checkpoint:pub(crate):production",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture:private:production",
         ]
@@ -6543,6 +6589,7 @@ mod tests {
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test",
+            "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture",
         ]
         .into_iter()
@@ -6666,6 +6713,43 @@ mod tests {
         let mut projection_inventory = AuthoritySurfaceAstInventory::default();
         projection_inventory.visit_file(&projection_storage_mutation);
         assert_eq!(projection_inventory.projection_sites.len(), 1);
+
+        let hidden_surface_mutation = syn::parse_file(
+            r#"
+                #[authority_issuer]
+                mod hidden_issuers;
+                type AuthorityAlias = GuardianCheckpointValidatedManifestAuthorityV1;
+                struct AuthorityVault {
+                    authority: GuardianCheckpointValidatedManifestAuthorityV1,
+                }
+                struct Factory;
+                impl Factory {
+                    const AUTHORITY: Option<GuardianCheckpointValidatedManifestAuthorityV1> = None;
+                    fn issue() -> GuardianCheckpointValidatedManifestAuthorityV1 {
+                        hidden_authority!()
+                    }
+                }
+                construct_authority!();
+            "#,
+        )
+        .expect("parse alternate authority surface mutation");
+        let mut hidden_surface_inventory = AuthoritySurfaceAstInventory::default();
+        hidden_surface_inventory.visit_file(&hidden_surface_mutation);
+        assert_eq!(
+            hidden_surface_inventory.modules,
+            vec!["out-of-line:hidden_issuers".to_owned()]
+        );
+        assert_eq!(
+            hidden_surface_inventory.unexpected_attributes,
+            vec!["authority_issuer".to_owned()]
+        );
+        assert_eq!(hidden_surface_inventory.aliases_or_storage.len(), 2);
+        assert_eq!(hidden_surface_inventory.external_storage_sites.len(), 1);
+        assert_eq!(hidden_surface_inventory.associated_items.len(), 2);
+        assert_eq!(hidden_surface_inventory.return_sites.len(), 1);
+        assert_eq!(hidden_surface_inventory.authority_signature_surfaces.len(), 1);
+        assert_eq!(hidden_surface_inventory.item_macros.len(), 1);
+        assert_eq!(hidden_surface_inventory.expression_macros.len(), 1);
 
         let plaintext = b"single-use zeroizing seal intent";
         let (descriptor, _, _, _) = record_descriptor();
