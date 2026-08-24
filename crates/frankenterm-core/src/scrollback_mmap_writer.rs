@@ -319,6 +319,16 @@ pub struct MmapScrollback {
 
 impl MmapScrollback {
     pub fn open(config: MmapScrollbackConfig) -> Result<Self, MmapScrollbackError> {
+        Self::open_with_after_lock(config, || {})
+    }
+
+    fn open_with_after_lock<F>(
+        config: MmapScrollbackConfig,
+        after_lock: F,
+    ) -> Result<Self, MmapScrollbackError>
+    where
+        F: FnOnce(),
+    {
         let cap_bytes = normalize_cap_bytes(config.cap_bytes)?;
         if config
             .base_dir
@@ -353,13 +363,31 @@ impl MmapScrollback {
                 reason: "writer lock has no file name",
             }
         })?;
-        let lock_file = open_writer_file(&base_directory, Path::new(lock_leaf), &lock_path)?;
-        lock_file
-            .lock_exclusive()
-            .map_err(|source| MmapScrollbackError::Lock {
-                path: lock_path.clone(),
-                source,
-            })?;
+        let opened_lock =
+            open_writer_file(&base_directory, Path::new(lock_leaf), &lock_path)?;
+        let lock_file = opened_lock.file;
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(MmapScrollbackError::WriterBusy {
+                    path: lock_path.clone(),
+                });
+            }
+            Err(source) => {
+                return Err(MmapScrollbackError::Lock {
+                    path: lock_path.clone(),
+                    source,
+                });
+            }
+        }
+        after_lock();
+        revalidate_writer_file(
+            &base_directory,
+            Path::new(lock_leaf),
+            &lock_path,
+            &lock_file,
+            opened_lock.identity,
+        )?;
         revalidate_writer_directory(
             &base_directory,
             &config.base_dir,
@@ -372,13 +400,21 @@ impl MmapScrollback {
                 path: path.clone(),
                 reason: "writer data file has no file name",
             })?;
-        let mut file = open_writer_file(&base_directory, Path::new(data_leaf), &path)?;
+        let opened_data =
+            open_writer_file(&base_directory, Path::new(data_leaf), &path)?;
+        let mut file = opened_data.file;
+        revalidate_writer_file(
+            &base_directory,
+            Path::new(data_leaf),
+            &path,
+            &file,
+            opened_data.identity,
+        )?;
         revalidate_writer_directory(
             &base_directory,
             &config.base_dir,
             base_directory_identity,
         )?;
-        let target_len = HEADER_SIZE as u64 + cap_bytes;
         let metadata_len = file
             .metadata()
             .map_err(|source| MmapScrollbackError::Metadata {
@@ -387,7 +423,41 @@ impl MmapScrollback {
             })?
             .len();
 
-        let header = if metadata_len >= HEADER_SIZE as u64 {
+        let target_len = HEADER_SIZE as u64 + cap_bytes;
+        let (header, v2_state, active_state_slot, used_bytes) = if opened_data.created {
+            if metadata_len != 0 {
+                return Err(MmapScrollbackError::UnsafeReadSource {
+                    path: path.clone(),
+                    reason: "newly created scrollback leaf was not empty before initialization",
+                });
+            }
+            file.set_len(target_len)
+                .map_err(|source| MmapScrollbackError::SetLen {
+                    path: path.clone(),
+                    len: target_len,
+                    source,
+                })?;
+            let mut header = ScrollbackHeader::new(
+                expected_pane_uuid,
+                cap_bytes,
+                epoch_millis(SystemTime::now()),
+            );
+            header.flags = HeaderFlags::from_bits(V2_RING_FLAG);
+            let state = V2RingState::fresh(cap_bytes)?;
+            (header, state, 0, 0)
+        } else {
+            // Pre-existing evidence is immutable until every structural and
+            // authenticated-state invariant has passed. In particular, never
+            // `set_len` a short, long, differently configured, or legacy-v1
+            // file in place.
+            if metadata_len != target_len {
+                return Err(MmapScrollbackError::ExistingFileShapeMismatch {
+                    path: path.clone(),
+                    configured_capacity_bytes: cap_bytes,
+                    expected_file_bytes: target_len,
+                    actual_file_bytes: metadata_len,
+                });
+            }
             let mut bytes = [0u8; HEADER_SIZE];
             file.seek(SeekFrom::Start(0))
                 .and_then(|_| file.read_exact(&mut bytes))
@@ -395,40 +465,29 @@ impl MmapScrollback {
                     path: path.clone(),
                     source,
                 })?;
-            let decoded = ScrollbackHeader::decode(&bytes)?;
+            let mut decoded = ScrollbackHeader::decode(&bytes)?;
             if decoded.pane_uuid != expected_pane_uuid {
                 return Err(MmapScrollbackError::UnsafeReadSource {
                     path: path.clone(),
                     reason: "existing scrollback header does not match its configured filename",
                 });
             }
-            if decoded.capacity_bytes != cap_bytes || metadata_len != target_len {
-                file.set_len(target_len)
-                    .map_err(|source| MmapScrollbackError::SetLen {
-                        path: path.clone(),
-                        len: target_len,
-                        source,
-                    })?;
-                ScrollbackHeader {
-                    capacity_bytes: cap_bytes,
-                    write_cursor_bytes: decoded.write_cursor_bytes.min(cap_bytes),
-                    ..decoded
-                }
-            } else {
-                decoded
-            }
-        } else {
-            file.set_len(target_len)
-                .map_err(|source| MmapScrollbackError::SetLen {
+            if decoded.capacity_bytes != cap_bytes {
+                return Err(MmapScrollbackError::ExistingFileShapeMismatch {
                     path: path.clone(),
-                    len: target_len,
-                    source,
-                })?;
-            ScrollbackHeader::new(
-                expected_pane_uuid,
-                cap_bytes,
-                epoch_millis(SystemTime::now()),
-            )
+                    configured_capacity_bytes: cap_bytes,
+                    expected_file_bytes: target_len,
+                    actual_file_bytes: metadata_len,
+                });
+            }
+            if decoded.flags.bits() & V2_RING_FLAG == 0 {
+                return Err(MmapScrollbackError::LegacyV1ReadOnly {
+                    path: path.clone(),
+                });
+            }
+            let loaded = load_v2_writer_state(&mut file, &path, &bytes, decoded, cap_bytes)?;
+            decoded.write_cursor_bytes = u64::from(loaded.state.tail);
+            (decoded, loaded.state, loaded.slot_index, loaded.used_bytes)
         };
 
         let mut writer = Self {
@@ -443,15 +502,31 @@ impl MmapScrollback {
             sync_interval: config.sync_interval,
             redactor: StreamingRedactor::new(),
             pending_record_kind: None,
+            v2_state,
+            active_state_slot,
+            used_bytes,
+            #[cfg(test)]
+            sync_observer: None,
         };
-        writer.write_header()?;
-        writer
-            .file
-            .sync_data()
-            .map_err(|source| MmapScrollbackError::Sync {
-                path: writer.path.clone(),
-                source,
-            })?;
+        if opened_data.created {
+            writer.header.last_msync_at_epoch_ms = epoch_millis(SystemTime::now());
+            writer.initialize_v2_file()?;
+            writer.sync_file_data()?;
+        }
+        revalidate_writer_file(
+            &base_directory,
+            Path::new(data_leaf),
+            &path,
+            &writer.file,
+            opened_data.identity,
+        )?;
+        revalidate_writer_file(
+            &base_directory,
+            Path::new(lock_leaf),
+            &lock_path,
+            &writer.lock_file,
+            opened_lock.identity,
+        )?;
         revalidate_writer_directory(
             &base_directory,
             &config.base_dir,
@@ -529,45 +604,128 @@ impl MmapScrollback {
         redacted: RedactionResult,
     ) -> Result<MmapAppendReport, MmapScrollbackError> {
         let payload = fit_payload_to_capacity(redacted.bytes, self.header.capacity_bytes)?;
-        let record_len =
+        let payload_len =
             u32::try_from(payload.len()).map_err(|_| MmapScrollbackError::RecordTooLarge {
                 payload_bytes: payload.len(),
                 capacity_bytes: self.header.capacity_bytes,
             })?;
-        let record = RecordHeader {
-            record_len,
-            record_kind,
-        }
-        .encode();
-        let total_len = record.len() as u64 + payload.len() as u64;
+        let total_len = V2_RECORD_HEADER_SIZE as u64 + u64::from(payload_len);
+        let original_state = self.v2_state;
+        let original_used_bytes = self.used_bytes;
+        let (mut prepared_state, prepared_used_bytes, evicted) =
+            self.plan_append_position(total_len)?;
 
-        let start_cursor =
-            if self.header.write_cursor_bytes + total_len > self.header.capacity_bytes {
-                0
-            } else {
-                self.header.write_cursor_bytes
-            };
+        // Overwriting a still-referenced record would make both metadata slots
+        // unrecoverable if the process died between the body overwrite and the
+        // next state publication. Commit and sync the eviction-only state first;
+        // this extra boundary occurs only when live bytes must be reclaimed.
+        if evicted {
+            self.v2_state = prepared_state;
+            self.used_bytes = prepared_used_bytes;
+            self.header.write_cursor_bytes = u64::from(self.v2_state.tail);
+            self.publish_v2_state()?;
+            self.sync_current_state()?;
+            prepared_state = self.v2_state;
+        }
+
+        let rollback_state = self.v2_state;
+        let rollback_used_bytes = self.used_bytes;
+        let start_cursor = u64::from(prepared_state.tail);
+        let record = encode_v2_record_header(
+            self.header.pane_uuid,
+            record_kind,
+            payload_len,
+            prepared_state.generation,
+            prepared_state.next_sequence,
+            &payload,
+        );
         let offset = HEADER_SIZE as u64 + start_cursor;
 
-        self.file
+        if let Err(source) = self
+            .file
             .seek(SeekFrom::Start(offset))
             .and_then(|_| self.file.write_all(&record))
             .and_then(|()| self.file.write_all(&payload))
-            .map_err(|source| MmapScrollbackError::WriteRecord {
+        {
+            if !evicted {
+                self.v2_state = original_state;
+                self.used_bytes = original_used_bytes;
+            } else {
+                self.v2_state = rollback_state;
+                self.used_bytes = rollback_used_bytes;
+            }
+            return Err(MmapScrollbackError::WriteRecord {
                 path: self.path.clone(),
                 source,
-            })?;
+            });
+        }
 
-        // `start_cursor + total_len` is already bounded by capacity. Preserve
-        // the exact-capacity sentinel instead of reducing it to zero; zero
-        // means an empty committed prefix to the linear recovery reader.
-        self.header.write_cursor_bytes = start_cursor + total_len;
+        let mut committed_state = prepared_state;
+        if committed_state.record_count == 0 {
+            committed_state.head = committed_state.tail;
+        }
+        committed_state.record_count = committed_state
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 record count overflow",
+            })?;
+        committed_state.next_sequence = committed_state
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 record sequence exhausted",
+            })?;
+        let end_cursor = start_cursor + total_len;
+        if end_cursor == self.header.capacity_bytes {
+            committed_state.tail = 0;
+            committed_state.wrap_at = u32::try_from(self.header.capacity_bytes).map_err(|_| {
+                MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 capacity does not fit ring offsets",
+                }
+            })?;
+            committed_state.generation = committed_state.generation.checked_add(1).ok_or_else(
+                || MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 ring generation exhausted",
+                },
+            )?;
+        } else {
+            committed_state.tail = u32::try_from(end_cursor).map_err(|_| {
+                MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 tail does not fit ring offset",
+                }
+            })?;
+        }
+
+        self.v2_state = committed_state;
+        self.used_bytes = prepared_used_bytes.checked_add(total_len).ok_or_else(|| {
+            MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 used-byte accounting overflow",
+            }
+        })?;
+        self.header.write_cursor_bytes = u64::from(self.v2_state.tail);
         self.header.total_bytes_written = self.header.total_bytes_written.saturating_add(total_len);
         self.header.redactions_applied = self
             .header
             .redactions_applied
             .saturating_add(u64::from(redacted.evidence.replacement_count));
-        self.write_header()?;
+        if let Err(error) = self.publish_v2_state() {
+            self.v2_state = rollback_state;
+            self.used_bytes = rollback_used_bytes;
+            self.header.write_cursor_bytes = u64::from(self.v2_state.tail);
+            self.header.total_bytes_written = self.header.total_bytes_written.saturating_sub(total_len);
+            self.header.redactions_applied = self
+                .header
+                .redactions_applied
+                .saturating_sub(u64::from(redacted.evidence.replacement_count));
+            return Err(error);
+        }
 
         self.appends_since_sync = self.appends_since_sync.saturating_add(1);
         let synced = self.sync_if_due()?;
@@ -582,14 +740,13 @@ impl MmapScrollback {
     }
 
     pub fn sync(&mut self) -> Result<(), MmapScrollbackError> {
+        self.sync_current_state()
+    }
+
+    fn sync_current_state(&mut self) -> Result<(), MmapScrollbackError> {
         self.header.last_msync_at_epoch_ms = epoch_millis(SystemTime::now());
-        self.write_header()?;
-        self.file
-            .sync_data()
-            .map_err(|source| MmapScrollbackError::Sync {
-                path: self.path.clone(),
-                source,
-            })?;
+        self.write_v2_telemetry()?;
+        self.sync_file_data()?;
         self.last_sync_at = SystemTime::now();
         self.appends_since_sync = 0;
         Ok(())
@@ -606,18 +763,15 @@ impl MmapScrollback {
             self.sync()?;
             Ok(true)
         } else {
-            self.file
-                .sync_data()
-                .map_err(|source| MmapScrollbackError::Sync {
-                    path: self.path.clone(),
-                    source,
-                })?;
             Ok(false)
         }
     }
 
-    fn write_header(&mut self) -> Result<(), MmapScrollbackError> {
-        let bytes = self.header.encode();
+    fn initialize_v2_file(&mut self) -> Result<(), MmapScrollbackError> {
+        let mut bytes = encode_v2_base_header(self.header);
+        let slot = encode_v2_state_slot(&bytes, self.v2_state);
+        bytes[V2_STATE_SLOTS_OFFSET..V2_STATE_SLOTS_OFFSET + V2_STATE_SLOT_SIZE]
+            .copy_from_slice(&slot);
         self.file
             .seek(SeekFrom::Start(0))
             .and_then(|_| self.file.write_all(&bytes))
@@ -625,6 +779,190 @@ impl MmapScrollback {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    fn write_v2_telemetry(&mut self) -> Result<(), MmapScrollbackError> {
+        let bytes = encode_v2_base_header(self.header);
+        self.file
+            .seek(SeekFrom::Start(64))
+            .and_then(|_| self.file.write_all(&bytes[64..88]))
+            .map_err(|source| MmapScrollbackError::WriteHeader {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    fn publish_v2_state(&mut self) -> Result<(), MmapScrollbackError> {
+        let mut next = self.v2_state;
+        next.slot_epoch = next.slot_epoch.checked_add(1).ok_or_else(|| {
+            MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 state epoch exhausted",
+            }
+        })?;
+        let next_slot = (self.active_state_slot + 1) % V2_STATE_SLOT_COUNT;
+        let base = encode_v2_base_header(self.header);
+        let encoded = encode_v2_state_slot(&base, next);
+        let offset = V2_STATE_SLOTS_OFFSET + next_slot * V2_STATE_SLOT_SIZE;
+        self.file
+            .seek(SeekFrom::Start(offset as u64))
+            .and_then(|_| self.file.write_all(&encoded))
+            .map_err(|source| MmapScrollbackError::WriteHeader {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.v2_state = next;
+        self.active_state_slot = next_slot;
+        Ok(())
+    }
+
+    fn sync_file_data(&self) -> Result<(), MmapScrollbackError> {
+        #[cfg(test)]
+        if let Some(observer) = &self.sync_observer {
+            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.file
+            .sync_data()
+            .map_err(|source| MmapScrollbackError::Sync {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    fn plan_append_position(
+        &mut self,
+        total_len: u64,
+    ) -> Result<(V2RingState, u64, bool), MmapScrollbackError> {
+        let capacity = self.header.capacity_bytes;
+        let capacity_u32 = u32::try_from(capacity).map_err(|_| {
+            MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 capacity does not fit ring offsets",
+            }
+        })?;
+        let mut state = self.v2_state;
+        let mut used_bytes = self.used_bytes;
+        let mut evicted = false;
+
+        if state.record_count == 0 {
+            state.head = 0;
+            state.tail = 0;
+            state.wrap_at = capacity_u32;
+            used_bytes = 0;
+            return Ok((state, used_bytes, false));
+        }
+
+        loop {
+            let tail = u64::from(state.tail);
+            let head = u64::from(state.head);
+            if tail < head {
+                if tail + total_len <= head {
+                    break;
+                }
+                self.evict_oldest_from_plan(&mut state, &mut used_bytes)?;
+                evicted = true;
+                continue;
+            }
+
+            let ring_full = state.record_count > 0 && used_bytes == capacity;
+            if !ring_full && tail + total_len <= capacity {
+                break;
+            }
+
+            if tail + total_len > capacity {
+                while state.record_count > 0 && total_len > u64::from(state.head) {
+                    self.evict_oldest_from_plan(&mut state, &mut used_bytes)?;
+                    evicted = true;
+                }
+                if state.record_count == 0 {
+                    state.head = 0;
+                    state.tail = 0;
+                    state.wrap_at = capacity_u32;
+                    used_bytes = 0;
+                } else {
+                    state.wrap_at = state.tail;
+                    state.tail = 0;
+                }
+                state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                    MmapScrollbackError::V2Integrity {
+                        path: self.path.clone(),
+                        reason: "v2 ring generation exhausted",
+                    }
+                })?;
+                break;
+            }
+
+            self.evict_oldest_from_plan(&mut state, &mut used_bytes)?;
+            evicted = true;
+        }
+
+        Ok((state, used_bytes, evicted))
+    }
+
+    fn evict_oldest_from_plan(
+        &mut self,
+        state: &mut V2RingState,
+        used_bytes: &mut u64,
+    ) -> Result<(), MmapScrollbackError> {
+        if state.record_count == 0 {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "attempted to evict from an empty v2 ring",
+            });
+        }
+        if state.head == state.wrap_at && state.head != 0 {
+            state.head = 0;
+            state.wrap_at = u32::try_from(self.header.capacity_bytes).map_err(|_| {
+                MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 capacity does not fit ring offsets",
+                }
+            })?;
+        }
+        let meta = read_v2_record_meta_verified(
+            &mut self.file,
+            &self.path,
+            self.header,
+            u64::from(state.head),
+            self.header.capacity_bytes,
+        )?;
+        let record_end = u64::from(state.head) + u64::from(meta.total_len);
+        *used_bytes = used_bytes.checked_sub(u64::from(meta.total_len)).ok_or_else(|| {
+            MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 used-byte accounting underflow",
+            }
+        })?;
+        state.record_count -= 1;
+        if state.record_count == 0 {
+            state.head = state.tail;
+            state.wrap_at = u32::try_from(self.header.capacity_bytes).map_err(|_| {
+                MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 capacity does not fit ring offsets",
+                }
+            })?;
+            return Ok(());
+        }
+        if record_end == u64::from(state.wrap_at) {
+            state.head = 0;
+            state.wrap_at = u32::try_from(self.header.capacity_bytes).map_err(|_| {
+                MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 capacity does not fit ring offsets",
+                }
+            })?;
+        } else if record_end == self.header.capacity_bytes {
+            state.head = 0;
+        } else {
+            state.head = u32::try_from(record_end).map_err(|_| {
+                MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 head does not fit ring offset",
+                }
+            })?;
+        }
+        Ok(())
     }
 }
 

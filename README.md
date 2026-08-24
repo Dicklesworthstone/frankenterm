@@ -1101,6 +1101,15 @@ identity-checked unlink plus parent-directory synchronization. It deliberately
 retains the private lock inode so a competing writer cannot create a second
 flock authority while the operation is retiring.
 
+All three flat-mmap orphan commands accept the same explicit recovery envelope:
+`--max-directory-entries`, `--max-file-bytes`, `--max-records`,
+`--max-replay-chunks`, `--max-payload-bytes`, and
+`--max-transcript-bytes`. Defaults stay conservative. Operators who configured
+a larger valid writer capacity can opt in up to the finite hard ceilings rather
+than having that file become impossible to inspect or discard. Invalid limits
+and operational scan/read/write/discard failures remain bounded and redacted in
+JSON/TOON output and exit with status 2.
+
 `ft snapshot restore <id> --dry-run` reads a bounded checkpoint descriptor and
 prints a metadata-only descriptor/status report. It does not load a full restorable projection and
 is not evidence that execution would succeed. Every non-dry snapshot restore,

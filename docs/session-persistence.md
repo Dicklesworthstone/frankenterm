@@ -275,6 +275,16 @@ reason. `ft session discard --force` removes only the still-leased,
 identity-revalidated data leaf, synchronizes its pinned parent, and retains the
 private lock inode to prevent split flock authority.
 
+`list-orphans`, `recover`, and `discard` share caller-selectable finite limits
+for directory entries, file bytes, records, replay chunks, payload bytes, and
+transcript bytes. The defaults remain the conservative 64 MiB/50 MiB recovery
+envelope, while explicit flags admit a non-default writer capacity only up to
+the hard 1 GiB and 1,048,576-record ceilings. Canonical paired lock companions
+have an independent bounded census so a first production scan cannot make a
+second scan fail merely by creating the missing recovery leases. All
+operational failures honor the requested plain/JSON/TOON format with stable,
+bounded, redacted error codes and exit status 2.
+
 Guardian raw-output v3 uses a keyed authenticated 176-byte header. A complete
 legacy 160-byte v1 header is reported as unsupported and left byte-for-byte
 untouched; it is never treated as a torn v3 header or shifted in place. Any

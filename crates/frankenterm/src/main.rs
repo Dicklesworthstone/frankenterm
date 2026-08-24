@@ -77642,22 +77642,37 @@ fn exit_session_export_error(
     message: &str,
     format: SnapshotSessionOutputFormat,
 ) -> ! {
-    let message = bounded_terminal_diagnostic(message, 1_024, 4_096);
-    if format.is_structured() {
-        let payload = serde_json::json!({
-            "ok": false,
-            "error_code": error_code,
-            "error": &message,
-        });
-        let rendered = format_snapshot_session_structured_output(&payload, format)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| payload.to_string());
+    let (message, rendered) = format_session_export_error(error_code, message, format);
+    if let Some(rendered) = rendered {
         println!("{rendered}");
     } else {
         eprintln!("Error: {message}");
     }
     std::process::exit(2);
+}
+
+fn format_session_export_error(
+    error_code: &'static str,
+    message: &str,
+    format: SnapshotSessionOutputFormat,
+) -> (String, Option<String>) {
+    let message = bounded_terminal_diagnostic(message, 1_024, 4_096);
+    let rendered = if format.is_structured() {
+        let payload = serde_json::json!({
+            "ok": false,
+            "error_code": error_code,
+            "error": &message,
+        });
+        Some(
+            format_snapshot_session_structured_output(&payload, format)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| payload.to_string()),
+        )
+    } else {
+        None
+    };
+    (message, rendered)
 }
 
 fn is_valid_scrollback_pane_uuid(value: &str) -> bool {
@@ -93638,6 +93653,47 @@ recorder_backend = "rusqlite"
         )
             .expect_err("a dangling recovery-directory symlink must not look like no state");
         assert!(error.to_string().contains("scan scrollback directory"));
+    }
+
+    #[test]
+    fn session_orphan_operational_failures_remain_bounded_json_and_toon() {
+        let raw_secret = format!("{} {}", "x".repeat(8_192), "sk-secret-value-1234567890");
+        for error_code in [
+            "session.orphan_scan_failed",
+            "session.orphan_artifact_write_failed",
+            "session.orphan_read_failed",
+            "session.orphan_discard_failed",
+        ] {
+            for format in [
+                SnapshotSessionOutputFormat::Json,
+                SnapshotSessionOutputFormat::Toon,
+            ] {
+                let (message, rendered) =
+                    format_session_export_error(error_code, &raw_secret, format);
+                assert!(message.len() <= 4_096);
+                assert!(!message.contains("sk-secret-value"));
+                let rendered = rendered.expect("structured error rendering");
+                let payload: serde_json::Value = match format {
+                    SnapshotSessionOutputFormat::Json => {
+                        serde_json::from_str(&rendered).expect("decode JSON operational error")
+                    }
+                    SnapshotSessionOutputFormat::Toon => {
+                        let decoded =
+                            toon_rust::try_decode(&rendered, None).expect("decode TOON operational error");
+                        let json = toon_rust::cli::json_stringify::json_stringify_lines(
+                            &decoded, 0,
+                        )
+                        .join("\n");
+                        serde_json::from_str(&json).expect("decode TOON error as JSON")
+                    }
+                    SnapshotSessionOutputFormat::Plain => unreachable!(),
+                };
+                assert_eq!(payload["ok"], false);
+                assert_eq!(payload["error_code"], error_code);
+                assert!(!payload["error"].as_str().unwrap_or_default().is_empty());
+                assert!(!rendered.contains("sk-secret-value"));
+            }
+        }
     }
 
     #[test]

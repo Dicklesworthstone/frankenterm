@@ -4043,6 +4043,65 @@ fn session_list_orphans_defaults_to_json_when_stdout_is_piped() {
     assert_eq!(payload["orphans"][0]["path"], path.display().to_string());
 }
 
+#[cfg(unix)]
+#[test]
+fn session_list_orphans_scan_rejection_returns_structured_exit_2() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let scrollback_dir = data_home.join("ft").join("scrollback");
+    std::fs::create_dir_all(&scrollback_dir).expect("create non-private recovery directory");
+    std::fs::set_permissions(&scrollback_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("make recovery directory deliberately non-private");
+
+    let output = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args(["session", "list-orphans", "--format", "json"])
+        .output()
+        .expect("ft session list-orphans should execute");
+
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("scan rejection stdout should be JSON");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error_code"], "session.orphan_scan_failed");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn session_recover_existing_output_returns_structured_exit_2_without_overwrite() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let scrollback_dir = data_home.join("ft").join("scrollback");
+    let (pane_uuid, _) = write_test_scrollback(&scrollback_dir, 0x6b);
+    let output_path = dir.path().join("already-present.txt");
+    std::fs::write(&output_path, b"retain me").expect("plant existing recovery output");
+
+    let output = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .arg("session")
+        .arg("recover")
+        .arg(&pane_uuid)
+        .arg("--allow-partial")
+        .arg("--output")
+        .arg(&output_path)
+        .args(["--format", "json"])
+        .output()
+        .expect("ft session recover should execute");
+
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("existing-artifact rejection stdout should be JSON");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(
+        payload["error_code"],
+        "session.orphan_artifact_write_failed"
+    );
+    assert_eq!(
+        std::fs::read(&output_path).expect("read retained output"),
+        b"retain me"
+    );
+}
+
 #[test]
 fn session_discard_removes_bin_retains_lock_and_disappears_from_list() {
     let (dir, ws) = setup_workspace();

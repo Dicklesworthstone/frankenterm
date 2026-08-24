@@ -159,10 +159,21 @@ ft session dump [--output <path>] [--allow-partial] [-f <auto|plain|json|toon>]
 ft session verify-dump <path> [-f <auto|plain|json|toon>]
 ft session list-durable [--max-entries <n>] [-f <auto|plain|json|toon>]
 ft session export-durable <32-hex-pane-id> [--output <path>] [--max-rows <n>] [--max-total-bytes <n>] [--max-physical-bytes <n>] [-f <auto|plain|json|toon>]
-ft session list-orphans [-f <auto|plain|json|toon>]
-ft session recover <64-hex-pane-uuid> [--output <path>] [--allow-partial] [-f <auto|plain|json|toon>]
-ft session discard <64-hex-pane-uuid> --force [-f <auto|plain|json|toon>]
+ft session list-orphans [<legacy-recovery-limits>] [-f <auto|plain|json|toon>]
+ft session recover <64-hex-pane-uuid> [--output <path>] [--allow-partial] [<legacy-recovery-limits>] [-f <auto|plain|json|toon>]
+ft session discard <64-hex-pane-uuid> --force [<legacy-recovery-limits>] [-f <auto|plain|json|toon>]
 ```
+
+`<legacy-recovery-limits>` is the shared finite envelope:
+`--max-directory-entries`, `--max-file-bytes`, `--max-records`,
+`--max-replay-chunks`, `--max-payload-bytes`, and
+`--max-transcript-bytes`. Conservative defaults remain 128 candidate leaves,
+64 MiB per file, 262,144 records/chunks, and 50 MiB payload/transcript. An
+operator recovering a valid non-default-capacity writer can opt in up to the
+hard ceilings: 1,024 candidate leaves (plus an independently bounded paired
+lock-companion census), 1 GiB per file/payload/transcript, and 1,048,576
+records/chunks. Invalid or internally inconsistent combinations return a
+structured error and exit status 2.
 
 `recover` is export-only and never writes archived output into a live PTY. It
 rejects an incomplete source or skipped record before creating an artifact
