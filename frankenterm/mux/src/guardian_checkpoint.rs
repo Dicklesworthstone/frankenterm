@@ -1298,21 +1298,35 @@ impl GuardianCheckpointCipher {
         plaintext: &[u8],
     ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
         context.validate()?;
-        if context.authority != GuardianCheckpointStageContextAuthorityV1::CanonicalDescriptor {
-            return Err(GuardianCheckpointCipherError::UntrustedPersistedContext);
+        let kind_authorized = matches!(
+            (context.kind, context.authority),
+            (
+                GuardianCheckpointStageRecordKindV1::CandidateMetadata
+                    | GuardianCheckpointStageRecordKindV1::Chunk,
+                GuardianCheckpointStageContextAuthorityV1::StageBinding,
+            ) | (
+                GuardianCheckpointStageRecordKindV1::SealManifest,
+                GuardianCheckpointStageContextAuthorityV1::ValidatedSeal,
+            )
+        );
+        if !kind_authorized {
+            return Err(GuardianCheckpointCipherError::InvalidKindAuthority);
         }
         let (plaintext_bytes, plaintext_digest) = checkpoint_stage_plaintext_identity(plaintext)?;
         if plaintext_bytes != context.plaintext_bytes
-            || !checkpoint_stage_digests_match(plaintext_digest, context.plaintext_digest)
+            || context.expected_plaintext_digest != Some(plaintext_digest)
         {
             return Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch);
         }
+        let inner_plaintext =
+            checkpoint_stage_inner_plaintext(plaintext, plaintext_digest)?;
         let key_id = self.key_id();
         let aad = checkpoint_stage_record_aad(key_id, &context);
         let (nonce, ciphertext) = self
             .output_cipher
-            .seal_guardian_metadata(plaintext, &aad)
+            .seal_guardian_metadata(inner_plaintext.as_slice(), &aad)
             .map_err(|_| GuardianCheckpointCipherError::EncryptionFailed)?;
+        drop(inner_plaintext);
         let record = GuardianEncryptedCheckpointStageRecordV1 {
             version: GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION,
             key_id,
@@ -1337,25 +1351,46 @@ impl GuardianCheckpointCipher {
         if !checkpoint_stage_key_ids_match(record.key_id, self.key_id()) {
             return Err(GuardianCheckpointCipherError::KeyIdentityMismatch);
         }
-        if !checkpoint_stage_contexts_match(&record.context, expected_context) {
+        if !record.context.same_wire_identity(expected_context) {
             return Err(GuardianCheckpointCipherError::ContextMismatch);
         }
         let aad = checkpoint_stage_record_aad(self.key_id(), expected_context);
-        let plaintext = self
+        let mut inner_plaintext = self
             .output_cipher
             .open_guardian_metadata(&record.nonce, &record.ciphertext, &aad)
             .map_err(|_| GuardianCheckpointCipherError::AuthenticationFailed)?;
+        let plaintext_bytes = usize::try_from(expected_context.plaintext_bytes)
+            .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?;
+        let expected_inner_bytes = plaintext_bytes
+            .checked_add(CHECKPOINT_STAGE_INNER_TRAILER_BYTES)
+            .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+        if inner_plaintext.len() != expected_inner_bytes {
+            return Err(GuardianCheckpointCipherError::InvalidInnerEnvelope);
+        }
+        let trailer = &inner_plaintext[plaintext_bytes..];
+        if trailer[..8] != CHECKPOINT_STAGE_INNER_TRAILER_MAGIC
+            || checkpoint_stage_u32_at(trailer, 8)
+                != CHECKPOINT_STAGE_INNER_TRAILER_VERSION
+            || trailer[12..16] != [0; 4]
+        {
+            return Err(GuardianCheckpointCipherError::InvalidInnerEnvelope);
+        }
+        let encrypted_plaintext_digest = checkpoint_stage_digest_at(trailer, 16);
         let (observed_bytes, observed_digest) =
-            checkpoint_stage_plaintext_identity(plaintext.as_slice())?;
+            checkpoint_stage_plaintext_identity(&inner_plaintext[..plaintext_bytes])?;
         if observed_bytes != expected_context.plaintext_bytes
-            || !checkpoint_stage_digests_match(
-                observed_digest,
-                expected_context.plaintext_digest,
-            )
+            || !checkpoint_stage_digests_match(observed_digest, encrypted_plaintext_digest)
+            || expected_context
+                .expected_plaintext_digest
+                .is_some_and(|expected| {
+                    !checkpoint_stage_digests_match(expected, observed_digest)
+                })
         {
             return Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch);
         }
-        Ok(plaintext)
+        inner_plaintext[plaintext_bytes..].zeroize();
+        inner_plaintext.truncate(plaintext_bytes);
+        Ok(inner_plaintext)
     }
 }
 
@@ -1536,6 +1571,12 @@ pub enum GuardianCheckpointCipherError {
     DescriptorScopeMismatch,
     #[error("checkpoint descriptor cannot mint stable staging identities")]
     InvalidDescriptor,
+    #[error("checkpoint pane scope does not match the protocol capture generation")]
+    CaptureGenerationMismatch,
+    #[error("Genesis checkpoint does not use the reserved capture generation")]
+    GenesisCaptureGenerationMismatch,
+    #[error("checkpoint seal witness does not match its stage binding")]
+    SealWitnessMismatch,
     #[error("checkpoint upload identity must be nonnil")]
     NilUploadIdentity,
     #[error("checkpoint publication identity must be nonnil")]
@@ -1566,14 +1607,16 @@ pub enum GuardianCheckpointCipherError {
     KeyIdentityMismatch,
     #[error("checkpoint staging context mismatch")]
     ContextMismatch,
-    #[error("persisted checkpoint context cannot authorize a new seal")]
-    UntrustedPersistedContext,
+    #[error("checkpoint record kind lacks its required staging authority")]
+    InvalidKindAuthority,
     #[error("checkpoint staging ciphertext length mismatch")]
     CiphertextLengthMismatch,
     #[error("checkpoint staging encryption failed")]
     EncryptionFailed,
     #[error("checkpoint staging authentication failed")]
     AuthenticationFailed,
+    #[error("checkpoint encrypted inner envelope is invalid")]
+    InvalidInnerEnvelope,
     #[error("checkpoint staging arithmetic overflow")]
     ArithmeticOverflow,
 }
@@ -1595,6 +1638,26 @@ fn checkpoint_stage_plaintext_identity(
     Ok((plaintext_bytes, hasher.finalize().into()))
 }
 
+fn checkpoint_stage_inner_plaintext(
+    plaintext: &[u8],
+    plaintext_digest: [u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError> {
+    let inner_bytes = plaintext
+        .len()
+        .checked_add(CHECKPOINT_STAGE_INNER_TRAILER_BYTES)
+        .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+    let mut inner_plaintext = Zeroizing::new(Vec::with_capacity(inner_bytes));
+    inner_plaintext.extend_from_slice(plaintext);
+    inner_plaintext.extend_from_slice(&CHECKPOINT_STAGE_INNER_TRAILER_MAGIC);
+    inner_plaintext.extend_from_slice(&CHECKPOINT_STAGE_INNER_TRAILER_VERSION.to_le_bytes());
+    inner_plaintext.extend_from_slice(&[0; 4]);
+    inner_plaintext.extend_from_slice(&plaintext_digest);
+    if inner_plaintext.len() != inner_bytes {
+        return Err(GuardianCheckpointCipherError::ArithmeticOverflow);
+    }
+    Ok(inner_plaintext)
+}
+
 fn checkpoint_stage_expected_ciphertext_bytes(
     context: &GuardianCheckpointStageRecordContextV1,
     max_plaintext_bytes: u32,
@@ -1610,6 +1673,8 @@ fn checkpoint_stage_expected_ciphertext_bytes(
     }
     usize::try_from(context.plaintext_bytes)
         .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?
+        .checked_add(CHECKPOINT_STAGE_INNER_TRAILER_BYTES)
+        .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?
         .checked_add(CHECKPOINT_STAGE_AEAD_TAG_BYTES)
         .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)
 }
@@ -1629,13 +1694,6 @@ fn checkpoint_stage_record_aad(
     aad.extend_from_slice(&key_id);
     aad.extend_from_slice(&context.encode_canonical());
     aad
-}
-
-fn checkpoint_stage_contexts_match(
-    left: &GuardianCheckpointStageRecordContextV1,
-    right: &GuardianCheckpointStageRecordContextV1,
-) -> bool {
-    checkpoint_stage_bytes_match(&left.encode_canonical(), &right.encode_canonical())
 }
 
 fn checkpoint_stage_key_ids_match(
@@ -2378,6 +2436,10 @@ pub enum GuardianCheckpointBoundaryError {
     ClaimedCheckpointIdentityMismatch,
     #[error("Genesis checkpoint has no guardian output-record authority")]
     GenesisHasNoRecordAuthority,
+    #[error("record-backed checkpoint has no Genesis Spawn authority")]
+    RecordHasNoGenesisAuthority,
+    #[error("Genesis checkpoint does not match the expected Spawn effect")]
+    GenesisEffectIdentityMismatch,
     #[error("guardian checkpoint does not match the verified output record")]
     VerifiedOutputIdentityMismatch,
     #[error("guardian checkpoint terminal payload length mismatch")]
