@@ -2509,6 +2509,13 @@ mod tests {
             ),
             Err(GuardianScrollbackManifestError::AuthenticationFailed)
         ));
+        assert!(matches!(
+            cipher.verify_scrollback_manifest(
+                &authentication,
+                br#"{"schema":"frankenterm.live-scrollback.manifest.v3","revision":10}"#,
+            ),
+            Err(GuardianScrollbackManifestError::CanonicalByteLimit)
+        ));
         let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
             .expect("wrong-key fixture is structurally valid");
         assert!(matches!(

@@ -150,6 +150,7 @@ const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 =
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = 512;
 const GF_PRIM: u32 = 0x11d;
 
+
 /// An immutable, bounded view of one pane log at a stable filesystem identity.
 ///
 /// The snapshot excludes a final non-newline-terminated record because an

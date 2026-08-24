@@ -5,6 +5,7 @@
 //! guardian binds encoded bytes to `GuardianCheckpointBoundary` after capture.
 
 use super::*;
+use crate::color::{ColorAttribute, SrgbaTuple};
 use frankenterm_escape_parser::csi::KittyKeyboardFlags;
 use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};

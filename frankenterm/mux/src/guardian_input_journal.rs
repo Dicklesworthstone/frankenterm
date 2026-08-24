@@ -22,6 +22,7 @@ use crate::guardian_protocol::{
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use thiserror::Error;

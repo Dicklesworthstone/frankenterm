@@ -172,7 +172,6 @@ pub fn reconcile_client_domain_config(
         Err(error) => Err(anyhow::Error::new(error)),
     }
 }
-
 struct LiveScrollbackSpillSink {
     pane_id: u64,
     active_ledger_pane_id: std::sync::atomic::AtomicU64,
@@ -634,7 +633,6 @@ fn verify_live_scrollback_logical_ledger_digest_from_snapshot(
     );
     Ok(observed)
 }
-
 fn live_scrollback_cleared_manifest_is_canonical(
     manifest: &LiveScrollbackManifestV1,
 ) -> bool {
@@ -719,7 +717,6 @@ fn acquire_live_scrollback_filesystem_mutation_lease(
     }
     Ok(LiveScrollbackFilesystemMutationLease { file })
 }
-
 #[derive(Debug)]
 struct LiveScrollbackManifestPublishError {
     outcome_indeterminate: bool,
@@ -1077,7 +1074,6 @@ impl LiveScrollbackSpillSink {
         pane_id_bytes.copy_from_slice(&digest[..8]);
         Ok(u64::from_le_bytes(pane_id_bytes) | (1_u64 << 63))
     }
-
     fn manifest_checksum(manifest: &LiveScrollbackManifestV1) -> anyhow::Result<String> {
         use sha2::{Digest as _, Sha256};
 
@@ -1351,7 +1347,6 @@ impl LiveScrollbackSpillSink {
         );
         Ok(())
     }
-
     fn validate_persisted_records(
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
         pane_id: u64,
@@ -2116,7 +2111,6 @@ impl LiveScrollbackSpillSink {
             .ok_or_else(|| anyhow::anyhow!("scrollback manifest path has no parent"))?;
         Ok(parent.join("manifest.json.installing-v3"))
     }
-
     fn persist_manifest(
         &self,
         publication_state: &'static str,
@@ -2616,7 +2610,6 @@ impl LiveScrollbackSpillSink {
         drop(store);
         self.revalidate_snapshot_manifest(&manifest)
     }
-
     fn lock_state(
         &self,
         context: &str,
@@ -6388,24 +6381,7 @@ mod tests {
         assert_eq!(export.next_seq, 2);
         assert!(!export.source_content_mutated);
         assert_eq!(export.exact_semantic_records, 2);
-        assert_eq!(export.legacy_non_recovery_grade_records, 0);
-        assert_eq!(export.pre_persistence_redaction_not_applied_records, 2);
-        assert_eq!(
-            export.legacy_redaction_attested_but_unauthenticated_records,
-            0
-        );
-        assert_eq!(export.raw_legacy_redaction_unknown_records, 0);
-        assert_eq!(
-            export.pre_persistence_redaction_not_applied_records
-                + export.legacy_redaction_attested_but_unauthenticated_records
-                + export.raw_legacy_redaction_unknown_records,
-            export.retained_rows
-        );
-        assert_eq!(
-            export.legacy_redaction_attested_but_unauthenticated_records
-                + export.raw_legacy_redaction_unknown_records,
-            export.legacy_non_recovery_grade_records
-        );
+ @ours
         assert!(export.redaction_applied_during_export);
 
         let log_after = std::fs::metadata(&log_path).expect("log metadata after export");

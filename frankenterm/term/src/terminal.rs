@@ -734,7 +734,7 @@ impl Terminal {
     #[cfg(feature = "use_serde")]
     pub fn capture_recovery_checkpoint_at_external_parser_ground(
         &self,
-        ground: frankenterm_escape_parser::RecoveryGroundBoundary<'_>,
+        ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
         self.capture_recovery_checkpoint_at_stream_watermark(ground.stream_bytes(), limits)

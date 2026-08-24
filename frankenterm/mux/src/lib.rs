@@ -1928,7 +1928,6 @@ struct LiveParserAuthorizedDelivery {
     cursor: LiveParserGuardianCursor,
     payload: Arc<[u8]>,
 }
-
 impl LiveParserGuardianCursor {
     fn matches_receipt(
         self,
@@ -1995,6 +1994,7 @@ impl LiveParserCheckpointState {
         }
     }
 }
+
 
 struct LiveParserCheckpointControl {
     state: Mutex<LiveParserCheckpointState>,
@@ -2454,7 +2454,6 @@ impl LiveParserCheckpointControl {
         }
         self.delivery_gate.notify_all();
     }
-
     fn authorize_guardian_delivery(
         &self,
         durable_pane_id: uuid::Uuid,
@@ -2749,6 +2748,7 @@ impl LiveParserCheckpointControl {
                 "parser byte watermark exceeded counted socket delivery",
             ));
         }
+
     }
 
     fn ready_checkpoint_target(&self) -> Result<Option<u64>, LiveParserCheckpointError> {
@@ -2769,6 +2769,7 @@ impl LiveParserCheckpointControl {
         Ok((state.delivered_bytes == pending.target && state.parsed_bytes == pending.target)
             .then_some(pending.target))
     }
+
 
     fn reject_ready_checkpoint(&self, error: LiveParserCheckpointError) {
         {
