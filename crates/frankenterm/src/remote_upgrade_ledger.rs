@@ -404,6 +404,8 @@ pub(crate) struct DurableEffectPermit {
     authorization_sequence: u32,
     attempt: u8,
     authorization: RemoteUpgradeRecord,
+    transaction_device: u64,
+    transaction_inode: u64,
     artifact_transaction_id: String,
     kind: DurableEffectKind,
     allow_existing_artifact: bool,
@@ -440,6 +442,11 @@ impl DurableEffectPermit {
                 && self.claim_sha256 == ledger.claim_sha256
                 && self.authorization.claim == ledger.claim,
             "durable effect permit belongs to a different remote upgrade ledger claim"
+        );
+        anyhow::ensure!(
+            self.transaction_device == ledger.transaction_device
+                && self.transaction_inode == ledger.transaction_inode,
+            "durable effect permit belongs to a different pinned upgrade transaction"
         );
         let scan = ledger.scan_revalidated_authority()?;
         anyhow::ensure!(
@@ -501,6 +508,8 @@ pub(crate) struct RemoteUpgradeLedger<'root> {
     transaction: cap_std::fs::Dir,
     effective_uid: u32,
     device: u64,
+    transaction_device: u64,
+    transaction_inode: u64,
     claim: RemoteUpgradeClaim,
     claim_sha256: String,
     latest: Option<RemoteUpgradeRecord>,
@@ -554,12 +563,15 @@ impl<'root> RemoteUpgradeLedger<'root> {
             &claim,
             &claim_sha256,
         )?;
+        let transaction_metadata = transaction.dir_metadata()?;
         let ledger = Self {
             root,
             transactions,
             transaction,
             effective_uid,
             device: root_device,
+            transaction_device: transaction_metadata.dev(),
+            transaction_inode: transaction_metadata.ino(),
             claim,
             claim_sha256,
             latest: scan.latest,
@@ -906,6 +918,8 @@ impl<'root> RemoteUpgradeLedger<'root> {
             authorization_sequence: record.sequence,
             attempt: record.attempt,
             authorization: record.clone(),
+            transaction_device: self.transaction_device,
+            transaction_inode: self.transaction_inode,
             artifact_transaction_id,
             kind,
             allow_existing_artifact,
@@ -1889,6 +1903,50 @@ mod tests {
         assert!(wrong_claim_error
             .to_string()
             .contains("not a valid one-shot authorization"));
+
+        let mut wrong_artifact = ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared authorization for artifact-binding mutation");
+        wrong_artifact.artifact_transaction_id = "0".repeat(32);
+        let wrong_artifact_error = wrong_artifact
+            .consume_publication(&ledger)
+            .expect_err("permit with a substituted effect identity must fail");
+        assert!(wrong_artifact_error
+            .to_string()
+            .contains("artifact identity is not bound to its authorization"));
+    }
+
+    #[test]
+    fn effect_permit_rejects_a_different_root_with_an_identical_claim_and_record() {
+        let (_first_fixture, first_root, first_uid) = root_fixture();
+        let (_second_fixture, second_root, second_uid) = root_fixture();
+        let mut first = RemoteUpgradeLedger::open(&first_root, first_uid, claim('a'))
+            .expect("create first identical durable ledger");
+        let permit = first
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit first identical Prepared authorization");
+        let mut second = RemoteUpgradeLedger::open(&second_root, second_uid, claim('a'))
+            .expect("create second identical durable ledger");
+        let _second_permit = second
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit second identical Prepared authorization");
+        assert_eq!(
+            first.latest(),
+            second.latest(),
+            "the attack fixture requires byte-identical logical authority"
+        );
+        assert_ne!(
+            (first.transaction_device, first.transaction_inode),
+            (second.transaction_device, second.transaction_inode),
+            "independently pinned transaction directories need distinct identities"
+        );
+
+        let error = permit
+            .consume_publication(&second)
+            .expect_err("permit must not cross identical claims in different roots");
+        assert!(error
+            .to_string()
+            .contains("different pinned upgrade transaction"));
     }
 
     #[test]

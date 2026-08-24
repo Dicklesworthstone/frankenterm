@@ -82,19 +82,11 @@ const CHECKPOINT_STAGE_FILE_SUFFIX: &str = ".ftgcp";
 const CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES: usize = 336;
 const CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES: usize = 400;
 const CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES: u64 = 296;
-const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize =
-    GUARDIAN_MAX_CHECKPOINT_CHUNKS as usize + 2;
-const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = GUARDIAN_MAX_CHECKPOINT_BYTES
-    + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES * GUARDIAN_MAX_CHECKPOINT_CHUNKS as u64
-    + (CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES as u64
-        + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)
-    + (CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES as u64
-        + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES);
+const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize = 1_026;
+const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = 268_739_888;
 const CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS: usize = 8;
-const CHECKPOINT_STAGE_MAX_FILES: usize =
-    CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS * CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD;
-const CHECKPOINT_STAGE_MAX_BYTES: u64 =
-    CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS as u64 * CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD;
+const CHECKPOINT_STAGE_MAX_FILES: usize = 8_208;
+const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_919_104;
 const CHECKPOINT_STAGE_CANDIDATE_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-phase-a-candidate.v1\0";
 const CHECKPOINT_STAGE_CHUNK_DIGEST_DOMAIN: &[u8] =
@@ -119,6 +111,28 @@ impl GuardianCheckpointStagePolicy {
     }
 
     fn validate(self) -> Result<Self, GuardianOutputError> {
+        let protocol_files_per_upload = usize::try_from(GUARDIAN_MAX_CHECKPOINT_CHUNKS)
+            .ok()
+            .and_then(|chunks| chunks.checked_add(2))
+            .ok_or(GuardianOutputError::Allocation)?;
+        let protocol_bytes_per_upload = u64::from(GUARDIAN_MAX_CHECKPOINT_CHUNKS)
+            .checked_mul(CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)
+            .and_then(|overhead| overhead.checked_add(GUARDIAN_MAX_CHECKPOINT_BYTES))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                        .ok()?
+                        .checked_add(CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES)
+                        .ok()?
+                        .checked_add(CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)?,
+                )
+            })
+            .ok_or(GuardianOutputError::Allocation)?;
         let minimum_files = self
             .max_retained_uploads
             .checked_mul(CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD)
@@ -128,6 +142,8 @@ impl GuardianCheckpointStagePolicy {
             .and_then(|uploads| uploads.checked_mul(CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD))
             .ok_or(GuardianOutputError::Allocation)?;
         if self.max_retained_uploads == 0
+            || protocol_files_per_upload != CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD
+            || protocol_bytes_per_upload != CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD
             || self.max_retained_uploads > CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
             || self.max_stage_files < minimum_files
             || self.max_stage_files > CHECKPOINT_STAGE_MAX_FILES
@@ -4953,6 +4969,302 @@ mod tests {
         completion(pipeline)?
             .result
             .map_err(|_| "durable append failed".into())
+    }
+
+    fn checkpoint_test_terminal_digest(payload: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankenterm.guardian-checkpoint-terminal-payload.v1\0");
+        hasher.update(u64::try_from(payload.len()).expect("fixture length fits u64").to_le_bytes());
+        hasher.update(payload);
+        hasher.finalize().into()
+    }
+
+    fn checkpoint_test_genesis_request(
+        kind: GuardianCheckpointStageKindV1,
+        spawn_effect_id: Uuid,
+        upload_id: Uuid,
+        terminal_payload: &[u8],
+        chunk_bytes: u32,
+        chunk: Option<(u32, &[u8])>,
+    ) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError> {
+        if chunk_bytes == 0 {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let total_bytes = u64::try_from(terminal_payload.len())
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let total_chunks_u64 = total_bytes
+            .checked_add(u64::from(chunk_bytes).saturating_sub(1))
+            .ok_or(GuardianProtocolError::InvalidOperationPayload)?
+            / u64::from(chunk_bytes);
+        let total_chunks = u32::try_from(total_chunks_u64)
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let replay_identity = mux::guardian_checkpoint::current_replay_identity_digest();
+        let terminal_digest = checkpoint_test_terminal_digest(terminal_payload);
+        let mut boundary_hasher = Sha256::new();
+        boundary_hasher.update(
+            b"frankenterm.guardian-checkpoint-genesis-boundary-identity.v1\0",
+        );
+        boundary_hasher.update(spawn_effect_id.as_bytes());
+        let boundary_digest: [u8; 32] = boundary_hasher.finalize().into();
+        let mut checkpoint_hasher = Sha256::new();
+        checkpoint_hasher.update(
+            b"frankenterm.guardian-checkpoint-artifact-identity.v1\0",
+        );
+        checkpoint_hasher.update(boundary_digest);
+        checkpoint_hasher.update(0_u64.to_le_bytes());
+        checkpoint_hasher.update(replay_identity);
+        checkpoint_hasher.update(24_u32.to_le_bytes());
+        checkpoint_hasher.update(80_u32.to_le_bytes());
+        checkpoint_hasher.update(total_bytes.to_le_bytes());
+        checkpoint_hasher.update(terminal_digest);
+        let checkpoint_digest: [u8; 32] = checkpoint_hasher.finalize().into();
+
+        let mut wire = vec![0_u8; CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES];
+        wire[..4].copy_from_slice(b"GCS1");
+        wire[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        wire[6] = match kind {
+            GuardianCheckpointStageKindV1::Begin => 1,
+            GuardianCheckpointStageKindV1::Chunk => 2,
+            GuardianCheckpointStageKindV1::Seal => 3,
+        };
+        wire[8] = 2;
+        wire[16..32].copy_from_slice(spawn_effect_id.as_bytes());
+        wire[40..56].copy_from_slice(upload_id.as_bytes());
+        wire[56..88].copy_from_slice(&checkpoint_digest);
+        wire[88..120].copy_from_slice(&boundary_digest);
+        wire[120..128].copy_from_slice(&1_u64.to_be_bytes());
+        wire[128..160].copy_from_slice(&replay_identity);
+        wire[160..164].copy_from_slice(&24_u32.to_be_bytes());
+        wire[164..168].copy_from_slice(&80_u32.to_be_bytes());
+        wire[168..176].copy_from_slice(&total_bytes.to_be_bytes());
+        wire[176..208].copy_from_slice(&terminal_digest);
+        wire[224] = 1;
+        wire[232..248].copy_from_slice(spawn_effect_id.as_bytes());
+        wire[328..332].copy_from_slice(&chunk_bytes.to_be_bytes());
+        wire[332..336].copy_from_slice(&total_chunks.to_be_bytes());
+        match (kind, chunk) {
+            (GuardianCheckpointStageKindV1::Chunk, Some((index, bytes))) => {
+                let offset = u64::from(index)
+                    .checked_mul(u64::from(chunk_bytes))
+                    .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+                wire.extend_from_slice(&index.to_be_bytes());
+                wire.extend_from_slice(&offset.to_be_bytes());
+                wire.extend_from_slice(&<[u8; 32]>::from(Sha256::digest(bytes)));
+                wire.extend_from_slice(
+                    &u32::try_from(bytes.len())
+                        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?
+                        .to_be_bytes(),
+                );
+                wire.extend_from_slice(bytes);
+            }
+            (GuardianCheckpointStageKindV1::Begin | GuardianCheckpointStageKindV1::Seal, None) => {}
+            _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+        }
+        GuardianCheckpointStageRequestV1::decode(&wire)
+    }
+
+    #[test]
+    fn checkpoint_stage_name_grammar_is_canonical_raw_and_bounded() {
+        let pane_id = Uuid::from_u128(0x11);
+        let upload_id = Uuid::from_u128(0x22);
+        let publication_id = Uuid::from_u128(0x33);
+        let key = CheckpointStageUploadKey {
+            scope: CheckpointStagePathScope::Pane {
+                pane_id,
+                generation: 7,
+            },
+            upload_id,
+        };
+        let chunk_name = format!(
+            "{}.publication-{publication_id}.chunk-{:010}{CHECKPOINT_STAGE_FILE_SUFFIX}",
+            key.base_name(),
+            9,
+        );
+        assert_eq!(
+            checkpoint_parse_stage_name(chunk_name.as_bytes()).expect("parse canonical chunk"),
+            (
+                key,
+                CheckpointStageFileRole::Chunk {
+                    publication_id,
+                    index: 9,
+                },
+            )
+        );
+        assert_eq!(checkpoint_stage_longest_name_bytes(), 200);
+
+        let uppercase = chunk_name.replace(&pane_id.to_string(), &pane_id.to_string().to_uppercase());
+        assert!(matches!(
+            checkpoint_parse_stage_name(uppercase.as_bytes()),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        let short_generation = chunk_name.replace("generation-00000000000000000007", "generation-7");
+        assert!(matches!(
+            checkpoint_parse_stage_name(short_generation.as_bytes()),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        let excessive_index = chunk_name.replace("chunk-0000000009", "chunk-0000001024");
+        assert!(matches!(
+            checkpoint_parse_stage_name(excessive_index.as_bytes()),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        let mut invalid_utf8 = b"checkpoint-pane-".to_vec();
+        invalid_utf8.push(0xff);
+        assert!(matches!(
+            checkpoint_parse_stage_name(&invalid_utf8),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_stage_begin_chunk_retry_and_gap_are_durable_and_exact(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-stage-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let spawn_effect_id = Uuid::from_u128(0x41);
+        let upload_id = Uuid::from_u128(0x42);
+        let payload = b"durable-checkpoint-fragments";
+        let chunk_bytes = 8;
+        let chunk_bytes_usize = usize::try_from(chunk_bytes)?;
+        let begin = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            None,
+        )?;
+        assert_eq!(
+            store.apply_begin(&begin)?,
+            GuardianCheckpointStageReplyV1::Ready {
+                upload_id,
+                next_index: 0,
+                committed_bytes: 0,
+            }
+        );
+
+        let second = &payload[8..16];
+        let out_of_order = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Chunk,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            Some((1, second)),
+        )?;
+        assert!(matches!(
+            store.apply_chunk(out_of_order),
+            Err(GuardianCheckpointStageStoreError::OutOfOrder)
+        ));
+
+        for (index, bytes) in payload.chunks(chunk_bytes_usize).enumerate() {
+            let index = u32::try_from(index)?;
+            let chunk = checkpoint_test_genesis_request(
+                GuardianCheckpointStageKindV1::Chunk,
+                spawn_effect_id,
+                upload_id,
+                payload,
+                chunk_bytes,
+                Some((index, bytes)),
+            )?;
+            let expected_bytes = u64::from(index + 1)
+                .checked_mul(u64::from(chunk_bytes))
+                .ok_or("fixture progress overflow")?
+                .min(u64::try_from(payload.len())?);
+            assert_eq!(
+                store.apply_chunk(chunk)?,
+                GuardianCheckpointStageReplyV1::Progress {
+                    upload_id,
+                    next_index: index + 1,
+                    committed_bytes: expected_bytes,
+                }
+            );
+        }
+        let first_retry = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Chunk,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            Some((0, &payload[..8])),
+        )?;
+        assert_eq!(
+            store.apply_chunk(first_retry)?,
+            GuardianCheckpointStageReplyV1::Progress {
+                upload_id,
+                next_index: 1,
+                committed_bytes: 8,
+            }
+        );
+        let total_chunks = u32::try_from(payload.chunks(chunk_bytes_usize).count())?;
+        assert_eq!(
+            store.apply_begin(&begin)?,
+            GuardianCheckpointStageReplyV1::Ready {
+                upload_id,
+                next_index: total_chunks,
+                committed_bytes: u64::try_from(payload.len())?,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_stage_torn_candidate_poison_is_retained_but_fresh_upload_progresses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-cut-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let spawn_effect_id = Uuid::from_u128(0x51);
+        let upload_id = Uuid::from_u128(0x52);
+        let payload = b"crash-cut-checkpoint";
+        let begin = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            8,
+            None,
+        )?;
+        let shape = CheckpointStageRequestShape::from_request(&begin)?;
+        let torn_path = checkpoint_candidate_path(&store.inner, shape.key())?;
+        let mut torn = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &torn_path,
+        )?;
+        torn.write_all(b"FTGC")?;
+        torn.sync_all()?;
+        store.inner.directory.sync_all()?;
+        drop(torn);
+        assert!(matches!(
+            store.apply_begin(&begin),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        assert_eq!(std::fs::metadata(&torn_path)?.len(), 4);
+
+        let fresh_upload_id = Uuid::from_u128(0x53);
+        let fresh = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            fresh_upload_id,
+            payload,
+            8,
+            None,
+        )?;
+        assert_eq!(
+            store.apply_begin(&fresh)?,
+            GuardianCheckpointStageReplyV1::Ready {
+                upload_id: fresh_upload_id,
+                next_index: 0,
+                committed_bytes: 0,
+            }
+        );
+        assert_eq!(std::fs::metadata(&torn_path)?.len(), 4);
+        Ok(())
     }
 
     #[test]
