@@ -4347,7 +4347,9 @@ mod tests {
                 if Some(*stable_row) != expected {
                     return Err(crate::config::ScrollbackSpillError::SnapshotRangeMismatch);
                 }
-                expected = stable_row.checked_add(1);
+                expected = Some(stable_row.checked_add(1).ok_or(
+                    crate::config::ScrollbackSpillError::ArithmeticOverflow("stable_row_range"),
+                )?);
                 snapshot_rows.push(line.clone());
             }
             if expected.unwrap_or(expected_newest_exclusive) != expected_newest_exclusive {
