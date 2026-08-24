@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const MAGIC: &[u8; 8] = b"FTDDOM01";
-const SCHEMA_VERSION: u32 = 1;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const HEADER_BYTES: usize = 32;
 const ENTRY_BYTES: usize = 33;
 const DIGEST_BYTES: usize = 32;
@@ -33,12 +34,15 @@ const MAX_DOMAIN_INTENTS: usize = 4_096;
 const MAX_MANIFEST_BYTES: u64 =
     (HEADER_BYTES + MAX_DOMAIN_INTENTS * ENTRY_BYTES + DIGEST_BYTES) as u64;
 const FINGERPRINT_DOMAIN: &[u8] = b"frankenterm.gui.domain-reconnect-name.v1\0";
-const CHECKSUM_DOMAIN: &[u8] = b"frankenterm.gui.domain-reconnect-manifest.v1\0";
-const SLOT_NAMES: [&str; 2] = [
+const LEGACY_CHECKSUM_DOMAIN: &[u8] = b"frankenterm.gui.domain-reconnect-manifest.v1\0";
+const CHECKSUM_DOMAIN: &[u8] = b"frankenterm.gui.domain-reconnect-manifest.v2\0";
+const SLOT_NAMES: [&str; 3] = [
     "domain-reconnect-manifest.slot-0",
     "domain-reconnect-manifest.slot-1",
+    "domain-reconnect-manifest.slot-2",
 ];
 const LOCK_NAME: &str = "domain-reconnect-manifest.lock";
+const PRIVATE_AUTHORITY_DIRECTORY: &str = "frankenterm-domain-reconnect-private-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +85,10 @@ pub enum DomainReconnectManifestError {
     Invalid { reason: &'static str },
     #[error("domain reconnect manifest has two different states at generation {generation}")]
     AmbiguousGeneration { generation: u64 },
+    #[error("domain reconnect manifest has no authoritative two-replica quorum")]
+    NoQuorum,
+    #[error("domain reconnect manifest legacy authority is ambiguous")]
+    LegacyAmbiguous,
     #[error("domain reconnect manifest generation namespace is exhausted")]
     GenerationExhausted,
     #[error("domain reconnect manifest private-file contract failed: {reason}")]
@@ -137,13 +145,36 @@ impl DomainReconnectManifest {
 #[derive(Debug)]
 struct LoadedManifest {
     manifest: DomainReconnectManifest,
-    active_slot: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedManifest {
+    schema_version: u32,
+    manifest: DomainReconnectManifest,
+}
+
+enum V2Authority {
+    Quorum(DomainReconnectManifest),
+    Migration {
+        manifest: DomainReconnectManifest,
+        legacy_anchor: usize,
+    },
+}
+
+struct LegacySelection {
+    manifest: DomainReconnectManifest,
+    active_slot: usize,
+}
+
+enum LegacyAuthority {
+    Pristine,
+    Published(LegacySelection),
 }
 
 enum SlotRead {
     Missing,
     Empty,
-    Valid(DomainReconnectManifest),
+    Valid(DecodedManifest),
     Invalid(DomainReconnectManifestError),
 }
 
@@ -156,13 +187,21 @@ pub fn fingerprint_domain_name(domain_name: &str) -> [u8; 32] {
 }
 
 #[cfg(test)]
-fn manifest_paths(directory: &Path) -> [PathBuf; 2] {
-    [directory.join(SLOT_NAMES[0]), directory.join(SLOT_NAMES[1])]
+fn manifest_paths(directory: &Path) -> [PathBuf; 3] {
+    [
+        directory.join(SLOT_NAMES[0]),
+        directory.join(SLOT_NAMES[1]),
+        directory.join(SLOT_NAMES[2]),
+    ]
 }
 
 #[cfg(test)]
 fn lock_path(directory: &Path) -> PathBuf {
     directory.join(LOCK_NAME)
+}
+
+fn private_manifest_directory(data_directory: &Path) -> PathBuf {
+    data_directory.join(PRIVATE_AUTHORITY_DIRECTORY)
 }
 
 #[cfg(test)]
@@ -477,9 +516,21 @@ impl Drop for ManifestLease {
     }
 }
 
-fn encode_manifest(
+fn checksum_domain(
+    schema_version: u32,
+) -> Result<&'static [u8], DomainReconnectManifestError> {
+    match schema_version {
+        LEGACY_SCHEMA_VERSION => Ok(LEGACY_CHECKSUM_DOMAIN),
+        SCHEMA_VERSION => Ok(CHECKSUM_DOMAIN),
+        found => Err(DomainReconnectManifestError::UnsupportedVersion { found }),
+    }
+}
+
+fn encode_manifest_for_schema(
     manifest: &DomainReconnectManifest,
+    schema_version: u32,
 ) -> Result<Vec<u8>, DomainReconnectManifestError> {
+    let checksum_domain = checksum_domain(schema_version)?;
     if manifest.generation == 0 {
         return Err(DomainReconnectManifestError::Invalid {
             reason: "published generation is zero",
@@ -504,7 +555,7 @@ fn encode_manifest(
         })?;
     let mut encoded = Vec::with_capacity(capacity);
     encoded.extend_from_slice(MAGIC);
-    encoded.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&schema_version.to_le_bytes());
     encoded.extend_from_slice(&0_u32.to_le_bytes());
     encoded.extend_from_slice(&manifest.generation.to_le_bytes());
     encoded.extend_from_slice(&count.to_le_bytes());
@@ -519,13 +570,19 @@ fn encode_manifest(
         encoded.push(intent.encode());
     }
     let mut checksum = Sha256::new();
-    checksum.update(CHECKSUM_DOMAIN);
+    checksum.update(checksum_domain);
     checksum.update(&encoded);
     encoded.extend_from_slice(&checksum.finalize());
     Ok(encoded)
 }
 
-fn decode_manifest(bytes: &[u8]) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+fn encode_manifest(
+    manifest: &DomainReconnectManifest,
+) -> Result<Vec<u8>, DomainReconnectManifestError> {
+    encode_manifest_for_schema(manifest, SCHEMA_VERSION)
+}
+
+fn decode_manifest(bytes: &[u8]) -> Result<DecodedManifest, DomainReconnectManifestError> {
     let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if actual > MAX_MANIFEST_BYTES {
         return Err(DomainReconnectManifestError::Oversized {
@@ -544,9 +601,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<DomainReconnectManifest, DomainReconn
         });
     }
     let schema = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed schema slice"));
-    if schema != SCHEMA_VERSION {
-        return Err(DomainReconnectManifestError::UnsupportedVersion { found: schema });
-    }
+    let checksum_domain = checksum_domain(schema)?;
     if bytes[12..16] != [0; 4] || bytes[28..32] != [0; 4] {
         return Err(DomainReconnectManifestError::Invalid {
             reason: "reserved header bytes are nonzero",
@@ -585,7 +640,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<DomainReconnectManifest, DomainReconn
     }
     let payload_end = expected - DIGEST_BYTES;
     let mut checksum = Sha256::new();
-    checksum.update(CHECKSUM_DOMAIN);
+    checksum.update(checksum_domain);
     checksum.update(&bytes[..payload_end]);
     let expected_checksum: [u8; 32] = checksum.finalize().into();
     if expected_checksum[..] != bytes[payload_end..] {
@@ -611,9 +666,12 @@ fn decode_manifest(bytes: &[u8]) -> Result<DomainReconnectManifest, DomainReconn
         previous = Some(fingerprint);
         intents.insert(fingerprint, DomainAttachmentIntent::decode(entry[32])?);
     }
-    Ok(DomainReconnectManifest {
-        generation,
-        intents,
+    Ok(DecodedManifest {
+        schema_version: schema,
+        manifest: DomainReconnectManifest {
+            generation,
+            intents,
+        },
     })
 }
 
@@ -716,69 +774,263 @@ fn read_slot(
     })
 }
 
-fn select_manifest(
-    first: SlotRead,
-    second: SlotRead,
-) -> Result<LoadedManifest, DomainReconnectManifestError> {
-    match (first, second) {
-        (SlotRead::Valid(first), SlotRead::Valid(second)) => {
-            if first.generation > second.generation {
-                Ok(LoadedManifest {
-                    manifest: first,
-                    active_slot: Some(0),
-                })
-            } else if second.generation > first.generation {
-                Ok(LoadedManifest {
-                    manifest: second,
-                    active_slot: Some(1),
-                })
-            } else if first == second {
-                Ok(LoadedManifest {
-                    manifest: first,
-                    active_slot: Some(0),
-                })
-            } else {
-                Err(DomainReconnectManifestError::AmbiguousGeneration {
-                    generation: first.generation,
-                })
-            }
-        }
-        (SlotRead::Valid(manifest), _) => Ok(LoadedManifest {
-            manifest,
-            active_slot: Some(0),
-        }),
-        (_, SlotRead::Valid(manifest)) => Ok(LoadedManifest {
-            manifest,
-            active_slot: Some(1),
-        }),
-        (SlotRead::Invalid(error), _) | (_, SlotRead::Invalid(error)) => Err(error),
-        (SlotRead::Missing | SlotRead::Empty, SlotRead::Missing | SlotRead::Empty) => {
-            Ok(LoadedManifest {
-                manifest: DomainReconnectManifest::default(),
-                active_slot: None,
-            })
-        }
+fn valid_record(slot: &SlotRead) -> Option<&DecodedManifest> {
+    match slot {
+        SlotRead::Valid(record) => Some(record),
+        SlotRead::Missing | SlotRead::Empty | SlotRead::Invalid(_) => None,
     }
 }
 
+fn slot_matches_v2(slot: &SlotRead, manifest: &DomainReconnectManifest) -> bool {
+    matches!(
+        slot,
+        SlotRead::Valid(record)
+            if record.schema_version == SCHEMA_VERSION && record.manifest == *manifest
+    )
+}
+
+fn select_v2_authority(
+    slots: &[SlotRead; 3],
+) -> Result<Option<V2Authority>, DomainReconnectManifestError> {
+    let v2_count = slots
+        .iter()
+        .filter_map(valid_record)
+        .filter(|record| record.schema_version == SCHEMA_VERSION)
+        .count();
+    if v2_count == 0 {
+        return Ok(None);
+    }
+
+    // A completed v2 state is identified by content, never merely by the
+    // numerically greatest surviving generation.  This is what makes a torn
+    // second publication fail closed instead of reviving either side.
+    for candidate in slots
+        .iter()
+        .filter_map(valid_record)
+        .filter(|record| record.schema_version == SCHEMA_VERSION)
+    {
+        let replicas = slots
+            .iter()
+            .filter_map(valid_record)
+            .filter(|record| {
+                record.schema_version == SCHEMA_VERSION
+                    && record.manifest == candidate.manifest
+            })
+            .count();
+        if replicas >= 2 {
+            return Ok(Some(V2Authority::Quorum(candidate.manifest.clone())));
+        }
+    }
+
+    // The sole singleton exception is the first migration publication.  It is
+    // authoritative only together with an exact schema-v1 content replica,
+    // and only while no valid record contains a newer or divergent peer state.
+    if v2_count == 1 {
+        let candidate = slots
+            .iter()
+            .filter_map(valid_record)
+            .find(|record| record.schema_version == SCHEMA_VERSION)
+            .expect("a v2 record was counted");
+        let legacy_anchor = slots.iter().enumerate().find_map(|(index, slot)| {
+            let record = valid_record(slot)?;
+            (record.schema_version == LEGACY_SCHEMA_VERSION
+                && record.manifest == candidate.manifest)
+                .then_some(index)
+        });
+        let is_newest_unambiguous_state = slots.iter().filter_map(valid_record).all(|record| {
+            record.manifest.generation < candidate.manifest.generation
+                || record.manifest == candidate.manifest
+        });
+        if let Some(legacy_anchor) = legacy_anchor.filter(|_| is_newest_unambiguous_state) {
+            return Ok(Some(V2Authority::Migration {
+                manifest: candidate.manifest.clone(),
+                legacy_anchor,
+            }));
+        }
+    }
+
+    Err(DomainReconnectManifestError::NoQuorum)
+}
+
+fn select_legacy_authority(
+    slots: [SlotRead; 3],
+) -> Result<LegacyAuthority, DomainReconnectManifestError> {
+    let [first, second, third] = slots;
+    let third_is_missing = match third {
+        SlotRead::Missing => true,
+        SlotRead::Empty | SlotRead::Invalid(DomainReconnectManifestError::Invalid { .. }) => {
+            false
+        }
+        SlotRead::Invalid(error) => return Err(error),
+        SlotRead::Valid(_) => return Err(DomainReconnectManifestError::LegacyAmbiguous),
+    };
+
+    match (first, second) {
+        (SlotRead::Valid(first), SlotRead::Valid(second)) => {
+            if first.schema_version != LEGACY_SCHEMA_VERSION
+                || second.schema_version != LEGACY_SCHEMA_VERSION
+            {
+                return Err(DomainReconnectManifestError::LegacyAmbiguous);
+            }
+            if first.manifest.generation > second.manifest.generation {
+                Ok(LegacyAuthority::Published(LegacySelection {
+                    manifest: first.manifest,
+                    active_slot: 0,
+                }))
+            } else if second.manifest.generation > first.manifest.generation {
+                Ok(LegacyAuthority::Published(LegacySelection {
+                    manifest: second.manifest,
+                    active_slot: 1,
+                }))
+            } else if first.manifest == second.manifest {
+                Ok(LegacyAuthority::Published(LegacySelection {
+                    manifest: first.manifest,
+                    active_slot: 0,
+                }))
+            } else {
+                Err(DomainReconnectManifestError::AmbiguousGeneration {
+                    generation: first.manifest.generation,
+                })
+            }
+        }
+        (SlotRead::Valid(first), SlotRead::Missing)
+            if first.schema_version == LEGACY_SCHEMA_VERSION
+                && first.manifest.generation == 1 =>
+        {
+            Ok(LegacyAuthority::Published(LegacySelection {
+                manifest: first.manifest,
+                active_slot: 0,
+            }))
+        }
+        (SlotRead::Invalid(error), _) | (_, SlotRead::Invalid(error)) => Err(error),
+        (SlotRead::Missing, SlotRead::Missing) if third_is_missing => {
+            Ok(LegacyAuthority::Pristine)
+        }
+        (
+            SlotRead::Missing | SlotRead::Empty | SlotRead::Valid(_),
+            SlotRead::Missing | SlotRead::Empty | SlotRead::Valid(_),
+        ) => Err(DomainReconnectManifestError::LegacyAmbiguous),
+    }
+}
+
+fn verify_fully_replicated(
+    directory: &CapDir,
+    manifest: &DomainReconnectManifest,
+) -> Result<(), DomainReconnectManifestError> {
+    for name in SLOT_NAMES {
+        match read_slot(directory, OsStr::new(name))? {
+            slot if slot_matches_v2(&slot, manifest) => {}
+            SlotRead::Invalid(error) => return Err(error),
+            SlotRead::Missing | SlotRead::Empty | SlotRead::Valid(_) => {
+                return Err(DomainReconnectManifestError::NoQuorum);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn repair_from_v2_quorum(
+    directory: &CapDir,
+    slots: &[SlotRead; 3],
+    manifest: &DomainReconnectManifest,
+) -> Result<(), DomainReconnectManifestError> {
+    for (index, slot) in slots.iter().enumerate() {
+        if !slot_matches_v2(slot, manifest) {
+            write_slot(directory, OsStr::new(SLOT_NAMES[index]), manifest)?;
+        }
+    }
+    verify_fully_replicated(directory, manifest)
+}
+
+fn complete_cross_schema_migration(
+    directory: &CapDir,
+    slots: &[SlotRead; 3],
+    manifest: &DomainReconnectManifest,
+    legacy_anchor: usize,
+) -> Result<(), DomainReconnectManifestError> {
+    for (index, slot) in slots.iter().enumerate() {
+        if index != legacy_anchor && !slot_matches_v2(slot, manifest) {
+            write_slot(directory, OsStr::new(SLOT_NAMES[index]), manifest)?;
+        }
+    }
+    write_slot(
+        directory,
+        OsStr::new(SLOT_NAMES[legacy_anchor]),
+        manifest,
+    )?;
+    verify_fully_replicated(directory, manifest)
+}
+
+fn migrate_legacy_authority(
+    directory: &CapDir,
+    selection: &LegacySelection,
+) -> Result<(), DomainReconnectManifestError> {
+    let stale_slot = match selection.active_slot {
+        0 => 1,
+        1 => 0,
+        _ => unreachable!("legacy authority has exactly two slots"),
+    };
+    // Slot 2 creates the cross-schema content quorum.  Converting the stale
+    // legacy slot next creates a native v2 quorum before the active legacy
+    // replica is touched.
+    for index in [2, stale_slot, selection.active_slot] {
+        write_slot(
+            directory,
+            OsStr::new(SLOT_NAMES[index]),
+            &selection.manifest,
+        )?;
+    }
+    verify_fully_replicated(directory, &selection.manifest)
+}
+
 fn load_locked(directory: &CapDir) -> Result<LoadedManifest, DomainReconnectManifestError> {
-    select_manifest(
+    let slots = [
         read_slot(directory, OsStr::new(SLOT_NAMES[0]))?,
         read_slot(directory, OsStr::new(SLOT_NAMES[1]))?,
-    )
+        read_slot(directory, OsStr::new(SLOT_NAMES[2]))?,
+    ];
+    match select_v2_authority(&slots)? {
+        Some(V2Authority::Quorum(manifest)) => {
+            repair_from_v2_quorum(directory, &slots, &manifest)?;
+            Ok(LoadedManifest { manifest })
+        }
+        Some(V2Authority::Migration {
+            manifest,
+            legacy_anchor,
+        }) => {
+            complete_cross_schema_migration(
+                directory,
+                &slots,
+                &manifest,
+                legacy_anchor,
+            )?;
+            Ok(LoadedManifest { manifest })
+        }
+        None => match select_legacy_authority(slots)? {
+            LegacyAuthority::Pristine => Ok(LoadedManifest {
+                manifest: DomainReconnectManifest::default(),
+            }),
+            LegacyAuthority::Published(selection) => {
+                migrate_legacy_authority(directory, &selection)?;
+                Ok(LoadedManifest {
+                    manifest: selection.manifest,
+                })
+            }
+        },
+    }
 }
 
 pub fn load_from(
     directory: &Path,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
-    let lease = ManifestLease::acquire(directory, false)?;
+    let lease = ManifestLease::acquire(directory, true)?;
     let loaded = load_locked(&lease.directory)?;
     lease.validate()?;
     Ok(loaded.manifest)
 }
 
 pub fn load() -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
-    load_from(config::DATA_DIR.as_path())
+    load_from(&private_manifest_directory(config::DATA_DIR.as_path()))
 }
 
 fn write_slot(
@@ -848,7 +1100,8 @@ fn write_slot(
         .take(MAX_MANIFEST_BYTES.saturating_add(1))
         .read_to_end(&mut persisted)
         .map_err(|error| DomainReconnectManifestError::io("verify authority slot", error))?;
-    if decode_manifest(&persisted)? != *manifest {
+    let persisted = decode_manifest(&persisted)?;
+    if persisted.schema_version != SCHEMA_VERSION || persisted.manifest != *manifest {
         return Err(DomainReconnectManifestError::Invalid {
             reason: "persisted authority does not match the intended generation",
         });
@@ -888,16 +1141,10 @@ pub fn set_intent_at(
         .checked_add(1)
         .ok_or(DomainReconnectManifestError::GenerationExhausted)?;
     next.intents.insert(fingerprint, intent);
-    let target_slot = match loaded.active_slot {
-        Some(0) => 1,
-        Some(1) | None => 0,
-        Some(_) => unreachable!("manifest has exactly two slots"),
-    };
-    write_slot(
-        &lease.directory,
-        OsStr::new(SLOT_NAMES[target_slot]),
-        &next,
-    )?;
+    for name in SLOT_NAMES {
+        write_slot(&lease.directory, OsStr::new(name), &next)?;
+    }
+    verify_fully_replicated(&lease.directory, &next)?;
     lease.validate()?;
     Ok(next)
 }
@@ -906,7 +1153,11 @@ pub fn set_intent(
     domain_name: &str,
     intent: DomainAttachmentIntent,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
-    set_intent_at(config::DATA_DIR.as_path(), domain_name, intent)
+    set_intent_at(
+        &private_manifest_directory(config::DATA_DIR.as_path()),
+        domain_name,
+        intent,
+    )
 }
 
 #[cfg(test)]
@@ -916,15 +1167,70 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
-    fn attached_manifest(name: &str) -> DomainReconnectManifest {
-        let mut intents = BTreeMap::new();
-        intents.insert(
-            fingerprint_domain_name(name),
-            DomainAttachmentIntent::Attached,
+    #[test]
+    fn production_authority_uses_a_dedicated_private_leaf() {
+        let data_directory = Path::new("legacy-data-root");
+        assert_eq!(
+            private_manifest_directory(data_directory),
+            data_directory.join(PRIVATE_AUTHORITY_DIRECTORY)
         );
+    }
+
+    fn manifest_with_intent(
+        name: &str,
+        intent: DomainAttachmentIntent,
+        generation: u64,
+    ) -> DomainReconnectManifest {
+        let mut intents = BTreeMap::new();
+        intents.insert(fingerprint_domain_name(name), intent);
         DomainReconnectManifest {
-            generation: 1,
+            generation,
             intents,
+        }
+    }
+
+    fn attached_manifest(name: &str) -> DomainReconnectManifest {
+        manifest_with_intent(name, DomainAttachmentIntent::Attached, 1)
+    }
+
+    fn detached_manifest(name: &str) -> DomainReconnectManifest {
+        manifest_with_intent(name, DomainAttachmentIntent::Detached, 2)
+    }
+
+    fn write_fixture(
+        directory: &Path,
+        slot: usize,
+        manifest: &DomainReconnectManifest,
+        schema_version: u32,
+    ) {
+        let paths = manifest_paths(directory);
+        let mut file = private_open_options()
+            .open(&paths[slot])
+            .expect("create private authority fixture");
+        file.set_len(0).expect("truncate authority fixture");
+        file.write_all(
+            &encode_manifest_for_schema(manifest, schema_version).expect("encode fixture"),
+        )
+        .expect("write authority fixture");
+        file.sync_all().expect("sync authority fixture");
+    }
+
+    fn write_corrupt_fixture(directory: &Path, slot: usize) {
+        let paths = manifest_paths(directory);
+        let mut file = private_open_options()
+            .open(&paths[slot])
+            .expect("create corrupt authority fixture");
+        file.set_len(0).expect("truncate corrupt fixture");
+        file.write_all(b"torn").expect("write corrupt fixture");
+        file.sync_all().expect("sync corrupt fixture");
+    }
+
+    fn assert_fully_replicated_v2(directory: &Path, manifest: &DomainReconnectManifest) {
+        for path in manifest_paths(directory) {
+            let bytes = std::fs::read(path).expect("read replicated fixture");
+            let decoded = decode_manifest(&bytes).expect("decode replicated fixture");
+            assert_eq!(decoded.schema_version, SCHEMA_VERSION);
+            assert_eq!(decoded.manifest, *manifest);
         }
     }
 
@@ -932,7 +1238,15 @@ mod tests {
     fn codec_is_canonical_bounded_and_checksum_protected() {
         let manifest = attached_manifest("trj");
         let encoded = encode_manifest(&manifest).expect("encode manifest");
-        assert_eq!(decode_manifest(&encoded).expect("decode manifest"), manifest);
+        let decoded = decode_manifest(&encoded).expect("decode manifest");
+        assert_eq!(decoded.schema_version, SCHEMA_VERSION);
+        assert_eq!(decoded.manifest, manifest);
+
+        let legacy = encode_manifest_for_schema(&manifest, LEGACY_SCHEMA_VERSION)
+            .expect("encode legacy fixture");
+        let decoded_legacy = decode_manifest(&legacy).expect("decode legacy fixture");
+        assert_eq!(decoded_legacy.schema_version, LEGACY_SCHEMA_VERSION);
+        assert_eq!(decoded_legacy.manifest, manifest);
 
         let mut corrupt = encoded;
         corrupt[HEADER_BYTES] ^= 1;
@@ -944,10 +1258,10 @@ mod tests {
         ));
 
         let mut unsupported = encode_manifest(&manifest).expect("encode unsupported fixture");
-        unsupported[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        unsupported[8..12].copy_from_slice(&3_u32.to_le_bytes());
         assert!(matches!(
             decode_manifest(&unsupported),
-            Err(DomainReconnectManifestError::UnsupportedVersion { found: 2 })
+            Err(DomainReconnectManifestError::UnsupportedVersion { found: 3 })
         ));
 
         let oversized = vec![0_u8; usize::try_from(MAX_MANIFEST_BYTES).expect("bound fits") + 1];
@@ -982,25 +1296,286 @@ mod tests {
         let detached = load_from(temp.path()).expect("reload detached");
         assert!(!detached.should_connect("trj", true));
         assert_eq!(detached.generation(), 2);
+        assert_fully_replicated_v2(temp.path(), &detached);
     }
 
     #[test]
-    fn torn_inactive_slot_preserves_last_committed_generation() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let first = set_intent_at(
-            temp.path(),
-            "trj",
-            DomainAttachmentIntent::Attached,
-        )
-        .expect("persist first generation");
-        let paths = manifest_paths(temp.path());
-        let mut inactive = private_open_options()
-            .open(&paths[1])
-            .expect("open inactive slot");
-        inactive.write_all(b"torn").expect("write torn slot");
-        inactive.sync_all().expect("sync torn slot");
+    fn v2_crash_cuts_select_only_an_exact_quorum() {
+        #[derive(Clone, Copy)]
+        enum Fixture<'a> {
+            Manifest(&'a DomainReconnectManifest),
+            Torn,
+        }
 
-        assert_eq!(load_from(temp.path()).expect("recover prior slot"), first);
+        enum Expected<'a> {
+            Manifest(&'a DomainReconnectManifest),
+            NoQuorum,
+        }
+
+        let attached = attached_manifest("trj");
+        let detached = detached_manifest("trj");
+        let cuts = [
+            (
+                [
+                    Fixture::Torn,
+                    Fixture::Manifest(&attached),
+                    Fixture::Manifest(&attached),
+                ],
+                Expected::Manifest(&attached),
+            ),
+            (
+                [
+                    Fixture::Manifest(&detached),
+                    Fixture::Manifest(&attached),
+                    Fixture::Manifest(&attached),
+                ],
+                Expected::Manifest(&attached),
+            ),
+            (
+                [
+                    Fixture::Manifest(&detached),
+                    Fixture::Torn,
+                    Fixture::Manifest(&attached),
+                ],
+                Expected::NoQuorum,
+            ),
+            (
+                [
+                    Fixture::Manifest(&detached),
+                    Fixture::Manifest(&detached),
+                    Fixture::Manifest(&attached),
+                ],
+                Expected::Manifest(&detached),
+            ),
+            (
+                [
+                    Fixture::Manifest(&detached),
+                    Fixture::Manifest(&detached),
+                    Fixture::Torn,
+                ],
+                Expected::Manifest(&detached),
+            ),
+            (
+                [
+                    Fixture::Manifest(&detached),
+                    Fixture::Manifest(&detached),
+                    Fixture::Manifest(&detached),
+                ],
+                Expected::Manifest(&detached),
+            ),
+        ];
+
+        for (fixtures, expected) in cuts {
+            let temp = tempfile::tempdir().expect("temporary crash-cut directory");
+            for (slot, fixture) in fixtures.into_iter().enumerate() {
+                match fixture {
+                    Fixture::Manifest(manifest) => {
+                        write_fixture(temp.path(), slot, manifest, SCHEMA_VERSION);
+                    }
+                    Fixture::Torn => write_corrupt_fixture(temp.path(), slot),
+                }
+            }
+            match expected {
+                Expected::Manifest(manifest) => {
+                    assert_eq!(load_from(temp.path()).expect("load quorum"), *manifest);
+                    assert_fully_replicated_v2(temp.path(), manifest);
+                }
+                Expected::NoQuorum => assert!(matches!(
+                    load_from(temp.path()),
+                    Err(DomainReconnectManifestError::NoQuorum)
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn a_committed_detach_survives_corruption_of_each_single_replica() {
+        let detached = detached_manifest("trj");
+        for corrupt_slot in 0..SLOT_NAMES.len() {
+            let temp = tempfile::tempdir().expect("temporary corruption directory");
+            for slot in 0..SLOT_NAMES.len() {
+                write_fixture(temp.path(), slot, &detached, SCHEMA_VERSION);
+            }
+            write_corrupt_fixture(temp.path(), corrupt_slot);
+
+            let loaded = load_from(temp.path()).expect("recover detached quorum");
+            assert_eq!(loaded, detached);
+            assert!(!loaded.should_connect("trj", true));
+            assert_fully_replicated_v2(temp.path(), &detached);
+        }
+    }
+
+    #[test]
+    fn losing_one_new_detach_replica_never_resolves_to_an_older_attach() {
+        let attached = attached_manifest("trj");
+        let detached = detached_manifest("trj");
+        for corrupt_slot in 0..2 {
+            let temp = tempfile::tempdir().expect("temporary rollback directory");
+            write_fixture(temp.path(), 0, &detached, SCHEMA_VERSION);
+            write_fixture(temp.path(), 1, &detached, SCHEMA_VERSION);
+            write_fixture(temp.path(), 2, &attached, SCHEMA_VERSION);
+            write_corrupt_fixture(temp.path(), corrupt_slot);
+
+            assert!(matches!(
+                load_from(temp.path()),
+                Err(DomainReconnectManifestError::NoQuorum)
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_authority_migrates_in_place_and_resumes_each_safe_cut() {
+        let attached = attached_manifest("trj");
+        let detached = detached_manifest("trj");
+
+        let first_publication =
+            tempfile::tempdir().expect("first-publication migration directory");
+        write_fixture(
+            first_publication.path(),
+            0,
+            &attached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        assert_eq!(
+            load_from(first_publication.path()).expect("migrate canonical legacy singleton"),
+            attached
+        );
+        assert_fully_replicated_v2(first_publication.path(), &attached);
+
+        let ordinary = tempfile::tempdir().expect("ordinary migration directory");
+        write_fixture(
+            ordinary.path(),
+            0,
+            &attached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_fixture(
+            ordinary.path(),
+            1,
+            &detached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        assert_eq!(
+            load_from(ordinary.path()).expect("migrate legacy authority"),
+            detached
+        );
+        assert_fully_replicated_v2(ordinary.path(), &detached);
+
+        let torn_third = tempfile::tempdir().expect("third-slot-cut migration directory");
+        write_fixture(
+            torn_third.path(),
+            0,
+            &attached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_fixture(
+            torn_third.path(),
+            1,
+            &detached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_corrupt_fixture(torn_third.path(), 2);
+        assert_eq!(
+            load_from(torn_third.path()).expect("resume torn third-slot publication"),
+            detached
+        );
+        assert_fully_replicated_v2(torn_third.path(), &detached);
+
+        let after_first = tempfile::tempdir().expect("first-cut migration directory");
+        write_fixture(
+            after_first.path(),
+            0,
+            &attached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_fixture(
+            after_first.path(),
+            1,
+            &detached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_fixture(after_first.path(), 2, &detached, SCHEMA_VERSION);
+        assert_eq!(
+            load_from(after_first.path()).expect("resume after first migration publication"),
+            detached
+        );
+        assert_fully_replicated_v2(after_first.path(), &detached);
+
+        let torn_stale = tempfile::tempdir().expect("stale-cut migration directory");
+        write_corrupt_fixture(torn_stale.path(), 0);
+        write_fixture(
+            torn_stale.path(),
+            1,
+            &detached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_fixture(torn_stale.path(), 2, &detached, SCHEMA_VERSION);
+        assert_eq!(
+            load_from(torn_stale.path()).expect("resume torn stale migration publication"),
+            detached
+        );
+        assert_fully_replicated_v2(torn_stale.path(), &detached);
+
+        let after_stale = tempfile::tempdir().expect("post-stale migration directory");
+        write_fixture(after_stale.path(), 0, &detached, SCHEMA_VERSION);
+        write_fixture(
+            after_stale.path(),
+            1,
+            &detached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_fixture(after_stale.path(), 2, &detached, SCHEMA_VERSION);
+        assert_eq!(
+            load_from(after_stale.path()).expect("resume after stale-slot publication"),
+            detached
+        );
+        assert_fully_replicated_v2(after_stale.path(), &detached);
+    }
+
+    #[test]
+    fn ambiguous_legacy_singleton_fails_closed_without_repair() {
+        let temp = tempfile::tempdir().expect("temporary legacy ambiguity directory");
+        let attached = attached_manifest("trj");
+        write_fixture(
+            temp.path(),
+            0,
+            &attached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_corrupt_fixture(temp.path(), 1);
+
+        assert!(matches!(
+            load_from(temp.path()),
+            Err(DomainReconnectManifestError::Invalid {
+                reason: "manifest is truncated"
+            })
+        ));
+        assert!(!manifest_paths(temp.path())[2].exists());
+    }
+
+    #[test]
+    fn a_v2_singleton_never_falls_back_to_an_older_legacy_generation() {
+        let temp = tempfile::tempdir().expect("temporary mixed-schema directory");
+        let attached = attached_manifest("trj");
+        let detached = detached_manifest("trj");
+        write_fixture(
+            temp.path(),
+            0,
+            &attached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_fixture(
+            temp.path(),
+            1,
+            &attached,
+            LEGACY_SCHEMA_VERSION,
+        );
+        write_fixture(temp.path(), 2, &detached, SCHEMA_VERSION);
+
+        assert!(matches!(
+            load_from(temp.path()),
+            Err(DomainReconnectManifestError::NoQuorum)
+        ));
     }
 
     #[test]
@@ -1012,17 +1587,8 @@ mod tests {
             fingerprint_domain_name("trj"),
             DomainAttachmentIntent::Detached,
         );
-        for (path, manifest) in manifest_paths(temp.path())
-            .into_iter()
-            .zip([attached, detached])
-        {
-            let mut file = private_open_options()
-                .open(path)
-                .expect("create private authority slot");
-            file.write_all(&encode_manifest(&manifest).expect("encode fixture"))
-                .expect("write authority fixture");
-            file.sync_all().expect("sync authority fixture");
-        }
+        write_fixture(temp.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
+        write_fixture(temp.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
 
         assert!(matches!(
             load_from(temp.path()),

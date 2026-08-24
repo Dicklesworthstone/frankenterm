@@ -6,13 +6,14 @@
 //! handles when the last authenticated connection for a mux incarnation goes
 //! away. Raw PTY output is encrypted and synchronized by a fixed bounded worker
 //! pool before the readiness loop records a content-free durable receipt or
-//! rearms that pane. Durable input, output delivery/replay, checkpoint
-//! publication, guardian crash recovery, and automated mux migration are
-//! intentionally rejected until their remaining durable mechanisms are
-//! integrated. The service can be stopped through an authenticated guarded
-//! transaction only while it owns no panes; a successful stop deliberately
-//! retains the socket path, so restart remains fail-closed until an explicit
-//! non-overwriting retirement design lands.
+//! rearms that pane. Input is admitted through a per-pane encrypted WAL and an
+//! exact one-shot PTY-write permit; ambiguous acceptance is never replayed.
+//! Output delivery/replay, checkpoint publication, guardian crash recovery,
+//! and automated mux migration remain intentionally rejected until their
+//! durable mechanisms are integrated. The service can be stopped through an
+//! authenticated guarded transaction only while it owns no panes; a successful
+//! stop deliberately retains the socket path, so restart remains fail-closed
+//! until an explicit non-overwriting retirement design lands.
 
 #[cfg(unix)]
 mod output;

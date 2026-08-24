@@ -20,8 +20,12 @@ pub enum DomainLifecycleEvent {
 }
 
 pub type DomainLifecycleFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
-pub type DomainLifecycleRecorder =
-    Arc<dyn Fn(String, DomainLifecycleEvent) -> DomainLifecycleFuture + Send + Sync + 'static>;
+pub type DomainLifecycleRecorder = Arc<
+    dyn Fn(String, DomainLifecycleEvent, DomainLifecycleWorkerHold) -> DomainLifecycleFuture
+        + Send
+        + Sync
+        + 'static,
+>;
 
 static DOMAIN_LIFECYCLE_RECORDER: OnceLock<DomainLifecycleRecorder> = OnceLock::new();
 
@@ -56,6 +60,18 @@ pub struct DomainLifecycleReservation {
 /// Entered exact per-domain lifecycle authority.
 #[must_use = "the lifecycle guard must span persistence, mutation, and handoff"]
 pub struct DomainLifecycleGuard {
+    entry: Arc<EnteredDomainLifecycle>,
+}
+
+/// A cancellation-safe hold transferred to an uncancellable persistence
+/// worker. The per-domain lane advances only after both the foreground guard
+/// and every admitted worker hold have been dropped.
+#[must_use = "a lifecycle worker hold must remain owned by its admitted worker"]
+pub struct DomainLifecycleWorkerHold {
+    _entry: Arc<EnteredDomainLifecycle>,
+}
+
+struct EnteredDomainLifecycle {
     domain_name: String,
     ticket: u64,
     release_required: bool,
@@ -128,9 +144,11 @@ impl DomainLifecycleReservation {
             anyhow::anyhow!("domain lifecycle readiness authority was lost before entry")
         })?;
         let guard = DomainLifecycleGuard {
-            domain_name: self.domain_name.clone(),
-            ticket: self.ticket,
-            release_required: self.release_required,
+            entry: Arc::new(EnteredDomainLifecycle {
+                domain_name: self.domain_name.clone(),
+                ticket: self.ticket,
+                release_required: self.release_required,
+            }),
         };
         self.release_required = false;
         Ok(guard)
@@ -147,13 +165,23 @@ impl Drop for DomainLifecycleReservation {
     }
 }
 
-impl Drop for DomainLifecycleGuard {
+impl Drop for EnteredDomainLifecycle {
     fn drop(&mut self) {
         finish_domain_lifecycle(
             &self.domain_name,
             self.ticket,
             &mut self.release_required,
         );
+    }
+}
+
+impl DomainLifecycleGuard {
+    /// Retain this exact lifecycle ticket across an uncancellable worker.
+    #[must_use]
+    pub fn worker_hold(&self) -> DomainLifecycleWorkerHold {
+        DomainLifecycleWorkerHold {
+            _entry: Arc::clone(&self.entry),
+        }
     }
 }
 
@@ -217,9 +245,10 @@ pub fn install_domain_lifecycle_recorder(recorder: DomainLifecycleRecorder) {
 async fn record_domain_lifecycle(
     domain_name: String,
     event: DomainLifecycleEvent,
+    lifecycle: &DomainLifecycleGuard,
 ) -> anyhow::Result<()> {
     if let Some(recorder) = DOMAIN_LIFECYCLE_RECORDER.get() {
-        recorder(domain_name, event).await?;
+        recorder(domain_name, event, lifecycle.worker_hold()).await?;
     }
     Ok(())
 }
@@ -279,21 +308,23 @@ impl UserData for MuxDomain {
                     promise::spawn::MainThreadServiceClass::Topology,
                     "attach domain",
                     || async move {
-                        let _lifecycle = reserve_domain_lifecycle(domain_name.clone())
+                        let lifecycle = reserve_domain_lifecycle(domain_name.clone())
                             .map_err(mlua::Error::external)?
                             .enter()
                             .await
                             .map_err(mlua::Error::external)?;
                         let detachable = domain.detachable();
+                        let attach_result = domain.attach(&mux, owner_client_id, window_id).await;
                         if detachable {
                             record_domain_lifecycle(
                                 domain_name.clone(),
                                 DomainLifecycleEvent::Attached,
+                                &lifecycle,
                             )
                             .await
                             .map_err(mlua::Error::external)?;
                         }
-                        match domain.attach(&mux, owner_client_id, window_id).await {
+                        match attach_result {
                             Ok(()) => Ok(()),
                             Err(error) => {
                                 let attach_error = mlua::Error::external(format!(
@@ -306,6 +337,7 @@ impl UserData for MuxDomain {
                                 match record_domain_lifecycle(
                                     domain_name,
                                     DomainLifecycleEvent::AttachFailed,
+                                    &lifecycle,
                                 )
                                 .await
                                 {
@@ -330,7 +362,7 @@ impl UserData for MuxDomain {
                 promise::spawn::MainThreadServiceClass::Topology,
                 "detach domain",
                 || async move {
-                    let _lifecycle = reserve_domain_lifecycle(domain_name.clone())
+                    let lifecycle = reserve_domain_lifecycle(domain_name.clone())
                         .map_err(mlua::Error::external)?
                         .enter()
                         .await
@@ -339,12 +371,14 @@ impl UserData for MuxDomain {
                         record_domain_lifecycle(
                             domain_name.clone(),
                             DomainLifecycleEvent::Detached,
+                            &lifecycle,
                         )
                         .await
                         .map_err(mlua::Error::external)?;
                         record_domain_lifecycle(
                             domain_name,
                             DomainLifecycleEvent::DetachedPersisted,
+                            &lifecycle,
                         )
                         .await
                         .map_err(mlua::Error::external)?;
@@ -499,6 +533,40 @@ mod tests {
     }
 
     #[test]
+    fn worker_hold_prevents_a_cancelled_foreground_from_releasing_its_successor() {
+        let name = "sequencer-worker-hold".to_string();
+        let foreground = futures::executor::block_on(
+            reserve_domain_lifecycle(name.clone())
+                .expect("reserve foreground lifecycle action")
+                .enter(),
+        )
+        .expect("enter foreground lifecycle action");
+        let worker_hold = foreground.worker_hold();
+        let successor = reserve_domain_lifecycle(name).expect("reserve successor action");
+        let mut successor_enter = Box::pin(successor.enter());
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+
+        drop(foreground);
+        assert!(matches!(
+            successor_enter.as_mut().poll(&mut context),
+            std::task::Poll::Pending
+        ));
+
+        drop(worker_hold);
+        let successor = match successor_enter.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(Ok(successor)) => successor,
+            std::task::Poll::Ready(Err(error)) => {
+                panic!("worker-held successor lost lifecycle authority: {error:#}")
+            }
+            std::task::Poll::Pending => {
+                panic!("successor was not released after the worker hold completed")
+            }
+        };
+        drop(successor);
+    }
+
+    #[test]
     fn lua_attach_and_detach_each_use_one_admitted_topology_transaction() {
         let source = include_str!("domain.rs");
         let attach_start = source
@@ -514,6 +582,16 @@ mod tests {
             .expect("Lua detach method remains bounded");
         let attach = &source[attach_start..detach_start];
         let detach = &source[detach_start..state_start];
+        let transport = attach
+            .find("let attach_result = domain.attach")
+            .expect("explicit Lua attach starts its transport");
+        let attached_intent = attach
+            .find("DomainLifecycleEvent::Attached")
+            .expect("explicit Lua attach persists requested intent");
+        assert!(
+            transport < attached_intent,
+            "best-effort remembrance must not gate the explicit Lua transport"
+        );
         assert_eq!(attach.matches("crate::run_on_main_thread(").count(), 1);
         assert_eq!(detach.matches("crate::run_on_main_thread(").count(), 1);
         for transaction in [attach, detach] {

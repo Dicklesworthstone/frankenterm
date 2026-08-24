@@ -124,6 +124,8 @@ static AUTO_CONNECT_ADMISSION_RETRY_STATE: Mutex<AdmissionRetryCoordinatorState>
 static MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE:
     Mutex<AdmissionRetryCoordinatorState> = Mutex::new(AdmissionRetryCoordinatorState::Idle);
 static DOMAIN_RECONNECT_MANIFEST_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static DOMAIN_RECONNECT_MANIFEST_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH: AtomicU64 = AtomicU64::new(0);
 static DOMAIN_RECONNECT_MANIFEST_SNAPSHOT: std::sync::RwLock<
     Option<domain_reconnect_manifest::DomainReconnectManifest>,
 > = std::sync::RwLock::new(None);
@@ -1304,16 +1306,57 @@ where
 fn publish_domain_reconnect_manifest_snapshot(
     manifest: domain_reconnect_manifest::DomainReconnectManifest,
 ) {
+    let generation = manifest.generation();
+    let mut ambiguous_generation = None;
+    let mut retired_supervisor = None;
     let mut snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if snapshot
-        .as_ref()
-        .is_none_or(|current| manifest.generation() >= current.generation())
-    {
+    let initialized = DOMAIN_RECONNECT_MANIFEST_INITIALIZED.load(Ordering::Acquire);
+    let high_water = DOMAIN_RECONNECT_MANIFEST_HIGH_WATER.load(Ordering::Acquire);
+    if !initialized || generation > high_water {
+        DOMAIN_RECONNECT_MANIFEST_HIGH_WATER.store(generation, Ordering::Release);
         *snapshot = Some(manifest);
+        mint_domain_reconnect_manifest_authority_epoch();
+    } else if generation == high_water {
+        match snapshot.as_ref() {
+            Some(current) if current == &manifest => {
+                // A distinct worker has just re-proven this durable state.
+                // Advance the publication epoch even though its manifest
+                // generation is idempotent so an older failed worker cannot
+                // invalidate the newer proof.
+                mint_domain_reconnect_manifest_authority_epoch();
+            }
+            Some(_) => {
+                *snapshot = None;
+                ambiguous_generation = Some(generation);
+                mint_domain_reconnect_manifest_authority_epoch();
+                retired_supervisor = Some(fence_and_take_auto_connect_supervisor(
+                    "divergent remembered-domain authority",
+                ));
+            }
+            None => {
+                // A same-or-older completion cannot repair an authority state
+                // already fenced at this generation. Only a later durable
+                // generation may make automatic connection eligible again.
+            }
+        }
     }
     DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
+    drop(snapshot);
+    drop(retired_supervisor.flatten());
+    if let Some(generation) = ambiguous_generation {
+        let message = format!(
+            "remembered domain attachment authority produced divergent state at generation {generation}; automatic domain connection is paused until a later durable generation"
+        );
+        frankenterm_gui::gui_debug_log::record(
+            log::Level::Error,
+            "frankenterm_gui::auto_connect",
+            message.clone(),
+        );
+        log::error!("{message}");
+        persistent_toast_notification("Remembered domain connections unavailable", &message);
+    }
 }
 
 fn domain_reconnect_manifest_snapshot(
@@ -1322,6 +1365,152 @@ fn domain_reconnect_manifest_snapshot(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
+}
+
+/// Revoke all in-memory automatic-reconnect authority after persistence can no
+/// longer prove an exact durable manifest. The high-water generation remains
+/// fenced so an older delayed completion cannot republish stale intent; only a
+/// later generation can repair the snapshot.
+pub(crate) fn invalidate_domain_reconnect_manifest_snapshot() {
+    let mut snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *snapshot = None;
+    mint_domain_reconnect_manifest_authority_epoch();
+    DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
+    let retired_supervisor = fence_and_take_auto_connect_supervisor(
+        "unavailable remembered-domain authority",
+    );
+    drop(snapshot);
+    drop(retired_supervisor);
+}
+
+/// Revoke stale in-memory authority after a worker failure without erasing a
+/// later lifecycle operation that completed while this worker was in flight.
+fn invalidate_domain_reconnect_manifest_snapshot_unless_newer_than(
+    baseline_authority_epoch: u64,
+) {
+    let mut snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
+        > baseline_authority_epoch
+    {
+        return;
+    }
+    *snapshot = None;
+    mint_domain_reconnect_manifest_authority_epoch();
+    DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
+    let retired_supervisor = fence_and_take_auto_connect_supervisor(
+        "failed remembered-domain persistence worker",
+    );
+    drop(snapshot);
+    drop(retired_supervisor);
+}
+
+fn current_domain_reconnect_manifest_for_intent(
+    domain_name: &str,
+    intent: DomainAttachmentIntent,
+    minimum_generation: u64,
+) -> Option<domain_reconnect_manifest::DomainReconnectManifest> {
+    domain_reconnect_manifest_snapshot().filter(|manifest| {
+        manifest.generation() >= minimum_generation
+            && manifest.intent_for_name(domain_name) == Some(intent)
+    })
+}
+
+enum DomainReconnectIntentPersistenceOutcome {
+    Committed(domain_reconnect_manifest::DomainReconnectManifest),
+    ReconciledWithoutRequestedIntent {
+        manifest: domain_reconnect_manifest::DomainReconnectManifest,
+        error: anyhow::Error,
+    },
+    AuthorityUnavailable(anyhow::Error),
+}
+
+/// Persist one explicit attachment intent and reconcile any ambiguous late
+/// write failure against the durable quorum before returning. A write that
+/// reached two replicas can therefore be recovered and completed; a write that
+/// did not commit retains the exact older quorum in memory. Only a failed
+/// quorum reload revokes automatic reconnect authority entirely.
+pub(crate) async fn persist_domain_reconnect_intent(
+    domain_name: String,
+    intent: DomainAttachmentIntent,
+    lifecycle_worker_hold: mux_lua::DomainLifecycleWorkerHold,
+) -> anyhow::Result<domain_reconnect_manifest::DomainReconnectManifest> {
+    let authority_baseline =
+        DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire);
+    let worker_domain_name = domain_name.clone();
+    let outcome = promise::spawn::spawn_into_new_thread(move || {
+        let outcome = match domain_reconnect_manifest::set_intent(&worker_domain_name, intent) {
+            Ok(manifest) => DomainReconnectIntentPersistenceOutcome::Committed(manifest),
+            Err(write_error) => match domain_reconnect_manifest::load() {
+                Ok(manifest)
+                    if manifest.intent_for_name(&worker_domain_name) == Some(intent) =>
+                {
+                    DomainReconnectIntentPersistenceOutcome::Committed(manifest)
+                }
+                Ok(manifest) => {
+                    DomainReconnectIntentPersistenceOutcome::ReconciledWithoutRequestedIntent {
+                        manifest,
+                        error: anyhow::anyhow!(
+                            "attachment-intent publication failed and the reconciled durable quorum retained its prior intent: {write_error}"
+                        ),
+                    }
+                }
+                Err(load_error) => DomainReconnectIntentPersistenceOutcome::AuthorityUnavailable(
+                    anyhow::anyhow!(
+                        "attachment-intent publication failed ({write_error}); durable authority reconciliation also failed ({load_error})"
+                    ),
+                ),
+            },
+        };
+        Ok((outcome, lifecycle_worker_hold))
+    })
+    .await;
+    let (outcome, _lifecycle_worker_hold) = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            invalidate_domain_reconnect_manifest_snapshot_unless_newer_than(authority_baseline);
+            return Err(error.context(
+                "attachment-intent persistence worker failed before authority reconciliation",
+            ));
+        }
+    };
+
+    match outcome {
+        DomainReconnectIntentPersistenceOutcome::Committed(manifest) => {
+            let minimum_generation = manifest.generation();
+            publish_domain_reconnect_manifest_snapshot(manifest.clone());
+            current_domain_reconnect_manifest_for_intent(
+                &domain_name,
+                intent,
+                minimum_generation,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "attachment-intent publication was superseded or rejected by newer in-memory authority"
+                )
+            })
+        }
+        DomainReconnectIntentPersistenceOutcome::ReconciledWithoutRequestedIntent {
+            manifest,
+            error,
+        } => {
+            let minimum_generation = manifest.generation();
+            publish_domain_reconnect_manifest_snapshot(manifest);
+            current_domain_reconnect_manifest_for_intent(
+                &domain_name,
+                intent,
+                minimum_generation,
+            )
+            .ok_or(error)
+        }
+        DomainReconnectIntentPersistenceOutcome::AuthorityUnavailable(error) => {
+            invalidate_domain_reconnect_manifest_snapshot_unless_newer_than(authority_baseline);
+            Err(error)
+        }
+    }
 }
 
 async fn initialize_domain_reconnect_manifest_snapshot() {
@@ -1335,9 +1524,9 @@ async fn initialize_domain_reconnect_manifest_snapshot() {
     {
         Ok(manifest) => publish_domain_reconnect_manifest_snapshot(manifest),
         Err(error) => {
-            DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
+            invalidate_domain_reconnect_manifest_snapshot();
             let message = format!(
-                "remembered domain attachment intent could not be loaded on the persistence worker and will be ignored until the next durable lifecycle event: {error}"
+                "remembered domain attachment authority could not be loaded on the persistence worker; automatic domain connection is paused until the next durable lifecycle event repairs authority: {error}"
             );
             frankenterm_gui::gui_debug_log::record(
                 log::Level::Error,
@@ -1359,20 +1548,18 @@ async fn initialize_domain_reconnect_manifest_snapshot() {
 /// durable negative intent must commit before the live domain is detached so
 /// an older remembered `Attached` record cannot reconnect behind the
 /// operator's back.
-async fn remember_attached_domain_best_effort(domain_name: String) -> bool {
-    match promise::spawn::spawn_into_new_thread(move || {
-        domain_reconnect_manifest::set_intent(
-            &domain_name,
-            DomainAttachmentIntent::Attached,
-        )
-        .map_err(anyhow::Error::new)
-    })
+pub(crate) async fn remember_attached_domain_best_effort(
+    domain_name: String,
+    lifecycle_worker_hold: mux_lua::DomainLifecycleWorkerHold,
+) -> Option<u64> {
+    match persist_domain_reconnect_intent(
+        domain_name,
+        DomainAttachmentIntent::Attached,
+        lifecycle_worker_hold,
+    )
     .await
     {
-        Ok(manifest) => {
-            publish_domain_reconnect_manifest_snapshot(manifest);
-            true
-        }
+        Ok(manifest) => Some(manifest.generation()),
         Err(error) => {
             let message = bounded_gui_failure_message(
                 "The explicit domain connection will continue, but its attached intent could not be remembered for automatic restart recovery",
@@ -1385,28 +1572,32 @@ async fn remember_attached_domain_best_effort(domain_name: String) -> bool {
             );
             log::error!("{message}");
             persistent_toast_notification("Domain reconnect preference unavailable", &message);
-            false
+            None
         }
     }
 }
 
-fn configured_auto_connect_domain_configs(config: &ConfigHandle) -> Vec<ClientDomainConfig> {
-    frankenterm_mux_server_impl::configured_client_domains(config)
-        .into_iter()
-        .filter(ClientDomainConfig::connect_automatically)
-        .collect()
-}
-
-fn auto_connect_domain_configs(config: &ConfigHandle) -> Option<Vec<ClientDomainConfig>> {
-    let manifest = domain_reconnect_manifest_snapshot()?;
-    Some(
+fn auto_connect_domain_configs(
+    config: &ConfigHandle,
+) -> Option<(u64, Vec<ClientDomainConfig>)> {
+    let (authority_epoch, manifest) = {
+        let snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let manifest = snapshot.as_ref()?.clone();
+        let authority_epoch =
+            DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire);
+        (authority_epoch, manifest)
+    };
+    Some((
+        authority_epoch,
         frankenterm_mux_server_impl::configured_client_domains(config)
             .into_iter()
             .filter(|domain| {
                 manifest.should_connect(domain.name(), domain.connect_automatically())
             })
             .collect(),
-    )
+    ))
 }
 
 fn auto_connect_generation_is_current(
@@ -1810,6 +2001,20 @@ fn mint_auto_connect_supervisor_generation() -> Option<u64> {
     }
 }
 
+fn mint_domain_reconnect_manifest_authority_epoch() {
+    if DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .is_err()
+    {
+        // No later publication can be distinguished after exhaustion. Keep
+        // explicit operator actions available, but permanently fail closed
+        // for automatic connection in this process.
+        AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
+    }
+}
+
 fn fence_auto_connect_supervisor_authority(context: &str) -> bool {
     let request_fenced = mint_auto_connect_admission_retry_generation().is_some();
     let supervisor_fenced = mint_auto_connect_supervisor_generation().is_some();
@@ -1837,9 +2042,15 @@ fn fence_auto_connect_supervisor_authority(context: &str) -> bool {
     false
 }
 
+fn fence_and_take_auto_connect_supervisor(
+    context: &str,
+) -> Option<promise::spawn::Task<()>> {
+    fence_auto_connect_supervisor_authority(context);
+    AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take())
+}
+
 fn cancel_auto_connect_supervisor() {
-    fence_auto_connect_supervisor_authority("a cancelled supervisor");
-    let previous = AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take());
+    let previous = fence_and_take_auto_connect_supervisor("a cancelled supervisor");
     // Drop only after releasing the RefCell borrow. Cancellation may dispose
     // future-owned domain guards and scheduler permits synchronously. The
     // generation fence above is already visible before any destructor runs.
@@ -1935,8 +2146,7 @@ fn start_auto_connect_admission_retry() -> bool {
 }
 
 fn desired_auto_connect_domains_for_retry(config: &ConfigHandle) -> Vec<ClientDomainConfig> {
-    auto_connect_domain_configs(config)
-        .unwrap_or_else(|| configured_auto_connect_domain_configs(config))
+    auto_connect_domain_configs(config).unwrap_or_default()
 }
 
 fn try_admit_auto_connect_supervisor(
@@ -2217,11 +2427,12 @@ fn schedule_auto_connect_domains_requiring(
     let desired_domains = match auto_connect_domain_configs(&config) {
         Some(desired_domains) => desired_domains,
         None => {
-            // A damaged optional preference must never become connection
-            // authority. Explicit configuration remains usable, while the
-            // privacy-safe error tells the operator that remembered intent
-            // was ignored rather than silently widening it.
-            let message = "remembered domain attachment intent is unavailable and was ignored; only explicit connect_automatically configuration will be used".to_string();
+            // Once remembered authority has existed, damage cannot distinguish
+            // a stale Attached record from a newer explicit Detached record.
+            // Pause automatic connection globally rather than broadening back
+            // to configuration and reconnecting against an operator's choice.
+            // Explicit operator-requested attach remains available.
+            let message = "remembered domain attachment authority is unavailable; automatic domain connection is paused until authority is durably repaired".to_string();
             frankenterm_gui::gui_debug_log::record(
                 log::Level::Error,
                 "frankenterm_gui::auto_connect",
@@ -2229,7 +2440,7 @@ fn schedule_auto_connect_domains_requiring(
             );
             log::error!("{message}");
             persistent_toast_notification("Remembered domain connections unavailable", &message);
-            configured_auto_connect_domain_configs(&config)
+            Vec::new()
         }
     };
     if desired_domains.is_empty() {
@@ -2531,43 +2742,61 @@ async fn async_run_terminal_gui(
             let mut attachment_attempt_started = false;
             let mut attachment_committed = false;
             let remote_open_result = async {
-                let _lifecycle =
+                let lifecycle =
                     mux_lua::reserve_domain_lifecycle(domain.domain_name().to_string())
                         .context("reserving ordered startup domain lifecycle")?
                         .enter()
                         .await
                         .context("entering ordered startup domain lifecycle")?;
-                if domain.downcast_ref::<ClientDomain>().is_some() {
-                    let persisted_domain_name = domain.domain_name().to_string();
-                    remembered_attachment =
-                        remember_attached_domain_best_effort(persisted_domain_name).await;
-                }
+                let remembers_attachment = domain.downcast_ref::<ClientDomain>().is_some();
+                let persisted_domain_name = domain.domain_name().to_string();
                 let owner_client_id = mux.active_identity();
                 attachment_attempt_started = true;
-                domain
+                let attach_result = domain
                     .attach(&mux, owner_client_id, Some(window_id))
-                    .await?;
-                attachment_committed = true;
-                let config = config::configuration();
-                let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
-                let tab = domain
-                    .spawn(
-                        &mux,
-                        config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
-                        cmd.clone(),
-                        None,
-                        window_id,
+                    .await;
+                if attach_result.is_err() && remembers_attachment {
+                    remembered_attachment = remember_attached_domain_best_effort(
+                        persisted_domain_name.clone(),
+                        lifecycle.worker_hold(),
                     )
-                    .await?;
-                mux.activate_tab_exact_in_window(window_id, &tab, false)
-                    .with_context(|| {
-                        format!(
-                            "domain `{}` spawned tab {}, but window {window_id} does not contain the exact registered tab",
-                            domain.domain_name(),
-                            tab.tab_id()
+                    .await
+                    .is_some();
+                }
+                attach_result?;
+                attachment_committed = true;
+                let post_attach_result = async {
+                    let config = config::configuration();
+                    let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
+                    let tab = domain
+                        .spawn(
+                            &mux,
+                            config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
+                            cmd.clone(),
+                            None,
+                            window_id,
                         )
-                    })?;
-                Result::<(), anyhow::Error>::Ok(())
+                        .await?;
+                    mux.activate_tab_exact_in_window(window_id, &tab, false)
+                        .with_context(|| {
+                            format!(
+                                "domain `{}` spawned tab {}, but window {window_id} does not contain the exact registered tab",
+                                domain.domain_name(),
+                                tab.tab_id()
+                            )
+                        })?;
+                    Result::<(), anyhow::Error>::Ok(())
+                }
+                .await;
+                if remembers_attachment {
+                    remembered_attachment = remember_attached_domain_best_effort(
+                        persisted_domain_name,
+                        lifecycle.worker_hold(),
+                    )
+                    .await
+                    .is_some();
+                }
+                post_attach_result
             }
             .await;
 
@@ -3022,52 +3251,58 @@ fn initialize_window_state_persistence() {
         );
     }
 
-    mux_lua::install_domain_lifecycle_recorder(Arc::new(|domain_name, event| {
-        Box::pin(async move {
-            if domain_name == "local" {
-                return Ok(());
-            }
-            match event {
-                mux_lua::DomainLifecycleEvent::Attached => {
-                    let _remembered = remember_attached_domain_best_effort(domain_name).await;
-                    // Rebuild from the accepted durable/configured authority
-                    // even when this optional write failed. The scheduler may
-                    // retain other explicitly configured domains, but cannot
-                    // infer this just-requested name from a failed write.
-                    schedule_auto_connect_domains();
-                    Ok(())
+    mux_lua::install_domain_lifecycle_recorder(Arc::new(
+        |domain_name, event, lifecycle_worker_hold| {
+            Box::pin(async move {
+                if domain_name == "local" {
+                    return Ok(());
                 }
-                mux_lua::DomainLifecycleEvent::Detached => {
-                    promise::spawn::spawn_into_new_thread(move || {
-                        domain_reconnect_manifest::set_intent(
-                            &domain_name,
-                            DomainAttachmentIntent::Detached,
+                match event {
+                    mux_lua::DomainLifecycleEvent::Attached => {
+                        let _remembered = remember_attached_domain_best_effort(
+                            domain_name,
+                            lifecycle_worker_hold,
                         )
-                        .map_err(anyhow::Error::new)
-                    })
-                    .await
-                    .map(publish_domain_reconnect_manifest_snapshot)
+                        .await;
+                        // Rebuild from the accepted durable/configured authority
+                        // even when this optional write failed. The scheduler may
+                        // retain other explicitly configured domains, but cannot
+                        // infer this just-requested name from a failed write.
+                        schedule_auto_connect_domains();
+                        Ok(())
+                    }
+                    mux_lua::DomainLifecycleEvent::Detached => {
+                        persist_domain_reconnect_intent(
+                            domain_name,
+                            DomainAttachmentIntent::Detached,
+                            lifecycle_worker_hold,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                    mux_lua::DomainLifecycleEvent::AttachFailed => {
+                        drop(lifecycle_worker_hold);
+                        let outcome = schedule_auto_connect_domain(&domain_name);
+                        anyhow::ensure!(
+                            outcome.establishes_retry_handoff(),
+                            "the exact failed domain was not admitted to automatic retry ({outcome:?})"
+                        );
+                        Ok(())
+                    }
+                    mux_lua::DomainLifecycleEvent::DetachedPersisted => {
+                        drop(lifecycle_worker_hold);
+                        // Detachment authority is already durable. Fence the old
+                        // snapshot before rebuilding it so no retired retry task
+                        // can race the subsequent live detach and reconnect the
+                        // domain against the operator's explicit choice.
+                        cancel_auto_connect_supervisor();
+                        schedule_auto_connect_domains();
+                        Ok(())
+                    }
                 }
-                mux_lua::DomainLifecycleEvent::AttachFailed => {
-                    let outcome = schedule_auto_connect_domain(&domain_name);
-                    anyhow::ensure!(
-                        outcome.establishes_retry_handoff(),
-                        "the exact failed domain was not admitted to automatic retry ({outcome:?})"
-                    );
-                    Ok(())
-                }
-                mux_lua::DomainLifecycleEvent::DetachedPersisted => {
-                    // Detachment authority is already durable. Fence the old
-                    // snapshot before rebuilding it so no retired retry task
-                    // can race the subsequent live detach and reconnect the
-                    // domain against the operator's explicit choice.
-                    cancel_auto_connect_supervisor();
-                    schedule_auto_connect_domains();
-                    Ok(())
-                }
-            }
-        })
-    }));
+            })
+        },
+    ));
 }
 
 fn run_gui_event_loop(gui: Rc<crate::frontend::GuiFrontEnd>) -> anyhow::Result<()> {
@@ -3483,12 +3718,12 @@ mod tests {
             .split_once("async fn remember_attached_domain_best_effort(")
             .expect("best-effort remembered-attachment helper remains present")
             .1
-            .split_once("\nfn configured_auto_connect_domain_configs(")
+            .split_once("\nfn auto_connect_domain_configs(")
             .expect("helper remains independently bounded")
             .0;
         assert!(helper.contains("Err(error) =>"));
         assert!(helper.contains("The explicit domain connection will continue"));
-        assert!(helper.contains("false"));
+        assert!(helper.contains("None"));
 
         let startup = source
             .split_once("async fn async_run_terminal_gui(")
@@ -3497,20 +3732,67 @@ mod tests {
             .split_once("\n#[derive(Debug)]\nenum Publish")
             .expect("terminal GUI startup remains independently bounded")
             .0;
-        let remember = startup
-            .find("remember_attached_domain_best_effort(persisted_domain_name).await")
-            .expect("explicit startup must attempt optional durable remembrance");
-        let attach = startup[remember..]
+        let attach = startup
             .find(".attach(&mux, owner_client_id, Some(window_id))")
-            .map(|offset| remember + offset)
-            .expect("explicit transport attach must follow the optional remembrance attempt");
-        assert!(attach > remember, "manifest failure must not return before attach");
+            .expect("explicit startup must begin its transport");
+        let remember = startup[attach..]
+            .find("remember_attached_domain_best_effort(")
+            .map(|offset| attach + offset)
+            .expect("explicit startup must attempt optional durable remembrance");
+        assert!(
+            remember > attach,
+            "optional manifest I/O must not gate the explicit transport"
+        );
         assert!(
             !startup[..attach].contains(
                 ".context(\"persisting explicitly requested domain attachment intent\")"
             ),
             "optional remembered intent must not regain question-mark admission authority"
         );
+    }
+
+    #[test]
+    fn persistence_failure_reconciles_quorum_or_revokes_auto_reconnect_authority() {
+        let source = include_str!("main.rs");
+        let persistence = source
+            .split_once("async fn persist_domain_reconnect_intent(")
+            .expect("reconciled intent helper remains present")
+            .1
+            .split_once("\nasync fn initialize_domain_reconnect_manifest_snapshot(")
+            .expect("reconciled intent helper remains independently bounded")
+            .0;
+        assert!(persistence.contains("domain_reconnect_manifest::set_intent"));
+        assert!(persistence.contains("domain_reconnect_manifest::load()"));
+        assert!(persistence.contains("intent_for_name(&worker_domain_name) == Some(intent)"));
+        assert!(persistence.contains("publish_domain_reconnect_manifest_snapshot(manifest)"));
+        assert!(persistence.contains(
+            "invalidate_domain_reconnect_manifest_snapshot_unless_newer_than(authority_baseline)"
+        ));
+        assert!(persistence.contains("lifecycle_worker_hold"));
+        assert!(persistence.contains("current_domain_reconnect_manifest_for_intent("));
+
+        let termwindow = include_str!("termwindow/mod.rs");
+        let persistence = termwindow
+            .find("crate::persist_domain_reconnect_intent(")
+            .expect("manual detach must enter reconciled persistence");
+        let detach = termwindow[persistence..]
+            .find("let detach_result = domain.detach();")
+            .map(|offset| persistence + offset)
+            .expect("manual live detach must remain present");
+        assert!(
+            persistence < detach,
+            "manual detach must not mutate the live domain before durable authority is reconciled"
+        );
+    }
+
+    #[test]
+    fn unavailable_remembered_authority_never_falls_back_to_configured_auto_connect() {
+        let source = include_str!("main.rs");
+        assert!(!source.contains("configured_auto_connect_domain_configs"));
+        assert!(source.contains("auto_connect_domain_configs(config).unwrap_or_default()"));
+        assert!(source.contains(
+            "automatic domain connection is paused until authority is durably repaired"
+        ));
     }
 
     #[test]

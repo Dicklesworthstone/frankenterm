@@ -2,10 +2,12 @@
 
 use crate::output::{
     GuardianOutputCompletionState, GuardianOutputPipeline, GuardianOutputSubmitError,
-    GuardianPaneOutputJournal, OUTPUT_RECORD_BYTES,
+    GuardianPaneInputCompletionError, GuardianPaneInputJournal, GuardianPaneInputTransaction,
+    GuardianPaneInputTransactionError, GuardianPaneOutputJournal, OUTPUT_RECORD_BYTES,
 };
 use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
+use mux::guardian_input_journal::replay_guardian_input_without_writer;
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GuardianEffectOutcome, GuardianEffectTransactionError,
     GuardianMuxLeaseRetirement, GuardianOperation, GuardianPaneState, GuardianProtocolError,
@@ -64,6 +66,13 @@ impl GuardianRuntimeConfig {
 /// Content-free operational counters for readiness and child polling faults.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GuardianRuntimeCounters {
+    pub pty_input_write_attempts: u64,
+    pub pty_input_bytes_applied: u64,
+    pub input_effects_terminally_reconciled: u64,
+    pub input_journal_failures: u64,
+    pub input_authority_failures: u64,
+    pub input_payload_identity_failures: u64,
+    pub input_indeterminate_outcomes: u64,
     pub pty_bytes_drained: u64,
     pub pty_bytes_durably_committed: u64,
     pub pty_records_durably_committed: u64,
@@ -107,13 +116,19 @@ impl RuntimePaneOutput {
     }
 }
 
+struct RuntimePaneJournals {
+    input: GuardianPaneInputJournal,
+    output: GuardianPaneOutputJournal,
+}
+
 struct RuntimePane {
     _master: Box<dyn MasterPty>,
-    _writer: Box<dyn Write + Send>,
+    writer: Box<dyn Write + Send>,
     reader: Box<dyn PollablePtyReader>,
     reader_registered: bool,
     child: Box<dyn Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    input: GuardianPaneInputJournal,
     output: RuntimePaneOutput,
     pty_eof_observed: bool,
     exit_observed: bool,
@@ -202,10 +217,9 @@ impl GuardianRuntime {
 
     /// Dispatch one already authenticated request.
     ///
-    /// Input, checkpoint, and output replay remain fail-closed in this service
-    /// slice. Accepting them without the input WAL, checkpoint publisher, and
-    /// authenticated output-delivery protocol would create false durability or
-    /// replay claims.
+    /// Input is admitted only through the per-pane encrypted WAL and one-shot
+    /// PTY-write permit. Checkpoint and output replay remain fail-closed until
+    /// their service-owned publisher/delivery protocols exist.
     pub fn dispatch(
         &mut self,
         request: &AuthenticatedGuardianRequest,
@@ -226,8 +240,8 @@ impl GuardianRuntime {
         }
         let effect_was_indeterminate = self.indeterminate_effect;
         let result = match request.header().operation {
-            GuardianOperation::Input
-            | GuardianOperation::Checkpoint
+            GuardianOperation::Input => self.apply_input(request),
+            GuardianOperation::Checkpoint
             | GuardianOperation::Replay
             | GuardianOperation::GuardedStop => Err(GuardianRejectionCode::InvalidRequest),
             GuardianOperation::Hello => {
@@ -746,6 +760,10 @@ impl GuardianRuntime {
                     let output = output_pipeline
                         .prepare_pane(guardian_incarnation, pane_id)
                         .map_err(|_| RuntimeEffectError)?;
+                    let input = output_pipeline
+                        .prepare_input(guardian_incarnation, pane_id)
+                        .map_err(|_| RuntimeEffectError)?;
+                    let journals = RuntimePaneJournals { input, output };
                     spawn_runtime_pane(
                         registry,
                         panes,
@@ -753,7 +771,7 @@ impl GuardianRuntime {
                         next_pty_token,
                         pane_id,
                         payload,
-                        output,
+                        journals,
                     )
                 })())
             }),
@@ -777,6 +795,134 @@ impl GuardianRuntime {
             }),
             indeterminate_effect,
         )
+    }
+
+    fn apply_input(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReply, GuardianRejectionCode> {
+        let pane_id = request
+            .header()
+            .pane_id
+            .ok_or(GuardianRejectionCode::InvalidRequest)?;
+        let Self {
+            protocol,
+            panes,
+            indeterminate_effect,
+            counters,
+            ..
+        } = self;
+        let Some(pane) = panes.get_mut(&pane_id) else {
+            return match replay_guardian_input_without_writer(protocol, request) {
+                Ok(reply) => Ok(reply),
+                Err(GuardianEffectTransactionError::Protocol(error)) => {
+                    Err(GuardianRejectionCode::from_protocol_error(&error))
+                }
+                Err(GuardianEffectTransactionError::Effect(())) => {
+                    Err(GuardianRejectionCode::InternalInvariant)
+                }
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => {
+                    counters.input_indeterminate_outcomes =
+                        counters.input_indeterminate_outcomes.saturating_add(1);
+                    *indeterminate_effect = true;
+                    Err(GuardianRejectionCode::InternalInvariant)
+                }
+            };
+        };
+
+        let transaction = match pane.input.begin_transaction(protocol, request) {
+            Ok(transaction) => transaction,
+            Err(GuardianPaneInputTransactionError::Protocol(error)) => {
+                return Err(GuardianRejectionCode::from_protocol_error(&error));
+            }
+            Err(GuardianPaneInputTransactionError::JournalBeforeWrite) => {
+                counters.input_journal_failures =
+                    counters.input_journal_failures.saturating_add(1);
+                return Err(GuardianRejectionCode::InternalInvariant);
+            }
+            Err(GuardianPaneInputTransactionError::AuthorityBeforeWrite) => {
+                counters.input_authority_failures =
+                    counters.input_authority_failures.saturating_add(1);
+                return Err(GuardianRejectionCode::InternalInvariant);
+            }
+            Err(GuardianPaneInputTransactionError::OutcomeIndeterminate) => {
+                counters.input_indeterminate_outcomes =
+                    counters.input_indeterminate_outcomes.saturating_add(1);
+                *indeterminate_effect = true;
+                return Err(GuardianRejectionCode::InternalInvariant);
+            }
+            Err(GuardianPaneInputTransactionError::AcceptedJournalUnavailable(reply)) => {
+                counters.input_journal_failures =
+                    counters.input_journal_failures.saturating_add(1);
+                return Ok(reply);
+            }
+            Err(GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable) => {
+                counters.input_authority_failures =
+                    counters.input_authority_failures.saturating_add(1);
+                *indeterminate_effect = true;
+                return Err(GuardianRejectionCode::InternalInvariant);
+            }
+            Err(GuardianPaneInputTransactionError::AcceptedProtocolUnavailable(
+                accepted_reply,
+            )) => {
+                counters.protocol_transition_failures =
+                    counters.protocol_transition_failures.saturating_add(1);
+                return Ok(accepted_reply);
+            }
+        };
+
+        let (accepted_reply, permit) = match transaction {
+            GuardianPaneInputTransaction::Reconciled(reply) => return Ok(reply),
+            GuardianPaneInputTransaction::WriteAuthorized {
+                accepted_reply,
+                permit,
+            } => (accepted_reply, permit),
+        };
+        let outcome = permit.write_once(&mut *pane.writer, request.payload());
+        if outcome.writer_was_invoked() {
+            counters.pty_input_write_attempts =
+                counters.pty_input_write_attempts.saturating_add(1);
+        } else {
+            counters.input_payload_identity_failures = counters
+                .input_payload_identity_failures
+                .saturating_add(1);
+        }
+        if let Some(applied_bytes) = outcome.applied_bytes() {
+            counters.pty_input_bytes_applied = counters
+                .pty_input_bytes_applied
+                .saturating_add(u64::from(applied_bytes));
+        }
+
+        match pane.input.complete_write(protocol, outcome) {
+            Ok(reply) => {
+                counters.input_effects_terminally_reconciled = counters
+                    .input_effects_terminally_reconciled
+                    .saturating_add(1);
+                Ok(reply)
+            }
+            Err(GuardianPaneInputCompletionError::DispositionIndeterminate) => {
+                counters.input_indeterminate_outcomes =
+                    counters.input_indeterminate_outcomes.saturating_add(1);
+                *indeterminate_effect = true;
+                Err(GuardianRejectionCode::InternalInvariant)
+            }
+            Err(GuardianPaneInputCompletionError::Journal) => {
+                counters.input_journal_failures =
+                    counters.input_journal_failures.saturating_add(1);
+                Ok(accepted_reply)
+            }
+            Err(GuardianPaneInputCompletionError::Authority) => {
+                counters.input_authority_failures =
+                    counters.input_authority_failures.saturating_add(1);
+                *indeterminate_effect = true;
+                Err(GuardianRejectionCode::InternalInvariant)
+            }
+            Err(GuardianPaneInputCompletionError::Protocol) => {
+                counters.protocol_transition_failures =
+                    counters.protocol_transition_failures.saturating_add(1);
+                Ok(accepted_reply)
+            }
+        }
     }
 
     fn apply_resize(
@@ -993,7 +1139,7 @@ fn spawn_runtime_pane(
     next_pty_token: &mut usize,
     pane_id: Uuid,
     payload: GuardianSpawnPayload,
-    output: GuardianPaneOutputJournal,
+    journals: RuntimePaneJournals,
 ) -> Result<(), RuntimeEffectError> {
     if panes.contains_key(&pane_id) || pty_tokens.contains_key(&Token(*next_pty_token)) {
         return Err(RuntimeEffectError);
@@ -1003,6 +1149,7 @@ fn spawn_runtime_pane(
     let token = Token(*next_pty_token);
     let following_token = next_pty_token.checked_add(1).ok_or(RuntimeEffectError)?;
     let (command, size) = payload.into_parts();
+    let RuntimePaneJournals { input, output } = journals;
     let pair = native_pty_system()
         .openpty(size)
         .map_err(|_| RuntimeEffectError)?;
@@ -1030,11 +1177,12 @@ fn spawn_runtime_pane(
     let killer = child.clone_killer();
     let pane = RuntimePane {
         _master: pair.master,
-        _writer: writer,
+        writer,
         reader,
         reader_registered: true,
         child,
         killer,
+        input,
         output: RuntimePaneOutput::new(output),
         pty_eof_observed: false,
         exit_observed: false,

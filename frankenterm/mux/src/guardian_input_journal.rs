@@ -17,8 +17,9 @@
 
 use crate::guardian_output_journal::{GuardianOutputCipher, GuardianOutputJournalError};
 use crate::guardian_protocol::{
-    GUARDIAN_MAX_INPUT_BYTES, GuardianInputEffectIdentity, GuardianProtocolError,
-    GuardianProtocolState, GuardianReply, InputEffectState,
+    GUARDIAN_MAX_INPUT_BYTES, AuthenticatedGuardianRequest, GuardianEffectTransactionError,
+    GuardianInputEffectIdentity, GuardianProtocolError, GuardianProtocolState, GuardianReply,
+    InputEffectState,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -301,13 +302,27 @@ pub struct GuardianInputJournalAppend {
 
 /// Opaque one-shot journal authority for the first PTY write attempt.
 ///
-/// The future live PTY adapter must consume this value together with the newly
-/// admitted protocol transaction. It is intentionally neither `Clone` nor
-/// `Copy`, and external callers cannot construct it.
+/// The live PTY adapter consumes this value together with the newly admitted
+/// protocol transaction. It is intentionally neither `Clone` nor `Copy`, and
+/// external callers cannot construct it.
 #[derive(Debug, Eq, PartialEq)]
 #[must_use = "the guardian input write permit must be consumed by the one PTY write attempt"]
 pub struct GuardianInputWritePermit {
     identity: GuardianInputEffectIdentity,
+}
+
+/// Content-free result of consuming one exact PTY-write permit.
+///
+/// `disposition == None` means the writer violated the `Write` contract by
+/// reporting more bytes than it was given. The caller must retain the durable
+/// `AcceptedNotDurable` fence in that case; it has no defensible exact prefix
+/// to publish. The payload itself is never retained here.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "the guardian input write outcome must be durably reconciled"]
+pub struct GuardianInputWriteOutcome {
+    identity: GuardianInputEffectIdentity,
+    disposition: Option<GuardianInputDisposition>,
+    writer_invoked: bool,
 }
 
 /// Opaque journal-to-protocol authority for one exact terminal disposition.
@@ -407,6 +422,226 @@ impl GuardianInputWritePermit {
     pub const fn identity(&self) -> GuardianInputEffectIdentity {
         self.identity
     }
+
+    /// Consume this permit in exactly one PTY `write` call.
+    ///
+    /// The authenticated length and digest are checked before the writer is
+    /// invoked. A payload mismatch therefore resolves to `KnownNotApplied`.
+    /// `Write::write` promises that an `Err` writes no bytes, so errors and
+    /// zero-byte successes have the same exact disposition. Interrupted writes
+    /// are deliberately not retried: doing so would turn one journal permit
+    /// into multiple externally observable write attempts.
+    pub fn write_once<W: Write + ?Sized>(
+        self,
+        writer: &mut W,
+        payload: &[u8],
+    ) -> GuardianInputWriteOutcome {
+        let identity = self.identity;
+        let payload_bytes = u32::try_from(payload.len()).ok();
+        let payload_sha256: [u8; 32] = Sha256::digest(payload).into();
+        if payload_bytes != Some(identity.input_bytes())
+            || payload_sha256 != identity.payload_sha256()
+        {
+            return GuardianInputWriteOutcome {
+                identity,
+                disposition: Some(GuardianInputDisposition::KnownNotApplied),
+                writer_invoked: false,
+            };
+        }
+
+        let disposition = match writer.write(payload) {
+            Ok(0) | Err(_) => Some(GuardianInputDisposition::KnownNotApplied),
+            Ok(applied_bytes) if applied_bytes == payload.len() => {
+                Some(GuardianInputDisposition::DurableFull)
+            }
+            Ok(applied_bytes) if applied_bytes < payload.len() => {
+                u32::try_from(applied_bytes).ok().map(|applied_bytes| {
+                    GuardianInputDisposition::DurablePrefix { applied_bytes }
+                })
+            }
+            Ok(_) => None,
+        };
+        GuardianInputWriteOutcome {
+            identity,
+            disposition,
+            writer_invoked: true,
+        }
+    }
+}
+
+impl GuardianInputWriteOutcome {
+    #[must_use]
+    pub const fn identity(&self) -> GuardianInputEffectIdentity {
+        self.identity
+    }
+
+    /// Exact terminal disposition, or `None` when the writer's byte count made
+    /// the observable prefix indeterminate.
+    #[must_use]
+    pub const fn disposition(&self) -> Option<GuardianInputDisposition> {
+        self.disposition
+    }
+
+    #[must_use]
+    pub const fn writer_was_invoked(&self) -> bool {
+        self.writer_invoked
+    }
+
+    #[must_use]
+    pub const fn applied_bytes(&self) -> Option<u32> {
+        match self.disposition {
+            Some(GuardianInputDisposition::DurableFull) => Some(self.identity.input_bytes()),
+            Some(GuardianInputDisposition::DurablePrefix { applied_bytes }) => {
+                Some(applied_bytes)
+            }
+            Some(GuardianInputDisposition::KnownNotApplied) => Some(0),
+            Some(GuardianInputDisposition::Intent | GuardianInputDisposition::AcceptedNotDurable)
+            | None => None,
+        }
+    }
+}
+
+/// Result of joining protocol admission to the exact durable journal phase.
+#[derive(Debug)]
+pub enum GuardianInputTransaction {
+    Reconciled(GuardianReply),
+    WriteAuthorized {
+        accepted_reply: GuardianReply,
+        permit: GuardianInputWritePermit,
+    },
+}
+
+pub enum GuardianInputTransactionError {
+    Protocol(GuardianProtocolError),
+    JournalBeforeWrite(GuardianInputJournalError),
+    OutcomeIndeterminate(GuardianReply),
+    AcceptedJournalUnavailable {
+        accepted_reply: GuardianReply,
+        error: GuardianInputJournalError,
+    },
+    AcceptedProtocolUnavailable {
+        accepted_reply: GuardianReply,
+        error: GuardianProtocolError,
+    },
+}
+
+impl std::fmt::Debug for GuardianInputTransactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(error) => formatter.debug_tuple("Protocol").field(error).finish(),
+            Self::JournalBeforeWrite(_) => formatter.write_str("JournalBeforeWrite"),
+            Self::OutcomeIndeterminate(_) => formatter.write_str("OutcomeIndeterminate"),
+            Self::AcceptedJournalUnavailable { .. } => {
+                formatter.write_str("AcceptedJournalUnavailable")
+            }
+            Self::AcceptedProtocolUnavailable { error, .. } => formatter
+                .debug_tuple("AcceptedProtocolUnavailable")
+                .field(error)
+                .finish(),
+        }
+    }
+}
+
+/// Join protocol admission to the per-pane WAL without ever authorizing an
+/// exact retry to write again.
+///
+/// The protocol callback runs only for a new effect identity. It synchronizes
+/// `Intent` and then `AcceptedNotDurable`; only a newly committed accepted
+/// marker can produce the non-cloneable write permit. When protocol admission
+/// is an exact replay, the current WAL phase is inspected solely for terminal
+/// reconciliation and cannot yield fresh write authority.
+pub fn begin_guardian_input_transaction(
+    protocol: &mut GuardianProtocolState,
+    journal: &mut GuardianInputJournal,
+    request: &AuthenticatedGuardianRequest,
+) -> Result<GuardianInputTransaction, GuardianInputTransactionError> {
+    let identity = GuardianInputEffectIdentity::from_authenticated_request(request)
+        .map_err(GuardianInputTransactionError::Protocol)?;
+    let mut prepared_append = None;
+    let admitted = protocol.apply_input_effect_transactionally(request, |_| {
+        let intent = journal.append_intent_and_sync(identity)?;
+        let append = if intent.disposition() == GuardianInputDisposition::Intent {
+            journal.append_disposition_and_sync(
+                identity,
+                GuardianInputDisposition::AcceptedNotDurable,
+            )?
+        } else {
+            intent
+        };
+        prepared_append = Some(append);
+        Ok(())
+    });
+    let reply = match admitted {
+        Ok(reply) => reply,
+        Err(GuardianEffectTransactionError::Protocol(error)) => {
+            return Err(GuardianInputTransactionError::Protocol(error));
+        }
+        Err(GuardianEffectTransactionError::Effect(error)) => {
+            return Err(GuardianInputTransactionError::JournalBeforeWrite(error));
+        }
+        Err(GuardianEffectTransactionError::OutcomeIndeterminate(reply)) => {
+            return Err(GuardianInputTransactionError::OutcomeIndeterminate(reply));
+        }
+    };
+
+    let append = match prepared_append {
+        Some(append) => append,
+        None => {
+            let existing = journal.effect(identity.effect_id()).ok_or_else(|| {
+                GuardianInputTransactionError::AcceptedJournalUnavailable {
+                    accepted_reply: reply.clone(),
+                    error: GuardianInputJournalError::EffectIdentityConflict,
+                }
+            })?;
+            if existing.identity() != identity {
+                return Err(GuardianInputTransactionError::AcceptedJournalUnavailable {
+                    accepted_reply: reply,
+                    error: GuardianInputJournalError::EffectIdentityConflict,
+                });
+            }
+            GuardianInputJournalAppend::reconciled(existing.identity(), existing.receipt())
+        }
+    };
+    match append.disposition() {
+        GuardianInputDisposition::DurableFull
+        | GuardianInputDisposition::DurablePrefix { .. }
+        | GuardianInputDisposition::KnownNotApplied => {
+            let permit = append.into_terminal_protocol_permit().ok_or_else(|| {
+                GuardianInputTransactionError::AcceptedProtocolUnavailable {
+                    accepted_reply: reply.clone(),
+                    error: GuardianProtocolError::StateInvariantViolation(
+                        "guardian-input-terminal-permit",
+                    ),
+                }
+            })?;
+            permit
+                .reconcile_protocol(protocol)
+                .map(GuardianInputTransaction::Reconciled)
+                .map_err(|error| GuardianInputTransactionError::AcceptedProtocolUnavailable {
+                    accepted_reply: reply,
+                    error,
+                })
+        }
+        GuardianInputDisposition::AcceptedNotDurable => {
+            match append.into_first_pty_write_permit() {
+                Some(permit) => Ok(GuardianInputTransaction::WriteAuthorized {
+                    accepted_reply: reply,
+                    permit,
+                }),
+                None => Ok(GuardianInputTransaction::Reconciled(reply)),
+            }
+        }
+        GuardianInputDisposition::Intent => Ok(GuardianInputTransaction::Reconciled(reply)),
+    }
+}
+
+/// Return an already retained exact input receipt when the live PTY/journal
+/// owner has been released, while proving that no new input can be admitted.
+pub fn replay_guardian_input_without_writer(
+    protocol: &mut GuardianProtocolState,
+    request: &AuthenticatedGuardianRequest,
+) -> Result<GuardianReply, GuardianEffectTransactionError<()>> {
+    protocol.apply_input_effect_transactionally(request, |_| Err(()))
 }
 
 impl GuardianInputTerminalPermit {
@@ -1457,6 +1692,110 @@ mod tests {
                 .recovery_protocol_state(),
             InputEffectState::DurablePrefix { applied_bytes: 2 }
         );
+    }
+
+    #[test]
+    fn one_shot_write_permit_classifies_exact_write_boundaries_without_retry() {
+        #[derive(Clone, Copy)]
+        enum WriteMode {
+            Full,
+            Prefix,
+            Zero,
+            Error,
+            OverReported,
+        }
+
+        struct Writer {
+            mode: WriteMode,
+            calls: u32,
+        }
+
+        impl std::io::Write for Writer {
+            fn write(&mut self, payload: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                match self.mode {
+                    WriteMode::Full => Ok(payload.len()),
+                    WriteMode::Prefix => Ok(2),
+                    WriteMode::Zero => Ok(0),
+                    WriteMode::Error => Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "injected one-shot write interruption",
+                    )),
+                    WriteMode::OverReported => Ok(payload.len() + 1),
+                }
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let payload = b"abcd";
+        let exact_identity = GuardianInputEffectIdentity::new(
+            pane(),
+            Uuid::from_bytes([0x52; 16]),
+            3,
+            1,
+            Uuid::from_bytes([0x91; 16]),
+            u32::try_from(payload.len()).unwrap(),
+            Sha256::digest(payload).into(),
+        )
+        .unwrap();
+        let permit = || GuardianInputWritePermit {
+            identity: exact_identity,
+        };
+
+        let mut full = Writer {
+            mode: WriteMode::Full,
+            calls: 0,
+        };
+        let outcome = permit().write_once(&mut full, payload);
+        assert_eq!(full.calls, 1);
+        assert_eq!(outcome.disposition(), Some(GuardianInputDisposition::DurableFull));
+        assert_eq!(outcome.applied_bytes(), Some(4));
+
+        let mut partial = Writer {
+            mode: WriteMode::Prefix,
+            calls: 0,
+        };
+        let outcome = permit().write_once(&mut partial, payload);
+        assert_eq!(partial.calls, 1);
+        assert_eq!(
+            outcome.disposition(),
+            Some(GuardianInputDisposition::DurablePrefix { applied_bytes: 2 })
+        );
+
+        for mode in [WriteMode::Zero, WriteMode::Error] {
+            let mut writer = Writer { mode, calls: 0 };
+            let outcome = permit().write_once(&mut writer, payload);
+            assert_eq!(writer.calls, 1);
+            assert_eq!(
+                outcome.disposition(),
+                Some(GuardianInputDisposition::KnownNotApplied)
+            );
+            assert_eq!(outcome.applied_bytes(), Some(0));
+        }
+
+        let mut mismatched = Writer {
+            mode: WriteMode::Full,
+            calls: 0,
+        };
+        let outcome = permit().write_once(&mut mismatched, b"abce");
+        assert_eq!(mismatched.calls, 0);
+        assert!(!outcome.writer_was_invoked());
+        assert_eq!(
+            outcome.disposition(),
+            Some(GuardianInputDisposition::KnownNotApplied)
+        );
+
+        let mut invalid = Writer {
+            mode: WriteMode::OverReported,
+            calls: 0,
+        };
+        let outcome = permit().write_once(&mut invalid, payload);
+        assert_eq!(invalid.calls, 1);
+        assert_eq!(outcome.disposition(), None);
+        assert_eq!(outcome.applied_bytes(), None);
     }
 
     #[cfg(unix)]

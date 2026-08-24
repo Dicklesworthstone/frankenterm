@@ -48,7 +48,7 @@ use frankenterm_core::frame_budget_a11y_gate as frame_budget_a11y;
 use frankenterm_core::session_pane_state::TerminalState;
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::accessibility_preferences::config_with_accessibility_palette;
-use frankenterm_gui::domain_reconnect_manifest::{self, DomainAttachmentIntent};
+use frankenterm_gui::domain_reconnect_manifest::DomainAttachmentIntent;
 use frankenterm_gui::floating_panes::{
     GuiFloatingPaneController, emit_floating_pane_a11y_messages, floating_pane_id_to_mux_pane_id,
     mux_pane_id_to_floating_pane_id,
@@ -7111,7 +7111,7 @@ impl TermWindow {
                         reservation
                             .spawn_local(async move {
                                 let result = async {
-                                    let _lifecycle =
+                                    let lifecycle =
                                         mux_lua::reserve_domain_lifecycle(domain_name.clone())
                                             .context(
                                                 "reserving ordered manual domain detachment lifecycle",
@@ -7121,16 +7121,12 @@ impl TermWindow {
                                             .context(
                                                 "entering ordered manual domain detachment lifecycle",
                                             )?;
-                                    let persisted_name = domain_name.clone();
-                                    promise::spawn::spawn_into_new_thread(move || {
-                                        domain_reconnect_manifest::set_intent(
-                                            &persisted_name,
-                                            DomainAttachmentIntent::Detached,
-                                        )
-                                        .map_err(anyhow::Error::new)
-                                    })
-                                    .await
-                                    .map(crate::publish_domain_reconnect_manifest_snapshot)?;
+                                    crate::persist_domain_reconnect_intent(
+                                        domain_name.clone(),
+                                        DomainAttachmentIntent::Detached,
+                                        lifecycle.worker_hold(),
+                                    )
+                                    .await?;
                                     crate::cancel_auto_connect_supervisor();
                                     // Keep the exact admitted domain generation
                                     // resolved by the operator action alive across
@@ -7222,14 +7218,12 @@ impl TermWindow {
                                 .await;
 
                                 if let Err((err, retry_applicable)) = result {
-                                    // The attach helper durably records an
-                                    // Attached intent before dialing. Refresh
-                                    // the supervisor only after this manual
-                                    // attempt has relinquished the client's
-                                    // single-flight attachment claim, so the
-                                    // remembered domain is actually added to
-                                    // the retry frontier without racing a
-                                    // second transport against this attempt.
+                                    // When best-effort remembrance succeeded,
+                                    // refresh the supervisor only after this
+                                    // manual attempt relinquished the client's
+                                    // single-flight attachment claim. A failed
+                                    // optional persistence attempt still dials,
+                                    // but cannot manufacture a retry frontier.
                                     let recovery = if retry_applicable
                                         && crate::schedule_auto_connect_domain(&domain_name)
                                             .establishes_retry_handoff()

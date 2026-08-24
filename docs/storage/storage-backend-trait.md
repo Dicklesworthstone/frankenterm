@@ -54,7 +54,18 @@ Either way, the work pays for itself.
   sticky boundary loss and rejects every later callback operation.
 - **`RusqliteBackend`** — the wired persistent implementation and factory over
   a real `rusqlite::Connection`; the remaining extraction work is threading
-  more of `storage.rs` through this boundary.
+  more of `storage.rs` through this boundary. The backend owns SQLite's single
+  authorizer slot. `new_with_authorizer` composes a caller policy with the
+  scoped-transaction fence; plain `new` explicitly installs an allow policy
+  and replaces any callback that existed before ownership transfer. Policy
+  decisions are immutable for the backend lifetime: they may not depend on
+  time, counters, roles, generations, or any other mutable state (interior
+  mutability is limited to observability that cannot influence the result).
+  Callback-fence transitions flush SQLite's prepare cache so stale prepare-time
+  authorization cannot be reused under a different fence state. A separate
+  internal-control phase permits only the backend's outer transaction-control
+  actions, so a caller policy may deny raw transaction SQL without disabling
+  `with_transaction` cleanup or commit.
 - **`MockBackend`** — in-memory mock for testing. Records executed statements + tracks transaction state + answers `user_version` queries. Useful in storage.rs unit tests today, before any frankensqlite migration.
 
 ## What the substrate intentionally does NOT ship
@@ -143,6 +154,14 @@ Representative tests in `storage_backend_trait::tests` include:
 | `transaction_error_rolls_back_when_not_committed` | Callback error rolls back before returning. |
 | `transaction_panic_rolls_back_and_resumes_unwind` | Panic cleanup precedes resuming the original payload. |
 | `rusqlite_transaction_authorizer_denies_control_sql_and_rolls_back_prior_writes` | SQLite's parser, not string matching, fences transaction-control variants and comments. |
+| `rusqlite_backend_composes_caller_authorizer_with_transaction_fence` | Backend transaction fencing preserves an explicitly transferred application policy. |
+| `rusqlite_backend_internal_control_bypasses_only_caller_control_denials` | Caller-issued transaction control stays denied while backend-owned scoped control remains usable. |
+| `rusqlite_authorizer_phase_transitions_flush_cached_authorizations` | Identical cached SQL is re-authorized after callback fence transitions. |
+| `rusqlite_raw_connection_loan_cannot_disable_later_transaction_fence` | A raw legacy loan cannot leave SQLite's single authorizer slot disabled. |
+| `rusqlite_raw_connection_loan_panic_restores_fence_before_resume` | Raw-loan unwind cleanup restores the fence before preserving the original payload. |
+| `rusqlite_raw_connection_loan_panic_rolls_back_an_open_transaction` | Raw-loan panic cleanup rolls back an open transaction before permitting reuse. |
+| `rusqlite_raw_loan_rollback_failure_preserves_panic_and_quarantines` | Failed raw-loan panic cleanup preserves the original payload and fences every later operation. |
+| `rusqlite_reclaimed_connection_retains_the_caller_policy` | Fallible raw reclamation removes backend phases without discarding the transferred caller policy. |
 | `rusqlite_automatic_rollback_is_sticky_and_blocks_later_callback_writes` | Automatic boundary loss prevents an autocommit suffix. |
 | `rusqlite_deferred_constraint_commit_failure_rolls_back_and_reuses_connection` | Failed `COMMIT` is cleaned up and the proven-autocommit connection is reusable. |
 | `rusqlite_rollback_failure_quarantines_every_connection_surface` | Failed cleanup permanently fences the unsafe connection. |

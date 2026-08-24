@@ -76,9 +76,10 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use serde::{Deserialize, Serialize};
 
 /// Authoritative state of the backend connection's outer transaction boundary.
@@ -791,6 +792,76 @@ impl std::error::Error for BackendError {}
 /// The flag is cleared on every return and unwind path.
 struct TransactionAdmission<'a> {
     active: &'a AtomicBool,
+}
+
+fn callback_transaction_control_is_forbidden(context: AuthContext<'_>) -> bool {
+    matches!(
+        context.action,
+        AuthAction::Transaction { .. } | AuthAction::Savepoint { .. }
+    )
+}
+
+const AUTHORIZER_PHASE_EXTERNAL: u8 = 0;
+const AUTHORIZER_PHASE_CALLBACK: u8 = 1;
+const AUTHORIZER_PHASE_INTERNAL_CONTROL: u8 = 2;
+
+/// Restores the authorizer phase even if a caller policy or SQLite wrapper
+/// unexpectedly unwinds while the connection is in a privileged phase.
+struct AuthorizerPhaseReset<'a> {
+    phase: &'a AtomicU8,
+}
+
+impl<'a> AuthorizerPhaseReset<'a> {
+    fn enter(phase: &'a AtomicU8, next: u8) -> Result<Self, BackendError> {
+        phase
+            .compare_exchange(
+                AUTHORIZER_PHASE_EXTERNAL,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| BackendError::TxPoisoned)?;
+        Ok(Self { phase })
+    }
+}
+
+impl Drop for AuthorizerPhaseReset<'_> {
+    fn drop(&mut self) {
+        self.phase
+            .store(AUTHORIZER_PHASE_EXTERNAL, Ordering::Release);
+    }
+}
+
+/// Caller-supplied SQLite authorizer policy composed with the backend's scoped
+/// transaction fence.
+///
+/// Rusqlite exposes one authorizer slot per connection and cannot recover a
+/// previously installed callback. Callers that need a policy after transferring
+/// a connection to [`RusqliteBackend`] must provide it to
+/// [`RusqliteBackend::new_with_authorizer`]. Interior mutability may be used for
+/// observability such as counters, but it must not influence the returned
+/// [`Authorization`]. Decisions must not depend on time, counters, roles,
+/// generations, or any other mutable state; they must remain stable for the
+/// lifetime of the backend. SQLite authorizes at statement preparation time,
+/// so changing a captured decision out of band could make a cached statement
+/// disagree with the new policy. Recreate the backend and connection to install
+/// different rules.
+pub type RusqliteAuthorizerPolicy =
+    dyn for<'r> Fn(AuthContext<'r>) -> Authorization + Send + Sync + 'static;
+
+fn install_rusqlite_backend_authorizer(
+    conn: &rusqlite::Connection,
+    phase: Arc<AtomicU8>,
+    policy: Arc<RusqliteAuthorizerPolicy>,
+) -> rusqlite::Result<()> {
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
+        let control = callback_transaction_control_is_forbidden(context);
+        match (phase.load(Ordering::Acquire), control) {
+            (AUTHORIZER_PHASE_CALLBACK, true) => Authorization::Deny,
+            (AUTHORIZER_PHASE_INTERNAL_CONTROL, true) => Authorization::Allow,
+            _ => policy(context),
+        }
+    }))
 }
 
 impl<'a> TransactionAdmission<'a> {
@@ -1562,18 +1633,50 @@ impl StorageBackend for MockBackend {
 pub struct RusqliteBackend {
     conn: Mutex<rusqlite::Connection>,
     transaction_active: AtomicBool,
+    authorizer_phase: Arc<AtomicU8>,
+    authorizer_policy: Arc<RusqliteAuthorizerPolicy>,
     quarantined: AtomicBool,
     #[cfg(test)]
     fail_next_rollback: AtomicBool,
 }
 
 impl RusqliteBackend {
-    /// Wrap an existing `rusqlite::Connection`. The backend
-    /// takes ownership.
+    /// Wrap an existing `rusqlite::Connection` and take ownership of both the
+    /// connection and its single SQLite authorizer slot.
+    ///
+    /// Any authorizer installed before this call is replaced immediately.
+    /// Call [`Self::new_with_authorizer`] instead when the transferred
+    /// connection must retain an application policy alongside the backend's
+    /// transaction-control fence.
     pub fn new(conn: rusqlite::Connection) -> Self {
+        Self::new_with_authorizer(conn, |_| Authorization::Allow)
+    }
+
+    /// Wrap a connection while preserving an explicit application authorizer.
+    ///
+    /// During a scoped transaction callback, the backend's denial of caller-
+    /// issued outer transaction and savepoint control takes precedence. The
+    /// backend's own outer BEGIN/COMMIT/ROLLBACK are admitted in a separate
+    /// internal phase. Every unrelated action is delegated to `policy` in all
+    /// phases, and external transaction control is delegated normally.
+    pub fn new_with_authorizer<F>(conn: rusqlite::Connection, policy: F) -> Self
+    where
+        F: for<'r> Fn(AuthContext<'r>) -> Authorization + Send + Sync + 'static,
+    {
+        let authorizer_phase = Arc::new(AtomicU8::new(AUTHORIZER_PHASE_EXTERNAL));
+        let authorizer_policy: Arc<RusqliteAuthorizerPolicy> = Arc::new(policy);
+        install_rusqlite_backend_authorizer(
+            &conn,
+            Arc::clone(&authorizer_phase),
+            Arc::clone(&authorizer_policy),
+        )
+        .unwrap_or_else(|error| panic!("failed to install storage authorizer: {error}"));
+
         Self {
             conn: Mutex::new(conn),
             transaction_active: AtomicBool::new(false),
+            authorizer_phase,
+            authorizer_policy,
             quarantined: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_rollback: AtomicBool::new(false),
@@ -1591,16 +1694,39 @@ impl RusqliteBackend {
     /// legacy infallible API.
     #[must_use]
     pub fn into_connection(self) -> rusqlite::Connection {
+        self.try_into_connection().unwrap_or_else(|_| {
+            panic!("refusing to reclaim quarantined or transaction-active storage connection")
+        })
+    }
+
+    /// Reclaim the connection only when its backend epoch is proven reusable.
+    ///
+    /// On error the rejected connection is dropped, which lets SQLite close
+    /// and roll back without exposing an indeterminate epoch to a caller or
+    /// pool. Use this fallible form at cleanup boundaries that must preserve an
+    /// already-caught callback panic.
+    pub fn try_into_connection(self) -> Result<rusqlite::Connection, BackendError> {
         let quarantined = self.quarantined.load(Ordering::Acquire);
+        let authorizer_policy = Arc::clone(&self.authorizer_policy);
         let conn = match self.conn.into_inner() {
             Ok(conn) => conn,
             Err(poisoned) => poisoned.into_inner(),
         };
-        assert!(
-            !quarantined && conn.is_autocommit(),
-            "refusing to reclaim quarantined or transaction-active storage connection"
-        );
-        conn
+        if quarantined || !conn.is_autocommit() {
+            return Err(BackendError::TxPoisoned);
+        }
+        // Remove the backend phase machine while retaining the caller's
+        // explicitly transferred policy on the reclaimed raw connection.
+        conn.authorizer(Some(move |context: AuthContext<'_>| {
+            authorizer_policy(context)
+        }))
+        .map_err(|error| {
+            BackendError::Other(format!(
+                "failed to restore caller authorizer while reclaiming connection: {error}"
+            ))
+        })?;
+        conn.flush_prepared_statement_cache();
+        Ok(conn)
     }
 
     fn reject_if_transaction_active(&self) -> Result<(), BackendError> {
@@ -1656,9 +1782,57 @@ impl RusqliteBackend {
                 "injected transaction rollback failure".into(),
             ));
         }
-        conn.execute("ROLLBACK", [])
+        self.execute_backend_transaction_control(conn, "ROLLBACK")
             .map(|_| ())
-            .map_err(|error| BackendError::Query(format!("ROLLBACK failed: {error}")))
+    }
+
+    /// Execute one backend-owned outer transaction-control statement while
+    /// preventing a caller policy from blocking the backend's cleanup and
+    /// finalization. Only transaction/savepoint authorizer actions receive the
+    /// internal allow; every unrelated action still delegates to the policy.
+    fn execute_backend_transaction_control(
+        &self,
+        conn: &rusqlite::Connection,
+        sql: &'static str,
+    ) -> Result<usize, BackendError> {
+        conn.flush_prepared_statement_cache();
+        let phase = AuthorizerPhaseReset::enter(
+            self.authorizer_phase.as_ref(),
+            AUTHORIZER_PHASE_INTERNAL_CONTROL,
+        )?;
+        // This is a cleanup-and-rethrow boundary, not panic recovery. Elevated
+        // control uses uncached `Connection::execute`; catching here guarantees
+        // the phase reset and symmetric cache flush before any unexpected
+        // unwind can release the connection mutex.
+        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            conn.execute(sql, [])
+        }));
+        drop(phase);
+        conn.flush_prepared_statement_cache();
+        match execution {
+            Ok(result) => {
+                result.map_err(|error| BackendError::Query(format!("{sql} failed: {error}")))
+            }
+            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+        }
+    }
+
+    fn reinstall_owned_authorizer(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<(), BackendError> {
+        install_rusqlite_backend_authorizer(
+            conn,
+            Arc::clone(&self.authorizer_phase),
+            Arc::clone(&self.authorizer_policy),
+        )
+        .map_err(|error| {
+            BackendError::Other(format!(
+                "failed to reinstall backend-owned storage authorizer: {error}"
+            ))
+        })?;
+        conn.flush_prepared_statement_cache();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1669,13 +1843,43 @@ impl RusqliteBackend {
     /// Borrow the wrapped connection for legacy rusqlite-only helpers.
     ///
     /// Keep this crate-private: new storage call sites should use the
-    /// [`StorageBackend`] trait surface, not reach through to rusqlite.
+    /// [`StorageBackend`] trait surface, not reach through to rusqlite. The
+    /// callback must not replace/remove the SQLite authorizer or execute SQL
+    /// under a replacement hook. The backend defensively reinstalls its exact
+    /// composed hook afterward (including on unwind) so an accidental slot
+    /// mutation cannot escape the loan and weaken a later scoped transaction.
     pub(crate) fn with_connection<F, R>(&self, f: F) -> Result<R, BackendError>
     where
         F: FnOnce(&rusqlite::Connection) -> R,
     {
         let conn = self.conn_guard()?;
-        Ok(f(&conn))
+        let callback_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&conn)));
+        let reinstall_result = self.reinstall_owned_authorizer(&conn);
+        if callback_result.is_err() && !conn.is_autocommit() {
+            let rollback_result = self.rollback_callback_transaction(&conn);
+            if rollback_result.is_err() || !conn.is_autocommit() {
+                self.quarantine();
+            }
+        }
+        let reusable_after_cleanup = conn.is_autocommit();
+        drop(conn);
+        if let Err(error) = reinstall_result {
+            self.quarantine();
+            return match callback_result {
+                Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+                Ok(_) => Err(error),
+            };
+        }
+        match callback_result {
+            Ok(value) => Ok(value),
+            Err(panic_payload) => {
+                if !reusable_after_cleanup {
+                    self.quarantine();
+                }
+                std::panic::resume_unwind(panic_payload)
+            }
+        }
     }
 
     /// Open a fresh connection at UTF-8 `path` with the given config.
@@ -1721,16 +1925,36 @@ where
     let original = std::mem::replace(conn, placeholder);
     let backend = RusqliteBackend::new(original);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&backend)));
-    if matches!(
-        backend.transaction_state(),
-        Ok(BackendTransactionState::Transaction)
-    ) {
-        let _ = backend.execute("ROLLBACK");
+    let mut callback_leaked_transaction = false;
+    let cleanup = match backend.transaction_state() {
+        Ok(BackendTransactionState::Autocommit) => Ok(()),
+        Ok(BackendTransactionState::Transaction) => {
+            callback_leaked_transaction = true;
+            backend.execute("ROLLBACK").map(|_| ())
+        }
+        Err(error) => Err(error),
+    };
+    let restoration_failed = match backend.try_into_connection() {
+        Ok(restored) => {
+            let placeholder = std::mem::replace(conn, restored);
+            drop(placeholder);
+            false
+        }
+        Err(_) => true,
+    };
+
+    if cleanup.is_err() || restoration_failed {
+        return match result {
+            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+            Ok(_) => Err(crate::error::StorageError::BackendEpochPoisoned.into()),
+        };
     }
-    let restored = backend.into_connection();
-    let placeholder = std::mem::replace(conn, restored);
-    drop(placeholder);
     match result {
+        Ok(Ok(_)) if callback_leaked_transaction => Err(crate::error::StorageError::Database(
+            "test storage callback returned success with an open transaction; the loan was rolled back"
+                .to_string(),
+        )
+        .into()),
         Ok(result) => result,
         Err(panic_payload) => std::panic::resume_unwind(panic_payload),
     }
@@ -1803,8 +2027,6 @@ impl StorageBackend for RusqliteBackend {
         &self,
         f: &mut dyn FnMut(&mut dyn StorageTransaction) -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
-        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-
         let admission = TransactionAdmission::acquire(&self.transaction_active)?;
         let mut guard = self.lock_connection()?;
         if !guard.is_autocommit() {
@@ -1813,63 +2035,57 @@ impl StorageBackend for RusqliteBackend {
             ));
         }
 
-        // Rusqlite exposes a single authorizer slot. RusqliteBackend owns that
-        // slot after its first scoped transaction. The callback gate leaves the
-        // installed hook inert outside callback SQL, so backend-owned BEGIN /
-        // COMMIT / ROLLBACK remain possible without a fragile lexical parser.
-        let callback_sql_active = Arc::new(AtomicBool::new(false));
-        let authorizer_gate = Arc::clone(&callback_sql_active);
-        guard
-            .authorizer(Some(move |context: AuthContext<'_>| {
-                if authorizer_gate.load(Ordering::Acquire)
-                    && matches!(
-                        context.action,
-                        AuthAction::Transaction { .. } | AuthAction::Savepoint { .. }
-                    )
-                {
-                    Authorization::Deny
-                } else {
-                    Authorization::Allow
-                }
-            }))
-            .map_err(|error| {
-                BackendError::Other(format!("failed to install transaction authorizer: {error}"))
-            })?;
-
-        if let Err(error) = guard.execute("BEGIN", []) {
+        if let Err(error) = self.execute_backend_transaction_control(&guard, "BEGIN") {
             if !guard.is_autocommit() {
                 self.quarantine();
                 return Err(BackendError::TxPoisoned);
             }
-            return Err(BackendError::Query(format!("BEGIN failed: {error}")));
+            return Err(error);
         }
 
+        // SQLite invokes the authorizer when a statement is prepared, not on
+        // every execution. Statements cached while the callback fence was
+        // inactive must therefore be finalized before the fence is enabled.
+        // The connection mutex excludes concurrent prepares across both the
+        // cache flush and gate transition.
+        guard.flush_prepared_statement_cache();
+        let callback_phase =
+            match AuthorizerPhaseReset::enter(
+                self.authorizer_phase.as_ref(),
+                AUTHORIZER_PHASE_CALLBACK,
+            ) {
+                Ok(phase) => phase,
+                Err(error) => {
+                    self.quarantine();
+                    return Err(error);
+                }
+            };
         let mut tx_handle = RusqliteTransactionHandle {
             conn: &mut *guard,
             boundary_lost: false,
         };
-
-        callback_sql_active.store(true, Ordering::Release);
         let callback_result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx_handle)));
-        callback_sql_active.store(false, Ordering::Release);
 
         let handle_boundary_lost = tx_handle.boundary_lost();
         drop(tx_handle);
+        drop(callback_phase);
+        // Keep the inverse transition honest too: future code may add cached
+        // callback statements whose prepare-time denial should not survive
+        // after the transaction fence is disabled.
+        guard.flush_prepared_statement_cache();
         let boundary_lost = handle_boundary_lost || guard.is_autocommit();
         let callback_requested_commit = matches!(&callback_result, Ok(Ok(())));
 
         let finalization = if callback_requested_commit && !boundary_lost {
-            match guard.execute("COMMIT", []) {
+            match self.execute_backend_transaction_control(&guard, "COMMIT") {
                 Ok(_) if guard.is_autocommit() => Ok(()),
                 Ok(_) => {
                     let _ = self.rollback_callback_transaction(&guard);
                     self.quarantine();
                     Err(BackendError::TxPoisoned)
                 }
-                Err(error) => {
-                    let commit_error =
-                        BackendError::Query(format!("COMMIT failed: {error}"));
+                Err(commit_error) => {
                     let _ = self.rollback_callback_transaction(&guard);
                     if guard.is_autocommit() {
                         Err(commit_error)
@@ -2155,11 +2371,10 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         param_rows: &[Vec<ToSqlValue<'_>>],
     ) -> Result<usize, BackendError> {
-        self.reject_if_transaction_active()?;
+        let conn = self.conn_guard()?;
         if param_rows.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn_guard()?;
         let mut stmt = conn
             .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -2462,16 +2677,53 @@ mod tests {
             .unwrap();
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = with_test_storage_backend(&mut conn, |_backend| -> crate::error::Result<()> {
-                panic!("panic while connection is loaned");
+            let _ = with_test_storage_backend(&mut conn, |backend| -> crate::error::Result<()> {
+                backend.execute("BEGIN").unwrap();
+                backend
+                    .execute("INSERT INTO preserved VALUES (99)")
+                    .unwrap();
+                panic!("panic while connection is loaned with an open transaction");
             });
         }));
-        assert!(panic.is_err());
+        let payload = panic.expect_err("loan callback panic must resume");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("panic while connection is loaned with an open transaction")
+        );
 
-        let value: i64 = conn
-            .query_row("SELECT value FROM preserved", [], |row| row.get(0))
+        let values: Vec<i64> = conn
+            .prepare("SELECT value FROM preserved ORDER BY value")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(value, 7);
+        assert_eq!(values, vec![7]);
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn test_backend_loan_rejects_success_with_a_leaked_transaction() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE preserved (value INTEGER); INSERT INTO preserved VALUES (7);")
+            .unwrap();
+
+        let result = with_test_storage_backend(&mut conn, |backend| -> crate::error::Result<()> {
+            backend.execute("BEGIN").unwrap();
+            backend
+                .execute("INSERT INTO preserved VALUES (99)")
+                .unwrap();
+            Ok(())
+        });
+        let error = result.expect_err("successful callback must not hide an open transaction");
+        assert!(error
+            .to_string()
+            .contains("returned success with an open transaction"));
+        assert!(conn.is_autocommit());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM preserved", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "leaked transaction must be rolled back");
     }
 
     #[test]
@@ -2830,17 +3082,28 @@ mod tests {
         ] {
             let backend = open_memory();
             backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+            let mut ordinary_insert_admitted = false;
 
             let result = backend.with_transaction(|tx| {
                 tx.execute("INSERT INTO t VALUES (1)")?;
+                ordinary_insert_admitted = true;
                 tx.execute(control_sql)?;
                 tx.execute("INSERT INTO t VALUES (2)")?;
                 Ok(())
             });
 
+            assert!(ordinary_insert_admitted, "ordinary SQL must be authorized");
+            let message = match result {
+                Err(BackendError::Query(message)) => message,
+                other => panic!(
+                    "SQLite's parser must deny transaction control `{control_sql}`: {other:?}"
+                ),
+            };
+            let normalized_message = message.to_ascii_lowercase();
             assert!(
-                matches!(result, Err(BackendError::Query(_))),
-                "SQLite's parser must deny transaction control `{control_sql}`: {result:?}"
+                normalized_message.contains("not authorized")
+                    || normalized_message.contains("authorization denied"),
+                "`{control_sql}` must fail at the authorizer, not for an incidental semantic reason: {message}"
             );
             assert_eq!(
                 backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
@@ -2855,6 +3118,304 @@ mod tests {
                 "ordinary SQL must remain usable after denying `{control_sql}`"
             );
         }
+    }
+
+    #[test]
+    fn scoped_transaction_authorizer_classifies_every_control_action() {
+        use rusqlite::hooks::TransactionOperation;
+
+        for action in [
+            AuthAction::Transaction {
+                operation: TransactionOperation::Begin,
+            },
+            AuthAction::Transaction {
+                operation: TransactionOperation::Release,
+            },
+            AuthAction::Transaction {
+                operation: TransactionOperation::Rollback,
+            },
+            AuthAction::Savepoint {
+                operation: TransactionOperation::Begin,
+                savepoint_name: "nested",
+            },
+            AuthAction::Savepoint {
+                operation: TransactionOperation::Release,
+                savepoint_name: "nested",
+            },
+            AuthAction::Savepoint {
+                operation: TransactionOperation::Rollback,
+                savepoint_name: "nested",
+            },
+        ] {
+            assert!(callback_transaction_control_is_forbidden(AuthContext {
+                action,
+                database_name: None,
+                accessor: None,
+            }));
+        }
+        assert!(!callback_transaction_control_is_forbidden(AuthContext {
+            action: AuthAction::Insert { table_name: "t" },
+            database_name: Some("main"),
+            accessor: None,
+        }));
+    }
+
+    #[test]
+    fn rusqlite_backend_composes_caller_authorizer_with_transaction_fence() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let backend = RusqliteBackend::new_with_authorizer(conn, |context| {
+            if matches!(context.action, AuthAction::Delete { .. }) {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        });
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        let callback_result = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)")?;
+            tx.execute("DELETE FROM t")?;
+            Ok(())
+        });
+        assert!(matches!(callback_result, Err(BackendError::Query(_))));
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("0"),
+            "the caller policy must be delegated to inside the callback and roll back prior writes"
+        );
+
+        backend.execute("INSERT INTO t VALUES (2)").unwrap();
+        let deletion = backend.execute("DELETE FROM t");
+        assert!(matches!(deletion, Err(BackendError::Query(_))));
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("1"),
+            "scoped transaction setup must not erase the caller's authorizer"
+        );
+    }
+
+    #[test]
+    fn rusqlite_backend_internal_control_bypasses_only_caller_control_denials() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let backend = RusqliteBackend::new_with_authorizer(conn, |context| {
+            if callback_transaction_control_is_forbidden(context) {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        });
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+
+        assert!(matches!(backend.execute("BEGIN"), Err(BackendError::Query(_))));
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit,
+            "caller-issued transaction control must remain subject to caller policy"
+        );
+
+        backend
+            .with_transaction(|tx| {
+                tx.execute("INSERT INTO t VALUES (1)")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("1"),
+            "backend-owned BEGIN and COMMIT must remain available to the scoped transaction"
+        );
+
+        let callback_error = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (2)")?;
+            Err::<(), _>(BackendError::Other("roll back under caller policy".into()))
+        });
+        assert!(matches!(callback_error, Err(BackendError::Other(_))));
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("1"),
+            "backend-owned ROLLBACK must remain available after a callback error"
+        );
+
+        let callback_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = backend.with_transaction::<(), _>(|tx| {
+                tx.execute("INSERT INTO t VALUES (3)")?;
+                panic!("panic under transaction-denying caller policy");
+            });
+        }));
+        let payload = callback_panic.expect_err("callback panic must resume");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("panic under transaction-denying caller policy")
+        );
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("1"),
+            "backend-owned ROLLBACK must remain available before panic resume"
+        );
+        assert!(matches!(backend.execute("BEGIN"), Err(BackendError::Query(_))));
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit,
+            "the external caller policy must be restored after every scoped exit"
+        );
+    }
+
+    #[test]
+    fn rusqlite_authorizer_phase_transitions_flush_cached_authorizations() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let read_prepares = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let policy_reads = Arc::clone(&read_prepares);
+        let backend = RusqliteBackend::new_with_authorizer(conn, move |context| {
+            if matches!(context.action, AuthAction::Read { .. }) {
+                policy_reads.fetch_add(1, Ordering::AcqRel);
+            }
+            Authorization::Allow
+        });
+        const QUERY: &str = "SELECT id FROM t WHERE id = 1";
+
+        assert_eq!(backend.query_scalar(QUERY).unwrap().as_deref(), Some("1"));
+        let first_prepare_count = read_prepares.load(Ordering::Acquire);
+        assert!(first_prepare_count > 0);
+
+        backend
+            .with_transaction(|tx| {
+                tx.execute("INSERT INTO t VALUES (2)")?;
+                Ok(())
+            })
+            .unwrap();
+        let count_after_transition = read_prepares.load(Ordering::Acquire);
+        assert_eq!(backend.query_scalar(QUERY).unwrap().as_deref(), Some("1"));
+        assert!(
+            read_prepares.load(Ordering::Acquire) > count_after_transition,
+            "the identical cached query must be re-authorized after a callback phase transition"
+        );
+    }
+
+    #[test]
+    fn rusqlite_raw_connection_loan_cannot_disable_later_transaction_fence() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        backend
+            .with_connection(|conn| {
+                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .unwrap();
+            })
+            .unwrap();
+
+        let result = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)")?;
+            tx.execute("COMMIT")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(BackendError::Query(_))));
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("0"),
+            "a raw loan must not disable the authorizer fence for a later callback"
+        );
+    }
+
+    #[test]
+    fn rusqlite_raw_connection_loan_panic_restores_fence_before_resume() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = backend.with_connection(|conn| {
+                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .unwrap();
+                panic!("panic after replacing raw-loan authorizer");
+            });
+        }));
+        let payload = panic_result.expect_err("raw loan panic must resume");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("panic after replacing raw-loan authorizer")
+        );
+
+        let result = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)")?;
+            tx.execute("COMMIT")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(BackendError::Query(_))));
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("0"),
+            "panic cleanup must reinstall the fence before resuming the payload"
+        );
+    }
+
+    #[test]
+    fn rusqlite_raw_connection_loan_panic_rolls_back_an_open_transaction() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), BackendError> = backend.with_connection(|conn| {
+                conn.execute_batch("BEGIN; INSERT INTO t VALUES (1);")
+                    .unwrap();
+                panic!("panic with open raw-loan transaction");
+            });
+        }));
+        let payload = panic_result.expect_err("raw loan panic must resume");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("panic with open raw-loan transaction")
+        );
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("0"),
+            "panic cleanup must roll back a raw-loan transaction before reuse"
+        );
+        backend.execute("INSERT INTO t VALUES (2)").unwrap();
+    }
+
+    #[test]
+    fn rusqlite_raw_loan_rollback_failure_preserves_panic_and_quarantines() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        backend.inject_next_rollback_failure();
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), BackendError> = backend.with_connection(|conn| {
+                conn.execute_batch("BEGIN; INSERT INTO t VALUES (1);")
+                    .unwrap();
+                panic!("raw-loan panic before injected rollback failure");
+            });
+        }));
+        let payload = panic_result.expect_err("raw loan panic must resume");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("raw-loan panic before injected rollback failure")
+        );
+        assert!(matches!(
+            backend.query_scalar("SELECT COUNT(*) FROM t"),
+            Err(BackendError::TxPoisoned)
+        ));
+    }
+
+    #[test]
+    fn rusqlite_reclaimed_connection_retains_the_caller_policy() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let backend = RusqliteBackend::new_with_authorizer(conn, |context| {
+            if matches!(context.action, AuthAction::Delete { .. }) {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        });
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        backend.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let conn = backend.try_into_connection().unwrap();
+        assert!(conn.execute("DELETE FROM t", []).is_err());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -2885,7 +3446,7 @@ mod tests {
             let conn = backend.conn.lock().unwrap();
             let statement = conn
                 .prepare_cached("COMMIT")
-                .expect("prime transaction-control statement cache before installing authorizer");
+                .expect("prime transaction-control cache while the callback fence is inactive");
             drop(statement);
         }
 
@@ -2991,7 +3552,46 @@ mod tests {
             Err(BackendError::TxPoisoned)
         ));
         assert!(matches!(
+            backend.set_busy_timeout(std::time::Duration::from_millis(1)),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
             backend.query_scalar("SELECT COUNT(*) FROM t"),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.query_row_strings("SELECT id FROM t", &[]),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.query_map_strings("SELECT id FROM t", &[]),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.query_row_typed("SELECT id FROM t", &[]),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.query_map_typed("SELECT id FROM t", &[]),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.query_row_cells("SELECT id FROM t", &[]),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.query_map_cells("SELECT id FROM t", &[]),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.execute_many(
+                "INSERT INTO t VALUES (?1)",
+                &[vec![ToSqlValue::Integer(2)]],
+            ),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.execute_many("INSERT INTO t VALUES (?1)", &[]),
             Err(BackendError::TxPoisoned)
         ));
         assert!(matches!(
@@ -3018,7 +3618,11 @@ mod tests {
         let reclaim = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = backend.into_connection();
         }));
-        assert!(reclaim.is_err(), "quarantined connection must not escape");
+        let payload = reclaim.expect_err("quarantined connection must not escape");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("refusing to reclaim quarantined or transaction-active storage connection")
+        );
     }
 
     #[test]
@@ -3046,30 +3650,41 @@ mod tests {
 
     #[test]
     fn rusqlite_backend_transaction_rejects_same_thread_reentrancy_then_reuses() {
-        let backend = open_memory();
-        backend
-            .execute("CREATE TABLE t (id INTEGER, origin TEXT)")
-            .unwrap();
-
-        backend
-            .with_transaction(|tx| {
-                tx.execute("INSERT INTO t VALUES (1, 'transaction')")?;
-                assert!(matches!(
-                    backend.execute("INSERT INTO t VALUES (2, 'reentrant')"),
-                    Err(BackendError::TransactionBusy)
-                ));
-                tx.execute("INSERT INTO t VALUES (3, 'transaction')")?;
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let backend = open_memory();
+            let result = (|| -> Result<(), BackendError> {
+                backend.execute("CREATE TABLE t (id INTEGER, origin TEXT)")?;
+                backend.with_transaction(|tx| {
+                    tx.execute("INSERT INTO t VALUES (1, 'transaction')")?;
+                    if !matches!(
+                        backend.execute("INSERT INTO t VALUES (2, 'reentrant')"),
+                        Err(BackendError::TransactionBusy)
+                    ) {
+                        return Err(BackendError::Other(
+                            "same-thread reentrant operation was not rejected".into(),
+                        ));
+                    }
+                    tx.execute("INSERT INTO t VALUES (3, 'transaction')")?;
+                    Ok(())
+                })?;
+                backend.execute("INSERT INTO t VALUES (4, 'post_transaction')")?;
+                let count = backend.query_scalar("SELECT COUNT(*) FROM t")?;
+                if count.as_deref() != Some("3") {
+                    return Err(BackendError::Other(
+                        "same-thread reentrancy test observed an unexpected row count".into(),
+                    ));
+                }
                 Ok(())
-            })
-            .unwrap();
+            })();
+            let _ = result_sender.send(result);
+        });
 
-        backend
-            .execute("INSERT INTO t VALUES (4, 'post_transaction')")
-            .unwrap();
-        assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
-            Some("3")
-        );
+        let result = result_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("same-thread reentrancy must fail fast instead of deadlocking");
+        worker.join().expect("reentrancy worker must not panic");
+        result.unwrap();
     }
 
     #[test]
@@ -3080,20 +3695,36 @@ mod tests {
             .unwrap();
 
         let child_backend = Arc::clone(&backend);
-        backend
-            .with_transaction(|tx| {
+        let (child_result_sender, child_result_receiver) = std::sync::mpsc::sync_channel(1);
+        let mut child_handle = None;
+        let transaction_result = backend.with_transaction(|tx| {
                 tx.execute("INSERT INTO t VALUES (1, 'tx_step1')")?;
                 let child = std::thread::spawn(move || {
-                    child_backend.execute("INSERT INTO t VALUES (100, 'child')")
+                    let result = child_backend.execute("INSERT INTO t VALUES (100, 'child')");
+                    let _ = child_result_sender.send(result);
                 });
-                assert!(matches!(
-                    child.join().expect("joined child must not panic"),
-                    Err(BackendError::TransactionBusy)
-                ));
+                child_handle = Some(child);
+                match child_result_receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(Err(BackendError::TransactionBusy)) => {}
+                    Ok(other) => {
+                        return Err(BackendError::Other(format!(
+                            "joined child returned an unexpected result: {other:?}"
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(BackendError::Other(
+                            "joined child blocked on the transaction-owned connection".into(),
+                        ));
+                    }
+                }
                 tx.execute("INSERT INTO t VALUES (2, 'tx_step2')")?;
                 Ok(())
-            })
-            .unwrap();
+            });
+        child_handle
+            .expect("transaction must spawn its child")
+            .join()
+            .expect("joined child must not panic");
+        transaction_result.unwrap();
 
         assert_eq!(
             backend.transaction_state().unwrap(),

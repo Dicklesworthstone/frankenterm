@@ -46,7 +46,6 @@ pub struct DomainAttachmentFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DomainAttachmentFailureStage {
     Preparation,
-    IntentPersistence,
     Attach,
     PostAttachSpawn,
 }
@@ -83,67 +82,75 @@ pub async fn attach_domain_to_window_or_spawn_recovery(
         let domain_id = domain.domain_id();
         let domain_name = domain.domain_name().to_string();
         let owner_client_id = mux.active_identity();
-        let _lifecycle = mux_lua::reserve_domain_lifecycle(domain_name.clone())
+        let lifecycle = mux_lua::reserve_domain_lifecycle(domain_name.clone())
             .context("reserving ordered domain attachment lifecycle")?
             .enter()
             .await
             .context("entering ordered domain attachment lifecycle")?;
-
-        if domain
+        let remembers_attachment = domain
             .downcast_ref::<frankenterm_client::domain::ClientDomain>()
-            .is_some()
-        {
-            stage = DomainAttachmentFailureStage::IntentPersistence;
-            let persisted_domain_name = domain_name.clone();
-            let manifest = promise::spawn::spawn_into_new_thread(move || {
-                frankenterm_gui::domain_reconnect_manifest::set_intent(
-                    &persisted_domain_name,
-                    frankenterm_gui::domain_reconnect_manifest::DomainAttachmentIntent::Attached,
-                )
-                .map_err(anyhow::Error::new)
-            })
-            .await
-            .context("persisting domain attachment intent before attach")?;
-            crate::publish_domain_reconnect_manifest_snapshot(manifest.clone());
-            receipt.remembered_manifest_generation = Some(manifest.generation());
-        }
+            .is_some();
 
         stage = DomainAttachmentFailureStage::Attach;
-        domain
+        let attach_result = domain
             .attach(&mux, owner_client_id, Some(window_id))
             .await
-            .with_context(|| format!("attaching domain `{domain_name}` to window {window_id}"))?;
+            .with_context(|| format!("attaching domain `{domain_name}` to window {window_id}"));
+        if let Err(error) = attach_result {
+            if remembers_attachment {
+                receipt.remembered_manifest_generation = crate::remember_attached_domain_best_effort(
+                    domain_name,
+                    lifecycle.worker_hold(),
+                )
+                .await;
+            }
+            return Err(error);
+        }
         receipt.attachment_committed = true;
 
-        if mux.window_has_panes_in_domain(window_id, domain_id) {
-            return Ok(());
+        let post_attach_result = if mux.window_has_panes_in_domain(window_id, domain_id) {
+            Ok(())
+        } else {
+            stage = DomainAttachmentFailureStage::PostAttachSpawn;
+            async {
+                let config = config::configuration();
+                config.update_ulimit()?;
+                let _tab = domain
+                    .spawn(
+                        &mux,
+                        config.initial_size(
+                            dpi,
+                            Some(crate::cell_pixel_dims(&config, f64::from(dpi))?),
+                        ),
+                        command,
+                        command_dir,
+                        window_id,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "spawning recovery tab for domain `{domain_name}` in window {window_id}"
+                        )
+                    })?;
+
+                ensure!(
+                    mux.window_has_panes_in_domain(window_id, domain_id),
+                    "domain `{domain_name}` attach/spawn completed, but window {window_id} still has no panes in that domain"
+                );
+                Ok(())
+            }
+            .await
+        };
+
+        if remembers_attachment {
+            receipt.remembered_manifest_generation = crate::remember_attached_domain_best_effort(
+                domain_name,
+                lifecycle.worker_hold(),
+            )
+            .await;
         }
 
-        stage = DomainAttachmentFailureStage::PostAttachSpawn;
-        let config = config::configuration();
-        config.update_ulimit()?;
-        let _tab = domain
-            .spawn(
-                &mux,
-                config.initial_size(
-                    dpi,
-                    Some(crate::cell_pixel_dims(&config, f64::from(dpi))?),
-                ),
-                command,
-                command_dir,
-                window_id,
-            )
-            .await
-            .with_context(|| {
-                format!("spawning recovery tab for domain `{domain_name}` in window {window_id}")
-            })?;
-
-        ensure!(
-            mux.window_has_panes_in_domain(window_id, domain_id),
-            "domain `{domain_name}` attach/spawn completed, but window {window_id} still has no panes in that domain"
-        );
-
-        Ok(())
+        post_attach_result
     }
     .await;
 
@@ -385,7 +392,6 @@ mod tests {
         );
         for (stage, committed) in [
             (DomainAttachmentFailureStage::Preparation, false),
-            (DomainAttachmentFailureStage::IntentPersistence, false),
             (DomainAttachmentFailureStage::Attach, true),
             (DomainAttachmentFailureStage::PostAttachSpawn, true),
         ] {
@@ -394,5 +400,29 @@ mod tests {
                 "stage {stage:?} committed={committed} must not promise domain recovery"
             );
         }
+    }
+
+    #[test]
+    fn explicit_client_domain_attach_dials_before_best_effort_remembrance() {
+        let source = include_str!("spawn.rs");
+        let helper = source
+            .split_once("pub async fn attach_domain_to_window_or_spawn_recovery(")
+            .expect("attachment helper remains present")
+            .1
+            .split_once("\npub fn spawn_command_impl(")
+            .expect("attachment helper remains independently bounded")
+            .0;
+        let attach = helper
+            .find(".attach(&mux, owner_client_id, Some(window_id))")
+            .expect("client-domain attachment must begin its transport");
+        let remember = helper[attach..]
+            .find("remember_attached_domain_best_effort(")
+            .map(|offset| attach + offset)
+            .expect("client-domain attachment must attempt optional remembrance");
+        assert!(remember > attach);
+        assert!(
+            helper.contains("lifecycle.worker_hold()"),
+            "the uncancellable persistence worker must retain lifecycle ordering"
+        );
     }
 }

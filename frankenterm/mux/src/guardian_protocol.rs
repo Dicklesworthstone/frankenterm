@@ -3308,9 +3308,10 @@ impl GuardianProtocolState {
 
     /// Apply an authenticated operation that cannot create or mutate a runtime effect.
     ///
-    /// Effect-producing requests must use [`Self::apply_effect_transactionally`]. Keeping
-    /// the surfaces separate prevents a transport from advancing a lease or recording a
-    /// spawn before the corresponding PTY/process operation has actually succeeded.
+    /// Effect-producing requests must use the generic or operation-specific
+    /// transactional surface. Keeping observation separate prevents a transport
+    /// from advancing a lease or recording a spawn before the corresponding
+    /// PTY/process operation has actually succeeded.
     pub fn apply_observation(
         &mut self,
         request: &AuthenticatedGuardianRequest,
@@ -3363,6 +3364,12 @@ impl GuardianProtocolState {
         if request.header.operation == GuardianOperation::Checkpoint {
             return Err(GuardianProtocolError::CheckpointRequiresTypedTransaction.into());
         }
+        if request.header.operation == GuardianOperation::Input {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Input,
+            }
+            .into());
+        }
         if !request.header.operation.creates_effect() {
             return Err(GuardianProtocolError::InvalidOperationScope {
                 operation: request.header.operation,
@@ -3370,6 +3377,37 @@ impl GuardianProtocolState {
             .into());
         }
         self.apply_effect_transaction_inner(request, perform_effect)
+    }
+
+    /// Admit one input only through the journal-owned typed transaction.
+    ///
+    /// This crate-visible seam deliberately accepts only a callback whose
+    /// error means that no PTY write was attempted. The sibling input-journal
+    /// module uses it to synchronize both the intent and
+    /// `AcceptedNotDurable` records before it allows a non-cloneable write
+    /// permit to escape. Keeping this method crate-visible prevents external
+    /// callers from treating ordinary effect admission as input authority.
+    pub(crate) fn apply_input_effect_transactionally<E>(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+        prepare_durable_input: impl FnOnce(&GuardianReply) -> Result<(), E>,
+    ) -> Result<GuardianReply, GuardianEffectTransactionError<E>> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch.into());
+        }
+        if request.header.operation != GuardianOperation::Input {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            }
+            .into());
+        }
+        self.apply_effect_transaction_inner(request, |reply| {
+            match prepare_durable_input(reply) {
+                Ok(()) => GuardianEffectOutcome::Applied,
+                Err(error) => GuardianEffectOutcome::DefinitelyNotApplied(error),
+            }
+        })
     }
 
     /// Publish one checkpoint under a typed, exact, non-retryable lifecycle.
@@ -6404,7 +6442,22 @@ mod tests {
             b"effect-once",
         ));
 
-        let failed = state.apply_effect_transactionally(&input, |_| Err("zero-byte write"));
+        let generic_callback_invoked = std::cell::Cell::new(false);
+        assert!(matches!(
+            state.apply_effect_transactionally(&input, |_| {
+                generic_callback_invoked.set(true);
+                GuardianEffectOutcome::<&str>::Applied
+            }),
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::Input
+                }
+            ))
+        ));
+        assert!(!generic_callback_invoked.get());
+
+        let failed =
+            state.apply_input_effect_transactionally(&input, |_| Err("zero-byte write"));
         assert!(matches!(
             failed,
             Err(GuardianEffectTransactionError::Effect("zero-byte write"))
@@ -6420,7 +6473,7 @@ mod tests {
         );
 
         let accepted = state
-            .apply_effect_transactionally(&input, |_| Ok::<(), &str>(()))
+            .apply_input_effect_transactionally(&input, |_| Ok::<(), &str>(()))
             .unwrap();
         assert_eq!(
             accepted,
@@ -6755,11 +6808,19 @@ mod tests {
         let blocked_callbacks = std::cell::Cell::new(0_usize);
         for blocked in blocked_effects {
             let authenticated_blocked = authenticate(&blocked);
-            assert!(matches!(
+            let blocked_result = if blocked.header.operation == GuardianOperation::Input {
+                state.apply_input_effect_transactionally(&authenticated_blocked, |_| {
+                    blocked_callbacks.set(blocked_callbacks.get() + 1);
+                    Ok::<(), &str>(())
+                })
+            } else {
                 state.apply_effect_transactionally(&authenticated_blocked, |_| {
                     blocked_callbacks.set(blocked_callbacks.get() + 1);
                     GuardianEffectOutcome::<&str>::Applied
-                }),
+                })
+            };
+            assert!(matches!(
+                blocked_result,
                 Err(GuardianEffectTransactionError::Protocol(
                     GuardianProtocolError::CheckpointOutcomeIndeterminate
                 ))
@@ -8433,9 +8494,26 @@ mod tests {
     fn durable_partial_input_is_count_bound_and_exact_retries_never_reapply_prefix() {
         use crate::guardian_input_journal::{
             GuardianInputDisposition, GuardianInputJournal, GuardianInputJournalLimits,
+            GuardianInputTransaction, GuardianInputTransactionError,
+            begin_guardian_input_transaction,
         };
         use crate::guardian_output_journal::GuardianOutputCipher;
         use std::os::unix::fs::OpenOptionsExt as _;
+
+        struct ThreeByteWriter {
+            calls: u32,
+        }
+
+        impl std::io::Write for ThreeByteWriter {
+            fn write(&mut self, _payload: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                Ok(3)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
 
         let guardian = id(1);
         let mux = id(2);
@@ -8484,24 +8562,18 @@ mod tests {
             )
             .expect("activate input journal");
 
-        let callback_invocations = std::cell::Cell::new(0_u32);
-        let mut write_permit = None;
-        let accepted = state
-            .apply_effect_transactionally(&authenticated_input, |_| {
-                callback_invocations.set(callback_invocations.get() + 1);
-                journal.append_intent_and_sync(identity)?;
-                write_permit = journal
-                    .append_disposition_and_sync(
-                        identity,
-                        GuardianInputDisposition::AcceptedNotDurable,
-                    )?
-                    .into_first_pty_write_permit();
-                Ok::<(), crate::guardian_input_journal::GuardianInputJournalError>(())
-            })
-            .unwrap();
-        assert_eq!(callback_invocations.get(), 1);
-        let write_permit =
-            write_permit.expect("fresh accepted marker yields exact write permit");
+        let (accepted, write_permit) =
+            match begin_guardian_input_transaction(&mut state, &mut journal, &authenticated_input)
+                .unwrap()
+            {
+                GuardianInputTransaction::WriteAuthorized {
+                    accepted_reply,
+                    permit,
+                } => (accepted_reply, permit),
+                GuardianInputTransaction::Reconciled(_) => {
+                    panic!("new input must yield one fresh write permit")
+                }
+            };
         assert_eq!(write_permit.identity(), identity);
         assert!(matches!(
             accepted,
@@ -8523,10 +8595,16 @@ mod tests {
         );
         assert_eq!(state, before_invalid_count);
 
+        let mut writer = ThreeByteWriter { calls: 0 };
+        let write_outcome = write_permit.write_once(&mut writer, authenticated_input.payload());
+        assert_eq!(writer.calls, 1);
+        assert_eq!(write_outcome.applied_bytes(), Some(3));
         let terminal_permit = journal
             .append_disposition_and_sync(
                 identity,
-                GuardianInputDisposition::DurablePrefix { applied_bytes: 3 },
+                write_outcome
+                    .disposition()
+                    .expect("partial write has an exact disposition"),
             )
             .expect("persist exact partial result")
             .into_terminal_protocol_permit()
@@ -8554,30 +8632,18 @@ mod tests {
         );
         assert_eq!(state, terminal_state);
 
-        let exact_replay_callback = std::cell::Cell::new(false);
-        assert_eq!(
-            state
-                .apply_effect_transactionally(&authenticated_input, |_| {
-                    exact_replay_callback.set(true);
-                    Ok::<(), std::convert::Infallible>(())
-                })
-                .unwrap(),
-            partial
-        );
-        assert!(!exact_replay_callback.get());
+        let records_before_retries = journal.record_count();
+        assert!(matches!(
+            begin_guardian_input_transaction(&mut state, &mut journal, &authenticated_input),
+            Ok(GuardianInputTransaction::Reconciled(reply)) if reply == partial
+        ));
         let mut alias = input.clone();
         alias.header.request_id = id(62);
-        let alias_callback = std::cell::Cell::new(false);
-        assert_eq!(
-            state
-                .apply_effect_transactionally(&authenticate(&alias), |_| {
-                    alias_callback.set(true);
-                    Ok::<(), std::convert::Infallible>(())
-                })
-                .unwrap(),
-            partial
-        );
-        assert!(!alias_callback.get());
+        assert!(matches!(
+            begin_guardian_input_transaction(&mut state, &mut journal, &authenticate(&alias)),
+            Ok(GuardianInputTransaction::Reconciled(reply)) if reply == partial
+        ));
+        assert_eq!(journal.record_count(), records_before_retries);
 
         let before_payload_splice = state.clone();
         let mut same_length_payload_splice = input.clone();
@@ -8585,20 +8651,16 @@ mod tests {
         same_length_payload_splice.payload = b"abcxef".to_vec();
         same_length_payload_splice.header.payload_sha256 =
             Sha256::digest(&same_length_payload_splice.payload).into();
-        let splice_callback = std::cell::Cell::new(false);
         assert!(matches!(
-            state.apply_effect_transactionally(
+            begin_guardian_input_transaction(
+                &mut state,
+                &mut journal,
                 &authenticate(&same_length_payload_splice),
-                |_| {
-                    splice_callback.set(true);
-                    Ok::<(), std::convert::Infallible>(())
-                },
             ),
-            Err(GuardianEffectTransactionError::Protocol(
+            Err(GuardianInputTransactionError::Protocol(
                 GuardianProtocolError::EffectIdentityConflict
             ))
         ));
-        assert!(!splice_callback.get());
         assert_eq!(state, before_payload_splice);
 
         let query = request(
@@ -9282,9 +9344,9 @@ mod tests {
         );
         let stale_retry_callback = std::cell::Cell::new(false);
         assert!(matches!(
-            state.apply_effect_transactionally(&authenticate(&input), |_| {
+            state.apply_input_effect_transactionally(&authenticate(&input), |_| {
                 stale_retry_callback.set(true);
-                GuardianEffectOutcome::<std::convert::Infallible>::Applied
+                Ok::<(), std::convert::Infallible>(())
             }),
             Err(GuardianEffectTransactionError::Protocol(
                 GuardianProtocolError::RepeatedSequence {

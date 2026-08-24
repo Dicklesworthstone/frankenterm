@@ -212,6 +212,15 @@ detached peer. A successful explicit attach refreshes the remembered supervisor
 plan as well as the live connection, preserving automatic recovery if the
 connection's internal retry budget is later exhausted.
 
+If an intent write reports a late failure, FrankenTerm reloads the replicated
+authority before deciding what happened. A two-replica commit is repaired and
+accepted only when the recovered quorum contains the exact requested intent; a
+pre-commit failure republishes the proven older quorum and leaves the requested
+live mutation unperformed. If the reload itself cannot establish a quorum, the
+in-memory snapshot is cleared and the reconnect supervisor is cancelled. An
+explicit attach may still continue as a direct operator action, but it is not
+advertised as remembered and cannot inherit stale automatic-reconnect state.
+
 Hot configuration reload retires an old exact client-domain generation before
 publishing its replacement, but continues adding unrelated domains and a safe
 default while that guard drains. It retries the newest configuration until the
@@ -227,22 +236,39 @@ scheduler saturation is retained by one serialized retry coordinator, and a
 thread that failed to start is never reported as a pending reconnect.
 
 The preference is stored under FrankenTerm's mode-0700 private data directory
-in two alternating, mode-0600 checksummed files. It stores only
-domain-separated SHA-256 fingerprints of domain aliases, never raw aliases,
-addresses, usernames, socket paths, or credentials. The directory is pinned as
-a capability before the lock or either slot is opened; every leaf is opened
-relative to that descriptor without following symlinks, constrained to one
-private regular-file link owned by the same account, and revalidated against
-its name after I/O. Replacing the directory, lock, or slot therefore fails the
-operation instead of splitting lock authority or falsely reporting a durable
-preference. If neither slot is valid, FrankenTerm reports the fault
-and falls back only to explicit `connect_automatically = true` configuration;
-damaged optional preference state cannot silently broaden connection authority.
-An explicit operator-requested attach still proceeds when this optional
-preference cannot be written, with a persistent warning that restart recovery
-was not remembered. An explicit detach remains fail-closed until its durable
-negative intent commits, preventing an older `Attached` record from reconnecting
-behind the operator's request.
+in three replicated, mode-0600 checksummed files. Schema v2 requires two exact
+replicas of the same complete generation before that state is authoritative. A
+higher-generation singleton is an interrupted publication and cannot displace
+the older two-replica quorum. A preference update reports success only after
+all three replicas have been written, synchronized, read back, and verified.
+On load, FrankenTerm repairs a missing, damaged, or stale replica only from an
+already authoritative quorum. If no quorum remains, reconnect is paused and
+the fault is reported; the loader does not select an older generation or fall
+back to `connect_automatically`.
+
+Existing schema-v1 two-slot state is migrated in place while holding the same
+exclusive authority lock. Migration accepts either two valid legacy slots (the
+newer generation wins, while divergent equal generations fail closed) or the
+canonical first publication in slot 0 at generation 1 with slot 1 absent. A
+single valid legacy slot paired with a damaged or empty slot is ambiguous and
+is never used as authority. Migration publishes schema v2 to the third slot
+first, then the stale legacy slot, and finally the active legacy slot. After a
+crash, it resumes only from an exact cross-schema content quorum or a normal
+schema-v2 quorum; once schema v2 is present, an unrelated older schema-v1 state
+is never a fallback.
+
+The files store only domain-separated SHA-256 fingerprints of domain aliases,
+never raw aliases, addresses, usernames, socket paths, or credentials. The
+directory is pinned as a capability before the lock or any slot is opened;
+every leaf is opened relative to that descriptor without following symlinks,
+constrained to one private regular-file link owned by the same account, and
+revalidated against its name after I/O. Replacing the directory, lock, or slot
+therefore fails the operation instead of splitting lock authority or falsely
+reporting a durable preference. An explicit operator-requested attach still
+proceeds when this optional preference cannot be written, with a persistent
+warning that restart recovery was not remembered. An explicit detach remains
+fail-closed until its durable negative intent commits, preventing an older
+`Attached` record from reconnecting behind the operator's request.
 
 ### Accessibility Timing
 

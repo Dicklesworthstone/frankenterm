@@ -1,17 +1,28 @@
-//! Durable raw PTY-output ownership for the standalone guardian.
+//! Durable PTY-output and input-WAL ownership for the standalone guardian.
 //!
 //! The readiness thread never performs a journal `sync_all` itself. It hands
 //! one bounded, zeroizing plaintext allocation to this fixed worker pool and
 //! receives only a content-free append receipt after the encrypted journal
 //! record and its filesystem identity have been synchronized and rechecked.
-//! There is deliberately no plaintext getter or mux-delivery API here.
+//! There is deliberately no plaintext getter or mux-delivery API here. Input
+//! WAL records retain only encrypted effect metadata, never raw input bytes.
 
 use crate::transport::provision_guardian_token_in_pinned_parent;
 use mio::Waker;
+use mux::guardian_input_journal::{
+    GuardianInputDisposition, GuardianInputJournal, GuardianInputJournalError,
+    GuardianInputJournalLimits, GuardianInputTransaction, GuardianInputTransactionError,
+    GuardianInputWriteOutcome, begin_guardian_input_transaction,
+    replay_guardian_input_without_writer,
+};
 use mux::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputJournal,
     GuardianOutputJournalError, GuardianOutputJournalLimits, GuardianOutputJournalTail,
     GuardianOutputKey, GuardianOutputPredecessor, GuardianOutputSegmentIdentity,
+};
+use mux::guardian_protocol::{
+    AuthenticatedGuardianRequest, GuardianEffectTransactionError, GuardianProtocolError,
+    GuardianProtocolState, GuardianReply,
 };
 use nix::unistd::geteuid;
 use sha2::{Digest as _, Sha256};
@@ -32,6 +43,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 pub(crate) const OUTPUT_RECORD_BYTES: usize = 8 * 1024;
 const OUTPUT_DIRECTORY_NAME: &str = "guardian-output-v3";
 const OUTPUT_KEY_NAME: &str = "journal.key";
+const INPUT_JOURNAL_SUFFIX: &str = "ftgin";
 const OUTPUT_WORKER_THREADS: usize = 2;
 const OUTPUT_MAX_IN_FLIGHT: usize = 64;
 const OUTPUT_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
@@ -67,6 +79,8 @@ pub(crate) enum GuardianOutputError {
     },
     #[error("guardian output journal initialization failed")]
     Journal(#[from] GuardianOutputJournalError),
+    #[error("guardian encrypted input journal initialization failed")]
+    InputJournal(#[from] GuardianInputJournalError),
     #[error("guardian output worker allocation failed")]
     Allocation,
 }
@@ -619,6 +633,150 @@ impl GuardianPaneOutputJournal {
     }
 }
 
+/// Descriptor-pinned encrypted input WAL for one live pane.
+pub(crate) struct GuardianPaneInputJournal {
+    journal: GuardianInputJournal,
+    directory: File,
+    directory_path: PathBuf,
+    path: PathBuf,
+    file_identity: FileIdentity,
+    persistence: Arc<PersistentOutputAuthority>,
+}
+
+pub(crate) type GuardianPaneInputTransaction = GuardianInputTransaction;
+
+pub(crate) enum GuardianPaneInputTransactionError {
+    Protocol(GuardianProtocolError),
+    JournalBeforeWrite,
+    AuthorityBeforeWrite,
+    OutcomeIndeterminate,
+    AcceptedJournalUnavailable(GuardianReply),
+    AcceptedAuthorityUnavailable,
+    AcceptedProtocolUnavailable(GuardianReply),
+}
+
+pub(crate) enum GuardianPaneInputCompletionError {
+    DispositionIndeterminate,
+    Journal,
+    Authority,
+    Protocol,
+}
+
+impl GuardianPaneInputJournal {
+    fn validate_path_authority(&self) -> Result<(), GuardianOutputError> {
+        self.persistence
+            .validate(&self.directory)
+            .map_err(|_| {
+                GuardianOutputError::FilesystemAuthority(
+                    "guardian input persistence authority changed",
+                )
+            })?;
+        validate_file_identity_at(
+            &self.directory,
+            &self.directory_path,
+            &self.path,
+            FileIdentity {
+                expected_len: Some(self.journal.committed_bytes()),
+                ..self.file_identity
+            },
+        )
+    }
+
+    /// Durably admit one exact input and yield write authority only for the
+    /// newly synchronized `AcceptedNotDurable` transition.
+    pub(crate) fn begin_transaction(
+        &mut self,
+        protocol: &mut GuardianProtocolState,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianPaneInputTransaction, GuardianPaneInputTransactionError> {
+        if self.validate_path_authority().is_err() {
+            return match replay_guardian_input_without_writer(protocol, request) {
+                Ok(_) => Err(GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable),
+                Err(GuardianEffectTransactionError::Protocol(error)) => {
+                    Err(GuardianPaneInputTransactionError::Protocol(error))
+                }
+                Err(GuardianEffectTransactionError::Effect(())) => {
+                    Err(GuardianPaneInputTransactionError::AuthorityBeforeWrite)
+                }
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => {
+                    Err(GuardianPaneInputTransactionError::OutcomeIndeterminate)
+                }
+            };
+        }
+        let transaction = begin_guardian_input_transaction(protocol, &mut self.journal, request);
+        match transaction {
+            Ok(transaction) => {
+                self.validate_path_authority().map_err(|_| {
+                    GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
+                })?;
+                Ok(transaction)
+            }
+            Err(GuardianInputTransactionError::Protocol(error)) => {
+                Err(GuardianPaneInputTransactionError::Protocol(error))
+            }
+            Err(GuardianInputTransactionError::JournalBeforeWrite(_)) => {
+                Err(GuardianPaneInputTransactionError::JournalBeforeWrite)
+            }
+            Err(GuardianInputTransactionError::OutcomeIndeterminate(_)) => {
+                Err(GuardianPaneInputTransactionError::OutcomeIndeterminate)
+            }
+            Err(GuardianInputTransactionError::AcceptedJournalUnavailable {
+                accepted_reply,
+                error: _,
+            }) => {
+                self.validate_path_authority().map_err(|_| {
+                    GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
+                })?;
+                Err(GuardianPaneInputTransactionError::AcceptedJournalUnavailable(
+                    accepted_reply,
+                ))
+            }
+            Err(GuardianInputTransactionError::AcceptedProtocolUnavailable {
+                accepted_reply,
+                error: _,
+            }) => {
+                self.validate_path_authority().map_err(|_| {
+                    GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
+                })?;
+                Err(GuardianPaneInputTransactionError::AcceptedProtocolUnavailable(
+                    accepted_reply,
+                ))
+            }
+        }
+    }
+
+    /// Synchronize the exact one-write outcome before completing protocol state.
+    pub(crate) fn complete_write(
+        &mut self,
+        protocol: &mut GuardianProtocolState,
+        outcome: GuardianInputWriteOutcome,
+    ) -> Result<GuardianReply, GuardianPaneInputCompletionError> {
+        let disposition = outcome
+            .disposition()
+            .ok_or(GuardianPaneInputCompletionError::DispositionIndeterminate)?;
+        if matches!(
+            disposition,
+            GuardianInputDisposition::Intent | GuardianInputDisposition::AcceptedNotDurable
+        ) {
+            return Err(GuardianPaneInputCompletionError::DispositionIndeterminate);
+        }
+        self.validate_path_authority()
+            .map_err(|_| GuardianPaneInputCompletionError::Authority)?;
+        let append = self
+            .journal
+            .append_disposition_and_sync(outcome.identity(), disposition)
+            .map_err(|_| GuardianPaneInputCompletionError::Journal)?;
+        self.validate_path_authority()
+            .map_err(|_| GuardianPaneInputCompletionError::Authority)?;
+        let permit = append.into_terminal_protocol_permit().ok_or(
+            GuardianPaneInputCompletionError::Protocol,
+        )?;
+        permit
+            .reconcile_protocol(protocol)
+            .map_err(|_| GuardianPaneInputCompletionError::Protocol)
+    }
+}
+
 struct OutputJob {
     pane_id: Uuid,
     journal: GuardianPaneOutputJournal,
@@ -893,6 +1051,85 @@ impl GuardianOutputPipeline {
         pane_journal_handle(authority)
     }
 
+    /// Create or reopen the empty encrypted WAL that will own input effects for
+    /// a newly spawned PTY. This is deliberately not restart recovery: any
+    /// committed input phase makes replacement-child creation ambiguous.
+    pub(crate) fn prepare_input(
+        &self,
+        guardian_incarnation: Uuid,
+        pane_id: Uuid,
+    ) -> Result<GuardianPaneInputJournal, GuardianOutputError> {
+        self.persistence
+            .validate(&self.directory)
+            .map_err(|_| {
+                GuardianOutputError::FilesystemAuthority(
+                    "guardian input persistence authority changed",
+                )
+            })?;
+        let directory = self
+            .directory
+            .try_clone()
+            .map_err(|error| GuardianOutputError::io("input-directory-clone", error))?;
+        let path = input_journal_path(&self.directory_path, guardian_incarnation, pane_id);
+        let file = match open_private_file_at(
+            &directory,
+            &self.directory_path,
+            &path,
+            false,
+        ) {
+            Ok(file) => file,
+            Err(GuardianOutputError::Io { source, .. })
+                if source.kind() == ErrorKind::NotFound =>
+            {
+                create_private_file_new_at(&directory, &self.directory_path, &path)?
+            }
+            Err(error) => return Err(error),
+        };
+        let opened = file
+            .metadata()
+            .map_err(|error| GuardianOutputError::io("input-journal-metadata", error))?;
+        validate_private_file_metadata(&opened, None)?;
+        let file_identity = FileIdentity::capture(&opened, None);
+        validate_file_identity_at(
+            &directory,
+            &self.directory_path,
+            &path,
+            file_identity,
+        )?;
+        let mut journal = GuardianInputJournal::open(
+            file,
+            pane_id,
+            self.cipher.clone(),
+            GuardianInputJournalLimits::default(),
+        )?;
+        journal.sync_parent_directory_and_activate(&directory)?;
+        // An existing empty header may be the residue of a crash between file
+        // sync and directory sync. Re-synchronize the descriptor unconditionally
+        // before treating that path as active spawn authority.
+        directory
+            .sync_all()
+            .map_err(|error| GuardianOutputError::io("input-directory-sync", error))?;
+        if journal.record_count() != 0
+            || journal.effects().len() != 0
+            || journal.tail() != mux::guardian_input_journal::GuardianInputJournalTail::Clean
+            || journal.is_poisoned()
+        {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian input spawn retry found an ambiguous nonempty journal",
+            ));
+        }
+        let input = GuardianPaneInputJournal {
+            journal,
+            directory,
+            directory_path: self.directory_path.clone(),
+            path,
+            file_identity,
+            persistence: Arc::clone(&self.persistence),
+        };
+        input.validate_path_authority()?;
+        Ok(input)
+    }
+
     #[cfg(test)]
     fn cold_open_pane_for_validation(
         &self,
@@ -1108,6 +1345,18 @@ fn journal_can_append(
 
 fn pane_file_prefix(guardian_incarnation: Uuid, pane_id: Uuid) -> String {
     format!("pane-{pane_id}.guardian-{guardian_incarnation}.")
+}
+
+fn input_journal_path(
+    directory_path: &Path,
+    guardian_incarnation: Uuid,
+    pane_id: Uuid,
+) -> PathBuf {
+    // This intentionally does not begin with `pane_file_prefix`: the output
+    // manifest scanner must never count an input WAL as an output artifact.
+    directory_path.join(format!(
+        "input-pane-{pane_id}.guardian-{guardian_incarnation}.{INPUT_JOURNAL_SUFFIX}"
+    ))
 }
 
 fn segment_path(
@@ -3064,6 +3313,52 @@ mod tests {
         completion(pipeline)?
             .result
             .map_err(|_| "durable append failed".into())
+    }
+
+    #[test]
+    fn input_wal_allows_only_empty_spawn_retry_and_stays_out_of_output_namespace(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-input-spawn-retry-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let guardian_incarnation = Uuid::from_u128(0x71);
+        let pane_id = Uuid::from_u128(0x72);
+        let path = input_journal_path(
+            &pipeline.directory_path,
+            guardian_incarnation,
+            pane_id,
+        );
+        assert!(
+            !path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("input journal file name")
+                .starts_with(&pane_file_prefix(guardian_incarnation, pane_id))
+        );
+
+        let first = pipeline.prepare_input(guardian_incarnation, pane_id)?;
+        drop(first);
+        let mut retry = pipeline.prepare_input(guardian_incarnation, pane_id)?;
+        let payload = b"test";
+        let identity = mux::guardian_protocol::GuardianInputEffectIdentity::new(
+            pane_id,
+            Uuid::from_u128(0x73),
+            1,
+            1,
+            Uuid::from_u128(0x74),
+            u32::try_from(payload.len())?,
+            Sha256::digest(payload).into(),
+        )?;
+        retry.journal.append_intent_and_sync(identity)?;
+        drop(retry);
+        assert!(
+            pipeline
+                .prepare_input(guardian_incarnation, pane_id)
+                .is_err(),
+            "a committed input phase must block replacement-PTY spawn preparation"
+        );
+        Ok(())
     }
 
     #[cfg(any(
