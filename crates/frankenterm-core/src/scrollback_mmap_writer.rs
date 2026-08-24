@@ -104,6 +104,12 @@ struct OpenedWriterFile {
     created: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingStateSlotRepair {
+    slot_index: usize,
+    prior_bytes: [u8; V2_STATE_SLOT_SIZE],
+}
+
 /// Caller-owned resource envelope for decoding a legacy mmap scrollback file.
 ///
 /// Recovery is forensic and fail-closed: reaching any limit returns an error;
@@ -335,10 +341,22 @@ pub struct MmapScrollback {
     /// successful data sync. While dirty, later publications reuse this slot
     /// so the other slot remains the immutable last-sync recovery authority.
     state_slot_dirty: bool,
+    /// Original bytes captured before a state-slot publication that returned
+    /// an I/O error. No later sync or append may proceed until these bytes have
+    /// been republished and synced, because the failed write may have torn the
+    /// only slot representing the in-memory rollback state.
+    pending_state_slot_repair: Option<PendingStateSlotRepair>,
+    /// Terminal fail-closed state entered when a required slot repair cannot
+    /// itself be written and synced.
+    write_poisoned: bool,
     used_bytes: u64,
     prewrite_sync_required: bool,
     #[cfg(test)]
     sync_observer: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
+    state_slot_partial_write_failure_after: Option<usize>,
+    #[cfg(test)]
+    state_slot_repair_write_failure: bool,
 }
 
 impl fmt::Debug for MmapScrollback {
@@ -356,6 +374,11 @@ impl fmt::Debug for MmapScrollback {
             .field("v2_state", &self.v2_state)
             .field("active_state_slot", &self.active_state_slot)
             .field("state_slot_dirty", &self.state_slot_dirty)
+            .field(
+                "state_slot_repair_required",
+                &self.pending_state_slot_repair.is_some(),
+            )
+            .field("write_poisoned", &self.write_poisoned)
             .field("used_bytes", &self.used_bytes)
             .field("prewrite_sync_required", &self.prewrite_sync_required)
             .finish()
@@ -576,10 +599,16 @@ impl MmapScrollback {
             v2_state,
             active_state_slot,
             state_slot_dirty: false,
+            pending_state_slot_repair: None,
+            write_poisoned: false,
             used_bytes,
             prewrite_sync_required: false,
             #[cfg(test)]
             sync_observer: None,
+            #[cfg(test)]
+            state_slot_partial_write_failure_after: None,
+            #[cfg(test)]
+            state_slot_repair_write_failure: false,
         };
         if opened_data.created {
             writer.header.last_msync_at_epoch_ms = epoch_millis(SystemTime::now());
@@ -678,7 +707,10 @@ impl MmapScrollback {
         record_kind: RecordKind,
         redacted: RedactionResult,
     ) -> Result<MmapAppendReport, MmapScrollbackError> {
-        if self.prewrite_sync_required {
+        if self.prewrite_sync_required
+            || self.pending_state_slot_repair.is_some()
+            || self.write_poisoned
+        {
             self.sync()?;
         }
         let payload = fit_payload_to_capacity(redacted.bytes, self.header.capacity_bytes)?;
@@ -885,6 +917,13 @@ impl MmapScrollback {
     }
 
     pub fn sync(&mut self) -> Result<(), MmapScrollbackError> {
+        if self.pending_state_slot_repair.is_some() {
+            self.repair_state_slot_before_sync()?;
+        } else if self.write_poisoned {
+            return Err(MmapScrollbackError::WriterPoisoned {
+                path: self.path.clone(),
+            });
+        }
         match self.sync_current_state() {
             Ok(()) => {
                 self.prewrite_sync_required = false;
@@ -899,6 +938,42 @@ impl MmapScrollback {
                 Err(error)
             }
         }
+    }
+
+    fn repair_state_slot_before_sync(&mut self) -> Result<(), MmapScrollbackError> {
+        let Some(repair) = self.pending_state_slot_repair.take() else {
+            return Ok(());
+        };
+        let offset = V2_STATE_SLOTS_OFFSET + repair.slot_index * V2_STATE_SLOT_SIZE;
+        let repair_write = (|| -> std::io::Result<()> {
+            self.file.seek(SeekFrom::Start(offset as u64))?;
+            #[cfg(test)]
+            if std::mem::take(&mut self.state_slot_repair_write_failure) {
+                return Err(std::io::Error::other(
+                    "injected state-slot repair write failure",
+                ));
+            }
+            self.file.write_all(&repair.prior_bytes)
+        })();
+        if let Err(source) = repair_write {
+            self.write_poisoned = true;
+            return Err(MmapScrollbackError::WriteHeader {
+                path: self.path.clone(),
+                source,
+            });
+        }
+        if let Err(error) = self.sync_file_data() {
+            self.write_poisoned = true;
+            return Err(error);
+        }
+
+        // The exact pre-attempt image is once again durable. For an active
+        // dirty-slot failure this image represents the caller's rollback
+        // state; for a first-dirty alternate failure the untouched active slot
+        // remains authoritative. Either way, a clean slot rotation is safe.
+        self.state_slot_dirty = false;
+        self.write_poisoned = false;
+        Ok(())
     }
 
     fn sync_current_state(&mut self) -> Result<(), MmapScrollbackError> {
@@ -948,6 +1023,11 @@ impl MmapScrollback {
     }
 
     fn publish_v2_state(&mut self) -> Result<(), MmapScrollbackError> {
+        if self.write_poisoned || self.pending_state_slot_repair.is_some() {
+            return Err(MmapScrollbackError::WriterPoisoned {
+                path: self.path.clone(),
+            });
+        }
         let mut next = self.v2_state;
         next.slot_epoch = next.slot_epoch.checked_add(1).ok_or_else(|| {
             MmapScrollbackError::V2Integrity {
@@ -963,13 +1043,38 @@ impl MmapScrollback {
         let base = encode_v2_base_header(self.header);
         let encoded = encode_v2_state_slot(&base, next);
         let offset = V2_STATE_SLOTS_OFFSET + next_slot * V2_STATE_SLOT_SIZE;
+        let mut prior_bytes = [0u8; V2_STATE_SLOT_SIZE];
         self.file
             .seek(SeekFrom::Start(offset as u64))
-            .and_then(|_| self.file.write_all(&encoded))
-            .map_err(|source| MmapScrollbackError::WriteHeader {
+            .and_then(|_| self.file.read_exact(&mut prior_bytes))
+            .map_err(|source| MmapScrollbackError::ReadHeader {
                 path: self.path.clone(),
                 source,
             })?;
+        let publish_write = (|| -> std::io::Result<()> {
+            self.file.seek(SeekFrom::Start(offset as u64))?;
+            #[cfg(test)]
+            if let Some(failure_after) = self.state_slot_partial_write_failure_after.take() {
+                let prefix_len = failure_after.min(encoded.len());
+                self.file.write_all(&encoded[..prefix_len])?;
+                return Err(std::io::Error::other(
+                    "injected partial state-slot write failure",
+                ));
+            }
+            self.file.write_all(&encoded)
+        })();
+        if let Err(source) = publish_write {
+            self.pending_state_slot_repair = Some(PendingStateSlotRepair {
+                slot_index: next_slot,
+                prior_bytes,
+            });
+            self.prewrite_sync_required = true;
+            self.write_poisoned = true;
+            return Err(MmapScrollbackError::WriteHeader {
+                path: self.path.clone(),
+                source,
+            });
+        }
         self.v2_state = next;
         self.active_state_slot = next_slot;
         self.state_slot_dirty = true;
@@ -2561,6 +2666,10 @@ pub enum MmapScrollbackError {
     LegacyV1ReadOnly { path: PathBuf },
     #[error("scrollback writer is already active for {path}")]
     WriterBusy { path: PathBuf },
+    #[error(
+        "scrollback writer for {path} is poisoned after a state-slot repair failure; close it and preserve the file for recovery"
+    )]
+    WriterPoisoned { path: PathBuf },
     #[error("v2 scrollback integrity failure for {path}: {reason}")]
     V2Integrity {
         path: PathBuf,
@@ -2938,19 +3047,20 @@ mod tests {
         payload: &[u8],
     ) -> MmapAppendReport {
         writer
-            .append_redacted_payload(
-                kind,
-                RedactionResult {
-                    bytes: payload.to_vec(),
-                    evidence: BytesRedactionEvidence {
-                        original_input_bytes: payload.len() as u64,
-                        decoded_input_text_bytes: payload.len() as u64,
-                        redacted_output_bytes: payload.len() as u64,
-                        ..BytesRedactionEvidence::default()
-                    },
-                },
-            )
+            .append_redacted_payload(kind, test_redaction_result(payload))
             .expect("append test payload")
+    }
+
+    fn test_redaction_result(payload: &[u8]) -> RedactionResult {
+        RedactionResult {
+            bytes: payload.to_vec(),
+            evidence: BytesRedactionEvidence {
+                original_input_bytes: payload.len() as u64,
+                decoded_input_text_bytes: payload.len() as u64,
+                redacted_output_bytes: payload.len() as u64,
+                ..BytesRedactionEvidence::default()
+            },
+        }
     }
 
     fn v2_state_slot_bytes(bytes: &[u8], slot_index: usize) -> &[u8] {
