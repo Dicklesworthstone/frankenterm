@@ -775,7 +775,7 @@ enum GuardianCheckpointStageContextAuthorityV1 {
 /// requires a separately supplied exact expected context and re-identifies the
 /// decrypted plaintext. A persisted claim can be authenticated and opened but
 /// cannot authorize a new seal.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct GuardianCheckpointStageRecordContextV1 {
     kind: GuardianCheckpointStageRecordKindV1,
     scope: GuardianCheckpointStageScopeV1,
@@ -788,6 +788,14 @@ pub struct GuardianCheckpointStageRecordContextV1 {
     plaintext_digest: [u8; 32],
     authority: GuardianCheckpointStageContextAuthorityV1,
 }
+
+impl PartialEq for GuardianCheckpointStageRecordContextV1 {
+    fn eq(&self, other: &Self) -> bool {
+        checkpoint_stage_contexts_match(self, other)
+    }
+}
+
+impl Eq for GuardianCheckpointStageRecordContextV1 {}
 
 impl GuardianCheckpointStageRecordContextV1 {
     pub fn candidate_metadata(
@@ -3530,13 +3538,10 @@ mod tests {
             plaintext,
         )
         .expect("construct candidate context");
-        let oversized_plaintext = Zeroizing::new(vec![
-            0x5a;
-            usize::try_from(
-                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES + 1
-            )
-            .expect("staging bound fits usize")
-        ]);
+        let oversized_bytes =
+            usize::try_from(GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES + 1)
+                .expect("staging bound fits usize");
+        let oversized_plaintext = Zeroizing::new(vec![0x5a; oversized_bytes]);
         assert!(matches!(
             GuardianCheckpointStageRecordContextV1::candidate_metadata(
                 scope,
