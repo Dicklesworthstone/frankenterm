@@ -114,7 +114,7 @@ impl std::fmt::Debug for GuardianOutputKeyring {
 impl GuardianOutputKeyring {
     /// Open the one guardian output keyring shared by encrypted scrollback and
     /// guardian journals, provisioning it only in the deterministic private
-    /// sibling of the scrollback store.
+    /// sibling of the durable pane directories inside the scrollback store.
     pub fn open_or_provision_scrollback_sibling(
         scrollback_base_dir: &Path,
     ) -> Result<Self, GuardianOutputKeyringError> {
@@ -249,10 +249,10 @@ fn open_inventory(
 fn scrollback_keyring_path(
     scrollback_base_dir: &Path,
 ) -> Result<PathBuf, GuardianOutputKeyringError> {
-    let parent = scrollback_base_dir
-        .parent()
-        .ok_or_else(|| std::io::Error::other("scrollback storage path has no parent"))?;
-    Ok(parent.join(SCROLLBACK_KEYRING_SIBLING))
+    if scrollback_base_dir.as_os_str().is_empty() {
+        return Err(std::io::Error::other("scrollback storage path is empty").into());
+    }
+    Ok(scrollback_base_dir.join(SCROLLBACK_KEYRING_SIBLING))
 }
 
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
@@ -283,8 +283,12 @@ fn open_private_path(path: &Path) -> Result<CapDir, GuardianOutputKeyringError> 
         return Err(GuardianOutputKeyringError::DirectoryNotPrivate);
     }
     #[cfg(unix)]
-    if before.permissions().mode() & 0o7777 != 0o700 {
-        return Err(GuardianOutputKeyringError::DirectoryNotPrivate);
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if before.permissions().mode() & 0o7777 != 0o700 {
+            return Err(GuardianOutputKeyringError::DirectoryNotPrivate);
+        }
     }
     let directory = CapDir::open_ambient_dir(path, cap_std::ambient_authority())?;
     validate_directory(&directory)?;
@@ -755,6 +759,9 @@ fn read_activation(mut file: CapFile) -> Result<Activation, GuardianOutputKeyrin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mux::guardian_output_journal::{
+        GuardianEncryptedScrollbackRow, GuardianScrollbackRowIdentity,
+    };
 
     #[cfg(unix)]
     fn open_private_directory(path: &std::path::Path) -> CapDir {
@@ -778,6 +785,62 @@ mod tests {
         assert_eq!(
             parse_activation_name(&activation_name(expected)),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn scrollback_sibling_reuses_rotated_historical_guardian_authority() {
+        let root = tempfile::tempdir().expect("create private storage root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let mut keyring = GuardianOutputKeyring::open_or_provision_scrollback_sibling(&scrollback)
+            .expect("provision shared sibling keyring");
+        let first_cipher = keyring.active_cipher().expect("derive first cipher");
+        let first_key_id = first_cipher.key_id();
+        let identity = GuardianScrollbackRowIdentity::new([7; 16], [8; 16], 1, 9, 0)
+            .expect("construct exact row identity");
+        let record = first_cipher
+            .seal_scrollback_row(identity, b"historical semantic secret")
+            .expect("seal historical row")
+            .encode()
+            .expect("encode historical row");
+        assert!(!record.contains("historical semantic secret"));
+
+        let second_key_id = keyring.rotate().expect("rotate shared keyring");
+        assert_ne!(first_key_id, second_key_id);
+        drop(keyring);
+
+        let reopened = GuardianOutputKeyring::open_existing_scrollback_sibling(&scrollback)
+            .expect("reopen rotated sibling keyring");
+        let parsed = GuardianEncryptedScrollbackRow::parse(&record)
+            .expect("parse historical encrypted row");
+        assert_eq!(parsed.key_id(), first_key_id);
+        let historical_cipher = reopened
+            .cipher_for_key_id(parsed.key_id())
+            .expect("load historical activated key");
+        let plaintext = historical_cipher
+            .open_scrollback_row(&parsed, [7; 16], [8; 16], 9, 0, 1024)
+            .expect("authenticate historical row after rotation");
+        assert_eq!(plaintext, b"historical semantic secret");
+    }
+
+    #[test]
+    fn read_only_sibling_open_never_provisions_an_empty_authority() {
+        let root = tempfile::tempdir().expect("create private storage root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let keyring_path = scrollback.join(SCROLLBACK_KEYRING_SIBLING);
+        create_private_directory(&keyring_path).expect("create empty keyring directory");
+
+        assert!(matches!(
+            GuardianOutputKeyring::open_existing_scrollback_sibling(&scrollback),
+            Err(GuardianOutputKeyringError::MissingActivatedKey)
+        ));
+        assert_eq!(
+            std::fs::read_dir(&keyring_path)
+                .expect("enumerate empty keyring")
+                .count(),
+            0
         );
     }
 

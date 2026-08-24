@@ -54,6 +54,7 @@ const SCROLLBACK_ROW_RECORD_PREFIX: &str = "ftsl3e:";
 const SCROLLBACK_ROW_FORMAT_VERSION: u32 = 3;
 const SCROLLBACK_ROW_HEADER_BYTES: usize = 96;
 const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES: u32 = 16 * 1024 * 1024;
+const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES_USIZE: usize = 16 * 1024 * 1024;
 
 /// Authenticated storage identity for one exact semantic cold-scrollback row.
 ///
@@ -164,7 +165,7 @@ impl GuardianEncryptedScrollbackRow {
             .strip_prefix(SCROLLBACK_ROW_RECORD_PREFIX)
             .ok_or(GuardianScrollbackRowError::MalformedRecord)?;
         let maximum_binary_bytes = SCROLLBACK_ROW_HEADER_BYTES
-            .checked_add(SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES as usize)
+            .checked_add(SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES_USIZE)
             .and_then(|bytes| bytes.checked_add(AEAD_TAG_BYTES_USIZE))
             .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
         let maximum_encoded_bytes = maximum_binary_bytes
@@ -1640,6 +1641,21 @@ mod tests {
                 1024,
             ),
             Err(GuardianScrollbackRowError::KeyIdentityMismatch)
+        ));
+
+        let mut header_tampered =
+            GuardianEncryptedScrollbackRow::parse(&encoded).expect("reparse exact row");
+        header_tampered.identity.stable_row = -2;
+        assert!(matches!(
+            cipher.open_scrollback_row(
+                &header_tampered,
+                [0x42; 16],
+                [0x24; 16],
+                -2,
+                11,
+                1024,
+            ),
+            Err(GuardianScrollbackRowError::DecryptionFailed)
         ));
 
         let mut tampered = parsed;

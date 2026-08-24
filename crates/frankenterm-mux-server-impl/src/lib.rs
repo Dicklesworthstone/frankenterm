@@ -50,8 +50,10 @@ const LIVE_SCROLLBACK_LINE_RECORD_V1_UNCOMPRESSED: &str = "ftsl1u:";
 const LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD: &str = "ftsl1z:";
 const LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED: &str = "ftsl2u:";
 const LIVE_SCROLLBACK_LINE_RECORD_V2_ZSTD: &str = "ftsl2z:";
+#[cfg(test)]
 const LIVE_SCROLLBACK_LINE_COMPRESS_MIN_BYTES: usize = 256;
 const LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES: u64 = 16 * 1024 * 1024;
+const LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE: usize = 16 * 1024 * 1024;
 
 fn client_domains(config: &config::ConfigHandle) -> Vec<ClientDomainConfig> {
     let mut domains = vec![];
@@ -82,7 +84,6 @@ struct LiveScrollbackSpillSink {
     store: std::sync::Mutex<frankenterm_core::storage::mmap_store::MmapScrollbackStore>,
     state: std::sync::Mutex<LiveScrollbackSpillState>,
     keyring: Arc<std::sync::Mutex<guardian_output_keys::GuardianOutputKeyring>>,
-    redactor: frankenterm_core::redactor::Redactor,
 }
 
 impl std::fmt::Debug for LiveScrollbackSpillSink {
@@ -301,6 +302,7 @@ pub struct LiveScrollbackTranscriptExport {
     pub physical_log_bytes: u64,
     pub trailing_uncommitted_bytes: u64,
     pub redaction_applied_before_persistence: bool,
+    pub redaction_applied_during_export: bool,
     pub source_content_mutated: bool,
     pub source_path: PathBuf,
 }
@@ -365,6 +367,7 @@ impl LiveScrollbackSpillSink {
         let oldest_seq = store.oldest_seq(pane_id).ok_or_else(|| {
             anyhow::anyhow!("non-empty scrollback log has no oldest sequence")
         })?;
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(keyring);
         for offset in 0..retained_rows {
             let seq = oldest_seq
                 .checked_add(
@@ -382,12 +385,12 @@ impl LiveScrollbackSpillSink {
                 .ok_or_else(|| anyhow::anyhow!("scrollback stable row range overflow"))?;
             decode_persisted_scrollback_line_with_limit(
                 &record,
-                keyring,
+                &mut cipher_cache,
                 durable_pane_id,
                 content_epoch,
                 stable_row,
                 seq,
-                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES as usize,
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
             )
             .with_context(|| format!("validate persisted scrollback record {seq}"))?;
         }
@@ -622,7 +625,6 @@ impl LiveScrollbackSpillSink {
             store: std::sync::Mutex::new(store),
             state: std::sync::Mutex::new(state),
             keyring,
-            redactor,
         };
         if let Some(publication_state) = repair_manifest_publication {
             sink.persist_manifest(publication_state).with_context(|| {
@@ -930,6 +932,7 @@ impl LiveScrollbackSpillSink {
     }
 }
 
+#[cfg(test)]
 fn first_visible_cell_attrs(line: &wezterm_term::Line) -> termwiz::cell::CellAttributes {
     line.visible_cells()
         .next()
@@ -937,6 +940,7 @@ fn first_visible_cell_attrs(line: &wezterm_term::Line) -> termwiz::cell::CellAtt
         .unwrap_or_else(termwiz::cell::CellAttributes::blank)
 }
 
+#[cfg(test)]
 fn prepare_scrollback_line_record(
     line: &wezterm_term::Line,
     redacted_text: &str,
@@ -957,6 +961,7 @@ fn prepare_scrollback_line_record(
     record_line
 }
 
+#[cfg(test)]
 fn encode_scrollback_line_record(
     line: &wezterm_term::Line,
     redactor: &frankenterm_core::redactor::Redactor,
@@ -996,18 +1001,95 @@ fn encode_exact_scrollback_line_record(
     cipher: &mux::guardian_output_journal::GuardianOutputCipher,
     identity: mux::guardian_output_journal::GuardianScrollbackRowIdentity,
 ) -> Option<String> {
-    let semantic_line = line.clone();
-    let plaintext = varbincode::serialize(&semantic_line).ok()?;
-    if plaintext.is_empty()
-        || u64::try_from(plaintext.len()).ok()? > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES
-    {
-        return None;
-    }
+    let plaintext = serialize_exact_semantic_scrollback_line(line)?;
     cipher
         .seal_scrollback_row(identity, &plaintext)
         .ok()?
         .encode()
         .ok()
+}
+
+fn serialize_exact_semantic_scrollback_line(line: &wezterm_term::Line) -> Option<Vec<u8>> {
+    let mut semantic_line = line.clone();
+    let cells = semantic_line.cells_mut();
+    if cells.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
+        return None;
+    }
+    let mut cell_widths = Vec::new();
+    cell_widths.try_reserve_exact(cells.len()).ok()?;
+    for cell in cells {
+        let width = u8::try_from(cell.width()).ok()?;
+        if !matches!(width, 1 | 2) {
+            return None;
+        }
+        cell_widths.push(width);
+    }
+    let semantic = ExactSemanticScrollbackLineV1 {
+        schema: 1,
+        line: semantic_line,
+        cell_widths,
+    };
+    let mut plaintext = BoundedScrollbackPlaintext::new(
+        LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+    );
+    let serialization = {
+        let mut serializer = varbincode::Serializer::new(&mut plaintext);
+        semantic.serialize(&mut serializer)
+    };
+    if plaintext.exceeded || serialization.is_err() || plaintext.bytes.is_empty() {
+        return None;
+    }
+    Some(plaintext.bytes)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactSemanticScrollbackLineV1 {
+    schema: u32,
+    line: wezterm_term::Line,
+    cell_widths: Vec<u8>,
+}
+
+struct BoundedScrollbackPlaintext {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl BoundedScrollbackPlaintext {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedScrollbackPlaintext {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "semantic scrollback serialization length overflow",
+            ));
+        };
+        if next_len > self.max_bytes {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "semantic scrollback serialization exceeds its hard limit",
+            ));
+        }
+        self.bytes
+            .try_reserve(buffer.len())
+            .map_err(std::io::Error::other)?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn decode_scrollback_line_record_with_limit(
@@ -1115,9 +1197,45 @@ enum DecodedScrollbackRecordFidelity {
     LegacyRedacted,
 }
 
+struct GuardianScrollbackCipherCache<'a> {
+    keyring: &'a guardian_output_keys::GuardianOutputKeyring,
+    ciphers: std::collections::HashMap<
+        [u8; 8],
+        mux::guardian_output_journal::GuardianOutputCipher,
+    >,
+}
+
+impl<'a> GuardianScrollbackCipherCache<'a> {
+    fn new(keyring: &'a guardian_output_keys::GuardianOutputKeyring) -> Self {
+        Self {
+            keyring,
+            ciphers: std::collections::HashMap::new(),
+        }
+    }
+
+    fn cipher_for_key_id(
+        &mut self,
+        key_id: [u8; 8],
+    ) -> anyhow::Result<&mux::guardian_output_journal::GuardianOutputCipher> {
+        self.ciphers
+            .try_reserve(1)
+            .map_err(|_| anyhow::anyhow!("guardian scrollback cipher cache allocation failed"))?;
+        let keyring = self.keyring;
+        match self.ciphers.entry(key_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let cipher = keyring
+                    .cipher_for_key_id(key_id)
+                    .context("load guardian scrollback key")?;
+                Ok(entry.insert(cipher))
+            }
+        }
+    }
+}
+
 fn decode_persisted_scrollback_line_with_limit(
     record: &str,
-    keyring: &guardian_output_keys::GuardianOutputKeyring,
+    cipher_cache: &mut GuardianScrollbackCipherCache<'_>,
     durable_pane_id: [u8; 16],
     content_epoch: [u8; 16],
     stable_row: wezterm_term::StableRowIndex,
@@ -1141,7 +1259,7 @@ fn decode_persisted_scrollback_line_with_limit(
         );
         let stable_row = i64::try_from(stable_row)
             .map_err(|_| anyhow::anyhow!("stable row does not fit encrypted row identity"))?;
-        let cipher = keyring
+        let cipher = cipher_cache
             .cipher_for_key_id(parsed.key_id())
             .context("load historical guardian key for semantic scrollback row")?;
         let plaintext = cipher
@@ -1151,20 +1269,36 @@ fn decode_persisted_scrollback_line_with_limit(
                 content_epoch,
                 stable_row,
                 sequence,
-                u32::try_from(max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES as usize))
+                u32::try_from(max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE))
                     .unwrap_or(u32::MAX),
             )
             .context("authenticate semantic scrollback row at durable location")?;
         let decoded_bytes = plaintext.len();
         let mut reader = plaintext.as_slice();
-        let line = codec::bounded_varbincode_deserialize(&mut reader)
+        let mut semantic: ExactSemanticScrollbackLineV1 =
+            codec::bounded_varbincode_deserialize(&mut reader)
             .context("bounded decode of semantic scrollback row")?;
         anyhow::ensure!(
             reader.is_empty(),
             "semantic scrollback row contains trailing plaintext"
         );
+        anyhow::ensure!(semantic.schema == 1, "unsupported semantic scrollback row schema");
+        let cells = semantic.line.cells_mut();
+        anyhow::ensure!(
+            cells.len() == semantic.cell_widths.len(),
+            "semantic scrollback cell-width sidecar length mismatch"
+        );
+        for (cell, width) in cells.iter_mut().zip(semantic.cell_widths) {
+            anyhow::ensure!(matches!(width, 1 | 2), "invalid semantic scrollback cell width");
+            let restored = termwiz::cell::Cell::new_grapheme_with_width(
+                cell.str(),
+                usize::from(width),
+                cell.attrs().clone(),
+            );
+            *cell = restored;
+        }
         return Ok((
-            line,
+            semantic.line,
             decoded_bytes,
             DecodedScrollbackRecordFidelity::ExactSemantic,
         ));
@@ -1203,19 +1337,6 @@ fn decode_persisted_scrollback_line_with_limit(
     ))
 }
 
-fn scrollback_line_records_are_equivalent(left: &str, right: &str) -> bool {
-    let Some(left) = decode_scrollback_line_record(left) else {
-        return false;
-    };
-    let Some(right) = decode_scrollback_line_record(right) else {
-        return false;
-    };
-    match (varbincode::serialize(&left), varbincode::serialize(&right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
 fn exact_scrollback_line_record_is_equivalent(
     existing: &str,
     line: &wezterm_term::Line,
@@ -1227,20 +1348,23 @@ fn exact_scrollback_line_record_is_equivalent(
 ) -> bool {
     let Ok((decoded, _decoded_bytes, fidelity)) = decode_persisted_scrollback_line_with_limit(
         existing,
-        keyring,
+        &mut GuardianScrollbackCipherCache::new(keyring),
         durable_pane_id,
         content_epoch,
         stable_row,
         sequence,
-        LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES as usize,
+        LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
     ) else {
         return false;
     };
     if fidelity != DecodedScrollbackRecordFidelity::ExactSemantic {
         return false;
     }
-    match (varbincode::serialize(&decoded), varbincode::serialize(line)) {
-        (Ok(decoded), Ok(expected)) => decoded == expected,
+    match (
+        serialize_exact_semantic_scrollback_line(&decoded),
+        serialize_exact_semantic_scrollback_line(line),
+    ) {
+        (Some(decoded), Some(expected)) => decoded == expected,
         _ => false,
     }
 }
@@ -1259,9 +1383,6 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         if max_retained_rows == 0 {
             return false;
         }
-        let Some(record) = encode_scrollback_line_record(line, &self.redactor) else {
-            return false;
-        };
 
         let Ok(_mutation_gate) = self.lock_mutation_gate("store_scrollback_line") else {
             return false;
@@ -1287,8 +1408,14 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             state.clear_pending_physical_reclamation = false;
         }
 
-        let (previous_state, manifest_prepare_required, desired_seq) = {
-            let Ok(mut state) = self.lock_state("store_scrollback_line initial row") else {
+        let (
+            previous_state,
+            proposed_state,
+            manifest_prepare_required,
+            desired_seq,
+            row_identity,
+        ) = {
+            let Ok(state) = self.lock_state("store_scrollback_line initial row") else {
                 return false;
             };
             let manifest_prepare_required = state.initial_stable_row.is_none();
@@ -1300,13 +1427,52 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                 return false;
             };
             let previous_state = *state;
-            if state.advance_revision().is_err() {
+            let mut proposed_state = previous_state;
+            if proposed_state.advance_revision().is_err() {
                 return false;
             }
-            state.initial_stable_row = Some(initial);
-            state.max_retained_rows = max_retained_rows;
-            (previous_state, manifest_prepare_required, desired_seq)
+            proposed_state.initial_stable_row = Some(initial);
+            proposed_state.max_retained_rows = max_retained_rows;
+            let Ok(stable_row_identity) = i64::try_from(stable_row) else {
+                return false;
+            };
+            let Ok(row_identity) =
+                mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+                    self.durable_pane_id,
+                    proposed_state.content_epoch,
+                    proposed_state.revision,
+                    stable_row_identity,
+                    desired_seq,
+                )
+            else {
+                return false;
+            };
+            (
+                previous_state,
+                proposed_state,
+                manifest_prepare_required,
+                desired_seq,
+                row_identity,
+            )
         };
+        let record = {
+            let Ok(keyring) = self.lock_keyring("store_scrollback_line active key") else {
+                return false;
+            };
+            let Ok(cipher) = keyring.active_cipher() else {
+                return false;
+            };
+            let Some(record) = encode_exact_scrollback_line_record(line, &cipher, row_identity)
+            else {
+                return false;
+            };
+            record
+        };
+        let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state") else {
+            return false;
+        };
+        *state = proposed_state;
+        drop(state);
         if manifest_prepare_required {
             if let Err(error) = self.persist_manifest("prepared") {
                 let Ok(mut state) = self.lock_state("store_scrollback_line prepare failure") else {
@@ -1330,9 +1496,25 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             };
             if desired_seq < next_seq {
                 match store.line_at(self.pane_id, desired_seq) {
-                    Ok(Some(existing)) if scrollback_line_records_are_equivalent(&existing, &record) => {
-                        // Idempotent retry after content durability succeeded
-                        // but a later manifest publication failed.
+                    Ok(Some(existing)) => {
+                        let Ok(keyring) =
+                            self.lock_keyring("store_scrollback_line idempotent retry")
+                        else {
+                            return false;
+                        };
+                        if !exact_scrollback_line_record_is_equivalent(
+                            &existing,
+                            line,
+                            &keyring,
+                            self.durable_pane_id,
+                            proposed_state.content_epoch,
+                            stable_row,
+                            desired_seq,
+                        ) {
+                            return false;
+                        }
+                        // Idempotent retry after exact content durability
+                        // succeeded but a later manifest publication failed.
                     }
                     Ok(None)
                         if store
@@ -1409,6 +1591,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return None;
         }
         let initial = state.initial_stable_row;
+        let content_epoch = state.content_epoch;
         drop(state);
         let initial = initial?;
         if stable_row < initial {
@@ -1421,19 +1604,19 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             .line_at(self.pane_id, seq)
             .ok()
             .flatten()?;
-        if record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_UNCOMPRESSED)
-            || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD)
-            || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED)
-            || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_ZSTD)
-        {
-            // A prefixed record that fails bounded decode is corrupt or
-            // incomplete. Never reinterpret its encoded bytes as legacy user
-            // text; that would manufacture plausible scrollback from damaged
-            // storage and hide the recovery boundary.
-            decode_scrollback_line_record(&record)
-        } else {
-            Some(legacy_text_scrollback_line(&record))
-        }
+        let keyring = self.lock_keyring("load_scrollback_line decrypt").ok()?;
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring);
+        decode_persisted_scrollback_line_with_limit(
+            &record,
+            &mut cipher_cache,
+            self.durable_pane_id,
+            content_epoch,
+            stable_row,
+            seq,
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .ok()
+        .map(|(line, _decoded_bytes, _fidelity)| line)
     }
 
     fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
@@ -1509,7 +1692,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         if state.clear_pending_physical_reclamation {
             return ScrollbackSnapshot::from_contiguous_rows(
                 state.snapshot_generation(),
-                ScrollbackSnapshotFidelity::LegacyRedacted,
+                ScrollbackSnapshotFidelity::ExactSemantic,
                 None,
                 expected_newest_exclusive,
                 0,
@@ -1555,7 +1738,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             }
             return ScrollbackSnapshot::from_contiguous_rows(
                 state.snapshot_generation(),
-                ScrollbackSnapshotFidelity::LegacyRedacted,
+                ScrollbackSnapshotFidelity::ExactSemantic,
                 None,
                 expected_newest_exclusive,
                 stored_bytes,
@@ -1593,6 +1776,9 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         rows.try_reserve_exact(retained_rows)
             .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
         let mut decoded_bytes = 0usize;
+        let mut fidelity = ScrollbackSnapshotFidelity::ExactSemantic;
+        let keyring = self.lock_keyring("snapshot_scrollback decrypt")?;
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring);
         if let Some(oldest_seq) = oldest_seq {
             for offset in 0..retained_rows_u64 {
                 let seq = oldest_seq
@@ -1610,29 +1796,44 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                         observed: u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
                         maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
                     })?;
-                let (line, line_decoded_bytes) = if record
-                    .starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_UNCOMPRESSED)
-                    || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD)
-                    || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED)
-                    || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_ZSTD)
-                {
-                    decode_scrollback_line_record_with_limit(
+                if mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
+                    &record,
+                ) {
+                    let parsed = mux::guardian_output_journal::GuardianEncryptedScrollbackRow::parse(
                         &record,
-                        u64::try_from(remaining_decoded_bytes).unwrap_or(u64::MAX),
                     )
-                    .ok_or(ScrollbackSpillError::StorageUnavailable)?
-                } else {
-                    if record.len() > remaining_decoded_bytes {
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                    let line_bytes = usize::try_from(parsed.plaintext_bytes())
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                    if line_bytes > remaining_decoded_bytes {
                         return Err(ScrollbackSpillError::ResourceLimit {
                             resource: "decoded_bytes",
-                            observed: u64::try_from(decoded_bytes.saturating_add(record.len()))
+                            observed: u64::try_from(decoded_bytes.saturating_add(line_bytes))
                                 .unwrap_or(u64::MAX),
                             maximum: u64::try_from(limits.max_decoded_bytes)
                                 .unwrap_or(u64::MAX),
                         });
                     }
-                    (legacy_text_scrollback_line(&record), record.len())
-                };
+                }
+                let stable_offset = wezterm_term::StableRowIndex::try_from(seq)
+                    .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                let stable_row = initial_stable_row
+                    .checked_add(stable_offset)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                let (line, line_decoded_bytes, row_fidelity) =
+                    decode_persisted_scrollback_line_with_limit(
+                        &record,
+                        &mut cipher_cache,
+                        self.durable_pane_id,
+                        state.content_epoch,
+                        stable_row,
+                        seq,
+                        remaining_decoded_bytes,
+                    )
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                if row_fidelity == DecodedScrollbackRecordFidelity::LegacyRedacted {
+                    fidelity = ScrollbackSnapshotFidelity::LegacyRedacted;
+                }
                 decoded_bytes = decoded_bytes.checked_add(line_decoded_bytes).ok_or(
                     ScrollbackSpillError::ArithmeticOverflow("decoded_bytes"),
                 )?;
@@ -1642,7 +1843,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
 
         ScrollbackSnapshot::from_contiguous_rows(
             state.snapshot_generation(),
-            ScrollbackSnapshotFidelity::LegacyRedacted,
+            fidelity,
             oldest_stable_row,
             expected_newest_exclusive,
             stored_bytes,
@@ -1660,6 +1861,11 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         use wezterm_term::config::{ScrollbackClearCommit, ScrollbackSpillError};
 
         let _mutation_gate = self.lock_mutation_gate("clear_scrollback")?;
+        // Prove the physical store is available before publishing a logical
+        // clear. Holding this guard through publication also prevents a clear
+        // manifest from becoming durable after store-lock poisoning has made
+        // reclamation impossible to even attempt.
+        let mut store = self.lock_store("clear_scrollback store availability")?;
         let (previous, clear_generation) = {
             let mut state = self.lock_state("clear_scrollback state reset")?;
             if state.transaction_quarantined {
@@ -1691,10 +1897,8 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             log::error!("failed to publish scrollback clear intent");
             return Err(ScrollbackSpillError::StorageUnavailable);
         }
-        let physical_reclaimed = match self.lock_store("clear_scrollback store reset") {
-            Ok(mut store) => store.clear_pane(self.pane_id).is_ok(),
-            Err(_) => false,
-        };
+        let physical_reclaimed = store.clear_pane(self.pane_id).is_ok();
+        drop(store);
         if physical_reclaimed {
             if let Ok(mut state) = self.lock_state("clear_scrollback physical completion") {
                 state.clear_pending_physical_reclamation = false;
@@ -2029,23 +2233,80 @@ pub fn export_live_scrollback_transcript(
         );
     }
 
+    let contains_exact_records = records.iter().any(|record| {
+        mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(record)
+    });
+    let keyring = if contains_exact_records {
+        Some(
+            guardian_output_keys::GuardianOutputKeyring::open_existing_scrollback_sibling(base_dir)
+                .context("open guardian output keyring for scrollback transcript export")?,
+        )
+    } else {
+        None
+    };
+    let mut cipher_cache = keyring
+        .as_ref()
+        .map(GuardianScrollbackCipherCache::new);
+    let content_epoch = live_scrollback_manifest_generation(&manifest_before)?
+        .map(|(epoch, _revision)| epoch);
+    let mut durable_pane_bytes = [0; 16];
+    if contains_exact_records {
+        hex::decode_to_slice(durable_pane_id, &mut durable_pane_bytes)
+            .map_err(|_| anyhow::anyhow!("invalid durable pane identity"))?;
+    }
+    let initial_stable_row = manifest_before.initial_stable_row;
+    let oldest_seq = snapshot.oldest_seq;
+    let redactor = frankenterm_core::redactor::Redactor::new();
     let mut transcript = String::new();
     for (index, record) in records.iter().enumerate() {
-        let line = decode_scrollback_line_record(record).ok_or_else(|| {
-            anyhow::anyhow!("live scrollback record {index} failed bounded integrity decoding")
-        })?;
+        let line = if mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
+            record,
+        ) {
+            let sequence = oldest_seq
+                .and_then(|oldest| oldest.checked_add(u64::try_from(index).ok()?))
+                .ok_or_else(|| anyhow::anyhow!("live scrollback export sequence overflow"))?;
+            let stable_row = initial_stable_row
+                .and_then(|initial| {
+                    wezterm_term::StableRowIndex::try_from(sequence)
+                        .ok()
+                        .and_then(|offset| initial.checked_add(offset))
+                })
+                .ok_or_else(|| anyhow::anyhow!("live scrollback export row identity overflow"))?;
+            let cipher_cache = cipher_cache
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("encrypted scrollback keyring is unavailable"))?;
+            let content_epoch = content_epoch.ok_or_else(|| {
+                anyhow::anyhow!("encrypted scrollback record has no content epoch")
+            })?;
+            decode_persisted_scrollback_line_with_limit(
+                record,
+                cipher_cache,
+                durable_pane_bytes,
+                content_epoch,
+                stable_row,
+                sequence,
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .with_context(|| format!("decrypt live scrollback record {index}"))?
+            .0
+        } else {
+            decode_scrollback_line_record(record).ok_or_else(|| {
+                anyhow::anyhow!("live scrollback record {index} failed bounded integrity decoding")
+            })?
+        };
         let text = line.as_str();
+        let redacted_text = redactor.redact(text.as_ref());
         let delimiter_bytes = usize::from(!line.last_cell_was_wrapped());
         let next_len = transcript
             .len()
-            .checked_add(text.len())
+            .checked_add(redacted_text.len())
             .and_then(|len| len.checked_add(delimiter_bytes))
             .ok_or_else(|| anyhow::anyhow!("live scrollback transcript length overflow"))?;
         anyhow::ensure!(
             next_len <= max_transcript_bytes,
             "live scrollback transcript exceeds configured {max_transcript_bytes}-byte limit"
         );
-        transcript.push_str(text.as_ref());
+        transcript.push_str(&redacted_text);
         if !line.last_cell_was_wrapped() {
             transcript.push('\n');
         }
@@ -2074,7 +2335,8 @@ pub fn export_live_scrollback_transcript(
         committed_log_bytes: snapshot.committed_bytes,
         physical_log_bytes: snapshot.physical_bytes,
         trailing_uncommitted_bytes: snapshot.trailing_uncommitted_bytes,
-        redaction_applied_before_persistence: true,
+        redaction_applied_before_persistence: !contains_exact_records,
+        redaction_applied_during_export: true,
         source_content_mutated: false,
         source_path: pane_path,
     })
@@ -2278,7 +2540,7 @@ mod tests {
     }
 
     #[test]
-    fn live_scrollback_spill_sink_hydrates_redacted_retained_rows() {
+    fn live_scrollback_spill_sink_hydrates_exact_rows_without_plaintext_on_disk() {
         let dir = tempfile::tempdir().expect("temp scrollback dir");
         let context = config::ScrollbackSpillSinkContext {
             pane_id: 7,
@@ -2312,8 +2574,19 @@ mod tests {
             .load_scrollback_line(2)
             .expect("retained row should hydrate");
         let hydrated_text = hydrated.as_str();
-        assert!(hydrated_text.contains("[REDACTED]"));
-        assert!(!hydrated_text.contains("sk-"));
+        assert!(
+            hydrated_text.contains("sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"),
+            "recovery hydration must retain exact unredacted semantic content"
+        );
+        let durable_id = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        let log_bytes = std::fs::read(dir.path().join(durable_id).join("0.log"))
+            .expect("read encrypted scrollback log");
+        assert!(!log_bytes
+            .windows(b"sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".len())
+            .any(|window| window == b"sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"));
+        assert!(!format!("{sink:?}").contains("abcdefghijklmnopqrstuvwxyz"));
     }
 
     #[test]
@@ -2329,18 +2602,38 @@ mod tests {
             .expect("create live spill sink");
         let mut attrs = CellAttributes::blank();
         attrs.set_italic(true);
-        let line = Line::from_text("styled-row", &attrs, 42, None);
+        attrs.set_hyperlink(Some(Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://checkpoint.example/row",
+            "exact-link",
+        ))));
+        let mut line = Line::from_text("A styled-row", &attrs, 42, None);
+        line.set_cell_grapheme(0, "A", 2, attrs.clone(), 42);
+        let source_text = line.as_str().into_owned();
 
         assert!(sink.store_scrollback_line(0, &line, 4));
 
         let hydrated = sink
             .load_scrollback_line(0)
             .expect("styled row should hydrate");
-        assert_eq!(hydrated.as_str().as_ref(), "styled-row");
+        assert_eq!(hydrated.as_str().as_ref(), source_text);
         assert_eq!(hydrated.current_seqno(), 42);
         assert!(
             hydrated.visible_cells().all(|cell| cell.attrs().italic()),
             "serialized cold row should preserve cell attributes"
+        );
+        let first = hydrated
+            .visible_cells()
+            .next()
+            .expect("explicit-width linked cell survives hydration");
+        assert_eq!(first.width(), 2);
+        assert_eq!(first.str(), "A");
+        assert_eq!(
+            first.attrs().hyperlink().map(|link| link.uri()),
+            Some("https://checkpoint.example/row")
+        );
+        assert_eq!(
+            varbincode::serialize(&hydrated).expect("serialize hydrated semantic row"),
+            varbincode::serialize(&line).expect("serialize source semantic row")
         );
     }
 
@@ -2388,6 +2681,61 @@ mod tests {
                 .as_str()
                 .as_ref(),
             "stable-row-14"
+        );
+    }
+
+    #[test]
+    fn live_scrollback_reopens_rows_across_guardian_key_rotation() {
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 811,
+            domain_id: 3,
+            durable_pane_id: [80; 16],
+            command_description: "rotated-key-shell".to_string(),
+        };
+        {
+            let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .expect("create live spill sink");
+            let attrs = CellAttributes::blank();
+            assert!(sink.store_scrollback_line(
+                10,
+                &Line::from_text("before-key-rotation", &attrs, 1, None),
+                8,
+            ));
+            let original_key = sink
+                .lock_keyring("test key rotation")
+                .expect("lock shared guardian keyring")
+                .active_key_id();
+            let rotated_key = sink
+                .lock_keyring("test key rotation")
+                .expect("lock shared guardian keyring")
+                .rotate()
+                .expect("rotate shared guardian keyring");
+            assert_ne!(original_key, rotated_key);
+            assert!(sink.store_scrollback_line(
+                11,
+                &Line::from_text("after-key-rotation", &attrs, 2, None),
+                8,
+            ));
+        }
+
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("reopen spill sink after key rotation");
+        assert_eq!(
+            reopened
+                .load_scrollback_line(10)
+                .expect("historical-key row survives reopen")
+                .as_str()
+                .as_ref(),
+            "before-key-rotation"
+        );
+        assert_eq!(
+            reopened
+                .load_scrollback_line(11)
+                .expect("active-key row survives reopen")
+                .as_str()
+                .as_ref(),
+            "after-key-rotation"
         );
     }
 
@@ -2445,8 +2793,9 @@ mod tests {
             assert!(sink.store_scrollback_line(20, &first, 8));
 
             let second = Line::from_text("durable-unpublished-row", &attrs, 2, None);
-            let record = encode_scrollback_line_record(&second, &sink.redactor)
-                .expect("encode durable unpublished row");
+            let redactor = frankenterm_core::redactor::Redactor::new();
+            let record = encode_scrollback_line_record(&second, &redactor)
+                .expect("encode legacy durable unpublished row");
             assert_eq!(
                 sink.lock_store("test interrupted complete publication")
                     .expect("test store lock")
@@ -2473,6 +2822,22 @@ mod tests {
         assert_eq!(manifest.oldest_seq, Some(0));
         assert_eq!(manifest.retained_rows, 2);
         assert_eq!(manifest.next_seq, 2);
+        let mixed_snapshot = reopened
+            .snapshot_scrollback(
+                22,
+                wezterm_term::config::ScrollbackSnapshotLimits {
+                    max_rows: 8,
+                    max_stored_bytes: 1024 * 1024,
+                    max_decoded_bytes: 1024 * 1024,
+                    max_physical_bytes: 1024 * 1024,
+                },
+            )
+            .expect("capture mixed exact and legacy snapshot");
+        assert_eq!(
+            mixed_snapshot.fidelity(),
+            wezterm_term::config::ScrollbackSnapshotFidelity::LegacyRedacted,
+            "one legacy row keeps the complete mixed snapshot non-recovery-grade"
+        );
     }
 
     #[test]
@@ -2558,7 +2923,12 @@ mod tests {
             ));
             assert!(sink.store_scrollback_line(
                 41,
-                &Line::from_text("recoverable-two", &attrs, 2, None),
+                &Line::from_text(
+                    "recoverable-two sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN",
+                    &attrs,
+                    2,
+                    None,
+                ),
                 8
             ));
         }
@@ -2585,12 +2955,15 @@ mod tests {
             1024 * 1024,
         )
         .expect("export durable transcript");
-        assert_eq!(export.transcript, "recoverable-one\nrecoverable-two\n");
+        assert!(export.transcript.starts_with("recoverable-one\nrecoverable-two "));
+        assert!(export.transcript.contains("[REDACTED]"));
+        assert!(!export.transcript.contains("sk-abcdefghijklmnopqrstuvwxyz"));
         assert_eq!(export.retained_rows, 2);
         assert_eq!(export.oldest_seq, Some(0));
         assert_eq!(export.next_seq, 2);
         assert!(!export.source_content_mutated);
-        assert!(export.redaction_applied_before_persistence);
+        assert!(!export.redaction_applied_before_persistence);
+        assert!(export.redaction_applied_during_export);
 
         let log_after = std::fs::metadata(&log_path).expect("log metadata after export");
         let manifest_after =
@@ -2968,7 +3341,7 @@ mod tests {
     }
 
     #[test]
-    fn live_scrollback_snapshot_is_contiguous_bounded_and_explicitly_legacy() {
+    fn live_scrollback_snapshot_is_contiguous_bounded_and_exact_semantic() {
         let dir = tempfile::tempdir().expect("temp scrollback dir");
         let context = config::ScrollbackSpillSinkContext {
             pane_id: 13,
@@ -2998,15 +3371,33 @@ mod tests {
         };
         let snapshot = sink
             .snapshot_scrollback(6, limits)
-            .expect("capture coherent legacy snapshot");
+            .expect("capture coherent exact snapshot");
         assert_eq!(
             snapshot.fidelity(),
-            wezterm_term::config::ScrollbackSnapshotFidelity::LegacyRedacted
+            wezterm_term::config::ScrollbackSnapshotFidelity::ExactSemantic
         );
         assert_eq!(snapshot.oldest_stable_row(), Some(4));
         assert_eq!(snapshot.newest_stable_row_exclusive(), 6);
         assert_eq!(snapshot.rows().len(), 2);
+        assert_eq!(snapshot.rows()[0].as_str().as_ref(), "snapshot-row-four");
+        assert_eq!(snapshot.rows()[1].as_str().as_ref(), "snapshot-row-five");
         assert!(!format!("{snapshot:?}").contains("snapshot-row"));
+        let bounded_error = sink
+            .snapshot_scrollback(
+                6,
+                wezterm_term::config::ScrollbackSnapshotLimits {
+                    max_decoded_bytes: 1,
+                    ..limits
+                },
+            )
+            .expect_err("exact row plaintext must obey the decoded-byte ceiling");
+        assert!(matches!(
+            bounded_error,
+            wezterm_term::config::ScrollbackSpillError::ResourceLimit {
+                resource: "decoded_bytes",
+                ..
+            }
+        ));
 
         let generation_before_clear = snapshot.generation();
         let clear_commit = sink
@@ -3018,6 +3409,10 @@ mod tests {
             .expect("snapshot committed empty generation");
         assert!(empty.rows().is_empty());
         assert_eq!(empty.oldest_stable_row(), None);
+        assert_eq!(
+            empty.fidelity(),
+            wezterm_term::config::ScrollbackSnapshotFidelity::ExactSemantic
+        );
 
         let manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
             .expect("read v2 manifest")
@@ -3067,6 +3462,8 @@ mod tests {
         let store_sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &store_context)
             .expect("create store-poison live spill sink");
         assert!(store_sink.store_scrollback_line(0, &first, 8));
+        let manifest_before_store_poison = std::fs::read(&store_sink.manifest_path)
+            .expect("read manifest before store poison");
 
         let store_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _store = store_sink.store.lock().expect("store lock for poison test");
@@ -3078,6 +3475,12 @@ mod tests {
         assert!(store_sink.store.is_poisoned());
         assert!(store_sink.load_scrollback_line(0).is_none());
         assert!(store_sink.clear_scrollback().is_err());
+        assert_eq!(
+            std::fs::read(&store_sink.manifest_path)
+                .expect("read manifest after rejected poisoned-store clear"),
+            manifest_before_store_poison,
+            "store unavailability must be detected before a clear manifest is published"
+        );
     }
 
     #[test]
