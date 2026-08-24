@@ -417,8 +417,15 @@ struct CheckpointStageUploadInspection {
     publication_id: Uuid,
     next_index: u32,
     committed_bytes: u64,
+    seal_present: bool,
     candidate_digest: [u8; 32],
     chunk_set_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+enum CheckpointStageSealInspection {
+    Reject,
+    IgnoreForHistoricalChunkRetry,
 }
 
 struct GuardianCheckpointStageStoreInner {
@@ -1143,7 +1150,12 @@ impl GuardianCheckpointStageStore {
                 }
                 census = checkpoint_stage_census(inner)?;
             }
-            let inspection = checkpoint_inspect_upload(inner, &census, &shape)?
+            let inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::Reject,
+            )?
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             Ok(GuardianCheckpointStageReplyV1::Ready {
                 upload_id: shape.upload_id,
@@ -1170,7 +1182,12 @@ impl GuardianCheckpointStageStore {
         }
         self.with_exclusive_directory(|inner| {
             let mut census = checkpoint_stage_census(inner)?;
-            let mut inspection = checkpoint_inspect_upload(inner, &census, &shape)?
+            let mut inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+            )?
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if index < inspection.next_index {
                 checkpoint_validate_exact_chunk_retry(
@@ -1184,7 +1201,7 @@ impl GuardianCheckpointStageStore {
                 )?;
                 return checkpoint_chunk_progress(&shape, index);
             }
-            if index != inspection.next_index {
+            if index != inspection.next_index || inspection.seal_present {
                 return Err(GuardianCheckpointStageStoreError::OutOfOrder);
             }
             let record_bytes = checkpoint_record_bytes_for_plaintext(bytes.len())?;
@@ -1228,7 +1245,12 @@ impl GuardianCheckpointStageStore {
                 }
             }
             census = checkpoint_stage_census(inner)?;
-            inspection = checkpoint_inspect_upload(inner, &census, &shape)?
+            inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+            )?
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if inspection.next_index <= index {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
@@ -1248,7 +1270,12 @@ impl GuardianCheckpointStageStore {
         let shape = CheckpointStageRequestShape::from_request(request)?;
         self.with_exclusive_directory(|inner| {
             let census = checkpoint_stage_census(inner)?;
-            let inspection = checkpoint_inspect_upload(inner, &census, &shape)?
+            let inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::Reject,
+            )?
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if inspection.next_index != shape.total_chunks
                 || inspection.committed_bytes != shape.total_bytes
@@ -1809,7 +1836,7 @@ fn checkpoint_remember_durable_record(
         return Err(GuardianCheckpointStageStoreError::Capacity);
     }
     durable_records
-        .try_reserve(1)
+        .try_reserve_exact(1)
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
     durable_records.push(identity);
     Ok(())
@@ -2023,6 +2050,7 @@ fn checkpoint_inspect_upload(
     inner: &GuardianCheckpointStageStoreInner,
     census: &CheckpointStageCensus,
     shape: &CheckpointStageRequestShape,
+    seal_inspection: CheckpointStageSealInspection,
 ) -> Result<Option<CheckpointStageUploadInspection>, GuardianCheckpointStageStoreError> {
     let mut candidate = None;
     let mut chunks = BTreeMap::new();
@@ -2057,7 +2085,8 @@ fn checkpoint_inspect_upload(
             Err(GuardianCheckpointStageStoreError::Poisoned)
         };
     };
-    if seal.is_some() {
+    let seal_present = seal.is_some();
+    if seal_present && matches!(seal_inspection, CheckpointStageSealInspection::Reject) {
         // V3 Seal records can be authenticated only with the exact primary or
         // retry operation capability. Production cannot mint the independent
         // assembled-stage witness yet, so no Seal can be adopted here and the
@@ -2150,6 +2179,7 @@ fn checkpoint_inspect_upload(
         publication_id,
         next_index,
         committed_bytes,
+        seal_present,
         candidate_digest,
         chunk_set_digest,
     }))
@@ -2178,13 +2208,19 @@ fn checkpoint_chunk_digest(
     Ok(hasher.finalize().into())
 }
 
+/// Reconstruct the canonical manifest bytes as inspection evidence only.
+/// This value carries no v3 assembly witness or publication authority and is
+/// never passed to the cipher's final-manifest API.
 fn checkpoint_seal_manifest(
     shape: &CheckpointStageRequestShape,
     candidate_digest: [u8; 32],
     chunk_set_digest: [u8; 32],
 ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointStageStoreError> {
     let seal_payload = Zeroizing::new(shape.seal_payload()?);
-    if seal_payload.len() != CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES {
+    if seal_payload.len() != CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
+        || candidate_digest == [0; 32]
+        || chunk_set_digest == [0; 32]
+    {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     let mut manifest = Vec::new();
@@ -2320,17 +2356,6 @@ fn checkpoint_chunk_progress(
         next_index,
         committed_bytes,
     })
-}
-
-fn checkpoint_sealed_reply(
-    shape: &CheckpointStageRequestShape,
-) -> GuardianCheckpointStageReplyV1 {
-    GuardianCheckpointStageReplyV1::Sealed {
-        upload_id: shape.upload_id,
-        checkpoint_id: shape.descriptor.checkpoint_id(),
-        boundary_id: shape.descriptor.boundary_id(),
-        total_bytes: shape.total_bytes,
-    }
 }
 
 fn checkpoint_bytes_match(left: &[u8], right: &[u8]) -> bool {
@@ -5608,7 +5633,12 @@ mod tests {
         }
         let shape = CheckpointStageRequestShape::from_request(&begin)?;
         let census = checkpoint_stage_census(&store.inner)?;
-        let inspection = checkpoint_inspect_upload(&store.inner, &census, &shape)?
+        let inspection = checkpoint_inspect_upload(
+            &store.inner,
+            &census,
+            &shape,
+            CheckpointStageSealInspection::Reject,
+        )?
             .ok_or("durable candidate disappeared")?;
         let seal_path = checkpoint_seal_path(
             &store.inner,
@@ -5631,6 +5661,22 @@ mod tests {
         let (_reopened_poll, reopened_pipeline) =
             reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
         let store = reopened_pipeline.checkpoint_stage_store();
+        let historical_retry = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Chunk,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            Some((0, &payload[..usize::try_from(chunk_bytes)?])),
+        )?;
+        assert_eq!(
+            store.apply_chunk(historical_retry)?,
+            GuardianCheckpointStageReplyV1::Progress {
+                upload_id,
+                next_index: 1,
+                committed_bytes: u64::from(chunk_bytes),
+            }
+        );
         assert!(matches!(
             store.apply_begin(&begin),
             Err(GuardianCheckpointStageStoreError::Poisoned)
