@@ -555,6 +555,90 @@ impl Line {
         self.seqno
     }
 
+    /// Number of semantic-zone records serialized with this line.
+    pub fn zone_count(&self) -> usize {
+        self.zones.len()
+    }
+
+    /// Returns whether any raw cell or compressed attribute run carries an
+    /// out-of-band image attachment.
+    ///
+    /// Inspecting the raw vector storage (rather than `visible_cells`) matters
+    /// for validation: a malformed serialized line must not be able to conceal
+    /// an image in a spacer cell skipped by the visible-cell iterator.
+    #[cfg(feature = "use_image")]
+    pub fn has_image_attachments(&self) -> bool {
+        match &self.cells {
+            CellStorage::V(cells) => cells
+                .iter()
+                .any(|cell| cell.attrs().has_image_attachments()),
+            CellStorage::C(line) => line
+                .iter()
+                .any(|cell| cell.attrs().has_image_attachments()),
+        }
+    }
+
+    /// Materialize the semantic line state used by terminal checkpoints.
+    ///
+    /// The result deliberately normalizes compressed/vector storage, omits
+    /// derived zone and hyperlink-scan caches, and preserves each grapheme's
+    /// authoritative stored width.  Consequently equivalent live lines have a
+    /// single persistence representation regardless of their cache history.
+    #[cfg(feature = "use_serde")]
+    #[doc(hidden)]
+    pub fn semantic_checkpoint_clone(&self) -> Self {
+        let mut cells = Vec::with_capacity(self.len());
+        for cell in self.visible_cells() {
+            let width = cell.width();
+            let attrs = cell.attrs().clone();
+            cells.push(Cell::new_grapheme_with_width(
+                cell.str(),
+                width,
+                attrs.clone(),
+            ));
+            for _ in 1..width {
+                cells.push(Cell::blank_with_attrs(attrs.clone()));
+            }
+        }
+
+        let mut line = Self::from_cells(cells, self.seqno);
+        if self.is_double_height_top() {
+            line.set_double_height_top(self.seqno);
+        } else if self.is_double_height_bottom() {
+            line.set_double_height_bottom(self.seqno);
+        } else if self.is_double_width() {
+            line.set_double_width(self.seqno);
+        }
+        let (bidi_enabled, bidi_hint) = self.bidi_info();
+        line.set_bidi_info(bidi_enabled, bidi_hint, self.seqno);
+        line.rebuild_checkpoint_hyperlink_bits();
+        line
+    }
+
+    /// Rebuild hyperlink presence/scanning bits after a semantic checkpoint
+    /// reconstruction.  The bits are derived from cell attributes and must not
+    /// inherit storage/cache history, but preserved implicit hyperlinks need to
+    /// remain marked as already scanned until the caller advances its rule
+    /// epoch; otherwise a no-op rescan would clear their presence bit.
+    #[cfg(feature = "use_serde")]
+    #[doc(hidden)]
+    pub fn rebuild_checkpoint_hyperlink_bits(&mut self) {
+        let mut has_explicit = false;
+        let mut has_implicit = false;
+        for cell in self.visible_cells() {
+            match cell.attrs().hyperlink() {
+                Some(link) if link.is_implicit() => has_implicit = true,
+                Some(_) => has_explicit = true,
+                None => {}
+            }
+        }
+        self.bits.set(LineBits::HAS_HYPERLINK, has_explicit);
+        self.bits
+            .set(LineBits::HAS_IMPLICIT_HYPERLINKS, has_implicit);
+        self.bits
+            .set(LineBits::SCANNED_IMPLICIT_HYPERLINKS, has_implicit);
+    }
+
     /// Annotate the line with the sequence number of a change.
     /// This can be used together with Line::changed_since to
     /// manage caching and rendering

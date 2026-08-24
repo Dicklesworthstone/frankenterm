@@ -164,6 +164,23 @@ impl Hyperlink {
         }
     }
 
+    /// Reconstruct a hyperlink from a capability-free semantic checkpoint.
+    ///
+    /// Ordinary OSC parsing should continue to use `new_with_params`; this
+    /// constructor exists because implicit-rule provenance affects whether a
+    /// restored line may be rescanned and must therefore survive persistence.
+    pub fn new_with_params_and_implicit<S: Into<String>>(
+        uri: S,
+        params: HashMap<String, String>,
+        implicit: bool,
+    ) -> Self {
+        Self {
+            uri: uri.into(),
+            params,
+            implicit,
+        }
+    }
+
     pub fn parse(osc: &[&[u8]]) -> Result<Option<Hyperlink>> {
         ensure!(osc.len() == 3, "wrong param count");
         if osc[1].is_empty() && osc[2].is_empty() {

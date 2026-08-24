@@ -96,6 +96,50 @@ pub(crate) struct ScreenCheckpointParts {
     pub saved_cursor: Option<SavedCursor>,
 }
 
+#[cfg(feature = "use_serde")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScreenCheckpointLimits {
+    pub max_total_lines: usize,
+    pub max_total_cells: usize,
+    pub max_total_cell_text_bytes: usize,
+    pub max_total_hyperlink_bytes: usize,
+    pub max_total_hyperlink_params: usize,
+    pub max_string_bytes: usize,
+    pub max_hyperlink_params_per_link: usize,
+    pub max_cold_scrollback_bytes: usize,
+    pub max_keyboard_stack_depth: usize,
+    pub max_rows: usize,
+    pub max_cols: usize,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Default, Debug)]
+pub(crate) struct ScreenCheckpointUsage {
+    pub lines: usize,
+    pub cells: usize,
+    pub cell_text_bytes: usize,
+    pub hyperlink_bytes: usize,
+    pub hyperlink_params: usize,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ScreenCheckpointCaptureError {
+    ResourceLimit {
+        resource: &'static str,
+        observed: usize,
+        maximum: usize,
+    },
+    ArithmeticOverflow(&'static str),
+    InvalidLineGeometry {
+        stored_cells: usize,
+        semantic_cells: usize,
+    },
+    UnsupportedGraphicsState,
+    ColdScrollbackMetadataInconsistent,
+    ColdScrollbackRowMissing(StableRowIndex),
+}
+
 #[cfg_attr(feature = "use_serde", derive(Deserialize, Serialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TieredScrollbackStatus {
@@ -893,17 +937,291 @@ fn scrollback_hot_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback
 
 impl Screen {
     #[cfg(feature = "use_serde")]
-    pub(crate) fn checkpoint_parts(&self) -> ScreenCheckpointParts {
-        ScreenCheckpointParts {
-            lines: self.lines.iter().cloned().collect(),
-            stable_row_index_offset: self.stable_row_index_offset,
+    pub(crate) fn checkpoint_parts(
+        &self,
+        limits: &ScreenCheckpointLimits,
+        usage: &mut ScreenCheckpointUsage,
+    ) -> Result<ScreenCheckpointParts, ScreenCheckpointCaptureError> {
+        fn accumulate(
+            current: &mut usize,
+            additional: usize,
+            maximum: usize,
+            resource: &'static str,
+        ) -> Result<(), ScreenCheckpointCaptureError> {
+            let observed = current
+                .checked_add(additional)
+                .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(resource))?;
+            if observed > maximum {
+                return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                    resource,
+                    observed,
+                    maximum,
+                });
+            }
+            *current = observed;
+            Ok(())
+        }
+
+        fn inspect_line(
+            line: &Line,
+            limits: &ScreenCheckpointLimits,
+            usage: &mut ScreenCheckpointUsage,
+        ) -> Result<(), ScreenCheckpointCaptureError> {
+            if line.has_image_attachments() {
+                return Err(ScreenCheckpointCaptureError::UnsupportedGraphicsState);
+            }
+            accumulate(
+                &mut usage.lines,
+                1,
+                limits.max_total_lines,
+                "screen_lines",
+            )?;
+            accumulate(
+                &mut usage.cells,
+                line.len(),
+                limits.max_total_cells,
+                "screen_cells",
+            )?;
+
+            let mut semantic_cells = 0usize;
+            for cell in line.visible_cells() {
+                let width = cell.width();
+                if !(1..=2).contains(&width) {
+                    return Err(ScreenCheckpointCaptureError::InvalidLineGeometry {
+                        stored_cells: line.len(),
+                        semantic_cells: width,
+                    });
+                }
+                semantic_cells = semantic_cells.checked_add(width).ok_or(
+                    ScreenCheckpointCaptureError::ArithmeticOverflow("semantic_line_cells"),
+                )?;
+
+                let text_bytes = cell.str().len();
+                if text_bytes > limits.max_string_bytes {
+                    return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                        resource: "cell_text_bytes",
+                        observed: text_bytes,
+                        maximum: limits.max_string_bytes,
+                    });
+                }
+                accumulate(
+                    &mut usage.cell_text_bytes,
+                    text_bytes,
+                    limits.max_total_cell_text_bytes,
+                    "cell_text_bytes",
+                )?;
+
+                if let Some(link) = cell.attrs().hyperlink() {
+                    if link.params().len() > limits.max_hyperlink_params_per_link {
+                        return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                            resource: "hyperlink_params_per_link",
+                            observed: link.params().len(),
+                            maximum: limits.max_hyperlink_params_per_link,
+                        });
+                    }
+                    accumulate(
+                        &mut usage.hyperlink_params,
+                        link.params().len(),
+                        limits.max_total_hyperlink_params,
+                        "hyperlink_params",
+                    )?;
+
+                    let mut link_bytes = link.uri().len();
+                    if link.uri().len() > limits.max_string_bytes {
+                        return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                            resource: "hyperlink_uri_bytes",
+                            observed: link.uri().len(),
+                            maximum: limits.max_string_bytes,
+                        });
+                    }
+                    for (key, value) in link.params() {
+                        if key.len() > limits.max_string_bytes {
+                            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                                resource: "hyperlink_param_key_bytes",
+                                observed: key.len(),
+                                maximum: limits.max_string_bytes,
+                            });
+                        }
+                        if value.len() > limits.max_string_bytes {
+                            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                                resource: "hyperlink_param_value_bytes",
+                                observed: value.len(),
+                                maximum: limits.max_string_bytes,
+                            });
+                        }
+                        link_bytes = link_bytes
+                            .checked_add(key.len())
+                            .and_then(|bytes| bytes.checked_add(value.len()))
+                            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                                "hyperlink_bytes",
+                            ))?;
+                    }
+                    accumulate(
+                        &mut usage.hyperlink_bytes,
+                        link_bytes,
+                        limits.max_total_hyperlink_bytes,
+                        "hyperlink_bytes",
+                    )?;
+                }
+            }
+
+            if semantic_cells != line.len() {
+                return Err(ScreenCheckpointCaptureError::InvalidLineGeometry {
+                    stored_cells: line.len(),
+                    semantic_cells,
+                });
+            }
+            Ok(())
+        }
+
+        if self.physical_rows == 0 || self.physical_rows > limits.max_rows {
+            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                resource: "physical_rows",
+                observed: self.physical_rows,
+                maximum: limits.max_rows,
+            });
+        }
+        if self.physical_cols == 0 || self.physical_cols > limits.max_cols {
+            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                resource: "physical_cols",
+                observed: self.physical_cols,
+                maximum: limits.max_cols,
+            });
+        }
+        if self.keyboard_stack.len() > limits.max_keyboard_stack_depth {
+            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                resource: "keyboard_stack_depth",
+                observed: self.keyboard_stack.len(),
+                maximum: limits.max_keyboard_stack_depth,
+            });
+        }
+
+        let hot_top = self.stable_row_index_offset;
+        let (cold_sink, oldest, retained_rows, retained_bytes) = if !self.allow_scrollback {
+            (None, hot_top, 0, 0)
+        } else {
+            match self.config.scrollback_spill_sink() {
+                Some(sink) => {
+                    let retained_rows = sink.retained_scrollback_rows();
+                    let retained_bytes = sink.retained_scrollback_bytes();
+                    let oldest = match (retained_rows, sink.oldest_scrollback_row()) {
+                        (0, None) => hot_top,
+                        (0, Some(row)) if usize::try_from(row).ok() == Some(hot_top) => hot_top,
+                        (_, Some(row)) => usize::try_from(row).map_err(|_| {
+                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
+                        })?,
+                        _ => {
+                            return Err(
+                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                            );
+                        }
+                    };
+                    if oldest > hot_top
+                        || hot_top.checked_sub(oldest) != Some(retained_rows)
+                        || retained_bytes > limits.max_cold_scrollback_bytes
+                    {
+                        if retained_bytes > limits.max_cold_scrollback_bytes {
+                            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                                resource: "cold_scrollback_bytes",
+                                observed: retained_bytes,
+                                maximum: limits.max_cold_scrollback_bytes,
+                            });
+                        }
+                        return Err(
+                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                        );
+                    }
+                    (Some(sink), oldest, retained_rows, retained_bytes)
+                }
+                None => (None, hot_top, 0, 0),
+            }
+        };
+
+        let total_lines = retained_rows
+            .checked_add(self.lines.len())
+            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                "screen_lines",
+            ))?;
+        let prospective_lines = usage.lines.checked_add(total_lines).ok_or(
+            ScreenCheckpointCaptureError::ArithmeticOverflow("screen_lines"),
+        )?;
+        if prospective_lines > limits.max_total_lines {
+            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                resource: "screen_lines",
+                observed: prospective_lines,
+                maximum: limits.max_total_lines,
+            });
+        }
+
+        // Inspect every resident line before cloning any of them.  Cold rows
+        // necessarily cross the sink boundary one at a time, but their declared
+        // count and byte ledger have already passed the hard preflight above.
+        for line in &self.lines {
+            inspect_line(line, limits, usage)?;
+        }
+
+        let mut cold_lines = Vec::with_capacity(retained_rows);
+        if let Some(sink) = cold_sink.as_ref() {
+            for stable in oldest..hot_top {
+                let stable = StableRowIndex::try_from(stable).map_err(|_| {
+                    ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
+                })?;
+                let line = sink
+                    .load_scrollback_line(stable)
+                    .ok_or(ScreenCheckpointCaptureError::ColdScrollbackRowMissing(stable))?;
+                inspect_line(&line, limits, usage)?;
+                cold_lines.push(line.semantic_checkpoint_clone());
+            }
+
+            if sink.retained_scrollback_rows() != retained_rows
+                || sink.retained_scrollback_bytes() != retained_bytes
+                || sink.oldest_scrollback_row().and_then(|row| usize::try_from(row).ok())
+                    != Some(oldest)
+            {
+                return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
+            }
+        }
+
+        let mut lines = Vec::with_capacity(total_lines);
+        lines.append(&mut cold_lines);
+        lines.extend(self.lines.iter().map(Line::semantic_checkpoint_clone));
+
+        Ok(ScreenCheckpointParts {
+            lines,
+            stable_row_index_offset: oldest,
             allow_scrollback: self.allow_scrollback,
             keyboard_stack: self.keyboard_stack.clone(),
             physical_rows: self.physical_rows,
             physical_cols: self.physical_cols,
             dpi: self.dpi,
             saved_cursor: self.saved_cursor.clone(),
-        }
+        })
+    }
+
+    /// Rebuild a screen from parts that have already passed the terminal
+    /// checkpoint validator.  Only semantic state is installed; all caches,
+    /// workers, scorecards, telemetry, and configuration-derived policies come
+    /// from a fresh `Screen::new` instance.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn from_validated_checkpoint_parts(
+        parts: ScreenCheckpointParts,
+        config: &Arc<dyn TerminalConfiguration>,
+        seqno: SequenceNo,
+        bidi_mode: BidiMode,
+    ) -> Self {
+        let size = TerminalSize {
+            rows: parts.physical_rows,
+            cols: parts.physical_cols,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: parts.dpi,
+        };
+        let mut screen = Self::new(size, config, parts.allow_scrollback, seqno, bidi_mode);
+        screen.lines = parts.lines.into();
+        screen.stable_row_index_offset = parts.stable_row_index_offset;
+        screen.keyboard_stack = parts.keyboard_stack;
+        screen.saved_cursor = parts.saved_cursor;
+        screen
     }
 
     /// Create a new Screen with the specified dimensions.
