@@ -104,7 +104,6 @@ struct OpenedWriterFile {
     created: bool,
 }
 
-#[derive(Debug, Clone)]
 struct PendingStateSlotRepair {
     slot_index: usize,
     prior_bytes: [u8; V2_STATE_SLOT_SIZE],
@@ -657,6 +656,7 @@ impl MmapScrollback {
         record_kind: RecordKind,
         payload: &[u8],
     ) -> Result<MmapAppendReport, MmapScrollbackError> {
+        self.ensure_ready_for_input()?;
         let output_record_kind = self.pending_record_kind.unwrap_or(record_kind);
         let redacted = self.redactor.redact_chunk(payload);
         if redacted.bytes.is_empty() {
@@ -686,6 +686,7 @@ impl MmapScrollback {
     pub fn flush_pending_redaction(
         &mut self,
     ) -> Result<Option<MmapAppendReport>, MmapScrollbackError> {
+        self.ensure_ready_for_input()?;
         if self.redactor.pending_bytes() == 0 {
             self.pending_record_kind = None;
             return Ok(None);
@@ -707,12 +708,7 @@ impl MmapScrollback {
         record_kind: RecordKind,
         redacted: RedactionResult,
     ) -> Result<MmapAppendReport, MmapScrollbackError> {
-        if self.prewrite_sync_required
-            || self.pending_state_slot_repair.is_some()
-            || self.write_poisoned
-        {
-            self.sync()?;
-        }
+        self.ensure_ready_for_input()?;
         let payload = fit_payload_to_capacity(redacted.bytes, self.header.capacity_bytes)?;
         let payload_len =
             u32::try_from(payload.len()).map_err(|_| MmapScrollbackError::RecordTooLarge {
@@ -914,6 +910,16 @@ impl MmapScrollback {
             write_cursor_bytes: self.header.write_cursor_bytes,
             synced,
         })
+    }
+
+    fn ensure_ready_for_input(&mut self) -> Result<(), MmapScrollbackError> {
+        if self.prewrite_sync_required
+            || self.pending_state_slot_repair.is_some()
+            || self.write_poisoned
+        {
+            self.sync()?;
+        }
+        Ok(())
     }
 
     pub fn sync(&mut self) -> Result<(), MmapScrollbackError> {
@@ -4199,6 +4205,134 @@ mod tests {
             Err(MmapScrollbackError::V2Integrity { .. })
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before_failed_reopen);
+    }
+
+    #[test]
+    fn partial_state_write_error_is_repaired_before_sync_and_cold_reopen() {
+        for prior_dirty in [false, true] {
+            let dir = test_dir(if prior_dirty {
+                "repair-active-dirty-slot"
+            } else {
+                "repair-first-dirty-slot"
+            });
+            let config = MmapScrollbackConfig::new(
+                &dir,
+                if prior_dirty {
+                    "repair-active-dirty-slot"
+                } else {
+                    "repair-first-dirty-slot"
+                },
+            )
+            .with_cap_bytes(4096)
+            .with_sync_every_appends(0)
+            .with_sync_interval(Duration::from_secs(3600));
+            let path = config.bin_path();
+            let mut writer = MmapScrollback::open(config.clone()).unwrap();
+            append_test_payload(&mut writer, RecordKind::Text, b"synced-baseline");
+            writer.sync().unwrap();
+
+            let mut expected = vec![(RecordKind::Text, b"synced-baseline".to_vec())];
+            if prior_dirty {
+                append_test_payload(&mut writer, RecordKind::Text, b"prior-dirty");
+                expected.push((RecordKind::Text, b"prior-dirty".to_vec()));
+                assert!(writer.state_slot_dirty);
+            } else {
+                assert!(!writer.state_slot_dirty);
+            }
+            let rollback_state = writer.v2_state;
+            let rollback_used_bytes = writer.used_bytes;
+            writer.state_slot_partial_write_failure_after = Some(17);
+
+            let error = writer
+                .append_redacted_payload(
+                    RecordKind::Osc,
+                    test_redaction_result(b"must-remain-unreferenced"),
+                )
+                .unwrap_err();
+
+            assert!(matches!(error, MmapScrollbackError::WriteHeader { .. }));
+            assert_eq!(writer.v2_state, rollback_state);
+            assert_eq!(writer.used_bytes, rollback_used_bytes);
+            assert!(writer.pending_state_slot_repair.is_some());
+            assert!(writer.write_poisoned);
+            assert!(writer.prewrite_sync_required);
+
+            writer
+                .sync()
+                .expect("handled publication error must repair exact prior slot bytes");
+            assert!(writer.pending_state_slot_repair.is_none());
+            assert!(!writer.write_poisoned);
+            assert!(!writer.prewrite_sync_required);
+            assert!(!writer.state_slot_dirty);
+            drop(writer);
+
+            let reopened = MmapScrollback::open(config).expect("cold writer reopen after repair");
+            drop(reopened);
+            let recovered = read_linear_records(&path, test_read_limits()).unwrap();
+            assert_eq!(recovered.records, expected);
+            assert_eq!(recovered.completeness, LinearRecordCompleteness::Complete);
+        }
+    }
+
+    #[test]
+    fn failed_state_slot_repair_terminally_poisons_writer_without_slot_rotation() {
+        let dir = test_dir("state-repair-poison");
+        let config = MmapScrollbackConfig::new(&dir, "state-repair-poison")
+            .with_cap_bytes(4096)
+            .with_sync_every_appends(0)
+            .with_sync_interval(Duration::from_secs(3600));
+        let path = config.bin_path();
+        let mut writer = MmapScrollback::open(config.clone()).unwrap();
+        append_test_payload(&mut writer, RecordKind::Text, b"durable-baseline");
+        writer.sync().unwrap();
+        writer.state_slot_partial_write_failure_after = Some(11);
+        assert!(matches!(
+            writer.append_redacted_payload(
+                RecordKind::Osc,
+                test_redaction_result(b"failed-publication"),
+            ),
+            Err(MmapScrollbackError::WriteHeader { .. })
+        ));
+        writer.state_slot_repair_write_failure = true;
+
+        assert!(matches!(
+            writer.sync(),
+            Err(MmapScrollbackError::WriteHeader { .. })
+        ));
+        assert!(writer.pending_state_slot_repair.is_none());
+        assert!(writer.write_poisoned);
+        let poisoned_bytes = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            writer.sync(),
+            Err(MmapScrollbackError::WriterPoisoned { .. })
+        ));
+        assert!(matches!(
+            writer.append_redacted_payload(
+                RecordKind::Clear,
+                test_redaction_result(b"must-not-rotate-slots"),
+            ),
+            Err(MmapScrollbackError::WriterPoisoned { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), poisoned_bytes);
+        drop(writer);
+
+        let recovered = read_linear_records(&path, test_read_limits()).unwrap();
+        assert_eq!(
+            recovered.records,
+            vec![(RecordKind::Text, b"durable-baseline".to_vec())]
+        );
+        assert!(matches!(
+            recovered.completeness,
+            LinearRecordCompleteness::Incomplete {
+                reason: LinearRecordTerminalReason::V2NewerStateInvalid,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MmapScrollback::open(config),
+            Err(MmapScrollbackError::V2Integrity { .. })
+        ));
     }
 
     #[test]

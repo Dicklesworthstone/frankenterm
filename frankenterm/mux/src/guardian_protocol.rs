@@ -3109,11 +3109,11 @@ impl GuardianCheckpointDescriptorV1 {
         // Admission is semantic as well as content-addressed: the terminal
         // codec enforces its bounded current schema, semantic invariants, and
         // byte-for-byte canonical re-encoding before a staged payload may be
-        // sealed. The descriptor itself can only be minted in production from
-        // an opaque live-capture or genesis terminal authority, which binds
-        // its parser watermark to these same canonical bytes. Wire admission
-        // still verifies the decoded geometry explicitly and the store must
-        // reconcile record boundaries against its guardian-owned journal.
+        // sealed. Production constructors bind descriptors to opaque live-
+        // capture or genesis terminal authority; wire admission separately
+        // verifies canonical bytes, digest, and geometry. A record-backed
+        // store must additionally reconcile the descriptor's exact output
+        // boundary against its guardian-owned journal before publication.
         let validated = TerminalCheckpointV2::decode_canonical_json(
             canonical_terminal_payload,
             TerminalCheckpointLimits::default(),
@@ -4307,53 +4307,71 @@ impl GuardianReplayPageDelivery {
                 {
                     return Err(GuardianProtocolError::InvalidReplyPayload);
                 }
-                if let GuardianReplaySelectorV1::Resume {
-                    checkpoint_id,
-                    next_sequence,
-                    previous_record_digest,
-                } = selector
-                {
-                    if matches!(
-                        &self.body,
-                        GuardianReplayPageBodyDelivery::CheckpointChunk(_)
-                            | GuardianReplayPageBodyDelivery::SnapshotExpired { .. }
-                    ) || matches!(
-                        &self.body,
+                match (selector, &self.body) {
+                    (
+                        GuardianReplaySelectorV1::LatestCompatible,
+                        GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
+                    ) if chunk.offset == 0 => {}
+                    (
+                        GuardianReplaySelectorV1::LatestCompatible,
+                        GuardianReplayPageBodyDelivery::Gap { .. },
+                    ) => {}
+                    (
+                        GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id },
+                        GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
+                    ) if chunk.offset == 0
+                        && chunk.descriptor.checkpoint_id == checkpoint_id => {}
+                    (
+                        GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id },
                         GuardianReplayPageBodyDelivery::Compacted {
                             requested_checkpoint,
                             ..
-                        } if *requested_checkpoint != checkpoint_id
-                    ) {
-                        return Err(GuardianProtocolError::InvalidReplyPayload);
+                        },
+                    ) if *requested_checkpoint == checkpoint_id => {}
+                    (
+                        GuardianReplaySelectorV1::ExactCheckpoint { .. },
+                        GuardianReplayPageBodyDelivery::Gap { .. },
+                    ) => {}
+                    (
+                        GuardianReplaySelectorV1::Resume {
+                            checkpoint_id: _,
+                            next_sequence,
+                            previous_record_digest,
+                        },
+                        GuardianReplayPageBodyDelivery::OutputRecords(_)
+                        | GuardianReplayPageBodyDelivery::Gap { .. },
+                    ) => {
+                        validate_page_start(
+                            &self.body,
+                            next_sequence,
+                            previous_record_digest,
+                        )?;
                     }
-                    validate_page_start(&self.body, next_sequence, previous_record_digest)?;
-                } else if let GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id } =
-                    selector
-                {
-                    let identity_matches = match &self.body {
-                        GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
-                            chunk.descriptor.checkpoint_id == checkpoint_id
-                        }
-                        GuardianReplayPageBodyDelivery::Compacted {
-                            requested_checkpoint,
-                            ..
-                        } => *requested_checkpoint == checkpoint_id,
-                        GuardianReplayPageBodyDelivery::Gap { .. } => true,
+                    (
+                        GuardianReplaySelectorV1::Resume {
+                            checkpoint_id,
+                            next_sequence,
+                            previous_record_digest,
+                        },
                         GuardianReplayPageBodyDelivery::Complete {
                             checkpoint_id: observed,
                             ..
-                        } => *observed == checkpoint_id,
-                        GuardianReplayPageBodyDelivery::OutputRecords(_)
-                        | GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => false,
-                    };
-                    if !identity_matches {
-                        return Err(GuardianProtocolError::InvalidReplyPayload);
+                        },
+                    ) if *observed == checkpoint_id => {
+                        validate_page_start(
+                            &self.body,
+                            next_sequence,
+                            previous_record_digest,
+                        )?;
                     }
-                } else if matches!(
-                    &self.body,
-                    GuardianReplayPageBodyDelivery::SnapshotExpired { .. }
-                ) {
-                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                    (
+                        GuardianReplaySelectorV1::Resume { checkpoint_id, .. },
+                        GuardianReplayPageBodyDelivery::Compacted {
+                            requested_checkpoint,
+                            ..
+                        },
+                    ) if *requested_checkpoint == checkpoint_id => {}
+                    _ => return Err(GuardianProtocolError::InvalidReplyPayload),
                 }
             }
             GuardianReplayRequestV1::Continue { cursor } => {
@@ -4369,21 +4387,38 @@ impl GuardianReplayPageDelivery {
                 {
                     return Err(GuardianProtocolError::InvalidReplyPayload);
                 }
-                validate_page_start(
-                    &self.body,
-                    cursor.next_sequence,
-                    cursor.previous_record_digest,
-                )?;
-                if let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) = &self.body {
-                    if cursor.phase != GuardianReplayPhaseV1::Checkpoint
-                        || cursor.checkpoint_offset != chunk.offset
-                    {
-                        return Err(GuardianProtocolError::InvalidReplyPayload);
+                match (cursor.phase, &self.body) {
+                    (
+                        GuardianReplayPhaseV1::Checkpoint,
+                        GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
+                    ) if cursor.checkpoint_offset == chunk.offset => {
+                        validate_page_start(
+                            &self.body,
+                            cursor.next_sequence,
+                            cursor.previous_record_digest,
+                        )?;
                     }
-                } else if matches!(&self.body, GuardianReplayPageBodyDelivery::OutputRecords(_))
-                    && cursor.phase != GuardianReplayPhaseV1::Output
-                {
-                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                    (
+                        GuardianReplayPhaseV1::Checkpoint,
+                        GuardianReplayPageBodyDelivery::Gap { .. },
+                    )
+                    | (
+                        GuardianReplayPhaseV1::Output,
+                        GuardianReplayPageBodyDelivery::OutputRecords(_)
+                            | GuardianReplayPageBodyDelivery::Complete { .. }
+                            | GuardianReplayPageBodyDelivery::Gap { .. },
+                    ) => {
+                        validate_page_start(
+                            &self.body,
+                            cursor.next_sequence,
+                            cursor.previous_record_digest,
+                        )?;
+                    }
+                    (
+                        GuardianReplayPhaseV1::Checkpoint | GuardianReplayPhaseV1::Output,
+                        GuardianReplayPageBodyDelivery::SnapshotExpired { .. },
+                    ) => {}
+                    _ => return Err(GuardianProtocolError::InvalidReplyPayload),
                 }
             }
         }
@@ -5995,17 +6030,15 @@ impl GuardianReply {
                 if reply.upload_id() != stage.upload_id() {
                     return Err(GuardianProtocolError::ResponseRequestMismatch);
                 }
-                match *reply {
-                    GuardianCheckpointStageReplyV1::Ready {
-                        next_index,
-                        committed_bytes,
-                        ..
-                    }
-                    | GuardianCheckpointStageReplyV1::Progress {
-                        next_index,
-                        committed_bytes,
-                        ..
-                    } => {
+                match (stage.kind(), *reply) {
+                    (
+                        GuardianCheckpointStageKindV1::Begin,
+                        GuardianCheckpointStageReplyV1::Ready {
+                            next_index,
+                            committed_bytes,
+                            ..
+                        },
+                    ) => {
                         let expected = u64::from(next_index)
                             .checked_mul(u64::from(stage.chunk_bytes()))
                             .map(|bytes| bytes.min(stage.total_bytes()))
@@ -6016,17 +6049,46 @@ impl GuardianReply {
                             Err(GuardianProtocolError::InvalidReplyPayload)
                         }
                     }
-                    GuardianCheckpointStageReplyV1::Sealed {
-                        checkpoint_id,
-                        boundary_id,
-                        total_bytes,
-                        ..
-                    } if checkpoint_id == stage.checkpoint_id()
+                    (
+                        GuardianCheckpointStageKindV1::Chunk,
+                        GuardianCheckpointStageReplyV1::Progress {
+                            next_index,
+                            committed_bytes,
+                            ..
+                        },
+                    ) => {
+                        let (chunk_index, _, _) = stage
+                            .chunk_position()
+                            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                        let expected_next = chunk_index
+                            .checked_add(1)
+                            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                        let expected_committed = u64::from(expected_next)
+                            .checked_mul(u64::from(stage.chunk_bytes()))
+                            .map(|bytes| bytes.min(stage.total_bytes()))
+                            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                        if next_index == expected_next && committed_bytes == expected_committed {
+                            Ok(())
+                        } else {
+                            Err(GuardianProtocolError::InvalidReplyPayload)
+                        }
+                    }
+                    (
+                        GuardianCheckpointStageKindV1::Seal,
+                        GuardianCheckpointStageReplyV1::Sealed {
+                            checkpoint_id,
+                            boundary_id,
+                            total_bytes,
+                            ..
+                        },
+                    ) if checkpoint_id == stage.checkpoint_id()
                         && boundary_id == stage.boundary_id()
                         && total_bytes == stage.total_bytes() => Ok(()),
-                    GuardianCheckpointStageReplyV1::Sealed { .. } => {
-                        Err(GuardianProtocolError::ResponseRequestMismatch)
-                    }
+                    (
+                        GuardianCheckpointStageKindV1::Seal,
+                        GuardianCheckpointStageReplyV1::Sealed { .. },
+                    ) => Err(GuardianProtocolError::ResponseRequestMismatch),
+                    _ => Err(GuardianProtocolError::ResponseRequestMismatch),
                 }
             }
             Self::ReplayAcked(receipt) => {
@@ -13413,7 +13475,10 @@ mod tests {
         let descriptor = record_checkpoint_descriptor(pane, generation, canonical);
         assert_eq!(descriptor.durable_pane_id(), Some(pane));
         assert_eq!(descriptor.capture_generation(), generation);
-        assert_eq!(descriptor.total_bytes(), canonical.len() as u64);
+        assert_eq!(
+            descriptor.total_bytes(),
+            u64::try_from(canonical.len()).unwrap()
+        );
         assert_eq!(descriptor.validate_canonical_payload(canonical), Ok(()));
 
         let scope = GuardianCheckpointScopeV1::Pane {
