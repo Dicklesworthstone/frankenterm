@@ -4183,30 +4183,30 @@ mod tests {
         let plaintext = b"bounded persisted checkpoint record";
         let (descriptor, _, _, _) = record_descriptor();
         let binding = record_stage_binding(descriptor, 11);
-        let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+        let intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
             &binding,
             Uuid::new_v4(),
             Uuid::new_v4(),
-            plaintext,
+            stage_plaintext(plaintext),
         )
-        .expect("construct candidate context");
+        .expect("construct candidate intent");
+        let context = intent.context();
         let oversized_bytes =
             usize::try_from(GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES + 1)
                 .expect("staging bound fits usize");
         let oversized_plaintext = Zeroizing::new(vec![0x5a; oversized_bytes]);
         assert!(matches!(
-            GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            GuardianCheckpointStageSealIntentV1::candidate_metadata(
                 &binding,
                 Uuid::new_v4(),
                 Uuid::new_v4(),
-                oversized_plaintext.as_slice(),
+                oversized_plaintext,
             ),
             Err(GuardianCheckpointCipherError::PlaintextByteLimit)
         ));
-        drop(oversized_plaintext);
         let cipher = checkpoint_stage_cipher(0x51);
         let record = cipher
-            .seal(context, plaintext)
+            .seal(intent)
             .expect("seal reconstruction fixture");
         let header = record.fixed_header();
 
@@ -4301,21 +4301,32 @@ mod tests {
     #[test]
     fn checkpoint_cipher_uses_fresh_random_nonces() {
         let plaintext = b"random nonce checkpoint fixture";
-        let (descriptor, segment, output, capture) = record_descriptor();
+        let (descriptor, _, _, capture) = record_descriptor();
         let binding = record_stage_binding(descriptor, 13);
-        let witness = record_seal_witness(&descriptor, segment, output, &capture);
-        let context = GuardianCheckpointStageRecordContextV1::seal_manifest(
+        let upload_id = Uuid::new_v4();
+        let publication_id = Uuid::new_v4();
+        let first_intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
             &binding,
-            &witness,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            plaintext,
+            record_manifest_authority(&descriptor, &capture),
+            upload_id,
+            publication_id,
+            stage_plaintext(plaintext),
         )
-        .expect("construct manifest context");
+        .expect("construct first manifest intent");
+        let context = first_intent.context();
+        let second_intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
+            &binding,
+            record_manifest_authority(&descriptor, &capture),
+            upload_id,
+            publication_id,
+            stage_plaintext(plaintext),
+        )
+        .expect("construct deterministic retry manifest intent");
+        assert_eq!(second_intent.context(), context);
         let cipher = checkpoint_stage_cipher(0x61);
-        let first = cipher.seal(context, plaintext).expect("seal first record");
+        let first = cipher.seal(first_intent).expect("seal first record");
         let second = cipher
-            .seal(context, plaintext)
+            .seal(second_intent)
             .expect("seal retry record");
         let first_header = first.fixed_header();
         let second_header = second.fixed_header();
@@ -4340,23 +4351,25 @@ mod tests {
         let plaintext = b"CHECKPOINT-PLAINTEXT-MUST-NOT-APPEAR";
         let (descriptor, _, _, _) = record_descriptor();
         let binding = record_stage_binding(descriptor, 15);
-        let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+        let intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
             &binding,
             Uuid::new_v4(),
             Uuid::new_v4(),
-            plaintext,
+            stage_plaintext(plaintext),
         )
-        .expect("construct debug context");
+        .expect("construct debug intent");
+        let context = intent.context();
+        let intent_debug = format!("{intent:?}");
         let cipher = checkpoint_stage_cipher(0x71);
-        let record = cipher.seal(context, plaintext).expect("seal debug fixture");
+        let record = cipher.seal(intent).expect("seal debug fixture");
         let header = record.fixed_header();
-        let debug = format!("{record:?} {context:?} {cipher:?}");
+        let debug = format!("{intent_debug} {record:?} {context:?} {cipher:?}");
 
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("CHECKPOINT-PLAINTEXT-MUST-NOT-APPEAR"));
         let (_, plaintext_digest) =
             checkpoint_stage_plaintext_identity(plaintext).expect("identify debug fixture");
-        assert!(!debug.contains(&hex::encode(plaintext_digest)));
+        assert!(!debug.contains(&hex::encode(&*plaintext_digest)));
         assert!(!debug.contains(&hex::encode(record.ciphertext())));
         assert!(!debug.contains(&hex::encode(&header[24..48])));
         assert_eq!(&header[200..232], &[0; 32]);
@@ -4369,39 +4382,49 @@ mod tests {
         let expected_plaintext = b"alpha-secret";
         let substituted_plaintext = b"omega-secret";
         assert_eq!(expected_plaintext.len(), substituted_plaintext.len());
-        let (descriptor, segment, output, capture) = record_descriptor();
+        let (descriptor, _, _, capture) = record_descriptor();
         let binding = record_stage_binding(descriptor, 17);
-        let witness = record_seal_witness(&descriptor, segment, output, &capture);
-        let candidate_context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+        let candidate_intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
             &binding,
             Uuid::new_v4(),
             Uuid::new_v4(),
-            expected_plaintext,
+            stage_plaintext(expected_plaintext),
         )
-        .expect("construct candidate context");
-        let manifest_context = GuardianCheckpointStageRecordContextV1::seal_manifest(
+        .expect("construct candidate intent");
+        let candidate_context = candidate_intent.context();
+        let manifest_intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
             &binding,
-            &witness,
+            record_manifest_authority(&descriptor, &capture),
             candidate_context.upload_id(),
             candidate_context.publication_id(),
-            expected_plaintext,
+            stage_plaintext(expected_plaintext),
         )
-        .expect("construct manifest context");
+        .expect("construct manifest intent");
         let cipher = checkpoint_stage_cipher(0x72);
 
-        for context in [candidate_context, manifest_context] {
+        for mut intent in [candidate_intent, manifest_intent] {
+            for (destination, source) in intent
+                .plaintext
+                .iter_mut()
+                .zip(substituted_plaintext.iter())
+            {
+                *destination = *source;
+            }
             assert!(matches!(
-                cipher.seal(context, substituted_plaintext),
-                Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
-            ));
-            assert!(matches!(
-                cipher.seal(context, b"short"),
+                cipher.seal(intent),
                 Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
             ));
         }
 
+        let valid_intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
+            &binding,
+            candidate_context.upload_id(),
+            candidate_context.publication_id(),
+            stage_plaintext(expected_plaintext),
+        )
+        .expect("construct exact candidate intent");
         let valid_record = cipher
-            .seal(candidate_context, expected_plaintext)
+            .seal(valid_intent)
             .expect("seal exact candidate plaintext");
         let opened: Zeroizing<Vec<u8>> = cipher
             .open(
@@ -4418,11 +4441,10 @@ mod tests {
         drop(opened);
 
         let aad = checkpoint_stage_record_aad(cipher.key_id(), &candidate_context);
-        let expected_digest = candidate_context
-            .expected_plaintext_digest
-            .expect("production context carries its encrypted digest authority");
+        let (_, expected_digest) = checkpoint_stage_plaintext_identity(expected_plaintext)
+            .expect("identify authenticated substitution fixture");
         let substituted_inner =
-            checkpoint_stage_inner_plaintext(substituted_plaintext, expected_digest)
+            checkpoint_stage_inner_plaintext(substituted_plaintext, &expected_digest)
                 .expect("construct authenticated inner-envelope splice fixture");
         let (nonce, ciphertext) = cipher
             .output_cipher
