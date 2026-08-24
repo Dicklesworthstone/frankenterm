@@ -1274,11 +1274,11 @@ impl GuardianCheckpointStageStore {
                     return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
                 }
             };
-            let manifest = Zeroizing::new(checkpoint_seal_manifest(
+            let manifest = checkpoint_seal_manifest(
                 &shape,
                 inspection.candidate_digest,
                 inspection.chunk_set_digest,
-            )?.to_vec());
+            )?;
             if let Some(observed_context) = inspection.seal_context {
                 let intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
                     &shape.binding,
@@ -2173,7 +2173,10 @@ fn checkpoint_inspect_upload(
                 != u32::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES)
                     .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
             || !checkpoint_shared_context_identity_matches(&seal_context, &candidate_context)
-            || !checkpoint_bytes_match(seal_plaintext.as_slice(), &expected_manifest)
+            || !checkpoint_bytes_match(
+                seal_plaintext.as_slice(),
+                expected_manifest.as_slice(),
+            )
         {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
@@ -2218,20 +2221,23 @@ fn checkpoint_seal_manifest(
     shape: &CheckpointStageRequestShape,
     candidate_digest: [u8; 32],
     chunk_set_digest: [u8; 32],
-) -> Result<[u8; CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES], GuardianCheckpointStageStoreError> {
-    let seal_payload = shape.seal_payload()?;
+) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointStageStoreError> {
+    let seal_payload = Zeroizing::new(shape.seal_payload()?);
     if seal_payload.len() != CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let mut manifest = [0_u8; CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES];
-    manifest[..CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES]
-        .copy_from_slice(&seal_payload);
-    manifest[CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
-        ..CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES + 32]
-        .copy_from_slice(&candidate_digest);
-    manifest[CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES + 32..]
-        .copy_from_slice(&chunk_set_digest);
-    Ok(manifest)
+    let mut manifest = Vec::new();
+    manifest
+        .try_reserve_exact(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    manifest.extend_from_slice(seal_payload.as_slice());
+    manifest.extend_from_slice(&candidate_digest);
+    manifest.extend_from_slice(&chunk_set_digest);
+    if manifest.len() != CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES {
+        manifest.zeroize();
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(Zeroizing::new(manifest))
 }
 
 fn checkpoint_validate_exact_chunk_retry(
@@ -5229,6 +5235,44 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_stage_resource_caps_match_the_protocol_envelope() {
+        let policy = GuardianCheckpointStagePolicy::production()
+            .validate()
+            .expect("production checkpoint staging policy");
+        let record_overhead = CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES;
+        let chunks = u64::from(GUARDIAN_MAX_CHECKPOINT_CHUNKS);
+        let expected_upload_bytes = GUARDIAN_MAX_CHECKPOINT_BYTES
+            .checked_add(chunks.checked_mul(record_overhead).expect("chunk overhead"))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                        .expect("candidate size")
+                        + record_overhead,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES)
+                        .expect("seal size")
+                        + record_overhead,
+                )
+            })
+            .expect("upload envelope");
+        assert_eq!(CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD, 1_026);
+        assert_eq!(CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD, expected_upload_bytes);
+        assert_eq!(expected_upload_bytes, 268_739_888);
+        assert_eq!(
+            policy.max_stage_files,
+            policy.max_retained_uploads * CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD
+        );
+        assert_eq!(
+            policy.max_stage_bytes,
+            u64::try_from(policy.max_retained_uploads).expect("retention count")
+                * CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD
+        );
+    }
+
+    #[test]
     fn checkpoint_stage_begin_chunk_retry_and_gap_are_durable_and_exact(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (directory, poll, pipeline) = pipeline_with_policy(
@@ -5317,6 +5361,18 @@ mod tests {
                 committed_bytes: 8,
             }
         );
+        let conflicting_first_retry = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Chunk,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            Some((0, b"conflict")),
+        )?;
+        assert!(matches!(
+            store.apply_chunk(conflicting_first_retry),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
         let total_chunks = u32::try_from(payload.chunks(chunk_bytes_usize).count())?;
         assert_eq!(
             store.apply_begin(&begin)?,

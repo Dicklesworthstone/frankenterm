@@ -819,6 +819,62 @@ mod tests {
     }
 
     #[test]
+    fn process_generation_lifetime_owner_spans_cleanup_and_exit() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("fn main() {").expect("find main function");
+        let run_start = source[main_start..]
+            .find("\nfn run(")
+            .map(|offset| main_start + offset)
+            .expect("find run function");
+        let main_source = &source[main_start..run_start];
+
+        let owner = main_source
+            .find("let mut generation_lifetime = None;")
+            .expect("main owns lifetime guard slot");
+        let run_call = main_source
+            .find("run(&mut generation_lifetime)")
+            .expect("main lends lifetime guard slot to run");
+        let error_cleanup = main_source
+            .find("wezterm_blob_leases::clear_storage();")
+            .expect("error path clears blob storage");
+        let error_log = main_source
+            .find("log::error!")
+            .expect("error path reports failure");
+        let process_exit = main_source
+            .find("std::process::exit(1);")
+            .expect("error path exits process");
+        let success_cleanup = main_source
+            .rfind("wezterm_blob_leases::clear_storage();")
+            .expect("success path clears blob storage");
+        assert!(owner < run_call);
+        assert!(run_call < error_cleanup);
+        assert!(error_cleanup < error_log);
+        assert!(error_log < process_exit);
+        assert!(process_exit < success_cleanup);
+        assert_ne!(error_cleanup, success_cleanup);
+        assert!(!main_source.contains("drop(generation_lifetime)"));
+
+        let run_source = &source[run_start..];
+        let parse = run_source.find("let opts = Opt::parse();").expect("parse opts");
+        let foreground = run_source
+            .find("if !opts.daemonize {")
+            .expect("separate mux owner from daemonizing parent");
+        let acquire = run_source
+            .find("GenerationLifetimeLease::acquire_for_current_process()")
+            .expect("acquire generation lifetime guard");
+        let store = run_source
+            .find("*generation_lifetime = Some(lease);")
+            .expect("transfer guard into main-owned slot");
+        let common_init = run_source
+            .find("config::common_init(")
+            .expect("find fallible configuration initialization");
+        assert!(parse < foreground);
+        assert!(foreground < acquire);
+        assert!(acquire < store);
+        assert!(store < common_init);
+    }
+
+    #[test]
     fn mux_domain_config_generation_fences_stale_reconciliation() {
         let _guard = lock_test_state();
 
