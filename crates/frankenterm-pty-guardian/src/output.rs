@@ -11,6 +11,14 @@
 
 use crate::transport::provision_guardian_token_in_pinned_parent;
 use mio::Waker;
+use mux::guardian_checkpoint::{
+    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+    GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES, GuardianCheckpointArtifactDescriptorV1,
+    GuardianCheckpointBoundaryError, GuardianCheckpointCipher, GuardianCheckpointCipherError,
+    GuardianCheckpointStageBindingV1, GuardianCheckpointStageRecordContextV1,
+    GuardianCheckpointStageRecordKindV1, GuardianCheckpointStageScopeV1,
+    GuardianCheckpointValidatedSealWitnessV1, GuardianEncryptedCheckpointStageRecordV1,
+};
 use mux::guardian_input_journal::{
     GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
     GuardianInputJournalLimits, GuardianInputTransaction, GuardianInputTransactionError,
@@ -23,12 +31,15 @@ use mux::guardian_output_journal::{
     GuardianOutputKey, GuardianOutputPredecessor, GuardianOutputSegmentIdentity,
 };
 use mux::guardian_protocol::{
-    AuthenticatedGuardianRequest, GuardianEffectTransactionError, GuardianProtocolError,
-    GuardianProtocolState, GuardianReply,
+    AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES,
+    GUARDIAN_MAX_CHECKPOINT_CHUNKS, GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+    GuardianCheckpointDescriptorV1, GuardianCheckpointScopeV1, GuardianCheckpointStageKindV1,
+    GuardianCheckpointStageReplyV1, GuardianCheckpointStageRequestV1,
+    GuardianEffectTransactionError, GuardianProtocolError, GuardianProtocolState, GuardianReply,
 };
-use nix::unistd::geteuid;
+use nix::unistd::{PathconfVar, fpathconf, geteuid};
 use sha2::{Digest as _, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -66,6 +77,70 @@ const OUTPUT_MAX_DURABLE_BYTES_PER_PANE: u64 = 1024 * 1024 * 1024;
 const OUTPUT_MAX_RELEVANT_FILES_PER_PANE: usize = OUTPUT_MAX_SEGMENTS_PER_PANE * 4;
 const OUTPUT_MAX_DIRECTORY_ENTRIES_PER_SCAN: usize = 1_048_576;
 const OUTPUT_PATH_COLLISION_ATTEMPTS: usize = 8;
+const CHECKPOINT_STAGE_FILE_PREFIX: &[u8] = b"checkpoint-";
+const CHECKPOINT_STAGE_FILE_SUFFIX: &str = ".ftgcp";
+const CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES: usize = 336;
+const CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES: usize = 400;
+const CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES: u64 = 296;
+const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize =
+    GUARDIAN_MAX_CHECKPOINT_CHUNKS as usize + 2;
+const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = GUARDIAN_MAX_CHECKPOINT_BYTES
+    + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES * GUARDIAN_MAX_CHECKPOINT_CHUNKS as u64
+    + (CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES as u64
+        + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)
+    + (CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES as u64
+        + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES);
+const CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS: usize = 8;
+const CHECKPOINT_STAGE_MAX_FILES: usize =
+    CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS * CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD;
+const CHECKPOINT_STAGE_MAX_BYTES: u64 =
+    CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS as u64 * CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD;
+const CHECKPOINT_STAGE_CANDIDATE_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-phase-a-candidate.v1\0";
+const CHECKPOINT_STAGE_CHUNK_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-phase-a-chunk.v1\0";
+const CHECKPOINT_STAGE_CHUNK_SET_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-phase-a-chunk-set.v1\0";
+
+#[derive(Clone, Copy, Debug)]
+struct GuardianCheckpointStagePolicy {
+    max_retained_uploads: usize,
+    max_stage_files: usize,
+    max_stage_bytes: u64,
+}
+
+impl GuardianCheckpointStagePolicy {
+    const fn production() -> Self {
+        Self {
+            max_retained_uploads: CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS,
+            max_stage_files: CHECKPOINT_STAGE_MAX_FILES,
+            max_stage_bytes: CHECKPOINT_STAGE_MAX_BYTES,
+        }
+    }
+
+    fn validate(self) -> Result<Self, GuardianOutputError> {
+        let minimum_files = self
+            .max_retained_uploads
+            .checked_mul(CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD)
+            .ok_or(GuardianOutputError::Allocation)?;
+        let minimum_bytes = u64::try_from(self.max_retained_uploads)
+            .ok()
+            .and_then(|uploads| uploads.checked_mul(CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD))
+            .ok_or(GuardianOutputError::Allocation)?;
+        if self.max_retained_uploads == 0
+            || self.max_retained_uploads > CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
+            || self.max_stage_files < minimum_files
+            || self.max_stage_files > CHECKPOINT_STAGE_MAX_FILES
+            || self.max_stage_bytes < minimum_bytes
+            || self.max_stage_bytes > CHECKPOINT_STAGE_MAX_BYTES
+        {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian checkpoint staging policy is invalid",
+            ));
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum GuardianOutputError {
@@ -91,6 +166,228 @@ impl GuardianOutputError {
     fn io(site: &'static str, source: std::io::Error) -> Self {
         Self::Io { site, source }
     }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum GuardianCheckpointStageStoreError {
+    #[error("guardian checkpoint staging request is invalid")]
+    Protocol(#[from] GuardianProtocolError),
+    #[error("guardian checkpoint staging cipher rejected the record")]
+    Cipher(#[from] GuardianCheckpointCipherError),
+    #[error("guardian checkpoint staging boundary authority is invalid")]
+    Boundary(#[from] GuardianCheckpointBoundaryError),
+    #[error("guardian checkpoint staging output authority is invalid")]
+    Output(#[from] GuardianOutputError),
+    #[error("guardian checkpoint staging journal recovery failed")]
+    Journal(#[from] GuardianOutputJournalError),
+    #[error("guardian checkpoint staging filesystem I/O failed at {site}")]
+    Io {
+        site: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("guardian checkpoint staging store lock was poisoned")]
+    LockPoisoned,
+    #[error("guardian checkpoint staging upload conflicts with durable state")]
+    Conflict,
+    #[error("guardian checkpoint staging chunks are not a contiguous prefix")]
+    OutOfOrder,
+    #[error("guardian checkpoint staging upload is poisoned or incomplete")]
+    Poisoned,
+    #[error("guardian checkpoint staging resource policy is exhausted")]
+    Capacity,
+    #[error("guardian checkpoint staging allocation failed")]
+    Allocation,
+    #[error("guardian checkpoint staging filesystem does not expose a safe name bound")]
+    NameLimit,
+    #[error("guardian checkpoint staging operation has no durable candidate")]
+    CandidateAbsent,
+    #[error("guardian checkpoint staging origin authority does not match its scope")]
+    OriginAuthorityMismatch,
+}
+
+impl GuardianCheckpointStageStoreError {
+    fn io(site: &'static str, source: std::io::Error) -> Self {
+        Self::Io { site, source }
+    }
+}
+
+pub(crate) enum GuardianCheckpointOriginAuthority<'a> {
+    Record(&'a GuardianPaneOutputJournal),
+    Genesis { spawn_effect_id: Uuid },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CheckpointStagePathScope {
+    Pane { pane_id: Uuid, generation: u64 },
+    Genesis { spawn_effect_id: Uuid },
+}
+
+impl CheckpointStagePathScope {
+    fn from_protocol(scope: GuardianCheckpointScopeV1) -> Self {
+        match scope {
+            GuardianCheckpointScopeV1::Pane {
+                pane_id,
+                generation,
+            } => Self::Pane {
+                pane_id,
+                generation,
+            },
+            GuardianCheckpointScopeV1::Genesis { spawn_effect_id } => {
+                Self::Genesis { spawn_effect_id }
+            }
+        }
+    }
+
+    fn stage_scope(self) -> Result<GuardianCheckpointStageScopeV1, GuardianCheckpointCipherError> {
+        match self {
+            Self::Pane {
+                pane_id,
+                generation,
+            } => GuardianCheckpointStageScopeV1::pane(pane_id, generation),
+            Self::Genesis { spawn_effect_id } => {
+                GuardianCheckpointStageScopeV1::genesis(spawn_effect_id)
+            }
+        }
+    }
+
+    fn base_name(self, upload_id: Uuid) -> String {
+        match self {
+            Self::Pane {
+                pane_id,
+                generation,
+            } => format!(
+                "checkpoint-pane-{pane_id}.generation-{generation:020}.upload-{upload_id}"
+            ),
+            Self::Genesis { spawn_effect_id } => {
+                format!("checkpoint-genesis-{spawn_effect_id}.upload-{upload_id}")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CheckpointStageUploadKey {
+    scope: CheckpointStagePathScope,
+    upload_id: Uuid,
+}
+
+impl CheckpointStageUploadKey {
+    fn base_name(self) -> String {
+        self.scope.base_name(self.upload_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointStageFileRole {
+    Candidate,
+    Chunk { publication_id: Uuid, index: u32 },
+    Seal { publication_id: Uuid },
+}
+
+#[derive(Debug)]
+struct CheckpointStageCensusEntry {
+    key: CheckpointStageUploadKey,
+    role: CheckpointStageFileRole,
+    path: PathBuf,
+    bytes: u64,
+}
+
+struct CheckpointStageCensus {
+    entries: Vec<CheckpointStageCensusEntry>,
+    uploads: BTreeSet<CheckpointStageUploadKey>,
+    total_files: usize,
+    total_bytes: u64,
+}
+
+struct CheckpointStageRequestShape {
+    scope: GuardianCheckpointScopeV1,
+    path_scope: CheckpointStagePathScope,
+    upload_id: Uuid,
+    descriptor: GuardianCheckpointDescriptorV1,
+    canonical_descriptor: GuardianCheckpointArtifactDescriptorV1,
+    binding: GuardianCheckpointStageBindingV1,
+    chunk_bytes: u32,
+    total_chunks: u32,
+    total_bytes: u64,
+}
+
+impl CheckpointStageRequestShape {
+    fn from_request(
+        request: &GuardianCheckpointStageRequestV1,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let scope = request.scope();
+        let path_scope = CheckpointStagePathScope::from_protocol(scope);
+        let descriptor = request.descriptor();
+        let canonical_descriptor = descriptor.canonical_descriptor()?;
+        let binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
+            path_scope.stage_scope()?,
+            canonical_descriptor,
+            descriptor.capture_generation(),
+        )?;
+        Ok(Self {
+            scope,
+            path_scope,
+            upload_id: request.upload_id(),
+            descriptor,
+            canonical_descriptor,
+            binding,
+            chunk_bytes: request.chunk_bytes(),
+            total_chunks: request.total_chunks(),
+            total_bytes: request.total_bytes(),
+        })
+    }
+
+    fn key(&self) -> CheckpointStageUploadKey {
+        CheckpointStageUploadKey {
+            scope: self.path_scope,
+            upload_id: self.upload_id,
+        }
+    }
+
+    fn begin_payload(&self) -> Result<Vec<u8>, GuardianProtocolError> {
+        GuardianCheckpointStageRequestV1::begin(
+            self.scope,
+            self.upload_id,
+            self.descriptor,
+            self.chunk_bytes,
+        )?
+        .encode()
+    }
+
+    fn seal_payload(&self) -> Result<Vec<u8>, GuardianProtocolError> {
+        GuardianCheckpointStageRequestV1::seal(
+            self.scope,
+            self.upload_id,
+            self.descriptor,
+            self.chunk_bytes,
+        )?
+        .encode()
+    }
+}
+
+struct CheckpointStageUploadInspection {
+    publication_id: Uuid,
+    next_index: u32,
+    committed_bytes: u64,
+    sealed: bool,
+    candidate_digest: [u8; 32],
+    chunk_set_digest: [u8; 32],
+}
+
+struct GuardianCheckpointStageStoreInner {
+    directory: File,
+    directory_path: PathBuf,
+    cipher: GuardianCheckpointCipher,
+    persistence: Arc<PersistentOutputAuthority>,
+    policy: GuardianCheckpointStagePolicy,
+    name_max: usize,
+    gate: Mutex<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GuardianCheckpointStageStore {
+    inner: Arc<GuardianCheckpointStageStoreInner>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

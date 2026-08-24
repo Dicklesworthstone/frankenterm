@@ -775,6 +775,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
     /// than minting another authorization. A different or unresolved observed
     /// authority is not a rollback and must be recorded as `Indeterminate` by
     /// the caller instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn record_rolled_back(
         &mut self,
         selector_after: SelectorAuthority,
@@ -1817,7 +1818,10 @@ mod tests {
         assert!(prepared_error
             .to_string()
             .contains("not preceded by Activating authority"));
-        assert_eq!(ledger.latest().expect("Prepared remains").state(), RemoteUpgradeState::Prepared);
+        assert_eq!(
+            ledger.latest().expect("Prepared remains").state(),
+            RemoteUpgradeState::Prepared
+        );
         assert_eq!(transaction_names(&ledger), prepared_names);
     }
 
@@ -1837,9 +1841,11 @@ mod tests {
             .consume_selector()
             .expect("consume selector effect permit");
         let names_before = transaction_names(&ledger);
+        let changed_generation = "d".repeat(64);
+        let changed_target = format!("generations/{changed_generation}");
         let changed = SelectorAuthority::selected(
-            &"d".repeat(64),
-            Path::new(&format!("generations/{}", "d".repeat(64))),
+            &changed_generation,
+            Path::new(&changed_target),
             41,
             43,
         )
@@ -1876,9 +1882,11 @@ mod tests {
             .consume_selector()
             .expect("consume selector effect permit");
         let authorization = ledger.latest().expect("Activating authorization");
+        let changed_generation = "d".repeat(64);
+        let changed_target = format!("generations/{changed_generation}");
         let changed = SelectorAuthority::selected(
-            &"d".repeat(64),
-            Path::new(&format!("generations/{}", "d".repeat(64))),
+            &changed_generation,
+            Path::new(&changed_target),
             47,
             53,
         )
@@ -2259,6 +2267,21 @@ mod tests {
             RemoteUpgradeState::Committed,
             2,
         ));
+        assert!(record_transition_is_valid(
+            RemoteUpgradeState::Activating,
+            2,
+            RemoteUpgradeState::RolledBack,
+            2,
+        ));
+        assert!(!record_transition_is_valid(
+            RemoteUpgradeState::Activating,
+            2,
+            RemoteUpgradeState::RolledBack,
+            3,
+        ));
+        assert!(RemoteUpgradeState::RolledBack.is_terminal());
+        assert!(!RemoteUpgradeState::RolledBack
+            .permits_successor(RemoteUpgradeState::Activating));
         assert_eq!(MAX_RECORD_BYTES, 64 * 1024);
         assert_eq!(MAX_COMMITTED_RECORDS, 32);
         assert_eq!(MAX_ATTEMPTS, 16);

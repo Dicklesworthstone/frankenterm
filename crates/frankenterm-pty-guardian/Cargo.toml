@@ -30,7 +30,7 @@ getrandom.workspace = true
 libc.workspace = true
 mio = { workspace = true, features = ["net", "os-ext", "os-poll"] }
 mux.workspace = true
-nix = { workspace = true, features = ["fs", "process", "signal", "user"] }
+nix = { workspace = true, features = ["feature", "fs", "process", "signal", "user"] }
 portable-pty = { workspace = true, features = ["serde_support"] }
 rustix.workspace = true
 sha2.workspace = true

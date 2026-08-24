@@ -3441,6 +3441,44 @@ mod tests {
         ));
     }
 
+    fn assert_authenticated_inner_mutation_fails(
+        cipher: &GuardianCheckpointCipher,
+        context: GuardianCheckpointStageRecordContextV1,
+        plaintext: &[u8],
+        expected_error: GuardianCheckpointCipherError,
+        mutate: impl FnOnce(&mut [u8]),
+    ) {
+        let (_, plaintext_digest) =
+            checkpoint_stage_plaintext_identity(plaintext).expect("identify inner fixture");
+        let mut inner_plaintext = checkpoint_stage_inner_plaintext(plaintext, plaintext_digest)
+            .expect("construct canonical encrypted inner fixture");
+        mutate(inner_plaintext.as_mut_slice());
+        let aad = checkpoint_stage_record_aad(cipher.key_id(), &context);
+        let (nonce, ciphertext) = cipher
+            .output_cipher
+            .seal_guardian_metadata(inner_plaintext.as_slice(), &aad)
+            .expect("authenticate inner-envelope mutation fixture");
+        drop(inner_plaintext);
+        let record = GuardianEncryptedCheckpointStageRecordV1 {
+            version: GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION,
+            key_id: cipher.key_id(),
+            nonce,
+            context,
+            ciphertext,
+        };
+        match cipher.open(
+            &context,
+            &record,
+            GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+        ) {
+            Err(observed) => assert_eq!(observed, expected_error),
+            Ok(unexpected_plaintext) => {
+                drop(unexpected_plaintext);
+                panic!("authenticated inner-envelope mutation was accepted");
+            }
+        }
+    }
+
     #[test]
     fn checkpoint_cipher_round_trips_every_typed_record_and_fixed_header() {
         let plaintext = b"bounded checkpoint staging plaintext";
@@ -3568,6 +3606,33 @@ mod tests {
             record_descriptor
                 .recompute_boundary_identity_digest()
                 .expect("stable descriptor boundary")
+        );
+        let later_scope = GuardianCheckpointStageScopeV1::pane(pane_id, 8)
+            .expect("construct later pane scope");
+        let later_binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
+            later_scope,
+            record_descriptor,
+            8,
+        )
+        .expect("bind matching later capture generation");
+        assert_ne!(pane_binding.scope(), later_binding.scope());
+        assert_eq!(
+            pane_binding
+                .boundary_identity_digest()
+                .expect("first generation boundary identity"),
+            later_binding
+                .boundary_identity_digest()
+                .expect("later generation boundary identity"),
+            "capture generation must fence staging without entering stable boundary identity"
+        );
+        assert_eq!(
+            pane_binding
+                .checkpoint_identity_digest()
+                .expect("first generation artifact identity"),
+            later_binding
+                .checkpoint_identity_digest()
+                .expect("later generation artifact identity"),
+            "capture generation must fence staging without entering stable artifact identity"
         );
 
         let spawn_effect_id = Uuid::new_v4();
@@ -4255,6 +4320,43 @@ mod tests {
             ),
             Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
         ));
+
+        let trailer_offset = expected_plaintext.len();
+        assert_authenticated_inner_mutation_fails(
+            &cipher,
+            candidate_context,
+            expected_plaintext,
+            GuardianCheckpointCipherError::PlaintextIdentityMismatch,
+            |inner| inner[0] ^= 1,
+        );
+        assert_authenticated_inner_mutation_fails(
+            &cipher,
+            candidate_context,
+            expected_plaintext,
+            GuardianCheckpointCipherError::InvalidInnerEnvelope,
+            |inner| inner[trailer_offset] ^= 1,
+        );
+        assert_authenticated_inner_mutation_fails(
+            &cipher,
+            candidate_context,
+            expected_plaintext,
+            GuardianCheckpointCipherError::InvalidInnerEnvelope,
+            |inner| inner[trailer_offset + 8] ^= 1,
+        );
+        assert_authenticated_inner_mutation_fails(
+            &cipher,
+            candidate_context,
+            expected_plaintext,
+            GuardianCheckpointCipherError::InvalidInnerEnvelope,
+            |inner| inner[trailer_offset + 12] ^= 1,
+        );
+        assert_authenticated_inner_mutation_fails(
+            &cipher,
+            candidate_context,
+            expected_plaintext,
+            GuardianCheckpointCipherError::PlaintextIdentityMismatch,
+            |inner| inner[trailer_offset + 16] ^= 1,
+        );
     }
 
     #[test]
