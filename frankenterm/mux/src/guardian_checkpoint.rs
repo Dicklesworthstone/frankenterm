@@ -8,7 +8,7 @@
 //! and validate its own bounded semantic payload, then bind it to this value.
 
 use crate::guardian_output_journal::{
-    GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
+    GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputSegmentIdentity,
 };
 use crate::pane::Pane;
 use crate::{
@@ -27,6 +27,7 @@ use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;
 use termwiz::escape::{parser::RecoveryGroundBoundary, Action};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const REPLAY_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-replay-identity.v1\0";
@@ -40,6 +41,25 @@ const GENESIS_BOUNDARY_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-genesis-boundary-identity.v1\0";
 const CHECKPOINT_ARTIFACT_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-artifact-identity.v1\0";
+const CHECKPOINT_STAGE_RECORD_AEAD_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-phase-a-record.v1\0";
+const CHECKPOINT_STAGE_PLAINTEXT_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-phase-a-plaintext.v1\0";
+const CHECKPOINT_STAGE_RECORD_MAGIC: [u8; 8] = *b"FTGCPA01";
+
+/// Version of the encrypted Phase-A checkpoint staging-record format.
+pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION: u32 = 1;
+/// Exact fixed header size emitted beside one encrypted staging-record body.
+pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES: usize = 232;
+/// Hard per-record plaintext admission bound shared with checkpoint uploads.
+pub const GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES: u32 = 256 * 1024;
+
+const CHECKPOINT_STAGE_CONTEXT_BYTES: usize = 184;
+const CHECKPOINT_STAGE_KEY_ID_BYTES: usize = 8;
+const CHECKPOINT_STAGE_NONCE_BYTES: usize = 24;
+const CHECKPOINT_STAGE_AEAD_TAG_BYTES: usize = 16;
+const CHECKPOINT_STAGE_MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const CHECKPOINT_STAGE_MAX_CHUNKS: u32 = 1_024;
 
 /// Version of the cross-subsystem checkpoint-boundary contract.
 pub const GUARDIAN_CHECKPOINT_BOUNDARY_VERSION: u32 = 2;

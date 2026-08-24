@@ -23,7 +23,10 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::guardian_checkpoint::{LiveParserCheckpointAck, current_replay_identity_digest};
+use crate::guardian_checkpoint::{
+    GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointOriginV1, LiveParserCheckpointAck,
+    current_replay_identity_digest,
+};
 
 pub const GUARDIAN_PROTOCOL_VERSION: u16 = 4;
 pub const GUARDIAN_AUTH_TOKEN_BYTES: usize = 32;
@@ -117,16 +120,6 @@ const REPLAY_PAGE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-page.v1";
 const REPLAY_RECORD_PLAINTEXT_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-output-plaintext-delivery.v3\0";
 const REPLAY_RECORD_PLAINTEXT_DIGEST_VERSION: u32 = 3;
-const CHECKPOINT_TERMINAL_PAYLOAD_DIGEST_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-terminal-payload.v1\0";
-const CHECKPOINT_OUTPUT_BOUNDARY_DIGEST_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-output-boundary-identity.v1\0";
-const CHECKPOINT_GENESIS_BOUNDARY_DIGEST_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-genesis-boundary-identity.v1\0";
-const CHECKPOINT_ARTIFACT_DIGEST_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-artifact-identity.v1\0";
-const CHECKPOINT_BOUNDARY_IDENTITY_VERSION: u32 = 2;
-
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -941,13 +934,15 @@ impl std::fmt::Debug for GuardianCheckpointIdentityDigest {
     }
 }
 
-/// Opaque identity of the exact durable output boundary included by a
-/// checkpoint. It is a separate type so callers cannot accidentally swap the
-/// artifact and output-boundary digests.
+/// Opaque identity of the exact durable boundary included by a checkpoint.
+///
+/// Record-backed checkpoints bind an output record; Genesis checkpoints bind
+/// a pre-spawn effect. It is a separate type so callers cannot accidentally
+/// swap the artifact and boundary digests.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub struct GuardianOutputBoundaryIdentityDigest([u8; 32]);
+pub struct GuardianCheckpointBoundaryIdentityDigest([u8; 32]);
 
-impl GuardianOutputBoundaryIdentityDigest {
+impl GuardianCheckpointBoundaryIdentityDigest {
     pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, GuardianProtocolError> {
         if bytes.iter().all(|byte| *byte == 0) {
             return Err(GuardianProtocolError::InvalidCheckpointIntent);
@@ -961,9 +956,9 @@ impl GuardianOutputBoundaryIdentityDigest {
     }
 }
 
-impl std::fmt::Debug for GuardianOutputBoundaryIdentityDigest {
+impl std::fmt::Debug for GuardianCheckpointBoundaryIdentityDigest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("GuardianOutputBoundaryIdentityDigest([REDACTED])")
+        formatter.write_str("GuardianCheckpointBoundaryIdentityDigest([REDACTED])")
     }
 }
 
@@ -975,7 +970,7 @@ impl std::fmt::Debug for GuardianOutputBoundaryIdentityDigest {
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct GuardianCheckpointIntent {
     checkpoint_identity: GuardianCheckpointIdentityDigest,
-    output_boundary_identity: GuardianOutputBoundaryIdentityDigest,
+    output_boundary_identity: GuardianCheckpointBoundaryIdentityDigest,
 }
 
 impl std::fmt::Debug for GuardianCheckpointIntent {
@@ -991,7 +986,7 @@ impl GuardianCheckpointIntent {
     #[must_use]
     pub const fn new(
         checkpoint_identity: GuardianCheckpointIdentityDigest,
-        output_boundary_identity: GuardianOutputBoundaryIdentityDigest,
+        output_boundary_identity: GuardianCheckpointBoundaryIdentityDigest,
     ) -> Self {
         Self {
             checkpoint_identity,
@@ -1005,7 +1000,7 @@ impl GuardianCheckpointIntent {
     }
 
     #[must_use]
-    pub const fn output_boundary_identity(self) -> GuardianOutputBoundaryIdentityDigest {
+    pub const fn output_boundary_identity(self) -> GuardianCheckpointBoundaryIdentityDigest {
         self.output_boundary_identity
     }
 
@@ -1034,7 +1029,7 @@ impl GuardianCheckpointIntent {
         output_boundary_identity.copy_from_slice(&payload[40..72]);
         Ok(Self::new(
             GuardianCheckpointIdentityDigest::from_bytes(checkpoint_identity)?,
-            GuardianOutputBoundaryIdentityDigest::from_bytes(output_boundary_identity)?,
+            GuardianCheckpointBoundaryIdentityDigest::from_bytes(output_boundary_identity)?,
         ))
     }
 }
@@ -1281,7 +1276,7 @@ impl GuardianCheckpointReceipt {
             intent: GuardianCheckpointIntent::new(
                 GuardianCheckpointIdentityDigest::from_bytes(checkpoint_identity)
                     .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
-                GuardianOutputBoundaryIdentityDigest::from_bytes(output_boundary_identity)
+                GuardianCheckpointBoundaryIdentityDigest::from_bytes(output_boundary_identity)
                     .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
             ),
             disposition: GuardianCheckpointDisposition::from_wire(payload[6])?,
@@ -1522,7 +1517,7 @@ impl GuardianCheckpointStageRequestV1 {
     }
 
     #[must_use]
-    pub const fn boundary_id(&self) -> GuardianOutputBoundaryIdentityDigest {
+    pub const fn boundary_id(&self) -> GuardianCheckpointBoundaryIdentityDigest {
         self.descriptor.boundary_id
     }
 
@@ -1807,7 +1802,7 @@ pub enum GuardianCheckpointStageReplyV1 {
     Sealed {
         upload_id: Uuid,
         checkpoint_id: GuardianCheckpointIdentityDigest,
-        boundary_id: GuardianOutputBoundaryIdentityDigest,
+        boundary_id: GuardianCheckpointBoundaryIdentityDigest,
         total_bytes: u64,
     },
 }
@@ -1886,7 +1881,7 @@ impl GuardianCheckpointStageReplyV1 {
                     upload_id,
                     checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
                         .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
-                    boundary_id: GuardianOutputBoundaryIdentityDigest::from_bytes(boundary_id)
+                    boundary_id: GuardianCheckpointBoundaryIdentityDigest::from_bytes(boundary_id)
                         .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
                     total_bytes: committed_bytes,
                 }
@@ -2671,7 +2666,7 @@ impl std::fmt::Debug for GuardianCheckpointOutputBoundaryV1 {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianCheckpointDescriptorV1 {
     checkpoint_id: GuardianCheckpointIdentityDigest,
-    boundary_id: GuardianOutputBoundaryIdentityDigest,
+    boundary_id: GuardianCheckpointBoundaryIdentityDigest,
     durable_pane_id: Uuid,
     capture_generation: u64,
     replay_semantics_id: [u8; 32],
@@ -2705,44 +2700,12 @@ impl GuardianCheckpointDescriptorV1 {
         capture: &LiveParserCheckpointAck,
         capture_generation: u64,
     ) -> Result<Self, GuardianProtocolError> {
-        let boundary = capture.boundary();
-        let terminal = capture.terminal_checkpoint();
-        let rows = u32::try_from(terminal.rows())
+        let canonical = GuardianCheckpointArtifactDescriptorV1::from_live_capture(capture)
             .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        let cols = u32::try_from(terminal.cols())
-            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        let output_boundary = GuardianCheckpointOutputBoundaryV1::Record {
-            segment_id: capture.segment_id(),
-            sequence: capture.output_sequence(),
-            record_digest: capture.output_record_digest(),
-            committed_log_bytes: capture.output_committed_log_bytes(),
-            cumulative_plaintext_bytes: capture.journal_cumulative_plaintext_bytes(),
-            parser_stream_bytes: capture.parser_stream_bytes(),
-        };
-        let descriptor = Self::from_artifact_parts(
-            capture.durable_pane_id(),
-            capture_generation,
-            boundary.replay_identity_digest(),
-            rows,
-            cols,
-            capture.terminal_payload_bytes(),
-            capture.terminal_payload_digest(),
-            output_boundary,
+        let descriptor = Self::from_canonical_descriptor(canonical, capture_generation)?;
+        descriptor.validate_canonical_payload(
+            capture.terminal_checkpoint().canonical_payload(),
         )?;
-        let authoritative_boundary = GuardianOutputBoundaryIdentityDigest::from_bytes(
-            capture.output_boundary_identity_digest(),
-        )
-        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        let authoritative_checkpoint = GuardianCheckpointIdentityDigest::from_bytes(
-            capture.checkpoint_artifact_identity_digest(),
-        )
-        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        if descriptor.boundary_id != authoritative_boundary
-            || descriptor.checkpoint_id != authoritative_checkpoint
-        {
-            return Err(GuardianProtocolError::InvalidReplyPayload);
-        }
-        descriptor.validate_canonical_payload(terminal.canonical_payload())?;
         Ok(descriptor)
     }
 
@@ -2753,66 +2716,74 @@ impl GuardianCheckpointDescriptorV1 {
         spawn_effect_id: Uuid,
         terminal: &RecoveryTerminalCheckpointV2,
     ) -> Result<Self, GuardianProtocolError> {
-        if terminal.parser_stream_bytes() != 0 {
-            return Err(GuardianProtocolError::InvalidReplyPayload);
-        }
-        let rows = u32::try_from(terminal.rows())
-            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        let cols = u32::try_from(terminal.cols())
-            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        let canonical_terminal_payload = terminal.canonical_payload();
-        let total_bytes = u64::try_from(canonical_terminal_payload.len())
-            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        let terminal_payload_digest = checkpoint_terminal_payload_digest(
-            total_bytes,
-            canonical_terminal_payload,
-        )?;
-        Self::from_artifact_parts(
-            Uuid::nil(),
-            GUARDIAN_GENESIS_CAPTURE_GENERATION,
-            current_replay_identity_digest(),
-            rows,
-            cols,
-            total_bytes,
-            terminal_payload_digest,
-            GuardianCheckpointOutputBoundaryV1::Genesis {
-                spawn_effect_id,
-                parser_stream_bytes: 0,
-            },
+        let canonical = GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
+            spawn_effect_id,
+            terminal,
         )
+        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        Self::from_canonical_descriptor(canonical, GUARDIAN_GENESIS_CAPTURE_GENERATION)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn from_artifact_parts(
-        durable_pane_id: Uuid,
+    fn from_canonical_descriptor(
+        canonical: GuardianCheckpointArtifactDescriptorV1,
         capture_generation: u64,
-        replay_semantics_id: [u8; 32],
-        rows: u32,
-        cols: u32,
-        total_bytes: u64,
-        terminal_payload_digest: [u8; 32],
-        output_boundary: GuardianCheckpointOutputBoundaryV1,
     ) -> Result<Self, GuardianProtocolError> {
-        let boundary_id = checkpoint_output_boundary_identity(durable_pane_id, output_boundary)?;
-        let checkpoint_id = checkpoint_artifact_identity(
-            boundary_id,
-            replay_semantics_id,
-            rows,
-            cols,
-            total_bytes,
-            terminal_payload_digest,
-            output_boundary,
-        )?;
+        let origin = canonical.origin();
+        let (durable_pane_id, output_boundary) = if origin.is_genesis() {
+            let spawn_effect_id = origin
+                .spawn_effect_id()
+                .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+            (
+                Uuid::nil(),
+                GuardianCheckpointOutputBoundaryV1::Genesis {
+                    spawn_effect_id,
+                    parser_stream_bytes: canonical.parser_stream_bytes(),
+                },
+            )
+        } else {
+            let durable_pane_id = origin
+                .durable_pane_id()
+                .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+            (
+                durable_pane_id,
+                GuardianCheckpointOutputBoundaryV1::Record {
+                    segment_id: origin
+                        .segment_id()
+                        .ok_or(GuardianProtocolError::InvalidReplyPayload)?,
+                    sequence: origin
+                        .output_sequence()
+                        .ok_or(GuardianProtocolError::InvalidReplyPayload)?,
+                    record_digest: origin
+                        .output_record_digest()
+                        .ok_or(GuardianProtocolError::InvalidReplyPayload)?,
+                    committed_log_bytes: origin
+                        .output_committed_log_bytes()
+                        .ok_or(GuardianProtocolError::InvalidReplyPayload)?,
+                    cumulative_plaintext_bytes: origin
+                        .journal_cumulative_plaintext_bytes()
+                        .ok_or(GuardianProtocolError::InvalidReplyPayload)?,
+                    parser_stream_bytes: canonical.parser_stream_bytes(),
+                },
+            )
+        };
         let descriptor = Self {
-            checkpoint_id,
-            boundary_id,
+            checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(
+                canonical
+                    .recompute_checkpoint_identity_digest()
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+            )?,
+            boundary_id: GuardianCheckpointBoundaryIdentityDigest::from_bytes(
+                canonical
+                    .recompute_boundary_identity_digest()
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+            )?,
             durable_pane_id,
             capture_generation,
-            replay_semantics_id,
-            rows,
-            cols,
-            total_bytes,
-            terminal_payload_digest,
+            replay_semantics_id: canonical.replay_identity_digest(),
+            rows: canonical.rows(),
+            cols: canonical.cols(),
+            total_bytes: canonical.terminal_payload_bytes(),
+            terminal_payload_digest: canonical.terminal_payload_digest(),
             output_boundary,
         };
         descriptor.validate()?;
@@ -2822,7 +2793,7 @@ impl GuardianCheckpointDescriptorV1 {
     #[allow(clippy::too_many_arguments)]
     fn from_claimed_parts(
         checkpoint_id: GuardianCheckpointIdentityDigest,
-        boundary_id: GuardianOutputBoundaryIdentityDigest,
+        boundary_id: GuardianCheckpointBoundaryIdentityDigest,
         durable_pane_id: Uuid,
         capture_generation: u64,
         replay_semantics_id: [u8; 32],
@@ -2854,7 +2825,7 @@ impl GuardianCheckpointDescriptorV1 {
     }
 
     #[must_use]
-    pub const fn boundary_id(self) -> GuardianOutputBoundaryIdentityDigest {
+    pub const fn boundary_id(self) -> GuardianCheckpointBoundaryIdentityDigest {
         self.boundary_id
     }
 
@@ -2996,7 +2967,7 @@ impl GuardianCheckpointDescriptorV1 {
         Self::from_claimed_parts(
             GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
                 .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
-            GuardianOutputBoundaryIdentityDigest::from_bytes(boundary_id)
+            GuardianCheckpointBoundaryIdentityDigest::from_bytes(boundary_id)
                 .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
             durable_pane_id,
             read_u64(payload, 64)?,
@@ -9577,7 +9548,8 @@ mod tests {
     ) -> GuardianCheckpointIntent {
         GuardianCheckpointIntent::new(
             GuardianCheckpointIdentityDigest::from_bytes([checkpoint_byte; 32]).unwrap(),
-            GuardianOutputBoundaryIdentityDigest::from_bytes([output_boundary_byte; 32]).unwrap(),
+            GuardianCheckpointBoundaryIdentityDigest::from_bytes([output_boundary_byte; 32])
+                .unwrap(),
         )
     }
 
@@ -9751,7 +9723,7 @@ mod tests {
         let output_boundary_bytes = [0x52; 32];
         let intent = GuardianCheckpointIntent::new(
             GuardianCheckpointIdentityDigest::from_bytes(checkpoint_bytes).unwrap(),
-            GuardianOutputBoundaryIdentityDigest::from_bytes(output_boundary_bytes).unwrap(),
+            GuardianCheckpointBoundaryIdentityDigest::from_bytes(output_boundary_bytes).unwrap(),
         );
         let encoded = intent.encode();
         assert_eq!(encoded.len(), GUARDIAN_CHECKPOINT_INTENT_BYTES);
