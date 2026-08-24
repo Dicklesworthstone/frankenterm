@@ -682,6 +682,12 @@ impl std::fmt::Debug for GuardianResponseEnvelope {
     }
 }
 
+impl Drop for GuardianResponseEnvelope {
+    fn drop(&mut self) {
+        self.payload.zeroize();
+    }
+}
+
 #[derive(Eq, PartialEq)]
 pub struct AuthenticatedGuardianResponse(GuardianResponseEnvelope);
 
@@ -717,7 +723,7 @@ impl AuthenticatedGuardianResponse {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 pub struct GuardianSpawnPayload {
     command: CommandBuilder,
     size: PtySize,
@@ -4756,7 +4762,7 @@ impl CorrelatedGuardianResponse {
         self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianReplayPageDelivery, GuardianProtocolError> {
-        let response = self.0;
+        let mut response = self.0;
         if response.header.status != GuardianResponseStatus::Success
             || response.header.operation != GuardianOperation::Replay
             || response.header.protocol_version != request.header.protocol_version
@@ -4771,7 +4777,8 @@ impl CorrelatedGuardianResponse {
         {
             return Err(GuardianProtocolError::ResponseRequestMismatch);
         }
-        let page = GuardianReplayPageDelivery::decode(response.payload)?;
+        let payload = Zeroizing::new(std::mem::take(&mut *response.payload));
+        let page = GuardianReplayPageDelivery::decode(payload)?;
         page.validate_for_request(request)?;
         Ok(page)
     }
