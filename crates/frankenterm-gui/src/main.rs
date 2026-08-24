@@ -30,6 +30,7 @@ use frankenterm_mux_server_impl::{
 use frankenterm_toast_notification::*;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
+use mux::ssh::RemoteSshDomain;
 use mux::{DomainOperationGuard, Mux};
 use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
@@ -552,6 +553,21 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
         // later by the admitted reconciliation path.
         MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.store(generation, Ordering::Release);
         fence_auto_connect_supervisor_authority("mux-domain configuration reload");
+        if admission_retry_coordinator_is_running(
+            &MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE,
+            "mux-domain config",
+        ) {
+            // The existing worker observes the generation published above and
+            // owns admission of its newest value. Directly admitting here as
+            // well would allow the worker and this callback to enqueue the
+            // same reconciliation generation independently.
+            metrics::counter!(
+                "gui.domain_config_reload_admission",
+                "outcome" => "coalesced_behind_retry_owner"
+            )
+            .increment(1);
+            return true;
+        }
         match try_admit_mux_domain_config_reconciliation(generation) {
             MuxDomainConfigAdmission::Started => {}
             MuxDomainConfigAdmission::Retryable(rejection) => {
@@ -711,48 +727,203 @@ fn finish_admission_retry_coordinator(
     has_newer_request
 }
 
-fn finish_mux_domain_config_admission_retry(observed_generation: u64) -> bool {
-    finish_admission_retry_coordinator(
-        &MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE,
-        &MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION,
-        observed_generation,
-        "mux-domain config",
-    )
+/// Transactional ownership receipt for one admitted retry worker.
+///
+/// A normal finish retires ownership under the coordinator mutex. Any other
+/// exit first clears the stale `Starting`/`Running` publication, then restarts
+/// only when the latest generation has not already reached the main-thread
+/// scheduler. This keeps panic recovery from either stranding a coalesced
+/// request or scheduling a duplicate successor.
+struct AdmissionRetryCoordinatorCompletionGuard<'a, Restart, ReportFailure>
+where
+    Restart: FnOnce() -> std::io::Result<()>,
+    ReportFailure: FnOnce(&std::io::Error),
+{
+    state: &'a Mutex<AdmissionRetryCoordinatorState>,
+    generation: &'a AtomicU64,
+    name: &'a str,
+    restart: Option<Restart>,
+    report_failure: Option<ReportFailure>,
+    observed_generation: Option<u64>,
+    handed_off_generation: Option<u64>,
+}
+
+impl<'a, Restart, ReportFailure>
+    AdmissionRetryCoordinatorCompletionGuard<'a, Restart, ReportFailure>
+where
+    Restart: FnOnce() -> std::io::Result<()>,
+    ReportFailure: FnOnce(&std::io::Error),
+{
+    fn new(
+        state: &'a Mutex<AdmissionRetryCoordinatorState>,
+        generation: &'a AtomicU64,
+        name: &'a str,
+        restart: Restart,
+        report_failure: ReportFailure,
+    ) -> Self {
+        Self {
+            state,
+            generation,
+            name,
+            restart: Some(restart),
+            report_failure: Some(report_failure),
+            observed_generation: None,
+            handed_off_generation: None,
+        }
+    }
+
+    fn begin_request(&mut self, generation: u64) {
+        self.observed_generation = Some(generation);
+        self.handed_off_generation = None;
+    }
+
+    fn record_downstream_handoff(&mut self, generation: u64) {
+        debug_assert_eq!(self.observed_generation, Some(generation));
+        self.handed_off_generation = Some(generation);
+    }
+
+    fn finish(&mut self, observed_generation: u64) -> bool {
+        debug_assert_eq!(self.observed_generation, Some(observed_generation));
+        let has_newer_request = finish_admission_retry_coordinator(
+            self.state,
+            self.generation,
+            observed_generation,
+            self.name,
+        );
+        if !has_newer_request {
+            self.restart.take();
+        }
+        has_newer_request
+    }
+}
+
+impl<Restart, ReportFailure> Drop
+    for AdmissionRetryCoordinatorCompletionGuard<'_, Restart, ReportFailure>
+where
+    Restart: FnOnce() -> std::io::Result<()>,
+    ReportFailure: FnOnce(&std::io::Error),
+{
+    fn drop(&mut self) {
+        let Some(restart) = self.restart.take() else {
+            return;
+        };
+        let restart_error = {
+            // This destructor may run during an unwind, so avoid the ordinary
+            // logging lock helper: a project logger is callback code and must
+            // not be allowed to create a nested panic here.
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => {
+                    self.state.clear_poison();
+                    poisoned.into_inner()
+                }
+            };
+            // Read the generation under the same mutex that serializes a
+            // publisher's ensure/start step. A publisher either increments
+            // before this read and is covered by our restart, or observes the
+            // terminal state published by this transaction.
+            let current_generation = self.generation.load(Ordering::Acquire);
+            let latest_request_was_handed_off =
+                self.handed_off_generation == Some(current_generation);
+            match *state {
+                AdmissionRetryCoordinatorState::Starting
+                | AdmissionRetryCoordinatorState::Running => {
+                    *state = AdmissionRetryCoordinatorState::Idle;
+                }
+                AdmissionRetryCoordinatorState::Idle => return,
+            }
+            if latest_request_was_handed_off {
+                return;
+            }
+
+            // Preserve the same linearization contract as `ensure_*`: no
+            // publisher can observe an Idle gap between abandoned-owner
+            // recovery and replacement thread creation. A successful spawn
+            // publishes exactly one Running owner; every failure or nested
+            // panic publishes Idle before this mutex is released.
+            *state = AdmissionRetryCoordinatorState::Starting;
+            match frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::ClientCallback,
+                std::panic::AssertUnwindSafe(restart),
+            ) {
+                Ok(Ok(())) => {
+                    *state = AdmissionRetryCoordinatorState::Running;
+                    None
+                }
+                Ok(Err(error)) => {
+                    *state = AdmissionRetryCoordinatorState::Idle;
+                    Some(error)
+                }
+                Err(_) => {
+                    *state = AdmissionRetryCoordinatorState::Idle;
+                    None
+                }
+            }
+        };
+
+        if let Some(error) = restart_error {
+            let Some(report_failure) = self.report_failure.take() else {
+                return;
+            };
+            // Failure reporting is callback-rich and must run after releasing
+            // the coordinator mutex. Contain it as well so a logger/toast
+            // panic cannot replace the original worker unwind.
+            let _ = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::ClientCallback,
+                std::panic::AssertUnwindSafe(|| report_failure(&error)),
+            );
+        }
+    }
+}
+
+fn spawn_mux_domain_config_admission_retry() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("ft-domain-config-admission".to_string())
+        .spawn(retry_mux_domain_config_admission)
+        .map(|_thread| ())
+}
+
+fn report_mux_domain_config_admission_retry_start_failure(error: &std::io::Error) {
+    let error = anyhow!(
+        "failed to start mux-domain config admission retry coordinator: {error}; automatic reconnect remains fail-closed until a later valid reload converges"
+    );
+    report_mux_domain_config_reload_failure(&error);
 }
 
 fn start_mux_domain_config_admission_retry() -> bool {
     if let Err(error) = ensure_admission_retry_coordinator(
         &MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE,
         "mux-domain config",
-        || {
-            std::thread::Builder::new()
-                .name("ft-domain-config-admission".to_string())
-                .spawn(retry_mux_domain_config_admission)
-                .map(|_thread| ())
-        },
+        spawn_mux_domain_config_admission_retry,
     ) {
-        let error = anyhow!(
-            "failed to start mux-domain config admission retry coordinator: {error}; automatic reconnect remains fail-closed until a later valid reload converges"
-        );
-        report_mux_domain_config_reload_failure(&error);
+        report_mux_domain_config_admission_retry_start_failure(&error);
         return false;
     }
     true
 }
 
 fn retry_mux_domain_config_admission() {
+    let mut completion = AdmissionRetryCoordinatorCompletionGuard::new(
+        &MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE,
+        &MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION,
+        "mux-domain config",
+        spawn_mux_domain_config_admission_retry,
+        report_mux_domain_config_admission_retry_start_failure,
+    );
     let mut delay = std::time::Duration::from_millis(10);
     let mut attempts = 0_u64;
     loop {
         let generation = MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire);
+        completion.begin_request(generation);
         match try_admit_mux_domain_config_reconciliation(generation) {
             MuxDomainConfigAdmission::Started => {
+                completion.record_downstream_handoff(generation);
                 if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
                     != generation
                 {
                     continue;
                 }
-                if finish_mux_domain_config_admission_retry(generation) {
+                if completion.finish(generation) {
                     continue;
                 }
                 return;
@@ -770,7 +941,7 @@ fn retry_mux_domain_config_admission() {
                     .min(std::time::Duration::from_secs(1));
             }
             MuxDomainConfigAdmission::Terminal(rejection) => {
-                if finish_mux_domain_config_admission_retry(generation) {
+                if completion.finish(generation) {
                     delay = std::time::Duration::from_millis(10);
                     attempts = 0;
                     continue;
@@ -783,6 +954,60 @@ fn retry_mux_domain_config_admission() {
             }
         }
     }
+}
+
+/// Return the complete name frontier whose manual lifecycle operations must be
+/// serialized with one aggregate configuration reconciliation. Desired names
+/// cover not-yet-registered replacements; current names cover removals and
+/// transport changes from the prior generation.
+fn mux_domain_config_lifecycle_names(config: &ConfigHandle, mux: Option<&Mux>) -> Vec<String> {
+    let mut lifecycle_names = frankenterm_mux_server_impl::configured_client_domains(config)
+        .into_iter()
+        .map(|domain| domain.name().to_string())
+        .collect::<Vec<_>>();
+    lifecycle_names.extend(
+        config
+            .ssh_domains()
+            .into_iter()
+            .map(|domain| domain.name),
+    );
+    lifecycle_names.extend(
+        config
+            .wsl_domains()
+            .into_iter()
+            .map(|domain| domain.name),
+    );
+    lifecycle_names.extend(
+        config
+            .exec_domains
+            .iter()
+            .map(|domain| domain.name.clone()),
+    );
+    lifecycle_names.extend(
+        config
+            .serial_ports
+            .iter()
+            .map(|domain| domain.name.clone()),
+    );
+    if let Some(mux) = mux {
+        lifecycle_names.extend(
+            mux.iter_domains()
+                .into_iter()
+                .filter_map(|domain| {
+                    let configuration_owned = domain.downcast_ref::<ClientDomain>().is_some()
+                        || domain
+                            .downcast_ref::<RemoteSshDomain>()
+                            .is_some_and(RemoteSshDomain::is_configuration_owned)
+                        || domain
+                            .downcast_ref::<LocalDomain>()
+                            .is_some_and(LocalDomain::is_configuration_owned);
+                    configuration_owned.then(|| domain.domain_name().to_string())
+                }),
+        );
+    }
+    lifecycle_names.sort();
+    lifecycle_names.dedup();
+    lifecycle_names
 }
 
 async fn reconcile_mux_domain_config_until_converged(
@@ -800,19 +1025,8 @@ async fn reconcile_mux_domain_config_until_converged(
     let mut retry_delay = std::time::Duration::from_millis(25);
     const MAX_RECONCILIATION_DELAY: std::time::Duration =
         std::time::Duration::from_secs(1);
-    let mut lifecycle_names = frankenterm_mux_server_impl::configured_client_domains(&config)
-        .into_iter()
-        .map(|domain| domain.name().to_string())
-        .collect::<Vec<_>>();
-    if let Some(mux) = Mux::try_get() {
-        lifecycle_names.extend(mux.iter_domains().into_iter().filter_map(|domain| {
-            domain
-                .downcast_ref::<ClientDomain>()
-                .map(|_| domain.domain_name().to_string())
-        }));
-    }
-    lifecycle_names.sort();
-    lifecycle_names.dedup();
+    let lifecycle_names =
+        mux_domain_config_lifecycle_names(&config, Mux::try_get().as_deref());
 
     loop {
         if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != generation {
@@ -1132,6 +1346,46 @@ async fn initialize_domain_reconnect_manifest_snapshot() {
             );
             log::error!("{message}");
             persistent_toast_notification("Remembered domain connections unavailable", &message);
+        }
+    }
+}
+
+/// Persist an operator-authorized attached intent without turning the optional
+/// remembered-state store into admission authority for the explicit attach.
+///
+/// A corrupt, unavailable, or temporarily unwritable manifest must disable
+/// automatic recovery honestly, but it must not make a directly requested
+/// domain unusable. Detach intentionally keeps the opposite contract: its
+/// durable negative intent must commit before the live domain is detached so
+/// an older remembered `Attached` record cannot reconnect behind the
+/// operator's back.
+async fn remember_attached_domain_best_effort(domain_name: String) -> bool {
+    match promise::spawn::spawn_into_new_thread(move || {
+        domain_reconnect_manifest::set_intent(
+            &domain_name,
+            DomainAttachmentIntent::Attached,
+        )
+        .map_err(anyhow::Error::new)
+    })
+    .await
+    {
+        Ok(manifest) => {
+            publish_domain_reconnect_manifest_snapshot(manifest);
+            true
+        }
+        Err(error) => {
+            let message = bounded_gui_failure_message(
+                "The explicit domain connection will continue, but its attached intent could not be remembered for automatic restart recovery",
+                &error,
+            );
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Error,
+                "frankenterm_gui::domain_reconnect_manifest",
+                message.clone(),
+            );
+            log::error!("{message}");
+            persistent_toast_notification("Domain reconnect preference unavailable", &message);
+            false
         }
     }
 }
@@ -1653,31 +1907,28 @@ fn mint_auto_connect_admission_retry_generation() -> Option<u64> {
         .and_then(|previous| previous.checked_add(1))
 }
 
-fn finish_auto_connect_admission_retry(observed_generation: u64) -> bool {
-    finish_admission_retry_coordinator(
-        &AUTO_CONNECT_ADMISSION_RETRY_STATE,
-        &AUTO_CONNECT_ADMISSION_RETRY_GENERATION,
-        observed_generation,
-        "automatic domain connection",
-    )
+fn spawn_auto_connect_admission_retry() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("ft-domain-auto-admission".to_string())
+        .spawn(retry_auto_connect_admission)
+        .map(|_thread| ())
+}
+
+fn report_auto_connect_admission_retry_start_failure(error: &std::io::Error) {
+    log::error!(
+        "failed to start automatic domain admission retry coordinator: {error}"
+    );
 }
 
 fn start_auto_connect_admission_retry() -> bool {
     match ensure_admission_retry_coordinator(
         &AUTO_CONNECT_ADMISSION_RETRY_STATE,
         "automatic domain connection",
-        || {
-            std::thread::Builder::new()
-                .name("ft-domain-auto-admission".to_string())
-                .spawn(retry_auto_connect_admission)
-                .map(|_thread| ())
-        },
+        spawn_auto_connect_admission_retry,
     ) {
         Ok(()) => true,
         Err(error) => {
-            log::error!(
-                "failed to start automatic domain admission retry coordinator: {error}"
-            );
+            report_auto_connect_admission_retry_start_failure(&error);
             false
         }
     }
@@ -1785,16 +2036,24 @@ fn try_admit_auto_connect_supervisor(
 }
 
 fn retry_auto_connect_admission() {
+    let mut completion = AdmissionRetryCoordinatorCompletionGuard::new(
+        &AUTO_CONNECT_ADMISSION_RETRY_STATE,
+        &AUTO_CONNECT_ADMISSION_RETRY_GENERATION,
+        "automatic domain connection",
+        spawn_auto_connect_admission_retry,
+        report_auto_connect_admission_retry_start_failure,
+    );
     let mut delay = std::time::Duration::from_millis(10);
     let mut attempts = 0_u64;
     loop {
         let request_generation =
             AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
+        completion.begin_request(request_generation);
         if !auto_connect_supervisor_may_schedule(
             AUTO_CONNECT_ENABLED.load(Ordering::Acquire),
             AUTO_CONNECT_STARTUP_READY.load(Ordering::Acquire),
         ) {
-            if finish_auto_connect_admission_retry(request_generation) {
+            if completion.finish(request_generation) {
                 continue;
             }
             return;
@@ -1837,7 +2096,7 @@ fn retry_auto_connect_admission() {
             continue;
         }
         if desired_domains.is_empty() {
-            if finish_auto_connect_admission_retry(request_generation) {
+            if completion.finish(request_generation) {
                 continue;
             }
             return;
@@ -1848,7 +2107,8 @@ fn retry_auto_connect_admission() {
             Arc::new(desired_domains),
         ) {
             AutoConnectSupervisorAdmission::Scheduled => {
-                if finish_auto_connect_admission_retry(request_generation) {
+                completion.record_downstream_handoff(request_generation);
+                if completion.finish(request_generation) {
                     delay = std::time::Duration::from_millis(10);
                     attempts = 0;
                     continue;
@@ -1872,7 +2132,7 @@ fn retry_auto_connect_admission() {
                     .min(std::time::Duration::from_secs(1));
             }
             AutoConnectSupervisorAdmission::Terminal(rejection) => {
-                if finish_auto_connect_admission_retry(request_generation) {
+                if completion.finish(request_generation) {
                     delay = std::time::Duration::from_millis(10);
                     attempts = 0;
                     continue;
@@ -2279,17 +2539,8 @@ async fn async_run_terminal_gui(
                         .context("entering ordered startup domain lifecycle")?;
                 if domain.downcast_ref::<ClientDomain>().is_some() {
                     let persisted_domain_name = domain.domain_name().to_string();
-                    promise::spawn::spawn_into_new_thread(move || {
-                        domain_reconnect_manifest::set_intent(
-                            &persisted_domain_name,
-                            DomainAttachmentIntent::Attached,
-                        )
-                        .map_err(anyhow::Error::new)
-                    })
-                    .await
-                    .context("persisting explicitly requested domain attachment intent")
-                    .map(publish_domain_reconnect_manifest_snapshot)?;
-                    remembered_attachment = true;
+                    remembered_attachment =
+                        remember_attached_domain_best_effort(persisted_domain_name).await;
                 }
                 let owner_client_id = mux.active_identity();
                 attachment_attempt_started = true;
@@ -2778,15 +3029,11 @@ fn initialize_window_state_persistence() {
             }
             match event {
                 mux_lua::DomainLifecycleEvent::Attached => {
-                    let manifest = promise::spawn::spawn_into_new_thread(move || {
-                        domain_reconnect_manifest::set_intent(
-                            &domain_name,
-                            DomainAttachmentIntent::Attached,
-                        )
-                        .map_err(anyhow::Error::new)
-                    })
-                    .await?;
-                    publish_domain_reconnect_manifest_snapshot(manifest);
+                    let _remembered = remember_attached_domain_best_effort(domain_name).await;
+                    // Rebuild from the accepted durable/configured authority
+                    // even when this optional write failed. The scheduler may
+                    // retain other explicitly configured domains, but cannot
+                    // infer this just-requested name from a failed write.
                     schedule_auto_connect_domains();
                     Ok(())
                 }
@@ -3230,6 +3477,43 @@ mod tests {
     }
 
     #[test]
+    fn explicit_attach_treats_remembered_intent_as_advisory_not_admission() {
+        let source = include_str!("main.rs");
+        let helper = source
+            .split_once("async fn remember_attached_domain_best_effort(")
+            .expect("best-effort remembered-attachment helper remains present")
+            .1
+            .split_once("\nfn configured_auto_connect_domain_configs(")
+            .expect("helper remains independently bounded")
+            .0;
+        assert!(helper.contains("Err(error) =>"));
+        assert!(helper.contains("The explicit domain connection will continue"));
+        assert!(helper.contains("false"));
+
+        let startup = source
+            .split_once("async fn async_run_terminal_gui(")
+            .expect("terminal GUI startup remains present")
+            .1
+            .split_once("\n#[derive(Debug)]\nenum Publish")
+            .expect("terminal GUI startup remains independently bounded")
+            .0;
+        let remember = startup
+            .find("remember_attached_domain_best_effort(persisted_domain_name).await")
+            .expect("explicit startup must attempt optional durable remembrance");
+        let attach = startup[remember..]
+            .find(".attach(&mux, owner_client_id, Some(window_id))")
+            .map(|offset| remember + offset)
+            .expect("explicit transport attach must follow the optional remembrance attempt");
+        assert!(attach > remember, "manifest failure must not return before attach");
+        assert!(
+            !startup[..attach].contains(
+                ".context(\"persisting explicitly requested domain attachment intent\")"
+            ),
+            "optional remembered intent must not regain question-mark admission authority"
+        );
+    }
+
+    #[test]
     fn retry_promise_requires_the_exact_domain_in_the_scheduled_frontier() {
         let pending = vec!["trj".to_string(), "csd".to_string()];
         assert!(retry_frontier_includes(&pending, None));
@@ -3325,6 +3609,325 @@ mod tests {
             *state.lock().expect("read retained state"),
             AdmissionRetryCoordinatorState::Running,
             "a request published before serialized retirement must retain the existing owner"
+        );
+    }
+
+    #[test]
+    fn config_reload_coalesces_before_direct_admission_when_retry_owner_is_live() {
+        let source = include_str!("main.rs");
+        let subscriber_start = source
+            .find("fn subscribe_to_mux_domain_config_reload()")
+            .expect("config reload subscriber must remain present");
+        let subscriber_end = source[subscriber_start..]
+            .find("\nfn mint_mux_domain_config_reconciliation_generation()")
+            .map(|offset| subscriber_start + offset)
+            .expect("config reload subscriber must remain bounded");
+        let subscriber = &source[subscriber_start..subscriber_end];
+        let owner_check = subscriber
+            .find("if admission_retry_coordinator_is_running(")
+            .expect("reload admission must first honor an existing retry owner");
+        let direct_admission = subscriber
+            .find("match try_admit_mux_domain_config_reconciliation(generation)")
+            .expect("reload subscriber must retain direct admission when no worker owns it");
+        assert!(
+            owner_check < direct_admission,
+            "retry ownership must be checked before direct reconciliation admission"
+        );
+        assert!(
+            subscriber[owner_check..direct_admission].contains("return true;"),
+            "a live retry owner must terminate the callback before duplicate direct admission"
+        );
+    }
+
+    #[test]
+    fn retry_completion_guard_restarts_latest_unhanded_request_after_unwind() {
+        let state = Mutex::new(AdmissionRetryCoordinatorState::Running);
+        let generation = AtomicU64::new(31);
+        let restarts = std::sync::atomic::AtomicUsize::new(0);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut completion = AdmissionRetryCoordinatorCompletionGuard::new(
+                &state,
+                &generation,
+                "test",
+                || {
+                    assert!(
+                        matches!(
+                            state.try_lock(),
+                            Err(std::sync::TryLockError::WouldBlock)
+                        ),
+                        "replacement creation must remain inside the owner-state transaction"
+                    );
+                    restarts.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+                |error| panic!("unexpected replacement failure: {error}"),
+            );
+            completion.begin_request(31);
+            generation.store(32, Ordering::Release);
+            panic!("planted coordinator unwind before downstream handoff");
+        }));
+
+        assert!(unwind.is_err(), "the planted unwind must reach the guard");
+        assert_eq!(
+            restarts.load(Ordering::Acquire),
+            1,
+            "the latest coalesced request must acquire a replacement worker"
+        );
+        assert_eq!(
+            *state.lock().expect("read restarted coordinator state"),
+            AdmissionRetryCoordinatorState::Running,
+            "the replacement worker must publish durable ownership"
+        );
+    }
+
+    #[test]
+    fn retry_completion_guard_does_not_duplicate_latest_scheduler_handoff() {
+        let state = Mutex::new(AdmissionRetryCoordinatorState::Running);
+        let generation = AtomicU64::new(47);
+        let duplicate_restarts = std::sync::atomic::AtomicUsize::new(0);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut completion = AdmissionRetryCoordinatorCompletionGuard::new(
+                &state,
+                &generation,
+                "test",
+                || {
+                    duplicate_restarts.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+                |error| panic!("unexpected replacement failure: {error}"),
+            );
+            completion.begin_request(47);
+            completion.record_downstream_handoff(47);
+            panic!("planted coordinator unwind after downstream handoff");
+        }));
+
+        assert!(unwind.is_err(), "the planted unwind must reach the guard");
+        assert_eq!(
+            duplicate_restarts.load(Ordering::Acquire),
+            0,
+            "a scheduler-owned latest generation must not be enqueued twice"
+        );
+        assert_eq!(
+            *state.lock().expect("read released coordinator state"),
+            AdmissionRetryCoordinatorState::Idle,
+            "the abandoned worker publication must still be released"
+        );
+
+        let later_starts = std::sync::atomic::AtomicUsize::new(0);
+        ensure_admission_retry_coordinator(&state, "test", || {
+            later_starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })
+        .expect("admit a later request after the handed-off generation");
+        assert_eq!(
+            later_starts.load(Ordering::Acquire),
+            1,
+            "released ownership must not coalesce a later request behind a dead worker"
+        );
+    }
+
+    #[test]
+    fn retry_completion_guard_contains_restart_panic_during_worker_unwind() {
+        let state = Mutex::new(AdmissionRetryCoordinatorState::Running);
+        let generation = AtomicU64::new(59);
+
+        let original_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut completion = AdmissionRetryCoordinatorCompletionGuard::new(
+                &state,
+                &generation,
+                "test",
+                || -> std::io::Result<()> { panic!("planted nested restart panic") },
+                |error| panic!("unexpected replacement failure: {error}"),
+            );
+            completion.begin_request(59);
+            panic!("planted original worker panic");
+        }));
+
+        assert!(
+            original_unwind.is_err(),
+            "the original worker panic must continue after nested recovery containment"
+        );
+        assert_eq!(
+            *state.lock().expect("read state after nested panic recovery"),
+            AdmissionRetryCoordinatorState::Idle,
+            "a panicking restart callback must leave retryable Idle state"
+        );
+    }
+
+    #[test]
+    fn retry_completion_guard_reports_spawn_failure_after_unlock() {
+        let state = Mutex::new(AdmissionRetryCoordinatorState::Running);
+        let generation = AtomicU64::new(61);
+        let reports = std::sync::atomic::AtomicUsize::new(0);
+
+        let original_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut completion = AdmissionRetryCoordinatorCompletionGuard::new(
+                &state,
+                &generation,
+                "test",
+                || Err(std::io::Error::other("planted replacement spawn failure")),
+                |error| {
+                    assert_eq!(
+                        *state.lock().expect("failure reporter must run after unlock"),
+                        AdmissionRetryCoordinatorState::Idle,
+                        "spawn failure must publish Idle before invoking callbacks"
+                    );
+                    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                    reports.fetch_add(1, Ordering::AcqRel);
+                    panic!("planted failure reporter panic");
+                },
+            );
+            completion.begin_request(61);
+            panic!("planted original worker panic");
+        }));
+
+        assert!(
+            original_unwind.is_err(),
+            "the original worker panic must survive failure-report containment"
+        );
+        assert_eq!(
+            reports.load(Ordering::Acquire),
+            1,
+            "one failed replacement must emit exactly one failure report"
+        );
+        assert_eq!(
+            *state.lock().expect("read state after reported spawn failure"),
+            AdmissionRetryCoordinatorState::Idle
+        );
+    }
+
+    #[test]
+    fn retry_worker_source_keeps_transactional_completion_and_wake_ordering() {
+        let source = include_str!("main.rs");
+        let drop_start = source
+            .find("impl<Restart, ReportFailure> Drop")
+            .expect("retry completion drop guard must remain present");
+        let drop_end = source[drop_start..]
+            .find("\nfn spawn_mux_domain_config_admission_retry()")
+            .map(|offset| drop_start + offset)
+            .expect("retry completion drop guard must remain bounded");
+        let drop_body = &source[drop_start..drop_end];
+        let lock = drop_body
+            .find("let mut state = match self.state.lock()")
+            .expect("abandoned-owner recovery must acquire the coordinator mutex");
+        let generation = drop_body
+            .find("let current_generation = self.generation.load(Ordering::Acquire)")
+            .expect("abandoned-owner recovery must observe the latest generation");
+        assert!(
+            lock < generation,
+            "generation observation must remain serialized with owner recovery to prevent a lost wake"
+        );
+        let starting = drop_body
+            .find("*state = AdmissionRetryCoordinatorState::Starting")
+            .expect("replacement startup must publish Starting transactionally");
+        let restart = drop_body
+            .find("std::panic::AssertUnwindSafe(restart)")
+            .expect("replacement startup must invoke the restart callback");
+        let running = drop_body
+            .find("*state = AdmissionRetryCoordinatorState::Running")
+            .expect("successful replacement startup must publish Running");
+        assert!(
+            generation < starting && starting < restart && restart < running,
+            "replacement creation and Running publication must remain in the serialized recovery transaction"
+        );
+        assert!(
+            drop_body.contains("frankenterm_sigpipe::catch_recoverable("),
+            "restart callbacks must remain inside the canonical nested-panic boundary"
+        );
+
+        let mux_worker_start = source
+            .find("fn retry_mux_domain_config_admission()")
+            .expect("mux-domain retry worker must remain present");
+        let mux_worker_end = source[mux_worker_start..]
+            .find("\n/// Return the complete name frontier")
+            .map(|offset| mux_worker_start + offset)
+            .expect("mux-domain retry worker must remain bounded");
+        let auto_worker_start = source
+            .find("fn retry_auto_connect_admission()")
+            .expect("auto-connect retry worker must remain present");
+        let auto_worker_end = source[auto_worker_start..]
+            .find("\nfn schedule_auto_connect_domains()")
+            .map(|offset| auto_worker_start + offset)
+            .expect("auto-connect retry worker must remain bounded");
+        for (worker, body) in [
+            ("mux-domain", &source[mux_worker_start..mux_worker_end]),
+            ("auto-connect", &source[auto_worker_start..auto_worker_end]),
+        ] {
+            for required_source in [
+                "AdmissionRetryCoordinatorCompletionGuard::new(",
+                "completion.begin_request(",
+                "completion.record_downstream_handoff(",
+                "completion.finish(",
+            ] {
+                assert!(
+                    body.contains(required_source),
+                    "{worker} worker lost completion-guard wiring {required_source:?}"
+                );
+            }
+        }
+        assert!(
+            source[mux_worker_start..mux_worker_end]
+                .contains("spawn_mux_domain_config_admission_retry"),
+            "mux-domain recovery must start a replacement worker"
+        );
+        assert!(
+            source[auto_worker_start..auto_worker_end]
+                .contains("spawn_auto_connect_admission_retry"),
+            "auto-connect recovery must start a replacement worker"
+        );
+    }
+
+    #[test]
+    fn config_reconciliation_lifecycle_source_fences_raw_and_live_domain_names() {
+        let source = include_str!("main.rs");
+        let helper_start = source
+            .find("fn mux_domain_config_lifecycle_names(")
+            .expect("domain lifecycle frontier helper must remain present");
+        let helper_end = source[helper_start..]
+            .find("\nasync fn reconcile_mux_domain_config_until_converged(")
+            .map(|offset| helper_start + offset)
+            .expect("domain lifecycle frontier helper must remain bounded");
+        let helper = &source[helper_start..helper_end];
+        for required_source in [
+            "configured_client_domains(config)",
+            ".ssh_domains()",
+            ".wsl_domains()",
+            ".exec_domains",
+            ".serial_ports",
+            "mux.iter_domains()",
+            ".filter_map(|domain| {",
+            "domain.downcast_ref::<ClientDomain>().is_some()",
+            ".downcast_ref::<RemoteSshDomain>()",
+            ".is_some_and(RemoteSshDomain::is_configuration_owned)",
+            ".downcast_ref::<LocalDomain>()",
+            ".is_some_and(LocalDomain::is_configuration_owned)",
+            "configuration_owned.then(|| domain.domain_name().to_string())",
+            "lifecycle_names.sort()",
+            "lifecycle_names.dedup()",
+        ] {
+            assert!(
+                helper.contains(required_source),
+                "domain lifecycle frontier lost required source {required_source:?}"
+            );
+        }
+
+        let reconcile_start = helper_end;
+        let reconcile_end = source[reconcile_start..]
+            .find("\nfn report_mux_domain_config_reload_failure(")
+            .map(|offset| reconcile_start + offset)
+            .expect("domain reconciliation function must remain bounded");
+        let reconcile = &source[reconcile_start..reconcile_end];
+        let frontier = reconcile
+            .find("mux_domain_config_lifecycle_names(&config, Mux::try_get().as_deref())")
+            .expect("reconciliation must consume the complete lifecycle frontier");
+        let reservation = reconcile
+            .find("mux_lua::reserve_domain_lifecycle(domain_name.clone())")
+            .expect("reconciliation must serialize each lifecycle name");
+        assert!(
+            frontier < reservation,
+            "the complete domain frontier must be computed before lifecycle admission"
         );
     }
 

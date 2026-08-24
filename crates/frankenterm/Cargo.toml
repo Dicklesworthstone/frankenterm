@@ -38,6 +38,7 @@ frankenterm-alloc = { workspace = true, optional = true }
 frankenterm-client.workspace = true
 frankenterm-mux-server-impl.workspace = true
 mux.workspace = true
+codec = { workspace = true, default-features = false }
 # Portable nonblocking socket-pair capture for finite doctor subprocess probes
 # (also used by the EPIPE integration-test substrate).
 filedescriptor.workspace = true
@@ -65,7 +66,7 @@ zstd.workspace = true
 asupersync = { workspace = true, features = ["tls"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "user"] }
 
 # [round8 Windows port] openssl-sys reaches the `ft` build transitively via
 # frankenterm-ssh -> libssh-rs (config depends on frankenterm-ssh

@@ -13701,11 +13701,11 @@ mod writer_epoch_transaction_tests {
             self.inner.query_row_strings(sql, params)
         }
 
-        fn begin_transaction(
+        fn with_transaction_dyn(
             &self,
-        ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
-        {
-            self.inner.begin_transaction()
+            f: &mut dyn FnMut(&mut dyn crate::storage_backend_trait::StorageTransaction) -> std::result::Result<(), BackendError>,
+        ) -> std::result::Result<(), BackendError> {
+            self.inner.with_transaction_dyn(f)
         }
 
         fn user_version(&self) -> std::result::Result<u32, BackendError> {
@@ -15622,11 +15622,11 @@ mod writer_io_scheduler_tests {
             self.inner.transaction_state()
         }
 
-        fn begin_transaction(
+        fn with_transaction_dyn(
             &self,
-        ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
-        {
-            self.inner.begin_transaction()
+            f: &mut dyn FnMut(&mut dyn crate::storage_backend_trait::StorageTransaction) -> std::result::Result<(), BackendError>,
+        ) -> std::result::Result<(), BackendError> {
+            self.inner.with_transaction_dyn(f)
         }
 
         fn user_version(&self) -> std::result::Result<u32, BackendError> {
@@ -15732,12 +15732,12 @@ mod writer_io_scheduler_tests {
             self.inner.transaction_state()
         }
 
-        fn begin_transaction(
+        fn with_transaction_dyn(
             &self,
-        ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
-        {
-            self.note_call("begin_transaction");
-            self.inner.begin_transaction()
+            f: &mut dyn FnMut(&mut dyn crate::storage_backend_trait::StorageTransaction) -> std::result::Result<(), BackendError>,
+        ) -> std::result::Result<(), BackendError> {
+            self.note_call("with_transaction");
+            self.inner.with_transaction_dyn(f)
         }
 
         fn user_version(&self) -> std::result::Result<u32, BackendError> {
@@ -16536,11 +16536,11 @@ mod writer_io_scheduler_tests {
             self.inner.transaction_state()
         }
 
-        fn begin_transaction(
+        fn with_transaction_dyn(
             &self,
-        ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
-        {
-            self.inner.begin_transaction()
+            f: &mut dyn FnMut(&mut dyn crate::storage_backend_trait::StorageTransaction) -> std::result::Result<(), BackendError>,
+        ) -> std::result::Result<(), BackendError> {
+            self.inner.with_transaction_dyn(f)
         }
 
         fn user_version(&self) -> std::result::Result<u32, BackendError> {

@@ -2380,14 +2380,13 @@ mod tests {
             BackendTransactionState::Autocommit
         );
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
-        let tx = backend.begin_transaction().unwrap();
-        assert_eq!(
-            backend.transaction_state().unwrap(),
-            BackendTransactionState::Transaction
-        );
-        backend.execute("INSERT INTO t VALUES (1)").unwrap();
-        backend.execute("INSERT INTO t VALUES (2)").unwrap();
-        tx.commit().unwrap();
+        backend
+            .with_transaction(|tx| {
+                tx.execute("INSERT INTO t VALUES (1)")?;
+                tx.execute("INSERT INTO t VALUES (2)")?;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(
             backend.transaction_state().unwrap(),
             BackendTransactionState::Autocommit
@@ -2439,13 +2438,104 @@ mod tests {
     fn rusqlite_backend_transaction_rollback_discards_inserts() {
         let backend = open_memory();
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
-        {
-            let _tx = backend.begin_transaction().unwrap();
-            backend.execute("INSERT INTO t VALUES (99)").unwrap();
-            // _tx drops without commit — Drop runs ROLLBACK.
-        }
+        let res: Result<(), _> = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (99)")?;
+            Err(BackendError::Other("abort transaction".into()))
+        });
+        assert!(res.is_err());
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
         let count = backend.query_scalar("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(count.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn rusqlite_backend_transaction_panic_rolls_back_and_restores_autocommit() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = backend.with_transaction(|tx| {
+                tx.execute("INSERT INTO t VALUES (99)")?;
+                panic!("mutation panic inside transaction");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+        let count = backend.query_scalar("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn rusqlite_backend_transaction_prevents_concurrent_interleaving() {
+        let backend = Arc::new(open_memory());
+        backend
+            .execute("CREATE TABLE t (id INTEGER, origin TEXT)")
+            .unwrap();
+
+        let b1 = Arc::clone(&backend);
+        let b2 = Arc::clone(&backend);
+
+        let barrier_start = Arc::new(std::sync::Barrier::new(2));
+        let barrier_step = Arc::new(std::sync::Barrier::new(2));
+
+        let bs1 = Arc::clone(&barrier_start);
+        let bst1 = Arc::clone(&barrier_step);
+
+        let t1 = std::thread::spawn(move || {
+            bs1.wait();
+            b1.with_transaction(|tx| {
+                tx.execute("INSERT INTO t VALUES (1, 'tx1_step1')")?;
+                bst1.wait();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                tx.execute("INSERT INTO t VALUES (2, 'tx1_step2')")?;
+                Ok(())
+            })
+        });
+
+        let bs2 = Arc::clone(&barrier_start);
+        let bst2 = Arc::clone(&barrier_step);
+
+        let t2 = std::thread::spawn(move || {
+            bs2.wait();
+            bst2.wait();
+            b2.execute("INSERT INTO t VALUES (100, 'concurrent_stmt')")
+        });
+
+        t1.join().unwrap().unwrap();
+        t2.join().unwrap().unwrap();
+
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+
+        let rows = backend
+            .query_map_strings("SELECT id, origin FROM t ORDER BY rowid", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], "1");
+        assert_eq!(rows[0][1], "tx1_step1");
+        assert_eq!(rows[1][0], "2");
+        assert_eq!(rows[1][1], "tx1_step2");
+        assert_eq!(rows[2][0], "100");
+        assert_eq!(rows[2][1], "concurrent_stmt");
+    }
+
+    #[test]
+    fn rusqlite_backend_transaction_rejects_non_autocommit_start() {
+        let backend = open_memory();
+        backend.execute("BEGIN").unwrap();
+        let res: Result<(), _> = backend.with_transaction(|tx| {
+            tx.execute("SELECT 1")?;
+            Ok(())
+        });
+        assert!(res.is_err());
+        backend.execute("ROLLBACK").unwrap();
     }
 
     #[test]

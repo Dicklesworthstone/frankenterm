@@ -347,24 +347,72 @@ proven:
    chain so rollover can neither reuse an output identity nor hide a gap. A new
    segment cannot accept output until its file and parent directory entry are
    synchronized. Key authority lives in a pinned mode-0700 capability
-   directory. Each random 32-byte key is an immutable mode-0600, no-follow,
-   single-link regular file whose lowercase ID is the first eight bytes of its
-   SHA-256 fingerprint. Append-only, checksummed activation records start at
-   generation one and remain contiguous; rotation synchronizes the new key and
-   its directory entry before publishing the next activation. Existing segment
-   writers retain their original cipher until rollover, and historical keys are
-   never overwritten or discarded while an activation can reference them. A
-   torn unactivated key from an interrupted rotation is preserved but cannot
-   supersede the prior activation or satisfy historical segment lookup. The
-   pinned active key and full activation inventory are revalidated before new
-   cipher use or rotation, so external key mutation and concurrent activation
-   advancement fail closed. An exact retry after activation acknowledgement
-   loss reopens and synchronizes the immutable record, then verifies its
-   decoded identity, referenced key, and the full contiguous inventory before
-   returning success. A missing, truncated, symlinked, hard-linked,
-   permission-unsafe, wrong-ID, or corrupt referenced key fails closed. Key
-   bytes are zeroized when their in-memory authority is dropped and never enter
-   `Debug`, argv, environment variables, receipts, dumps, or log fields.
+   directory. On supported Unix targets, each random 32-byte key is an
+   immutable mode-0600, no-follow, single-link regular file whose lowercase ID
+   is the first eight bytes of its SHA-256 fingerprint. Append-only,
+   checksummed activation records start at
+   generation one and remain contiguous. Each initial publication or rotation
+   first synchronizes a deterministic private key stage, then atomically
+   publishes an immutable 224-byte retained intent without replacement, then
+   atomically renames the staged key to its final name without replacement,
+   and finally stages and atomically publishes the activation without
+   replacement. Each step synchronizes its file and capability-directory entry
+   before the next step; a target without the required dirfd-relative atomic
+   no-replace primitive refuses publication rather than falling back to an
+   overwriting rename. The intent binds a random stable authority ID,
+   generation, key ID and full key SHA-256, the exact predecessor generation,
+   key ID and activation digest, the new activation digest, the predecessor
+   intent digest, and its own domain-separated record digest. All intents from
+   the first protocol generation onward are retained as one contiguous digest
+   chain. A legacy activation-only authority transitions by binding its exact
+   latest activation as the first retained intent's predecessor.
+
+   Sibling-keyring creation first identity-pins the owned scrollback parent,
+   creates and opens the private child relative to that descriptor, synchronizes
+   the child and the pinned parent, and revalidates both descriptor-to-name
+   bindings before and after keyring publication. Renaming or replacing the
+   ambient scrollback path therefore fails closed instead of redirecting the
+   parent sync or silently selecting an unsynchronized replacement child.
+
+   Exactly one contiguous newest intent may lack its activation. A writable
+   opener holds the exclusive authority lease across inventory, recovery, and
+   publication and completes only that intent's exact staged or already-final
+   key and activation. A read-only opener never performs recovery: when an
+   earlier activation exists it may continue historical reads with that prior
+   authority while reporting the pending generation, but it never authorizes
+   the pending key; an initial pending generation without any activation is an
+   explicit unavailable state. Private, canonically named stage residues are
+   inert, size-checked, counted against the bounded directory inventory, and
+   retained rather than deleted. A partial or unretained semantic final key,
+   intent, or activation is fatal; it is never reclassified as an ignorable
+   crash residue. Existing segment writers retain their original cipher until
+   rollover, and historical keys are never overwritten or discarded while an
+   activation can reference them. The pinned active key and full activation
+   and intent inventory are revalidated before new cipher use or rotation, so
+   external key mutation, forks, and concurrent advancement fail closed. Exact
+   retry after publication acknowledgement loss reconciles the immutable bytes
+   and then verifies the full contiguous inventory. A missing, truncated,
+   symlinked, hard-linked, permission-unsafe, wrong-ID, or corrupt referenced
+   key fails closed. Key bytes are zeroized when their in-memory authority is
+   dropped and never enter `Debug`, argv, environment variables, receipts,
+   dumps, or log fields. The retained chain detects missing or forked interior
+   protocol records. Deletion of the entire retained-intent set can still make
+   its surviving activations appear legacy, and deletion of an entire newest
+   intent/activation/key suffix can expose its predecessor; both attacks remain
+   outside this directory-only model. Detecting either rollback requires an
+   independently durable monotonic head.
+
+   The current standalone guardian runtime has a separate authority at
+   `guardian-output-v3/journal.key`. Its static 32-byte key now reuses the
+   guardian token publisher's private stage, digest-bound readiness marker, and
+   atomic no-replace publication. If the final key is absent, a bounded,
+   identity-revalidated artifact census permits only recognized provisioning
+   residue and refuses to create a split authority when any output artifact is
+   already present; a legacy partial semantic final remains fatal. This is not
+   yet the activated mux keyring described above: it has no rotations,
+   historical key inventory, retained intent chain, or shared active-key
+   integration.
+
    The guardian retains a bounded replay window and terminal-state
    checkpoints that bind parser version, rows/columns, raw-output sequence, hot
    viewport, cold-scrollback base sequence, and a content digest.
@@ -561,19 +609,40 @@ close, and checkpoint operations
 have the same request-digest replay rule, so an ambiguous response is queried
 or replayed by identity rather than converted into a second effect.
 
-The implementation exposes runtime effects only through a transactional API,
-not the pure observation surface. It validates authentication, incarnation,
-idempotency, capacity, pane state, generation, and sequence before invoking a
-new-effect callback. An exact request or effect replay returns its retained
-receipt without invoking that callback. The pane transition and new receipt
-are committed only after callback success; receipt capacity is preflighted but
-its exact eviction plan is likewise deferred until success. A zero-effect
-spawn/resize/signal failure therefore cannot create a phantom pane, consume a
-sequence, or discard an older replay receipt. Callback failure is
-permitted only when no bytes, signal, resize, process, or other external effect
-became observable. A possibly partial input write is therefore committed as
-`accepted_not_durable` and reconciled by its exact effect UUID; it must never be
-reported as a safely retryable callback failure.
+The protocol contract requires runtime effects to pass through a transactional
+API rather than the pure observation surface. Authentication, incarnation,
+idempotency, capacity, pane state, generation, and sequence must be validated
+before an external effect. All receipt maps, reverse indexes, protected
+identities, and queue capacity must be reserved before that boundary, and an
+exact request or effect replay must return its retained receipt without
+invoking the effect again. Callback failure is permitted only when no bytes,
+signal, resize, process, or other external effect became observable. A possibly
+partial input write is therefore committed as `accepted_not_durable` and
+reconciled by its exact effect UUID; it must never be reported as a safely
+retryable callback failure.
+
+The typed input and checkpoint transaction paths implement that stronger
+pre-reserved commit pattern. The generic in-memory transaction path for
+`Spawn`, `Resize`, `Signal`, live-pane `Close`, `Claim`, and `RetireLease` now
+pre-reserves its receipt maps, reverse indexes, protected identities, and
+queues and installs a conservative pane quarantine before invoking the external
+callback. A definitely-not-applied result restores the exact prior pane state;
+an applied result commits the already-reserved receipt; and a panic or
+indeterminate result retains both the exact effect identity and a non-retryable
+quarantine. Exact request/effect replay therefore cannot invoke the callback a
+second time merely because an in-process allocation or callback panic occurred.
+
+That is still only live guardian-process authority, not crash durability. The
+generic effect identities, receipts, and quarantine transitions are not yet
+synchronized to a restart-recoverable protocol journal before the external
+boundary, and each runtime adapter must still prove that every error it labels
+definitely-not-applied really has zero observable effect. Response construction
+after a successful commit must also close the connection for exact receipt
+replay rather than emit a terminal negative acknowledgment. Guardian service
+activation and mux-upgrade continuity remain withheld until durable generic
+effect recovery, operation-specific reconciliation of ambiguous outcomes, and
+mutation-sensitive crash/fault cuts prove that no observable effect can execute
+twice across guardian restart.
 
 The guardian input-effect journal makes that callback rule crash-safe without
 persisting raw keystrokes. For each input it synchronizes the encrypted exact
@@ -666,10 +735,16 @@ artifact. It brackets sequential pane reads with two bounded pane listings and
 requires their structural topology fingerprints to match. It captures redacted
 pane metadata and redacted UTF-8 pane text into a versioned JSON envelope with
 per-pane, whole-payload, and whole-artifact SHA-256 checksums. The output is
-created through a no-symlink pinned directory capability with private
-permissions, never overwrites an existing file, and synchronizes both the file
-and containing directory before success is reported. Partial pane reads or
-topology drift are recorded and fail the command by default. Payload and
+created through a no-symlink pinned directory capability. Directories the
+command creates use mode 0700 and the artifact itself uses mode 0600; a custom
+pre-existing parent is not silently chmodded. Both producer and verifier reopen
+the complete parent path without following symlinks and require its device and
+inode to match the pinned capability, so a renamed/replaced parent cannot turn
+a detached file into a successful pathname receipt. The artifact requires one
+and only one hard link to its inode, is never overwritten, and both the file
+and containing directory are synchronized before success is reported. Partial
+pane reads or topology drift are
+recorded and fail the command by default. Payload and
 topology checksum passes are streaming and byte-bounded. The topology projection
 uses the same redacted canonical domain/workspace strings published in the
 artifact, so its digest cannot retain a dictionary-testable pre-redaction value.
@@ -683,8 +758,8 @@ not authenticate origin against an actor who can rewrite the private artifact
 and recompute every digest.
 
 `ft session verify-dump <path>` performs bounded offline verification of the
-private regular-file shape, complete-publication marker, schema, whole-payload
-checksum, per-pane text checksums and byte/line counts, aggregate limits,
+private single-link regular-file shape, complete-publication marker, schema,
+whole-payload checksum, per-pane text checksums and byte/line counts, aggregate limits,
 the one canonical v1 JSON encoding, exact field sets at every nested object,
 pane metadata, exact outcome equality with the sorted unique initial-pane-ID
 manifest, unique capture-error ownership, sorted domain summaries,

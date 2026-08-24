@@ -173,6 +173,28 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   process remains active while a separately installed candidate CLI stages and
   drains every remote server.
 
+### Reliable pane-input delivery
+
+- Adds negotiated codec v64 PDU100/101 for bounded arbitrary pane bytes on the
+  same ordered client lane as reliable key transitions. `PaneWriter::write`
+  now transfers ownership only after a shared FIFO accepts a bounded prefix;
+  the in-flight entry continues to count against hard event and byte caps.
+- Performs at most one remote `Write::write` effect per exact serial,
+  pane-registration identity, payload length, and SHA-256 payload digest. Typed
+  replies distinguish exact applied prefixes (including ACK-loss replay),
+  definitely-zero retries or rejections, and indeterminate outcomes that are
+  quarantined rather than duplicated.
+- Keeps a partially applied suffix ahead of every later queued key or write
+  under its pre-reserved fresh serial, fences ambiguous retries across mux
+  server incarnation changes, and makes `flush` wait off the mux thread without
+  retaining the queue lock. A mux-thread flush reports persistent `WouldBlock`
+  while accepted work remains pending, and terminal delivery failures remain
+  sticky and user-visible.
+- Refuses pre-v64 peers explicitly instead of falling back to legacy
+  `WriteToPane`. The existing matched-pair upgrade flow is the supported path.
+  The delivery ledger remains mux-process-local; crash-durable accepted-input
+  replay is intentionally unclaimed until the guardian input WAL lands.
+
 ### Session and scrollback durability
 
 - Adds `ft session dump` plus bounded offline `verify-dump` for private,

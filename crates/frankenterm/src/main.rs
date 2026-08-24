@@ -6149,6 +6149,34 @@ enum SetupCommands {
         timeout_secs: u64,
     },
 
+    /// Internal helper for descriptor-confined remote generation publication.
+    #[command(name = "__publish-remote-generation", hide = true)]
+    PublishRemoteGeneration {
+        #[arg(long)]
+        root: PathBuf,
+
+        #[arg(long)]
+        ft_source: PathBuf,
+
+        #[arg(long)]
+        mux_server_source: PathBuf,
+
+        #[arg(long)]
+        expected_ft_sha256: String,
+
+        #[arg(long)]
+        expected_ft_bytes: u64,
+
+        #[arg(long)]
+        expected_mux_sha256: String,
+
+        #[arg(long)]
+        expected_mux_bytes: u64,
+
+        #[arg(long)]
+        transaction_id: String,
+    },
+
     /// Generate WezTerm config additions
     Config,
 
@@ -62038,6 +62066,37 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         };
                         run_remote_setup(&host, &options)?;
                     }
+                    SetupCommands::PublishRemoteGeneration {
+                        root,
+                        ft_source,
+                        mux_server_source,
+                        expected_ft_sha256,
+                        expected_ft_bytes,
+                        expected_mux_sha256,
+                        expected_mux_bytes,
+                        transaction_id,
+                    } => {
+                        let receipt = publish_remote_process_family_generation(
+                            &RemoteGenerationPublishRequest {
+                                root: &root,
+                                ft_source: &ft_source,
+                                mux_server_source: &mux_server_source,
+                                expected: ProcessFamilyByteReceipt {
+                                    ft: ComponentByteReceipt {
+                                        sha256: expected_ft_sha256,
+                                        byte_len: expected_ft_bytes,
+                                    },
+                                    mux_server: ComponentByteReceipt {
+                                        sha256: expected_mux_sha256,
+                                        byte_len: expected_mux_bytes,
+                                    },
+                                },
+                                transaction_id: &transaction_id,
+                                activate_current: false,
+                            },
+                        )?;
+                        print!("{}", receipt.canonical_line());
+                    }
                     SetupCommands::Config => {
                         use frankenterm_core::setup;
 
@@ -75767,7 +75826,9 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir
     parent.open_dir_nofollow(Path::new(leaf))
 }
 
-fn artifact_parent_and_leaf(path: &Path) -> anyhow::Result<(cap_std::fs::Dir, PathBuf)> {
+fn artifact_parent_and_leaf(
+    path: &Path,
+) -> anyhow::Result<(cap_std::fs::Dir, PathBuf, PathBuf)> {
     if path_contains_parent_component(path) {
         anyhow::bail!(
             "Artifact path {} contains a parent component; use a normalized path",
@@ -75782,17 +75843,20 @@ fn artifact_parent_and_leaf(path: &Path) -> anyhow::Result<(cap_std::fs::Dir, Pa
     let parent_path = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent = ensure_private_directory_tree_nofollow(parent_path).map_err(|err| {
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let parent = ensure_private_directory_tree_nofollow(&parent_path).map_err(|err| {
         anyhow::anyhow!(
             "Failed to create and pin artifact directory {} without following symlinks: {err}",
             parent_path.display()
         )
     })?;
-    Ok((parent, leaf))
+    Ok((parent, leaf, parent_path))
 }
 
-fn open_artifact_parent_and_leaf(path: &Path) -> anyhow::Result<(cap_std::fs::Dir, PathBuf)> {
+fn open_artifact_parent_and_leaf(
+    path: &Path,
+) -> anyhow::Result<(cap_std::fs::Dir, PathBuf, PathBuf)> {
     if path_contains_parent_component(path) {
         anyhow::bail!(
             "Artifact path {} contains a parent component; use a normalized path",
@@ -75807,14 +75871,52 @@ fn open_artifact_parent_and_leaf(path: &Path) -> anyhow::Result<(cap_std::fs::Di
     let parent_path = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent = open_directory_tree_nofollow(parent_path).map_err(|err| {
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let parent = open_directory_tree_nofollow(&parent_path).map_err(|err| {
         anyhow::anyhow!(
             "Failed to pin artifact directory {} without following symlinks: {err}",
             parent_path.display()
         )
     })?;
-    Ok((parent, leaf))
+    Ok((parent, leaf, parent_path))
+}
+
+fn revalidate_artifact_parent_directory(
+    parent_path: &Path,
+    pinned_parent: &cap_std::fs::Dir,
+) -> anyhow::Result<()> {
+    use cap_fs_ext::OsMetadataExt as _;
+
+    let pinned_metadata = pinned_parent.dir_metadata().map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to inspect pinned artifact directory {}: {err}",
+            parent_path.display()
+        )
+    })?;
+    let reopened = open_directory_tree_nofollow(parent_path).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to re-open artifact directory {} without following symlinks: {err}",
+            parent_path.display()
+        )
+    })?;
+    let reopened_metadata = reopened.dir_metadata().map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to re-inspect artifact directory {}: {err}",
+            parent_path.display()
+        )
+    })?;
+    if !pinned_metadata.is_dir()
+        || !reopened_metadata.is_dir()
+        || pinned_metadata.dev() != reopened_metadata.dev()
+        || pinned_metadata.ino() != reopened_metadata.ino()
+    {
+        anyhow::bail!(
+            "Artifact parent directory changed identity during the operation: {}",
+            parent_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn sha256_reader(mut reader: impl Read) -> std::io::Result<(u64, String)> {
@@ -75858,7 +75960,7 @@ fn write_new_private_artifact(
     path: &Path,
     bytes: &[u8],
 ) -> anyhow::Result<PrivateArtifactReceipt> {
-    let (parent, leaf) = artifact_parent_and_leaf(path)?;
+    let (parent, leaf, parent_path) = artifact_parent_and_leaf(path)?;
     let mut options = cap_std::fs::OpenOptions::new();
     options
         .read(true)
@@ -75886,6 +75988,7 @@ fn write_new_private_artifact(
             path.display()
         )
     })?;
+    revalidate_artifact_parent_directory(&parent_path, &parent)?;
 
     let handle_metadata = file
         .metadata()
@@ -75893,10 +75996,8 @@ fn write_new_private_artifact(
     if !handle_metadata.is_file() {
         anyhow::bail!("Artifact is not a regular file: {}", path.display());
     }
-    #[cfg(unix)]
     {
         use cap_fs_ext::OsMetadataExt as _;
-        use cap_std::fs::PermissionsExt as _;
 
         let path_metadata = parent.symlink_metadata(&leaf).map_err(|err| {
             anyhow::anyhow!("Failed to revalidate artifact name {}: {err}", path.display())
@@ -75904,12 +76005,19 @@ fn write_new_private_artifact(
         if !path_metadata.is_file()
             || path_metadata.dev() != handle_metadata.dev()
             || path_metadata.ino() != handle_metadata.ino()
+            || path_metadata.nlink() != 1
+            || handle_metadata.nlink() != 1
         {
             anyhow::bail!(
-                "Artifact name changed identity during persistence: {}",
+                "Artifact name changed identity or acquired another hard link during persistence: {}",
                 path.display()
             );
         }
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt as _;
+
         if handle_metadata.permissions().mode() & 0o077 != 0 {
             anyhow::bail!("Artifact permissions are not private: {}", path.display());
         }
@@ -75927,6 +76035,43 @@ fn write_new_private_artifact(
             path.display()
         );
     }
+    let handle_metadata_after = file.metadata().map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to re-inspect artifact {} after verification: {err}",
+            path.display()
+        )
+    })?;
+    {
+        use cap_fs_ext::OsMetadataExt as _;
+
+        let path_metadata_after = parent.symlink_metadata(&leaf).map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to revalidate artifact name after verification {}: {err}",
+                path.display()
+            )
+        })?;
+        if !path_metadata_after.is_file()
+            || path_metadata_after.dev() != handle_metadata_after.dev()
+            || path_metadata_after.ino() != handle_metadata_after.ino()
+            || path_metadata_after.nlink() != 1
+            || handle_metadata_after.nlink() != 1
+            || handle_metadata_after.len() != persisted_bytes
+        {
+            anyhow::bail!(
+                "Artifact name changed identity or acquired another hard link during verification: {}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt as _;
+
+        if handle_metadata_after.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("Artifact permissions are not private: {}", path.display());
+        }
+    }
+    revalidate_artifact_parent_directory(&parent_path, &parent)?;
     Ok(PrivateArtifactReceipt {
         bytes: persisted_bytes,
         sha256: persisted_sha256,
@@ -75935,7 +76080,7 @@ fn write_new_private_artifact(
 }
 
 fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
-    let (parent, leaf) = open_artifact_parent_and_leaf(path)?;
+    let (parent, leaf, parent_path) = open_artifact_parent_and_leaf(path)?;
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let mut file = parent.open_with(&leaf, &options).map_err(|err| {
@@ -75947,22 +76092,30 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
     if !metadata.is_file() {
         anyhow::bail!("Mux dump is not a regular file: {}", path.display());
     }
-    #[cfg(unix)]
     {
         use cap_fs_ext::OsMetadataExt as _;
-        use cap_std::fs::PermissionsExt as _;
 
-        if metadata.permissions().mode() & 0o077 != 0 {
-            anyhow::bail!("Mux dump permissions are not private: {}", path.display());
-        }
         let path_metadata = parent.symlink_metadata(&leaf).map_err(|err| {
             anyhow::anyhow!("Failed to revalidate mux dump name {}: {err}", path.display())
         })?;
         if !path_metadata.is_file()
             || path_metadata.dev() != metadata.dev()
             || path_metadata.ino() != metadata.ino()
+            || path_metadata.nlink() != 1
+            || metadata.nlink() != 1
         {
-            anyhow::bail!("Mux dump name changed identity: {}", path.display());
+            anyhow::bail!(
+                "Mux dump name changed identity or has another hard link: {}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt as _;
+
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("Mux dump permissions are not private: {}", path.display());
         }
     }
     if metadata.len() > max_bytes {
@@ -75993,16 +76146,16 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
             path.display()
         );
     }
-    let metadata_after = file
+    let handle_metadata_after = file
         .metadata()
         .map_err(|err| anyhow::anyhow!("Failed to re-inspect mux dump {}: {err}", path.display()))?;
-    let metadata_after = DiagnosticFileSnapshot::capture_cap(&metadata_after).map_err(|err| {
-        anyhow::anyhow!("Failed to re-snapshot mux dump {}: {err}", path.display())
-    })?;
+    let metadata_after = DiagnosticFileSnapshot::capture_cap(&handle_metadata_after)
+        .map_err(|err| {
+            anyhow::anyhow!("Failed to re-snapshot mux dump {}: {err}", path.display())
+        })?;
     if metadata_after != metadata_before {
         anyhow::bail!("Mux dump changed during verification: {}", path.display());
     }
-    #[cfg(unix)]
     {
         use cap_fs_ext::OsMetadataExt as _;
 
@@ -76015,13 +76168,16 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
         if !path_metadata_after.is_file()
             || path_metadata_after.dev() != metadata.dev()
             || path_metadata_after.ino() != metadata.ino()
+            || path_metadata_after.nlink() != 1
+            || handle_metadata_after.nlink() != 1
         {
             anyhow::bail!(
-                "Mux dump name changed identity while being read: {}",
+                "Mux dump name changed identity or acquired another hard link while being read: {}",
                 path.display()
             );
         }
     }
+    revalidate_artifact_parent_directory(&parent_path, &parent)?;
     Ok(bytes)
 }
 
@@ -78422,6 +78578,10 @@ fn should_auto_install_bundled_font(command: Option<&Commands>) -> bool {
                     command: Some(SetupCommands::Font { .. }),
                     ..
                 }
+                | Commands::Setup {
+                    command: Some(SetupCommands::PublishRemoteGeneration { .. }),
+                    ..
+                }
         )
     )
 }
@@ -79043,6 +79203,65 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
     Ok(())
 }
 
+const REMOTE_GUARDIAN_SERVICE_NAME: &str = "frankenterm-pty-guardian.service";
+const REMOTE_GUARDIAN_RUNTIME_DIRECTORY: &str = "frankenterm/guardian";
+const REMOTE_GUARDIAN_SOCKET_PATH: &str = "%t/frankenterm/guardian/guardian.sock";
+const REMOTE_GUARDIAN_TOKEN_PATH: &str = "%S/frankenterm/guardian/guardian.token";
+
+/// Generate the independent per-user PTY-guardian unit.
+///
+/// This unit deliberately has no `PartOf=`, `BindsTo=`, `Requires=`, or
+/// `ExecStop=` relationship with the mux. An ordinary `systemctl stop` is
+/// refused at the manager boundary; the eventual explicit stop transaction
+/// must authenticate to the guardian and prove an empty pane census rather
+/// than relying on systemd's unconditional process termination.
+#[allow(
+    dead_code,
+    reason = "guardian unit publication stays fail-closed until authenticated control lands"
+)]
+fn remote_guardian_service_unit(guardian_path: &str) -> anyhow::Result<String> {
+    let guardian_path = validate_remote_guardian_path(guardian_path)?;
+    Ok(format!(
+        r"[Unit]
+Description=FrankenTerm PTY Guardian
+Documentation=https://github.com/Dicklesworthstone/frankenterm
+Before=frankenterm-mux-server.service
+RefuseManualStop=yes
+
+[Service]
+Type=simple
+UMask=0077
+RuntimeDirectory={REMOTE_GUARDIAN_RUNTIME_DIRECTORY}
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory={REMOTE_GUARDIAN_RUNTIME_DIRECTORY}
+StateDirectoryMode=0700
+ExecStart={guardian_path} serve --socket-path {REMOTE_GUARDIAN_SOCKET_PATH} --token-path {REMOTE_GUARDIAN_TOKEN_PATH}
+# The guardian owns the only live PTY/process handles in this revision. Forced
+# unit termination must fail closed instead of leaving unowned child processes
+# that only appear recoverable. Authenticated guarded-stop reaches this path
+# only after proving that the pane census is empty.
+KillMode=control-group
+# The current guardian cannot recover live PTYs after its own process crash,
+# and it refuses to unlink an existing socket implicitly. Do not create a
+# false restart/continuity claim or a restart storm around a retained socket.
+Restart=no
+
+[Install]
+WantedBy=default.target
+"
+    ))
+}
+
+/// Generate the authenticated readiness gate used by a mux unit only after
+/// the guardian's bounded census probe is available.
+fn remote_guardian_mux_start_probe(guardian_path: &str) -> anyhow::Result<String> {
+    let guardian_path = validate_remote_guardian_path(guardian_path)?;
+    Ok(format!(
+        "{guardian_path} probe --socket-path {REMOTE_GUARDIAN_SOCKET_PATH} --token-path {REMOTE_GUARDIAN_TOKEN_PATH}"
+    ))
+}
+
 /// Generate a systemd unit for the FrankenTerm mux server using the resolved binary path.
 ///
 /// The unit opts out of systemd-oomd. The mux owns every pane's PTY, so killing
@@ -79054,15 +79273,41 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
 /// to reclaim -- it is only ever picked because it is a cheap candidate sitting
 /// in a pressured slice. `ManagedOOMPreference=omit` removes it from oomd's
 /// candidate set entirely; `MemoryHigh` still bounds it if it genuinely leaks.
-fn remote_mux_service_unit(mux_path: &str) -> String {
-    format!(
+///
+/// When `guardian_path` is present, the unit has a one-way start relationship:
+/// `Wants=` requests guardian activation, `After=` orders it, and an
+/// authenticated `ExecStartPre=` census probe fails the mux start if guardian
+/// readiness is not proven. It intentionally does not use `Requires=`,
+/// `PartOf=`, or `BindsTo=`, so mux stop/restart cannot stop the guardian and a
+/// guardian lifecycle action is never smuggled into a mux transaction.
+#[allow(
+    dead_code,
+    reason = "source-owned unit publication is withheld until a durable startup lease exists"
+)]
+fn remote_mux_service_unit(
+    mux_path: &str,
+    guardian_path: Option<&str>,
+) -> anyhow::Result<String> {
+    let mux_path = validate_remote_mux_server_path(mux_path)?;
+    let (guardian_wants, guardian_after, guardian_probe) = match guardian_path {
+        Some(guardian_path) => (
+            format!("Wants={REMOTE_GUARDIAN_SERVICE_NAME}\n"),
+            format!("After=network.target {REMOTE_GUARDIAN_SERVICE_NAME}"),
+            format!(
+                "ExecStartPre={}\n",
+                remote_guardian_mux_start_probe(guardian_path)?
+            ),
+        ),
+        None => (String::new(), "After=network.target".to_string(), String::new()),
+    };
+    Ok(format!(
         r"[Unit]
 Description=FrankenTerm Mux Server
-After=network.target
+{guardian_wants}{guardian_after}
 
 [Service]
 Type=simple
-ExecStart={mux_path} --daemonize=false
+{guardian_probe}ExecStart={mux_path} --daemonize=false
 Restart=on-failure
 RestartSec=2
 # Never let systemd-oomd reclaim the mux: it holds every pane's PTY, so an
@@ -79075,7 +79320,7 @@ MemoryHigh=400G
 [Install]
 WantedBy=default.target
 "
-    )
+    ))
 }
 
 struct RemoteCommandOutput {
@@ -79169,6 +79414,234 @@ fn validate_process_family_byte_receipt(
             "{role} component receipt has an invalid SHA-256 digest"
         );
     }
+    Ok(())
+}
+
+const REMOTE_GENERATION_MANIFEST_SCHEMA: &str =
+    "frankenterm.remote-process-family-generation.v1";
+const REMOTE_GENERATION_MANIFEST_FILE: &str = "manifest.json";
+const REMOTE_GENERATION_FT_FILE: &str = "ft";
+const REMOTE_GENERATION_MUX_FILE: &str = "frankenterm-mux-server";
+const REMOTE_GENERATION_MANIFEST_MAX_BYTES: u64 = 16 * 1024;
+const REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE: u32 = 0o700;
+const REMOTE_GENERATION_DIRECTORY_MODE: u32 = 0o500;
+const REMOTE_GENERATION_BINARY_MODE: u32 = 0o500;
+const REMOTE_GENERATION_MANIFEST_MODE: u32 = 0o400;
+const REMOTE_GENERATION_LOCK_MODE: u32 = 0o600;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const REMOTE_GENERATION_SELECTOR_ARTIFACT_MAX_BYTES: usize = 64;
+
+struct RemoteGenerationPublishRequest<'a> {
+    root: &'a Path,
+    ft_source: &'a Path,
+    mux_server_source: &'a Path,
+    expected: ProcessFamilyByteReceipt,
+    transaction_id: &'a str,
+    activate_current: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteGenerationActivation {
+    PendingLease,
+    Current,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteGenerationPublicationReceipt {
+    generation_id: String,
+    activation: RemoteGenerationActivation,
+}
+
+impl RemoteGenerationPublicationReceipt {
+    fn canonical_line(&self) -> String {
+        match self.activation {
+            RemoteGenerationActivation::PendingLease => format!(
+                "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                self.generation_id
+            ),
+            RemoteGenerationActivation::Current => format!(
+                "FT_REMOTE_GENERATION_PUBLICATION_V1={}:current:generations/{}\n",
+                self.generation_id, self.generation_id
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct RemoteGenerationBuildIdentity {
+    build_id: String,
+    target: String,
+    profile: String,
+    version: String,
+}
+
+impl From<&LocalComponentIdentity> for RemoteGenerationBuildIdentity {
+    fn from(identity: &LocalComponentIdentity) -> Self {
+        Self {
+            build_id: identity.build_id.clone(),
+            target: identity.target.clone(),
+            profile: identity.profile.clone(),
+            version: identity.version.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct RemoteGenerationComponentManifest {
+    filename: String,
+    sha256: String,
+    byte_len: u64,
+    mode: u32,
+    build_identity: RemoteGenerationBuildIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct RemoteGenerationManifest {
+    schema: String,
+    generation_id: String,
+    codec_version: u64,
+    ft: RemoteGenerationComponentManifest,
+    mux_server: RemoteGenerationComponentManifest,
+}
+
+#[derive(serde::Serialize)]
+struct RemoteGenerationIdMaterial<'a> {
+    schema: &'a str,
+    codec_version: u64,
+    ft: &'a RemoteGenerationComponentManifest,
+    mux_server: &'a RemoteGenerationComponentManifest,
+}
+
+impl RemoteGenerationManifest {
+    fn from_process_family(family: &ValidatedLocalProcessFamily) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            family.ft.identity == family.mux_server.identity,
+            "remote generation components do not share one sealed build identity"
+        );
+        let codec_version = u64::try_from(codec::CODEC_VERSION)
+            .map_err(|_| anyhow::anyhow!("codec version does not fit the generation manifest"))?;
+        let ft = RemoteGenerationComponentManifest {
+            filename: REMOTE_GENERATION_FT_FILE.to_string(),
+            sha256: family.ft.sha256.clone(),
+            byte_len: family.ft.byte_len,
+            mode: REMOTE_GENERATION_BINARY_MODE,
+            build_identity: RemoteGenerationBuildIdentity::from(&family.ft.identity),
+        };
+        let mux_server = RemoteGenerationComponentManifest {
+            filename: REMOTE_GENERATION_MUX_FILE.to_string(),
+            sha256: family.mux_server.sha256.clone(),
+            byte_len: family.mux_server.byte_len,
+            mode: REMOTE_GENERATION_BINARY_MODE,
+            build_identity: RemoteGenerationBuildIdentity::from(&family.mux_server.identity),
+        };
+        let mut manifest = Self {
+            schema: REMOTE_GENERATION_MANIFEST_SCHEMA.to_string(),
+            generation_id: String::new(),
+            codec_version,
+            ft,
+            mux_server,
+        };
+        manifest.generation_id = manifest.recompute_generation_id()?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    fn recompute_generation_id(&self) -> anyhow::Result<String> {
+        let material = RemoteGenerationIdMaterial {
+            schema: &self.schema,
+            codec_version: self.codec_version,
+            ft: &self.ft,
+            mux_server: &self.mux_server,
+        };
+        let bytes = serialize_json_bounded(
+            &material,
+            REMOTE_GENERATION_MANIFEST_MAX_BYTES,
+            JsonSerializationStyle::Compact,
+        )?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    fn canonical_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        self.validate()?;
+        let mut bytes = serialize_json_bounded(
+            self,
+            REMOTE_GENERATION_MANIFEST_MAX_BYTES.saturating_sub(1),
+            JsonSerializationStyle::Pretty,
+        )?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema == REMOTE_GENERATION_MANIFEST_SCHEMA,
+            "remote generation manifest has an unsupported schema"
+        );
+        anyhow::ensure!(
+            self.codec_version > 0,
+            "remote generation manifest has an invalid codec version"
+        );
+        validate_remote_generation_component(
+            &self.ft,
+            REMOTE_GENERATION_FT_FILE,
+            REMOTE_GENERATION_BINARY_MODE,
+        )?;
+        validate_remote_generation_component(
+            &self.mux_server,
+            REMOTE_GENERATION_MUX_FILE,
+            REMOTE_GENERATION_BINARY_MODE,
+        )?;
+        anyhow::ensure!(
+            self.ft.build_identity == self.mux_server.build_identity,
+            "remote generation manifest mixes build identities"
+        );
+        anyhow::ensure!(
+            is_canonical_lowercase_sha256(&self.generation_id)
+                && self.generation_id == self.recompute_generation_id()?,
+            "remote generation manifest generation ID does not match its canonical identity"
+        );
+        Ok(())
+    }
+}
+
+fn validate_remote_generation_component(
+    component: &RemoteGenerationComponentManifest,
+    expected_filename: &str,
+    expected_mode: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        component.filename == expected_filename,
+        "remote generation manifest has an unexpected component filename"
+    );
+    anyhow::ensure!(
+        component.byte_len > 0 && component.byte_len <= REMOTE_COMPONENT_MAX_BYTES,
+        "remote generation manifest component length is outside the supported bound"
+    );
+    anyhow::ensure!(
+        is_canonical_lowercase_sha256(&component.sha256),
+        "remote generation manifest component digest is not canonical SHA-256"
+    );
+    anyhow::ensure!(
+        component.mode == expected_mode,
+        "remote generation manifest component mode is not the frozen owner-only mode"
+    );
+    let identity = &component.build_identity;
+    anyhow::ensure!(
+        is_canonical_lowercase_sha256(&identity.build_id),
+        "remote generation manifest build ID is not canonical SHA-256"
+    );
+    anyhow::ensure!(
+        [&identity.target, &identity.profile, &identity.version]
+            .into_iter()
+            .all(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'.' | b'_' | b'+' | b'-')
+                    })
+            }),
+        "remote generation manifest contains an invalid build identity field"
+    );
     Ok(())
 }
 
@@ -79381,6 +79854,1309 @@ fn validate_local_process_family(
     Ok(ValidatedLocalProcessFamily { ft, mux_server })
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn remote_generation_effective_uid() -> u32 {
+    nix::unistd::geteuid().as_raw()
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn validate_remote_generation_transaction_id(transaction_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        transaction_id.len() == 32
+            && transaction_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "remote generation transaction ID must be 32 lowercase hex characters"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn read_remote_generation_source_snapshot(
+    path: &Path,
+    expected_component: &str,
+    effective_uid: u32,
+) -> anyhow::Result<LocalComponentSnapshot> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let snapshot = read_local_component_snapshot(path, expected_component)?;
+    let file = open_local_component_nofollow(path)?;
+    let metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!(
+            "cannot inspect remote generation source {}: {error}",
+            path.display()
+        )
+    })?;
+    let handle_snapshot = DiagnosticFileSnapshot::capture(&metadata)?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == effective_uid
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o7777 == REMOTE_GENERATION_BINARY_MODE
+            && handle_snapshot == snapshot.source_identity,
+        "remote generation source {} is not one stable owner-only regular file with nlink=1",
+        path.display()
+    );
+    Ok(snapshot)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn validate_remote_generation_directory(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    directory: &cap_std::fs::Dir,
+    expected_mode: u32,
+    effective_uid: u32,
+    expected_device: Option<u64>,
+    label: &str,
+) -> anyhow::Result<u64> {
+    use cap_std::fs::MetadataExt as _;
+    use cap_std::fs::PermissionsExt as _;
+
+    let path_metadata = parent.symlink_metadata(name).map_err(|error| {
+        anyhow::anyhow!("cannot inspect {label} directory entry without following links: {error}")
+    })?;
+    let handle_metadata = directory
+        .dir_metadata()
+        .map_err(|error| anyhow::anyhow!("cannot inspect pinned {label} directory: {error}"))?;
+    anyhow::ensure!(
+        path_metadata.is_dir()
+            && handle_metadata.is_dir()
+            && path_metadata.dev() == handle_metadata.dev()
+            && path_metadata.ino() == handle_metadata.ino()
+            && path_metadata.uid() == effective_uid
+            && handle_metadata.uid() == effective_uid
+            && path_metadata.permissions().mode() & 0o7777 == expected_mode
+            && handle_metadata.permissions().mode() & 0o7777 == expected_mode,
+        "{label} directory is not one stable nofollow owner directory with mode {expected_mode:#o}"
+    );
+    if let Some(expected_device) = expected_device {
+        anyhow::ensure!(
+            handle_metadata.dev() == expected_device,
+            "{label} directory is not on the pinned generation filesystem"
+        );
+    }
+    Ok(handle_metadata.dev())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn create_or_open_remote_generation_directory(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    effective_uid: u32,
+    expected_device: Option<u64>,
+    label: &str,
+) -> anyhow::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+    use cap_std::fs::PermissionsExt as _;
+
+    let created = match create_private_child_directory(parent, name) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(anyhow::anyhow!("cannot create {label} directory: {error}")),
+    };
+    let directory = parent.open_dir_nofollow(name).map_err(|error| {
+        anyhow::anyhow!("cannot open {label} directory without following links: {error}")
+    })?;
+    if created {
+        directory.open(".")?.set_permissions(
+            cap_std::fs::Permissions::from_mode(REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE),
+        )?;
+        sync_capability_directory(&directory)?;
+    }
+    validate_remote_generation_directory(
+        parent,
+        name,
+        &directory,
+        REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
+        effective_uid,
+        expected_device,
+        label,
+    )?;
+    if created {
+        sync_capability_directory(parent)
+            .map_err(|error| anyhow::anyhow!("cannot synchronize new {label} entry: {error}"))?;
+    }
+    Ok(directory)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn open_remote_generation_root(
+    root_path: &Path,
+    effective_uid: u32,
+) -> anyhow::Result<(cap_std::fs::Dir, cap_std::fs::Dir)> {
+    use cap_std::fs::MetadataExt as _;
+
+    anyhow::ensure!(
+        root_path.is_absolute()
+            && !path_contains_parent_component(root_path)
+            && root_path.file_name().is_some(),
+        "remote generation root must be a normalized absolute path"
+    );
+    let root_name = Path::new(
+        root_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("remote generation root has no leaf name"))?,
+    );
+    let root_parent_path = root_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("remote generation root has no parent"))?;
+    // Existing ordinary HOME/.local/share ancestors need not be private. They
+    // are still traversed descriptor-by-descriptor without following links.
+    let root_parent = ensure_private_directory_tree_nofollow(root_parent_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot pin remote generation root parent {} without following links: {error}",
+            root_parent_path.display()
+        )
+    })?;
+    let root = create_or_open_remote_generation_directory(
+        &root_parent,
+        root_name,
+        effective_uid,
+        None,
+        "remote generation root",
+    )?;
+    let root_device = root.dir_metadata()?.dev();
+    let generations = create_or_open_remote_generation_directory(
+        &root,
+        Path::new("generations"),
+        effective_uid,
+        Some(root_device),
+        "remote generations",
+    )?;
+    Ok((root, generations))
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn revalidate_remote_generation_root(
+    root_path: &Path,
+    pinned_root: &cap_std::fs::Dir,
+    effective_uid: u32,
+) -> anyhow::Result<()> {
+    use cap_std::fs::MetadataExt as _;
+    use cap_std::fs::PermissionsExt as _;
+
+    let reopened = open_directory_tree_nofollow(root_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot re-open remote generation root {} without following links: {error}",
+            root_path.display()
+        )
+    })?;
+    let pinned = pinned_root.dir_metadata()?;
+    let current = reopened.dir_metadata()?;
+    anyhow::ensure!(
+        pinned.is_dir()
+            && current.is_dir()
+            && pinned.dev() == current.dev()
+            && pinned.ino() == current.ino()
+            && pinned.uid() == effective_uid
+            && current.uid() == effective_uid
+            && pinned.permissions().mode() & 0o7777
+                == REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE
+            && current.permissions().mode() & 0o7777
+                == REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
+        "remote generation root changed identity, owner, or mode during publication"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn revalidate_remote_generations_binding(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    effective_uid: u32,
+) -> anyhow::Result<()> {
+    use cap_std::fs::MetadataExt as _;
+
+    let root_device = root.dir_metadata()?.dev();
+    validate_remote_generation_directory(
+        root,
+        Path::new("generations"),
+        generations,
+        REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
+        effective_uid,
+        Some(root_device),
+        "remote generations",
+    )?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn acquire_remote_generation_publication_lock(
+    root: &cap_std::fs::Dir,
+    effective_uid: u32,
+) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
+    use cap_std::fs::MetadataExt as _;
+    use cap_std::fs::OpenOptionsExt as _;
+    use cap_std::fs::PermissionsExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let lock_name = Path::new(".publication-lock.v1");
+    let mut create_options = cap_std::fs::OpenOptions::new();
+    create_options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .mode(REMOTE_GENERATION_LOCK_MODE);
+    let (file, created) = match root.open_with(lock_name, &create_options) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut open_options = cap_std::fs::OpenOptions::new();
+            open_options
+                .read(true)
+                .write(true)
+                .follow(FollowSymlinks::No);
+            (
+                root.open_with(lock_name, &open_options).map_err(|open_error| {
+                    anyhow::anyhow!(
+                        "cannot open existing remote generation publication lock without following links: {open_error}"
+                    )
+                })?,
+                false,
+            )
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cannot create remote generation publication lock: {error}"
+            ));
+        }
+    };
+    if created {
+        file.set_permissions(cap_std::fs::Permissions::from_mode(
+            REMOTE_GENERATION_LOCK_MODE,
+        ))?;
+        file.sync_all()?;
+        sync_capability_directory(root)?;
+    }
+    let metadata = file.metadata()?;
+    let path_metadata = root.symlink_metadata(lock_name)?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && path_metadata.is_file()
+            && metadata.dev() == path_metadata.dev()
+            && metadata.ino() == path_metadata.ino()
+            && metadata.uid() == effective_uid
+            && path_metadata.uid() == effective_uid
+            && metadata.nlink() == 1
+            && path_metadata.nlink() == 1
+            && metadata.len() == 0
+            && metadata.permissions().mode() & 0o7777 == REMOTE_GENERATION_LOCK_MODE,
+        "remote generation publication lock is not one private owner file with nlink=1"
+    );
+    let locked = nix::fcntl::Flock::lock(
+        file.into_std(),
+        nix::fcntl::FlockArg::LockExclusiveNonblock,
+    )
+    .map_err(|(_file, error)| {
+        anyhow::anyhow!(
+            "another remote generation publisher owns the publication lock: {error}"
+        )
+    })?;
+    let locked_metadata = locked.metadata()?;
+    let named_metadata = root.symlink_metadata(lock_name)?;
+    anyhow::ensure!(
+        locked_metadata.is_file()
+            && named_metadata.is_file()
+            && locked_metadata.dev() == named_metadata.dev()
+            && locked_metadata.ino() == named_metadata.ino()
+            && locked_metadata.uid() == effective_uid
+            && named_metadata.uid() == effective_uid
+            && locked_metadata.nlink() == 1
+            && named_metadata.nlink() == 1
+            && locked_metadata.len() == 0
+            && locked_metadata.permissions().mode() & 0o7777 == REMOTE_GENERATION_LOCK_MODE,
+        "remote generation publication lock changed identity before lock acquisition completed"
+    );
+    Ok(locked)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn validate_remote_generation_file_metadata(
+    directory: &cap_std::fs::Dir,
+    filename: &Path,
+    file: &cap_std::fs::File,
+    expected_mode: u32,
+    expected_len: Option<u64>,
+    effective_uid: u32,
+    expected_device: u64,
+) -> anyhow::Result<DiagnosticFileSnapshot> {
+    use cap_std::fs::MetadataExt as _;
+    use cap_std::fs::PermissionsExt as _;
+
+    let path_metadata = directory.symlink_metadata(filename).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot inspect generation file {} without following links: {error}",
+            filename.display()
+        )
+    })?;
+    let handle_metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!("cannot inspect opened generation file {}: {error}", filename.display())
+    })?;
+    anyhow::ensure!(
+        path_metadata.is_file()
+            && handle_metadata.is_file()
+            && path_metadata.dev() == handle_metadata.dev()
+            && path_metadata.ino() == handle_metadata.ino()
+            && path_metadata.dev() == expected_device
+            && path_metadata.uid() == effective_uid
+            && handle_metadata.uid() == effective_uid
+            && path_metadata.nlink() == 1
+            && handle_metadata.nlink() == 1
+            && path_metadata.permissions().mode() & 0o7777 == expected_mode
+            && handle_metadata.permissions().mode() & 0o7777 == expected_mode,
+        "generation file {} is not one stable owner-only regular file with nlink=1 and mode {expected_mode:#o}",
+        filename.display()
+    );
+    if let Some(expected_len) = expected_len {
+        anyhow::ensure!(
+            handle_metadata.len() == expected_len && path_metadata.len() == expected_len,
+            "generation file {} length does not match its manifest",
+            filename.display()
+        );
+    }
+    Ok(DiagnosticFileSnapshot::capture_cap(&handle_metadata)?)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn verify_open_remote_generation_file(
+    directory: &cap_std::fs::Dir,
+    component: &RemoteGenerationComponentManifest,
+    file: &mut cap_std::fs::File,
+    effective_uid: u32,
+    expected_device: u64,
+) -> anyhow::Result<()> {
+    let filename = Path::new(&component.filename);
+    let before = validate_remote_generation_file_metadata(
+        directory,
+        filename,
+        file,
+        component.mode,
+        Some(component.byte_len),
+        effective_uid,
+        expected_device,
+    )?;
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot rewind generation component {} before hashing: {error}",
+            component.filename
+        )
+    })?;
+    let (actual_len, actual_sha256) = sha256_reader(
+        (&mut *file).take(component.byte_len.saturating_add(1)),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("cannot hash generation component {}: {error}", component.filename)
+    })?;
+    anyhow::ensure!(
+        actual_len == component.byte_len && actual_sha256 == component.sha256,
+        "generation component {} does not match its exact length and SHA-256 manifest identity",
+        component.filename
+    );
+    let after = validate_remote_generation_file_metadata(
+        directory,
+        filename,
+        file,
+        component.mode,
+        Some(component.byte_len),
+        effective_uid,
+        expected_device,
+    )?;
+    anyhow::ensure!(
+        before == after,
+        "generation component {} changed while it was verified",
+        component.filename
+    );
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot rewind verified generation component {}: {error}",
+            component.filename
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn open_verified_remote_generation_file(
+    directory: &cap_std::fs::Dir,
+    component: &RemoteGenerationComponentManifest,
+    effective_uid: u32,
+    expected_device: u64,
+) -> anyhow::Result<cap_std::fs::File> {
+    let filename = Path::new(&component.filename);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = directory.open_with(filename, &options).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot open generation component {} without following links: {error}",
+            component.filename
+        )
+    })?;
+    verify_open_remote_generation_file(
+        directory,
+        component,
+        &mut file,
+        effective_uid,
+        expected_device,
+    )?;
+    Ok(file)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn verify_remote_generation_file(
+    directory: &cap_std::fs::Dir,
+    component: &RemoteGenerationComponentManifest,
+    effective_uid: u32,
+    expected_device: u64,
+) -> anyhow::Result<()> {
+    drop(open_verified_remote_generation_file(
+        directory,
+        component,
+        effective_uid,
+        expected_device,
+    )?);
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn read_remote_generation_manifest(
+    directory: &cap_std::fs::Dir,
+    effective_uid: u32,
+    expected_device: u64,
+) -> anyhow::Result<RemoteGenerationManifest> {
+    let filename = Path::new(REMOTE_GENERATION_MANIFEST_FILE);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = directory.open_with(filename, &options).map_err(|error| {
+        anyhow::anyhow!("cannot open generation manifest without following links: {error}")
+    })?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.len() > 0 && metadata.len() <= REMOTE_GENERATION_MANIFEST_MAX_BYTES,
+        "generation manifest length is outside the supported bound"
+    );
+    let before = validate_remote_generation_file_metadata(
+        directory,
+        filename,
+        &file,
+        REMOTE_GENERATION_MANIFEST_MODE,
+        Some(metadata.len()),
+        effective_uid,
+        expected_device,
+    )?;
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| anyhow::anyhow!("generation manifest length does not fit this platform"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|error| anyhow::anyhow!("cannot reserve generation manifest buffer: {error}"))?;
+    (&mut file)
+        .take(REMOTE_GENERATION_MANIFEST_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("cannot read generation manifest: {error}"))?;
+    anyhow::ensure!(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) == metadata.len(),
+        "generation manifest changed length while it was read"
+    );
+    let after = validate_remote_generation_file_metadata(
+        directory,
+        filename,
+        &file,
+        REMOTE_GENERATION_MANIFEST_MODE,
+        Some(metadata.len()),
+        effective_uid,
+        expected_device,
+    )?;
+    anyhow::ensure!(before == after, "generation manifest changed while it was read");
+    let manifest: RemoteGenerationManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("generation manifest is not valid JSON: {error}"))?;
+    manifest.validate()?;
+    verify_exact_pretty_json_encoding(
+        &manifest,
+        &bytes,
+        REMOTE_GENERATION_MANIFEST_MAX_BYTES,
+    )
+    .context("generation manifest does not use the one canonical v1 encoding")?;
+    Ok(manifest)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn write_remote_generation_component(
+    stage: &cap_std::fs::Dir,
+    source_path: &Path,
+    source_snapshot: &LocalComponentSnapshot,
+    component: &RemoteGenerationComponentManifest,
+    expected_component: &str,
+    effective_uid: u32,
+    stage_device: u64,
+) -> anyhow::Result<()> {
+    use cap_std::fs::OpenOptionsExt as _;
+    use cap_std::fs::PermissionsExt as _;
+    use sha2::{Digest as _, Sha256};
+
+    let mut source = open_local_component_nofollow(source_path)?;
+    let source_before = DiagnosticFileSnapshot::capture(&source.metadata()?)?;
+    anyhow::ensure!(
+        source_before == source_snapshot.source_identity,
+        "remote generation source {} changed before copy",
+        source_path.display()
+    );
+    let filename = Path::new(&component.filename);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .mode(REMOTE_GENERATION_BINARY_MODE);
+    let mut destination = stage.open_with(filename, &options).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot create generation component {} without overwriting: {error}",
+            component.filename
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).map_err(|error| {
+            anyhow::anyhow!("cannot read generation source {}: {error}", source_path.display())
+        })?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| anyhow::anyhow!("generation component byte count overflow"))?;
+        anyhow::ensure!(
+            copied <= REMOTE_COMPONENT_MAX_BYTES && copied <= component.byte_len,
+            "generation source {} exceeded its exact bounded length during copy",
+            source_path.display()
+        );
+        hasher.update(&buffer[..read]);
+        destination.write_all(&buffer[..read]).map_err(|error| {
+            anyhow::anyhow!("cannot write generation component {}: {error}", component.filename)
+        })?;
+    }
+    let copied_sha256 = hex::encode(hasher.finalize());
+    anyhow::ensure!(
+        copied == component.byte_len && copied_sha256 == component.sha256,
+        "generation source {} changed content while it was copied",
+        source_path.display()
+    );
+    let source_after_copy = DiagnosticFileSnapshot::capture(&source.metadata()?)?;
+    anyhow::ensure!(
+        source_after_copy == source_before,
+        "generation source {} changed metadata while it was copied",
+        source_path.display()
+    );
+    destination.set_permissions(cap_std::fs::Permissions::from_mode(
+        REMOTE_GENERATION_BINARY_MODE,
+    ))?;
+    destination.sync_all().map_err(|error| {
+        anyhow::anyhow!("cannot synchronize generation component {}: {error}", component.filename)
+    })?;
+    verify_remote_generation_file(stage, component, effective_uid, stage_device)?;
+    let source_after = read_remote_generation_source_snapshot(
+        source_path,
+        expected_component,
+        effective_uid,
+    )?;
+    anyhow::ensure!(
+        source_after == *source_snapshot,
+        "generation source {} changed identity or hash during publication",
+        source_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn write_remote_generation_manifest(
+    stage: &cap_std::fs::Dir,
+    manifest: &RemoteGenerationManifest,
+    effective_uid: u32,
+    stage_device: u64,
+) -> anyhow::Result<()> {
+    use cap_std::fs::OpenOptionsExt as _;
+    use cap_std::fs::PermissionsExt as _;
+
+    let bytes = manifest.canonical_bytes()?;
+    let filename = Path::new(REMOTE_GENERATION_MANIFEST_FILE);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .mode(REMOTE_GENERATION_MANIFEST_MODE);
+    let mut file = stage.open_with(filename, &options).map_err(|error| {
+        anyhow::anyhow!("cannot create generation manifest without overwriting: {error}")
+    })?;
+    file.write_all(&bytes)?;
+    file.set_permissions(cap_std::fs::Permissions::from_mode(
+        REMOTE_GENERATION_MANIFEST_MODE,
+    ))?;
+    file.sync_all()?;
+    let persisted = read_remote_generation_manifest(stage, effective_uid, stage_device)?;
+    anyhow::ensure!(
+        persisted == *manifest,
+        "generation manifest exact readback differs from the requested canonical manifest"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn remote_generation_directory_inventory(
+    directory: &cap_std::fs::Dir,
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for entry in directory.entries()? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("generation directory contains a non-UTF-8 entry"))?;
+        anyhow::ensure!(
+            names.insert(name),
+            "generation directory returned a duplicate entry name"
+        );
+    }
+    Ok(names)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn verify_remote_generation_directory(
+    generations: &cap_std::fs::Dir,
+    directory_name: &str,
+    require_content_derived_name: bool,
+    expected_manifest: Option<&RemoteGenerationManifest>,
+    effective_uid: u32,
+) -> anyhow::Result<RemoteGenerationManifest> {
+    use cap_fs_ext::DirExt as _;
+    use cap_std::fs::MetadataExt as _;
+
+    anyhow::ensure!(
+        !directory_name.is_empty()
+            && !directory_name.contains('/')
+            && !path_contains_parent_component(Path::new(directory_name)),
+        "generation directory name is not one normalized path component"
+    );
+    let directory = generations
+        .open_dir_nofollow(Path::new(directory_name))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "cannot open generation directory {directory_name} without following links: {error}"
+            )
+        })?;
+    let generations_device = generations.dir_metadata()?.dev();
+    validate_remote_generation_directory(
+        generations,
+        Path::new(directory_name),
+        &directory,
+        REMOTE_GENERATION_DIRECTORY_MODE,
+        effective_uid,
+        Some(generations_device),
+        "immutable generation",
+    )?;
+    let expected_names = BTreeSet::from([
+        REMOTE_GENERATION_FT_FILE.to_string(),
+        REMOTE_GENERATION_MANIFEST_FILE.to_string(),
+        REMOTE_GENERATION_MUX_FILE.to_string(),
+    ]);
+    anyhow::ensure!(
+        remote_generation_directory_inventory(&directory)? == expected_names,
+        "immutable generation directory does not contain exactly ft, mux, and manifest"
+    );
+    let manifest = read_remote_generation_manifest(
+        &directory,
+        effective_uid,
+        generations_device,
+    )?;
+    if require_content_derived_name {
+        anyhow::ensure!(
+            manifest.generation_id == directory_name,
+            "generation directory name does not match its content-derived manifest identity"
+        );
+    }
+    if let Some(expected_manifest) = expected_manifest {
+        anyhow::ensure!(
+            &manifest == expected_manifest,
+            "existing generation conflicts with the requested exact process-family identity"
+        );
+    }
+    verify_remote_generation_file(
+        &directory,
+        &manifest.ft,
+        effective_uid,
+        generations_device,
+    )?;
+    verify_remote_generation_file(
+        &directory,
+        &manifest.mux_server,
+        effective_uid,
+        generations_device,
+    )?;
+    anyhow::ensure!(
+        remote_generation_directory_inventory(&directory)? == expected_names,
+        "immutable generation directory changed while it was verified"
+    );
+    validate_remote_generation_directory(
+        generations,
+        Path::new(directory_name),
+        &directory,
+        REMOTE_GENERATION_DIRECTORY_MODE,
+        effective_uid,
+        Some(generations_device),
+        "immutable generation",
+    )?;
+    Ok(manifest)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn run_descriptor_pinned_remote_generation_mux_version(
+    executable: &impl std::os::fd::AsFd,
+) -> anyhow::Result<()> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    use std::os::fd::AsRawFd as _;
+
+    // `dup` intentionally produces a non-CLOEXEC descriptor. The child must
+    // retain it long enough for Linux to resolve `/proc/self/fd/<n>` to the
+    // exact already-open file, including when a test fixture is an interpreter
+    // script. RAII closes this one-purpose duplicate after the bounded child
+    // has been reaped; no ambient generation pathname is executed.
+    let inherited = nix::unistd::dup(executable)
+        .map_err(|error| anyhow::anyhow!("cannot duplicate verified mux descriptor: {error}"))?;
+    let descriptor_flags = FdFlag::from_bits_truncate(
+        fcntl(&inherited, FcntlArg::F_GETFD)
+            .map_err(|error| anyhow::anyhow!("cannot inspect verified mux descriptor: {error}"))?,
+    );
+    anyhow::ensure!(
+        !descriptor_flags.contains(FdFlag::FD_CLOEXEC),
+        "verified mux execution descriptor unexpectedly has close-on-exec set"
+    );
+    let inherited_number = inherited.as_raw_fd();
+    let executable_path = PathBuf::from("/proc/self/fd").join(inherited_number.to_string());
+    let mut command = std::process::Command::new(&executable_path);
+    command.arg("--version");
+    let output = run_cmd_with_timeout(
+        &mut command,
+        Duration::from_secs(10),
+        64 * 1024,
+        64 * 1024,
+    )?;
+    anyhow::ensure!(
+        !output.stdout.overflowed && !output.stderr.overflowed,
+        "mux version probe output exceeded its bounded capture"
+    );
+    anyhow::ensure!(
+        output.status.success(),
+        "hash-verified mux generation candidate failed --version with status {}",
+        output.status
+    );
+    anyhow::ensure!(
+        inherited.as_raw_fd() == inherited_number,
+        "verified mux execution descriptor identity changed during the version probe"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn run_verified_remote_generation_mux_version(
+    stage: &cap_std::fs::Dir,
+    manifest: &RemoteGenerationManifest,
+    effective_uid: u32,
+    stage_device: u64,
+) -> anyhow::Result<()> {
+    // The exact destination handle is admitted before execution, executed via
+    // its inherited `/proc/self/fd` identity, and re-admitted through both the
+    // same handle and its nofollow named entry afterward. A version probe never
+    // precedes hash admission and a name substitution cannot redirect exec.
+    let mut executable = open_verified_remote_generation_file(
+        stage,
+        &manifest.mux_server,
+        effective_uid,
+        stage_device,
+    )?;
+    run_descriptor_pinned_remote_generation_mux_version(&executable)?;
+    verify_open_remote_generation_file(
+        stage,
+        &manifest.mux_server,
+        &mut executable,
+        effective_uid,
+        stage_device,
+    )?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn validate_remote_generation_selector_target(target: &Path) -> anyhow::Result<&str> {
+    let mut components = target.components();
+    anyhow::ensure!(
+        matches!(components.next(), Some(std::path::Component::Normal(value)) if value == "generations"),
+        "remote generation selector target must begin with generations/"
+    );
+    let generation_id = match components.next() {
+        Some(std::path::Component::Normal(value)) => value
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("selector generation ID is not UTF-8"))?,
+        _ => anyhow::bail!("remote generation selector target has no generation ID"),
+    };
+    let target_text = target
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("remote generation selector target is not UTF-8"))?;
+    anyhow::ensure!(
+        components.next().is_none()
+            && is_canonical_lowercase_sha256(generation_id)
+            && target_text == format!("generations/{generation_id}"),
+        "remote generation selector target is not normalized generations/<generation-id>"
+    );
+    Ok(generation_id)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteGenerationSelectorSnapshot {
+    target: PathBuf,
+    device: u64,
+    inode: u64,
+    generation_id: String,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn verify_remote_generation_selector(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    selector_name: &str,
+    expected_generation_id: Option<&str>,
+    effective_uid: u32,
+) -> anyhow::Result<RemoteGenerationSelectorSnapshot> {
+    use cap_std::fs::MetadataExt as _;
+
+    revalidate_remote_generations_binding(root, generations, effective_uid)?;
+    let selector_path = Path::new(selector_name);
+    let before = root.symlink_metadata(selector_path).map_err(|error| {
+        anyhow::anyhow!("cannot inspect generation selector {selector_name}: {error}")
+    })?;
+    anyhow::ensure!(
+        before.file_type().is_symlink()
+            && before.uid() == effective_uid
+            && before.nlink() == 1
+            && before.dev() == root.dir_metadata()?.dev(),
+        "generation selector {selector_name} is not one owner symlink with nlink=1 on the pinned filesystem"
+    );
+    let target = root.read_link(selector_path).map_err(|error| {
+        anyhow::anyhow!("cannot read generation selector {selector_name}: {error}")
+    })?;
+    let generation_id = validate_remote_generation_selector_target(&target)?.to_string();
+    if let Some(expected_generation_id) = expected_generation_id {
+        anyhow::ensure!(
+            generation_id == expected_generation_id,
+            "generation selector {selector_name} does not name the expected generation"
+        );
+    }
+    verify_remote_generation_directory(
+        generations,
+        &generation_id,
+        true,
+        None,
+        effective_uid,
+    )?;
+    let after = root.symlink_metadata(selector_path)?;
+    let target_after = root.read_link(selector_path)?;
+    anyhow::ensure!(
+        after.file_type().is_symlink()
+            && after.dev() == before.dev()
+            && after.ino() == before.ino()
+            && after.uid() == effective_uid
+            && after.nlink() == 1
+            && target_after == target,
+        "generation selector {selector_name} changed while its target generation was verified"
+    );
+    revalidate_remote_generations_binding(root, generations, effective_uid)?;
+    Ok(RemoteGenerationSelectorSnapshot {
+        target,
+        device: before.dev(),
+        inode: before.ino(),
+        generation_id,
+    })
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn activate_remote_generation_selector(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    transaction_id: &str,
+    effective_uid: u32,
+) -> anyhow::Result<()> {
+    use nix::fcntl::{RenameFlags, renameat2};
+
+    validate_remote_generation_transaction_id(transaction_id)?;
+    revalidate_remote_generations_binding(root, generations, effective_uid)?;
+    let target = PathBuf::from("generations").join(generation_id);
+    anyhow::ensure!(
+        validate_remote_generation_selector_target(&target)? == generation_id,
+        "candidate selector target is not canonical"
+    );
+    verify_remote_generation_directory(
+        generations,
+        generation_id,
+        true,
+        None,
+        effective_uid,
+    )?;
+
+    let current_before = match root.symlink_metadata("current") {
+        Ok(_) => Some(verify_remote_generation_selector(
+            root,
+            generations,
+            "current",
+            None,
+            effective_uid,
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(anyhow::anyhow!("cannot inspect current selector: {error}")),
+    };
+    if current_before
+        .as_ref()
+        .is_some_and(|current| current.generation_id == generation_id)
+    {
+        // Acknowledgement-loss retry: re-synchronize and revalidate the exact
+        // already-current selector rather than manufacturing another switch.
+        sync_capability_directory(root)?;
+        verify_remote_generation_selector(
+            root,
+            generations,
+            "current",
+            Some(generation_id),
+            effective_uid,
+        )?;
+        return Ok(());
+    }
+
+    let staged_selector = if current_before.is_some() {
+        format!(".selector-rollback-{transaction_id}")
+    } else {
+        format!(".selector-new-{transaction_id}")
+    };
+    anyhow::ensure!(
+        staged_selector.len() <= REMOTE_GENERATION_SELECTOR_ARTIFACT_MAX_BYTES
+            && !staged_selector.contains('/')
+            && !path_contains_parent_component(Path::new(&staged_selector)),
+        "transaction selector artifact name is not one bounded normalized component"
+    );
+    anyhow::ensure!(
+        root.symlink_metadata(&staged_selector)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "transaction-unique staged selector already exists; refusing to overwrite or remove it"
+    );
+    root.symlink(&target, &staged_selector).map_err(|error| {
+        anyhow::anyhow!("cannot create transaction-unique generation selector: {error}")
+    })?;
+    sync_capability_directory(root)?;
+    let staged_before = verify_remote_generation_selector(
+        root,
+        generations,
+        &staged_selector,
+        Some(generation_id),
+        effective_uid,
+    )?;
+
+    match current_before {
+        Some(old_current) => {
+            let current_revalidated = verify_remote_generation_selector(
+                root,
+                generations,
+                "current",
+                Some(&old_current.generation_id),
+                effective_uid,
+            )?;
+            anyhow::ensure!(
+                current_revalidated == old_current,
+                "current selector changed before atomic exchange"
+            );
+            let staged_revalidated = verify_remote_generation_selector(
+                root,
+                generations,
+                &staged_selector,
+                Some(generation_id),
+                effective_uid,
+            )?;
+            anyhow::ensure!(
+                staged_revalidated == staged_before,
+                "candidate selector changed before atomic exchange"
+            );
+            renameat2(
+                root,
+                staged_selector.as_str(),
+                root,
+                "current",
+                RenameFlags::RENAME_EXCHANGE,
+            )
+            .map_err(|error| anyhow::anyhow!("atomic current-selector exchange failed: {error}"))?;
+            sync_capability_directory(root)?;
+            let current_after = verify_remote_generation_selector(
+                root,
+                generations,
+                "current",
+                Some(generation_id),
+                effective_uid,
+            )?;
+            anyhow::ensure!(
+                current_after.device == staged_before.device
+                    && current_after.inode == staged_before.inode,
+                "current selector does not have the atomically exchanged candidate identity"
+            );
+            let retained_old = verify_remote_generation_selector(
+                root,
+                generations,
+                &staged_selector,
+                Some(&old_current.generation_id),
+                effective_uid,
+            )?;
+            anyhow::ensure!(
+                retained_old.device == old_current.device
+                    && retained_old.inode == old_current.inode
+                    && retained_old.target == old_current.target,
+                "displaced current selector was not retained under the rollback name"
+            );
+        }
+        None => {
+            anyhow::ensure!(
+                root.symlink_metadata("current")
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "current selector appeared before atomic no-replace activation"
+            );
+            let staged_revalidated = verify_remote_generation_selector(
+                root,
+                generations,
+                &staged_selector,
+                Some(generation_id),
+                effective_uid,
+            )?;
+            anyhow::ensure!(
+                staged_revalidated == staged_before,
+                "candidate selector changed before atomic no-replace activation"
+            );
+            renameat2(
+                root,
+                staged_selector.as_str(),
+                root,
+                "current",
+                RenameFlags::RENAME_NOREPLACE,
+            )
+            .map_err(|error| anyhow::anyhow!("atomic current-selector publication failed: {error}"))?;
+            sync_capability_directory(root)?;
+            let current_after = verify_remote_generation_selector(
+                root,
+                generations,
+                "current",
+                Some(generation_id),
+                effective_uid,
+            )?;
+            anyhow::ensure!(
+                current_after.device == staged_before.device
+                    && current_after.inode == staged_before.inode,
+                "current selector does not have the atomically published candidate identity"
+            );
+        }
+    }
+    revalidate_remote_generations_binding(root, generations, effective_uid)?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn publish_remote_process_family_generation(
+    request: &RemoteGenerationPublishRequest<'_>,
+) -> anyhow::Result<RemoteGenerationPublicationReceipt> {
+    use cap_fs_ext::DirExt as _;
+    use cap_std::fs::MetadataExt as _;
+    use cap_std::fs::PermissionsExt as _;
+    use nix::fcntl::{RenameFlags, renameat2};
+
+    validate_process_family_byte_receipt(&request.expected)?;
+    validate_remote_generation_transaction_id(request.transaction_id)?;
+    let effective_uid = remote_generation_effective_uid();
+    let (root, generations) = open_remote_generation_root(request.root, effective_uid)?;
+    let _publication_lock = acquire_remote_generation_publication_lock(&root, effective_uid)?;
+    revalidate_remote_generation_root(request.root, &root, effective_uid)?;
+    revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
+
+    let ft = read_remote_generation_source_snapshot(
+        request.ft_source,
+        REMOTE_GENERATION_FT_FILE,
+        effective_uid,
+    )?;
+    let mux_server = read_remote_generation_source_snapshot(
+        request.mux_server_source,
+        REMOTE_GENERATION_MUX_FILE,
+        effective_uid,
+    )?;
+    let family = ValidatedLocalProcessFamily { ft, mux_server };
+    anyhow::ensure!(
+        ProcessFamilyByteReceipt::from(&family) == request.expected,
+        "remote generation sources do not match the caller's exact length and hash receipt"
+    );
+    anyhow::ensure!(
+        family.ft.identity == family.mux_server.identity,
+        "remote generation sources do not share one sealed build identity"
+    );
+    let manifest = RemoteGenerationManifest::from_process_family(&family)?;
+    let generation_id = manifest.generation_id.clone();
+
+    let generation_exists = match generations.symlink_metadata(&generation_id) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cannot inspect requested generation entry: {error}"
+            ));
+        }
+    };
+    if generation_exists {
+        // Acknowledgement-loss retry is accepted only after exact nofollow
+        // manifest/file/owner/mode/nlink/dev+inode revalidation.
+        verify_remote_generation_directory(
+            &generations,
+            &generation_id,
+            true,
+            Some(&manifest),
+            effective_uid,
+        )?;
+        sync_capability_directory(&generations)?;
+    } else {
+        let stage_name = format!(".stage-{generation_id}-{}", request.transaction_id);
+        create_private_child_directory(&generations, Path::new(&stage_name)).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot create transaction-unique generation stage (stale stages are never removed): {error}"
+            )
+        })?;
+        sync_capability_directory(&generations)?;
+        let stage = generations
+            .open_dir_nofollow(Path::new(&stage_name))
+            .map_err(|error| anyhow::anyhow!("cannot pin generation stage: {error}"))?;
+        stage.open(".")?.set_permissions(
+            cap_std::fs::Permissions::from_mode(REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE),
+        )?;
+        let generations_device = generations.dir_metadata()?.dev();
+        let stage_device = validate_remote_generation_directory(
+            &generations,
+            Path::new(&stage_name),
+            &stage,
+            REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
+            effective_uid,
+            Some(generations_device),
+            "generation stage",
+        )?;
+        write_remote_generation_component(
+            &stage,
+            request.ft_source,
+            &family.ft,
+            &manifest.ft,
+            REMOTE_GENERATION_FT_FILE,
+            effective_uid,
+            stage_device,
+        )?;
+        write_remote_generation_component(
+            &stage,
+            request.mux_server_source,
+            &family.mux_server,
+            &manifest.mux_server,
+            REMOTE_GENERATION_MUX_FILE,
+            effective_uid,
+            stage_device,
+        )?;
+        run_verified_remote_generation_mux_version(
+            &stage,
+            &manifest,
+            effective_uid,
+            stage_device,
+        )?;
+        write_remote_generation_manifest(&stage, &manifest, effective_uid, stage_device)?;
+        sync_capability_directory(&stage)?;
+        stage.open(".")?.set_permissions(
+            cap_std::fs::Permissions::from_mode(REMOTE_GENERATION_DIRECTORY_MODE),
+        )?;
+        sync_capability_directory(&stage)?;
+        verify_remote_generation_directory(
+            &generations,
+            &stage_name,
+            false,
+            Some(&manifest),
+            effective_uid,
+        )?;
+
+        match renameat2(
+            &generations,
+            stage_name.as_str(),
+            &generations,
+            generation_id.as_str(),
+            RenameFlags::RENAME_NOREPLACE,
+        ) {
+            Ok(()) => {
+                sync_capability_directory(&generations)?;
+                revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
+                verify_remote_generation_directory(
+                    &generations,
+                    &generation_id,
+                    true,
+                    Some(&manifest),
+                    effective_uid,
+                )?;
+            }
+            Err(nix::errno::Errno::EEXIST) => {
+                // A concurrent exact publisher may have won before this lock
+                // domain existed. Keep our immutable stage and accept only an
+                // exact existing generation; a conflict fails closed.
+                verify_remote_generation_directory(
+                    &generations,
+                    &generation_id,
+                    true,
+                    Some(&manifest),
+                    effective_uid,
+                )?;
+                sync_capability_directory(&generations)?;
+                revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "atomic no-replace generation publication failed: {error}"
+                ));
+            }
+        }
+    }
+
+    let activation = if request.activate_current {
+        revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
+        activate_remote_generation_selector(
+            &root,
+            &generations,
+            &generation_id,
+            request.transaction_id,
+            effective_uid,
+        )?;
+        RemoteGenerationActivation::Current
+    } else {
+        RemoteGenerationActivation::PendingLease
+    };
+    revalidate_remote_generation_root(request.root, &root, effective_uid)?;
+    revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
+    Ok(RemoteGenerationPublicationReceipt {
+        generation_id,
+        activation,
+    })
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn publish_remote_process_family_generation(
+    _request: &RemoteGenerationPublishRequest<'_>,
+) -> anyhow::Result<RemoteGenerationPublicationReceipt> {
+    anyhow::bail!(
+        "immutable remote generation publication requires Linux GNU renameat2 NOREPLACE/EXCHANGE"
+    )
+}
+
 fn validate_remote_release_tag(tag: &str) -> anyhow::Result<&str> {
     if tag.is_empty() || tag.len() > 128 {
         anyhow::bail!("remote release tag must contain 1 to 128 characters");
@@ -79429,6 +81205,21 @@ fn validate_remote_mux_server_path(path: &str) -> anyhow::Result<&str> {
     {
         anyhow::bail!(
             "remote mux-server path contains whitespace, control bytes, or shell metacharacters"
+        );
+    }
+    Ok(path)
+}
+
+fn validate_remote_guardian_path(path: &str) -> anyhow::Result<&str> {
+    if path.is_empty() || path.len() > 4096 || !Path::new(path).is_absolute() {
+        anyhow::bail!("remote guardian path must be a bounded absolute path");
+    }
+    if !path
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "remote guardian path contains whitespace, control bytes, or shell metacharacters"
         );
     }
     Ok(path)
@@ -79740,6 +81531,181 @@ printf 'FT_REMOTE_COMPONENT_VERIFIED={remote_name}:%s:%s\n' "$actual_bytes" "$ac
     )
 }
 
+fn remote_generation_publication_command(
+    ft_source: &str,
+    mux_source: &str,
+    suffix: &str,
+    process_family: &ProcessFamilyByteReceipt,
+) -> anyhow::Result<String> {
+    validate_process_family_byte_receipt(process_family)?;
+    anyhow::ensure!(
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "component staging suffix must be 32 lowercase hex characters"
+    );
+    anyhow::ensure!(
+        [ft_source, mux_source].into_iter().all(|path| {
+            path.starts_with("$HOME/")
+                && !path.contains("..")
+                && path.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'$' | b'/' | b'.' | b'_' | b'-')
+                })
+        }),
+        "remote generation source is not a fixed HOME-relative shell path"
+    );
+    Ok(format!(
+        r#"set -eu
+verify_source() {{
+  path=$1
+  expected_bytes=$2
+  expected_sha256=$3
+  test -f "$path" && test ! -L "$path" || return 1
+  actual_bytes=$(stat -c %s -- "$path") || return 1
+  test "$actual_bytes" = "$expected_bytes" || return 1
+  actual_sha256=$(sha256sum -- "$path") || return 1
+  actual_sha256=${{actual_sha256%% *}}
+  test "$actual_sha256" = "$expected_sha256"
+}}
+verify_descriptor() {{
+  path=$1
+  expected_bytes=$2
+  expected_sha256=$3
+  test -f "$path" && test -r "$path" || return 1
+  test "$(stat -Lc %u -- "$path")" = "$(id -u)" || return 1
+  test "$(stat -Lc %h -- "$path")" = 1 || return 1
+  actual_bytes=$(stat -Lc %s -- "$path") || return 1
+  test "$actual_bytes" = "$expected_bytes" || return 1
+  actual_sha256=$(sha256sum -- "$path") || return 1
+  actual_sha256=${{actual_sha256%% *}}
+  test "$actual_sha256" = "$expected_sha256"
+}}
+verify_same_inode() {{
+  descriptor=$1
+  named=$2
+  test "$(stat -Lc '%d:%i' -- "$descriptor")" = "$(stat -Lc '%d:%i' -- "$named")"
+}}
+ft_source="{ft_source}"
+mux_source="{mux_source}"
+root="$HOME/.local/share/frankenterm/process-family"
+verify_source "$ft_source" "{ft_bytes}" "{ft_sha256}"
+verify_source "$mux_source" "{mux_bytes}" "{mux_sha256}"
+exec 8<"$ft_source"
+exec 9<"$mux_source"
+ft_descriptor=/proc/self/fd/8
+mux_descriptor=/proc/self/fd/9
+verify_descriptor "$ft_descriptor" "{ft_bytes}" "{ft_sha256}"
+verify_descriptor "$mux_descriptor" "{mux_bytes}" "{mux_sha256}"
+verify_source "$ft_source" "{ft_bytes}" "{ft_sha256}"
+verify_source "$mux_source" "{mux_bytes}" "{mux_sha256}"
+verify_same_inode "$ft_descriptor" "$ft_source"
+verify_same_inode "$mux_descriptor" "$mux_source"
+chmod 0500 -- "$ft_descriptor" "$mux_descriptor"
+test "$(stat -Lc %a -- "$ft_descriptor")" = 500
+test "$(stat -Lc %a -- "$mux_descriptor")" = 500
+verify_descriptor "$ft_descriptor" "{ft_bytes}" "{ft_sha256}"
+verify_descriptor "$mux_descriptor" "{mux_bytes}" "{mux_sha256}"
+verify_source "$ft_source" "{ft_bytes}" "{ft_sha256}"
+verify_source "$mux_source" "{mux_bytes}" "{mux_sha256}"
+verify_same_inode "$ft_descriptor" "$ft_source"
+verify_same_inode "$mux_descriptor" "$mux_source"
+exec "$ft_descriptor" setup __publish-remote-generation \
+  --root "$root" \
+  --ft-source "$ft_source" \
+  --mux-server-source "$mux_source" \
+  --expected-ft-sha256 "{ft_sha256}" \
+  --expected-ft-bytes "{ft_bytes}" \
+  --expected-mux-sha256 "{mux_sha256}" \
+  --expected-mux-bytes "{mux_bytes}" \
+  --transaction-id "{suffix}""#,
+        ft_bytes = process_family.ft.byte_len,
+        ft_sha256 = process_family.ft.sha256,
+        mux_bytes = process_family.mux_server.byte_len,
+        mux_sha256 = process_family.mux_server.sha256,
+    ))
+}
+
+fn uploaded_process_family_generation_command(
+    suffix: &str,
+    process_family: &ProcessFamilyByteReceipt,
+) -> anyhow::Result<String> {
+    remote_generation_publication_command(
+        &format!("$HOME/.local/bin/ft.installing-{suffix}"),
+        &format!("$HOME/.local/bin/frankenterm-mux-server.installing-{suffix}"),
+        suffix,
+        process_family,
+    )
+}
+
+fn remote_release_generation_publication_command(
+    tag: &str,
+    suffix: &str,
+    process_family: &ProcessFamilyByteReceipt,
+) -> anyhow::Result<String> {
+    let tag = validate_remote_release_tag(tag)?;
+    remote_generation_publication_command(
+        &format!("$HOME/.cache/frankenterm/releases/{tag}-{suffix}/ft"),
+        &format!(
+            "$HOME/.cache/frankenterm/releases/{tag}-{suffix}/frankenterm-mux-server"
+        ),
+        suffix,
+        process_family,
+    )
+}
+
+fn parse_remote_generation_publication_receipt(
+    stdout: &str,
+) -> anyhow::Result<RemoteGenerationPublicationReceipt> {
+    const PREFIX: &str = "FT_REMOTE_GENERATION_PUBLICATION_V1=";
+    anyhow::ensure!(
+        stdout.ends_with('\n')
+            && !stdout.contains('\r')
+            && stdout.lines().count() == 1
+            && stdout.starts_with(PREFIX),
+        "remote generation publisher returned no exact single-line receipt"
+    );
+    let mut fields = stdout
+        .trim_end_matches('\n')
+        .strip_prefix(PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("remote generation receipt prefix is missing"))?
+        .split(':');
+    let generation_id = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("remote generation receipt has no generation ID"))?;
+    anyhow::ensure!(
+        is_canonical_lowercase_sha256(generation_id),
+        "remote generation receipt has a non-canonical generation ID"
+    );
+    let activation = match fields.next() {
+        Some("pending_activation_lease") => {
+            anyhow::ensure!(
+                fields.next().is_none(),
+                "pending generation receipt has unexpected fields"
+            );
+            RemoteGenerationActivation::PendingLease
+        }
+        Some("current") => {
+            let target = fields.next().ok_or_else(|| {
+                anyhow::anyhow!("current generation receipt has no selector target")
+            })?;
+            anyhow::ensure!(
+                fields.next().is_none()
+                    && target == format!("generations/{generation_id}"),
+                "current generation receipt has a non-canonical selector target"
+            );
+            RemoteGenerationActivation::Current
+        }
+        _ => anyhow::bail!("remote generation receipt has an unknown activation state"),
+    };
+    Ok(RemoteGenerationPublicationReceipt {
+        generation_id: generation_id.to_string(),
+        activation,
+    })
+}
+
+#[cfg(test)]
 fn local_process_family_publish_command(
     suffix: &str,
     process_family: &ProcessFamilyByteReceipt,
@@ -79895,11 +81861,12 @@ if ! verify_component "$mux_stage" "{mux_bytes}" "{mux_sha256}" || \
   report_incomplete_rollback
   exit 2
 fi
-printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish:{suffix}\n'"#
+printf 'FT_COMPONENT_PUBLICATION=active_compensating_publish_not_crash_atomic:{suffix}\n'"#
         ))
     }
 }
 
+#[cfg(test)]
 fn remote_release_stage_command(
     tag: &str,
     suffix: &str,
@@ -80075,6 +82042,89 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
     run_remote_setup_with_runner(host, options, &run_remote_command)
 }
 
+const REMOTE_MUX_OWNERSHIP_PROBE_COMMAND: &str = r#"set -u
+service_name='franken''term-mux-server'
+process_pattern='(^|/)[f]ranken''term-mux-server([^/[:space:]]*)([[:space:]]|$)'
+if command -v systemctl >/dev/null 2>&1 && \
+   systemctl --user is-active --quiet "$service_name" 2>/dev/null; then
+  printf 'active\n'
+  exit 0
+fi
+if command -v pgrep >/dev/null 2>&1; then
+  pgrep -u "$(id -u)" -f "$process_pattern" >/dev/null 2>&1
+  probe_status=$?
+  case "$probe_status" in
+    0) printf 'active\n'; exit 0 ;;
+    1) printf 'inactive\n'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+fi
+if command -v ps >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
+  process_list=$(ps -u "$(id -u)" -o args= 2>/dev/null) || exit 3
+  printf '%s\n' "$process_list" | grep -Eq "$process_pattern"
+  probe_status=$?
+  case "$probe_status" in
+    0) printf 'active\n'; exit 0 ;;
+    1) printf 'inactive\n'; exit 0 ;;
+    *) exit 4 ;;
+  esac
+fi
+exit 5"#;
+
+fn parse_remote_mux_ownership_probe(output: &RemoteCommandOutput) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        output.status.success(),
+        "remote mux ownership fence failed; refusing to assume the host is inactive"
+    );
+    match output.stdout.as_str() {
+        "active\n" => Ok(true),
+        "inactive\n" => Ok(false),
+        _ => anyhow::bail!(
+            "remote mux ownership probe returned no unambiguous state; refusing component activation"
+        ),
+    }
+}
+
+fn remote_mux_activation_summary(
+    apply_changes: bool,
+    install_candidate: bool,
+    active_mux_before_install: bool,
+    mux_owner_active_after_setup: bool,
+) -> anyhow::Result<&'static str> {
+    if !apply_changes {
+        return Ok("not attempted; dry-run only");
+    }
+
+    if active_mux_before_install {
+        anyhow::ensure!(
+            mux_owner_active_after_setup,
+            "mux ownership disappeared during setup; refusing to report preservation"
+        );
+        return Ok(
+            "pending; candidate not activated and the previously live mux owner was preserved",
+        );
+    }
+
+    if install_candidate {
+        return if mux_owner_active_after_setup {
+            Ok(
+                "pending; candidate not activated and a mux owner appeared without the publication lease",
+            )
+        } else {
+            Ok("pending; candidate not activated because no cross-launcher lifetime lease exists")
+        };
+    }
+
+    if mux_owner_active_after_setup {
+        // A combined service/process census proves only that some mux owner is
+        // running. Without a launch lease and readiness receipt it cannot bind
+        // that process to a unit or immutable generation.
+        Ok("mux owner observed; exact service and running-generation identities remain unverified")
+    } else {
+        Ok("service inactive; automatic start withheld because no cross-launcher lifetime lease exists")
+    }
+}
+
 fn run_remote_setup_with_runner<F>(
     host: &str,
     options: &RemoteSetupOptions<'_>,
@@ -80170,57 +82220,21 @@ where
     // A client binary cannot be activated independently of the mux process it
     // speaks to. Replacing ~/.local/bin/ft while an older mux keeps running is
     // the exact split-brain that made previously configured domains appear to
-    // stop reconnecting. Until PTY ownership is moved into the guardian, a
-    // live mux fences activation of both components.
+    // stop reconnecting. This census is observational only: neither an active
+    // nor an inactive result is the cross-launcher lifetime lease required to
+    // activate a candidate.
     let active_mux_before_install = {
         let output = run_remote_step(
-            "Fence FrankenTerm mux ownership and component activation",
+            "Observe FrankenTerm mux ownership before pending publication",
             host,
-            r#"set -u
-service_name='franken''term-mux-server'
-process_pattern='(^|/)[f]ranken''term-mux-server([^/[:space:]]*)([[:space:]]|$)'
-if command -v systemctl >/dev/null 2>&1 && \
-   systemctl --user is-active --quiet "$service_name" 2>/dev/null; then
-  printf 'active\n'
-  exit 0
-fi
-if command -v pgrep >/dev/null 2>&1; then
-  pgrep -u "$(id -u)" -f "$process_pattern" >/dev/null 2>&1
-  probe_status=$?
-  case "$probe_status" in
-    0) printf 'active\n'; exit 0 ;;
-    1) printf 'inactive\n'; exit 0 ;;
-    *) exit 2 ;;
-  esac
-fi
-if command -v ps >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
-  process_list=$(ps -u "$(id -u)" -o args= 2>/dev/null) || exit 3
-  printf '%s\n' "$process_list" | grep -Eq "$process_pattern"
-  probe_status=$?
-  case "$probe_status" in
-    0) printf 'active\n'; exit 0 ;;
-    1) printf 'inactive\n'; exit 0 ;;
-    *) exit 4 ;;
-  esac
-fi
-exit 5"#,
+            REMOTE_MUX_OWNERSHIP_PROBE_COMMAND,
             timeout,
             runner,
             &redactor,
             options.verbose,
             false,
         )?;
-        anyhow::ensure!(
-            output.status.success(),
-            "remote mux ownership fence failed; refusing to assume the host is inactive"
-        );
-        match output.stdout.as_str() {
-            "active\n" => true,
-            "inactive\n" => false,
-            _ => anyhow::bail!(
-                "remote mux ownership fence returned no unambiguous state; refusing component activation"
-            ),
-        }
+        parse_remote_mux_ownership_probe(&output)?
     };
     if apply_changes && options.install_ft && active_mux_before_install {
         let dump_output = run_remote_step(
@@ -80271,6 +82285,8 @@ fi"#,
             anyhow::bail!("pre-upgrade dump command returned an invalid status marker");
         }
     }
+    let mut remote_generation_publication = None;
+
     // Step 2: Detect package manager
     let pkg_output = run_remote_step(
         "Detect package manager",
@@ -80445,10 +82461,10 @@ fi"#,
         }
     }
 
-    // Step 4: Optionally stage the exact client/server process family before
-    // resolving the service path. Updating bytes on disk never restarts an
-    // active mux: doing so would destroy the PTYs it owns. The operator can
-    // drain and restart deliberately after this command returns.
+    // Step 4: Publish the exact client/server process family as one immutable
+    // same-filesystem generation before resolving the service path. A live mux
+    // leaves the generation pending; the point-in-time ownership observation
+    // is not a lifetime lease and therefore cannot authorize replacement.
     if options.install_ft {
         if apply_changes {
             run_remote_step(
@@ -80489,17 +82505,12 @@ fi"#,
                     timeout,
                     &process_family.mux_server,
                 )?;
-                let publish_command = local_process_family_publish_command(
+                let publish_command = uploaded_process_family_generation_command(
                     &staging_suffix,
                     &ProcessFamilyByteReceipt::from(process_family),
-                    active_mux_before_install,
                 )?;
                 let publication = run_remote_step(
-                    if active_mux_before_install {
-                        "Stage pending FrankenTerm process family"
-                    } else {
-                        "Publish matched FrankenTerm process family transactionally"
-                    },
+                    "Publish immutable pending FrankenTerm generation",
                     host,
                     &publish_command,
                     timeout,
@@ -80508,19 +82519,13 @@ fi"#,
                     options.verbose,
                     true,
                 )?;
-                let expected_publication_receipt = if active_mux_before_install {
-                    format!(
-                        "FT_COMPONENT_ACTIVATION=pending_live_mux:{staging_suffix}\n"
-                    )
-                } else {
-                    format!(
-                        "FT_COMPONENT_ACTIVATION=active_transactional_publish:{staging_suffix}\n"
-                    )
-                };
+                let receipt = parse_remote_generation_publication_receipt(&publication.stdout)?;
                 anyhow::ensure!(
-                    publication.stdout == expected_publication_receipt,
-                    "remote process-family publication returned no exact activation receipt"
+                    receipt.activation == RemoteGenerationActivation::PendingLease,
+                    "remote generation publisher attempted activation without a cross-launcher lease"
                 );
+                println!("  immutable generation id: {}", receipt.generation_id);
+                remote_generation_publication = Some(receipt);
                 println!("  component transaction id: {staging_suffix}");
             } else if let Some(tag) = options.ft_version {
                 let install_timeout = timeout.max(std::time::Duration::from_secs(600));
@@ -80534,7 +82539,7 @@ fi"#,
                     if active_mux_before_install {
                         "Download verified pending FrankenTerm release process family"
                     } else {
-                        "Download verified FrankenTerm release process family for transactional publication"
+                        "Download verified FrankenTerm release process family for pending publication"
                     },
                     host,
                     &install_command,
@@ -80545,36 +82550,13 @@ fi"#,
                     true,
                 )?;
                 let receipt = parse_remote_release_component_receipt(&installation.stdout, tag)?;
-                let stage_command =
-                    remote_release_stage_command(tag, &staging_suffix, &receipt)?;
-                let staging = run_remote_step(
-                    "Bind verified release bytes to the local publication stage",
-                    host,
-                    &stage_command,
-                    timeout,
-                    runner,
-                    &redactor,
-                    options.verbose,
-                    true,
-                )?;
-                let expected_stage_receipt =
-                    format!("FT_RELEASE_COMPONENT_STAGE_V1={tag}:{staging_suffix}\n");
-                anyhow::ensure!(
-                    staging.stdout == expected_stage_receipt,
-                    "remote release staging returned no exact byte-binding receipt"
-                );
-
-                let publish_command = local_process_family_publish_command(
+                let publish_command = remote_release_generation_publication_command(
+                    tag,
                     &staging_suffix,
                     &receipt,
-                    active_mux_before_install,
                 )?;
                 let publication = run_remote_step(
-                    if active_mux_before_install {
-                        "Stage verified release as a pending process family"
-                    } else {
-                        "Publish verified release process family transactionally"
-                    },
+                    "Publish verified release as an immutable pending generation",
                     host,
                     &publish_command,
                     timeout,
@@ -80583,76 +82565,48 @@ fi"#,
                     options.verbose,
                     true,
                 )?;
-                let expected_publication_receipt = if active_mux_before_install {
-                    format!(
-                        "FT_COMPONENT_ACTIVATION=pending_live_mux:{staging_suffix}\n"
-                    )
-                } else {
-                    format!(
-                        "FT_COMPONENT_ACTIVATION=active_transactional_publish:{staging_suffix}\n"
-                    )
-                };
+                let generation_receipt =
+                    parse_remote_generation_publication_receipt(&publication.stdout)?;
                 anyhow::ensure!(
-                    publication.stdout == expected_publication_receipt,
-                    "remote release publication returned no exact activation receipt"
+                    generation_receipt.activation == RemoteGenerationActivation::PendingLease,
+                    "remote release publisher attempted activation without a cross-launcher lease"
                 );
+                println!(
+                    "  immutable generation id: {}",
+                    generation_receipt.generation_id
+                );
+                remote_generation_publication = Some(generation_receipt);
                 println!("  component transaction id: {staging_suffix}");
             }
-            if active_mux_before_install {
-                println!(
-                    "  ✓ matching ft and mux-server bytes are pending; the compatible active pair was not replaced"
-                );
-            } else {
-                println!("  ✓ matching ft and mux-server bytes are active as one process family");
-            }
+            println!(
+                "  ✓ matching ft and mux-server bytes are in one immutable pending generation; current was not switched without a cross-launcher lease"
+            );
         } else if let (Some(ft_path), Some(mux_server_path)) =
             (options.ft_path, options.mux_server_path)
         {
-            if active_mux_before_install {
-                println!("• Would stage a pending FrankenTerm process family via identity-fenced SSH upload");
-            } else {
-                println!("• Would publish the atomic FrankenTerm process family via identity-fenced SSH upload");
-            }
+            println!("• Would publish an immutable pending FrankenTerm generation via identity-fenced SSH upload; activation requires a cross-launcher lease");
             println!("  ft: {}", ft_path.display());
             println!("  mux-server: {}", mux_server_path.display());
         } else if let Some(tag) = options.ft_version {
-            if active_mux_before_install {
-                println!(
-                    "• Would download and stage verified release {tag} as a pending process family"
-                );
-            } else {
-                println!(
-                    "• Would download, probe, and transactionally publish verified release process family {tag}"
-                );
-            }
+            println!(
+                "• Would download, verify, and publish release {tag} as a pending process family; activation requires a cross-launcher lease"
+            );
         }
     }
 
-    // Step 5: Resolve mux-server path and install user service unit
-    let mux_path_output = run_remote_step(
-        "Locate frankenterm-mux-server",
-        host,
-        "if test -x \"$HOME/.local/bin/frankenterm-mux-server\"; then \
-           printf '%s\\n' \"$HOME/.local/bin/frankenterm-mux-server\"; \
-         else command -v frankenterm-mux-server || \
-           which frankenterm-mux-server 2>/dev/null || \
-           echo /usr/bin/frankenterm-mux-server; fi",
-        timeout,
-        runner,
-        &redactor,
-        options.verbose,
-        false,
-    )?;
-    let mux_server_path = mux_path_output
-        .stdout
-        .trim()
-        .lines()
-        .next()
-        .unwrap_or("/usr/bin/frankenterm-mux-server")
-        .trim();
-    let mux_server_path = validate_remote_mux_server_path(mux_server_path)?.to_string();
-    let mux_unit = remote_mux_service_unit(&mux_server_path);
-
+    // Step 5: Inspect only the shape of the existing user service unit. An
+    // immutable candidate remains pending until every mux launcher participates
+    // in one lifetime lease. The current remote shell surface also cannot prove
+    // descriptor-confined, crash-durable unit publication or even an exact
+    // pathname-race-free content read, so setup must not consume unit bytes or
+    // emulate a write transaction with path-based `cat`/`mv` operations.
+    // Guardian service publication remains withheld until its source-level
+    // census/guarded-stop controls have durable acknowledgement replay,
+    // external-effect atomicity, and mock-free current-source proof. Do not
+    // order the active mux behind an unproved continuity boundary.
+    println!(
+        "⚠ PTY guardian service activation is withheld until durable replay-safe control, effect atomicity, and current-source service proof are complete."
+    );
     let service_path = "~/.config/systemd/user/frankenterm-mux-server.service";
     let check_service_cmd = r#"set -u
 service="$HOME/.config/systemd/user/frankenterm-mux-server.service"
@@ -80660,7 +82614,6 @@ if test ! -e "$service" && test ! -L "$service"; then
   printf 'FT_REMOTE_SERVICE_STATE_V1=missing\n'
 elif test -f "$service" && test ! -L "$service"; then
   printf 'FT_REMOTE_SERVICE_STATE_V1=regular\n'
-  cat "$service"
 else
   printf 'FT_REMOTE_SERVICE_STATE_V1=unsafe_shape\n'
 fi"#;
@@ -80678,122 +82631,44 @@ fi"#;
         service_output.status.success(),
         "remote mux service-unit shape probe failed"
     );
-    let existing_service = if service_output.stdout == "FT_REMOTE_SERVICE_STATE_V1=missing\n" {
-        ""
+    let service_is_missing = if service_output.stdout == "FT_REMOTE_SERVICE_STATE_V1=missing\n" {
+        true
+    } else if service_output.stdout == "FT_REMOTE_SERVICE_STATE_V1=regular\n" {
+        false
     } else if service_output.stdout == "FT_REMOTE_SERVICE_STATE_V1=unsafe_shape\n" {
         anyhow::bail!(
             "remote mux service-unit path is a symlink or non-regular object; refusing to read or replace it"
         );
-    } else if let Some(contents) = service_output
-        .stdout
-        .strip_prefix("FT_REMOTE_SERVICE_STATE_V1=regular\n")
-    {
-        contents.trim()
     } else {
         anyhow::bail!("remote mux service-unit shape probe returned an invalid marker");
     };
-    let expected_service = mux_unit.trim();
-    if existing_service == expected_service {
-        println!("✓ mux service unit already up to date");
-    } else if existing_service.is_empty() || options.install_ft {
-        if apply_changes {
-            let service_transaction = component_transaction
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-            let install_cmd = format!(
-                r#"set -eu
-service="$HOME/.config/systemd/user/frankenterm-mux-server.service"
-stage="$service.installing-{service_transaction}"
-backup_candidate="$service.previous-{service_transaction}"
-backup=""
-mkdir -p "$HOME/.config/systemd/user"
-test ! -e "$stage" && test ! -L "$stage"
-test ! -e "$backup_candidate" && test ! -L "$backup_candidate"
-cat > "$stage" <<'EOF'
-{mux_unit}EOF
-if test -e "$service" || test -L "$service"; then
-  test -f "$service" && test ! -L "$service"
-  backup="$backup_candidate"
-  mv "$service" "$backup"
-fi
-if ! mv "$stage" "$service"; then
-  test -z "$backup" || mv "$backup" "$service"
-  exit 1
-fi"#
+    let candidate_waiting_for_lease = options.install_ft
+        && remote_generation_publication
+            .as_ref()
+            .is_some_and(|receipt| receipt.activation == RemoteGenerationActivation::PendingLease);
+    if candidate_waiting_for_lease {
+        println!(
+            "⚠ immutable candidate is pending on the cross-launcher lease; leaving the existing service unit and systemd start state unchanged"
+        );
+        if service_is_missing {
+            println!(
+                "  No service unit is installed because the pending generation is not an activation authority."
             );
-            run_remote_step(
-                if existing_service.is_empty() {
-                    "Install mux service unit"
-                } else {
-                    "Preserve and update mux service unit"
-                },
-                host,
-                &install_cmd,
-                timeout,
-                runner,
-                &redactor,
-                options.verbose,
-                true,
-            )?;
-            println!("  service transaction id: {service_transaction}");
-        } else {
-            if existing_service.is_empty() {
-                println!("• Would install mux service unit at {service_path}");
-            } else {
-                println!(
-                    "• Would preserve and update mux service unit to use {mux_server_path}"
-                );
-            }
         }
+    } else if !service_is_missing {
+        println!("✓ a regular mux service-unit path exists and remains unchanged");
+        println!(
+            "  its exact bytes are unclaimed because the current shell surface cannot provide a descriptor-confined read; daemon-reload, enable, and start remain unchanged"
+        );
     } else {
-        println!("⚠ mux service unit exists but differs; leaving unchanged.");
-        if apply_changes {
-            println!("  Remove or update {service_path} manually if desired.");
-        }
+        println!(
+            "⚠ automatic mux service-unit publication is withheld: the current remote shell surface cannot prove descriptor-confined create-new, exact readback, atomic exchange, directory fsync, and replayable outcome"
+        );
+        println!("  Leaving {service_path} unchanged.");
     }
-
-    if apply_changes {
-        run_remote_step(
-            "systemctl --user daemon-reload",
-            host,
-            "systemctl --user daemon-reload",
-            timeout,
-            runner,
-            &redactor,
-            options.verbose,
-            true,
-        )?;
-        if active_mux_before_install {
-            run_remote_step(
-                "Enable mux service without starting a second generation",
-                host,
-                "systemctl --user enable frankenterm-mux-server",
-                timeout,
-                runner,
-                &redactor,
-                options.verbose,
-                true,
-            )?;
-        } else {
-            run_remote_step(
-                "Enable and start mux service",
-                host,
-                "systemctl --user enable --now frankenterm-mux-server",
-                timeout,
-                runner,
-                &redactor,
-                options.verbose,
-                true,
-            )?;
-        }
-    } else {
-        println!("• Would run: systemctl --user daemon-reload");
-        if active_mux_before_install {
-            println!("• Would run: systemctl --user enable frankenterm-mux-server");
-        } else {
-            println!("• Would run: systemctl --user enable --now frankenterm-mux-server");
-        }
-    }
+    println!(
+        "⚠ systemd daemon-reload/enable/start are withheld; no point-in-time negative census is a startup lease"
+    );
 
     let status_output = run_remote_step(
         "Check mux service status",
@@ -80809,8 +82684,32 @@ fi"#
     if status == "active" {
         println!("✓ mux service is active");
     } else if !status.is_empty() {
-        println!("⚠ mux service status: {status}");
+        println!(
+            "⚠ mux service status: {}",
+            bounded_terminal_diagnostic(status, 128, 256)
+        );
     }
+    let mux_owner_active_after_setup = if apply_changes {
+        let output = run_remote_step(
+            "Recheck mux ownership after setup",
+            host,
+            REMOTE_MUX_OWNERSHIP_PROBE_COMMAND,
+            timeout,
+            runner,
+            &redactor,
+            options.verbose,
+            false,
+        )?;
+        parse_remote_mux_ownership_probe(&output)?
+    } else {
+        active_mux_before_install
+    };
+    let activation_summary = remote_mux_activation_summary(
+        apply_changes,
+        options.install_ft,
+        active_mux_before_install,
+        mux_owner_active_after_setup,
+    )?;
 
     // Step 6: Enable linger
     let linger_output = run_remote_step(
@@ -80852,11 +82751,7 @@ fi"#
     );
     if options.install_ft {
         println!("  Components: ft + frankenterm-mux-server (same release identity)");
-        if active_mux_before_install {
-            println!("  Activation: pending; compatible live client/server pair preserved");
-        } else {
-            println!("  Activation: complete; no prior live mux required replacement");
-        }
+        println!("  Activation: {activation_summary}");
     }
     println!("  Next: verify with `ssh {host} 'systemctl --user status frankenterm-mux-server'`");
 
@@ -90761,6 +92656,40 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
+    fn private_artifact_verification_rejects_an_additional_hard_link() {
+        let dir = tempfile::tempdir().expect("artifact tempdir");
+        let path = dir.path().join("private").join("mux-dump.json");
+        write_new_private_artifact(&path, b"private dump bytes\n")
+            .expect("publish single-link private artifact");
+        let alias = dir.path().join("private").join("shared-inode.json");
+        std::fs::hard_link(&path, &alias).expect("create adversarial hard link");
+
+        let error = read_private_artifact_bounded(&path, 1024)
+            .expect_err("a multiply linked artifact must fail closed");
+        assert!(error.to_string().contains("another hard link"));
+        assert_eq!(std::fs::read(&alias).unwrap(), b"private dump bytes\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_artifact_parent_capability_rejects_path_replacement() {
+        let dir = tempfile::tempdir().expect("artifact parent fixture");
+        let path = dir.path().join("private").join("mux-dump.json");
+        let (pinned_parent, _leaf, parent_path) =
+            artifact_parent_and_leaf(&path).expect("pin original artifact parent");
+        let displaced_parent = dir.path().join("displaced-private");
+        std::fs::rename(&parent_path, &displaced_parent)
+            .expect("displace pinned artifact parent");
+        std::fs::create_dir(&parent_path).expect("plant replacement artifact parent");
+
+        let error = revalidate_artifact_parent_directory(&parent_path, &pinned_parent)
+            .expect_err("replacement parent path must not retain the pinned authority");
+        assert!(error
+            .to_string()
+            .contains("parent directory changed identity"));
+    }
+
+    #[test]
     fn mux_dump_verifier_recomputes_embedded_payload_checksum() {
         let dir = tempfile::tempdir().expect("dump tempdir");
         let path = dir.path().join("mux-dump.json");
@@ -96361,6 +98290,124 @@ log_level = "debug"
 
     #[cfg(unix)]
     #[test]
+    fn remote_guardian_unit_is_private_independent_and_manual_stop_refusing() {
+        let unit = remote_guardian_service_unit(
+            "/home/operator/.local/bin/frankenterm-pty-guardian",
+        )
+        .expect("bounded absolute guardian path");
+
+        assert!(unit.contains("Before=frankenterm-mux-server.service"));
+        assert!(unit.contains("RefuseManualStop=yes"));
+        assert!(unit.contains("UMask=0077"));
+        assert!(unit.contains("RuntimeDirectory=frankenterm/guardian"));
+        assert!(unit.contains("RuntimeDirectoryMode=0700"));
+        assert!(unit.contains("RuntimeDirectoryPreserve=yes"));
+        assert!(unit.contains("StateDirectory=frankenterm/guardian"));
+        assert!(unit.contains("StateDirectoryMode=0700"));
+        assert!(unit.contains(
+            "serve --socket-path %t/frankenterm/guardian/guardian.sock"
+        ));
+        assert!(unit.contains("--token-path %S/frankenterm/guardian/guardian.token"));
+        assert!(unit.contains("KillMode=control-group"));
+        assert!(unit.contains("Restart=no"));
+        for forbidden in [
+            "PartOf=",
+            "BindsTo=",
+            "Requires=",
+            "PropagatesStopTo=",
+            "ExecStop=",
+        ] {
+            assert!(
+                !unit.contains(forbidden),
+                "guardian unit must not couple to mux lifecycle via {forbidden}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_mux_guardian_gate_is_one_way_and_precedes_mux_exec() {
+        let unit = remote_mux_service_unit(
+            "/home/operator/.local/bin/frankenterm-mux-server",
+            Some("/home/operator/.local/bin/frankenterm-pty-guardian"),
+        )
+        .expect("bounded absolute service paths");
+
+        assert!(unit.contains("Wants=frankenterm-pty-guardian.service"));
+        assert!(
+            unit.contains(
+                "After=network.target frankenterm-pty-guardian.service"
+            )
+        );
+        let probe = unit
+            .find("ExecStartPre=/home/operator/.local/bin/frankenterm-pty-guardian probe")
+            .expect("authenticated guardian probe gate");
+        let mux = unit
+            .find("ExecStart=/home/operator/.local/bin/frankenterm-mux-server")
+            .expect("mux start command");
+        assert!(probe < mux, "guardian probe must run before mux ExecStart");
+        assert!(unit.contains("--socket-path %t/frankenterm/guardian/guardian.sock"));
+        assert!(unit.contains("--token-path %S/frankenterm/guardian/guardian.token"));
+        for forbidden in ["PartOf=", "BindsTo=", "Requires=", "PropagatesStopTo="] {
+            assert!(
+                !unit.contains(forbidden),
+                "mux must not acquire guardian stop propagation via {forbidden}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_mux_legacy_unit_makes_no_false_guardian_readiness_claim() {
+        let unit = remote_mux_service_unit(
+            "/home/operator/.local/bin/frankenterm-mux-server",
+            None,
+        )
+        .expect("bounded absolute mux path");
+
+        assert!(!unit.contains("frankenterm-pty-guardian"));
+        assert!(!unit.contains("ExecStartPre="));
+        assert!(unit.contains("After=network.target\n"));
+    }
+
+    #[test]
+    fn remote_activation_summary_never_promotes_service_liveness_to_generation_proof() {
+        let dry_run = remote_mux_activation_summary(false, false, false, false)
+            .expect("dry-run never requires a service mutation result");
+        assert_eq!(dry_run, "not attempted; dry-run only");
+
+        let started = remote_mux_activation_summary(true, false, false, true)
+            .expect("an active mux owner satisfies only the process-liveness gate");
+        assert_eq!(
+            started,
+            "mux owner observed; exact service and running-generation identities remain unverified"
+        );
+        assert!(!started.contains("complete"));
+
+        let preserved = remote_mux_activation_summary(true, true, true, true)
+            .expect("a manual or service-owned live mux remains an activation fence");
+        assert_eq!(
+            preserved,
+            "pending; candidate not activated and the previously live mux owner was preserved"
+        );
+
+        let lease_blocked = remote_mux_activation_summary(true, true, false, false)
+            .expect("a safely pending candidate does not require a mux to be started");
+        assert_eq!(
+            lease_blocked,
+            "pending; candidate not activated because no cross-launcher lifetime lease exists"
+        );
+    }
+
+    #[test]
+    fn remote_activation_summary_fails_closed_when_a_preexisting_owner_disappears() {
+        let lost_owner = remote_mux_activation_summary(true, true, true, false)
+            .expect_err("loss of the previously live owner must not be hidden");
+        assert!(lost_owner.to_string().contains("refusing to report"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remote_setup_dry_run_avoids_install_commands() {
         use std::os::unix::process::ExitStatusExt;
         use std::sync::Mutex;
@@ -96484,27 +98531,11 @@ log_level = "debug"
                     "b".repeat(64),
                     "c".repeat(64)
                 )
-            } else if command.contains("FT_RELEASE_COMPONENT_STAGE_V1=") {
-                let literal = command
-                    .lines()
-                    .find_map(|line| {
-                        line.trim()
-                            .strip_prefix("printf '")
-                            .and_then(|value| value.strip_suffix("'"))
-                    })
-                    .expect("release stage receipt printf");
-                literal.replace("\\n", "\n")
-            } else if command.contains("FT_COMPONENT_ACTIVATION=pending_live_mux") {
-                let literal = command
-                    .lines()
-                    .find_map(|line| {
-                        let value = line.trim().strip_prefix("printf '")?.strip_suffix("'")?;
-                        value
-                            .starts_with("FT_COMPONENT_ACTIVATION=pending_live_mux")
-                            .then_some(value)
-                    })
-                    .expect("pending activation receipt printf");
-                literal.replace("\\n", "\n")
+            } else if command.contains("__publish-remote-generation") {
+                format!(
+                    "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                    "d".repeat(64)
+                )
             } else {
                 String::new()
             };
@@ -96539,6 +98570,14 @@ log_level = "debug"
             !fence.contains("frankenterm-mux-server"),
             "the probe shell command must not contain the literal process name that pgrep searches for"
         );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.as_str() == REMOTE_MUX_OWNERSHIP_PROBE_COMMAND)
+                .count(),
+            2,
+            "apply must fence mux ownership before mutation and recheck it before reporting"
+        );
         let installer = commands
             .iter()
             .find(|command| command.contains("install-v0.15.2-"))
@@ -96557,31 +98596,177 @@ log_level = "debug"
         assert!(!installer.contains("--dest \"$HOME/.local/bin\""));
         let pending = commands
             .iter()
-            .find(|command| command.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"))
-            .expect("release pending publication command");
-        assert!(pending.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"));
-        assert!(pending.contains("ft.pending-"));
-        assert!(pending.contains("frankenterm-mux-server.pending-"));
-        assert!(pending.contains("\"$ft_stage\" --version >/dev/null"));
-        assert!(pending.contains("\"$mux_stage\" --version >/dev/null"));
+            .find(|command| command.contains("__publish-remote-generation"))
+            .expect("immutable pending generation publication command");
+        assert!(pending.contains("$HOME/.local/share/frankenterm/process-family"));
+        assert!(pending.contains("--expected-ft-sha256"));
+        assert!(pending.contains("--expected-mux-sha256"));
+        assert!(!pending.contains("--activate-current"));
         assert!(pending.matches(&"b".repeat(64)).count() >= 2);
         assert!(pending.matches(&"c".repeat(64)).count() >= 2);
-        assert!(!pending.contains("mv \"$bin/ft\" \"$ft_backup\""));
-        let service_publish = commands
+        assert!(!pending.contains("mv -n"));
+        assert!(!commands
             .iter()
-            .find(|command| command.contains("backup_candidate=\"$service.previous-"))
-            .expect("transaction-unique service-unit publication command");
-        assert!(service_publish.contains("test ! -L \"$stage\""));
-        assert!(service_publish.contains("test ! -L \"$backup_candidate\""));
-        assert!(service_publish.contains("if test -e \"$service\" || test -L \"$service\""));
-        assert!(service_publish.contains("test -f \"$service\" && test ! -L \"$service\""));
+            .any(|command| command.contains("backup_candidate=\"$service.previous-")));
         assert!(!commands.iter().any(|command| command.contains("systemctl --user restart")));
         assert!(!commands
             .iter()
             .any(|command| command.contains("systemctl --user enable --now")));
-        assert!(commands
+        assert!(!commands
             .iter()
             .any(|command| command == "systemctl --user enable frankenterm-mux-server"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_inactive_probe_still_cannot_activate_without_a_lifetime_lease() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::Mutex;
+
+        if build_meta::GIT_HASH == "unknown" || build_meta::GIT_DIRTY != "" {
+            return;
+        }
+
+        let commands = Mutex::new(Vec::new());
+        let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
+            commands.lock().unwrap().push(command.to_string());
+            let stdout = if command.contains("FT_REMOTE_COMMAND_CHANNEL_V1") {
+                "FT_REMOTE_COMMAND_CHANNEL_V1\n".to_string()
+            } else if command == REMOTE_MUX_OWNERSHIP_PROBE_COMMAND {
+                "inactive\n".to_string()
+            } else if command.contains("command -v apt-get") {
+                "/usr/bin/apt-get\n".to_string()
+            } else if command.contains("command -v wezterm") {
+                "/usr/bin/wezterm\n".to_string()
+            } else if command.contains("wezterm --version") {
+                "wezterm 20260824\n".to_string()
+            } else if command.contains("FT_RELEASE_COMPONENT_RECEIPT_V1=") {
+                format!(
+                    "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\n",
+                    "b".repeat(64),
+                    "c".repeat(64)
+                )
+            } else if command.contains("__publish-remote-generation") {
+                format!(
+                    "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                    "d".repeat(64)
+                )
+            } else if command.contains("command -v frankenterm-mux-server") {
+                "/usr/bin/frankenterm-mux-server\n".to_string()
+            } else if command.contains("FT_REMOTE_SERVICE_STATE_V1") {
+                "FT_REMOTE_SERVICE_STATE_V1=missing\n".to_string()
+            } else if command.contains("systemctl --user is-active") {
+                "inactive\n".to_string()
+            } else if command.contains("loginctl show-user") {
+                "Linger=yes\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(RemoteCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: String::new(),
+                duration_ms: 1,
+            })
+        };
+        let options = RemoteSetupOptions {
+            apply: true,
+            dry_run: false,
+            yes: true,
+            install_ft: true,
+            ft_path: None,
+            mux_server_path: None,
+            ft_version: Some("v0.15.2"),
+            timeout_secs: 5,
+            verbose: 0,
+        };
+
+        run_remote_setup_with_runner("example", &options, &runner)
+            .expect("inactive point census must permit staging but never activation");
+        let commands = commands.lock().unwrap();
+        let publication = commands
+            .iter()
+            .find(|command| command.contains("__publish-remote-generation"))
+            .expect("pending generation publication command");
+        assert!(!publication.contains("--activate-current"));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("backup_candidate=\"$service.previous-")));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("systemctl --user daemon-reload")));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("systemctl --user enable --now")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_withholds_unproved_service_unit_publication() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::Mutex;
+
+        let commands = Mutex::new(Vec::new());
+        let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
+            commands.lock().unwrap().push(command.to_string());
+            let stdout = if command.contains("FT_REMOTE_COMMAND_CHANNEL_V1") {
+                "FT_REMOTE_COMMAND_CHANNEL_V1\n"
+            } else if command == REMOTE_MUX_OWNERSHIP_PROBE_COMMAND {
+                "inactive\n"
+            } else if command.contains("command -v apt-get") {
+                "/usr/bin/apt-get\n"
+            } else if command.contains("command -v wezterm") {
+                "/usr/bin/wezterm\n"
+            } else if command.contains("wezterm --version") {
+                "wezterm 20260824\n"
+            } else if command.contains("command -v frankenterm-mux-server") {
+                "/usr/bin/frankenterm-mux-server\n"
+            } else if command.contains("FT_REMOTE_SERVICE_STATE_V1") {
+                "FT_REMOTE_SERVICE_STATE_V1=missing\n"
+            } else if command.contains("systemctl --user is-active") {
+                "inactive\n"
+            } else if command.contains("loginctl show-user") {
+                "Linger=yes\n"
+            } else {
+                ""
+            };
+            Ok(RemoteCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                duration_ms: 1,
+            })
+        };
+        let options = RemoteSetupOptions {
+            apply: true,
+            dry_run: false,
+            yes: true,
+            install_ft: false,
+            ft_path: None,
+            mux_server_path: None,
+            ft_version: None,
+            timeout_secs: 5,
+            verbose: 0,
+        };
+
+        run_remote_setup_with_runner("example", &options, &runner)
+            .expect("read-only service inspection should remain available");
+        let commands = commands.lock().unwrap();
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("service.installing-")));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("cat \"$service\"")));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("mv -n \"$source\" \"$target\"")));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("systemctl --user daemon-reload")));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("systemctl --user enable --now")));
     }
 
     #[cfg(unix)]
@@ -96671,6 +98856,506 @@ log_level = "debug"
         assert_eq!(commands.len(), 2, "setup mutated after a failed ownership probe");
     }
 
+    fn synthetic_remote_generation_family(
+        ft_sha256: &str,
+        ft_bytes: u64,
+        mux_sha256: &str,
+        mux_bytes: u64,
+    ) -> ValidatedLocalProcessFamily {
+        let identity = LocalComponentIdentity {
+            build_id: "a".repeat(64),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            profile: "release-interactive".to_string(),
+            version: "0.15.2".to_string(),
+        };
+        ValidatedLocalProcessFamily {
+            ft: LocalComponentSnapshot {
+                identity: LocalComponentIdentity {
+                    build_id: identity.build_id.clone(),
+                    target: identity.target.clone(),
+                    profile: identity.profile.clone(),
+                    version: identity.version.clone(),
+                },
+                sha256: ft_sha256.to_string(),
+                byte_len: ft_bytes,
+                source_identity: DiagnosticFileSnapshot::synthetic(ft_bytes, 1),
+            },
+            mux_server: LocalComponentSnapshot {
+                identity,
+                sha256: mux_sha256.to_string(),
+                byte_len: mux_bytes,
+                source_identity: DiagnosticFileSnapshot::synthetic(mux_bytes, 2),
+            },
+        }
+    }
+
+    #[test]
+    fn remote_generation_manifest_has_one_stable_content_derived_identity() {
+        let family = synthetic_remote_generation_family(
+            &"b".repeat(64),
+            101,
+            &"c".repeat(64),
+            202,
+        );
+        let first = RemoteGenerationManifest::from_process_family(&family).unwrap();
+        let second = RemoteGenerationManifest::from_process_family(&family).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.generation_id, first.recompute_generation_id().unwrap());
+        assert_eq!(first.schema, REMOTE_GENERATION_MANIFEST_SCHEMA);
+        assert_eq!(first.ft.filename, REMOTE_GENERATION_FT_FILE);
+        assert_eq!(first.mux_server.filename, REMOTE_GENERATION_MUX_FILE);
+        assert_eq!(first.ft.mode, 0o500);
+        assert_eq!(first.mux_server.mode, 0o500);
+        assert_eq!(first.codec_version, u64::try_from(codec::CODEC_VERSION).unwrap());
+        let canonical = first.canonical_bytes().unwrap();
+        assert_eq!(canonical.last(), Some(&b'\n'));
+        verify_exact_pretty_json_encoding(
+            &first,
+            &canonical,
+            REMOTE_GENERATION_MANIFEST_MAX_BYTES,
+        )
+        .unwrap();
+
+        let changed = synthetic_remote_generation_family(
+            &"b".repeat(64),
+            102,
+            &"c".repeat(64),
+            202,
+        );
+        let changed = RemoteGenerationManifest::from_process_family(&changed).unwrap();
+        assert_ne!(first.generation_id, changed.generation_id);
+    }
+
+    #[test]
+    fn remote_generation_shell_command_delegates_one_atomic_publication() {
+        let family = synthetic_remote_generation_family(
+            &"b".repeat(64),
+            101,
+            &"c".repeat(64),
+            202,
+        );
+        let receipt = ProcessFamilyByteReceipt::from(&family);
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let pending = uploaded_process_family_generation_command(suffix, &receipt).unwrap();
+        assert!(pending.contains("setup __publish-remote-generation"));
+        assert!(pending.contains("$HOME/.local/share/frankenterm/process-family"));
+        assert!(pending.contains("chmod 0500"));
+        assert!(pending.contains("exec 8<\"$ft_source\""));
+        assert!(pending.contains("exec 9<\"$mux_source\""));
+        assert!(pending.contains("ft_descriptor=/proc/self/fd/8"));
+        assert!(pending.contains("mux_descriptor=/proc/self/fd/9"));
+        assert!(pending.contains("verify_descriptor \"$ft_descriptor\""));
+        assert!(pending.contains(
+            "chmod 0500 -- \"$ft_descriptor\" \"$mux_descriptor\""
+        ));
+        assert!(!pending.contains("chmod 0500 -- \"$ft_source\" \"$mux_source\""));
+        assert!(pending.contains("exec \"$ft_descriptor\" setup"));
+        assert!(!pending.contains("exec \"$ft_source\" setup"));
+        assert!(!pending.contains("--activate-current"));
+        assert!(!pending.contains("mv -n"));
+        assert!(!pending.contains("flock"));
+        assert!(pending.matches(&family.ft.sha256).count() >= 3);
+        assert!(pending.matches(&family.mux_server.sha256).count() >= 3);
+        assert!(uploaded_process_family_generation_command("unsafe", &receipt).is_err());
+    }
+
+    #[test]
+    fn remote_generation_receipt_parser_is_exact_and_fail_closed() {
+        let generation_id = "d".repeat(64);
+        let pending = parse_remote_generation_publication_receipt(&format!(
+            "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
+        ))
+        .unwrap();
+        assert_eq!(pending.generation_id, generation_id);
+        assert_eq!(pending.activation, RemoteGenerationActivation::PendingLease);
+        let current = parse_remote_generation_publication_receipt(&format!(
+            "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:generations/{generation_id}\n"
+        ))
+        .unwrap();
+        assert_eq!(current.activation, RemoteGenerationActivation::Current);
+        assert!(parse_remote_generation_publication_receipt(&format!(
+            "banner\nFT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
+        ))
+        .is_err());
+        assert!(parse_remote_generation_publication_receipt(&format!(
+            "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:../{generation_id}\n"
+        ))
+        .is_err());
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn write_remote_generation_script_fixture(
+        path: &Path,
+        build_id: &str,
+        component: &str,
+        payload: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = format!(
+            "#!/bin/sh\n# FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:{component}:x86_64-unknown-linux-gnu:release-interactive:0.15.2;\n# {payload}\nexit 0\n"
+        );
+        std::fs::write(path, script).expect("write executable generation fixture");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
+            .expect("set exact generation source fixture mode");
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn remote_generation_mux_version_executes_the_pinned_descriptor_after_name_substitution() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create pinned execution fixture");
+        let named = fixture.path().join("frankenterm-mux-server");
+        let replacement = fixture.path().join("replacement");
+        let retained = fixture.path().join("retained-original");
+        std::fs::write(&named, b"#!/bin/sh\nexit 0\n").expect("write admitted executable");
+        std::fs::write(&replacement, b"#!/bin/sh\nexit 73\n")
+            .expect("write hostile replacement executable");
+        for path in [&named, &replacement] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
+                .expect("set executable fixture mode");
+        }
+
+        let pinned = std::fs::File::open(&named).expect("pin admitted executable");
+        std::fs::rename(&named, &retained).expect("retain admitted named entry");
+        std::fs::rename(&replacement, &named).expect("substitute hostile named entry");
+
+        run_descriptor_pinned_remote_generation_mux_version(&pinned)
+            .expect("descriptor-pinned execution must still run the admitted inode");
+        let ambient_status = std::process::Command::new(&named)
+            .arg("--version")
+            .status()
+            .expect("run substituted ambient path negative control");
+        assert_eq!(ambient_status.code(), Some(73));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn remote_generation_rejects_a_rebound_named_generations_directory() {
+        use cap_std::fs::MetadataExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create generation-binding fixture");
+        let root_path = fixture.path().join("process-family");
+        let effective_uid = remote_generation_effective_uid();
+        let (root, generations) =
+            open_remote_generation_root(&root_path, effective_uid).expect("pin generation tree");
+        let retained = root_path.join("retained-generations");
+        std::fs::rename(root_path.join("generations"), &retained)
+            .expect("detach the admitted generations directory from its name");
+        std::fs::create_dir(root_path.join("generations"))
+            .expect("plant a replacement generations directory");
+        std::fs::set_permissions(
+            root_path.join("generations"),
+            std::fs::Permissions::from_mode(REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE),
+        )
+        .expect("set replacement directory mode");
+
+        let error = revalidate_remote_generations_binding(&root, &generations, effective_uid)
+            .expect_err("a selector target must never be verified against a detached dirfd");
+        assert!(error.to_string().contains("stable nofollow owner directory"));
+        assert_eq!(
+            generations.dir_metadata().expect("pinned metadata").ino(),
+            std::fs::metadata(&retained).expect("retained metadata").ino()
+        );
+        assert_ne!(
+            generations.dir_metadata().expect("pinned metadata").ino(),
+            std::fs::metadata(root_path.join("generations"))
+                .expect("replacement metadata")
+                .ino()
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn remote_generation_publication_is_immutable_idempotent_and_selector_atomic() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create generation publication fixture");
+        let root = fixture.path().join("process-family");
+        std::fs::create_dir(&root).expect("create pre-existing generation root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("set generation root mode");
+        std::fs::write(root.join("legacy-sentinel"), b"preserve-me")
+            .expect("plant legacy byte sentinel");
+
+        let ft_one = fixture.path().join("ft-one");
+        let mux_one = fixture.path().join("mux-one");
+        write_remote_generation_script_fixture(
+            &ft_one,
+            &"a".repeat(64),
+            "ft",
+            "first-ft",
+        );
+        write_remote_generation_script_fixture(
+            &mux_one,
+            &"a".repeat(64),
+            "frankenterm-mux-server",
+            "first-mux",
+        );
+        let first_family = validate_local_process_family(&ft_one, &mux_one).unwrap();
+        let first_expected = ProcessFamilyByteReceipt::from(&first_family);
+        let pending = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root,
+            ft_source: &ft_one,
+            mux_server_source: &mux_one,
+            expected: first_expected.clone(),
+            transaction_id: "11111111111111111111111111111111",
+            activate_current: false,
+        })
+        .expect("publish one complete pending immutable generation");
+        assert_eq!(pending.activation, RemoteGenerationActivation::PendingLease);
+        assert!(!root.join("current").exists());
+        let first_dir = root.join("generations").join(&pending.generation_id);
+        assert!(first_dir.is_dir());
+        assert_eq!(
+            std::fs::metadata(&first_dir).unwrap().permissions().mode() & 0o7777,
+            0o500
+        );
+        for (filename, mode) in [
+            (REMOTE_GENERATION_FT_FILE, 0o500),
+            (REMOTE_GENERATION_MUX_FILE, 0o500),
+            (REMOTE_GENERATION_MANIFEST_FILE, 0o400),
+        ] {
+            let metadata = std::fs::symlink_metadata(first_dir.join(filename)).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(metadata.permissions().mode() & 0o7777, mode);
+        }
+
+        let current = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root,
+            ft_source: &ft_one,
+            mux_server_source: &mux_one,
+            expected: first_expected.clone(),
+            transaction_id: "22222222222222222222222222222222",
+            activate_current: true,
+        })
+        .expect("acknowledgement-loss retry must reopen and select exact generation");
+        assert_eq!(current.generation_id, pending.generation_id);
+        assert_eq!(
+            std::fs::read_link(root.join("current")).unwrap(),
+            PathBuf::from("generations").join(&pending.generation_id)
+        );
+
+        let retry = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root,
+            ft_source: &ft_one,
+            mux_server_source: &mux_one,
+            expected: first_expected,
+            transaction_id: "33333333333333333333333333333333",
+            activate_current: true,
+        })
+        .expect("exact already-current retry must be idempotent");
+        assert_eq!(retry, current);
+
+        let ft_two = fixture.path().join("ft-two");
+        let mux_two = fixture.path().join("mux-two");
+        write_remote_generation_script_fixture(
+            &ft_two,
+            &"e".repeat(64),
+            "ft",
+            "second-ft",
+        );
+        write_remote_generation_script_fixture(
+            &mux_two,
+            &"e".repeat(64),
+            "frankenterm-mux-server",
+            "second-mux",
+        );
+        let second_family = validate_local_process_family(&ft_two, &mux_two).unwrap();
+        let second_expected = ProcessFamilyByteReceipt::from(&second_family);
+        let colliding_transaction = "99999999999999999999999999999999";
+        let colliding_selector = format!(".selector-rollback-{colliding_transaction}");
+        let retained_collision_target = PathBuf::from("generations").join(&current.generation_id);
+        std::os::unix::fs::symlink(
+            &retained_collision_target,
+            root.join(&colliding_selector),
+        )
+        .expect("plant transaction-selector collision");
+        let collision_error =
+            publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+                root: &root,
+                ft_source: &ft_two,
+                mux_server_source: &mux_two,
+                expected: second_expected.clone(),
+                transaction_id: colliding_transaction,
+                activate_current: true,
+            })
+            .expect_err("selector collision must fail without overwrite");
+        assert!(collision_error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            std::fs::read_link(root.join(&colliding_selector)).unwrap(),
+            retained_collision_target
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("current")).unwrap(),
+            PathBuf::from("generations").join(&current.generation_id)
+        );
+
+        let second = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root,
+            ft_source: &ft_two,
+            mux_server_source: &mux_two,
+            expected: second_expected,
+            transaction_id: "44444444444444444444444444444444",
+            activate_current: true,
+        })
+        .expect("publish and exchange a second complete generation");
+        assert_ne!(second.generation_id, current.generation_id);
+        assert_eq!(
+            std::fs::read_link(root.join("current")).unwrap(),
+            PathBuf::from("generations").join(&second.generation_id)
+        );
+        assert_eq!(
+            std::fs::read_link(
+                root.join(".selector-rollback-44444444444444444444444444444444")
+            )
+            .unwrap(),
+            PathBuf::from("generations").join(&current.generation_id)
+        );
+        assert!(root.join("generations").join(&current.generation_id).is_dir());
+        assert!(root.join("generations").join(&second.generation_id).is_dir());
+        assert_eq!(
+            std::fs::read(root.join("legacy-sentinel")).unwrap(),
+            b"preserve-me"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn remote_generation_conflicting_eexist_fails_without_overwrite() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create conflicting generation fixture");
+        let root = fixture.path().join("process-family");
+        let ft = fixture.path().join("ft");
+        let mux = fixture.path().join("mux");
+        write_remote_generation_script_fixture(&ft, &"a".repeat(64), "ft", "ft");
+        write_remote_generation_script_fixture(
+            &mux,
+            &"a".repeat(64),
+            "frankenterm-mux-server",
+            "mux",
+        );
+        let family = validate_local_process_family(&ft, &mux).unwrap();
+        let expected = ProcessFamilyByteReceipt::from(&family);
+        let first = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root,
+            ft_source: &ft,
+            mux_server_source: &mux,
+            expected: expected.clone(),
+            transaction_id: "66666666666666666666666666666666",
+            activate_current: false,
+        })
+        .unwrap();
+        let published_mux = root
+            .join("generations")
+            .join(&first.generation_id)
+            .join(REMOTE_GENERATION_MUX_FILE);
+        std::fs::set_permissions(&published_mux, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&published_mux)
+            .unwrap()
+            .write_all(b"conflict")
+            .unwrap();
+        let planted = std::fs::read(&published_mux).unwrap();
+        let error = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root,
+            ft_source: &ft,
+            mux_server_source: &mux,
+            expected,
+            transaction_id: "77777777777777777777777777777777",
+            activate_current: false,
+        })
+        .expect_err("conflicting EEXIST generation must fail closed");
+        assert!(error.to_string().contains("generation"));
+        assert_eq!(std::fs::read(&published_mux).unwrap(), planted);
+        assert!(!root.join("current").exists());
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn remote_generation_publication_rejects_link_mode_and_selector_attacks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create generation attack fixture");
+        let ft = fixture.path().join("ft");
+        let mux = fixture.path().join("mux");
+        write_remote_generation_script_fixture(&ft, &"a".repeat(64), "ft", "ft");
+        write_remote_generation_script_fixture(
+            &mux,
+            &"a".repeat(64),
+            "frankenterm-mux-server",
+            "mux",
+        );
+        let symlink = fixture.path().join("ft-symlink");
+        std::os::unix::fs::symlink(&ft, &symlink).expect("plant source symlink");
+        assert!(read_remote_generation_source_snapshot(
+            &symlink,
+            REMOTE_GENERATION_FT_FILE,
+            remote_generation_effective_uid(),
+        )
+        .is_err());
+
+        let hardlink = fixture.path().join("mux-hardlink");
+        std::fs::hard_link(&mux, &hardlink).expect("plant source hard link");
+        assert!(read_remote_generation_source_snapshot(
+            &mux,
+            REMOTE_GENERATION_MUX_FILE,
+            remote_generation_effective_uid(),
+        )
+        .is_err());
+
+        let wrong_mode = fixture.path().join("wrong-mode");
+        write_remote_generation_script_fixture(
+            &wrong_mode,
+            &"a".repeat(64),
+            "ft",
+            "wrong-mode",
+        );
+        std::fs::set_permissions(&wrong_mode, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(read_remote_generation_source_snapshot(
+            &wrong_mode,
+            REMOTE_GENERATION_FT_FILE,
+            remote_generation_effective_uid(),
+        )
+        .is_err());
+
+        let root = fixture.path().join("unsafe-root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink("../escape", root.join("current"))
+            .expect("plant unsafe current selector");
+        // Use fresh nlink=1 sources after the hardlink negative control.
+        let ft_safe = fixture.path().join("ft-safe");
+        let mux_safe = fixture.path().join("mux-safe");
+        write_remote_generation_script_fixture(&ft_safe, &"f".repeat(64), "ft", "safe-ft");
+        write_remote_generation_script_fixture(
+            &mux_safe,
+            &"f".repeat(64),
+            "frankenterm-mux-server",
+            "safe-mux",
+        );
+        let family = validate_local_process_family(&ft_safe, &mux_safe).unwrap();
+        let error = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root,
+            ft_source: &ft_safe,
+            mux_server_source: &mux_safe,
+            expected: ProcessFamilyByteReceipt::from(&family),
+            transaction_id: "55555555555555555555555555555555",
+            activate_current: true,
+        })
+        .expect_err("unsafe existing current selector must fail closed");
+        assert!(error.to_string().contains("selector"));
+        assert_eq!(std::fs::read_link(root.join("current")).unwrap(), PathBuf::from("../escape"));
+    }
+
     #[test]
     fn remote_local_process_family_has_a_pending_live_mux_publication_path() {
         let identity = LocalComponentIdentity {
@@ -96719,7 +99404,9 @@ log_level = "debug"
         assert!(pending.contains("restore_pending_ft()"));
         assert!(pending.contains("FT_COMPONENT_ROLLBACK_INCOMPLETE="));
         assert!(!pending.contains("ft_backup=\"\""));
-        assert!(active.contains("FT_COMPONENT_ACTIVATION=active_transactional_publish"));
+        assert!(active.contains(
+            "FT_COMPONENT_PUBLICATION=active_compensating_publish_not_crash_atomic"
+        ));
         assert!(active.contains("ft_backup=\"\""));
         assert!(active.contains("test ! -L \"$ft_backup_candidate\""));
         assert!(active.contains("test ! -L \"$mux_backup_candidate\""));
@@ -97167,7 +99854,7 @@ log_level = "debug"
             assert!(!remote_bin.join("frankenterm-mux-server").exists());
 
             std::fs::copy(&ft_path, &remote_stage)
-                .expect("restore exact ft stage for transactional publication");
+                .expect("restore exact ft stage for compensating publication");
             let accepted_publication = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&publish_command)
@@ -97181,7 +99868,7 @@ log_level = "debug"
             );
             assert_eq!(
                 String::from_utf8_lossy(&accepted_publication.stdout),
-                "FT_COMPONENT_ACTIVATION=active_transactional_publish:0123456789abcdef0123456789abcdef\n"
+                "FT_COMPONENT_PUBLICATION=active_compensating_publish_not_crash_atomic:0123456789abcdef0123456789abcdef\n"
             );
             assert_eq!(
                 hex::encode(sha2::Sha256::digest(
@@ -112372,6 +115059,21 @@ A  docs/new-proof.md\n";
             command: Some(SetupCommands::Font {
                 force: false,
                 dir: None,
+            }),
+        })));
+        assert!(!should_auto_install_bundled_font(Some(&Commands::Setup {
+            list_hosts: false,
+            apply: false,
+            dry_run: false,
+            command: Some(SetupCommands::PublishRemoteGeneration {
+                root: PathBuf::from("/tmp/process-family"),
+                ft_source: PathBuf::from("/tmp/ft"),
+                mux_server_source: PathBuf::from("/tmp/mux"),
+                expected_ft_sha256: "a".repeat(64),
+                expected_ft_bytes: 1,
+                expected_mux_sha256: "b".repeat(64),
+                expected_mux_bytes: 1,
+                transaction_id: "c".repeat(32),
             }),
         })));
         assert!(should_auto_install_bundled_font(Some(&Commands::Setup {

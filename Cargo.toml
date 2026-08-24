@@ -24,6 +24,7 @@ members = [
     "crates/frankenterm-core-telemetry-types",
     "crates/frankenterm-core-x11-resize-types",
     "crates/frankenterm-gui",
+    "crates/frankenterm-pty-guardian",
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
@@ -100,6 +101,7 @@ default-members = [
     "crates/frankenterm",
     "crates/frankenterm-core",
     "crates/frankenterm-gui",
+    "crates/frankenterm-pty-guardian",
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
@@ -578,6 +580,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 glob = "0.3.3"
 console = "0.16.3"
 getrandom = "0.4.2"
+rustix = { version = "1.1.4", features = ["fs"] }
 trybuild = { version = "1.0.116", default-features = false }
 # Crypto provider: ring, NOT the rustls default of aws-lc-rs (#67). aws-lc-rs
 # spawns a jitter-entropy background thread whose Windows FLS teardown during

@@ -3317,8 +3317,9 @@ fn lock_file_name(primary: &Path) -> PathBuf {
 
 fn open_lock_file(primary: &Path) -> Result<File, PersistenceFailure> {
     if let Some(parent) = primary.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| PersistenceFailure::io("create state directory", error))?;
+        config::create_user_owned_dirs(parent).map_err(|error| {
+            PersistenceFailure::io("create private state directory", io::Error::other(error))
+        })?;
     }
     OpenOptions::new()
         .create(true)
@@ -5935,8 +5936,9 @@ fn write_inactive_slot(
 ) -> Result<(), PersistenceFailure> {
     let _ = interruption;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| PersistenceFailure::io("create state directory", error))?;
+        config::create_user_owned_dirs(parent).map_err(|error| {
+            PersistenceFailure::io("create private state directory", io::Error::other(error))
+        })?;
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -6384,8 +6386,9 @@ fn write_initial_slot(
 ) -> Result<(), PersistenceFailure> {
     let _ = interruption;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|error| PersistenceFailure::io("create state directory", error))?;
+    config::create_user_owned_dirs(parent).map_err(|error| {
+        PersistenceFailure::io("create private state directory", io::Error::other(error))
+    })?;
     telemetry.initial_publish_attempt();
     let choice = choose_initial_attempt_slot(path)?;
     if choice.occupied {
@@ -6860,6 +6863,31 @@ mod tests {
     const CROSS_PROCESS_STATE_PATH_ENV: &str = "FT_TEST_WINDOW_STATE_PATH";
     const CROSS_PROCESS_WORKSPACE_ENV: &str = "FT_TEST_WINDOW_STATE_WORKSPACE";
     const CROSS_PROCESS_MARKER_ENV: &str = "FT_TEST_WINDOW_STATE_MARKER";
+
+    #[cfg(unix)]
+    #[test]
+    fn window_state_initialization_establishes_the_shared_private_directory_contract() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("window-state directory fixture");
+        let data_dir = fixture.path().join("data");
+        std::fs::create_dir(&data_dir).expect("plant legacy shared data directory");
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("plant legacy permissive directory mode");
+
+        let primary = data_dir.join("window-state.json");
+        let _lock = open_lock_file(&primary)
+            .expect("window state must establish private persistence authority");
+        assert_eq!(
+            std::fs::symlink_metadata(&data_dir)
+                .expect("inspect shared persistence directory")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700,
+            "window-state startup must not make reconnect authority unreadable"
+        );
+    }
 
     struct ControlledPersistenceWorker {
         writer: Option<PersistenceWriter>,

@@ -3151,6 +3151,7 @@ name = "filedescriptor"
 version = "0.8.3"
 dependencies = [
  "libc",
+ "socket2",
  "thiserror 2.0.18",
  "winapi",
 ]
@@ -4317,6 +4318,7 @@ dependencies = [
  "frankenterm-uds",
  "fs2",
  "futures",
+ "getrandom 0.4.3",
  "hex",
  "hostname",
  "io-uring",
@@ -4331,6 +4333,7 @@ dependencies = [
  "proptest",
  "rangeset",
  "rcgen",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4341,6 +4344,7 @@ dependencies = [
  "uuid",
  "varbincode",
  "winapi",
+ "zeroize",
  "zstd",
 ]
 
@@ -4351,6 +4355,26 @@ dependencies = [
  "log",
  "proptest",
  "winapi",
+]
+
+[[package]]
+name = "frankenterm-pty-guardian"
+version = "0.15.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "getrandom 0.4.3",
+ "libc",
+ "mio",
+ "mux",
+ "nix",
+ "portable-pty",
+ "rustix 1.1.4",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

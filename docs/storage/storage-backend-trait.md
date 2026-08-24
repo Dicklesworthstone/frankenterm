@@ -38,13 +38,13 @@ Either way, the work pays for itself.
   - `execute(sql) -> Result<rows_affected, BackendError>` for DDL + DML.
   - `execute_batch(sql)` for migration scripts.
   - `query_scalar(sql)` for single-value reads.
-  - `begin_transaction() -> TransactionGuard<'_>` with RAII commit/rollback.
+  - `with_transaction(f)` for exclusive, non-interleavable transaction execution.
   - `user_version()` / `set_user_version(v)` for the schema-migration runner.
   - `backend_name()` for diagnostics.
 - **`StorageBackendFactory`** — separate trait carrying the `open()` constructor, kept off `StorageBackend` so the latter stays object-safe.
 - **`OpenConfig`** — common open-time knobs (read-only, WAL, page size hint).
 - **`BackendError`** — common error surface (Connect / Query / TxPoisoned / Schema / Other).
-- **`TransactionGuard`** — RAII transaction wrapper. Rolls back on `Drop` by default; explicit `commit()` required for durability.
+- **`StorageTransaction`** — exclusive transaction handle passed to `with_transaction` closures. Automatically commits on `Ok` and rolls back on `Err` or panic.
 - **`RusqliteBackend`** — the wired persistent implementation and factory over
   a real `rusqlite::Connection`; the remaining extraction work is threading
   more of `storage.rs` through this boundary.

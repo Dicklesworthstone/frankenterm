@@ -166,7 +166,10 @@ impl StorageBackend for FrankenSQLiteBackend {
         Err(BackendError::Other(NOT_WIRED_HINT.to_string()))
     }
 
-    fn begin_transaction(&self) -> Result<TransactionGuard<'_>, BackendError> {
+    fn with_transaction_dyn(
+        &self,
+        _f: &mut dyn FnMut(&mut dyn StorageTransaction) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
         Err(BackendError::Other(NOT_WIRED_HINT.to_string()))
     }
 
@@ -284,9 +287,9 @@ mod tests {
     }
 
     #[test]
-    fn begin_transaction_returns_not_wired() {
+    fn with_transaction_returns_not_wired() {
         let backend = FrankenSQLiteBackend::for_stub_tests("/tmp/x.db");
-        assert!(backend.begin_transaction().is_err());
+        assert!(backend.with_transaction(|_| Ok(())).is_err());
     }
 
     #[test]
