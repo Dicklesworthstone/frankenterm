@@ -2137,6 +2137,46 @@ fn revalidate_writer_directory(
     Ok(())
 }
 
+fn revalidate_writer_file(
+    directory: &CapDir,
+    leaf: &Path,
+    display_path: &Path,
+    file: &File,
+    expected_identity: LinearRecordSourceIdentity,
+) -> Result<(), MmapScrollbackError> {
+    let directory_path = display_path.parent().unwrap_or_else(|| Path::new("."));
+    let directory_metadata = directory.dir_metadata().map_err(|source| {
+        MmapScrollbackError::Metadata {
+            path: directory_path.to_path_buf(),
+            source,
+        }
+    })?;
+    validate_private_cap_directory(&directory_metadata, directory_path)?;
+    let path_metadata = directory.symlink_metadata(leaf).map_err(|source| {
+        MmapScrollbackError::Metadata {
+            path: display_path.to_path_buf(),
+            source,
+        }
+    })?;
+    let handle_metadata = file.metadata().map_err(|source| MmapScrollbackError::Metadata {
+        path: display_path.to_path_buf(),
+        source,
+    })?;
+    validate_private_cap_file(&path_metadata, display_path)?;
+    validate_private_std_file(&handle_metadata, display_path)?;
+    validate_owner_against_directory(&path_metadata, &directory_metadata, display_path)?;
+    validate_same_owner(&path_metadata, &handle_metadata, display_path)?;
+    if metadata_identity(&path_metadata) != expected_identity
+        || metadata_identity(&handle_metadata) != expected_identity
+    {
+        return Err(MmapScrollbackError::UnsafeReadSource {
+            path: display_path.to_path_buf(),
+            reason: "writer leaf changed identity after lock acquisition or open",
+        });
+    }
+    Ok(())
+}
+
 fn validate_private_std_file(
     metadata: &std::fs::Metadata,
     path: &Path,
@@ -2339,6 +2379,26 @@ pub enum MmapScrollbackError {
         path: PathBuf,
         reason: &'static str,
     },
+    #[error(
+        "existing scrollback file {path} does not match configured capacity {configured_capacity_bytes}: expected {expected_file_bytes} physical bytes, found {actual_file_bytes}; evidence was left untouched"
+    )]
+    ExistingFileShapeMismatch {
+        path: PathBuf,
+        configured_capacity_bytes: u64,
+        expected_file_bytes: u64,
+        actual_file_bytes: u64,
+    },
+    #[error(
+        "legacy v1 scrollback file {path} is read-only; export or discard it explicitly instead of mutating it in place"
+    )]
+    LegacyV1ReadOnly { path: PathBuf },
+    #[error("scrollback writer is already active for {path}")]
+    WriterBusy { path: PathBuf },
+    #[error("v2 scrollback integrity failure for {path}: {reason}")]
+    V2Integrity {
+        path: PathBuf,
+        reason: &'static str,
+    },
     #[error("failed to create scrollback mmap directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -2422,7 +2482,7 @@ fn open_writer_file(
     directory: &CapDir,
     leaf: &Path,
     display_path: &Path,
-) -> Result<File, MmapScrollbackError> {
+) -> Result<OpenedWriterFile, MmapScrollbackError> {
     open_writer_file_with_sync(
         directory,
         leaf,
@@ -2436,7 +2496,7 @@ fn open_writer_file_with_sync<F>(
     leaf: &Path,
     display_path: &Path,
     sync_parent: &mut F,
-) -> Result<File, MmapScrollbackError>
+) -> Result<OpenedWriterFile, MmapScrollbackError>
 where
     F: FnMut(&CapDir, LinearRecordSourceIdentity) -> std::io::Result<()>,
 {
@@ -2460,11 +2520,13 @@ where
         }
     };
     let mut options = CapOpenOptions::new();
-    options
-        .create(true)
-        .read(true)
-        .write(true)
-        .follow(FollowSymlinks::No);
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    if publication_required {
+        // `create_new` is the authority boundary that distinguishes a leaf we
+        // created from pre-existing evidence. If another actor wins the race,
+        // fail closed instead of opening and initializing their bytes.
+        options.create_new(true);
+    }
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt as _;
@@ -2597,11 +2659,15 @@ where
             });
         }
     }
-    Ok(file)
+    Ok(OpenedWriterFile {
+        file,
+        identity,
+        created: publication_required,
+    })
 }
 
 fn normalize_cap_bytes(cap_bytes: u64) -> Result<u64, MmapScrollbackError> {
-    let minimum = RECORD_HEADER_SIZE as u64 + 1;
+    let minimum = V2_RECORD_HEADER_SIZE as u64 + 1;
     if cap_bytes < minimum {
         Err(MmapScrollbackError::CapTooSmall {
             minimum,
@@ -2621,10 +2687,10 @@ fn fit_payload_to_capacity(
     mut payload: Vec<u8>,
     capacity_bytes: u64,
 ) -> Result<Vec<u8>, MmapScrollbackError> {
-    let max_payload = capacity_bytes.saturating_sub(RECORD_HEADER_SIZE as u64);
+    let max_payload = capacity_bytes.saturating_sub(V2_RECORD_HEADER_SIZE as u64);
     if max_payload == 0 {
         return Err(MmapScrollbackError::CapTooSmall {
-            minimum: RECORD_HEADER_SIZE as u64 + 1,
+            minimum: V2_RECORD_HEADER_SIZE as u64 + 1,
             actual: capacity_bytes,
         });
     }

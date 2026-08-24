@@ -86,8 +86,11 @@ const LIVE_SCROLLBACK_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const LIVE_SCROLLBACK_MUTATION_LOCK_NAME: &str = ".mutation-lock.v3";
 
 #[cfg(test)]
-static LIVE_SCROLLBACK_AUTHORITY_RECORD_READS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+std::thread_local! {
+    static LIVE_SCROLLBACK_AUTHORITY_RECORD_READS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
     config
@@ -662,7 +665,7 @@ fn live_scrollback_authority_record_at(
     sequence: u64,
 ) -> anyhow::Result<String> {
     #[cfg(test)]
-    LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     store
         .line_at(ledger_pane_id, sequence)?
         .ok_or_else(|| anyhow::anyhow!("authenticated ledger is missing sequence {sequence}"))
@@ -776,9 +779,7 @@ impl VerifiedLedgerState {
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
     ) -> anyhow::Result<(Self, u64)> {
         anyhow::ensure!(
-            self.next_sequence == desired_sequence
-                && self.ledger_pane_id != u64::MAX
-                && max_retained_rows != 0,
+            self.next_sequence == desired_sequence && max_retained_rows != 0,
             "incremental append predecessor authority is inconsistent"
         );
         let max_retained_rows = u64::try_from(max_retained_rows)?;
@@ -2085,8 +2086,18 @@ impl LiveScrollbackSpillSink {
             && manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
         {
             let (anchor, tail) = expected_live_scrollback_v4_chain(manifest)?;
-            Some(hex::encode(anchor)) == wal.predecessor_chain_anchor_sha256
-                && Some(hex::encode(tail)) == wal.predecessor_chain_tail_sha256
+            decode_live_scrollback_canonical_digest(
+                wal.predecessor_chain_anchor_sha256
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("v2 predecessor chain anchor is missing"))?,
+                "v2 predecessor chain anchor",
+            )? == anchor
+                && decode_live_scrollback_canonical_digest(
+                    wal.predecessor_chain_tail_sha256.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("v2 predecessor chain tail is missing")
+                    })?,
+                    "v2 predecessor chain tail",
+                )? == tail
         } else {
             true
         };
@@ -2123,8 +2134,18 @@ impl LiveScrollbackSpillSink {
                 && manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
         let chain_matches = if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 {
             let (anchor, tail) = expected_live_scrollback_v4_chain(manifest)?;
-            Some(hex::encode(anchor)) == wal.target_chain_anchor_sha256
-                && Some(hex::encode(tail)) == wal.target_chain_tail_sha256
+            decode_live_scrollback_canonical_digest(
+                wal.target_chain_anchor_sha256
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("v2 target chain anchor is missing"))?,
+                "v2 target chain anchor",
+            )? == anchor
+                && decode_live_scrollback_canonical_digest(
+                    wal.target_chain_tail_sha256
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("v2 target chain tail is missing"))?,
+                    "v2 target chain tail",
+                )? == tail
         } else {
             true
         };
