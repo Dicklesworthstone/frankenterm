@@ -294,7 +294,7 @@ impl CheckpointStageUploadKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CheckpointStageFileRole {
     Candidate,
     Chunk { publication_id: Uuid, index: u32 },
@@ -1247,7 +1247,7 @@ impl GuardianCheckpointStageStore {
                 inspection.chunk_set_digest,
             )?;
             if inspection.sealed {
-                return checkpoint_sealed_reply(&shape);
+                return Ok(checkpoint_sealed_reply(&shape));
             }
             let context = GuardianCheckpointStageRecordContextV1::seal_manifest(
                 &shape.binding,
@@ -1277,7 +1277,7 @@ impl GuardianCheckpointStageStore {
             if !sealed.sealed {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
-            checkpoint_sealed_reply(&shape)
+            Ok(checkpoint_sealed_reply(&shape))
         })
     }
 
@@ -1487,6 +1487,7 @@ fn checkpoint_stage_census(
         .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     let mut entries = Vec::new();
     let mut uploads = BTreeSet::new();
+    let mut semantic_names = BTreeSet::new();
     let mut total_bytes = 0_u64;
     for name in read_directory_names(&inner.directory)? {
         let raw = name.as_bytes();
@@ -1497,6 +1498,9 @@ fn checkpoint_stage_census(
             return Err(GuardianCheckpointStageStoreError::NameLimit);
         }
         let (key, role) = checkpoint_parse_stage_name(raw)?;
+        if !semantic_names.insert((key, role)) {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
         let path = inner.directory_path.join(&name);
         let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
         let metadata = file.metadata().map_err(|error| {
@@ -2248,13 +2252,13 @@ fn checkpoint_chunk_progress(
 
 fn checkpoint_sealed_reply(
     shape: &CheckpointStageRequestShape,
-) -> Result<GuardianCheckpointStageReplyV1, GuardianCheckpointStageStoreError> {
-    Ok(GuardianCheckpointStageReplyV1::Sealed {
+) -> GuardianCheckpointStageReplyV1 {
+    GuardianCheckpointStageReplyV1::Sealed {
         upload_id: shape.upload_id,
         checkpoint_id: shape.descriptor.checkpoint_id(),
         boundary_id: shape.descriptor.boundary_id(),
         total_bytes: shape.total_bytes,
-    })
+    }
 }
 
 fn checkpoint_bytes_match(left: &[u8], right: &[u8]) -> bool {
@@ -4875,6 +4879,7 @@ mod tests {
     use mio::{Poll, Token};
     use std::fs::hard_link;
     use std::io::{Seek, SeekFrom};
+    use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt, symlink};
     use std::time::{Duration, Instant};
 
@@ -4992,10 +4997,7 @@ mod tests {
         }
         let total_bytes = u64::try_from(terminal_payload.len())
             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
-        let total_chunks_u64 = total_bytes
-            .checked_add(u64::from(chunk_bytes).saturating_sub(1))
-            .ok_or(GuardianProtocolError::InvalidOperationPayload)?
-            / u64::from(chunk_bytes);
+        let total_chunks_u64 = total_bytes.div_ceil(u64::from(chunk_bytes));
         let total_chunks = u32::try_from(total_chunks_u64)
             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
         let replay_identity = mux::guardian_checkpoint::current_replay_identity_digest();
@@ -5065,7 +5067,7 @@ mod tests {
 
     #[test]
     fn checkpoint_stage_name_grammar_is_canonical_raw_and_bounded() {
-        let pane_id = Uuid::from_u128(0x11);
+        let pane_id = Uuid::from_u128(0xabcdef1234567890abcdef1234567890);
         let upload_id = Uuid::from_u128(0x22);
         let publication_id = Uuid::from_u128(0x33);
         let key = CheckpointStageUploadKey {
@@ -5264,6 +5266,131 @@ mod tests {
             }
         );
         assert_eq!(std::fs::metadata(&torn_path)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_stage_conflicting_begin_cannot_relabel_the_durable_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-conflict-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let spawn_effect_id = Uuid::from_u128(0x61);
+        let upload_id = Uuid::from_u128(0x62);
+        let original = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            upload_id,
+            b"original-terminal-state",
+            8,
+            None,
+        )?;
+        let conflicting = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            upload_id,
+            b"different-terminal-state",
+            8,
+            None,
+        )?;
+        let expected = GuardianCheckpointStageReplyV1::Ready {
+            upload_id,
+            next_index: 0,
+            committed_bytes: 0,
+        };
+        assert_eq!(store.apply_begin(&original)?, expected);
+        assert!(matches!(
+            store.apply_begin(&conflicting),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        assert_eq!(store.apply_begin(&original)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_stage_global_retention_cap_fails_closed_without_reclamation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-retention-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let payload = b"bounded-retention-fixture";
+        for ordinal in 0..CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS {
+            let ordinal = u128::try_from(ordinal)?;
+            let begin = checkpoint_test_genesis_request(
+                GuardianCheckpointStageKindV1::Begin,
+                Uuid::from_u128(0x700 + ordinal),
+                Uuid::from_u128(0x800 + ordinal),
+                payload,
+                8,
+                None,
+            )?;
+            assert!(matches!(
+                store.apply_begin(&begin)?,
+                GuardianCheckpointStageReplyV1::Ready {
+                    next_index: 0,
+                    committed_bytes: 0,
+                    ..
+                }
+            ));
+        }
+        let refused = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            Uuid::from_u128(0x900),
+            Uuid::from_u128(0x901),
+            payload,
+            8,
+            None,
+        )?;
+        assert!(matches!(
+            store.apply_begin(&refused),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        let census = checkpoint_stage_census(&store.inner)?;
+        assert_eq!(census.uploads.len(), CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS);
+        assert_eq!(census.total_files, CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_stage_invalid_utf8_prefixed_entry_is_never_ignored(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-raw-name-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let mut raw_name = b"checkpoint-invalid-".to_vec();
+        raw_name.push(0xff);
+        let path = store
+            .inner
+            .directory_path
+            .join(OsString::from_vec(raw_name));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(b"retained")?;
+        file.sync_all()?;
+        store.inner.directory.sync_all()?;
+        let begin = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            Uuid::from_u128(0xa01),
+            Uuid::from_u128(0xa02),
+            b"raw-name-census",
+            8,
+            None,
+        )?;
+        assert!(matches!(
+            store.apply_begin(&begin),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        assert_eq!(std::fs::metadata(path)?.len(), 8);
         Ok(())
     }
 

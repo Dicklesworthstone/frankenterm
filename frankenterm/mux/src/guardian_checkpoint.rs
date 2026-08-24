@@ -625,70 +625,106 @@ impl std::fmt::Debug for GuardianCheckpointArtifactDescriptorV1 {
     }
 }
 
+/// Nonconstructible permit retained by the guardian's Spawn transaction.
+///
+/// This module deliberately exposes no production constructor from a raw UUID:
+/// an effect identifier is identity data, not evidence that the corresponding
+/// Spawn was authenticated, retained, and fenced against reuse. Until the
+/// guardian protocol hands this module its exact retained-effect permit,
+/// Genesis final sealing remains unavailable rather than manufacturing trust.
+pub struct GuardianCheckpointGenesisSpawnPermitV1 {
+    spawn_effect_id: Uuid,
+    _private: (),
+}
+
+impl GuardianCheckpointGenesisSpawnPermitV1 {
+    #[cfg(test)]
+    fn issue_for_test(spawn_effect_id: Uuid) -> Self {
+        assert!(!spawn_effect_id.is_nil());
+        Self {
+            spawn_effect_id,
+            _private: (),
+        }
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointGenesisSpawnPermitV1")
+            .field("spawn_effect_id", &self.spawn_effect_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Nonconstructible authority proving that one complete checkpoint payload is
 /// eligible for final publication.
 ///
-/// A record-backed witness is minted only after canonical payload validation
-/// and reconciliation with the exact guardian-verified segment and receipt. A
-/// Genesis witness instead proves the same payload against the exact Spawn
-/// effect embedded in its stable origin.
-pub struct GuardianCheckpointValidatedSealWitnessV1 {
+/// A live record-backed authority is derived from the complete opaque
+/// [`LiveParserCheckpointAck`], never from a claimed descriptor, caller bytes,
+/// or a receipt supplied beside those bytes. Genesis authority additionally
+/// consumes the guardian's exact retained Spawn-effect permit. The authority
+/// is intentionally neither `Clone` nor `Copy` and is consumed by the one
+/// manifest sealing intent.
+pub struct GuardianCheckpointValidatedManifestAuthorityV1 {
     boundary_identity_digest: [u8; 32],
     checkpoint_identity_digest: [u8; 32],
 }
 
-impl GuardianCheckpointArtifactDescriptorV1 {
-    pub fn validated_record_seal_witness(
-        &self,
-        canonical_terminal_payload: &[u8],
-        verified_segment: GuardianOutputSegmentIdentity,
-        verified_output: GuardianOutputAppendReceipt,
-    ) -> Result<GuardianCheckpointValidatedSealWitnessV1, GuardianCheckpointBoundaryError> {
-        self.validate_canonical_payload(
-            canonical_terminal_payload,
-            TerminalCheckpointLimits::default(),
-        )?;
-        self.validate_record_authority(verified_segment, verified_output)?;
-        self.mint_validated_seal_witness()
-    }
-
-    pub fn validated_genesis_seal_witness(
-        &self,
-        expected_spawn_effect_id: Uuid,
-        canonical_terminal_payload: &[u8],
-    ) -> Result<GuardianCheckpointValidatedSealWitnessV1, GuardianCheckpointBoundaryError> {
-        match self.origin.kind {
-            GuardianCheckpointOriginKindV1::Genesis { spawn_effect_id }
-                if spawn_effect_id == expected_spawn_effect_id
-                    && !expected_spawn_effect_id.is_nil() => {}
-            GuardianCheckpointOriginKindV1::Genesis { .. } => {
-                return Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch);
-            }
-            GuardianCheckpointOriginKindV1::Record { .. } => {
-                return Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority);
-            }
+impl GuardianCheckpointValidatedManifestAuthorityV1 {
+    /// Mint publication authority only when this descriptor exactly matches
+    /// the payload, parser watermark, segment, and synchronized receipt already
+    /// sealed inside one nonconstructible live capture acknowledgement.
+    pub fn from_live_capture(
+        descriptor: &GuardianCheckpointArtifactDescriptorV1,
+        capture: &LiveParserCheckpointAck,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        let captured_descriptor =
+            GuardianCheckpointArtifactDescriptorV1::from_live_capture(capture)?;
+        if descriptor != &captured_descriptor {
+            return Err(GuardianCheckpointBoundaryError::LiveCaptureAuthorityMismatch);
         }
-        self.validate_canonical_payload(
-            canonical_terminal_payload,
-            TerminalCheckpointLimits::default(),
-        )?;
-        self.mint_validated_seal_witness()
+        Self::from_authoritative_descriptor(&captured_descriptor)
     }
 
-    fn mint_validated_seal_witness(
-        &self,
-    ) -> Result<GuardianCheckpointValidatedSealWitnessV1, GuardianCheckpointBoundaryError> {
-        Ok(GuardianCheckpointValidatedSealWitnessV1 {
-            boundary_identity_digest: self.recompute_boundary_identity_digest()?,
-            checkpoint_identity_digest: self.recompute_checkpoint_identity_digest()?,
+    /// Mint Genesis publication authority only from a canonical pre-spawn
+    /// terminal checkpoint and the one retained Spawn-effect permit.
+    pub fn from_genesis_spawn_permit(
+        descriptor: &GuardianCheckpointArtifactDescriptorV1,
+        permit: GuardianCheckpointGenesisSpawnPermitV1,
+        terminal_checkpoint: &RecoveryTerminalCheckpointV2,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        let authoritative_descriptor =
+            GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
+                permit.spawn_effect_id,
+                terminal_checkpoint,
+            )?;
+        if !descriptor.origin.is_genesis() {
+            return Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority);
+        }
+        if descriptor.origin.spawn_effect_id() != Some(permit.spawn_effect_id) {
+            return Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch);
+        }
+        if descriptor != &authoritative_descriptor {
+            return Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch);
+        }
+        Self::from_authoritative_descriptor(&authoritative_descriptor)
+    }
+
+    fn from_authoritative_descriptor(
+        descriptor: &GuardianCheckpointArtifactDescriptorV1,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        Ok(Self {
+            boundary_identity_digest: descriptor.recompute_boundary_identity_digest()?,
+            checkpoint_identity_digest: descriptor.recompute_checkpoint_identity_digest()?,
         })
     }
 }
 
-impl std::fmt::Debug for GuardianCheckpointValidatedSealWitnessV1 {
+impl std::fmt::Debug for GuardianCheckpointValidatedManifestAuthorityV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("GuardianCheckpointValidatedSealWitnessV1")
+            .debug_struct("GuardianCheckpointValidatedManifestAuthorityV1")
             .field("boundary_identity_digest", &"[REDACTED]")
             .field("checkpoint_identity_digest", &"[REDACTED]")
             .finish()
