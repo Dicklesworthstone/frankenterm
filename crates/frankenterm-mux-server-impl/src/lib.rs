@@ -78,13 +78,28 @@ const LIVE_SCROLLBACK_APPEND_WAL_TARGET_DIGEST_DOMAIN: &[u8] =
 const LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const LIVE_SCROLLBACK_MUTATION_LOCK_NAME: &str = ".mutation-lock.v3";
 
+fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
+    config
+        .ssh_domains()
+        .into_iter()
+        .map(|mut domain| {
+            // Freeze the top-level fallback into each exact generation.
+            // Otherwise a reload that changes only `ssh_backend` leaves
+            // `None == None` in the domain snapshot while changing the
+            // effective transport used by both raw and multiplexed SSH.
+            domain.ssh_backend.get_or_insert(config.ssh_backend);
+            domain
+        })
+        .collect()
+}
+
 pub fn configured_client_domains(config: &config::ConfigHandle) -> Vec<ClientDomainConfig> {
     let mut domains = vec![];
     for unix_dom in &config.unix_domains {
         domains.push(ClientDomainConfig::Unix(unix_dom.clone()));
     }
 
-    for ssh_dom in config.ssh_domains() {
+    for ssh_dom in configured_ssh_domains(config) {
         if ssh_dom.multiplexing == SshMultiplexing::WezTerm {
             domains.push(ClientDomainConfig::Ssh(ssh_dom.clone()));
         }
@@ -192,7 +207,7 @@ impl ConfiguredRawDomains {
 
 fn configured_raw_domains(config: &config::ConfigHandle) -> anyhow::Result<ConfiguredRawDomains> {
     let mut domains = ConfiguredRawDomains::default();
-    for ssh in config.ssh_domains() {
+    for ssh in configured_ssh_domains(config) {
         if ssh.multiplexing == SshMultiplexing::None {
             domains.insert(ConfiguredRawDomain::Ssh(ssh))?;
         }
@@ -8242,6 +8257,92 @@ mod tests {
             serial
                 .downcast_ref::<LocalDomain>()
                 .is_some_and(|domain| domain.matches_serial_configuration(&expected_serial))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_replaces_ssh_domains_when_global_backend_changes()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let raw = SshDomain {
+            name: "backend-raw".to_string(),
+            remote_address: "raw-backend.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ssh_backend: None,
+            ..SshDomain::default()
+        };
+        let client = SshDomain {
+            name: "backend-client".to_string(),
+            remote_address: "client-backend.example:22".to_string(),
+            multiplexing: SshMultiplexing::WezTerm,
+            ssh_backend: None,
+            ..SshDomain::default()
+        };
+        let first_handle =
+            make_test_handle_with(vec![raw.clone(), client.clone()], |config| {
+                config.ssh_backend = config::SshBackend::LibSsh;
+            });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&first_handle)?;
+
+        let barriers = ["backend-raw", "backend-client"]
+            .into_iter()
+            .map(|name| {
+                mux.get_domain_by_name(name)
+                    .unwrap_or_else(|| panic!("initial {name} generation exists"))
+            })
+            .collect::<Vec<_>>();
+        let retired_ids = barriers
+            .iter()
+            .map(|domain| (domain.domain_name().to_string(), domain.domain_id()))
+            .collect::<BTreeMap<_, _>>();
+
+        let replacement_handle = make_test_handle_with(vec![raw.clone(), client], |config| {
+            config.ssh_backend = config::SshBackend::Ssh2;
+        });
+        assert_eq!(
+            reconcile_mux_domains(&replacement_handle)?,
+            MuxDomainUpdateOutcome::PendingRetirements {
+                domain_names: vec!["backend-client".to_string(), "backend-raw".to_string()],
+            }
+        );
+        assert!(mux.get_domain_by_name("backend-raw").is_none());
+        assert!(mux.get_domain_by_name("backend-client").is_none());
+
+        drop(barriers);
+        wait_for_domain_reconciliation(&replacement_handle)?;
+
+        let mut expected_raw = raw;
+        expected_raw.ssh_backend = Some(config::SshBackend::Ssh2);
+        let replacement_raw = mux
+            .get_domain_by_name("backend-raw")
+            .expect("raw SSH backend successor exists");
+        assert_ne!(replacement_raw.domain_id(), retired_ids["backend-raw"]);
+        assert!(
+            replacement_raw
+                .downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|domain| domain.matches_configuration(&expected_raw))
+        );
+
+        let expected_client = configured_client_domains(&replacement_handle)
+            .into_iter()
+            .find(|domain| domain.name() == "backend-client")
+            .expect("normalized client SSH configuration exists");
+        let replacement_client = mux
+            .get_domain_by_name("backend-client")
+            .expect("client SSH backend successor exists");
+        assert_ne!(
+            replacement_client.domain_id(),
+            retired_ids["backend-client"]
+        );
+        assert!(
+            replacement_client
+                .downcast_ref::<ClientDomain>()
+                .is_some_and(|domain| domain.reconcile_configuration(&expected_client))
         );
         Ok(())
     }

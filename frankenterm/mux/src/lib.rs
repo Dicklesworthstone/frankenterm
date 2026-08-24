@@ -61,11 +61,13 @@ use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
 use crate::guardian_checkpoint::{
-    LiveParserCaptureAndBindError, LiveParserCheckpointAck,
+    GuardianCheckpointBoundary, LiveParserCaptureAndBindError, LiveParserCheckpointAck,
     capture_and_bind_live_parser_checkpoint,
 };
 use crate::guardian_output_journal::{
-    GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
+    GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalError,
+    GuardianOutputJournalTail, GuardianOutputPredecessor, GuardianOutputRecoveryBatch,
+    GuardianOutputRecoveryLimits, GuardianOutputSegmentIdentity,
 };
 use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
@@ -1845,7 +1847,7 @@ struct PaneRetirementCompletion {
 const LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
-pub(crate) enum LiveParserCheckpointError {
+pub enum LiveParserCheckpointError {
     #[error("live parser checkpoint timeout must be nonzero and no greater than {LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT:?}")]
     InvalidTimeout,
     #[error("pane registration is no longer current")]
@@ -1874,6 +1876,8 @@ pub(crate) enum LiveParserCheckpointError {
     GuardianDeliveryWatermarkMismatch,
     #[error("guardian output delivery cannot start after unjournaled parser bytes")]
     GuardianDeliveryStartedLate,
+    #[error("guardian output recovery page does not continue the authenticated parser cursor")]
+    GuardianRecoveryRangeMismatch,
     #[error("guardian output delivery byte accounting overflowed")]
     GuardianDeliveryOverflow,
     #[error("raw parser delivery attempted bytes without an authenticated guardian receipt")]
@@ -1912,6 +1916,104 @@ pub(crate) enum LiveParserCheckpointError {
     Timeout,
     #[error("live parser checkpoint completion channel disconnected")]
     CompletionDisconnected,
+}
+
+/// Content-free acknowledgement for one authenticated journal recovery page
+/// delivered through the exact live parser registration.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianOutputRecoveryDelivery {
+    segment_identity: GuardianOutputSegmentIdentity,
+    requested_first_sequence: u64,
+    delivered_records: u64,
+    delivered_plaintext_bytes: u64,
+    next_recovery_sequence: Option<u64>,
+    committed_next_sequence: Option<u64>,
+    committed_log_bytes: u64,
+    cumulative_plaintext_bytes: u64,
+    terminal_predecessor: Option<GuardianOutputPredecessor>,
+    tail: GuardianOutputJournalTail,
+}
+
+impl GuardianOutputRecoveryDelivery {
+    #[must_use]
+    pub const fn segment_identity(self) -> GuardianOutputSegmentIdentity {
+        self.segment_identity
+    }
+
+    #[must_use]
+    pub const fn requested_first_sequence(self) -> u64 {
+        self.requested_first_sequence
+    }
+
+    #[must_use]
+    pub const fn delivered_records(self) -> u64 {
+        self.delivered_records
+    }
+
+    #[must_use]
+    pub const fn delivered_plaintext_bytes(self) -> u64 {
+        self.delivered_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn next_recovery_sequence(self) -> Option<u64> {
+        self.next_recovery_sequence
+    }
+
+    #[must_use]
+    pub const fn committed_next_sequence(self) -> Option<u64> {
+        self.committed_next_sequence
+    }
+
+    #[must_use]
+    pub const fn committed_log_bytes(self) -> u64 {
+        self.committed_log_bytes
+    }
+
+    #[must_use]
+    pub const fn cumulative_plaintext_bytes(self) -> u64 {
+        self.cumulative_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn terminal_predecessor(self) -> Option<GuardianOutputPredecessor> {
+        self.terminal_predecessor
+    }
+
+    #[must_use]
+    pub const fn tail(self) -> GuardianOutputJournalTail {
+        self.tail
+    }
+}
+
+impl std::fmt::Debug for GuardianOutputRecoveryDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianOutputRecoveryDelivery")
+            .field("segment_identity", &self.segment_identity)
+            .field("requested_first_sequence", &self.requested_first_sequence)
+            .field("delivered_records", &self.delivered_records)
+            .field("delivered_plaintext_bytes", &self.delivered_plaintext_bytes)
+            .field("next_recovery_sequence", &self.next_recovery_sequence)
+            .field("committed_next_sequence", &self.committed_next_sequence)
+            .field("committed_log_bytes", &self.committed_log_bytes)
+            .field("cumulative_plaintext_bytes", &self.cumulative_plaintext_bytes)
+            .field("terminal_predecessor", &self.terminal_predecessor)
+            .field("tail", &self.tail)
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianOutputRecoveryDeliveryError {
+    #[error("authenticated guardian output journal recovery failed")]
+    Journal(#[from] GuardianOutputJournalError),
+    #[error("guardian checkpoint boundary did not match authenticated journal recovery")]
+    CheckpointBoundary(#[from] GuardianCheckpointBoundaryError),
+    #[error("guardian output recovery could not be admitted to the exact live parser")]
+    LiveParser(#[from] LiveParserCheckpointError),
+    #[error("guardian output recovery page is internally inconsistent: {0}")]
+    InvalidPage(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -1999,6 +2101,7 @@ impl LiveParserCheckpointState {
 struct LiveParserCheckpointControl {
     state: Mutex<LiveParserCheckpointState>,
     delivery_gate: Condvar,
+    data_writer: Mutex<Option<FileDescriptor>>,
     wake_writer: Mutex<Option<FileDescriptor>>,
 }
 
@@ -2085,22 +2188,33 @@ impl LiveParserCheckpointControl {
         Self {
             state: Mutex::new(LiveParserCheckpointState::new(registration_wire_identity)),
             delivery_gate: Condvar::new(),
+            data_writer: Mutex::new(None),
             wake_writer: Mutex::new(None),
         }
     }
 
-    fn attach_wake_writer(&self, writer: FileDescriptor) -> Result<(), LiveParserCheckpointError> {
-        let mut wake_writer = self.wake_writer.lock();
+    fn attach_reader_channels(
+        &self,
+        data_writer: FileDescriptor,
+        checkpoint_wake_writer: FileDescriptor,
+    ) -> Result<(), LiveParserCheckpointError> {
+        let mut current_data_writer = self.data_writer.lock();
+        let mut current_wake_writer = self.wake_writer.lock();
         let mut state = self.state.lock();
         if state.dead {
             return Err(LiveParserCheckpointError::ReaderDead);
         }
-        if state.attached || wake_writer.is_some() {
+        if state.attached || current_data_writer.is_some() || current_wake_writer.is_some() {
             return Err(LiveParserCheckpointError::ReaderUnavailable);
         }
-        *wake_writer = Some(writer);
+        *current_data_writer = Some(data_writer);
+        *current_wake_writer = Some(checkpoint_wake_writer);
         state.attached = true;
         Ok(())
+    }
+
+    fn close_data_writer(&self) {
+        self.data_writer.lock().take();
     }
 
     fn wake_parser(&self) {
@@ -2806,7 +2920,15 @@ impl LiveParserCheckpointControl {
         }
     }
 
-    fn write_delivered_bytes(
+    fn write_delivered_bytes(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut writer = self.data_writer.lock();
+        let writer = writer.as_mut().ok_or_else(|| {
+            std::io::Error::other(LiveParserCheckpointError::ReaderUnavailable.to_string())
+        })?;
+        self.write_delivered_bytes_with_writer(writer, bytes)
+    }
+
+    fn write_delivered_bytes_with_writer(
         &self,
         writer: &mut FileDescriptor,
         bytes: &[u8],
@@ -9626,7 +9748,6 @@ fn read_from_pane_pty(
     generation: Arc<PaneRegistrationGeneration>,
     banner: Option<String>,
     mut reader: Box<dyn std::io::Read>,
-    mut tx: FileDescriptor,
     dead: Arc<AtomicBool>,
     parser_done: std::sync::mpsc::Receiver<()>,
 ) {
@@ -9642,7 +9763,7 @@ fn read_from_pane_pty(
     if let Some(banner) = banner {
         if let Err(err) = generation
             .live_parser_checkpoint
-            .write_delivered_bytes(&mut tx, banner.as_bytes())
+            .write_delivered_bytes(banner.as_bytes())
         {
             error!(
                 "read_pty failed to write banner to parser: pane {} {:?}",
@@ -9667,7 +9788,7 @@ fn read_from_pane_pty(
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
                 if let Err(err) = generation
                     .live_parser_checkpoint
-                    .write_delivered_bytes(&mut tx, &buf[..size])
+                    .write_delivered_bytes(&buf[..size])
                 {
                     error!(
                         "read_pty failed to write to parser: pane {} {:?}",
@@ -9683,7 +9804,7 @@ fn read_from_pane_pty(
     // buffered actions. Do not retire the generation until that final flush
     // completes; otherwise very short-lived commands can lose their last
     // frame when EOF races exact-generation cleanup.
-    drop(tx);
+    generation.live_parser_checkpoint.close_data_writer();
     let _ = parser_done.recv();
 
     let exit_behavior = exit_behavior.unwrap_or_else(|| configuration().exit_behavior);
@@ -13628,9 +13749,9 @@ impl Mux {
                 .with_context(|| format!("make pane {pane_id} checkpoint reader nonblocking"))?;
             generation
                 .live_parser_checkpoint
-                .attach_wake_writer(checkpoint_wake_tx)
+                .attach_reader_channels(tx, checkpoint_wake_tx)
                 .map_err(|error| {
-                    anyhow!("attach pane {pane_id} checkpoint control channel: {error}")
+                    anyhow!("attach pane {pane_id} parser data/control channels: {error}")
                 })?;
             let banner = self.banner.read().clone();
             let weak_pane = Arc::downgrade(pane);
@@ -13735,7 +13856,6 @@ impl Mux {
                                     reader_generation,
                                     banner,
                                     reader,
-                                    tx,
                                     reader_dead,
                                     parser_done_rx,
                                 );
@@ -20333,7 +20453,6 @@ mod tests {
         pane: Arc<dyn Pane>,
         registration: PaneRegistrationHandle,
         generation: Arc<PaneRegistrationGeneration>,
-        writer: Arc<StdMutex<Option<FileDescriptor>>>,
         parser_thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -20371,8 +20490,8 @@ mod tests {
                 .expect("make test checkpoint wake reader nonblocking");
             generation
                 .live_parser_checkpoint
-                .attach_wake_writer(wake_writer)
-                .expect("attach test checkpoint control");
+                .attach_reader_channels(data_writer, wake_writer)
+                .expect("attach test parser data/control channels");
             let parser_generation = Arc::clone(&generation);
             let parser_pane = Arc::downgrade(&pane);
             let parser_dead = Arc::clone(&generation.reader_dead);
@@ -20394,7 +20513,6 @@ mod tests {
                 pane,
                 registration,
                 generation,
-                writer: Arc::new(StdMutex::new(Some(data_writer))),
                 parser_thread: Some(parser_thread),
             }
         }
@@ -20415,13 +20533,9 @@ mod tests {
         }
 
         fn write(&self, payload: &[u8]) -> std::io::Result<()> {
-            let mut writer = self.writer.lock().unwrap_or_else(|error| error.into_inner());
             self.generation
                 .live_parser_checkpoint
-                .write_delivered_bytes(
-                    writer.as_mut().expect("test parser writer remains live"),
-                    payload,
-                )
+                .write_delivered_bytes(payload)
         }
 
         fn capture(
@@ -20461,10 +20575,7 @@ mod tests {
 
     impl Drop for LiveParserTestHarness {
         fn drop(&mut self) {
-            self.writer
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
+            self.generation.live_parser_checkpoint.close_data_writer();
             if let Some(parser_thread) = self.parser_thread.take() {
                 let _ = parser_thread.join();
             }
@@ -20689,7 +20800,7 @@ mod tests {
         });
 
         control
-            .write_delivered_bytes(&mut writer, &payload)
+            .write_delivered_bytes_with_writer(&mut writer, &payload)
             .expect("deliver payload through forced socket backpressure");
         assert_eq!(
             parser.join().expect("backpressure parser does not panic"),
@@ -20740,19 +20851,12 @@ mod tests {
             Err(LiveParserCheckpointError::CheckpointBusy)
         ));
 
-        let writer = Arc::clone(&harness.writer);
         let control = Arc::clone(&harness.generation.live_parser_checkpoint);
         let (writer_started_tx, writer_started_rx) = std::sync::mpsc::sync_channel(1);
         let (writer_done_tx, writer_done_rx) = std::sync::mpsc::sync_channel(1);
         let post_target_writer = std::thread::spawn(move || {
             writer_started_tx.send(()).expect("report writer start");
-            let result = {
-                let mut writer = writer.lock().unwrap_or_else(|error| error.into_inner());
-                control.write_delivered_bytes(
-                    writer.as_mut().expect("parser writer remains live"),
-                    b"post-target",
-                )
-            };
+            let result = control.write_delivered_bytes(b"post-target");
             writer_done_tx.send(result).expect("report writer result");
         });
         writer_started_rx
@@ -20945,11 +21049,7 @@ mod tests {
             assert!(Instant::now() < deadline, "checkpoint request was not registered");
             std::thread::yield_now();
         }
-        harness
-            .writer
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        harness.generation.live_parser_checkpoint.close_data_writer();
         assert!(matches!(
             capture_thread.join().expect("capture thread does not panic"),
             Err(LiveParserCheckpointError::IncompleteBoundary { .. })

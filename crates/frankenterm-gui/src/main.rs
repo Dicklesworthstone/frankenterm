@@ -109,6 +109,7 @@ static AUTO_CONNECT_STARTUP_READY: AtomicBool = AtomicBool::new(false);
 static AUTO_CONNECT_SUPERVISOR_GENERATION: AtomicU64 = AtomicU64::new(0);
 static AUTO_CONNECT_ADMISSION_RETRY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdmissionRetryCoordinatorState {
@@ -537,6 +538,12 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
                 return true;
             }
         };
+        // Reload callbacks run before any main-thread reconciliation admission
+        // is guaranteed. Retire both authorities synchronously here so a
+        // scheduler-saturated GUI cannot keep dialing with the configuration
+        // captured by an older automatic-connect supervisor. The main-thread
+        // task handle is dropped later by the admitted reconciliation path.
+        fence_auto_connect_supervisor_authority("mux-domain configuration reload");
         match try_admit_mux_domain_config_reconciliation(generation) {
             MuxDomainConfigAdmission::Started => {}
             MuxDomainConfigAdmission::Retryable(rejection) => {
@@ -1499,29 +1506,36 @@ fn mint_auto_connect_supervisor_generation() -> Option<u64> {
     }
 }
 
+fn fence_auto_connect_supervisor_authority(context: &str) -> bool {
+    let request_fenced = mint_auto_connect_admission_retry_generation().is_some();
+    let supervisor_fenced = mint_auto_connect_supervisor_generation().is_some();
+    if request_fenced && supervisor_fenced {
+        return true;
+    }
+
+    AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
+    let exhausted = match (request_fenced, supervisor_fenced) {
+        (false, false) => "request and supervisor generations",
+        (false, true) => "request generation",
+        (true, false) => "supervisor generation",
+        (true, true) => unreachable!("both successful fences returned above"),
+    };
+    let message = format!(
+        "automatic domain connection {exhausted} exhausted while fencing {context}; automatic connection is disabled for this process"
+    );
+    frankenterm_gui::gui_debug_log::record(
+        log::Level::Error,
+        "frankenterm_gui::auto_connect",
+        message.clone(),
+    );
+    log::error!("{message}");
+    persistent_toast_notification("Domain auto-connect unavailable", &message);
+    false
+}
+
 fn cancel_auto_connect_supervisor() {
-    if mint_auto_connect_admission_retry_generation().is_none() {
-        AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
-        let message = "automatic domain admission request generation exhausted while fencing a cancelled supervisor; automatic connection is disabled for this process";
-        frankenterm_gui::gui_debug_log::record(
-            log::Level::Error,
-            "frankenterm_gui::auto_connect",
-            message,
-        );
-        log::error!("{message}");
-        persistent_toast_notification("Domain auto-connect unavailable", message);
-    }
+    fence_auto_connect_supervisor_authority("a cancelled supervisor");
     let previous = AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take());
-    if mint_auto_connect_supervisor_generation().is_none() {
-        let message = "automatic domain connection generation exhausted while fencing a cancelled supervisor; automatic connection is disabled for this process";
-        frankenterm_gui::gui_debug_log::record(
-            log::Level::Error,
-            "frankenterm_gui::auto_connect",
-            message,
-        );
-        log::error!("{message}");
-        persistent_toast_notification("Domain auto-connect unavailable", message);
-    }
     // Drop only after releasing the RefCell borrow. Cancellation may dispose
     // future-owned domain guards and scheduler permits synchronously. The
     // generation fence above is already visible before any destructor runs.
@@ -3155,6 +3169,66 @@ mod tests {
                 "unexpected retry promise: {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn retry_coordinator_publishes_only_completed_startup_and_serializes_retirement() {
+        let state = Mutex::new(AdmissionRetryCoordinatorState::Idle);
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+
+        let failed = ensure_admission_retry_coordinator(&state, "test", || {
+            starts.fetch_add(1, Ordering::AcqRel);
+            Err(std::io::Error::other("planted thread creation failure"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            *state.lock().expect("read failed-start state"),
+            AdmissionRetryCoordinatorState::Idle,
+            "a failed startup must not publish a retry handoff"
+        );
+
+        ensure_admission_retry_coordinator(&state, "test", || {
+            starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })
+        .expect("publish successful coordinator startup");
+        ensure_admission_retry_coordinator(&state, "test", || {
+            starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })
+        .expect("coalesce behind running coordinator");
+        assert_eq!(
+            starts.load(Ordering::Acquire),
+            2,
+            "a running coordinator must retain sole startup ownership"
+        );
+
+        let generation = AtomicU64::new(7);
+        assert!(!finish_admission_retry_coordinator(
+            &state,
+            &generation,
+            7,
+            "test",
+        ));
+        assert_eq!(
+            *state.lock().expect("read retired state"),
+            AdmissionRetryCoordinatorState::Idle
+        );
+
+        ensure_admission_retry_coordinator(&state, "test", || Ok(()))
+            .expect("restart coordinator for newer-request handoff");
+        generation.store(8, Ordering::Release);
+        assert!(finish_admission_retry_coordinator(
+            &state,
+            &generation,
+            7,
+            "test",
+        ));
+        assert_eq!(
+            *state.lock().expect("read retained state"),
+            AdmissionRetryCoordinatorState::Running,
+            "a request published before serialized retirement must retain the existing owner"
+        );
     }
 
     #[test]
