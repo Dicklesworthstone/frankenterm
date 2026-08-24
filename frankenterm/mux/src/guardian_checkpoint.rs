@@ -3359,9 +3359,292 @@ mod tests {
     use frankenterm_term::{
         RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
     };
+    use std::collections::BTreeSet;
     use std::fs::File;
     use std::sync::Arc;
+    use syn::visit::{self, Visit};
     use tempfile::tempdir;
+
+    const AUTHORITY_CRITICAL_TYPES: &[&str] = &[
+        "GuardianCheckpointGenesisSpawnPermitV1",
+        "GuardianCheckpointCandidateIdentityV1",
+        "GuardianCheckpointOrderedChunkSetIdentityV1",
+        "GuardianCheckpointOrderedChunkSetBuilderV1",
+        "GuardianCheckpointValidatedStageAssemblyV1",
+        "GuardianCheckpointValidatedManifestAuthorityV1",
+        "GuardianCheckpointStageSealIntentV1",
+        "GuardianCheckpointValidatedManifestOperationV1",
+        "GuardianCheckpointManifestRetryCapabilityV1",
+        "GuardianCheckpointManifestSealCapabilitiesV1",
+    ];
+
+    #[derive(Default)]
+    struct AuthoritySurfaceAstInventory {
+        derives: Vec<String>,
+        fields: Vec<String>,
+        impls: Vec<String>,
+        inherent_methods: Vec<String>,
+        return_sites: Vec<String>,
+        construction_sites: Vec<String>,
+        aliases_or_storage: Vec<String>,
+        item_macros: Vec<String>,
+        current_impl_owner: Option<String>,
+        current_impl_is_inherent: bool,
+        current_function: Option<String>,
+    }
+
+    impl AuthoritySurfaceAstInventory {
+        fn protected(name: &str) -> bool {
+            AUTHORITY_CRITICAL_TYPES.contains(&name)
+        }
+
+        fn direct_type_name(ty: &syn::Type) -> Option<String> {
+            let syn::Type::Path(path) = ty else {
+                return None;
+            };
+            path.path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+        }
+
+        fn path_name(path: &syn::Path) -> Option<String> {
+            path.segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+        }
+
+        fn cfg_test(attributes: &[syn::Attribute]) -> bool {
+            attributes.iter().any(|attribute| {
+                attribute.path().is_ident("cfg")
+                    && attribute
+                        .parse_args::<syn::Meta>()
+                        .is_ok_and(|meta| matches!(meta, syn::Meta::Path(path) if path.is_ident("test")))
+            })
+        }
+
+        fn visibility(visibility: &syn::Visibility) -> String {
+            match visibility {
+                syn::Visibility::Inherited => "private".to_owned(),
+                syn::Visibility::Public(_) => "pub".to_owned(),
+                syn::Visibility::Restricted(restricted) => {
+                    let path = restricted
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    format!("pub({path})")
+                }
+            }
+        }
+
+        fn protected_return_names(
+            output: &syn::ReturnType,
+            owner: Option<&str>,
+        ) -> Vec<String> {
+            let syn::ReturnType::Type(_, ty) = output else {
+                return Vec::new();
+            };
+            struct ReturnTypeVisitor<'a> {
+                owner: Option<&'a str>,
+                names: BTreeSet<String>,
+            }
+            impl<'ast> Visit<'ast> for ReturnTypeVisitor<'_> {
+                fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+                    if let Some(name) = path.path.segments.last().map(|segment| {
+                        if segment.ident == "Self" {
+                            self.owner.unwrap_or("Self").to_owned()
+                        } else {
+                            segment.ident.to_string()
+                        }
+                    }) && AuthoritySurfaceAstInventory::protected(&name)
+                    {
+                        self.names.insert(name);
+                    }
+                    visit::visit_type_path(self, path);
+                }
+            }
+            let mut visitor = ReturnTypeVisitor {
+                owner,
+                names: BTreeSet::new(),
+            };
+            visitor.visit_type(ty);
+            visitor.names.into_iter().collect()
+        }
+
+        fn record_return_sites(
+            &mut self,
+            owner: Option<&str>,
+            function: &syn::Signature,
+            visibility: &syn::Visibility,
+            cfg_test: bool,
+        ) {
+            let owner_label = owner.unwrap_or("<free>");
+            let visibility = Self::visibility(visibility);
+            let cfg_label = if cfg_test { "test" } else { "production" };
+            for returned in Self::protected_return_names(&function.output, owner) {
+                self.return_sites.push(format!(
+                    "{returned}@{owner_label}::{}:{visibility}:{cfg_label}",
+                    function.ident
+                ));
+            }
+        }
+
+        fn record_construction(&mut self, path: &syn::Path) {
+            let Some(mut constructed) = Self::path_name(path) else {
+                return;
+            };
+            if constructed == "Self" {
+                let Some(owner) = self.current_impl_owner.as_ref() else {
+                    return;
+                };
+                constructed.clone_from(owner);
+            }
+            if !Self::protected(&constructed) {
+                return;
+            }
+            self.construction_sites.push(format!(
+                "{constructed}@{}::{}",
+                self.current_impl_owner.as_deref().unwrap_or("<free>"),
+                self.current_function.as_deref().unwrap_or("<item>")
+            ));
+        }
+
+        fn record_typed_item(
+            &mut self,
+            kind: &str,
+            name: &str,
+            ty: &syn::Type,
+        ) {
+            let output = syn::ReturnType::Type(Default::default(), Box::new(ty.clone()));
+            for protected in Self::protected_return_names(&output, None) {
+                self.aliases_or_storage
+                    .push(format!("{kind}:{name}:{protected}"));
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for AuthoritySurfaceAstInventory {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if Self::cfg_test(&item.attrs) {
+                return;
+            }
+            visit::visit_item_mod(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            let target = item.ident.to_string();
+            if Self::protected(&target) {
+                for attribute in &item.attrs {
+                    if attribute.path().is_ident("derive") {
+                        attribute
+                            .parse_nested_meta(|meta| {
+                                if let Some(derived) = meta.path.segments.last() {
+                                    self.derives.push(format!("{target}:{}", derived.ident));
+                                }
+                                Ok(())
+                            })
+                            .expect("parse authority-critical derive attribute");
+                    }
+                }
+                for field in &item.fields {
+                    self.fields.push(format!(
+                        "{target}:{}:{}",
+                        field
+                            .ident
+                            .as_ref()
+                            .map_or_else(|| "<unnamed>".to_owned(), ToString::to_string),
+                        Self::visibility(&field.vis)
+                    ));
+                }
+            }
+            visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let target = Self::direct_type_name(&item.self_ty);
+            if let Some(target) = target.as_deref().filter(|name| Self::protected(name)) {
+                let trait_name = item
+                    .trait_
+                    .as_ref()
+                    .and_then(|(_, path, _)| Self::path_name(path))
+                    .unwrap_or_else(|| "<inherent>".to_owned());
+                self.impls.push(format!("{target}:{trait_name}"));
+            }
+            let previous_owner = self.current_impl_owner.clone();
+            let previous_inherent = self.current_impl_is_inherent;
+            self.current_impl_owner = target;
+            self.current_impl_is_inherent = item.trait_.is_none();
+            visit::visit_item_impl(self, item);
+            self.current_impl_owner = previous_owner;
+            self.current_impl_is_inherent = previous_inherent;
+        }
+
+        fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+            let owner = self.current_impl_owner.clone();
+            if let Some(owner) = owner.as_deref().filter(|name| Self::protected(name)) {
+                let cfg_test = Self::cfg_test(&function.attrs);
+                if self.current_impl_is_inherent {
+                    self.inherent_methods.push(format!(
+                        "{owner}::{}:{}:{}",
+                        function.sig.ident,
+                        Self::visibility(&function.vis),
+                        if cfg_test { "test" } else { "production" }
+                    ));
+                }
+                self.record_return_sites(
+                    Some(owner),
+                    &function.sig,
+                    &function.vis,
+                    cfg_test,
+                );
+            }
+            let previous_function = self.current_function.replace(function.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, function);
+            self.current_function = previous_function;
+        }
+
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            self.record_return_sites(
+                None,
+                &function.sig,
+                &function.vis,
+                Self::cfg_test(&function.attrs),
+            );
+            let previous_function = self.current_function.replace(function.sig.ident.to_string());
+            visit::visit_item_fn(self, function);
+            self.current_function = previous_function;
+        }
+
+        fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+            self.record_construction(&expression.path);
+            visit::visit_expr_struct(self, expression);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            self.record_typed_item("type", &item.ident.to_string(), &item.ty);
+            visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+            self.record_typed_item("static", &item.ident.to_string(), &item.ty);
+            visit::visit_item_static(self, item);
+        }
+
+        fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+            self.record_typed_item("const", &item.ident.to_string(), &item.ty);
+            visit::visit_item_const(self, item);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            self.item_macros.push(
+                Self::path_name(&item.mac.path).unwrap_or_else(|| "<anonymous>".to_owned()),
+            );
+            visit::visit_item_macro(self, item);
+        }
+    }
 
     #[derive(Debug)]
     struct CheckpointTerminalConfig;
@@ -4652,162 +4935,171 @@ mod tests {
             GuardianCheckpointStageRecordContextV1
         >());
 
-        let source = include_str!("guardian_checkpoint.rs");
-        let production = source
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .expect("isolate production source");
-        let intent_start = production
-            .find("pub struct GuardianCheckpointStageSealIntentV1 {")
-            .expect("find seal-intent declaration");
-        let intent_impl_start = production[intent_start..]
-            .find("impl GuardianCheckpointStageSealIntentV1 {")
-            .map(|offset| intent_start + offset)
-            .expect("find seal-intent implementation");
-        let intent_debug_start = production[intent_impl_start..]
-            .find("impl std::fmt::Debug for GuardianCheckpointStageSealIntentV1")
-            .map(|offset| intent_impl_start + offset)
-            .expect("find seal-intent Debug implementation");
-        let intent_declaration = &production[intent_start..intent_impl_start];
-        let intent_implementation = &production[intent_impl_start..intent_debug_start];
-        assert!(intent_declaration.contains("Zeroizing<[u8; 32]>"));
-        assert!(intent_declaration.contains("Zeroizing<Vec<u8>>"));
-        assert!(!intent_declaration.contains("#[derive(Clone"));
-        assert!(intent_implementation.contains("pub fn candidate_metadata("));
-        assert!(intent_implementation.contains("pub fn chunk("));
-        assert!(!intent_implementation.contains("seal_manifest"));
-        assert!(!intent_implementation.contains("pub fn plaintext("));
-        assert!(!intent_implementation.contains("plaintext_digest(&self"));
+        assert!(std::mem::needs_drop::<
+            GuardianCheckpointCandidateIdentityV1
+        >());
+        assert!(std::mem::needs_drop::<
+            GuardianCheckpointOrderedChunkSetIdentityV1
+        >());
+        assert!(std::mem::needs_drop::<
+            GuardianCheckpointOrderedChunkSetBuilderV1
+        >());
 
-        let assembly_start = production
-            .find("pub struct GuardianCheckpointValidatedStageAssemblyV1 {")
-            .expect("find validated stage-assembly declaration");
-        let assembly_impl_start = production[assembly_start..]
-            .find("impl GuardianCheckpointValidatedStageAssemblyV1 {")
-            .map(|offset| assembly_start + offset)
-            .expect("find validated stage-assembly implementation");
-        let assembly_debug_start = production[assembly_impl_start..]
-            .find("impl std::fmt::Debug for GuardianCheckpointValidatedStageAssemblyV1")
-            .map(|offset| assembly_impl_start + offset)
-            .expect("find validated stage-assembly Debug implementation");
-        let assembly_declaration = &production[assembly_start..assembly_impl_start];
-        let assembly_implementation = &production[assembly_impl_start..assembly_debug_start];
-        assert!(!assembly_declaration.contains("#[derive(Clone"));
-        assert!(assembly_declaration.contains("candidate_record_digest: Zeroizing<[u8; 32]>"));
-        assert!(assembly_declaration.contains("ordered_chunk_set_digest: Zeroizing<[u8; 32]>"));
-        assert!(assembly_implementation.contains("#[cfg(test)]"));
-        assert!(assembly_implementation.contains("fn issue_for_test("));
-        assert!(!assembly_implementation.contains("pub fn "));
+        let syntax = syn::parse_file(include_str!("guardian_checkpoint.rs"))
+            .expect("parse the complete checkpoint module as Rust syntax");
+        let mut inventory = AuthoritySurfaceAstInventory::default();
+        inventory.visit_file(&syntax);
 
-        let authority_start = production
-            .find("pub struct GuardianCheckpointValidatedManifestAuthorityV1 {")
-            .expect("find manifest authority declaration");
-        let authority_impl_start = production[authority_start..]
-            .find("impl GuardianCheckpointValidatedManifestAuthorityV1 {")
-            .map(|offset| authority_start + offset)
-            .expect("find manifest authority implementation");
-        let authority_debug_start = production[authority_impl_start..]
-            .find("impl std::fmt::Debug for GuardianCheckpointValidatedManifestAuthorityV1")
-            .map(|offset| authority_impl_start + offset)
-            .expect("find manifest authority Debug implementation");
-        let authority_declaration = &production[authority_start..authority_impl_start];
-        let authority_implementation =
-            &production[authority_impl_start..authority_debug_start];
-        assert!(!authority_declaration.contains("#[derive(Clone"));
-        assert!(authority_implementation.contains("capture: LiveParserCheckpointAck,"));
-        assert!(!authority_implementation.contains("capture: &LiveParserCheckpointAck,"));
-        assert!(authority_implementation.contains("permit: GuardianCheckpointGenesisSpawnPermitV1,"));
-        assert!(!authority_implementation.contains("from_claimed"));
-        assert!(authority_implementation.contains("pub fn bind_seal_operation("));
-        assert!(authority_implementation.contains("assembly: GuardianCheckpointValidatedStageAssemblyV1,"));
-        assert!(!authority_implementation.contains("candidate_record_digest: [u8; 32]"));
-        assert!(!authority_implementation.contains("ordered_chunk_set_digest: [u8; 32]"));
+        inventory.derives.sort();
+        assert_eq!(inventory.derives, Vec::<String>::new());
 
-        let operation_start = production
-            .find("pub struct GuardianCheckpointValidatedManifestOperationV1 {")
-            .expect("find typed manifest operation declaration");
-        let operation_impl_start = production[operation_start..]
-            .find("impl GuardianCheckpointValidatedManifestOperationV1 {")
-            .map(|offset| operation_start + offset)
-            .expect("find typed manifest operation implementation");
-        let operation_declaration = &production[operation_start..operation_impl_start];
-        assert!(!operation_declaration.contains("#[derive(Clone"));
-        assert!(operation_declaration.contains("canonical_manifest: Zeroizing<Vec<u8>>"));
-        assert!(operation_declaration.contains("expected_manifest_digest: Zeroizing<[u8; 32]>"));
-        assert!(!operation_declaration.contains("pub canonical_manifest"));
+        inventory.fields.sort();
+        let mut expected_fields = vec![
+            "GuardianCheckpointCandidateIdentityV1:digest:private",
+            "GuardianCheckpointGenesisSpawnPermitV1:_private:private",
+            "GuardianCheckpointGenesisSpawnPermitV1:spawn_effect_id:private",
+            "GuardianCheckpointManifestRetryCapabilityV1:operation:private",
+            "GuardianCheckpointManifestSealCapabilitiesV1:primary:private",
+            "GuardianCheckpointManifestSealCapabilitiesV1:retry:private",
+            "GuardianCheckpointOrderedChunkSetBuilderV1:chunk_bytes:private",
+            "GuardianCheckpointOrderedChunkSetBuilderV1:committed_bytes:private",
+            "GuardianCheckpointOrderedChunkSetBuilderV1:hasher:private",
+            "GuardianCheckpointOrderedChunkSetBuilderV1:next_index:private",
+            "GuardianCheckpointOrderedChunkSetBuilderV1:total_bytes:private",
+            "GuardianCheckpointOrderedChunkSetBuilderV1:total_chunks:private",
+            "GuardianCheckpointOrderedChunkSetIdentityV1:digest:private",
+            "GuardianCheckpointStageSealIntentV1:context:private",
+            "GuardianCheckpointStageSealIntentV1:expected_plaintext_digest:private",
+            "GuardianCheckpointStageSealIntentV1:plaintext:private",
+            "GuardianCheckpointValidatedManifestAuthorityV1:binding:private",
+            "GuardianCheckpointValidatedManifestOperationV1:binding:private",
+            "GuardianCheckpointValidatedManifestOperationV1:canonical_manifest:private",
+            "GuardianCheckpointValidatedManifestOperationV1:context:private",
+            "GuardianCheckpointValidatedManifestOperationV1:expected_manifest_digest:private",
+            "GuardianCheckpointValidatedManifestOperationV1:expected_operation_digest:private",
+            "GuardianCheckpointValidatedManifestOperationV1:expected_plaintext_digest:private",
+            "GuardianCheckpointValidatedStageAssemblyV1:_private:private",
+            "GuardianCheckpointValidatedStageAssemblyV1:candidate_identity:private",
+            "GuardianCheckpointValidatedStageAssemblyV1:ordered_chunk_set_identity:private",
+            "GuardianCheckpointValidatedStageAssemblyV1:publication_id:private",
+            "GuardianCheckpointValidatedStageAssemblyV1:seal_request:private",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_fields.sort();
+        assert_eq!(inventory.fields, expected_fields);
 
-        let retry_start = production
-            .find("pub struct GuardianCheckpointManifestRetryCapabilityV1 {")
-            .expect("find retry capability declaration");
-        let retry_impl_start = production[retry_start..]
-            .find("impl GuardianCheckpointManifestRetryCapabilityV1 {")
-            .map(|offset| retry_start + offset)
-            .expect("find retry capability implementation");
-        let retry_declaration = &production[retry_start..retry_impl_start];
-        let retry_debug_start = production[retry_impl_start..]
-            .find("impl std::fmt::Debug for GuardianCheckpointManifestRetryCapabilityV1")
-            .map(|offset| retry_impl_start + offset)
-            .expect("find retry capability Debug implementation");
-        let retry_implementation = &production[retry_impl_start..retry_debug_start];
-        assert!(!retry_declaration.contains("#[derive(Clone"));
-        assert!(retry_declaration.contains("operation: GuardianCheckpointValidatedManifestOperationV1"));
-        assert!(!retry_implementation.contains("into_operation"));
+        inventory.impls.sort();
+        let mut expected_impls = vec![
+            "GuardianCheckpointCandidateIdentityV1:<inherent>",
+            "GuardianCheckpointCandidateIdentityV1:Debug",
+            "GuardianCheckpointCandidateIdentityV1:Eq",
+            "GuardianCheckpointCandidateIdentityV1:PartialEq",
+            "GuardianCheckpointGenesisSpawnPermitV1:<inherent>",
+            "GuardianCheckpointGenesisSpawnPermitV1:Debug",
+            "GuardianCheckpointManifestRetryCapabilityV1:<inherent>",
+            "GuardianCheckpointManifestRetryCapabilityV1:Debug",
+            "GuardianCheckpointManifestSealCapabilitiesV1:<inherent>",
+            "GuardianCheckpointManifestSealCapabilitiesV1:Debug",
+            "GuardianCheckpointOrderedChunkSetBuilderV1:<inherent>",
+            "GuardianCheckpointOrderedChunkSetBuilderV1:Debug",
+            "GuardianCheckpointOrderedChunkSetIdentityV1:<inherent>",
+            "GuardianCheckpointOrderedChunkSetIdentityV1:Debug",
+            "GuardianCheckpointOrderedChunkSetIdentityV1:Eq",
+            "GuardianCheckpointOrderedChunkSetIdentityV1:PartialEq",
+            "GuardianCheckpointStageSealIntentV1:<inherent>",
+            "GuardianCheckpointStageSealIntentV1:Debug",
+            "GuardianCheckpointValidatedManifestAuthorityV1:<inherent>",
+            "GuardianCheckpointValidatedManifestAuthorityV1:Debug",
+            "GuardianCheckpointValidatedManifestOperationV1:<inherent>",
+            "GuardianCheckpointValidatedManifestOperationV1:Debug",
+            "GuardianCheckpointValidatedStageAssemblyV1:<inherent>",
+            "GuardianCheckpointValidatedStageAssemblyV1:Debug",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_impls.sort();
+        assert_eq!(inventory.impls, expected_impls);
 
-        let cipher_impl_start = production
-            .find("impl GuardianCheckpointCipher {")
-            .expect("find checkpoint cipher implementation");
-        let cipher_debug_start = production[cipher_impl_start..]
-            .find("impl std::fmt::Debug for GuardianCheckpointCipher")
-            .map(|offset| cipher_impl_start + offset)
-            .expect("find checkpoint cipher Debug implementation");
-        let cipher_implementation = &production[cipher_impl_start..cipher_debug_start];
-        assert!(cipher_implementation.contains("intent: GuardianCheckpointStageSealIntentV1,"));
-        assert!(cipher_implementation.contains("operation: GuardianCheckpointValidatedManifestOperationV1,"));
-        assert!(cipher_implementation.contains("retry: &GuardianCheckpointManifestRetryCapabilityV1,"));
-        let manifest_method_start = cipher_implementation
-            .find("    pub fn seal_manifest(")
-            .expect("find typed manifest cipher method");
-        let manifest_method_end = cipher_implementation[manifest_method_start..]
-            .find("    fn seal_exact_payload(")
-            .map(|offset| manifest_method_start + offset)
-            .expect("bound typed manifest cipher method");
-        let manifest_method = &cipher_implementation[manifest_method_start..manifest_method_end];
-        assert!(!manifest_method.contains("Zeroizing<Vec<u8>>"));
-        assert!(!manifest_method.contains("plaintext:"));
+        inventory.inherent_methods.sort();
+        let mut expected_methods = vec![
+            "GuardianCheckpointCandidateIdentityV1::digest:private:production",
+            "GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext:pub:production",
+            "GuardianCheckpointCandidateIdentityV1::is_zero:private:production",
+            "GuardianCheckpointGenesisSpawnPermitV1::issue_for_test:private:test",
+            "GuardianCheckpointManifestRetryCapabilityV1::context:pub:production",
+            "GuardianCheckpointManifestSealCapabilitiesV1::from_authority:private:production",
+            "GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
+            "GuardianCheckpointOrderedChunkSetBuilderV1::finish:pub:production",
+            "GuardianCheckpointOrderedChunkSetBuilderV1::new:pub:production",
+            "GuardianCheckpointOrderedChunkSetBuilderV1::push_authenticated_chunk:pub:production",
+            "GuardianCheckpointOrderedChunkSetIdentityV1::digest:private:production",
+            "GuardianCheckpointOrderedChunkSetIdentityV1::is_zero:private:production",
+            "GuardianCheckpointStageSealIntentV1::candidate_metadata:pub:production",
+            "GuardianCheckpointStageSealIntentV1::chunk:pub:production",
+            "GuardianCheckpointStageSealIntentV1::context:pub:production",
+            "GuardianCheckpointStageSealIntentV1::from_binding:private:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1::bind_seal_operation:pub:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture:pub:production",
+            "GuardianCheckpointValidatedManifestOperationV1::context:pub:production",
+            "GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
+            "GuardianCheckpointValidatedManifestOperationV1::validate:private:production",
+            "GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_methods.sort();
+        assert_eq!(inventory.inherent_methods, expected_methods);
 
-        let permit_impl_start = production
-            .find("impl GuardianCheckpointGenesisSpawnPermitV1 {")
-            .expect("find Genesis permit implementation");
-        let permit_debug_start = production[permit_impl_start..]
-            .find("impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1")
-            .map(|offset| permit_impl_start + offset)
-            .expect("find Genesis permit Debug implementation");
-        let permit_implementation = &production[permit_impl_start..permit_debug_start];
-        assert!(permit_implementation.contains("#[cfg(test)]"));
-        assert_eq!(permit_implementation.matches("fn ").count(), 1);
-        assert!(!permit_implementation.contains("pub fn "));
+        inventory.return_sites.sort();
+        let mut expected_return_sites = vec![
+            "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext:pub:production",
+            "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue_for_test:private:test",
+            "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
+            "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointValidatedManifestAuthorityV1::bind_seal_operation:pub:production",
+            "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority:private:production",
+            "GuardianCheckpointOrderedChunkSetBuilderV1@GuardianCheckpointOrderedChunkSetBuilderV1::new:pub:production",
+            "GuardianCheckpointOrderedChunkSetIdentityV1@GuardianCheckpointOrderedChunkSetBuilderV1::finish:pub:production",
+            "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::candidate_metadata:pub:production",
+            "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::chunk:pub:production",
+            "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding:private:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture:pub:production",
+            "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
+            "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
+            "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_return_sites.sort();
+        assert_eq!(inventory.return_sites, expected_return_sites);
 
-        let context_start = production
-            .find("pub struct GuardianCheckpointStageRecordContextV1 {")
-            .expect("find persisted context declaration");
-        let context_impl_start = production[context_start..]
-            .find("impl GuardianCheckpointStageRecordContextV1 {")
-            .map(|offset| context_start + offset)
-            .expect("find persisted context implementation");
-        let context_declaration = &production[context_start..context_impl_start];
-        assert!(!context_declaration.contains("plaintext_digest"));
-        assert!(!context_declaration.contains("authority"));
-
-        let record_start = production
-            .find("pub struct GuardianEncryptedCheckpointStageRecordV1 {")
-            .expect("find encrypted-record declaration");
-        let record_impl_start = production[record_start..]
-            .find("impl GuardianEncryptedCheckpointStageRecordV1 {")
-            .map(|offset| record_start + offset)
-            .expect("find encrypted-record implementation");
-        let record_declaration = &production[record_start..record_impl_start];
-        assert!(!record_declaration.contains("plaintext_digest"));
-        assert!(!record_declaration.contains("authority"));
+        inventory.construction_sites.sort();
+        let mut expected_construction_sites = vec![
+            "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext",
+            "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue_for_test",
+            "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
+            "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
+            "GuardianCheckpointOrderedChunkSetBuilderV1@GuardianCheckpointOrderedChunkSetBuilderV1::new",
+            "GuardianCheckpointOrderedChunkSetIdentityV1@GuardianCheckpointOrderedChunkSetBuilderV1::finish",
+            "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
+            "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
+            "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_construction_sites.sort();
+        assert_eq!(inventory.construction_sites, expected_construction_sites);
+        assert_eq!(inventory.aliases_or_storage, Vec::<String>::new());
+        assert_eq!(inventory.item_macros, Vec::<String>::new());
 
         let plaintext = b"single-use zeroizing seal intent";
         let (descriptor, _, _, _) = record_descriptor();
