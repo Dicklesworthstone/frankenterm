@@ -139,7 +139,7 @@ physical salvage, but it marks the result `incomplete` with
 The writer treats every pre-existing v1 leaf as read-only forensic evidence and
 never resizes, reinitializes, or migrates it in place.
 
-Fresh files use the **v2 authenticated-ring profile**. The outer 256-byte
+Fresh files use the **v2 integrity-checked ring profile**. The outer 256-byte
 identity envelope remains decodable by the bounded census and carries flag
 `0x8000`; its on-disk v1 cursor is fixed at zero so an unaware reader cannot
 mistake physical order for logical order. Bytes `88..216` contain two
@@ -155,7 +155,7 @@ containing `FTR2`, payload length and kind, wrap generation, monotone sequence,
 and a full SHA-256 digest bound to pane UUID plus payload. The explicit
 `head`/`tail`/`wrap_at` state reconstructs surviving records in FIFO order
 after wrap; sequence and record digests reject reordering, tears, and payload
-corruption. Recovery can fall back to the older authenticated slot when a
+corruption. Recovery can fall back to the older checksummed slot when a
 newer record publication is torn, but reports that salvage as incomplete.
 Writer reopen is stricter: any ambiguous/torn slot or record fails closed.
 
@@ -176,7 +176,7 @@ runtime does not call the helper.
    `MmapScrollback::append`. Current direct callers are tests.
 2. `append` runs the **redactor** (ft-x0666 G10 surface) before
    the mmap write. Secrets never reach disk.
-3. `append` uses bounded positional file writes at the authenticated v2 tail,
+3. `append` uses bounded positional file writes at the integrity-checked v2 tail,
    evicts only whole verified records, and publishes the next alternating state
    slot. The crate forbids unsafe code, so this substrate does not invoke
    platform mmap APIs directly. Before reusing bytes still referenced by the

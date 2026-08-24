@@ -701,6 +701,9 @@ impl GuardianRuntime {
         request: AuthenticatedGuardianRequest,
         route: GuardianInputRoute,
     ) -> GuardianInputSubmission {
+        let mut request = OwnedInputRequest::new(request);
+        #[cfg(test)]
+        request.set_wipe_probe(self.input_request_wipe_probe.clone());
         if request.header().operation != GuardianOperation::Input
             || request.header().request_id != route.request_id
             || request.header().effect_id != Some(route.effect_id)
@@ -855,7 +858,7 @@ impl GuardianRuntime {
                         .counters
                         .protocol_transition_failures
                         .saturating_add(1);
-                    self.replay_deferred_protocol_observations();
+                    self.replay_deferred_child_exits();
                     return GuardianRuntimeInputCompletionState::Ready(
                         GuardianRuntimeInputCompletion {
                             route: completion.route,
@@ -899,7 +902,7 @@ impl GuardianRuntime {
                     )
                     | None => {}
                 }
-                self.replay_deferred_protocol_observations();
+                self.replay_deferred_child_exits();
                 GuardianRuntimeInputCompletionState::Ready(
                     GuardianRuntimeInputCompletion {
                         route: completion.route,
@@ -923,7 +926,7 @@ impl GuardianRuntime {
         }
     }
 
-    fn replay_deferred_protocol_observations(&mut self) {
+    fn replay_deferred_child_exits(&mut self) {
         let Some(protocol) = self.protocol.as_mut() else {
             return;
         };
@@ -939,90 +942,31 @@ impl GuardianRuntime {
                     .saturating_add(1);
             }
         }
-        while let Some(retirement) = self.pending_mux_retirements.pop() {
-            if protocol
-                .retire_disconnected_mux_leases(retirement.mux_incarnation)
-                .is_err()
-            {
-                self.indeterminate_effect = true;
-                self.counters.protocol_transition_failures = self
-                    .counters
-                    .protocol_transition_failures
-                    .saturating_add(1);
-            }
-        }
         self.release_silent_closed_panes();
     }
 
-    pub fn retire_disconnected_mux(
+    /// Apply one transport-authorized final-disconnect retirement if the input
+    /// worker is not currently holding the sole protocol authority.
+    ///
+    /// The readiness-loop tracker owns deferred retirement, lifecycle epochs,
+    /// and exact authenticated membership. Runtime deliberately retains no
+    /// transport observation that could become stale while protocol is away.
+    pub(crate) fn retire_disconnected_mux(
         &mut self,
         mux_incarnation: Uuid,
-        disconnected_connection_generation: u64,
-    ) -> Result<GuardianMuxLeaseRetirement, GuardianProtocolError> {
+    ) -> Result<Option<GuardianMuxLeaseRetirement>, GuardianProtocolError> {
         if mux_incarnation.is_nil() {
             return Err(GuardianProtocolError::ZeroIdentity("mux incarnation"));
-        }
-        if disconnected_connection_generation == 0 {
-            return Err(GuardianProtocolError::StateInvariantViolation(
-                "guardian disconnected mux connection generation is zero",
-            ));
         }
         if self.indeterminate_effect {
             return Err(GuardianProtocolError::StateInvariantViolation(
                 "guardian external effects are quarantined after an indeterminate outcome",
             ));
         }
-        let Some(protocol) = self.protocol.as_mut() else {
-            if let Some(retirement) = self
-                .pending_mux_retirements
-                .iter_mut()
-                .find(|retirement| retirement.mux_incarnation == mux_incarnation)
-            {
-                retirement.disconnected_connection_generation = retirement
-                    .disconnected_connection_generation
-                    .max(disconnected_connection_generation);
-                return Ok(GuardianMuxLeaseRetirement::default());
-            }
-            if self.pending_mux_retirements.len()
-                >= self.config.max_pending_mux_retirements
-            {
-                self.indeterminate_effect = true;
-                return Err(GuardianProtocolError::CapacityExhausted);
-            }
-            self.pending_mux_retirements.push(PendingMuxRetirement {
-                mux_incarnation,
-                disconnected_connection_generation,
-            });
-            return Ok(GuardianMuxLeaseRetirement::default());
-        };
-        protocol.retire_disconnected_mux_leases(mux_incarnation)
-    }
-
-    /// Cancel a deferred last-connection retirement after a newer connection
-    /// for the same mux has completed an authenticated Hello.
-    ///
-    /// This is deliberately usable while the input worker owns the protocol:
-    /// the vector is readiness-loop-owned transport observation state, not
-    /// protocol authority.  A strict generation comparison makes stale Hello
-    /// observations powerless against newer disconnects.
-    pub(crate) fn observe_connected_mux(
-        &mut self,
-        mux_incarnation: Uuid,
-        connection_generation: u64,
-    ) -> Result<(), GuardianProtocolError> {
-        if mux_incarnation.is_nil() {
-            return Err(GuardianProtocolError::ZeroIdentity("mux incarnation"));
-        }
-        if connection_generation == 0 {
-            return Err(GuardianProtocolError::StateInvariantViolation(
-                "guardian connected mux connection generation is zero",
-            ));
-        }
-        self.pending_mux_retirements.retain(|retirement| {
-            retirement.mux_incarnation != mux_incarnation
-                || retirement.disconnected_connection_generation >= connection_generation
-        });
-        Ok(())
+        self.protocol
+            .as_mut()
+            .map(|protocol| protocol.retire_disconnected_mux_leases(mux_incarnation))
+            .transpose()
     }
 
     /// Read one bounded PTY record, then pause readiness until its encrypted
@@ -1934,7 +1878,6 @@ mod tests {
             OUTPUT_RECORD_BYTES,
             OUTPUT_RECORD_BYTES,
             2,
-            4,
         )
         .expect("valid runtime test limits");
         let runtime = GuardianRuntime::new(
@@ -2701,13 +2644,13 @@ mod tests {
 
     #[test]
     fn aggregate_output_budget_is_checked_and_dominates_local_headroom() {
-        let config = GuardianRuntimeConfig::new(4, 128, 256, 10, 4).unwrap();
+        let config = GuardianRuntimeConfig::new(4, 128, 256, 10).unwrap();
         assert_eq!(remaining_output_capacity(config, 32, 240), 16);
         assert_eq!(remaining_output_capacity(config, 128, 0), 0);
         assert_eq!(remaining_output_capacity(config, 0, 256), 0);
 
-        assert!(GuardianRuntimeConfig::new(2, 128, 257, 10, 2).is_err());
-        assert!(GuardianRuntimeConfig::new(2, usize::MAX, 1, 10, 2).is_err());
+        assert!(GuardianRuntimeConfig::new(2, 128, 257, 10).is_err());
+        assert!(GuardianRuntimeConfig::new(2, usize::MAX, 1, 10).is_err());
     }
 
     #[test]

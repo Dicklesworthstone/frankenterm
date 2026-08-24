@@ -361,7 +361,6 @@ impl GuardianService {
             config.max_output_bytes_per_pane,
             config.max_total_output_bytes,
             first_pty_token,
-            config.max_connections,
         )?;
         let output_completion_waker = Arc::new(
             Waker::new(poll.registry(), output_completion_token)

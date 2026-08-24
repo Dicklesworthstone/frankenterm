@@ -1,8 +1,8 @@
-//! Crash-safe scrollback writer over the authenticated v2 ring profile.
+//! Crash-safe scrollback writer over the integrity-checked v2 ring profile.
 //!
 //! This module intentionally keeps the public contract at the format
 //! boundary: one per-pane `.bin` file plus a sidecar `.bin.lock`, dual
-//! authenticated state slots, integrity-tagged records, redaction-before-write,
+//! integrity-checked state slots and records, redaction-before-write,
 //! bounded capacity, and explicit sync cadence. Legacy v1 leaves are forensic
 //! read-only inputs and are never migrated in place. The crate forbids unsafe
 //! code, so this implementation uses positional file writes and `sync_data`
@@ -29,7 +29,7 @@ const MAX_CAP_BYTES: u64 = HARD_MAX_LINEAR_RECORD_FILE_BYTES - HEADER_SIZE as u6
 const DEFAULT_SYNC_EVERY_APPENDS: u64 = 64;
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 
-// Fresh files use an authenticated v2 ring profile inside the existing
+// Fresh files use an integrity-checked v2 ring profile inside the existing
 // 256-byte envelope. Keeping the outer `FormatVersion::V1` value lets the
 // bounded orphan census decode immutable identity/telemetry without teaching
 // that scanner how to replay records; the dedicated reader below requires this
@@ -315,6 +315,7 @@ pub struct MmapScrollback {
     v2_state: V2RingState,
     active_state_slot: usize,
     used_bytes: u64,
+    prewrite_sync_required: bool,
     #[cfg(test)]
     sync_observer: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
@@ -507,6 +508,7 @@ impl MmapScrollback {
             v2_state,
             active_state_slot,
             used_bytes,
+            prewrite_sync_required: false,
             #[cfg(test)]
             sync_observer: None,
         };
@@ -605,6 +607,9 @@ impl MmapScrollback {
         record_kind: RecordKind,
         redacted: RedactionResult,
     ) -> Result<MmapAppendReport, MmapScrollbackError> {
+        if self.prewrite_sync_required {
+            self.sync()?;
+        }
         let payload = fit_payload_to_capacity(redacted.bytes, self.header.capacity_bytes)?;
         let payload_len =
             u32::try_from(payload.len()).map_err(|_| MmapScrollbackError::RecordTooLarge {
@@ -625,8 +630,14 @@ impl MmapScrollback {
             self.v2_state = prepared_state;
             self.used_bytes = prepared_used_bytes;
             self.header.write_cursor_bytes = u64::from(self.v2_state.tail);
-            self.publish_v2_state()?;
-            self.sync_current_state()?;
+            if let Err(error) = self.publish_v2_state() {
+                self.v2_state = original_state;
+                self.used_bytes = original_used_bytes;
+                self.header.write_cursor_bytes = u64::from(original_state.tail);
+                return Err(error);
+            }
+            self.prewrite_sync_required = true;
+            self.sync()?;
             prepared_state = self.v2_state;
         }
 
@@ -750,7 +761,9 @@ impl MmapScrollback {
     }
 
     pub fn sync(&mut self) -> Result<(), MmapScrollbackError> {
-        self.sync_current_state()
+        self.sync_current_state()?;
+        self.prewrite_sync_required = false;
+        Ok(())
     }
 
     fn sync_current_state(&mut self) -> Result<(), MmapScrollbackError> {
@@ -1011,7 +1024,7 @@ enum V2SlotObservation {
 }
 
 fn encode_v2_base_header(mut header: ScrollbackHeader) -> [u8; HEADER_SIZE] {
-    // v2 replay authority lives exclusively in the authenticated dual slots.
+    // v2 replay authority lives exclusively in the checksummed dual slots.
     // Keep the v1 cursor zero on disk so a reader that ignores the v2 flag can
     // never mis-present a wrapped physical prefix as an ordered export.
     header.write_cursor_bytes = 0;
