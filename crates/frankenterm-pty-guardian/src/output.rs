@@ -1586,11 +1586,11 @@ fn checkpoint_parse_stage_name(
         .strip_prefix(".upload-")
         .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
     let (upload_id, role_text) = checkpoint_take_uuid(after_upload)?;
-    let role = if role_text == format!(".candidate{CHECKPOINT_STAGE_FILE_SUFFIX}") {
+    let role = if role_text == ".candidate.ftgcp" {
         CheckpointStageFileRole::Candidate
     } else if let Some(rest) = role_text.strip_prefix(".publication-") {
         let (publication_id, rest) = checkpoint_take_uuid(rest)?;
-        if rest == format!(".seal{CHECKPOINT_STAGE_FILE_SUFFIX}") {
+        if rest == ".seal.ftgcp" {
             CheckpointStageFileRole::Seal { publication_id }
         } else {
             let index_text = rest
@@ -1636,7 +1636,10 @@ fn checkpoint_take_uuid(
     if identity.is_nil() || identity.to_string() != encoded {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    Ok((identity, &value[36..]))
+    let remainder = value
+        .get(36..)
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    Ok((identity, remainder))
 }
 
 fn checkpoint_stage_require_capacity(
@@ -1845,6 +1848,16 @@ fn checkpoint_open_record(
         .cipher
         .open(&context, &record, max_plaintext_bytes)
         .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    inner
+        .persistence
+        .validate(&inner.directory)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    validate_file_identity_at(
+        &inner.directory,
+        &inner.directory_path,
+        &entry.path,
+        identity,
+    )?;
     Ok((context, plaintext))
 }
 
@@ -2267,7 +2280,7 @@ fn checkpoint_bytes_match(left: &[u8], right: &[u8]) -> bool {
     }
     left.iter()
         .zip(right)
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        .fold(0_u8, |difference, (left, right)| difference | (*left ^ *right))
         == 0
 }
 
@@ -2661,6 +2674,7 @@ impl GuardianOutputPipeline {
         })
     }
 
+    #[must_use]
     pub(crate) fn checkpoint_stage_store(&self) -> GuardianCheckpointStageStore {
         self.checkpoint_store.clone()
     }
@@ -5120,7 +5134,7 @@ mod tests {
     #[test]
     fn checkpoint_stage_begin_chunk_retry_and_gap_are_durable_and_exact(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, _poll, pipeline) = pipeline_with_policy(
+        let (directory, poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-stage-",
             OutputSegmentPolicy::production(),
         )?;
@@ -5184,6 +5198,12 @@ mod tests {
                 }
             );
         }
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+        let (_reopened_poll, reopened_pipeline) =
+            reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
+        let store = reopened_pipeline.checkpoint_stage_store();
         let first_retry = checkpoint_test_genesis_request(
             GuardianCheckpointStageKindV1::Chunk,
             spawn_effect_id,

@@ -931,16 +931,16 @@ impl GuardianCheckpointStageBindingV1 {
             .map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)
     }
 
-    fn validate_seal_witness(
+    fn validate_manifest_authority(
         &self,
-        witness: &GuardianCheckpointValidatedSealWitnessV1,
+        authority: &GuardianCheckpointValidatedManifestAuthorityV1,
     ) -> Result<(), GuardianCheckpointCipherError> {
         if checkpoint_stage_digests_match(
-            self.boundary_identity_digest()?,
-            witness.boundary_identity_digest,
+            &self.boundary_identity_digest()?,
+            &authority.boundary_identity_digest,
         ) && checkpoint_stage_digests_match(
-            self.checkpoint_identity_digest()?,
-            witness.checkpoint_identity_digest,
+            &self.checkpoint_identity_digest()?,
+            &authority.checkpoint_identity_digest,
         ) {
             Ok(())
         } else {
@@ -959,42 +959,32 @@ impl std::fmt::Debug for GuardianCheckpointStageBindingV1 {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum GuardianCheckpointStageContextAuthorityV1 {
+enum GuardianCheckpointStageSealAuthorityV1 {
     StageBinding,
-    ValidatedSeal,
-    PersistedClaim,
+    ValidatedManifest(GuardianCheckpointValidatedManifestAuthorityV1),
 }
 
-/// Complete authenticated identity of one encrypted Phase-A staging record.
+/// Single-use authority and zeroizing plaintext for one Phase-A seal.
 ///
-/// Private fields prevent unchecked construction. Production constructors
-/// derive both stable checkpoint identities from the canonical descriptor and
-/// derive the content identity from the exact plaintext. The persisted-parts
-/// constructor validates an untrusted fixed header; successful opening still
-/// requires a separately supplied exact expected context and re-identifies the
-/// decrypted plaintext. A persisted claim can be authenticated and opened but
-/// cannot authorize a new seal.
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub struct GuardianCheckpointStageRecordContextV1 {
-    kind: GuardianCheckpointStageRecordKindV1,
-    scope: GuardianCheckpointStageScopeV1,
-    upload_id: Uuid,
-    boundary_identity_digest: [u8; 32],
-    checkpoint_identity_digest: [u8; 32],
-    publication_id: Uuid,
-    chunk_position: Option<(u32, u64)>,
-    plaintext_bytes: u32,
-    expected_plaintext_digest: Option<[u8; 32]>,
-    authority: GuardianCheckpointStageContextAuthorityV1,
+/// This type deliberately implements neither `Clone` nor `Copy`. Constructors
+/// consume a zeroizing plaintext allocation and, for a final manifest, the
+/// nonconstructible validated publication authority. The digest remains in a
+/// zeroizing allocation until [`GuardianCheckpointCipher::seal`] consumes the
+/// complete intent. No plaintext or digest accessor is exposed.
+#[must_use = "a checkpoint staging seal intent must be consumed by the checkpoint cipher"]
+pub struct GuardianCheckpointStageSealIntentV1 {
+    context: GuardianCheckpointStageRecordContextV1,
+    expected_plaintext_digest: Zeroizing<[u8; 32]>,
+    plaintext: Zeroizing<Vec<u8>>,
+    authority: GuardianCheckpointStageSealAuthorityV1,
 }
 
-impl GuardianCheckpointStageRecordContextV1 {
+impl GuardianCheckpointStageSealIntentV1 {
     pub fn candidate_metadata(
         binding: &GuardianCheckpointStageBindingV1,
         upload_id: Uuid,
         publication_id: Uuid,
-        plaintext: &[u8],
+        plaintext: Zeroizing<Vec<u8>>,
     ) -> Result<Self, GuardianCheckpointCipherError> {
         Self::from_binding(
             GuardianCheckpointStageRecordKindV1::CandidateMetadata,
@@ -1003,7 +993,7 @@ impl GuardianCheckpointStageRecordContextV1 {
             publication_id,
             None,
             plaintext,
-            GuardianCheckpointStageContextAuthorityV1::StageBinding,
+            GuardianCheckpointStageSealAuthorityV1::StageBinding,
         )
     }
 
@@ -1014,7 +1004,7 @@ impl GuardianCheckpointStageRecordContextV1 {
         publication_id: Uuid,
         index: u32,
         offset: u64,
-        plaintext: &[u8],
+        plaintext: Zeroizing<Vec<u8>>,
     ) -> Result<Self, GuardianCheckpointCipherError> {
         Self::from_binding(
             GuardianCheckpointStageRecordKindV1::Chunk,
@@ -1023,18 +1013,18 @@ impl GuardianCheckpointStageRecordContextV1 {
             publication_id,
             Some((index, offset)),
             plaintext,
-            GuardianCheckpointStageContextAuthorityV1::StageBinding,
+            GuardianCheckpointStageSealAuthorityV1::StageBinding,
         )
     }
 
     pub fn seal_manifest(
         binding: &GuardianCheckpointStageBindingV1,
-        witness: &GuardianCheckpointValidatedSealWitnessV1,
+        authority: GuardianCheckpointValidatedManifestAuthorityV1,
         upload_id: Uuid,
         publication_id: Uuid,
-        plaintext: &[u8],
+        plaintext: Zeroizing<Vec<u8>>,
     ) -> Result<Self, GuardianCheckpointCipherError> {
-        binding.validate_seal_witness(witness)?;
+        binding.validate_manifest_authority(&authority)?;
         Self::from_binding(
             GuardianCheckpointStageRecordKindV1::SealManifest,
             binding,
@@ -1042,10 +1032,87 @@ impl GuardianCheckpointStageRecordContextV1 {
             publication_id,
             None,
             plaintext,
-            GuardianCheckpointStageContextAuthorityV1::ValidatedSeal,
+            GuardianCheckpointStageSealAuthorityV1::ValidatedManifest(authority),
         )
     }
 
+    #[must_use]
+    pub const fn context(&self) -> GuardianCheckpointStageRecordContextV1 {
+        self.context
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_binding(
+        kind: GuardianCheckpointStageRecordKindV1,
+        binding: &GuardianCheckpointStageBindingV1,
+        upload_id: Uuid,
+        publication_id: Uuid,
+        chunk_position: Option<(u32, u64)>,
+        plaintext: Zeroizing<Vec<u8>>,
+        authority: GuardianCheckpointStageSealAuthorityV1,
+    ) -> Result<Self, GuardianCheckpointCipherError> {
+        let boundary_identity_digest = binding.boundary_identity_digest()?;
+        let checkpoint_identity_digest = binding.checkpoint_identity_digest()?;
+        let (plaintext_bytes, plaintext_digest) =
+            checkpoint_stage_plaintext_identity(plaintext.as_slice())?;
+        if let Some((_, offset)) = chunk_position {
+            let end = offset
+                .checked_add(u64::from(plaintext_bytes))
+                .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+            if end > binding.descriptor.terminal_payload_bytes() {
+                return Err(GuardianCheckpointCipherError::InvalidChunkIdentity);
+            }
+        }
+        let context = GuardianCheckpointStageRecordContextV1::from_persisted_parts(
+            kind,
+            binding.scope,
+            upload_id,
+            boundary_identity_digest,
+            checkpoint_identity_digest,
+            publication_id,
+            chunk_position,
+            plaintext_bytes,
+        )?;
+        Ok(Self {
+            context,
+            expected_plaintext_digest: plaintext_digest,
+            plaintext,
+            authority,
+        })
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointStageSealIntentV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointStageSealIntentV1")
+            .field("context", &self.context)
+            .field("expected_plaintext_digest", &"[REDACTED]")
+            .field("plaintext", &"[REDACTED]")
+            .field("authority", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Persistable authenticated wire identity of one Phase-A staging record.
+///
+/// This copyable value deliberately contains neither plaintext-derived digest
+/// nor sealing authority. It is always only a persisted wire claim, including
+/// when returned by a freshly encrypted record. Only the non-copyable
+/// [`GuardianCheckpointStageSealIntentV1`] can authorize sealing.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianCheckpointStageRecordContextV1 {
+    kind: GuardianCheckpointStageRecordKindV1,
+    scope: GuardianCheckpointStageScopeV1,
+    upload_id: Uuid,
+    boundary_identity_digest: [u8; 32],
+    checkpoint_identity_digest: [u8; 32],
+    publication_id: Uuid,
+    chunk_position: Option<(u32, u64)>,
+    plaintext_bytes: u32,
+}
+
+impl GuardianCheckpointStageRecordContextV1 {
     /// Reconstruct a context from a decoded private fixed header.
     ///
     /// Claimed identities remain untrusted until [`GuardianCheckpointCipher::open`]
@@ -1070,8 +1137,6 @@ impl GuardianCheckpointStageRecordContextV1 {
             publication_id,
             chunk_position,
             plaintext_bytes,
-            expected_plaintext_digest: None,
-            authority: GuardianCheckpointStageContextAuthorityV1::PersistedClaim,
         };
         context.validate()?;
         Ok(context)
@@ -1117,42 +1182,6 @@ impl GuardianCheckpointStageRecordContextV1 {
         self.plaintext_bytes
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn from_binding(
-        kind: GuardianCheckpointStageRecordKindV1,
-        binding: &GuardianCheckpointStageBindingV1,
-        upload_id: Uuid,
-        publication_id: Uuid,
-        chunk_position: Option<(u32, u64)>,
-        plaintext: &[u8],
-        authority: GuardianCheckpointStageContextAuthorityV1,
-    ) -> Result<Self, GuardianCheckpointCipherError> {
-        let boundary_identity_digest = binding.boundary_identity_digest()?;
-        let checkpoint_identity_digest = binding.checkpoint_identity_digest()?;
-        let (plaintext_bytes, plaintext_digest) = checkpoint_stage_plaintext_identity(plaintext)?;
-        if let Some((_, offset)) = chunk_position {
-            let end = offset
-                .checked_add(u64::from(plaintext_bytes))
-                .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
-            if end > binding.descriptor.terminal_payload_bytes() {
-                return Err(GuardianCheckpointCipherError::InvalidChunkIdentity);
-            }
-        }
-        let mut context = Self::from_persisted_parts(
-            kind,
-            binding.scope,
-            upload_id,
-            boundary_identity_digest,
-            checkpoint_identity_digest,
-            publication_id,
-            chunk_position,
-            plaintext_bytes,
-        )?;
-        context.expected_plaintext_digest = Some(plaintext_digest);
-        context.authority = authority;
-        Ok(context)
-    }
-
     fn validate(&self) -> Result<(), GuardianCheckpointCipherError> {
         self.scope.validate()?;
         if self.upload_id.is_nil() {
@@ -1171,9 +1200,6 @@ impl GuardianCheckpointStageRecordContextV1 {
             || self.plaintext_bytes > GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES
         {
             return Err(GuardianCheckpointCipherError::PlaintextByteLimit);
-        }
-        if self.expected_plaintext_digest == Some([0; 32]) {
-            return Err(GuardianCheckpointCipherError::ZeroPlaintextDigest);
         }
         match (self.kind, self.chunk_position) {
             (GuardianCheckpointStageRecordKindV1::Chunk, Some((index, offset))) => {
@@ -1295,8 +1321,6 @@ impl std::fmt::Debug for GuardianCheckpointStageRecordContextV1 {
             .field("publication_id", &self.publication_id)
             .field("chunk_position", &self.chunk_position)
             .field("plaintext_bytes", &self.plaintext_bytes)
-            .field("expected_plaintext_digest", &"[REDACTED]")
-            .field("authority", &"[REDACTED]")
             .finish()
     }
 }
@@ -1327,35 +1351,49 @@ impl GuardianCheckpointCipher {
         self.output_cipher.key_id()
     }
 
-    /// Seal one bounded plaintext under its exact typed staging context.
+    /// Consume one bounded, authority-bearing, zeroizing staging intent.
     pub fn seal(
         &self,
-        context: GuardianCheckpointStageRecordContextV1,
-        plaintext: &[u8],
+        intent: GuardianCheckpointStageSealIntentV1,
     ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
+        let context = intent.context;
         context.validate()?;
-        let kind_authorized = matches!(
-            (context.kind, context.authority),
+        match (context.kind, &intent.authority) {
             (
                 GuardianCheckpointStageRecordKindV1::CandidateMetadata
                     | GuardianCheckpointStageRecordKindV1::Chunk,
-                GuardianCheckpointStageContextAuthorityV1::StageBinding,
-            ) | (
+                GuardianCheckpointStageSealAuthorityV1::StageBinding,
+            ) => {}
+            (
                 GuardianCheckpointStageRecordKindV1::SealManifest,
-                GuardianCheckpointStageContextAuthorityV1::ValidatedSeal,
-            )
-        );
-        if !kind_authorized {
-            return Err(GuardianCheckpointCipherError::InvalidKindAuthority);
+                GuardianCheckpointStageSealAuthorityV1::ValidatedManifest(authority),
+            ) => {
+                if !checkpoint_stage_digests_match(
+                    &context.boundary_identity_digest,
+                    &authority.boundary_identity_digest,
+                ) || !checkpoint_stage_digests_match(
+                    &context.checkpoint_identity_digest,
+                    &authority.checkpoint_identity_digest,
+                ) {
+                    return Err(GuardianCheckpointCipherError::SealWitnessMismatch);
+                }
+            }
+            _ => return Err(GuardianCheckpointCipherError::InvalidKindAuthority),
         }
-        let (plaintext_bytes, plaintext_digest) = checkpoint_stage_plaintext_identity(plaintext)?;
+        let (plaintext_bytes, plaintext_digest) =
+            checkpoint_stage_plaintext_identity(intent.plaintext.as_slice())?;
         if plaintext_bytes != context.plaintext_bytes
-            || context.expected_plaintext_digest != Some(plaintext_digest)
+            || !checkpoint_stage_digests_match(
+                &plaintext_digest,
+                &intent.expected_plaintext_digest,
+            )
         {
             return Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch);
         }
-        let inner_plaintext =
-            checkpoint_stage_inner_plaintext(plaintext, plaintext_digest)?;
+        let inner_plaintext = checkpoint_stage_inner_plaintext(
+            intent.plaintext.as_slice(),
+            &plaintext_digest,
+        )?;
         let key_id = self.key_id();
         let aad = checkpoint_stage_record_aad(key_id, &context);
         let (nonce, ciphertext) = self
@@ -1363,6 +1401,7 @@ impl GuardianCheckpointCipher {
             .seal_guardian_metadata(inner_plaintext.as_slice(), &aad)
             .map_err(|_| GuardianCheckpointCipherError::EncryptionFailed)?;
         drop(inner_plaintext);
+        drop(intent);
         let record = GuardianEncryptedCheckpointStageRecordV1 {
             version: GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION,
             key_id,
@@ -1411,16 +1450,15 @@ impl GuardianCheckpointCipher {
         {
             return Err(GuardianCheckpointCipherError::InvalidInnerEnvelope);
         }
-        let encrypted_plaintext_digest = checkpoint_stage_digest_at(trailer, 16);
+        let encrypted_plaintext_digest =
+            Zeroizing::new(checkpoint_stage_digest_at(trailer, 16));
         let (observed_bytes, observed_digest) =
             checkpoint_stage_plaintext_identity(&inner_plaintext[..plaintext_bytes])?;
         if observed_bytes != expected_context.plaintext_bytes
-            || !checkpoint_stage_digests_match(observed_digest, encrypted_plaintext_digest)
-            || expected_context
-                .expected_plaintext_digest
-                .is_some_and(|expected| {
-                    !checkpoint_stage_digests_match(expected, observed_digest)
-                })
+            || !checkpoint_stage_digests_match(
+                &observed_digest,
+                &encrypted_plaintext_digest,
+            )
         {
             return Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch);
         }
@@ -1653,13 +1691,15 @@ pub enum GuardianCheckpointCipherError {
     AuthenticationFailed,
     #[error("checkpoint encrypted inner envelope is invalid")]
     InvalidInnerEnvelope,
+    #[error("checkpoint staging plaintext allocation failed")]
+    PlaintextAllocationFailed,
     #[error("checkpoint staging arithmetic overflow")]
     ArithmeticOverflow,
 }
 
 fn checkpoint_stage_plaintext_identity(
     plaintext: &[u8],
-) -> Result<(u32, [u8; 32]), GuardianCheckpointCipherError> {
+) -> Result<(u32, Zeroizing<[u8; 32]>), GuardianCheckpointCipherError> {
     let plaintext_bytes = u32::try_from(plaintext.len())
         .map_err(|_| GuardianCheckpointCipherError::PlaintextByteLimit)?;
     if plaintext_bytes == 0
@@ -1671,18 +1711,24 @@ fn checkpoint_stage_plaintext_identity(
     hasher.update(CHECKPOINT_STAGE_PLAINTEXT_DIGEST_DOMAIN);
     hasher.update(plaintext_bytes.to_le_bytes());
     hasher.update(plaintext);
-    Ok((plaintext_bytes, hasher.finalize().into()))
+    Ok((
+        plaintext_bytes,
+        Zeroizing::new(<[u8; 32]>::from(hasher.finalize())),
+    ))
 }
 
 fn checkpoint_stage_inner_plaintext(
     plaintext: &[u8],
-    plaintext_digest: [u8; 32],
+    plaintext_digest: &[u8; 32],
 ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError> {
     let inner_bytes = plaintext
         .len()
         .checked_add(CHECKPOINT_STAGE_INNER_TRAILER_BYTES)
         .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
-    let mut inner_plaintext = Zeroizing::new(Vec::with_capacity(inner_bytes));
+    let mut inner_plaintext = Zeroizing::new(Vec::new());
+    inner_plaintext
+        .try_reserve_exact(inner_bytes)
+        .map_err(|_| GuardianCheckpointCipherError::PlaintextAllocationFailed)?;
     inner_plaintext.extend_from_slice(plaintext);
     inner_plaintext.extend_from_slice(&CHECKPOINT_STAGE_INNER_TRAILER_MAGIC);
     inner_plaintext.extend_from_slice(&CHECKPOINT_STAGE_INNER_TRAILER_VERSION.to_le_bytes());
@@ -1739,8 +1785,8 @@ fn checkpoint_stage_key_ids_match(
     checkpoint_stage_bytes_match(&left, &right)
 }
 
-fn checkpoint_stage_digests_match(left: [u8; 32], right: [u8; 32]) -> bool {
-    checkpoint_stage_bytes_match(&left, &right)
+fn checkpoint_stage_digests_match(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    checkpoint_stage_bytes_match(left, right)
 }
 
 fn checkpoint_stage_bytes_match(left: &[u8], right: &[u8]) -> bool {
