@@ -317,10 +317,6 @@ impl LiveParserCaptureRequest {
         self.request_id
     }
 
-    pub(super) const fn target(&self) -> u64 {
-        self.target
-    }
-
     pub(super) const fn durable_pane_id(&self) -> Uuid {
         self.durable_pane_id
     }

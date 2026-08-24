@@ -314,13 +314,22 @@ impl Drop for GuardianRequestEnvelope {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub struct AuthenticatedGuardianRequest(GuardianRequestEnvelope);
+pub struct AuthenticatedGuardianRequest {
+    envelope: GuardianRequestEnvelope,
+    /// Authenticated length retained independently of the wipeable plaintext.
+    ///
+    /// Input terminal receipts need this bound after the live writer has
+    /// consumed and zeroized the payload.  Retaining only the length and the
+    /// header's authenticated digest preserves response correlation without a
+    /// second plaintext allocation.
+    authenticated_payload_bytes: u32,
+}
 
 impl std::fmt::Debug for AuthenticatedGuardianRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_tuple("AuthenticatedGuardianRequest")
-            .field(&self.0)
+            .field(&self.envelope)
             .finish()
     }
 }
@@ -329,7 +338,7 @@ impl std::ops::Deref for AuthenticatedGuardianRequest {
     type Target = GuardianRequestEnvelope;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.envelope
     }
 }
 
@@ -383,6 +392,8 @@ pub enum GuardianRejectionCode {
     CheckpointOutcomeIndeterminate = 22,
     CheckpointIdentityMismatch = 23,
     OwnedPanesPresent = 24,
+    /// The exact input effect durably proved that zero bytes reached the PTY.
+    InputKnownNotApplied = 25,
 }
 
 impl GuardianRejectionCode {
@@ -446,6 +457,7 @@ impl GuardianRejectionCode {
             22 => Self::CheckpointOutcomeIndeterminate,
             23 => Self::CheckpointIdentityMismatch,
             24 => Self::OwnedPanesPresent,
+            25 => Self::InputKnownNotApplied,
             _ => return Err(GuardianProtocolError::InvalidRejectionPayload),
         };
         if code.status() != status {
@@ -1316,30 +1328,36 @@ impl CorrelatedGuardianResponse {
 impl AuthenticatedGuardianRequest {
     #[must_use]
     pub const fn header(&self) -> &GuardianRequestHeader {
-        &self.0.header
+        &self.envelope.header
     }
 
     #[must_use]
     pub fn payload(&self) -> &[u8] {
-        &self.0.payload
+        &self.envelope.payload
     }
 
     #[must_use]
     pub const fn envelope(&self) -> &GuardianRequestEnvelope {
-        &self.0
+        &self.envelope
+    }
+
+    /// Original authenticated payload length, retained after plaintext wipe.
+    #[must_use]
+    pub const fn authenticated_payload_bytes(&self) -> u32 {
+        self.authenticated_payload_bytes
     }
 
     /// Wipe the authenticated request payload as soon as its operation has
     /// consumed it. The authenticated header and payload commitment remain
     /// available for response correlation.
     pub fn zeroize_payload(&mut self) {
-        self.0.payload.zeroize();
+        self.envelope.payload.zeroize();
     }
 
     /// Consume the authenticated envelope and transfer its sensitive payload
     /// into an allocation that remains zeroizing at the next ownership layer.
     pub fn into_zeroizing_payload(mut self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(std::mem::take(&mut self.0.payload))
+        Zeroizing::new(std::mem::take(&mut self.envelope.payload))
     }
 }
 
@@ -2374,10 +2392,9 @@ impl GuardianReply {
         request: &AuthenticatedGuardianRequest,
     ) -> Result<(), GuardianProtocolError> {
         match self {
-            Self::InputReceipt { state, .. } => state.validate_for_input_bytes(
-                u32::try_from(request.payload.len())
-                    .map_err(|_| GuardianProtocolError::InvalidInputDisposition)?,
-            ),
+            Self::InputReceipt { state, .. } => {
+                state.validate_for_input_bytes(request.authenticated_payload_bytes())
+            }
             Self::InputEffect { state, .. } => {
                 let query = GuardianInputEffectQuery::decode(&request.payload)?;
                 state.validate_for_input_bytes(query.input_bytes)
@@ -5099,7 +5116,9 @@ pub fn decode_guardian_request(
         .ok_or(GuardianProtocolError::TruncatedFrame)?;
     secret.verify(&frame[..mac_start], &frame[mac_start..])?;
 
-    let payload_len = read_u32(frame, REQUEST_PAYLOAD_LENGTH_OFFSET)? as usize;
+    let authenticated_payload_bytes = read_u32(frame, REQUEST_PAYLOAD_LENGTH_OFFSET)?;
+    let payload_len = usize::try_from(authenticated_payload_bytes)
+        .map_err(|_| GuardianProtocolError::PayloadTooLarge)?;
     if payload_len > GUARDIAN_MAX_PAYLOAD_BYTES {
         return Err(GuardianProtocolError::PayloadTooLarge);
     }
@@ -5150,7 +5169,10 @@ pub fn decode_guardian_request(
         payload: payload.to_vec(),
     };
     validate_request_envelope(&request)?;
-    Ok(AuthenticatedGuardianRequest(request))
+    Ok(AuthenticatedGuardianRequest {
+        envelope: request,
+        authenticated_payload_bytes,
+    })
 }
 
 pub fn encode_guardian_response(
@@ -5827,8 +5849,31 @@ mod tests {
         let mut envelope = GuardianRequestEnvelope::new(header, sensitive.clone());
         assert_eq!(envelope.payload(), sensitive.as_slice());
 
-        let authenticated = authenticate(&envelope);
-        let transferred = authenticated.into_zeroizing_payload();
+        let mut authenticated = authenticate(&envelope);
+        assert_eq!(
+            authenticated.authenticated_payload_bytes(),
+            u32::try_from(sensitive.len()).unwrap()
+        );
+        authenticated.zeroize_payload();
+        assert!(authenticated.payload().is_empty());
+        assert_eq!(
+            GuardianResponseEnvelope::reply(
+                &authenticated,
+                &GuardianReply::InputReceipt {
+                    pane_id: id(4),
+                    generation: 1,
+                    sequence: 1,
+                    effect_id: id(5),
+                    state: InputEffectState::KnownNotApplied,
+                },
+            )
+            .unwrap()
+            .header()
+            .status,
+            GuardianResponseStatus::Success
+        );
+
+        let transferred = authenticate(&envelope).into_zeroizing_payload();
         assert_eq!(transferred.as_slice(), sensitive.as_slice());
 
         envelope.zeroize_payload();
@@ -7284,6 +7329,8 @@ mod tests {
             GuardianRejectionCode::InternalInvariant,
             GuardianRejectionCode::CheckpointOutcomeIndeterminate,
             GuardianRejectionCode::CheckpointIdentityMismatch,
+            GuardianRejectionCode::OwnedPanesPresent,
+            GuardianRejectionCode::InputKnownNotApplied,
         ];
         for code in all_codes {
             let response = GuardianResponseEnvelope::rejection(&authenticated_request, code);
@@ -8491,11 +8538,104 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn durable_partial_input_is_count_bound_and_exact_retries_never_reapply_prefix() {
+    fn terminal_capacity_exhaustion_never_yields_or_invokes_an_input_writer() {
         use crate::guardian_input_journal::{
-            GuardianInputDisposition, GuardianInputJournal, GuardianInputJournalLimits,
+            GuardianInputJournal, GuardianInputJournalError, GuardianInputJournalLimits,
             GuardianInputTransaction, GuardianInputTransactionError,
             begin_guardian_input_transaction,
+        };
+        use crate::guardian_output_journal::GuardianOutputCipher;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        struct CountingWriter {
+            calls: u32,
+        }
+
+        impl std::io::Write for CountingWriter {
+            fn write(&mut self, payload: &[u8]) -> std::io::Result<usize> {
+                self.calls = self.calls.saturating_add(1);
+                Ok(payload.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 6, 7),
+        )
+        .unwrap();
+        let input = request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(70),
+            Some(pane),
+            1,
+            1,
+            Some(id(71)),
+            b"x",
+        );
+        let authenticated_input = authenticate(&input);
+        let journal_temp = tempfile::tempdir().expect("create input journal tempdir");
+        let journal_path = journal_temp.path().join("input.journal");
+        let journal_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&journal_path)
+            .expect("create private input journal");
+        let defaults = GuardianInputJournalLimits::default();
+        let mut journal = GuardianInputJournal::create(
+            journal_file,
+            pane,
+            guardian,
+            GuardianOutputCipher::try_from_key_slice(&[0x92; 32])
+                .expect("valid journal fixture key"),
+            GuardianInputJournalLimits {
+                max_records: 2,
+                ..defaults
+            },
+        )
+        .expect("initialize capacity-negative journal");
+        journal
+            .sync_parent_directory_and_activate(
+                &std::fs::File::open(journal_temp.path()).expect("open journal directory"),
+            )
+            .expect("activate capacity-negative journal");
+
+        let protocol_before = state.clone();
+        let mut writer = CountingWriter { calls: 0 };
+        match begin_guardian_input_transaction(&mut state, &mut journal, &authenticated_input) {
+            Err(GuardianInputTransactionError::JournalBeforeWrite(
+                GuardianInputJournalError::RecordLimit { maximum: 2 },
+            )) => {}
+            Ok(GuardianInputTransaction::WriteAuthorized { permit, .. }) => {
+                let _outcome = permit.write_once(&mut writer, authenticated_input.payload());
+                panic!("terminal capacity exhaustion must not yield write authority");
+            }
+            other => panic!("unexpected capacity-negative outcome: {other:?}"),
+        }
+        assert_eq!(writer.calls, 0);
+        assert_eq!(journal.record_count(), 0);
+        assert_eq!(state, protocol_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_partial_input_is_count_bound_and_exact_retries_never_reapply_prefix() {
+        use crate::guardian_input_journal::{
+            GuardianInputJournal, GuardianInputJournalLimits, GuardianInputTransaction,
+            GuardianInputTransactionError, begin_guardian_input_transaction,
+            commit_guardian_input_outcome,
         };
         use crate::guardian_output_journal::GuardianOutputCipher;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -8548,9 +8688,10 @@ mod tests {
             .mode(0o600)
             .open(&journal_path)
             .expect("create private input journal");
-        let mut journal = GuardianInputJournal::open(
+        let mut journal = GuardianInputJournal::create(
             journal_file,
             pane,
+            guardian,
             GuardianOutputCipher::try_from_key_slice(&[0x91; 32])
                 .expect("valid journal fixture key"),
             GuardianInputJournalLimits::default(),
@@ -8599,17 +8740,9 @@ mod tests {
         let write_outcome = write_permit.write_once(&mut writer, authenticated_input.payload());
         assert_eq!(writer.calls, 1);
         assert_eq!(write_outcome.applied_bytes(), Some(3));
-        let terminal_permit = journal
-            .append_disposition_and_sync(
-                identity,
-                write_outcome
-                    .disposition()
-                    .expect("partial write has an exact disposition"),
-            )
-            .expect("persist exact partial result")
-            .into_terminal_protocol_permit()
-            .expect("partial result yields exact terminal permit");
-        let partial = terminal_permit.reconcile_protocol(&mut state).unwrap();
+        let completion = commit_guardian_input_outcome(&mut journal, write_outcome)
+            .expect("persist exact partial result");
+        let partial = completion.reconcile_protocol(&mut state).unwrap();
         assert_eq!(
             partial,
             GuardianReply::InputReceipt {

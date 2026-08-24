@@ -1,18 +1,20 @@
 //! Durable PTY-output and input-WAL ownership for the standalone guardian.
 //!
-//! The readiness thread never performs a journal `sync_all` itself. It hands
-//! one bounded, zeroizing plaintext allocation to this fixed worker pool and
-//! receives only a content-free append receipt after the encrypted journal
-//! record and its filesystem identity have been synchronized and rechecked.
-//! There is deliberately no plaintext getter or mux-delivery API here. Input
-//! WAL records retain only encrypted effect metadata, never raw input bytes.
+//! The steady-state PTY-output path hands one bounded, zeroizing plaintext
+//! allocation to this fixed worker pool and receives only a content-free append
+//! receipt after the encrypted journal record and its filesystem identity have
+//! been synchronized and rechecked. Spawn preparation still performs bounded
+//! filesystem publication before the child is admitted. There is deliberately
+//! no plaintext getter or mux-delivery API here. The live-input worker owns the
+//! per-pane encrypted WAL through the transaction wrappers below; the sole Mio
+//! readiness loop never calls synchronous journal or PTY-write operations.
 
 use crate::transport::provision_guardian_token_in_pinned_parent;
 use mio::Waker;
 use mux::guardian_input_journal::{
-    GuardianInputDisposition, GuardianInputJournal, GuardianInputJournalError,
+    GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
     GuardianInputJournalLimits, GuardianInputTransaction, GuardianInputTransactionError,
-    GuardianInputWriteOutcome, begin_guardian_input_transaction,
+    GuardianInputWriteOutcome, begin_guardian_input_transaction, commit_guardian_input_outcome,
     replay_guardian_input_without_writer,
 };
 use mux::guardian_output_journal::{
@@ -633,7 +635,8 @@ impl GuardianPaneOutputJournal {
     }
 }
 
-/// Descriptor-pinned encrypted input WAL for one live pane.
+/// Descriptor-pinned encrypted input WAL owned by the live-input worker while
+/// one transaction is in flight.
 pub(crate) struct GuardianPaneInputJournal {
     journal: GuardianInputJournal,
     directory: File,
@@ -682,8 +685,9 @@ impl GuardianPaneInputJournal {
         )
     }
 
-    /// Durably admit one exact input and yield write authority only for the
-    /// newly synchronized `AcceptedNotDurable` transition.
+    /// Worker-side primitive that durably admits one exact input and yields
+    /// write authority only for the newly synchronized `AcceptedNotDurable`
+    /// transition.
     pub(crate) fn begin_transaction(
         &mut self,
         protocol: &mut GuardianProtocolState,
@@ -751,27 +755,24 @@ impl GuardianPaneInputJournal {
         protocol: &mut GuardianProtocolState,
         outcome: GuardianInputWriteOutcome,
     ) -> Result<GuardianReply, GuardianPaneInputCompletionError> {
-        let disposition = outcome
-            .disposition()
-            .ok_or(GuardianPaneInputCompletionError::DispositionIndeterminate)?;
-        if matches!(
-            disposition,
-            GuardianInputDisposition::Intent | GuardianInputDisposition::AcceptedNotDurable
-        ) {
-            return Err(GuardianPaneInputCompletionError::DispositionIndeterminate);
-        }
         self.validate_path_authority()
             .map_err(|_| GuardianPaneInputCompletionError::Authority)?;
-        let append = self
-            .journal
-            .append_disposition_and_sync(outcome.identity(), disposition)
-            .map_err(|_| GuardianPaneInputCompletionError::Journal)?;
-        self.validate_path_authority()
-            .map_err(|_| GuardianPaneInputCompletionError::Authority)?;
-        let permit = append.into_terminal_protocol_permit().ok_or(
-            GuardianPaneInputCompletionError::Protocol,
+        let completion = commit_guardian_input_outcome(&mut self.journal, outcome).map_err(
+            |error| match error {
+                GuardianInputCompletionError::DispositionIndeterminate => {
+                    GuardianPaneInputCompletionError::DispositionIndeterminate
+                }
+                GuardianInputCompletionError::Journal(_) => {
+                    GuardianPaneInputCompletionError::Journal
+                }
+                GuardianInputCompletionError::StateInvariant => {
+                    GuardianPaneInputCompletionError::Protocol
+                }
+            },
         )?;
-        permit
+        self.validate_path_authority()
+            .map_err(|_| GuardianPaneInputCompletionError::Authority)?;
+        completion
             .reconcile_protocol(protocol)
             .map_err(|_| GuardianPaneInputCompletionError::Protocol)
     }
@@ -1051,9 +1052,11 @@ impl GuardianOutputPipeline {
         pane_journal_handle(authority)
     }
 
-    /// Create or reopen the empty encrypted WAL that will own input effects for
-    /// a newly spawned PTY. This is deliberately not restart recovery: any
-    /// committed input phase makes replacement-child creation ambiguous.
+    /// Prepare the empty encrypted WAL transferred into a newly spawned pane.
+    ///
+    /// This is not restart recovery: any existing journal, including a valid
+    /// header-only prefix, makes replacement-child creation ambiguous and is
+    /// withheld until a durable anti-rollback high-water authority exists.
     pub(crate) fn prepare_input(
         &self,
         guardian_incarnation: Uuid,
@@ -1071,17 +1074,20 @@ impl GuardianOutputPipeline {
             .try_clone()
             .map_err(|error| GuardianOutputError::io("input-directory-clone", error))?;
         let path = input_journal_path(&self.directory_path, guardian_incarnation, pane_id);
-        let file = match open_private_file_at(
+        let (file, created) = match open_private_file_at(
             &directory,
             &self.directory_path,
             &path,
             false,
         ) {
-            Ok(file) => file,
+            Ok(file) => (file, false),
             Err(GuardianOutputError::Io { source, .. })
                 if source.kind() == ErrorKind::NotFound =>
             {
-                create_private_file_new_at(&directory, &self.directory_path, &path)?
+                (
+                    create_private_file_new_at(&directory, &self.directory_path, &path)?,
+                    true,
+                )
             }
             Err(error) => return Err(error),
         };
@@ -1096,16 +1102,21 @@ impl GuardianOutputPipeline {
             &path,
             file_identity,
         )?;
-        let mut journal = GuardianInputJournal::open(
+        if !created {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian input WAL reopen requires durable anti-rollback authority",
+            ));
+        }
+        let mut journal = GuardianInputJournal::create(
             file,
             pane_id,
+            guardian_incarnation,
             self.cipher.clone(),
             GuardianInputJournalLimits::default(),
         )?;
         journal.sync_parent_directory_and_activate(&directory)?;
-        // An existing empty header may be the residue of a crash between file
-        // sync and directory sync. Re-synchronize the descriptor unconditionally
-        // before treating that path as active spawn authority.
+        // Synchronize the directory again after the journal header itself is
+        // durable, before treating this newly created path as spawn authority.
         directory
             .sync_all()
             .map_err(|error| GuardianOutputError::io("input-directory-sync", error))?;
@@ -1115,7 +1126,7 @@ impl GuardianOutputPipeline {
             || journal.is_poisoned()
         {
             return Err(GuardianOutputError::FilesystemAuthority(
-                "guardian input spawn retry found an ambiguous nonempty journal",
+                "new guardian input WAL initialized with unexpected state",
             ));
         }
         let input = GuardianPaneInputJournal {
@@ -3316,7 +3327,7 @@ mod tests {
     }
 
     #[test]
-    fn input_wal_allows_only_empty_spawn_retry_and_stays_out_of_output_namespace(
+    fn input_wal_reopen_is_withheld_without_anti_rollback_authority_and_stays_out_of_output_namespace(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-input-spawn-retry-",
@@ -3339,24 +3350,11 @@ mod tests {
 
         let first = pipeline.prepare_input(guardian_incarnation, pane_id)?;
         drop(first);
-        let mut retry = pipeline.prepare_input(guardian_incarnation, pane_id)?;
-        let payload = b"test";
-        let identity = mux::guardian_protocol::GuardianInputEffectIdentity::new(
-            pane_id,
-            Uuid::from_u128(0x73),
-            1,
-            1,
-            Uuid::from_u128(0x74),
-            u32::try_from(payload.len())?,
-            Sha256::digest(payload).into(),
-        )?;
-        retry.journal.append_intent_and_sync(identity)?;
-        drop(retry);
         assert!(
             pipeline
                 .prepare_input(guardian_incarnation, pane_id)
                 .is_err(),
-            "a committed input phase must block replacement-PTY spawn preparation"
+            "even a header-only reopen must be withheld without anti-rollback authority"
         );
         Ok(())
     }

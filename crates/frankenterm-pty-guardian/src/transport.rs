@@ -1,14 +1,19 @@
 //! Bounded authenticated Unix transport for the standalone PTY guardian.
 
 use crate::output::GuardianOutputPipeline;
-use crate::runtime::{GuardianRuntime, GuardianRuntimeConfig};
+use crate::runtime::{
+    GuardianInputRoute, GuardianInputSubmission, GuardianRuntime,
+    GuardianRuntimeConfig, GuardianRuntimeCounters,
+    GuardianRuntimeInputCompletionState,
+};
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_protocol::{
-    AuthenticatedGuardianRequest, GuardianCensusPageRequest, GuardianOperation,
-    GuardianProtocolError, GuardianReply, GuardianRequestEnvelope, GuardianRequestHeader,
-    GuardianRejectionCode, GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret,
-    GuardianResizePayload, GuardianSignal, GuardianSpawnPayload, GUARDIAN_AUTH_TOKEN_BYTES,
+    AuthenticatedGuardianRequest, GuardianCensusPageRequest, GuardianInputEffectQuery,
+    GuardianOperation, GuardianProtocolError, GuardianReply, GuardianRequestEnvelope,
+    GuardianRequestHeader, GuardianRejectionCode, GuardianResponseEnvelope,
+    GuardianResponseStatus, GuardianSecret, GuardianResizePayload, GuardianSignal,
+    GuardianSpawnPayload, InputEffectState, GUARDIAN_AUTH_TOKEN_BYTES,
     GUARDIAN_MAX_CENSUS_BYTES, GUARDIAN_MAX_CENSUS_ENTRIES, GUARDIAN_MAX_FRAME_BYTES,
     GUARDIAN_MAX_PANES, decode_guardian_request, decode_guardian_response,
     encode_guardian_request, encode_guardian_response,
@@ -192,28 +197,38 @@ struct ReadyEvent {
 
 struct Connection {
     stream: UnixStream,
+    generation: u64,
     read_buf: Zeroizing<Vec<u8>>,
     write_buf: Zeroizing<Vec<u8>>,
     write_offset: usize,
     mux_incarnation: Option<Uuid>,
     close_after_write: bool,
     guarded_stop_response: Option<GuardedStopAuthority>,
+    pending_input: Option<GuardianInputRoute>,
     accepted_at: Instant,
 }
 
 impl Connection {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: UnixStream, generation: u64) -> Self {
         Self {
             stream,
+            generation,
             read_buf: Zeroizing::new(Vec::new()),
             write_buf: Zeroizing::new(Vec::new()),
             write_offset: 0,
             mux_incarnation: None,
             close_after_write: false,
             guarded_stop_response: None,
+            pending_input: None,
             accepted_at: Instant::now(),
         }
     }
+}
+
+enum FrameProcessing {
+    Response(GuardianResponseEnvelope),
+    PendingInput,
+    Close,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,6 +330,7 @@ pub struct GuardianService {
     transport_failures: u64,
     lifecycle: GuardianLifecycle,
     output_completion_token: Token,
+    next_connection_generation: u64,
 }
 
 impl GuardianService {
@@ -345,6 +361,7 @@ impl GuardianService {
             config.max_output_bytes_per_pane,
             config.max_total_output_bytes,
             first_pty_token,
+            config.max_connections,
         )?;
         let output_completion_waker = Arc::new(
             Waker::new(poll.registry(), output_completion_token)
@@ -353,7 +370,7 @@ impl GuardianService {
         let output_pipeline = GuardianOutputPipeline::open(
             &config.token_path,
             config.max_panes,
-            output_completion_waker,
+            Arc::clone(&output_completion_waker),
         )
         .map_err(|_| GuardianServiceError::OutputInitialization)?;
         let runtime = GuardianRuntime::new(
@@ -363,6 +380,7 @@ impl GuardianService {
             runtime_config,
             Uuid::new_v4(),
             output_pipeline,
+            output_completion_waker,
         )?;
         let endpoint_capacity = config
             .max_connections
@@ -432,6 +450,7 @@ impl GuardianService {
             transport_failures: 0,
             lifecycle: GuardianLifecycle::Running,
             output_completion_token,
+            next_connection_generation: 1,
         })
     }
 
@@ -443,6 +462,12 @@ impl GuardianService {
     #[must_use]
     pub const fn transport_failures(&self) -> u64 {
         self.transport_failures
+    }
+
+    /// Content-free runtime counters suitable for operator health checks.
+    #[must_use]
+    pub const fn runtime_counters(&self) -> GuardianRuntimeCounters {
+        self.runtime.counters()
     }
 
     pub fn run_forever(&mut self) -> Result<(), GuardianServiceError> {
@@ -527,6 +552,7 @@ impl GuardianService {
                 }
             } else if event.token == self.output_completion_token {
                 self.runtime.handle_output_completions();
+                self.handle_input_completions();
             } else if self.runtime.owns_pty_token(event.token) {
                 if event.readable || event.closed {
                     self.runtime.handle_pty_ready(event.token);
@@ -539,6 +565,7 @@ impl GuardianService {
         // readiness batch makes completion application independent of the
         // number of worker wake calls represented by one poll event.
         self.runtime.handle_output_completions();
+        self.handle_input_completions();
         self.expire_unauthenticated_connections();
         self.runtime.reap_children_once();
         Ok(())
@@ -564,6 +591,12 @@ impl GuardianService {
                 self.transport_failures = self.transport_failures.saturating_add(1);
                 continue;
             };
+            let generation = self.next_connection_generation;
+            let Some(next_generation) = generation.checked_add(1) else {
+                self.free_connection_tokens.push(raw_token);
+                self.transport_failures = self.transport_failures.saturating_add(1);
+                continue;
+            };
             let token = Token(raw_token);
             if self
                 .poll
@@ -575,7 +608,9 @@ impl GuardianService {
                 self.transport_failures = self.transport_failures.saturating_add(1);
                 continue;
             }
-            self.connections.insert(token, Connection::new(stream));
+            self.next_connection_generation = next_generation;
+            self.connections
+                .insert(token, Connection::new(stream, generation));
         }
         Ok(())
     }
@@ -584,6 +619,15 @@ impl GuardianService {
         let Some(mut connection) = self.connections.remove(&event.token) else {
             return;
         };
+        if connection.pending_input.is_some() {
+            let keep = monitor_pending_input_connection(&mut connection, event);
+            if keep {
+                self.connections.insert(event.token, connection);
+            } else {
+                self.finish_connection(event.token, connection);
+            }
+            return;
+        }
         let mut keep = !event.closed;
         if keep && event.readable && connection.write_buf.is_empty() {
             keep = self.read_connection_frame(event.token, &mut connection);
@@ -627,20 +671,34 @@ impl GuardianService {
                             &mut connection.read_buf,
                             Zeroizing::new(Vec::new()),
                         );
-                        let Some(response) = self.process_frame(token, connection, &frame) else {
-                            return false;
+                        return match self.process_frame(token, connection, &frame) {
+                            FrameProcessing::Response(response) => {
+                                connection.write_buf =
+                                    match encode_guardian_response(&self.secret, &response) {
+                                        Ok(frame) => Zeroizing::new(frame),
+                                        Err(_) => return false,
+                                    };
+                                connection.write_offset = 0;
+                                self.poll
+                                    .registry()
+                                    .reregister(
+                                        &mut connection.stream,
+                                        token,
+                                        Interest::WRITABLE,
+                                    )
+                                    .is_ok()
+                            }
+                            FrameProcessing::PendingInput => self
+                                .poll
+                                .registry()
+                                .reregister(
+                                    &mut connection.stream,
+                                    token,
+                                    Interest::READABLE,
+                                )
+                                .is_ok(),
+                            FrameProcessing::Close => false,
                         };
-                        connection.write_buf =
-                            match encode_guardian_response(&self.secret, &response) {
-                                Ok(frame) => Zeroizing::new(frame),
-                                Err(_) => return false,
-                            };
-                        connection.write_offset = 0;
-                        return self
-                            .poll
-                            .registry()
-                            .reregister(&mut connection.stream, token, Interest::WRITABLE)
-                            .is_ok();
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
@@ -694,34 +752,50 @@ impl GuardianService {
         token: Token,
         connection: &mut Connection,
         frame: &[u8],
-    ) -> Option<GuardianResponseEnvelope> {
-        let mut request = decode_guardian_request(&self.secret, frame).ok()?;
-        let response = self.process_authenticated_frame(token, connection, &request);
-        request.zeroize_payload();
-        response
+    ) -> FrameProcessing {
+        let Ok(request) = decode_guardian_request(&self.secret, frame) else {
+            return FrameProcessing::Close;
+        };
+        self.process_authenticated_frame(token, connection, request)
     }
 
     fn process_authenticated_frame(
         &mut self,
         token: Token,
         connection: &mut Connection,
-        request: &AuthenticatedGuardianRequest,
-    ) -> Option<GuardianResponseEnvelope> {
+        mut request: AuthenticatedGuardianRequest,
+    ) -> FrameProcessing {
         if self.lifecycle.request_fence().is_err() {
             connection.close_after_write = true;
-            return Some(GuardianResponseEnvelope::rejection(
-                request,
+            let response = GuardianResponseEnvelope::rejection(
+                &request,
                 GuardianRejectionCode::InvalidRequest,
-            ));
+            );
+            request.zeroize_payload();
+            return FrameProcessing::Response(response);
         }
         match connection.mux_incarnation {
             None => {
                 if request.header().operation != GuardianOperation::Hello {
-                    return None;
+                    request.zeroize_payload();
+                    return FrameProcessing::Close;
                 }
-                let response = self.runtime.dispatch(request)?;
+                let Some(response) = self.runtime.dispatch(&request) else {
+                    request.zeroize_payload();
+                    return FrameProcessing::Close;
+                };
                 if response.header().status == GuardianResponseStatus::Success {
                     let mux_incarnation = request.header().mux_incarnation;
+                    if self
+                        .runtime
+                        .observe_connected_mux(mux_incarnation, connection.generation)
+                        .is_err()
+                    {
+                        self.transport_failures =
+                            self.transport_failures.saturating_add(1);
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    }
                     connection.mux_incarnation = Some(mux_incarnation);
                     let active = self
                         .active_mux_connections
@@ -731,20 +805,26 @@ impl GuardianService {
                 } else {
                     connection.close_after_write = true;
                 }
-                Some(response)
+                request.zeroize_payload();
+                FrameProcessing::Response(response)
             }
             Some(mux_incarnation) => {
                 if request.header().operation == GuardianOperation::Hello
                     || request.header().mux_incarnation != mux_incarnation
                 {
                     connection.close_after_write = true;
-                    return Some(GuardianResponseEnvelope::rejection(
-                        request,
+                    let response = GuardianResponseEnvelope::rejection(
+                        &request,
                         GuardianRejectionCode::InvalidRequest,
-                    ));
+                    );
+                    request.zeroize_payload();
+                    return FrameProcessing::Response(response);
                 }
                 if request.header().operation == GuardianOperation::GuardedStop {
-                    let effect_id = request.header().effect_id?;
+                    let Some(effect_id) = request.header().effect_id else {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    };
                     let authority = GuardedStopAuthority {
                         connection: token,
                         request_id: request.header().request_id,
@@ -754,17 +834,102 @@ impl GuardianService {
                         .lifecycle
                         .begin_guarded_stop(authority, self.runtime.pane_count())
                     {
-                        return Some(GuardianResponseEnvelope::rejection(request, code));
+                        let response =
+                            GuardianResponseEnvelope::rejection(&request, code);
+                        request.zeroize_payload();
+                        return FrameProcessing::Response(response);
                     }
                     connection.guarded_stop_response = Some(authority);
                     connection.close_after_write = true;
-                    return GuardianResponseEnvelope::reply(
-                        request,
+                    let response = GuardianResponseEnvelope::reply(
+                        &request,
                         &GuardianReply::GuardedStopAccepted,
-                    )
-                    .ok();
+                    );
+                    request.zeroize_payload();
+                    return match response {
+                        Ok(response) => FrameProcessing::Response(response),
+                        Err(_) => FrameProcessing::Close,
+                    };
                 }
-                self.runtime.dispatch(request)
+                if request.header().operation == GuardianOperation::Input {
+                    let Some(route) = request.header().effect_id.and_then(|effect_id| {
+                        GuardianInputRoute::new(
+                            token,
+                            connection.generation,
+                            request.header().request_id,
+                            effect_id,
+                        )
+                    }) else {
+                        let response = GuardianResponseEnvelope::rejection(
+                            &request,
+                            GuardianRejectionCode::InvalidRequest,
+                        );
+                        request.zeroize_payload();
+                        return FrameProcessing::Response(response);
+                    };
+                    return match self.runtime.submit_input(request, route) {
+                        GuardianInputSubmission::Pending => {
+                            connection.pending_input = Some(route);
+                            FrameProcessing::PendingInput
+                        }
+                        GuardianInputSubmission::Respond(response) => {
+                            FrameProcessing::Response(response)
+                        }
+                        GuardianInputSubmission::CloseRetryably => FrameProcessing::Close,
+                    };
+                }
+                let response = self.runtime.dispatch(&request);
+                request.zeroize_payload();
+                match response {
+                    Some(response) => FrameProcessing::Response(response),
+                    None => FrameProcessing::Close,
+                }
+            }
+        }
+    }
+
+    fn handle_input_completions(&mut self) {
+        loop {
+            let completion = match self.runtime.try_input_completion() {
+                GuardianRuntimeInputCompletionState::Ready(completion) => completion,
+                GuardianRuntimeInputCompletionState::Empty
+                | GuardianRuntimeInputCompletionState::Disconnected => break,
+            };
+            let token = completion.route.connection_token;
+            let Some(mut connection) = self.connections.remove(&token) else {
+                // The originating peer disconnected. Runtime restoration and
+                // deferred final-lease retirement already happened before this
+                // routing step; never redirect the result to a recycled token.
+                continue;
+            };
+            if !pending_input_route_matches(
+                connection.generation,
+                connection.pending_input,
+                completion.route,
+            ) {
+                self.connections.insert(token, connection);
+                continue;
+            }
+            connection.pending_input = None;
+            let Some(response) = completion.response else {
+                self.finish_connection(token, connection);
+                continue;
+            };
+            let Ok(frame) = encode_guardian_response(&self.secret, &response) else {
+                self.finish_connection(token, connection);
+                continue;
+            };
+            connection.write_buf = Zeroizing::new(frame);
+            connection.write_offset = 0;
+            if self
+                .poll
+                .registry()
+                .reregister(&mut connection.stream, token, Interest::WRITABLE)
+                .is_ok()
+            {
+                self.connections.insert(token, connection);
+            } else {
+                self.finish_connection(token, connection);
             }
         }
     }
@@ -791,7 +956,7 @@ impl GuardianService {
             self.active_mux_connections.remove(&mux_incarnation);
             if self
                 .runtime
-                .retire_disconnected_mux(mux_incarnation)
+                .retire_disconnected_mux(mux_incarnation, connection.generation)
                 .is_err()
             {
                 self.transport_failures = self.transport_failures.saturating_add(1);
@@ -822,6 +987,40 @@ impl GuardianService {
             }
         }
     }
+}
+
+fn monitor_pending_input_connection(
+    connection: &mut Connection,
+    event: ReadyEvent,
+) -> bool {
+    if event.closed {
+        return false;
+    }
+    if !event.readable {
+        return true;
+    }
+    // One connection carries one request at a time. Readability while its
+    // input is pending therefore means EOF or forbidden pipelining; either way
+    // close the transport identity while the worker safely finishes the exact
+    // durable disposition.
+    let mut probe = Zeroizing::new([0_u8; 1]);
+    loop {
+        match connection.stream.read(&mut probe[..]) {
+            Ok(_) => return false,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+fn pending_input_route_matches(
+    connection_generation: u64,
+    pending_input: Option<GuardianInputRoute>,
+    completion: GuardianInputRoute,
+) -> bool {
+    connection_generation == completion.connection_generation
+        && matches!(pending_input, Some(pending) if pending == completion)
 }
 
 /// Blocking client used by mux integration and real-service lifetime tests.
@@ -941,6 +1140,65 @@ impl GuardianClient {
             Vec::new(),
         );
         self.exchange(request)
+    }
+
+    /// Apply one bounded input effect through the guardian's durable
+    /// intent/write/disposition transaction. A terminal
+    /// `InputKnownNotApplied` rejection proves that zero bytes reached the PTY;
+    /// callers may choose a new effect identity, but an exact retry remains
+    /// inert and returns the same terminal result.
+    pub fn input(
+        &mut self,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        request_id: Uuid,
+        effect_id: Uuid,
+        payload: Vec<u8>,
+    ) -> Result<GuardianReply, GuardianClientError> {
+        let request = self.request(
+            GuardianOperation::Input,
+            request_id,
+            Some(pane_id),
+            generation,
+            sequence,
+            Some(effect_id),
+            payload,
+        );
+        self.exchange(request)
+    }
+
+    /// Reconcile one prior input effect without retaining or retransmitting its
+    /// plaintext. The query contains only the original sequence, byte length,
+    /// and authenticated SHA-256 commitment; the exact effect ID and lease
+    /// generation prevent a result from being borrowed across mutations.
+    /// After an earlier exchange returns an I/O error, use a newly connected
+    /// client: the old framed stream may contain a delayed reply and is not a
+    /// safe reconciliation channel.
+    pub fn query_input_effect(
+        &mut self,
+        pane_id: Uuid,
+        generation: u64,
+        request_id: Uuid,
+        effect_id: Uuid,
+        query: GuardianInputEffectQuery,
+    ) -> Result<InputEffectState, GuardianClientError> {
+        let request = self.request(
+            GuardianOperation::QueryInputEffect,
+            request_id,
+            Some(pane_id),
+            generation,
+            0,
+            Some(effect_id),
+            query.encode().to_vec(),
+        );
+        match self.exchange(request)? {
+            GuardianReply::InputEffect {
+                effect_id: returned_effect_id,
+                state,
+            } if returned_effect_id == effect_id => Ok(state),
+            _ => Err(GuardianClientError::UnexpectedReply),
+        }
     }
 
     pub fn resize(
@@ -1167,11 +1425,13 @@ impl GuardianClient {
         &mut self,
         mut request: GuardianRequestEnvelope,
     ) -> Result<GuardianReply, GuardianClientError> {
-        let frame = Zeroizing::new(encode_guardian_request(&self.secret, &request)?);
+        let mut frame = Zeroizing::new(encode_guardian_request(&self.secret, &request)?);
         request.zeroize_payload();
-        let authenticated: AuthenticatedGuardianRequest =
+        let mut authenticated: AuthenticatedGuardianRequest =
             decode_guardian_request(&self.secret, &frame)?;
+        retire_authenticated_input_plaintext(&mut authenticated);
         self.stream.write_all(&frame)?;
+        frame.as_mut_slice().zeroize();
         let response_frame = read_blocking_frame(&mut self.stream)?;
         let response = decode_guardian_response(&self.secret, &response_frame)?;
         let correlated = response.correlate(authenticated.header())?;
@@ -1186,6 +1446,18 @@ impl GuardianClient {
                 .typed_reply(&authenticated)
                 .map_err(GuardianClientError::from),
         }
+    }
+}
+
+/// Input is the uniquely sensitive operation whose reply contract retains its
+/// authenticated byte length independently of plaintext. Wipe that decoded
+/// copy before the potentially blocking socket write; other operations retain
+/// their bounded payload until typed reply validation consumes
+/// operation-specific query fields. The encoded frame is independently wiped
+/// immediately after the kernel accepts it.
+fn retire_authenticated_input_plaintext(authenticated: &mut AuthenticatedGuardianRequest) {
+    if authenticated.header().operation == GuardianOperation::Input {
+        authenticated.zeroize_payload();
     }
 }
 
@@ -2417,6 +2689,7 @@ fn require_same_object(left: &Metadata, right: &Metadata) -> Result<(), Guardian
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
     use std::os::unix::fs::symlink;
 
     fn authority(connection: usize, request: u128, effect: u128) -> GuardedStopAuthority {
@@ -2446,6 +2719,221 @@ mod tests {
             );
         }
         assert_eq!(partition_endpoint_tokens(usize::MAX), None);
+    }
+
+    #[test]
+    fn delayed_input_completion_cannot_route_to_a_recycled_connection_token() {
+        let original = GuardianInputRoute::new(
+            Token(7),
+            11,
+            Uuid::from_u128(12),
+            Uuid::from_u128(13),
+        )
+        .unwrap();
+        let recycled = GuardianInputRoute::new(
+            Token(7),
+            12,
+            Uuid::from_u128(12),
+            Uuid::from_u128(13),
+        )
+        .unwrap();
+        let aliased_request = GuardianInputRoute::new(
+            Token(7),
+            11,
+            Uuid::from_u128(14),
+            Uuid::from_u128(13),
+        )
+        .unwrap();
+        let aliased_effect = GuardianInputRoute::new(
+            Token(7),
+            11,
+            Uuid::from_u128(12),
+            Uuid::from_u128(15),
+        )
+        .unwrap();
+
+        assert!(pending_input_route_matches(11, Some(original), original));
+        assert!(!pending_input_route_matches(12, Some(recycled), original));
+        assert!(!pending_input_route_matches(
+            11,
+            Some(aliased_request),
+            original,
+        ));
+        assert!(!pending_input_route_matches(
+            11,
+            Some(aliased_effect),
+            original,
+        ));
+        assert!(!pending_input_route_matches(11, None, original));
+        assert!(GuardianInputRoute::new(
+            Token(7),
+            0,
+            Uuid::from_u128(12),
+            Uuid::from_u128(13),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn input_plaintext_can_die_before_write_without_losing_reply_validation() {
+        let secret =
+            GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
+        let pane_id = Uuid::from_u128(21);
+        let request_id = Uuid::from_u128(22);
+        let effect_id = Uuid::from_u128(23);
+        let payload = b"erase-before-socket-write".to_vec();
+        let payload_bytes = u32::try_from(payload.len()).unwrap();
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::Input,
+                Uuid::from_u128(24),
+                Uuid::from_u128(25),
+                request_id,
+                Some(pane_id),
+                3,
+                7,
+                Some(effect_id),
+                &payload,
+            ),
+            payload,
+        );
+        let mut frame =
+            Zeroizing::new(encode_guardian_request(&secret, &request).unwrap());
+        let frame_bytes = frame.len();
+        let mut authenticated = decode_guardian_request(&secret, &frame).unwrap();
+
+        retire_authenticated_input_plaintext(&mut authenticated);
+        assert!(authenticated.payload().is_empty());
+        assert_eq!(authenticated.authenticated_payload_bytes(), payload_bytes);
+
+        let reply = GuardianReply::InputReceipt {
+            pane_id,
+            generation: 3,
+            sequence: 7,
+            effect_id,
+            state: InputEffectState::DurableFull,
+        };
+        let response = GuardianResponseEnvelope::reply(&authenticated, &reply)
+            .expect("retained authenticated length validates the Input receipt");
+        let response_frame = encode_guardian_response(&secret, &response).unwrap();
+        let decoded = decode_guardian_response(&secret, &response_frame).unwrap();
+        let correlated = decoded.correlate(authenticated.header()).unwrap();
+        assert_eq!(correlated.success_reply(&authenticated).unwrap(), reply);
+
+        frame.as_mut_slice().zeroize();
+        assert_eq!(frame.len(), frame_bytes);
+        assert!(frame.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn query_payload_survives_until_its_typed_reply_is_validated() {
+        let secret =
+            GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
+        let effect_id = Uuid::from_u128(31);
+        let query = GuardianInputEffectQuery::new(
+            8,
+            9,
+            Sha256::digest(b"forgotten-input").into(),
+        )
+        .unwrap();
+        let encoded_query = query.encode();
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::QueryInputEffect,
+                Uuid::from_u128(32),
+                Uuid::from_u128(33),
+                Uuid::from_u128(34),
+                Some(Uuid::from_u128(35)),
+                4,
+                0,
+                Some(effect_id),
+                &encoded_query,
+            ),
+            encoded_query.to_vec(),
+        );
+        let frame = encode_guardian_request(&secret, &request).unwrap();
+        let mut authenticated = decode_guardian_request(&secret, &frame).unwrap();
+
+        retire_authenticated_input_plaintext(&mut authenticated);
+        assert_eq!(authenticated.payload(), encoded_query.as_slice());
+        GuardianResponseEnvelope::reply(
+            &authenticated,
+            &GuardianReply::InputEffect {
+                effect_id,
+                state: InputEffectState::DurablePrefix { applied_bytes: 5 },
+            },
+        )
+        .expect("query plaintext remains until operation-specific validation");
+    }
+
+    #[test]
+    fn client_query_input_effect_round_trips_typed_plaintext_free_state() {
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        client_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+
+        let secret_bytes = [0x5a; GUARDIAN_AUTH_TOKEN_BYTES];
+        let guardian_incarnation = Uuid::from_u128(41);
+        let mux_incarnation = Uuid::from_u128(42);
+        let pane_id = Uuid::from_u128(43);
+        let request_id = Uuid::from_u128(44);
+        let effect_id = Uuid::from_u128(45);
+        let query = GuardianInputEffectQuery::new(
+            12,
+            16,
+            Sha256::digest(b"input-no-longer-retained").into(),
+        )
+        .unwrap();
+        let expected_state = InputEffectState::DurablePrefix { applied_bytes: 6 };
+        let server = std::thread::spawn(move || {
+            let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
+            let frame = read_blocking_frame(&mut server_stream).unwrap();
+            let request = decode_guardian_request(&secret, &frame).unwrap();
+            assert_eq!(request.header().operation, GuardianOperation::QueryInputEffect);
+            assert_eq!(request.header().guardian_incarnation, guardian_incarnation);
+            assert_eq!(request.header().mux_incarnation, mux_incarnation);
+            assert_eq!(request.header().request_id, request_id);
+            assert_eq!(request.header().pane_id, Some(pane_id));
+            assert_eq!(request.header().lease_generation, 5);
+            assert_eq!(request.header().lease_sequence, 0);
+            assert_eq!(request.header().effect_id, Some(effect_id));
+            assert_eq!(request.payload(), query.encode().as_slice());
+
+            let response = GuardianResponseEnvelope::reply(
+                &request,
+                &GuardianReply::InputEffect {
+                    effect_id,
+                    state: expected_state,
+                },
+            )
+            .unwrap();
+            let frame = encode_guardian_response(&secret, &response).unwrap();
+            server_stream.write_all(&frame).unwrap();
+        });
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes(secret_bytes).unwrap(),
+            mux_incarnation,
+            guardian_incarnation,
+        };
+
+        assert_eq!(
+            client
+                .query_input_effect(pane_id, 5, request_id, effect_id, query)
+                .unwrap(),
+            expected_state
+        );
+        server.join().expect("query test server exits cleanly");
     }
 
     #[test]

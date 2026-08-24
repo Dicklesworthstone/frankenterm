@@ -6,14 +6,18 @@
 //! handles when the last authenticated connection for a mux incarnation goes
 //! away. Raw PTY output is encrypted and synchronized by a fixed bounded worker
 //! pool before the readiness loop records a content-free durable receipt or
-//! rearms that pane. Input is admitted through a per-pane encrypted WAL and an
-//! exact one-shot PTY-write permit; ambiguous acceptance is never replayed.
-//! Output delivery/replay, checkpoint publication, guardian crash recovery,
-//! and automated mux migration remain intentionally rejected until their
-//! durable mechanisms are integrated. The service can be stopped through an
-//! authenticated guarded transaction only while it owns no panes; a successful
-//! stop deliberately retains the socket path, so restart remains fail-closed
-//! until an explicit non-overwriting retirement design lands.
+//! rearms that pane. Live `Input` requests run through a fixed bounded worker:
+//! the guardian synchronizes durable intent before granting one PTY-write
+//! permit, then synchronizes the terminal disposition before replying. A caller
+//! that loses the reply can query the exact effect by its sequence, byte length,
+//! and authenticated SHA-256 commitment without retaining plaintext. Output
+//! delivery/replay, checkpoint publication, guardian crash recovery, durable
+//! same-incarnation WAL reopening, and automated mux migration remain
+//! intentionally rejected until their anti-rollback and recovery authorities
+//! are integrated. The service can be stopped through an authenticated guarded
+//! transaction only while it owns no panes; a successful stop deliberately
+//! retains the socket path, so restart remains fail-closed until an explicit
+//! non-overwriting retirement design lands.
 
 #[cfg(unix)]
 mod output;
@@ -24,6 +28,8 @@ pub mod transport;
 
 #[cfg(unix)]
 pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};
+#[cfg(unix)]
+pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
 #[cfg(unix)]
 pub use transport::{
     GuardianClient, GuardianClientError, GuardianProbeReport, GuardianService,

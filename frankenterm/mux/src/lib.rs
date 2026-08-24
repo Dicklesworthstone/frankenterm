@@ -111,7 +111,7 @@ use std::num::NonZeroU64;
 #[cfg(windows)]
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
@@ -1449,6 +1449,77 @@ pub struct DomainOperationGuard {
     /// it optional makes that order explicit instead of relying on Rust's field
     /// destruction after the custom destructor returns.
     registration: Option<Arc<LiveDomainRegistration>>,
+}
+
+/// Opaque process-owned authority retained while an explicitly requested
+/// spawn is using a detachable domain.
+///
+/// The mux deliberately does not know how a GUI persists reconnect intent.
+/// A GUI-installed [`DomainSpawnLifecycle`] implementation returns one of
+/// these leases after attach has completed and durable persistence has either
+/// completed or been handed to a worker retained by the same lifecycle lane;
+/// the mux then holds the lease through the corresponding pane spawn. A
+/// headless mux installs no implementation and keeps its in-memory behavior.
+pub trait DomainSpawnLifecycleLease: Send {}
+
+/// Exact spawn-domain authority plus an optional frontend lifecycle lease.
+///
+/// Construction is mux-owned so an installed lifecycle implementation can
+/// enrich, but cannot replace, the exact [`DomainOperationGuard`] selected by
+/// the originating spawn request.
+#[must_use = "prepared spawn-domain authority must be retained through the spawn"]
+pub struct PreparedDomainSpawn {
+    domain: DomainOperationGuard,
+    _lifecycle: Option<Box<dyn DomainSpawnLifecycleLease>>,
+}
+
+impl PreparedDomainSpawn {
+    fn new(domain: DomainOperationGuard) -> Self {
+        Self {
+            domain,
+            _lifecycle: None,
+        }
+    }
+
+    /// Retain the frontend's exact lifecycle transaction through the spawn.
+    pub fn with_lifecycle(
+        mut self,
+        lifecycle: Box<dyn DomainSpawnLifecycleLease>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self._lifecycle.is_none(),
+            "spawn-domain lifecycle authority was installed more than once"
+        );
+        self._lifecycle = Some(lifecycle);
+        Ok(self)
+    }
+}
+
+impl std::ops::Deref for PreparedDomainSpawn {
+    type Target = DomainOperationGuard;
+
+    fn deref(&self) -> &Self::Target {
+        &self.domain
+    }
+}
+
+/// Optional frontend policy for an implicit detachable-domain attach caused
+/// by a spawn request.
+///
+/// Inputs are owned so an implementation can move the complete transaction to
+/// a cancellation-safe local worker.  It must return the same
+/// [`PreparedDomainSpawn`] value enriched with a lifecycle lease; its private
+/// domain field prevents selector substitution or generation redirection.
+pub trait DomainSpawnLifecycle: Send + Sync {
+    fn prepare<'a>(
+        &'a self,
+        mux: Arc<Mux>,
+        domain: PreparedDomainSpawn,
+        owner_client_id: Option<Arc<ClientId>>,
+        window_id: Option<WindowId>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<PreparedDomainSpawn>> + 'a>,
+    >;
 }
 
 impl std::fmt::Debug for DomainOperationGuard {
@@ -8855,6 +8926,10 @@ pub struct Mux {
     domain_registrations_by_name: RwLock<HashMap<String, Arc<LiveDomainRegistration>>>,
     domain_registration: Mutex<()>,
     domain_owner_identity: Arc<()>,
+    /// Optional frontend-owned persistence transaction for implicit attaches
+    /// caused by spawn operations.  This is per-mux rather than process-global
+    /// so test muxes and headless servers cannot inherit GUI policy.
+    domain_spawn_lifecycle: OnceLock<Arc<dyn DomainSpawnLifecycle>>,
     domain_retirements: Arc<DomainRetirementTracker>,
     pending_domain_retirements: Mutex<PendingDomainRetirements>,
     domain_retirement_wakeup: Arc<DomainRetirementWakeup>,
@@ -10302,6 +10377,7 @@ impl Mux {
             domain_registrations_by_name: RwLock::new(domain_registrations_by_name),
             domain_registration: Mutex::new(()),
             domain_owner_identity: Arc::new(()),
+            domain_spawn_lifecycle: OnceLock::new(),
             domain_retirements: Arc::new(DomainRetirementTracker::default()),
             pending_domain_retirements: Mutex::new(PendingDomainRetirements::default()),
             domain_retirement_wakeup: Arc::new(DomainRetirementWakeup::default()),
@@ -19014,6 +19090,53 @@ impl Mux {
         Ok(self.domain_operation_guard_from_acquired_registration(registration))
     }
 
+    /// Install the first frontend lifecycle policy for implicit domain
+    /// attaches on this exact mux.  Later installation attempts are harmless:
+    /// the process-lifetime authority that admitted the first request remains
+    /// in force and cannot be replaced during a config reload.
+    pub fn install_domain_spawn_lifecycle(
+        &self,
+        lifecycle: Arc<dyn DomainSpawnLifecycle>,
+    ) {
+        let _ = self.domain_spawn_lifecycle.set(lifecycle);
+    }
+
+    /// Prepare an exact domain for a spawn, retaining any frontend lifecycle
+    /// lease until the caller drops the returned authority after the spawn.
+    ///
+    /// Detachable domains are handed to the optional GUI policy before the
+    /// final state check.  That policy serializes with explicit detach, then
+    /// rechecks and performs attach plus either durable intent recording or a
+    /// retained handoff of that recording under one lane. Headless muxes
+    /// install no policy and retain the historical in-memory attach behavior.
+    async fn prepare_domain_for_spawn(
+        self: &Arc<Self>,
+        domain: DomainOperationGuard,
+        owner_client_id: Option<Arc<ClientId>>,
+        window_id: Option<WindowId>,
+    ) -> anyhow::Result<PreparedDomainSpawn> {
+        let prepared = PreparedDomainSpawn::new(domain);
+        if prepared.detachable() {
+            if let Some(lifecycle) = self.domain_spawn_lifecycle.get() {
+                let prepared = lifecycle
+                    .prepare(Arc::clone(self), prepared, owner_client_id, window_id)
+                    .await?;
+                anyhow::ensure!(
+                    prepared._lifecycle.is_some(),
+                    "installed spawn-domain lifecycle returned without retaining its authority"
+                );
+                return Ok(prepared);
+            }
+        }
+
+        if prepared.state() == DomainState::Detached {
+            prepared
+                .attach(self, owner_client_id, window_id)
+                .await?;
+        }
+        Ok(prepared)
+    }
+
     /// Resolve one spawn selector and acquire its non-cloneable exact
     /// generation lease in the same serialized registration cut.
     pub fn resolve_spawn_tab_domain(
@@ -19238,11 +19361,13 @@ impl Mux {
         // spawn is outstanding. Final commit reacquires exact authority.
         drop(target_operation);
 
-        if domain.state() == DomainState::Detached {
-            domain
-                .attach(self, owner_client_id.clone(), Some(target.window_id()))
-                .await?;
-        }
+        let domain = self
+            .prepare_domain_for_spawn(
+                domain,
+                owner_client_id.clone(),
+                Some(target.window_id()),
+            )
+            .await?;
         if owner_client_id
             .as_ref()
             .is_some_and(|client_id| !self.client_registration_is_current(client_id))
@@ -19359,11 +19484,9 @@ impl Mux {
             .resolve_spawn_tab_domain_for_operation(&target, &domain)
             .context("resolve_spawn_tab_domain")?;
 
-        if domain.state() == DomainState::Detached {
-            domain
-                .attach(self, owner_client_id, Some(window_id))
-                .await?;
-        }
+        let domain = self
+            .prepare_domain_for_spawn(domain, owner_client_id, Some(window_id))
+            .await?;
 
         let command_dir = self.resolve_cwd(
             command_dir,
@@ -19403,11 +19526,9 @@ impl Mux {
         let domain = self
             .resolve_spawn_tab_domain_for_operation(&target, &domain)
             .context("resolve_spawn_tab_domain")?;
-        if domain.state() == DomainState::Detached {
-            domain
-                .attach(self, owner_client_id, Some(window_id))
-                .await?;
-        }
+        let domain = self
+            .prepare_domain_for_spawn(domain, owner_client_id, Some(window_id))
+            .await?;
         domain
             .split_pane_moved(self, &target, &source, request)
             .await
@@ -19855,11 +19976,9 @@ impl Mux {
             (*window_builder, size)
         };
 
-        if domain.state() == DomainState::Detached {
-            domain
-                .attach(self, owner_client_id, Some(window_id))
-                .await?;
-        }
+        let domain = self
+            .prepare_domain_for_spawn(domain, owner_client_id, Some(window_id))
+            .await?;
 
         let cwd = self.resolve_cwd(
             command_dir,
