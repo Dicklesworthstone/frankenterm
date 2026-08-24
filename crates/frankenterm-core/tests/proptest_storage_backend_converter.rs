@@ -11,10 +11,10 @@
 //!    converter regression that depended on real `query_map_strings`
 //!    formatting (NULL handling, numeric stringification,
 //!    `rowid` ordering) was invisible.
-//! 2. The mock implemented `begin_transaction` as a hard error,
-//!    so transaction-aware converter code paths (the wired-pass
-//!    is expected to wrap large copies in a transaction) could
-//!    not be exercised end-to-end.
+//! 2. The mock had no usable scoped-transaction path, so
+//!    transaction-aware converter code (the wired pass is expected
+//!    to wrap large copies in `with_transaction`) could not be
+//!    exercised end-to-end.
 //!
 //! The migration here uses `RusqliteBackend::open(":memory:", &OpenConfig::default())`
 //! which is the exact substrate type production code wraps a

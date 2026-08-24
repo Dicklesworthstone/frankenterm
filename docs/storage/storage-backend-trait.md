@@ -43,8 +43,15 @@ Either way, the work pays for itself.
   - `backend_name()` for diagnostics.
 - **`StorageBackendFactory`** — separate trait carrying the `open()` constructor, kept off `StorageBackend` so the latter stays object-safe.
 - **`OpenConfig`** — common open-time knobs (read-only, WAL, page size hint).
-- **`BackendError`** — common error surface (Connect / Query / TxPoisoned / Schema / Other).
-- **`StorageTransaction`** — exclusive transaction handle passed to `with_transaction` closures. Automatically commits on `Ok` and rolls back on `Err` or panic.
+- **`BackendError`** — common error surface, including explicit busy,
+  transaction-boundary-loss, callback-contract, and persistent poison states.
+- **`StorageTransaction`** — exclusive transaction handle passed to
+  `with_transaction` closures. The backend commits on `Ok`, rolls back on
+  `Err` or panic, and verifies SQLite returned to autocommit before reuse.
+  SQLite's authorizer rejects callback-issued `BEGIN`, `COMMIT`, `ROLLBACK`,
+  `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO` at parser level. If SQLite itself
+  ends the transaction (for example, `INSERT OR ROLLBACK`), the handle records
+  sticky boundary loss and rejects every later callback operation.
 - **`RusqliteBackend`** — the wired persistent implementation and factory over
   a real `rusqlite::Connection`; the remaining extraction work is threading
   more of `storage.rs` through this boundary.
@@ -55,9 +62,11 @@ Either way, the work pays for itself.
 - **Refactor of storage.rs.** storage.rs is large and uses
   `rusqlite::Connection` directly throughout. Threading the trait through every
   call site is a multi-week refactor filed as **`wa-2l27x.8.cont.extract`**.
-- **Real `FrankenSQLiteBackend` impl.** Blocked on one-runtime dependency
-  convergence and exclusive transaction ownership. Filed as
-  **`wa-2l27x.8.cont.frankensqlite`**.
+- **Real `FrankenSQLiteBackend` impl.** The feature-gated type is deliberately
+  a `NOT_WIRED` compile-time scaffold; every operation except
+  `backend_name()` fails. Runtime integration remains blocked on one-runtime
+  dependency convergence and native exclusive transaction ownership. Filed
+  as **`wa-2l27x.8.cont.frankensqlite`**.
 - **Side-by-side benchmarks.** Per the bead's task #4, requires both impls. Filed as **`wa-2l27x.8.cont.benchmarks`**.
 - **rusqlite → frankensqlite migration tool.** Per the bead's task #5. Filed as **`wa-2l27x.8.cont.migration_tool`**.
 
@@ -93,8 +102,10 @@ needs:
 - Read scalar values — covered by `query_scalar` (the
   full row-mapper extension lands under cont.extract when
   storage.rs starts being threaded through).
-- Begin / commit / rollback transactions — covered by
-  `TransactionGuard`.
+- Execute an exclusive scoped transaction — covered by
+  `with_transaction` / `with_transaction_dyn` and the borrowed
+  `StorageTransaction` handle. The callback never owns the connection itself
+  and cannot finish the backend-owned outer boundary.
 - Schema versioning — covered by `user_version` /
   `set_user_version`.
 
@@ -102,6 +113,22 @@ cont.extract will extend the trait as it threads storage.rs
 through — adding `prepare(sql) -> Statement`, `Row` accessors,
 parameter binding traits, etc. The substrate is the *floor*, not
 the ceiling.
+
+### Transaction proof boundary
+
+The scoped transaction API is synchronous. It provides exactly-once callback
+invocation, fail-fast reentrancy rejection, parser-authoritative transaction
+control fencing, commit/rollback finalization, panic cleanup and rethrow, and
+persistent quarantine when cleanup cannot prove autocommit. It does **not**
+claim async cancellation safety: a thread or process can still be interrupted
+outside Rust's unwind path.
+
+The general `execute` and `execute_batch` methods intentionally still expose
+raw transaction-control SQL outside a scoped callback because existing
+storage migration and recovery code uses that surface. Backend-wide ownership
+of those legacy controls is separate follow-up work; callers must not infer
+that `with_transaction` serializes an independently opened SQLite connection
+or survives process death.
 
 ## Tests
 
@@ -112,8 +139,14 @@ Representative tests in `storage_backend_trait::tests` include:
 | `trait_is_dyn_safe` | `Box<dyn StorageBackend>` compiles + dispatches. |
 | `mock_records_executed_statements` | The mock log captures every `execute` call in order. |
 | `execute_batch_splits_on_semicolons` | Migration scripts decompose correctly. |
-| `transaction_commit_records_committed_state` | `commit()` issues `COMMIT` + flips `last_tx_committed`. |
-| `transaction_drop_rolls_back_when_not_committed` | RAII guard rolls back on Drop without `commit()`. |
+| `transaction_commit_records_committed_state` | Callback success commits and updates the mock witness. |
+| `transaction_error_rolls_back_when_not_committed` | Callback error rolls back before returning. |
+| `transaction_panic_rolls_back_and_resumes_unwind` | Panic cleanup precedes resuming the original payload. |
+| `rusqlite_transaction_authorizer_denies_control_sql_and_rolls_back_prior_writes` | SQLite's parser, not string matching, fences transaction-control variants and comments. |
+| `rusqlite_automatic_rollback_is_sticky_and_blocks_later_callback_writes` | Automatic boundary loss prevents an autocommit suffix. |
+| `rusqlite_deferred_constraint_commit_failure_rolls_back_and_reuses_connection` | Failed `COMMIT` is cleaned up and the proven-autocommit connection is reusable. |
+| `rusqlite_rollback_failure_quarantines_every_connection_surface` | Failed cleanup permanently fences the unsafe connection. |
+| `rusqlite_backend_transaction_rejects_joined_child_reentrancy_without_deadlock` | A callback-spawned worker fails fast instead of deadlocking on the held connection. |
 | `user_version_round_trips` | Schema-version probe + setter agree. |
 | `open_config_defaults_to_wal_mode_writable` | Defaults match the bead's stated migration target. |
 | `backend_error_renders_each_variant` | `Display` impl renders every variant with the `storage backend` prefix. |

@@ -3006,16 +3006,6 @@ impl EffectFingerprint {
             payload_sha256: request.header.payload_sha256,
         })
     }
-
-    fn matches_input_identity(&self, identity: GuardianInputEffectIdentity) -> bool {
-        self.operation == GuardianOperation::Input
-            && self.pane_id == identity.pane_id()
-            && self.mux_incarnation == identity.mux_incarnation()
-            && self.lease_generation == identity.generation()
-            && self.lease_sequence == identity.sequence()
-            && self.payload_bytes == identity.input_bytes()
-            && self.payload_sha256 == identity.payload_sha256()
-    }
 }
 impl std::fmt::Debug for EffectFingerprint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

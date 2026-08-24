@@ -2818,47 +2818,282 @@ mod tests {
     }
 
     #[test]
-    fn rusqlite_backend_transaction_rejects_concurrent_interleaving_then_reuses() {
+    fn rusqlite_transaction_authorizer_denies_control_sql_and_rolls_back_prior_writes() {
+        for control_sql in [
+            "/* leading comment */ COMMIT",
+            "-- leading comment\nROLLBACK",
+            "END TRANSACTION",
+            "BEGIN IMMEDIATE",
+            "SAVEPOINT nested",
+            "RELEASE SAVEPOINT nested",
+            "ROLLBACK TO SAVEPOINT nested",
+        ] {
+            let backend = open_memory();
+            backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+
+            let result = backend.with_transaction(|tx| {
+                tx.execute("INSERT INTO t VALUES (1)")?;
+                tx.execute(control_sql)?;
+                tx.execute("INSERT INTO t VALUES (2)")?;
+                Ok(())
+            });
+
+            assert!(
+                matches!(result, Err(BackendError::Query(_))),
+                "SQLite's parser must deny transaction control `{control_sql}`: {result:?}"
+            );
+            assert_eq!(
+                backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+                Some("0"),
+                "a denied `{control_sql}` must roll back writes that preceded it"
+            );
+
+            backend.execute("INSERT INTO t VALUES (3)").unwrap();
+            assert_eq!(
+                backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+                Some("1"),
+                "ordinary SQL must remain usable after denying `{control_sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rusqlite_transaction_batch_cannot_rollback_then_write_in_autocommit() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let result = backend.with_transaction(|tx| {
+            tx.execute_batch(
+                "INSERT INTO t VALUES (1); ROLLBACK; INSERT INTO t VALUES (2);",
+            )?;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(BackendError::Query(_))));
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("0"),
+            "the batch prefix must be rolled back and its suffix must never reach autocommit"
+        );
+    }
+
+    #[test]
+    fn rusqlite_transaction_cached_control_statement_cannot_bypass_authorizer() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        {
+            let conn = backend.conn.lock().unwrap();
+            let statement = conn
+                .prepare_cached("COMMIT")
+                .expect("prime transaction-control statement cache before installing authorizer");
+            drop(statement);
+        }
+
+        let result = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)")?;
+            tx.execute("COMMIT")?;
+            tx.execute("INSERT INTO t VALUES (2)")?;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(BackendError::Query(_))));
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn rusqlite_automatic_rollback_is_sticky_and_blocks_later_callback_writes() {
+        let backend = open_memory();
+        backend
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        backend.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let result = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (2)")?;
+            assert!(matches!(
+                tx.execute("INSERT OR ROLLBACK INTO t VALUES (1)"),
+                Err(BackendError::Query(_))
+            ));
+            assert!(matches!(
+                tx.execute("INSERT INTO t VALUES (3)"),
+                Err(BackendError::TransactionBoundaryLost)
+            ));
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(BackendError::TransactionBoundaryLost)
+        ));
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("1"),
+            "SQLite's automatic rollback must discard the earlier callback write"
+        );
+        backend.execute("INSERT INTO t VALUES (4)").unwrap();
+    }
+
+    #[test]
+    fn rusqlite_deferred_constraint_commit_failure_rolls_back_and_reuses_connection() {
+        let backend = open_memory();
+        backend
+            .execute_batch(
+                "PRAGMA foreign_keys = ON; \
+                 CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+                 CREATE TABLE child (parent_id INTEGER, \
+                     FOREIGN KEY(parent_id) REFERENCES parent(id) \
+                     DEFERRABLE INITIALLY DEFERRED);",
+            )
+            .unwrap();
+
+        let result = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO child VALUES (99)")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(BackendError::Query(_))));
+        assert_eq!(
+            backend
+                .query_scalar("SELECT COUNT(*) FROM child")
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+
+        backend.execute("INSERT INTO parent VALUES (99)").unwrap();
+        backend.execute("INSERT INTO child VALUES (99)").unwrap();
+    }
+
+    #[test]
+    fn rusqlite_rollback_failure_quarantines_every_connection_surface() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        backend.inject_next_rollback_failure();
+
+        let result = backend.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)")?;
+            Err::<(), _>(BackendError::Other("force rollback".into()))
+        });
+        assert!(matches!(result, Err(BackendError::TxPoisoned)));
+
+        assert!(matches!(
+            backend.execute("INSERT INTO t VALUES (2)"),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.execute_batch("SELECT 1;"),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.query_scalar("SELECT COUNT(*) FROM t"),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.transaction_state(),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.user_version(),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.set_user_version(1),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.with_transaction(|_tx| Ok::<(), BackendError>(())),
+            Err(BackendError::TxPoisoned)
+        ));
+        assert!(matches!(
+            backend.with_connection(rusqlite::Connection::is_autocommit),
+            Err(BackendError::TxPoisoned)
+        ));
+
+        let reclaim = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = backend.into_connection();
+        }));
+        assert!(reclaim.is_err(), "quarantined connection must not escape");
+    }
+
+    #[test]
+    fn rusqlite_rollback_failure_during_panic_preserves_payload_and_quarantines() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        backend.inject_next_rollback_failure();
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = backend.with_transaction::<(), _>(|tx| {
+                tx.execute("INSERT INTO t VALUES (1)")?;
+                panic!("original transaction panic payload");
+            });
+        }));
+        let payload = panic_result.expect_err("callback panic must resume");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("original transaction panic payload")
+        );
+        assert!(matches!(
+            backend.query_scalar("SELECT COUNT(*) FROM t"),
+            Err(BackendError::TxPoisoned)
+        ));
+    }
+
+    #[test]
+    fn rusqlite_backend_transaction_rejects_same_thread_reentrancy_then_reuses() {
+        let backend = open_memory();
+        backend
+            .execute("CREATE TABLE t (id INTEGER, origin TEXT)")
+            .unwrap();
+
+        backend
+            .with_transaction(|tx| {
+                tx.execute("INSERT INTO t VALUES (1, 'transaction')")?;
+                assert!(matches!(
+                    backend.execute("INSERT INTO t VALUES (2, 'reentrant')"),
+                    Err(BackendError::TransactionBusy)
+                ));
+                tx.execute("INSERT INTO t VALUES (3, 'transaction')")?;
+                Ok(())
+            })
+            .unwrap();
+
+        backend
+            .execute("INSERT INTO t VALUES (4, 'post_transaction')")
+            .unwrap();
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn rusqlite_backend_transaction_rejects_joined_child_reentrancy_without_deadlock() {
         let backend = Arc::new(open_memory());
         backend
             .execute("CREATE TABLE t (id INTEGER, origin TEXT)")
             .unwrap();
 
-        let b1 = Arc::clone(&backend);
-        let b2 = Arc::clone(&backend);
-
-        let barrier_start = Arc::new(std::sync::Barrier::new(2));
-        let barrier_step = Arc::new(std::sync::Barrier::new(2));
-
-        let bs1 = Arc::clone(&barrier_start);
-        let bst1 = Arc::clone(&barrier_step);
-
-        let t1 = std::thread::spawn(move || {
-            bs1.wait();
-            b1.with_transaction(|tx| {
-                tx.execute("INSERT INTO t VALUES (1, 'tx1_step1')")?;
-                bst1.wait();
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                tx.execute("INSERT INTO t VALUES (2, 'tx1_step2')")?;
+        let child_backend = Arc::clone(&backend);
+        backend
+            .with_transaction(|tx| {
+                tx.execute("INSERT INTO t VALUES (1, 'tx_step1')")?;
+                let child = std::thread::spawn(move || {
+                    child_backend.execute("INSERT INTO t VALUES (100, 'child')")
+                });
+                assert!(matches!(
+                    child.join().expect("joined child must not panic"),
+                    Err(BackendError::TransactionBusy)
+                ));
+                tx.execute("INSERT INTO t VALUES (2, 'tx_step2')")?;
                 Ok(())
             })
-        });
-
-        let bs2 = Arc::clone(&barrier_start);
-        let bst2 = Arc::clone(&barrier_step);
-
-        let t2 = std::thread::spawn(move || {
-            bs2.wait();
-            bst2.wait();
-            b2.execute("INSERT INTO t VALUES (100, 'concurrent_stmt')")
-        });
-
-        t1.join().unwrap().unwrap();
-        let concurrent_result = t2.join().unwrap();
-        assert!(matches!(
-            concurrent_result,
-            Err(BackendError::TransactionBusy)
-        ));
+            .unwrap();
 
         assert_eq!(
             backend.transaction_state().unwrap(),
@@ -2873,9 +3108,9 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], "1");
-        assert_eq!(rows[0][1], "tx1_step1");
+        assert_eq!(rows[0][1], "tx_step1");
         assert_eq!(rows[1][0], "2");
-        assert_eq!(rows[1][1], "tx1_step2");
+        assert_eq!(rows[1][1], "tx_step2");
         assert_eq!(rows[2][0], "100");
         assert_eq!(rows[2][1], "post_transaction");
     }
