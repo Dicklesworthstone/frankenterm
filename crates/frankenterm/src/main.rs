@@ -79707,15 +79707,17 @@ fn validate_process_family_byte_receipt(
 }
 
 const REMOTE_GENERATION_MANIFEST_SCHEMA: &str =
-    "frankenterm.remote-process-family-generation.v1";
+    "frankenterm.remote-process-family-generation.v2";
 const REMOTE_GENERATION_MANIFEST_FILE: &str = "manifest.json";
 const REMOTE_GENERATION_FT_FILE: &str = "ft";
 const REMOTE_GENERATION_MUX_FILE: &str = "frankenterm-mux-server";
+const REMOTE_GENERATION_LIFETIME_LEASE_FILE: &str = ".lifetime-lease.v1";
 const REMOTE_GENERATION_MANIFEST_MAX_BYTES: u64 = 16 * 1024;
 const REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE: u32 = 0o700;
 const REMOTE_GENERATION_DIRECTORY_MODE: u32 = 0o500;
 const REMOTE_GENERATION_BINARY_MODE: u32 = 0o500;
 const REMOTE_GENERATION_MANIFEST_MODE: u32 = 0o400;
+const REMOTE_GENERATION_LIFETIME_LEASE_MODE: u32 = 0o600;
 const REMOTE_GENERATION_LOCK_MODE: u32 = 0o600;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const REMOTE_GENERATION_SELECTOR_ARTIFACT_MAX_BYTES: usize = 64;
@@ -79787,12 +79789,20 @@ struct RemoteGenerationComponentManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct RemoteGenerationLifetimeLeaseManifest {
+    filename: String,
+    byte_len: u64,
+    mode: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RemoteGenerationManifest {
     schema: String,
     generation_id: String,
     codec_version: u64,
     ft: RemoteGenerationComponentManifest,
     mux_server: RemoteGenerationComponentManifest,
+    lifetime_lease: RemoteGenerationLifetimeLeaseManifest,
 }
 
 #[derive(serde::Serialize)]
@@ -79801,6 +79811,7 @@ struct RemoteGenerationIdMaterial<'a> {
     codec_version: u64,
     ft: &'a RemoteGenerationComponentManifest,
     mux_server: &'a RemoteGenerationComponentManifest,
+    lifetime_lease: &'a RemoteGenerationLifetimeLeaseManifest,
 }
 
 impl RemoteGenerationManifest {
@@ -79825,12 +79836,18 @@ impl RemoteGenerationManifest {
             mode: REMOTE_GENERATION_BINARY_MODE,
             build_identity: RemoteGenerationBuildIdentity::from(&family.mux_server.identity),
         };
+        let lifetime_lease = RemoteGenerationLifetimeLeaseManifest {
+            filename: REMOTE_GENERATION_LIFETIME_LEASE_FILE.to_string(),
+            byte_len: 0,
+            mode: REMOTE_GENERATION_LIFETIME_LEASE_MODE,
+        };
         let mut manifest = Self {
             schema: REMOTE_GENERATION_MANIFEST_SCHEMA.to_string(),
             generation_id: String::new(),
             codec_version,
             ft,
             mux_server,
+            lifetime_lease,
         };
         manifest.generation_id = manifest.recompute_generation_id()?;
         manifest.validate()?;
@@ -79843,6 +79860,7 @@ impl RemoteGenerationManifest {
             codec_version: self.codec_version,
             ft: &self.ft,
             mux_server: &self.mux_server,
+            lifetime_lease: &self.lifetime_lease,
         };
         let bytes = serialize_json_bounded(
             &material,
@@ -79882,6 +79900,12 @@ impl RemoteGenerationManifest {
             REMOTE_GENERATION_MUX_FILE,
             REMOTE_GENERATION_BINARY_MODE,
         )?;
+        anyhow::ensure!(
+            self.lifetime_lease.filename == REMOTE_GENERATION_LIFETIME_LEASE_FILE
+                && self.lifetime_lease.byte_len == 0
+                && self.lifetime_lease.mode == REMOTE_GENERATION_LIFETIME_LEASE_MODE,
+            "remote generation manifest has an invalid lifetime-lease authority"
+        );
         anyhow::ensure!(
             self.ft.build_identity == self.mux_server.build_identity,
             "remote generation manifest mixes build identities"
@@ -80667,7 +80691,7 @@ fn read_remote_generation_manifest(
         &bytes,
         REMOTE_GENERATION_MANIFEST_MAX_BYTES,
     )
-    .context("generation manifest does not use the one canonical v1 encoding")?;
+    .context("generation manifest does not use the one canonical v2 encoding")?;
     Ok(manifest)
 }
 
@@ -80797,6 +80821,96 @@ fn write_remote_generation_manifest(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn open_verified_remote_generation_lifetime_lease(
+    directory: &cap_std::fs::Dir,
+    lease: &RemoteGenerationLifetimeLeaseManifest,
+    effective_uid: u32,
+    expected_device: u64,
+) -> anyhow::Result<cap_std::fs::File> {
+    anyhow::ensure!(
+        lease.filename == REMOTE_GENERATION_LIFETIME_LEASE_FILE
+            && lease.byte_len == 0
+            && lease.mode == REMOTE_GENERATION_LIFETIME_LEASE_MODE,
+        "generation lifetime-lease manifest is not canonical"
+    );
+    let filename = Path::new(&lease.filename);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = directory.open_with(filename, &options).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot open generation lifetime lease without following links: {error}"
+        )
+    })?;
+    validate_remote_generation_file_metadata(
+        directory,
+        filename,
+        &file,
+        lease.mode,
+        Some(lease.byte_len),
+        effective_uid,
+        expected_device,
+    )?;
+    Ok(file)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn write_remote_generation_lifetime_lease(
+    stage: &cap_std::fs::Dir,
+    lease: &RemoteGenerationLifetimeLeaseManifest,
+    effective_uid: u32,
+    stage_device: u64,
+) -> anyhow::Result<()> {
+    use cap_std::fs::OpenOptionsExt as _;
+    use cap_std::fs::PermissionsExt as _;
+
+    anyhow::ensure!(
+        lease.filename == REMOTE_GENERATION_LIFETIME_LEASE_FILE
+            && lease.byte_len == 0
+            && lease.mode == REMOTE_GENERATION_LIFETIME_LEASE_MODE,
+        "generation lifetime-lease manifest is not canonical"
+    );
+    let filename = Path::new(&lease.filename);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .mode(lease.mode);
+    let file = stage.open_with(filename, &options).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot create generation lifetime lease without overwriting: {error}"
+        )
+    })?;
+    file.set_permissions(cap_std::fs::Permissions::from_mode(lease.mode))?;
+    file.sync_all()
+        .context("cannot synchronize generation lifetime lease")?;
+    validate_remote_generation_file_metadata(
+        stage,
+        filename,
+        &file,
+        lease.mode,
+        Some(lease.byte_len),
+        effective_uid,
+        stage_device,
+    )?;
+    sync_capability_directory(stage)?;
+    let verified = open_verified_remote_generation_lifetime_lease(
+        stage,
+        lease,
+        effective_uid,
+        stage_device,
+    )?;
+    let created = DiagnosticFileSnapshot::capture_cap(&file.metadata()?)?;
+    let reopened = DiagnosticFileSnapshot::capture_cap(&verified.metadata()?)?;
+    anyhow::ensure!(
+        created == reopened,
+        "generation lifetime lease changed identity while it was durabilized"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn remote_generation_directory_inventory(
     directory: &cap_std::fs::Dir,
 ) -> anyhow::Result<BTreeSet<String>> {
@@ -80850,13 +80964,14 @@ fn verify_remote_generation_directory(
         "immutable generation",
     )?;
     let expected_names = BTreeSet::from([
+        REMOTE_GENERATION_LIFETIME_LEASE_FILE.to_string(),
         REMOTE_GENERATION_FT_FILE.to_string(),
         REMOTE_GENERATION_MANIFEST_FILE.to_string(),
         REMOTE_GENERATION_MUX_FILE.to_string(),
     ]);
     anyhow::ensure!(
         remote_generation_directory_inventory(&directory)? == expected_names,
-        "immutable generation directory does not contain exactly ft, mux, and manifest"
+        "immutable generation directory does not contain exactly lifetime lease, ft, mux, and manifest"
     );
     let manifest = read_remote_generation_manifest(
         &directory,
@@ -80887,6 +81002,12 @@ fn verify_remote_generation_directory(
         effective_uid,
         generations_device,
     )?;
+    drop(open_verified_remote_generation_lifetime_lease(
+        &directory,
+        &manifest.lifetime_lease,
+        effective_uid,
+        generations_device,
+    )?);
     anyhow::ensure!(
         remote_generation_directory_inventory(&directory)? == expected_names,
         "immutable generation directory changed while it was verified"
@@ -81999,6 +82120,12 @@ fn publish_remote_process_family_generation(
         run_verified_remote_generation_mux_version(
             &stage,
             &manifest,
+            effective_uid,
+            stage_device,
+        )?;
+        write_remote_generation_lifetime_lease(
+            &stage,
+            &manifest.lifetime_lease,
             effective_uid,
             stage_device,
         )?;
@@ -100146,8 +100273,14 @@ log_level = "debug"
         assert_eq!(first.schema, REMOTE_GENERATION_MANIFEST_SCHEMA);
         assert_eq!(first.ft.filename, REMOTE_GENERATION_FT_FILE);
         assert_eq!(first.mux_server.filename, REMOTE_GENERATION_MUX_FILE);
+        assert_eq!(
+            first.lifetime_lease.filename,
+            REMOTE_GENERATION_LIFETIME_LEASE_FILE
+        );
         assert_eq!(first.ft.mode, 0o500);
         assert_eq!(first.mux_server.mode, 0o500);
+        assert_eq!(first.lifetime_lease.mode, 0o600);
+        assert_eq!(first.lifetime_lease.byte_len, 0);
         assert_eq!(first.codec_version, u64::try_from(codec::CODEC_VERSION).unwrap());
         let canonical = first.canonical_bytes().unwrap();
         assert_eq!(canonical.last(), Some(&b'\n'));
@@ -100166,6 +100299,18 @@ log_level = "debug"
         );
         let changed = RemoteGenerationManifest::from_process_family(&changed).unwrap();
         assert_ne!(first.generation_id, changed.generation_id);
+
+        let mut rejected_legacy = first.clone();
+        rejected_legacy.schema =
+            "frankenterm.remote-process-family-generation.v1".to_string();
+        rejected_legacy.generation_id = rejected_legacy.recompute_generation_id().unwrap();
+        assert!(rejected_legacy.validate().is_err());
+
+        let mut rejected_lease = first.clone();
+        rejected_lease.lifetime_lease.mode = 0o400;
+        rejected_lease.generation_id = rejected_lease.recompute_generation_id().unwrap();
+        assert_ne!(first.generation_id, rejected_lease.generation_id);
+        assert!(rejected_lease.validate().is_err());
     }
 
     #[test]
@@ -100270,6 +100415,49 @@ log_level = "debug"
             .status()
             .expect("run substituted ambient path negative control");
         assert_eq!(ambient_status.code(), Some(73));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn remote_generation_rejects_legacy_three_file_inventory_without_lifetime_lease() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create legacy generation fixture");
+        let root_path = fixture.path().join("process-family");
+        let effective_uid = remote_generation_effective_uid();
+        let (_root, generations) = open_remote_generation_root(&root_path, effective_uid)
+            .expect("open generation fixture root");
+        let generation_id = "a".repeat(64);
+        let generation_path = root_path.join("generations").join(&generation_id);
+        std::fs::create_dir(&generation_path).expect("create legacy generation directory");
+        for (filename, mode) in [
+            (REMOTE_GENERATION_FT_FILE, REMOTE_GENERATION_BINARY_MODE),
+            (REMOTE_GENERATION_MUX_FILE, REMOTE_GENERATION_BINARY_MODE),
+            (
+                REMOTE_GENERATION_MANIFEST_FILE,
+                REMOTE_GENERATION_MANIFEST_MODE,
+            ),
+        ] {
+            let path = generation_path.join(filename);
+            std::fs::write(&path, b"legacy-v1").expect("write legacy generation entry");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set legacy generation entry mode");
+        }
+        std::fs::set_permissions(
+            &generation_path,
+            std::fs::Permissions::from_mode(REMOTE_GENERATION_DIRECTORY_MODE),
+        )
+        .expect("seal legacy generation directory");
+
+        let error = verify_remote_generation_directory(
+            &generations,
+            &generation_id,
+            false,
+            None,
+            effective_uid,
+        )
+        .expect_err("a managed generation without a lifetime lease must fail closed");
+        assert!(error.to_string().contains("lifetime lease"));
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -100612,6 +100800,7 @@ log_level = "debug"
             0o500
         );
         for (filename, mode) in [
+            (REMOTE_GENERATION_LIFETIME_LEASE_FILE, 0o600),
             (REMOTE_GENERATION_FT_FILE, 0o500),
             (REMOTE_GENERATION_MUX_FILE, 0o500),
             (REMOTE_GENERATION_MANIFEST_FILE, 0o400),
@@ -100620,6 +100809,9 @@ log_level = "debug"
             assert!(metadata.is_file());
             assert_eq!(metadata.nlink(), 1);
             assert_eq!(metadata.permissions().mode() & 0o7777, mode);
+            if filename == REMOTE_GENERATION_LIFETIME_LEASE_FILE {
+                assert_eq!(metadata.len(), 0);
+            }
         }
 
         let current = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {

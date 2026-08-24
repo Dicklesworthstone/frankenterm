@@ -233,10 +233,16 @@ impl GuardianCheckpointStageStoreError {
 }
 
 pub(crate) enum GuardianCheckpointOriginAuthority<'a> {
+    /// A nonconstructible live-capture authority plus independent recovery of
+    /// the exact output-journal receipt named by the canonical descriptor.
+    /// A wire descriptor or caller-supplied receipt is never sufficient.
     Record {
         journal: &'a GuardianPaneOutputJournal,
         manifest_authority: GuardianCheckpointValidatedManifestAuthorityV1,
     },
+    /// Genesis remains unavailable until Spawn retains and transports the
+    /// guardian-issued permit needed to mint this opaque authority. A raw
+    /// effect UUID is deliberately not accepted here.
     Genesis {
         manifest_authority: GuardianCheckpointValidatedManifestAuthorityV1,
     },
@@ -2219,7 +2225,7 @@ fn checkpoint_validate_exact_chunk_retry(
     publication_id: Uuid,
     index: u32,
     offset: u64,
-    expected_plaintext: &[u8],
+    expected_plaintext: Zeroizing<Vec<u8>>,
 ) -> Result<(), GuardianCheckpointStageStoreError> {
     let mut matching = census.entries.iter().filter(|entry| {
         entry.key == shape.key()
@@ -2239,7 +2245,10 @@ fn checkpoint_validate_exact_chunk_retry(
         .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
     let (context, observed_plaintext) =
         checkpoint_open_record(inner, entry, max_plaintext_bytes)?;
-    let expected_context = GuardianCheckpointStageRecordContextV1::chunk(
+    if !checkpoint_bytes_match(observed_plaintext.as_slice(), expected_plaintext.as_slice()) {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let expected_intent = GuardianCheckpointStageSealIntentV1::chunk(
         &shape.binding,
         shape.upload_id,
         publication_id,
@@ -2247,9 +2256,7 @@ fn checkpoint_validate_exact_chunk_retry(
         offset,
         expected_plaintext,
     )?;
-    if !checkpoint_context_public_identity_matches(&context, &expected_context)
-        || !checkpoint_bytes_match(observed_plaintext.as_slice(), expected_plaintext)
-    {
+    if !checkpoint_context_public_identity_matches(&context, &expected_intent.context()) {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
     Ok(())
@@ -2291,20 +2298,21 @@ fn checkpoint_assemble_payload(
         let expected_bytes_u32 = u32::try_from(expected_bytes)
             .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
         let (context, chunk) = checkpoint_open_record(inner, entry, expected_bytes_u32)?;
-        let expected_context = GuardianCheckpointStageRecordContextV1::chunk(
+        if u64::try_from(chunk.len()).ok() != Some(expected_bytes) {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        payload.extend_from_slice(chunk.as_slice());
+        let expected_intent = GuardianCheckpointStageSealIntentV1::chunk(
             &shape.binding,
             shape.upload_id,
             publication_id,
             index,
             offset,
-            chunk.as_slice(),
+            chunk,
         )?;
-        if !checkpoint_context_public_identity_matches(&context, &expected_context)
-            || u64::try_from(chunk.len()).ok() != Some(expected_bytes)
-        {
+        if !checkpoint_context_public_identity_matches(&context, &expected_intent.context()) {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
-        payload.extend_from_slice(chunk.as_slice());
     }
     if payload.len() != payload_bytes {
         payload.zeroize();
@@ -5485,7 +5493,7 @@ mod tests {
     #[test]
     fn checkpoint_stage_torn_seal_is_quarantined_without_hiding_other_uploads(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, _poll, pipeline) = pipeline_with_policy(
+        let (directory, poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-seal-cut-",
             OutputSegmentPolicy::production(),
         )?;
@@ -5531,6 +5539,13 @@ mod tests {
         torn.sync_all()?;
         store.inner.directory.sync_all()?;
         drop(torn);
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+
+        let (_reopened_poll, reopened_pipeline) =
+            reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
+        let store = reopened_pipeline.checkpoint_stage_store();
         assert!(matches!(
             store.apply_begin(&begin),
             Err(GuardianCheckpointStageStoreError::Poisoned)
