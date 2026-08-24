@@ -3314,6 +3314,37 @@ mod tests {
     }
 
     #[test]
+    fn guardian_client_source_wires_plaintext_retirement_before_blocking_boundaries() {
+        let source = include_str!("transport.rs");
+        let exchange_source = source
+            .split("    fn exchange(")
+            .nth(1)
+            .and_then(|source| source.split("/// Input is the uniquely sensitive").next())
+            .expect("GuardianClient::exchange production body is present");
+        let boundary = |needle: &str| {
+            exchange_source
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing production exchange boundary: {needle}"))
+        };
+        let ordered_boundaries = [
+            boundary("let encoded = encode_guardian_request"),
+            boundary("request.zeroize_payload();"),
+            boundary("Zeroizing::new(encoded?)"),
+            boundary("drop(request);"),
+            boundary("decode_guardian_request"),
+            boundary("retire_authenticated_input_plaintext(&mut authenticated);"),
+            boundary("self.stream.write_all(&frame)?;"),
+            boundary("frame.as_mut_slice().zeroize();"),
+            boundary("read_blocking_frame(&mut self.stream)?"),
+        ];
+
+        assert!(
+            ordered_boundaries.windows(2).all(|pair| pair[0] < pair[1]),
+            "owned request, decoded Input, and encoded frame must die before their next blocking boundary"
+        );
+    }
+
+    #[test]
     fn production_input_exchange_validates_reply_after_both_plaintext_copies_die() {
         let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
         client_stream
@@ -3335,12 +3366,30 @@ mod tests {
         let request_id = Uuid::from_u128(34);
         let effect_id = Uuid::from_u128(35);
         let wipe_probe = Arc::new(ClientRequestWipeProbe::default());
+        let server_wipe_probe = Arc::clone(&wipe_probe);
         let server = std::thread::spawn(move || {
             let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
             let frame = read_blocking_frame(&mut server_stream).unwrap();
             let request = decode_guardian_request(&secret, &frame).unwrap();
             assert_eq!(request.header().operation, GuardianOperation::Input);
             assert_eq!(request.authenticated_payload_bytes(), 23);
+            let wipe_deadline = Instant::now() + Duration::from_secs(3);
+            while (!server_wipe_probe
+                .authenticated_input_wipe
+                .load(Ordering::SeqCst)
+                || !server_wipe_probe
+                    .encoded_frame_wipe
+                    .load(Ordering::SeqCst))
+                && Instant::now() < wipe_deadline
+            {
+                std::thread::yield_now();
+            }
+            assert!(
+                server_wipe_probe
+                    .authenticated_input_wipe
+                    .load(Ordering::SeqCst)
+            );
+            assert!(server_wipe_probe.encoded_frame_wipe.load(Ordering::SeqCst));
             let response = GuardianResponseEnvelope::reply(
                 &request,
                 &GuardianReply::InputReceipt {
