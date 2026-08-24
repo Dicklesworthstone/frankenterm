@@ -204,7 +204,11 @@ fn main() {
     // Retain the static build fence through LTO/strip.  Package verification
     // can therefore reject stale mux servers without starting one.
     std::hint::black_box(FT_ATOMIC_COMPONENT_MARKER);
-    if let Err(err) = run() {
+    // Process-level ownership is intentional: listener threads and blob-lease
+    // cleanup can remain active after `run` returns. A managed generation must
+    // therefore stay pinned through cleanup, error reporting, and termination.
+    let mut generation_lifetime = None;
+    if let Err(err) = run(&mut generation_lifetime) {
         wezterm_blob_leases::clear_storage();
         log::error!("{:#}", err);
         std::process::exit(1);
@@ -212,12 +216,23 @@ fn main() {
     wezterm_blob_leases::clear_storage();
 }
 
-fn run() -> anyhow::Result<()> {
+fn run(
+    generation_lifetime: &mut Option<GenerationLifetimeLease>,
+) -> anyhow::Result<()> {
     //stats::Stats::init()?;
     config::designate_this_as_the_main_thread();
     let _saver = umask::UmaskSaver::new();
 
     let opts = Opt::parse();
+
+    // The daemonizing parent never owns mux state. Every foreground process
+    // and daemon re-exec child acquires before configuration or any other
+    // fallible initialization, then transfers the guard into `main`'s scope.
+    if !opts.daemonize {
+        let lease = GenerationLifetimeLease::acquire_for_current_process()
+            .context("acquire mux managed-generation lifetime authority")?;
+        *generation_lifetime = Some(lease);
+    }
 
     config::common_init(
         opts.config_file.as_ref(),
@@ -237,13 +252,12 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // A daemonized parent returns above without ever becoming a mux owner; its
-    // re-exec child reaches this point and acquires independently. Keep this
-    // RAII value in `run` so a managed server holds its shared generation
-    // lifetime lease from before listener creation through graceful shutdown.
-    let generation_lifetime = GenerationLifetimeLease::acquire_for_current_process()
-        .context("acquire mux managed-generation lifetime authority")?;
-    if let Some(metadata) = generation_lifetime.metadata() {
+    // The daemon re-exec child has `daemonize=false`, so it populated the slot
+    // before initialization above. Log only content-free readiness metadata.
+    if let Some(metadata) = generation_lifetime
+        .as_ref()
+        .and_then(GenerationLifetimeLease::metadata)
+    {
         log::info!(
             "frankenterm-mux-server-generation-lifetime-ready generation={} generations_dev={} generations_ino={} generation_dev={} generation_ino={} lease_dev={} lease_ino={} executable_dev={} executable_ino={}",
             metadata.generation_id(),

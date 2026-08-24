@@ -232,6 +232,10 @@ impl GuardianCheckpointStageStoreError {
     }
 }
 
+// Phase A constructs the durable store but deliberately does not route wire
+// requests into it until the runtime supplies the non-forgeable authority
+// boundary required by final publication.
+#[allow(dead_code)]
 pub(crate) enum GuardianCheckpointOriginAuthority<'a> {
     /// A nonconstructible live-capture authority plus independent recovery of
     /// the exact output-journal receipt named by the canonical descriptor.
@@ -1044,6 +1048,7 @@ impl GuardianPaneOutputJournal {
     }
 }
 
+#[allow(dead_code)]
 impl GuardianCheckpointStageStore {
     fn open(
         directory: &File,
@@ -1490,7 +1495,13 @@ fn checkpoint_candidate_path(
     inner: &GuardianCheckpointStageStoreInner,
     key: CheckpointStageUploadKey,
 ) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
-    checkpoint_stage_path(inner, format!("{}.candidate{CHECKPOINT_STAGE_FILE_SUFFIX}", key.base_name()))
+    checkpoint_stage_path(
+        inner,
+        format!(
+            "{}.candidate{CHECKPOINT_STAGE_FILE_SUFFIX}",
+            key.base_name()
+        ),
+    )
 }
 
 fn checkpoint_chunk_path(
@@ -1597,7 +1608,10 @@ fn checkpoint_stage_census(
 
 fn checkpoint_parse_stage_name(
     raw: &[u8],
-) -> Result<(CheckpointStageUploadKey, CheckpointStageFileRole), GuardianCheckpointStageStoreError> {
+) -> Result<
+    (CheckpointStageUploadKey, CheckpointStageFileRole),
+    GuardianCheckpointStageStoreError,
+> {
     if !raw.is_ascii() {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
@@ -1776,7 +1790,9 @@ fn checkpoint_create_record_new(
 ) -> Result<CheckpointStageCreateOutcome, GuardianCheckpointStageStoreError> {
     match create_private_file_new_at(&inner.directory, &inner.directory_path, path) {
         Ok(file) => Ok(CheckpointStageCreateOutcome::Created(file)),
-        Err(GuardianOutputError::Io { source, .. }) if source.kind() == ErrorKind::AlreadyExists => {
+        Err(GuardianOutputError::Io { source, .. })
+            if source.kind() == ErrorKind::AlreadyExists =>
+        {
             Ok(CheckpointStageCreateOutcome::Existing)
         }
         Err(error) => Err(error.into()),
@@ -2055,11 +2071,11 @@ fn checkpoint_inspect_upload(
         u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
             .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
     )?;
-    if !checkpoint_bytes_match(candidate_plaintext.as_slice(), &begin_payload) {
+    if !checkpoint_bytes_match(candidate_plaintext.as_slice(), begin_payload.as_slice()) {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
     let publication_id = candidate_context.publication_id();
-    let candidate_digest = checkpoint_candidate_digest(&begin_payload);
+    let candidate_digest = checkpoint_candidate_digest(begin_payload.as_slice());
     let expected_candidate_intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
         &shape.binding,
         shape.upload_id,
@@ -2751,6 +2767,7 @@ impl GuardianOutputPipeline {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn checkpoint_stage_store(&self) -> GuardianCheckpointStageStore {
         self.checkpoint_store.clone()
     }
@@ -5184,12 +5201,16 @@ mod tests {
         );
         assert_eq!(checkpoint_stage_longest_name_bytes(), 200);
 
-        let uppercase = chunk_name.replace(&pane_id.to_string(), &pane_id.to_string().to_uppercase());
+        let uppercase = chunk_name.replace(
+            &pane_id.to_string(),
+            &pane_id.to_string().to_uppercase(),
+        );
         assert!(matches!(
             checkpoint_parse_stage_name(uppercase.as_bytes()),
             Err(GuardianCheckpointStageStoreError::Poisoned)
         ));
-        let short_generation = chunk_name.replace("generation-00000000000000000007", "generation-7");
+        let short_generation =
+            chunk_name.replace("generation-00000000000000000007", "generation-7");
         assert!(matches!(
             checkpoint_parse_stage_name(short_generation.as_bytes()),
             Err(GuardianCheckpointStageStoreError::Poisoned)
