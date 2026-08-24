@@ -1640,7 +1640,7 @@ impl Screen {
                             .checked_add(1)
                             .is_some_and(|revision| commit.generation().revision() == revision)
                 }
-                None => commit.generation().revision() != 0,
+                None => commit.generation().revision() == 1,
             };
             if !generation_is_valid
                 || commit.oldest_stable_row() != oldest_stable_row
@@ -4706,7 +4706,7 @@ mod tests {
                         crate::config::ScrollbackSpillError::SnapshotGenerationMismatch,
                     );
                 }
-                None if !rows.is_empty() => {
+                None if !rows.is_empty() || current_generation.revision() != 0 => {
                     return Err(
                         crate::config::ScrollbackSpillError::SnapshotGenerationMismatch,
                     );

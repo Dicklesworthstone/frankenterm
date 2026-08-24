@@ -2562,6 +2562,7 @@ struct PaneRegistrationGeneration {
     wire_identity: [u8; 16],
     operation_state: AtomicUsize,
     reader_dead: Arc<AtomicBool>,
+    live_parser_checkpoint: Arc<LiveParserCheckpointControl>,
     retirement_tracker: Weak<PaneRetirementTracker>,
     owner: Weak<Mux>,
     cleanup: Mutex<PaneRetirementCleanupState>,
@@ -2587,6 +2588,7 @@ impl PaneRegistrationGeneration {
             wire_identity: *uuid::Uuid::new_v4().as_bytes(),
             operation_state: AtomicUsize::new(0),
             reader_dead: Arc::new(AtomicBool::new(false)),
+            live_parser_checkpoint: Arc::new(LiveParserCheckpointControl::default()),
             retirement_tracker: Arc::downgrade(retirement_tracker),
             owner,
             cleanup: Mutex::new(PaneRetirementCleanupState::Unattached),
@@ -2623,6 +2625,7 @@ impl PaneRegistrationGeneration {
 
     fn retire(self: &Arc<Self>) {
         self.reader_dead.store(true, Ordering::Release);
+        self.live_parser_checkpoint.mark_dead();
         let mut state = self.operation_state.load(Ordering::Acquire);
         loop {
             if state & PANE_REGISTRATION_RETIRED != 0 {

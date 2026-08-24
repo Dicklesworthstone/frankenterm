@@ -965,7 +965,8 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     /// The implementation must hold a single mutation boundary while it:
     ///
     /// 1. verifies `expected_generation` equals the currently published
-    ///    generation (or, for `None`, verifies that no logical rows exist),
+    ///    generation (or, for `None`, verifies a pristine revision-zero sink
+    ///    with no logical rows),
     /// 2. validates and stages every exact-semantic row without truncation,
     /// 3. durably publishes a manifest that names exactly `prefix`, and
     /// 4. removes every stale logical prefix or suffix from reachability.
@@ -976,7 +977,9 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     /// rows. The returned receipt must name the exact requested half-open
     /// range. Its generation must preserve the predecessor content epoch and
     /// advance its revision by exactly one when `expected_generation` is
-    /// `Some`; after `None`, the returned revision must be nonzero. Ordinary
+    /// `Some`; after `None`, the returned revision must be exactly one. This
+    /// prevents a checkpoint with no cold generation from overwriting an
+    /// empty-but-advanced lineage. Ordinary
     /// errors prove that no logical publication occurred; indeterminate
     /// publication must quarantine the sink and return
     /// [`ScrollbackSpillError::CommitOutcomeIndeterminate`]. A caller that
