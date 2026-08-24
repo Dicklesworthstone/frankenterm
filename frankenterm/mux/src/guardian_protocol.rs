@@ -13685,6 +13685,195 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_stage_reply_kind_is_bound_to_the_exact_request_kind() {
+        let guardian = id(74);
+        let mux = id(75);
+        let pane = id(76);
+        let generation = 4;
+        let terminal = terminal_checkpoint();
+        let canonical = terminal.canonical_payload();
+        let descriptor = record_checkpoint_descriptor(pane, generation, canonical);
+        let scope = GuardianCheckpointScopeV1::Pane {
+            pane_id: pane,
+            generation,
+        };
+        let upload_id = id(77);
+        let chunk_bytes = 1_024;
+
+        let begin_payload = GuardianCheckpointStageRequestV1::begin(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let begin = authenticate(&request(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(78),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &begin_payload,
+        ));
+        let ready = GuardianCheckpointStageReplyV1::Ready {
+            upload_id,
+            next_index: 0,
+            committed_bytes: 0,
+        };
+        let ready_wire = ready.encode().unwrap();
+        assert_eq!(GuardianCheckpointStageReplyV1::decode(&ready_wire), Ok(ready));
+        assert!(GuardianResponseEnvelope::success(
+            &begin,
+            &GuardianReply::CheckpointStage(ready),
+        )
+        .is_ok());
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &begin,
+                &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Progress {
+                    upload_id,
+                    next_index: 0,
+                    committed_bytes: 0,
+                }),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch),
+            "a Begin retry has a stable Ready receipt, never a later request kind's receipt"
+        );
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &begin,
+                &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Sealed {
+                    upload_id,
+                    checkpoint_id: descriptor.checkpoint_id(),
+                    boundary_id: descriptor.boundary_id(),
+                    total_bytes: descriptor.total_bytes(),
+                }),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+
+        let first_len = usize::try_from(chunk_bytes).unwrap().min(canonical.len());
+        let chunk_payload = GuardianCheckpointStageRequestV1::chunk(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+            0,
+            Zeroizing::new(canonical[..first_len].to_vec()),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let chunk = authenticate(&request(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(79),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &chunk_payload,
+        ));
+        let progress = GuardianCheckpointStageReplyV1::Progress {
+            upload_id,
+            next_index: 1,
+            committed_bytes: u64::try_from(first_len).unwrap(),
+        };
+        assert!(GuardianResponseEnvelope::success(
+            &chunk,
+            &GuardianReply::CheckpointStage(progress),
+        )
+        .is_ok());
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &chunk,
+                &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Ready {
+                    upload_id,
+                    next_index: 1,
+                    committed_bytes: u64::try_from(first_len).unwrap(),
+                }),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &chunk,
+                &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Progress {
+                    upload_id,
+                    next_index: 2,
+                    committed_bytes: u64::try_from(first_len).unwrap(),
+                }),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
+
+        let seal_payload = GuardianCheckpointStageRequestV1::seal(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let seal = authenticate(&request(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(80),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &seal_payload,
+        ));
+        let sealed = GuardianCheckpointStageReplyV1::Sealed {
+            upload_id,
+            checkpoint_id: descriptor.checkpoint_id(),
+            boundary_id: descriptor.boundary_id(),
+            total_bytes: descriptor.total_bytes(),
+        };
+        assert!(GuardianResponseEnvelope::success(
+            &seal,
+            &GuardianReply::CheckpointStage(sealed),
+        )
+        .is_ok());
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &seal,
+                &GuardianReply::CheckpointStage(ready),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &seal,
+                &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Sealed {
+                    upload_id,
+                    checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes([0xa5; 32])
+                        .unwrap(),
+                    boundary_id: descriptor.boundary_id(),
+                    total_bytes: descriptor.total_bytes(),
+                }),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+
+        let mut noncanonical_ready = ready_wire;
+        noncanonical_ready[7] = 1;
+        assert_eq!(
+            GuardianCheckpointStageReplyV1::decode(&noncanonical_ready),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
+    }
+
+    #[test]
     fn genesis_stage_requires_exact_spawn_generation_and_zero_parser_watermark() {
         let terminal = terminal_checkpoint();
         assert_eq!(terminal.parser_stream_bytes(), 0);
@@ -13740,6 +13929,401 @@ mod tests {
             Err(GuardianProtocolError::InvalidReplyPayload),
             "a self-consistent but unsupported replay semantics identity must fail"
         );
+    }
+
+    #[test]
+    fn replay_cursor_request_and_ack_codecs_are_canonical_bounded_and_correlated() {
+        let snapshot_id = id(81);
+        let snapshot_digest = [0x41; 32];
+        let cursor = GuardianReplayCursorV1::new(
+            snapshot_id,
+            snapshot_digest,
+            GuardianReplayPhaseV1::Output,
+            3,
+            0,
+            10,
+            [0x62; 32],
+            2,
+            4_096,
+            4,
+        )
+        .unwrap();
+        let cursor_wire = cursor.encode();
+        assert_eq!(GuardianReplayCursorV1::decode(&cursor_wire), Ok(cursor));
+
+        let mut reserved_cursor = cursor_wire;
+        reserved_cursor[49] = 1;
+        assert_eq!(
+            GuardianReplayCursorV1::decode(&reserved_cursor),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        let mut retargeted_cursor = cursor_wire;
+        retargeted_cursor[59] ^= 1;
+        assert_eq!(
+            GuardianReplayCursorV1::decode(&retargeted_cursor),
+            Err(GuardianProtocolError::InvalidOperationPayload),
+            "a field mutation without the cursor commitment must fail"
+        );
+        assert!(matches!(
+            GuardianReplayCursorV1::new(
+                snapshot_id,
+                snapshot_digest,
+                GuardianReplayPhaseV1::Output,
+                0,
+                0,
+                1,
+                [0; 32],
+                1,
+                GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES + 1,
+                1,
+            ),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+
+        let open = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: 4_096,
+            max_records: 4,
+            wait_millis: GUARDIAN_MAX_REPLAY_WAIT_MILLIS,
+        };
+        let open_wire = open.encode().unwrap();
+        assert_eq!(GuardianReplayRequestV1::decode(&open_wire), Ok(open));
+        let continue_request = GuardianReplayRequestV1::Continue { cursor };
+        let continue_wire = continue_request.encode().unwrap();
+        assert_eq!(
+            GuardianReplayRequestV1::decode(&continue_wire),
+            Ok(continue_request)
+        );
+        let mut noncanonical_open = open_wire;
+        noncanonical_open[88] = 1;
+        assert_eq!(
+            GuardianReplayRequestV1::decode(&noncanonical_open),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        assert!(matches!(
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::LatestCompatible,
+                max_plaintext_bytes: 4_096,
+                max_records: GUARDIAN_MAX_REPLAY_RECORDS + 1,
+                wait_millis: 0,
+            }
+            .encode(),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+        assert_eq!(
+            GuardianReplayRequestV1::decode(&[]),
+            Err(GuardianProtocolError::InvalidOperationPayload),
+            "the pre-v4 empty Replay payload is not a valid request"
+        );
+        let old_empty_replay = request(
+            GuardianOperation::Replay,
+            id(82),
+            id(83),
+            id(84),
+            Some(id(85)),
+            1,
+            0,
+            None,
+            &[],
+        );
+        assert_eq!(
+            encode_guardian_request(&secret(), &old_empty_replay),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+
+        let page_digest = [0x71; 32];
+        let ack = GuardianReplayAckV1::new(
+            snapshot_id,
+            snapshot_digest,
+            3,
+            page_digest,
+            Some(cursor.digest()),
+            9,
+            [0x62; 32],
+            false,
+        )
+        .unwrap();
+        let ack_wire = ack.encode().unwrap();
+        assert_eq!(GuardianReplayAckV1::decode(&ack_wire), Ok(ack));
+        let mut noncanonical_ack = ack_wire;
+        noncanonical_ack[93] = 1;
+        assert_eq!(
+            GuardianReplayAckV1::decode(&noncanonical_ack),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        assert!(matches!(
+            GuardianReplayAckV1::new(
+                snapshot_id,
+                snapshot_digest,
+                3,
+                page_digest,
+                Some(cursor.digest()),
+                9,
+                [0x62; 32],
+                true,
+            ),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+
+        let receipt = GuardianReplayAckReceiptV1::from_ack(ack);
+        let receipt_wire = receipt.encode().unwrap();
+        assert_eq!(GuardianReplayAckReceiptV1::decode(&receipt_wire), Ok(receipt));
+        let mut noncanonical_receipt = receipt_wire;
+        noncanonical_receipt[131] = 1;
+        assert_eq!(
+            GuardianReplayAckReceiptV1::decode(&noncanonical_receipt),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
+
+        let pane = id(85);
+        let ack_request = authenticate(&request(
+            GuardianOperation::ReplayAck,
+            id(82),
+            id(83),
+            id(86),
+            Some(pane),
+            7,
+            0,
+            None,
+            &ack_wire,
+        ));
+        assert!(GuardianResponseEnvelope::success(
+            &ack_request,
+            &GuardianReply::ReplayAcked(receipt),
+        )
+        .is_ok());
+        let wrong_receipt = GuardianReplayAckReceiptV1 {
+            snapshot_id,
+            page_index: 3,
+            page_digest: [0x72; 32],
+            through_sequence: 9,
+            through_record_digest: [0x62; 32],
+        };
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &ack_request,
+                &GuardianReply::ReplayAcked(wrong_receipt),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+    }
+
+    #[test]
+    fn replay_output_page_round_trip_is_ordered_consuming_and_digest_bound() {
+        let guardian = id(87);
+        let mux = id(88);
+        let pane = id(89);
+        let generation = 7;
+        let snapshot_id = id(92);
+        let snapshot_digest = [0x41; 32];
+        let terminal = terminal_checkpoint();
+        let descriptor =
+            record_checkpoint_descriptor(pane, generation, terminal.canonical_payload());
+        let replay = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id: descriptor.checkpoint_id(),
+                next_sequence: 8,
+                previous_record_digest: [0x55; 32],
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 4,
+            wait_millis: 0,
+        }
+        .encode()
+        .unwrap();
+        let original_request = request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(93),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &replay,
+        );
+        let authenticated = authenticate(&original_request);
+        assert_eq!(
+            GuardianResponseEnvelope::reply(
+                &authenticated,
+                &GuardianReply::ReplayReady {
+                    pane_id: pane,
+                    generation,
+                },
+            ),
+            Err(GuardianProtocolError::ReplayRequiresConsumingDelivery)
+        );
+
+        let page = replay_output_page(pane, generation, snapshot_id, snapshot_digest);
+        let expected_page_digest = page.header().page_digest();
+        assert!(!format!("{page:?}").contains("first"));
+        let response = GuardianResponseEnvelope::replay_page(&authenticated, page).unwrap();
+        let frame = encode_guardian_response(&secret(), &response).unwrap();
+        let correlated = decode_guardian_response(&secret(), &frame)
+            .unwrap()
+            .correlate(&original_request.header)
+            .unwrap();
+        let delivered = correlated.into_replay_page(&authenticated).unwrap();
+        assert_eq!(delivered.header().page_digest(), expected_page_digest);
+        assert_eq!(delivered.header().page_index(), 0);
+        let GuardianReplayPageBodyDelivery::OutputRecords(records) = delivered.into_body() else {
+            panic!("resume replay must deliver output records");
+        };
+        assert_eq!(records.first_sequence(), 8);
+        assert_eq!(records.previous_record_digest(), [0x55; 32]);
+        assert_eq!(records.record_count(), 2);
+        assert_eq!(records.plaintext_bytes(), 11);
+        let mut plaintext = Vec::new();
+        let metadata = records
+            .into_records()
+            .into_iter()
+            .map(|record| record.write_all_bounded(&mut plaintext, 4_096).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(plaintext, b"first\nlast\n");
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|record| record.sequence())
+                .collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        assert_eq!(metadata[0].predecessor().unwrap().last_sequence(), 7);
+        assert_eq!(metadata[1].cumulative_plaintext_bytes(), 523);
+
+        let mut page_digest_mutation = replay_output_page(
+            pane,
+            generation,
+            snapshot_id,
+            snapshot_digest,
+        )
+        .into_payload()
+        .unwrap();
+        let last = page_digest_mutation.len() - 1;
+        page_digest_mutation[last] ^= 1;
+        assert!(matches!(
+            GuardianReplayPageDelivery::decode(page_digest_mutation),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ));
+
+        let mut plaintext_digest_mutation = replay_output_page(
+            pane,
+            generation,
+            snapshot_id,
+            snapshot_digest,
+        )
+        .into_payload()
+        .unwrap();
+        let last = plaintext_digest_mutation.len() - 1;
+        plaintext_digest_mutation[last] ^= 1;
+        let repaired_page_digest =
+            compute_replay_page_digest(&plaintext_digest_mutation).unwrap();
+        plaintext_digest_mutation[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
+            .copy_from_slice(&repaired_page_digest);
+        assert!(matches!(
+            GuardianReplayPageDelivery::decode(plaintext_digest_mutation),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "the per-record commitment must reject plaintext even after the outer page digest is recomputed");
+
+        let mut order_mutation = replay_output_page(
+            pane,
+            generation,
+            snapshot_id,
+            snapshot_digest,
+        )
+        .into_payload()
+        .unwrap();
+        let first_record = REPLAY_PAGE_HEADER_BYTES + REPLAY_OUTPUT_RECORDS_HEADER_BYTES;
+        let second_record = first_record + REPLAY_OUTPUT_RECORD_FIXED_BYTES + b"first\n".len();
+        order_mutation[second_record + 104..second_record + 112]
+            .copy_from_slice(&11_u64.to_be_bytes());
+        let predecessor = GuardianReplayPredecessorV1::new(
+            id(90),
+            7,
+            [0x55; 32],
+            512,
+            4_096,
+        )
+        .unwrap();
+        let altered_metadata = GuardianReplayRecordMetadataV1::new(
+            id(91),
+            8,
+            Some(predecessor),
+            11,
+            u32::try_from(b"last\n".len()).unwrap(),
+            523,
+            5_100,
+            [0x62; 32],
+        )
+        .unwrap();
+        let altered_plaintext_digest =
+            replay_record_plaintext_digest(altered_metadata, b"last\n").unwrap();
+        order_mutation[second_record + 168..second_record + 200]
+            .copy_from_slice(&altered_plaintext_digest);
+        let repaired_page_digest = compute_replay_page_digest(&order_mutation).unwrap();
+        order_mutation[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
+            .copy_from_slice(&repaired_page_digest);
+        assert!(matches!(
+            GuardianReplayPageDelivery::decode(order_mutation),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "a self-consistent record digest cannot hide a sequence-order gap");
+
+        let too_small_replay = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id: descriptor.checkpoint_id(),
+                next_sequence: 8,
+                previous_record_digest: [0x55; 32],
+            },
+            max_plaintext_bytes: 10,
+            max_records: 4,
+            wait_millis: 0,
+        }
+        .encode()
+        .unwrap();
+        let too_small = authenticate(&request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(94),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &too_small_replay,
+        ));
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &too_small,
+                replay_output_page(pane, generation, snapshot_id, snapshot_digest),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ));
+
+        let wrong_generation = authenticate(&request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(95),
+            Some(pane),
+            generation + 1,
+            0,
+            None,
+            &replay,
+        ));
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &wrong_generation,
+                replay_output_page(pane, generation, snapshot_id, snapshot_digest),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        ));
+        let mut wrong_header = original_request.header.clone();
+        wrong_header.request_id = id(96);
+        assert!(matches!(
+            decode_guardian_response(&secret(), &frame)
+                .unwrap()
+                .correlate(&wrong_header),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        ));
     }
 
     #[test]

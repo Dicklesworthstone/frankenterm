@@ -71,7 +71,11 @@ pub struct GuardianCheckpointOriginV1 {
 }
 
 impl GuardianCheckpointOriginV1 {
-    fn genesis(spawn_effect_id: Uuid) -> Result<Self, GuardianCheckpointBoundaryError> {
+    /// Validate and construct a Genesis origin from the exact future Spawn
+    /// effect identity carried on the wire.
+    pub fn from_genesis_effect(
+        spawn_effect_id: Uuid,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
         if spawn_effect_id.is_nil() {
             return Err(GuardianCheckpointBoundaryError::NilGenesisEffectIdentity);
         }
@@ -80,18 +84,28 @@ impl GuardianCheckpointOriginV1 {
         })
     }
 
-    fn record(boundary: &GuardianCheckpointBoundary) -> Self {
-        Self {
+    /// Validate and construct a record origin from untrusted wire fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_record_parts(
+        durable_pane_id: Uuid,
+        segment_id: Uuid,
+        output_sequence: u64,
+        output_record_digest: [u8; 32],
+        output_committed_log_bytes: u64,
+        journal_cumulative_plaintext_bytes: u64,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        let origin = Self {
             kind: GuardianCheckpointOriginKindV1::Record {
-                durable_pane_id: boundary.durable_pane_id(),
-                segment_id: boundary.segment_id(),
-                output_sequence: boundary.output_sequence(),
-                output_record_digest: boundary.output_record_digest(),
-                output_committed_log_bytes: boundary.output_committed_log_bytes(),
-                journal_cumulative_plaintext_bytes: boundary
-                    .journal_cumulative_plaintext_bytes(),
+                durable_pane_id,
+                segment_id,
+                output_sequence,
+                output_record_digest,
+                output_committed_log_bytes,
+                journal_cumulative_plaintext_bytes,
             },
-        }
+        };
+        origin.validate()?;
+        Ok(origin)
     }
 
     #[must_use]
@@ -169,6 +183,48 @@ impl GuardianCheckpointOriginV1 {
             } => Some(journal_cumulative_plaintext_bytes),
         }
     }
+
+    fn validate(&self) -> Result<(), GuardianCheckpointBoundaryError> {
+        match self.kind {
+            GuardianCheckpointOriginKindV1::Genesis { spawn_effect_id } => {
+                if spawn_effect_id.is_nil() {
+                    return Err(GuardianCheckpointBoundaryError::NilGenesisEffectIdentity);
+                }
+            }
+            GuardianCheckpointOriginKindV1::Record {
+                durable_pane_id,
+                segment_id,
+                output_sequence,
+                output_record_digest,
+                output_committed_log_bytes,
+                journal_cumulative_plaintext_bytes,
+            } => {
+                if durable_pane_id.is_nil() {
+                    return Err(GuardianCheckpointBoundaryError::NilPaneIdentity);
+                }
+                if segment_id.is_nil() {
+                    return Err(GuardianCheckpointBoundaryError::NilSegmentIdentity);
+                }
+                if output_sequence == 0 {
+                    return Err(GuardianCheckpointBoundaryError::ZeroOutputSequence);
+                }
+                if output_record_digest == [0; 32] {
+                    return Err(GuardianCheckpointBoundaryError::ZeroOutputRecordDigest);
+                }
+                if output_committed_log_bytes == 0 {
+                    return Err(
+                        GuardianCheckpointBoundaryError::ZeroOutputCommittedLogBytes,
+                    );
+                }
+                if journal_cumulative_plaintext_bytes == 0 {
+                    return Err(
+                        GuardianCheckpointBoundaryError::ZeroJournalPlaintextWatermark,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for GuardianCheckpointOriginV1 {
@@ -226,15 +282,7 @@ impl GuardianCheckpointArtifactDescriptorV1 {
         capture: &LiveParserCheckpointAck,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
         let boundary = capture.boundary();
-        let descriptor = Self {
-            origin: GuardianCheckpointOriginV1::record(boundary),
-            parser_stream_bytes: boundary.parser_stream_bytes(),
-            replay_identity_digest: boundary.replay_identity_digest(),
-            rows: boundary.rows(),
-            cols: boundary.cols(),
-            terminal_payload_bytes: boundary.terminal_payload_bytes(),
-            terminal_payload_digest: boundary.terminal_payload_digest(),
-        };
+        let descriptor = Self::from_boundary(boundary);
         descriptor.validate_canonical_payload(
             capture.terminal_checkpoint().canonical_payload(),
             TerminalCheckpointLimits::default(),
@@ -266,7 +314,7 @@ impl GuardianCheckpointArtifactDescriptorV1 {
         let (terminal_payload_bytes, terminal_payload_digest) =
             terminal_payload_identity(terminal_checkpoint.canonical_payload())?;
         let descriptor = Self {
-            origin: GuardianCheckpointOriginV1::genesis(spawn_effect_id)?,
+            origin: GuardianCheckpointOriginV1::from_genesis_effect(spawn_effect_id)?,
             parser_stream_bytes: 0,
             replay_identity_digest: current_replay_identity_digest(),
             rows,
@@ -279,6 +327,56 @@ impl GuardianCheckpointArtifactDescriptorV1 {
             TerminalCheckpointLimits::default(),
         )?;
         Ok(descriptor)
+    }
+
+    /// Validate untrusted wire fields and claimed stable identities before
+    /// returning an opaque descriptor authority. The terminal payload itself
+    /// must still pass [`Self::validate_canonical_payload`] before sealing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_claimed_parts(
+        claimed_boundary_identity_digest: [u8; 32],
+        claimed_checkpoint_identity_digest: [u8; 32],
+        origin: GuardianCheckpointOriginV1,
+        parser_stream_bytes: u64,
+        replay_identity_digest: [u8; 32],
+        rows: u32,
+        cols: u32,
+        terminal_payload_bytes: u64,
+        terminal_payload_digest: [u8; 32],
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        let descriptor = Self {
+            origin,
+            parser_stream_bytes,
+            replay_identity_digest,
+            rows,
+            cols,
+            terminal_payload_bytes,
+            terminal_payload_digest,
+        };
+        descriptor.validate_identity_fields()?;
+        if descriptor.replay_identity_digest != current_replay_identity_digest() {
+            return Err(GuardianCheckpointBoundaryError::ReplayIdentityMismatch);
+        }
+        descriptor.validate_claimed_identity_digests(
+            claimed_boundary_identity_digest,
+            claimed_checkpoint_identity_digest,
+        )?;
+        Ok(descriptor)
+    }
+
+    /// Verify both raw identities claimed by a decoded wire descriptor.
+    pub fn validate_claimed_identity_digests(
+        &self,
+        claimed_boundary_identity_digest: [u8; 32],
+        claimed_checkpoint_identity_digest: [u8; 32],
+    ) -> Result<(), GuardianCheckpointBoundaryError> {
+        if self.recompute_boundary_identity_digest()? != claimed_boundary_identity_digest {
+            return Err(GuardianCheckpointBoundaryError::ClaimedBoundaryIdentityMismatch);
+        }
+        if self.recompute_checkpoint_identity_digest()? != claimed_checkpoint_identity_digest {
+            return Err(GuardianCheckpointBoundaryError::ClaimedCheckpointIdentityMismatch);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -322,6 +420,10 @@ impl GuardianCheckpointArtifactDescriptorV1 {
         &self,
     ) -> Result<[u8; 32], GuardianCheckpointBoundaryError> {
         self.validate_identity_fields()?;
+        Ok(self.canonical_boundary_identity_digest())
+    }
+
+    fn canonical_boundary_identity_digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         match self.origin.kind {
             GuardianCheckpointOriginKindV1::Genesis { spawn_effect_id } => {
@@ -346,7 +448,7 @@ impl GuardianCheckpointArtifactDescriptorV1 {
                 hasher.update(journal_cumulative_plaintext_bytes.to_le_bytes());
             }
         }
-        Ok(hasher.finalize().into())
+        hasher.finalize().into()
     }
 
     /// Recompute the stable complete artifact identity from the boundary and
@@ -354,17 +456,21 @@ impl GuardianCheckpointArtifactDescriptorV1 {
     pub fn recompute_checkpoint_identity_digest(
         &self,
     ) -> Result<[u8; 32], GuardianCheckpointBoundaryError> {
-        let boundary_identity = self.recompute_boundary_identity_digest()?;
+        self.validate_identity_fields()?;
+        Ok(self.canonical_checkpoint_identity_digest())
+    }
+
+    fn canonical_checkpoint_identity_digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(CHECKPOINT_ARTIFACT_IDENTITY_DIGEST_DOMAIN);
-        hasher.update(boundary_identity);
+        hasher.update(self.canonical_boundary_identity_digest());
         hasher.update(self.parser_stream_bytes.to_le_bytes());
         hasher.update(self.replay_identity_digest);
         hasher.update(self.rows.to_le_bytes());
         hasher.update(self.cols.to_le_bytes());
         hasher.update(self.terminal_payload_bytes.to_le_bytes());
         hasher.update(self.terminal_payload_digest);
-        Ok(hasher.finalize().into())
+        hasher.finalize().into()
     }
 
     /// Admit only bounded, byte-for-byte canonical terminal state matching the
@@ -432,46 +538,14 @@ impl GuardianCheckpointArtifactDescriptorV1 {
     }
 
     fn validate_identity_fields(&self) -> Result<(), GuardianCheckpointBoundaryError> {
+        self.origin.validate()?;
         match self.origin.kind {
-            GuardianCheckpointOriginKindV1::Genesis { spawn_effect_id } => {
-                if spawn_effect_id.is_nil() {
-                    return Err(GuardianCheckpointBoundaryError::NilGenesisEffectIdentity);
-                }
+            GuardianCheckpointOriginKindV1::Genesis { .. } => {
                 if self.parser_stream_bytes != 0 {
                     return Err(GuardianCheckpointBoundaryError::GenesisParserWatermark);
                 }
             }
-            GuardianCheckpointOriginKindV1::Record {
-                durable_pane_id,
-                segment_id,
-                output_sequence,
-                output_record_digest,
-                output_committed_log_bytes,
-                journal_cumulative_plaintext_bytes,
-            } => {
-                if durable_pane_id.is_nil() {
-                    return Err(GuardianCheckpointBoundaryError::NilPaneIdentity);
-                }
-                if segment_id.is_nil() {
-                    return Err(GuardianCheckpointBoundaryError::NilSegmentIdentity);
-                }
-                if output_sequence == 0 {
-                    return Err(GuardianCheckpointBoundaryError::ZeroOutputSequence);
-                }
-                if output_record_digest == [0; 32] {
-                    return Err(GuardianCheckpointBoundaryError::ZeroOutputRecordDigest);
-                }
-                if output_committed_log_bytes == 0 {
-                    return Err(
-                        GuardianCheckpointBoundaryError::ZeroOutputCommittedLogBytes,
-                    );
-                }
-                if journal_cumulative_plaintext_bytes == 0 {
-                    return Err(
-                        GuardianCheckpointBoundaryError::ZeroJournalPlaintextWatermark,
-                    );
-                }
-            }
+            GuardianCheckpointOriginKindV1::Record { .. } => {}
         }
         if self.replay_identity_digest == [0; 32] {
             return Err(GuardianCheckpointBoundaryError::ReplayIdentityMismatch);
@@ -486,6 +560,28 @@ impl GuardianCheckpointArtifactDescriptorV1 {
             return Err(GuardianCheckpointBoundaryError::ZeroTerminalPayloadDigest);
         }
         Ok(())
+    }
+
+    fn from_boundary(boundary: &GuardianCheckpointBoundary) -> Self {
+        Self {
+            origin: GuardianCheckpointOriginV1 {
+                kind: GuardianCheckpointOriginKindV1::Record {
+                    durable_pane_id: boundary.durable_pane_id(),
+                    segment_id: boundary.segment_id(),
+                    output_sequence: boundary.output_sequence(),
+                    output_record_digest: boundary.output_record_digest(),
+                    output_committed_log_bytes: boundary.output_committed_log_bytes(),
+                    journal_cumulative_plaintext_bytes: boundary
+                        .journal_cumulative_plaintext_bytes(),
+                },
+            },
+            parser_stream_bytes: boundary.parser_stream_bytes(),
+            replay_identity_digest: boundary.replay_identity_digest(),
+            rows: boundary.rows(),
+            cols: boundary.cols(),
+            terminal_payload_bytes: boundary.terminal_payload_bytes(),
+            terminal_payload_digest: boundary.terminal_payload_digest(),
+        }
     }
 }
 
@@ -1071,29 +1167,13 @@ fn live_parser_boundary_digest(
 }
 
 fn output_boundary_identity_digest(boundary: &GuardianCheckpointBoundary) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(OUTPUT_BOUNDARY_IDENTITY_DIGEST_DOMAIN);
-    hasher.update(boundary.version().to_le_bytes());
-    hasher.update(boundary.durable_pane_id().as_bytes());
-    hasher.update(boundary.segment_id().as_bytes());
-    hasher.update(boundary.output_sequence().to_le_bytes());
-    hasher.update(boundary.output_record_digest());
-    hasher.update(boundary.output_committed_log_bytes().to_le_bytes());
-    hasher.update(boundary.journal_cumulative_plaintext_bytes().to_le_bytes());
-    hasher.finalize().into()
+    GuardianCheckpointArtifactDescriptorV1::from_boundary(boundary)
+        .canonical_boundary_identity_digest()
 }
 
 fn checkpoint_artifact_identity_digest(boundary: &GuardianCheckpointBoundary) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(CHECKPOINT_ARTIFACT_IDENTITY_DIGEST_DOMAIN);
-    hasher.update(boundary.output_boundary_identity_digest());
-    hasher.update(boundary.parser_stream_bytes().to_le_bytes());
-    hasher.update(boundary.replay_identity_digest());
-    hasher.update(boundary.rows().to_le_bytes());
-    hasher.update(boundary.cols().to_le_bytes());
-    hasher.update(boundary.terminal_payload_bytes().to_le_bytes());
-    hasher.update(boundary.terminal_payload_digest());
-    hasher.finalize().into()
+    GuardianCheckpointArtifactDescriptorV1::from_boundary(boundary)
+        .canonical_checkpoint_identity_digest()
 }
 
 fn validate_terminal_payload_identity(
@@ -1208,6 +1288,10 @@ pub enum GuardianCheckpointBoundaryError {
     ZeroTerminalPayloadDigest,
     #[error("guardian checkpoint stable identity disagrees with its capture authority")]
     StableIdentityMismatch,
+    #[error("claimed guardian checkpoint boundary identity does not recompute")]
+    ClaimedBoundaryIdentityMismatch,
+    #[error("claimed guardian checkpoint artifact identity does not recompute")]
+    ClaimedCheckpointIdentityMismatch,
     #[error("Genesis checkpoint has no guardian output-record authority")]
     GenesisHasNoRecordAuthority,
     #[error("guardian checkpoint does not match the verified output record")]
@@ -1665,6 +1749,97 @@ mod tests {
     }
 
     #[test]
+    fn claimed_wire_parts_must_recompute_both_stable_identities() {
+        let (descriptor, _, _, _) = record_descriptor();
+        let boundary_identity = descriptor
+            .recompute_boundary_identity_digest()
+            .expect("baseline boundary identity");
+        let checkpoint_identity = descriptor
+            .recompute_checkpoint_identity_digest()
+            .expect("baseline checkpoint identity");
+        let reconstructed = GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+            boundary_identity,
+            checkpoint_identity,
+            descriptor.origin(),
+            descriptor.parser_stream_bytes(),
+            descriptor.replay_identity_digest(),
+            descriptor.rows(),
+            descriptor.cols(),
+            descriptor.terminal_payload_bytes(),
+            descriptor.terminal_payload_digest(),
+        )
+        .expect("accept exact claimed wire parts");
+        assert_eq!(reconstructed, descriptor);
+
+        let mut wrong_boundary = boundary_identity;
+        wrong_boundary[0] ^= 1;
+        assert_eq!(
+            GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+                wrong_boundary,
+                checkpoint_identity,
+                descriptor.origin(),
+                descriptor.parser_stream_bytes(),
+                descriptor.replay_identity_digest(),
+                descriptor.rows(),
+                descriptor.cols(),
+                descriptor.terminal_payload_bytes(),
+                descriptor.terminal_payload_digest(),
+            ),
+            Err(GuardianCheckpointBoundaryError::ClaimedBoundaryIdentityMismatch)
+        );
+
+        let mut wrong_checkpoint = checkpoint_identity;
+        wrong_checkpoint[0] ^= 1;
+        assert_eq!(
+            GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+                boundary_identity,
+                wrong_checkpoint,
+                descriptor.origin(),
+                descriptor.parser_stream_bytes(),
+                descriptor.replay_identity_digest(),
+                descriptor.rows(),
+                descriptor.cols(),
+                descriptor.terminal_payload_bytes(),
+                descriptor.terminal_payload_digest(),
+            ),
+            Err(GuardianCheckpointBoundaryError::ClaimedCheckpointIdentityMismatch)
+        );
+
+        let origin = descriptor.origin();
+        let changed_origin = GuardianCheckpointOriginV1::from_record_parts(
+            origin.durable_pane_id().expect("record pane"),
+            origin.segment_id().expect("record segment"),
+            origin
+                .output_sequence()
+                .expect("record sequence")
+                .checked_add(1)
+                .expect("fixture sequence has mutation room"),
+            origin.output_record_digest().expect("record digest"),
+            origin
+                .output_committed_log_bytes()
+                .expect("record committed bytes"),
+            origin
+                .journal_cumulative_plaintext_bytes()
+                .expect("record cumulative bytes"),
+        )
+        .expect("construct structurally valid mutated origin");
+        assert_eq!(
+            GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+                boundary_identity,
+                checkpoint_identity,
+                changed_origin,
+                descriptor.parser_stream_bytes(),
+                descriptor.replay_identity_digest(),
+                descriptor.rows(),
+                descriptor.cols(),
+                descriptor.terminal_payload_bytes(),
+                descriptor.terminal_payload_digest(),
+            ),
+            Err(GuardianCheckpointBoundaryError::ClaimedBoundaryIdentityMismatch)
+        );
+    }
+
+    #[test]
     fn record_descriptor_hashes_every_boundary_and_artifact_preimage() {
         let (descriptor, _, _, _) = record_descriptor();
         let boundary_identity = descriptor
@@ -1835,27 +2010,43 @@ mod tests {
         assert_eq!(first.origin().spawn_effect_id(), Some(first_effect));
         assert_eq!(first.origin().durable_pane_id(), None);
         assert_eq!(first.parser_stream_bytes(), 0);
+        let first_boundary_identity = first
+            .recompute_boundary_identity_digest()
+            .expect("first Genesis boundary");
+        let first_checkpoint_identity = first
+            .recompute_checkpoint_identity_digest()
+            .expect("first Genesis artifact");
+        assert_eq!(
+            GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+                first_boundary_identity,
+                first_checkpoint_identity,
+                GuardianCheckpointOriginV1::from_genesis_effect(first_effect)
+                    .expect("construct claimed Genesis origin"),
+                first.parser_stream_bytes(),
+                first.replay_identity_digest(),
+                first.rows(),
+                first.cols(),
+                first.terminal_payload_bytes(),
+                first.terminal_payload_digest(),
+            )
+            .expect("accept exact claimed Genesis parts"),
+            first
+        );
         let mut expected = Sha256::new();
         expected.update(GENESIS_BOUNDARY_IDENTITY_DIGEST_DOMAIN);
         expected.update(first_effect.as_bytes());
         assert_eq!(
-            first
-                .recompute_boundary_identity_digest()
-                .expect("recompute Genesis boundary"),
+            first_boundary_identity,
             <[u8; 32]>::from(expected.finalize())
         );
         assert_ne!(
-            first
-                .recompute_boundary_identity_digest()
-                .expect("first Genesis boundary"),
+            first_boundary_identity,
             second
                 .recompute_boundary_identity_digest()
                 .expect("second Genesis boundary")
         );
         assert_ne!(
-            first
-                .recompute_checkpoint_identity_digest()
-                .expect("first Genesis artifact"),
+            first_checkpoint_identity,
             second
                 .recompute_checkpoint_identity_digest()
                 .expect("second Genesis artifact")
