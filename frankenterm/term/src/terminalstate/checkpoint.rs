@@ -3921,6 +3921,20 @@ impl TerminalCheckpointV2 {
 }
 
 impl ValidatedTerminalCheckpointV2 {
+    /// Canonical physical row count proven equal across both screens during
+    /// checkpoint validation.
+    #[must_use]
+    pub const fn rows(&self) -> u32 {
+        self.checkpoint.primary_screen.physical_rows
+    }
+
+    /// Canonical physical column count proven equal across both screens during
+    /// checkpoint validation.
+    #[must_use]
+    pub const fn cols(&self) -> u32 {
+        self.checkpoint.primary_screen.physical_cols
+    }
+
     /// Rebuild an off-topology terminal with no writer thread, callbacks, or
     /// spill capability. The supplied live configuration is retained only as
     /// the revision-fenced activation authority; replay runs against an

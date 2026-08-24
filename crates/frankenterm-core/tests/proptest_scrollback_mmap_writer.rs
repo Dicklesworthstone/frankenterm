@@ -243,11 +243,22 @@ proptest! {
             .iter()
             .map(|(_, payload)| V2_RECORD_HEADER_SIZE as u64 + payload.len() as u64)
             .sum();
+        let bytes_before_reopen = std::fs::read(&path).expect("snapshot before reopen");
         let reopened = MmapScrollback::open(config).expect("reopen writer");
         prop_assert_eq!(reopened.header().capacity_bytes, cap_bytes);
         prop_assert_eq!(reopened.header().write_cursor_bytes, expected_cursor);
         prop_assert_eq!(reopened.header().total_bytes_written, expected_cursor);
         drop(reopened);
+        prop_assert_eq!(
+            std::fs::read(&path).expect("snapshot after reopen"),
+            bytes_before_reopen,
+            "a successful reopen must not rewrite, resize, or reinitialize the leaf",
+        );
+
+        let reopened_read = read_linear_records(&path, read_limits(&path))
+            .expect("read records after reopen");
+        prop_assert_eq!(&reopened_read.records, &read_back.records);
+        prop_assert_eq!(reopened_read.completeness, read_back.completeness);
 
         let actual_bytes: Vec<u8> = read_back
             .records

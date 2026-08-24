@@ -459,6 +459,28 @@ impl MmapScrollback {
             &file,
             opened_data.identity,
         )?;
+        // The sidecar names the logical writer lease, while locking the data
+        // descriptor prevents a replaced sidecar leaf from admitting a second
+        // process onto the same ring inode.
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(MmapScrollbackError::WriterBusy { path: path.clone() });
+            }
+            Err(source) => {
+                return Err(MmapScrollbackError::Lock {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
+        revalidate_writer_file(
+            &base_directory,
+            &data_leaf,
+            &path,
+            &file,
+            opened_data.identity,
+        )?;
         revalidate_writer_directory(
             &base_directory,
             &config.base_dir,
@@ -546,13 +568,14 @@ impl MmapScrollback {
             lock_path,
             header,
             appends_since_sync: 0,
-            last_sync_at: SystemTime::now(),
+            last_sync_at: Instant::now(),
             sync_every_appends: config.sync_every_appends,
             sync_interval: config.sync_interval,
             redactor: StreamingRedactor::new(),
             pending_record_kind: None,
             v2_state,
             active_state_slot,
+            state_slot_dirty: false,
             used_bytes,
             prewrite_sync_required: false,
             #[cfg(test)]
@@ -607,8 +630,10 @@ impl MmapScrollback {
     ) -> Result<MmapAppendReport, MmapScrollbackError> {
         let output_record_kind = self.pending_record_kind.unwrap_or(record_kind);
         let redacted = self.redactor.redact_chunk(payload);
-        if redacted.bytes.is_empty() && !payload.is_empty() {
-            self.pending_record_kind.get_or_insert(record_kind);
+        if redacted.bytes.is_empty() {
+            if !payload.is_empty() {
+                self.pending_record_kind.get_or_insert(record_kind);
+            }
             return Ok(MmapAppendReport {
                 record_kind,
                 payload_bytes: 0,
@@ -667,6 +692,59 @@ impl MmapScrollback {
         let original_used_bytes = self.used_bytes;
         let (mut prepared_state, prepared_used_bytes, evicted) =
             self.plan_append_position(total_len)?;
+
+        // Exhausted authenticated counters must fail before publishing an
+        // eviction or writing an unreferenced body. These values normally take
+        // centuries to exhaust, but they are also authenticated on-disk input
+        // during reopen and therefore cannot be treated as unreachable.
+        let required_publications = if evicted { 2 } else { 1 };
+        original_state
+            .slot_epoch
+            .checked_add(required_publications)
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 state epoch exhausted",
+            })?;
+        prepared_state
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 record count overflow",
+            })?;
+        prepared_state
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 record sequence exhausted",
+            })?;
+        let planned_end = u64::from(prepared_state.tail)
+            .checked_add(total_len)
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 append cursor overflow",
+            })?;
+        if planned_end == self.header.capacity_bytes {
+            prepared_state.generation.checked_add(1).ok_or_else(|| {
+                MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 ring generation exhausted",
+                }
+            })?;
+        }
+        let planned_used_bytes = prepared_used_bytes.checked_add(total_len).ok_or_else(|| {
+            MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 used-byte accounting overflow",
+            }
+        })?;
+        if planned_used_bytes > self.header.capacity_bytes {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 append plan exceeds ring capacity",
+            });
+        }
 
         // Overwriting a still-referenced record would make both metadata slots
         // unrecoverable if the process died between the body overwrite and the
@@ -807,16 +885,27 @@ impl MmapScrollback {
     }
 
     pub fn sync(&mut self) -> Result<(), MmapScrollbackError> {
-        self.sync_current_state()?;
-        self.prewrite_sync_required = false;
-        Ok(())
+        match self.sync_current_state() {
+            Ok(()) => {
+                self.prewrite_sync_required = false;
+                self.state_slot_dirty = false;
+                Ok(())
+            }
+            Err(error) => {
+                // Do not let a caller that handles the error and continues
+                // silently widen the configured durability window. The next
+                // append must first complete this sync boundary.
+                self.prewrite_sync_required = true;
+                Err(error)
+            }
+        }
     }
 
     fn sync_current_state(&mut self) -> Result<(), MmapScrollbackError> {
         self.header.last_msync_at_epoch_ms = epoch_millis(SystemTime::now());
         self.write_v2_telemetry()?;
         self.sync_file_data()?;
-        self.last_sync_at = SystemTime::now();
+        self.last_sync_at = Instant::now();
         self.appends_since_sync = 0;
         Ok(())
     }
@@ -824,10 +913,7 @@ impl MmapScrollback {
     fn sync_if_due(&mut self) -> Result<bool, MmapScrollbackError> {
         let append_due =
             self.sync_every_appends > 0 && self.appends_since_sync >= self.sync_every_appends;
-        let time_due = self
-            .last_sync_at
-            .elapsed()
-            .is_ok_and(|elapsed| elapsed >= self.sync_interval);
+        let time_due = self.last_sync_at.elapsed() >= self.sync_interval;
         if append_due || time_due {
             self.sync()?;
             Ok(true)
@@ -869,7 +955,11 @@ impl MmapScrollback {
                 reason: "v2 state epoch exhausted",
             }
         })?;
-        let next_slot = (self.active_state_slot + 1) % V2_STATE_SLOT_COUNT;
+        let next_slot = if self.state_slot_dirty {
+            self.active_state_slot
+        } else {
+            (self.active_state_slot + 1) % V2_STATE_SLOT_COUNT
+        };
         let base = encode_v2_base_header(self.header);
         let encoded = encode_v2_state_slot(&base, next);
         let offset = V2_STATE_SLOTS_OFFSET + next_slot * V2_STATE_SLOT_SIZE;
@@ -882,6 +972,7 @@ impl MmapScrollback {
             })?;
         self.v2_state = next;
         self.active_state_slot = next_slot;
+        self.state_slot_dirty = true;
         Ok(())
     }
 
@@ -1044,6 +1135,7 @@ impl MmapScrollback {
 
 impl Drop for MmapScrollback {
     fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
         let _ = FileExt::unlock(&self.lock_file);
     }
 }

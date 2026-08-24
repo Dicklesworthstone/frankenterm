@@ -44,7 +44,7 @@ pub const GUARDIAN_MAX_CENSUS_SNAPSHOTS: usize = 8;
 pub const GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES: u32 = 256 * 1024;
 pub const GUARDIAN_MAX_REPLAY_RECORDS: u16 = 32;
 pub const GUARDIAN_MAX_REPLAY_WAIT_MILLIS: u16 = 1_000;
-pub const GUARDIAN_MAX_CHECKPOINT_BYTES: u64 = 128 * 1024 * 1024;
+pub const GUARDIAN_MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
 pub const GUARDIAN_MAX_CHECKPOINT_CHUNKS: u32 = 1_024;
 pub const GUARDIAN_MAX_REPLAY_SNAPSHOTS_PER_CONNECTION: usize = 8;
 pub const GUARDIAN_MAX_REPLAY_SNAPSHOTS_PER_SERVICE: usize = 64;
@@ -9296,6 +9296,17 @@ mod tests {
             .unwrap()
     }
 
+    fn replay_open_payload() -> Vec<u8> {
+        GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: 4_096,
+            max_records: 4,
+            wait_millis: 0,
+        }
+        .encode()
+        .unwrap()
+    }
+
     fn spawn_request(guardian: Uuid, mux: Uuid, pane: Uuid) -> GuardianRequestEnvelope {
         let payload = spawn_payload("bounded-command");
         request(
@@ -9604,7 +9615,6 @@ mod tests {
             GuardianOperation::Claim,
             GuardianOperation::Attach,
             GuardianOperation::Close,
-            GuardianOperation::Replay,
             GuardianOperation::RetireLease,
         ]
         .into_iter()
@@ -10850,12 +10860,11 @@ mod tests {
         );
         assert!(!format!("{response:?}").contains(&id(3).to_string()));
         let frame = encode_guardian_response(&secret(), &response).unwrap();
-        let authenticated = decode_guardian_response(&secret(), &frame).unwrap();
-        let correlated = authenticated
-            .clone()
+        let correlated = decode_guardian_response(&secret(), &frame)
+            .unwrap()
             .correlate(&original_request.header)
             .unwrap();
-        assert_eq!(correlated.envelope(), &response);
+        assert_eq!(correlated.header(), response.header());
         assert_eq!(
             correlated.success_reply(&authenticated_request).unwrap(),
             reply
@@ -10873,7 +10882,7 @@ mod tests {
                 GuardianResponseStatus::Success,
                 &mismatched_payload,
             ),
-            payload: mismatched_payload,
+            payload: Zeroizing::new(mismatched_payload),
         };
         assert_eq!(
             encode_guardian_response(&secret(), &mismatched_response),
@@ -10882,21 +10891,24 @@ mod tests {
 
         let different_request = spawn_request(id(1), id(2), id(8));
         assert_eq!(
-            authenticated.clone().correlate(&different_request.header),
+            decode_guardian_response(&secret(), &frame)
+                .unwrap()
+                .correlate(&different_request.header),
             Err(GuardianProtocolError::ResponseRequestMismatch)
         );
-        let mut different_payload_request = original_request.clone();
-        different_payload_request.payload = b"different-command".to_vec();
+        let mut different_payload_request = copy_request(&original_request);
+        different_payload_request.payload = Zeroizing::new(b"different-command".to_vec());
         different_payload_request.header.payload_sha256 =
             Sha256::digest(&different_payload_request.payload).into();
         assert_eq!(
-            authenticated
-                .clone()
+            decode_guardian_response(&secret(), &frame)
+                .unwrap()
                 .correlate(&different_payload_request.header),
             Err(GuardianProtocolError::ResponseRequestMismatch)
         );
 
-        let mut wrong_lease = response.clone();
+        let mut wrong_lease =
+            GuardianResponseEnvelope::success(&authenticated_request, &reply).unwrap();
         wrong_lease.header.lease_generation = 1;
         assert_eq!(
             encode_guardian_response(&secret(), &wrong_lease),
@@ -11196,7 +11208,7 @@ mod tests {
                 GuardianResponseStatus::Success,
                 &oversized_payload,
             ),
-            payload: oversized_payload,
+            payload: Zeroizing::new(oversized_payload),
         });
         assert_eq!(
             forged_correlated_page.success_reply(&entry_limited_request),
@@ -11671,7 +11683,7 @@ mod tests {
         let spawn = spawn_request(guardian, mux, pane);
         let first = apply_request(&mut state, &spawn).unwrap();
         assert_eq!(apply_request(&mut state, &spawn).unwrap(), first);
-        let mut same_spawn_effect_after_ambiguous_reply = spawn.clone();
+        let mut same_spawn_effect_after_ambiguous_reply = copy_request(&spawn);
         same_spawn_effect_after_ambiguous_reply.header.request_id = id(6);
         assert_eq!(
             apply_request(&mut state, &same_spawn_effect_after_ambiguous_reply).unwrap(),
@@ -11679,8 +11691,8 @@ mod tests {
         );
         assert_eq!(state.panes.len(), 1);
 
-        let mut conflicting = spawn.clone();
-        conflicting.payload = b"different-command".to_vec();
+        let mut conflicting = copy_request(&spawn);
+        conflicting.payload = Zeroizing::new(b"different-command".to_vec());
         conflicting.header.payload_sha256 = Sha256::digest(&conflicting.payload).into();
         assert_eq!(
             apply_request(&mut state, &conflicting),
@@ -12018,7 +12030,7 @@ mod tests {
             }
         );
         assert_eq!(apply_request(&mut state, &input).unwrap(), receipt);
-        let mut retry_after_ambiguous_response = input.clone();
+        let mut retry_after_ambiguous_response = copy_request(&input);
         retry_after_ambiguous_response.header.request_id = id(24);
         assert_eq!(
             apply_request(&mut state, &retry_after_ambiguous_response).unwrap(),
@@ -12045,9 +12057,9 @@ mod tests {
             }
         );
 
-        let mut conflicting = input.clone();
+        let mut conflicting = copy_request(&input);
         conflicting.header.request_id = id(23);
-        conflicting.payload = b"different".to_vec();
+        conflicting.payload = Zeroizing::new(b"different".to_vec());
         conflicting.header.payload_sha256 = Sha256::digest(&conflicting.payload).into();
         assert_eq!(
             apply_request(&mut state, &conflicting),
@@ -12398,7 +12410,7 @@ mod tests {
             begin_guardian_input_transaction(&mut state, &mut journal, &authenticated_input),
             Ok(GuardianInputTransaction::Reconciled(reply)) if reply == partial
         ));
-        let mut alias = input.clone();
+        let mut alias = copy_request(&input);
         alias.header.request_id = id(62);
         assert!(matches!(
             begin_guardian_input_transaction(&mut state, &mut journal, &authenticate(&alias)),
@@ -12407,9 +12419,9 @@ mod tests {
         assert_eq!(journal.record_count(), records_before_retries);
 
         let before_payload_splice = state.clone();
-        let mut same_length_payload_splice = input.clone();
+        let mut same_length_payload_splice = copy_request(&input);
         same_length_payload_splice.header.request_id = id(65);
-        same_length_payload_splice.payload = b"abcxef".to_vec();
+        same_length_payload_splice.payload = Zeroizing::new(b"abcxef".to_vec());
         same_length_payload_splice.header.payload_sha256 =
             Sha256::digest(&same_length_payload_splice.payload).into();
         assert!(matches!(
@@ -12620,7 +12632,7 @@ mod tests {
         );
         let pending_receipt = apply_request(&mut state, &input).unwrap();
         for alias_number in 1..GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT {
-            let mut alias = input.clone();
+            let mut alias = copy_request(&input);
             alias.header.request_id = Uuid::from_u128(0x1_0000 + alias_number as u128);
             assert_eq!(apply_request(&mut state, &alias).unwrap(), pending_receipt);
         }
@@ -12629,7 +12641,7 @@ mod tests {
             GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT
         );
 
-        let mut rejected_alias = input.clone();
+        let mut rejected_alias = copy_request(&input);
         rejected_alias.header.request_id = Uuid::from_u128(0x2_0000);
         assert_eq!(
             apply_request(&mut state, &rejected_alias),
@@ -12698,7 +12710,7 @@ mod tests {
             1,
             0,
             None,
-            b"",
+            &replay_open_payload(),
         );
         assert_eq!(
             apply_request(&mut state, &replay).unwrap(),
@@ -12775,7 +12787,7 @@ mod tests {
             b"reconciliation-preflight",
         );
         let pending_reply = apply_request(&mut state, &input).unwrap();
-        let mut alias = input.clone();
+        let mut alias = copy_request(&input);
         alias.header.request_id = id(10);
         assert_eq!(apply_request(&mut state, &alias).unwrap(), pending_reply);
         let identity = input_effect_identity(&input);
@@ -12971,7 +12983,7 @@ mod tests {
         apply_request(&mut state, &first).unwrap();
         apply_request(&mut state, &resize(10, 11, 2)).unwrap();
 
-        let mut newer_first_alias = first.clone();
+        let mut newer_first_alias = copy_request(&first);
         newer_first_alias.header.request_id = id(12);
         assert_eq!(
             apply_request(&mut state, &newer_first_alias).unwrap(),
