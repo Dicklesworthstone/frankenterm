@@ -1,11 +1,12 @@
-//! Crash-safe scrollback writer over the v1 mmap file format.
+//! Crash-safe scrollback writer over the authenticated v2 ring profile.
 //!
 //! This module intentionally keeps the public contract at the format
-//! boundary: one per-pane `.bin` file plus a sidecar `.bin.lock`, fixed
-//! header, tagged records, redaction-before-write, bounded capacity, and
-//! explicit sync cadence. The crate forbids unsafe code, so the first
-//! integration pass uses positional file writes and `sync_data` instead of
-//! calling platform mmap APIs directly.
+//! boundary: one per-pane `.bin` file plus a sidecar `.bin.lock`, dual
+//! authenticated state slots, integrity-tagged records, redaction-before-write,
+//! bounded capacity, and explicit sync cadence. Legacy v1 leaves are forensic
+//! read-only inputs and are never migrated in place. The crate forbids unsafe
+//! code, so this implementation uses positional file writes and `sync_data`
+//! instead of calling platform mmap APIs directly.
 
 use crate::redactor::{BytesRedactionEvidence, RedactionResult, StreamingRedactor};
 use crate::scrollback_mmap_format::{
@@ -3568,6 +3569,204 @@ mod tests {
 
         assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
         assert_eq!(std::fs::read(config.bin_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn writer_rejects_preexisting_short_leaf_without_changing_one_byte() {
+        let dir = test_dir("short-evidence-preserved");
+        create_private_dir(&dir);
+        let config =
+            MmapScrollbackConfig::new(&dir, "short-evidence").with_cap_bytes(4096);
+        write_private(&config.bin_path(), b"immutable forensic prefix");
+        let before = std::fs::read(config.bin_path()).unwrap();
+
+        let error = MmapScrollback::open(config.clone()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            MmapScrollbackError::ExistingFileShapeMismatch { .. }
+        ));
+        assert_eq!(std::fs::read(config.bin_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn writer_rejects_capacity_mismatch_without_resizing_or_reinitializing() {
+        let dir = test_dir("capacity-evidence-preserved");
+        let original =
+            MmapScrollbackConfig::new(&dir, "capacity-evidence").with_cap_bytes(4096);
+        let mut writer = MmapScrollback::open(original.clone()).unwrap();
+        append_test_payload(&mut writer, RecordKind::Text, b"durable evidence");
+        writer.sync().unwrap();
+        drop(writer);
+        let before = std::fs::read(original.bin_path()).unwrap();
+
+        let mismatched = original.clone().with_cap_bytes(8192);
+        let error = MmapScrollback::open(mismatched).unwrap_err();
+
+        assert!(matches!(
+            error,
+            MmapScrollbackError::ExistingFileShapeMismatch { .. }
+        ));
+        assert_eq!(std::fs::read(original.bin_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn writer_rejects_exact_length_legacy_v1_without_in_place_migration() {
+        let dir = test_dir("v1-read-only");
+        create_private_dir(&dir);
+        let config = MmapScrollbackConfig::new(&dir, "v1-read-only").with_cap_bytes(4096);
+        let header = ScrollbackHeader::new(pane_uuid_bytes("v1-read-only"), 4096, 17);
+        write_private(&config.bin_path(), &header.encode());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(config.bin_path())
+            .unwrap()
+            .set_len(HEADER_SIZE as u64 + 4096)
+            .unwrap();
+        let before = std::fs::read(config.bin_path()).unwrap();
+
+        let error = MmapScrollback::open(config.clone()).unwrap_err();
+
+        assert!(matches!(error, MmapScrollbackError::LegacyV1ReadOnly { .. }));
+        assert_eq!(std::fs::read(config.bin_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn wrapped_v1_reader_never_claims_complete_logical_order() {
+        let dir = test_dir("v1-wrap-incomplete");
+        create_private_dir(&dir);
+        let path = dir.join("wrapped-v1.bin");
+        let payload = b"physical-prefix";
+        let record = RecordHeader {
+            record_len: payload.len() as u32,
+            record_kind: RecordKind::Text,
+        };
+        let cursor = RECORD_HEADER_SIZE as u64 + payload.len() as u64;
+        let mut header = ScrollbackHeader::new([0x44; 32], 128, 0);
+        header.write_cursor_bytes = cursor;
+        header.total_bytes_written = 128 + cursor;
+        let mut bytes = header.encode().to_vec();
+        bytes.extend_from_slice(&record.encode());
+        bytes.extend_from_slice(payload);
+        bytes.resize(HEADER_SIZE + 128, 0);
+        write_private(&path, &bytes);
+
+        let snapshot = read_linear_records(&path, test_read_limits()).unwrap();
+
+        assert_eq!(snapshot.records, vec![(RecordKind::Text, payload.to_vec())]);
+        assert_eq!(
+            snapshot.completeness,
+            LinearRecordCompleteness::Incomplete {
+                decoded_cursor_bytes: cursor,
+                declared_cursor_bytes: cursor,
+                reason: LinearRecordTerminalReason::LegacyWrappedOrderUnknown,
+            }
+        );
+    }
+
+    #[test]
+    fn post_flock_lock_leaf_replacement_fails_before_data_creation() {
+        let dir = test_dir("replace-lock-after-flock");
+        create_private_dir(&dir);
+        let config =
+            MmapScrollbackConfig::new(&dir, "replace-lock-after-flock").with_cap_bytes(4096);
+        write_private(&config.lock_path(), b"original lock evidence");
+        let saved_lock = dir.join("original-lock-preserved");
+        let lock_path = config.lock_path();
+
+        let error = MmapScrollback::open_with_after_lock(config.clone(), || {
+            std::fs::rename(&lock_path, &saved_lock).unwrap();
+            write_private(&lock_path, b"replacement lock evidence");
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
+        assert_eq!(std::fs::read(saved_lock).unwrap(), b"original lock evidence");
+        assert_eq!(std::fs::read(lock_path).unwrap(), b"replacement lock evidence");
+        assert!(!config.bin_path().exists());
+    }
+
+    #[test]
+    fn second_writer_gets_bounded_busy_result() {
+        let dir = test_dir("writer-busy");
+        let config = MmapScrollbackConfig::new(&dir, "writer-busy").with_cap_bytes(4096);
+        let first = MmapScrollback::open(config.clone()).unwrap();
+
+        let error = MmapScrollback::open(config).unwrap_err();
+
+        assert!(matches!(error, MmapScrollbackError::WriterBusy { .. }));
+        drop(first);
+    }
+
+    #[test]
+    fn configured_append_sync_cadence_has_no_hidden_per_append_sync() {
+        let dir = test_dir("sync-cadence");
+        let mut writer = MmapScrollback::open(
+            MmapScrollbackConfig::new(&dir, "sync-cadence")
+                .with_cap_bytes(4096)
+                .with_sync_every_appends(3)
+                .with_sync_interval(Duration::from_secs(3600)),
+        )
+        .unwrap();
+        let sync_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        writer.sync_observer = Some(sync_count.clone());
+
+        assert!(!append_test_payload(&mut writer, RecordKind::Text, b"one").synced);
+        assert!(!append_test_payload(&mut writer, RecordKind::Text, b"two").synced);
+        assert_eq!(sync_count.load(Ordering::SeqCst), 0);
+        assert!(append_test_payload(&mut writer, RecordKind::Text, b"three").synced);
+        assert_eq!(sync_count.load(Ordering::SeqCst), 1);
+        assert!(!append_test_payload(&mut writer, RecordKind::Text, b"four").synced);
+        assert_eq!(sync_count.load(Ordering::SeqCst), 1);
+        writer.sync().unwrap();
+        assert_eq!(sync_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn v2_record_digest_rejects_tamper_and_falls_back_incomplete() {
+        let dir = test_dir("v2-record-tamper");
+        let config = MmapScrollbackConfig::new(&dir, "v2-record-tamper")
+            .with_cap_bytes(4096)
+            .with_sync_every_appends(0)
+            .with_sync_interval(Duration::from_secs(3600));
+        let path = config.bin_path();
+        let mut writer = MmapScrollback::open(config.clone()).unwrap();
+        let first = b"first";
+        let second = b"second";
+        append_test_payload(&mut writer, RecordKind::Text, first);
+        append_test_payload(&mut writer, RecordKind::Osc, second);
+        writer.sync().unwrap();
+        drop(writer);
+
+        let second_payload_offset = HEADER_SIZE as u64
+            + V2_RECORD_HEADER_SIZE as u64
+            + first.len() as u64
+            + V2_RECORD_HEADER_SIZE as u64;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(second_payload_offset)).unwrap();
+        file.write_all(b"X").unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let tampered = std::fs::read(&path).unwrap();
+
+        let snapshot = read_linear_records(&path, test_read_limits()).unwrap();
+        assert_eq!(snapshot.records, vec![(RecordKind::Text, first.to_vec())]);
+        assert!(matches!(
+            snapshot.completeness,
+            LinearRecordCompleteness::Incomplete {
+                reason: LinearRecordTerminalReason::V2NewerStateInvalid,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MmapScrollback::open(config),
+            Err(MmapScrollbackError::V2Integrity { .. })
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), tampered);
     }
 
     #[test]

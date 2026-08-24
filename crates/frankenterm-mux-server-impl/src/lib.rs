@@ -694,10 +694,7 @@ impl VerifiedLedgerState {
         let record_count = u64::try_from(store.line_count(ledger_pane_id))
             .map_err(|_| anyhow::anyhow!("authenticated ledger row count exceeds u64"))?;
         match (oldest_sequence, record_count) {
-            (None, 0) => anyhow::ensure!(
-                next_sequence == 0,
-                "empty authenticated ledger has a nonzero next sequence"
-            ),
+            (None, 0) => {}
             (Some(oldest), count) if count != 0 => anyhow::ensure!(
                 oldest.checked_add(count) == Some(next_sequence),
                 "authenticated ledger sequence interval is not contiguous"
@@ -2418,10 +2415,6 @@ impl LiveScrollbackSpillSink {
             "append WAL must be prepared at the exact next sequence"
         );
         let current_record_count = u64::try_from(store.line_count(ledger_pane_id))?;
-        anyhow::ensure!(
-            current_record_count != 0,
-            "first-row publication must use the prepared-manifest protocol"
-        );
         let max_retained_rows_u64 = u64::try_from(max_retained_rows)?;
         let (target_authority, evicted_record_count) = predecessor_authority.project_append(
             desired_sequence,
@@ -6879,21 +6872,30 @@ pub fn list_live_scrollback_panes(
                     )
                     .context("verify authenticated logical ledger during discovery")?;
                 } else {
-                    let observed = live_scrollback_logical_ledger_digest_from_records(
-                        &manifest_after,
-                        ledger_pane_id,
-                        None,
-                        0,
-                        0,
-                        0,
-                        0,
-                        &[],
-                    )?;
-                    anyhow::ensure!(
-                        observed
-                            == expected_live_scrollback_logical_ledger_digest(&manifest_after)?,
-                        "cleared authenticated logical ledger digest mismatch"
-                    );
+                    if manifest_after.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 {
+                        let observed = live_scrollback_logical_ledger_digest_from_records(
+                            &manifest_after,
+                            ledger_pane_id,
+                            None,
+                            0,
+                            0,
+                            0,
+                            0,
+                            &[],
+                        )?;
+                        anyhow::ensure!(
+                            observed
+                                == expected_live_scrollback_logical_ledger_digest(&manifest_after)?,
+                            "cleared authenticated v3 logical ledger digest mismatch"
+                        );
+                    } else {
+                        let (anchor, tail) =
+                            expected_live_scrollback_v4_chain(&manifest_after)?;
+                        anyhow::ensure!(
+                            anchor == tail,
+                            "cleared authenticated v4 chain is nonempty"
+                        );
+                    }
                 }
             }
             let metadata_after = std::fs::symlink_metadata(&pane_path)?;
@@ -7776,7 +7778,7 @@ mod tests {
                 &Line::from_text(
                     &format!("incremental-authority-row-{row}"),
                     &attributes,
-                    row,
+                    u64::try_from(row).expect("fixture row sequence fits u64"),
                     None,
                 ),
                 retained_rows,
@@ -7788,7 +7790,7 @@ mod tests {
             &Line::from_text(
                 "incremental-authority-measured-row",
                 &attributes,
-                retained_rows,
+                u64::try_from(retained_rows).expect("fixture row sequence fits u64"),
                 None,
             ),
             target_retention,
@@ -9498,6 +9500,11 @@ mod tests {
                 let stable_row = isize::try_from(stable_row).expect("stable row fits isize");
                 assert!(sink.store_scrollback_line(stable_row, &line, 8));
             }
+            let prior_authority = sink
+                .lock_state("test empty forward authority predecessor")
+                .expect("test state lock")
+                .verified_ledger
+                .expect("populated v4 ledger has verified authority");
             let mut store = sink
                 .lock_store("test empty forward retention state")
                 .expect("test store lock");
@@ -9508,6 +9515,17 @@ mod tests {
                     .expect("compact empty retained set")
             );
             drop(store);
+            sink.lock_state("test empty forward authority target")
+                .expect("test state lock")
+                .verified_ledger = Some(VerifiedLedgerState {
+                ledger_pane_id: prior_authority.ledger_pane_id,
+                oldest_sequence: None,
+                next_sequence: 4,
+                record_count: 0,
+                retained_record_bytes: 0,
+                chain_anchor: prior_authority.chain_tail,
+                chain_tail: prior_authority.chain_tail,
+            });
             sink.persist_manifest("complete")
                 .expect("authenticate empty forward-retention state");
         }

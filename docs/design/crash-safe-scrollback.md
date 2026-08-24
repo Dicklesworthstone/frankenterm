@@ -102,9 +102,9 @@ inherit tmux operator habits.
   because key management adds operational complexity that not
   every operator wants by default.
 
-## File format (v1)
+## File formats: forensic v1 and fresh-write v2
 
-The `.bin` file is a **fixed-header + ring buffer** layout:
+The original v1 `.bin` file is a **fixed-header + ring buffer** layout:
 
 ```
  byte offset    field                        notes
@@ -131,6 +131,40 @@ The `.bin` file is a **fixed-header + ring buffer** layout:
   movement / clear). Bumps to record_kind require a
   format_version bump (the v1 line above).
 
+V1 never recorded the oldest retained record or a wrap generation. Once
+`total_bytes_written > write_cursor_bytes`, physical bytes `0..cursor` are not
+enough to reconstruct logical FIFO order. The bounded reader may expose that
+physical salvage, but it marks the result `incomplete` with
+`legacy_wrapped_order_unknown`; it never labels a wrapped-v1 export complete.
+The writer treats every pre-existing v1 leaf as read-only forensic evidence and
+never resizes, reinitializes, or migrates it in place.
+
+Fresh files use the **v2 authenticated-ring profile**. The outer 256-byte
+identity envelope remains decodable by the bounded census and carries flag
+`0x8000`; its on-disk v1 cursor is fixed at zero so an unaware reader cannot
+mistake physical order for logical order. Bytes `88..216` contain two
+alternating 64-byte state slots. Each slot has a 128-bit truncated SHA-256
+checksum bound to the immutable outer identity and stores:
+
+```
+slot_epoch | head | tail | wrap_at | record_count | generation | next_sequence
+```
+
+The highest valid epoch is authoritative. A fresh record has a 64-byte header
+containing `FTR2`, payload length and kind, wrap generation, monotone sequence,
+and a full SHA-256 digest bound to pane UUID plus payload. The explicit
+`head`/`tail`/`wrap_at` state reconstructs surviving records in FIFO order
+after wrap; sequence and record digests reject reordering, tears, and payload
+corruption. Recovery can fall back to the older authenticated slot when a
+newer record publication is torn, but reports that salvage as incomplete.
+Writer reopen is stricter: any ambiguous/torn slot or record fails closed.
+
+Creation uses `create_new`; only a leaf proven newly created at that instant is
+initialized as v2. Any pre-existing short/long file, physical-length/capacity
+mismatch, corrupt v2 state, or legacy v1 evidence fails byte-preserving. The
+minimum v2 ring capacity is 65 bytes (64-byte record header plus one payload
+byte); the configured hard physical ceiling remains finite.
+
 ## Substrate write path contract
 
 The following is the contract implemented by the mmap writer/helper substrate.
@@ -142,13 +176,19 @@ runtime does not call the helper.
    `MmapScrollback::append`. Current direct callers are tests.
 2. `append` runs the **redactor** (ft-x0666 G10 surface) before
    the mmap write. Secrets never reach disk.
-3. `append` uses bounded positional file writes at `write_cursor_bytes` and
-   wraps on overrun. The crate forbids unsafe code, so this substrate does not
-   invoke platform mmap APIs directly.
+3. `append` uses bounded positional file writes at the authenticated v2 tail,
+   evicts only whole verified records, and publishes the next alternating state
+   slot. The crate forbids unsafe code, so this substrate does not invoke
+   platform mmap APIs directly. Before reusing bytes still referenced by the
+   prior state, it durably publishes an eviction-only state; this prevents a
+   crash during overwrite from invalidating both recovery generations.
 4. **Flush boundary**: every N appends OR every M ms, the
    write-side helper calls `sync_data` and bumps `last_msync_at_epoch_ms`.
    This is the durability boundary — bytes before the last successful sync
-   survive `kill -9`.
+   survive `kill -9`. A not-due append does **not** call `sync_data`; therefore
+   the configured N/M loss window is real rather than a hidden per-append sync.
+   Reclaiming referenced ring bytes is the one deliberate extra sync boundary
+   described above, because safe overwrite takes precedence over cadence.
 
 The in-memory ring stays as the read-side fast path. mmap is for
 durability, not access.
