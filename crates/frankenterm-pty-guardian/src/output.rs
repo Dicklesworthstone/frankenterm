@@ -5378,6 +5378,7 @@ mod tests {
         let (_reopened_poll, reopened_pipeline) =
             reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
         let store = reopened_pipeline.checkpoint_stage_store();
+        let total_chunks = u32::try_from(payload.chunks(chunk_bytes_usize).count())?;
         let first_retry = checkpoint_test_genesis_request(
             GuardianCheckpointStageKindV1::Chunk,
             spawn_effect_id,
@@ -5394,6 +5395,18 @@ mod tests {
                 committed_bytes: 8,
             }
         );
+        let expected_durable_records = usize::try_from(total_chunks)?
+            .checked_add(1)
+            .ok_or("fixture durable-record count overflow")?;
+        assert_eq!(
+            store
+                .inner
+                .durable_records
+                .lock()
+                .expect("checkpoint durability cache")
+                .len(),
+            expected_durable_records
+        );
         let conflicting_first_retry = checkpoint_test_genesis_request(
             GuardianCheckpointStageKindV1::Chunk,
             spawn_effect_id,
@@ -5406,7 +5419,6 @@ mod tests {
             store.apply_chunk(conflicting_first_retry),
             Err(GuardianCheckpointStageStoreError::Conflict)
         ));
-        let total_chunks = u32::try_from(payload.chunks(chunk_bytes_usize).count())?;
         assert_eq!(
             store.apply_begin(&begin)?,
             GuardianCheckpointStageReplyV1::Ready {
