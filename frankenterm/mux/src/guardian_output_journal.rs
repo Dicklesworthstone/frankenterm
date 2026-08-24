@@ -55,6 +55,117 @@ const SCROLLBACK_ROW_FORMAT_VERSION: u32 = 3;
 const SCROLLBACK_ROW_HEADER_BYTES: usize = 96;
 const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES: u32 = 16 * 1024 * 1024;
 const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES_USIZE: usize = 16 * 1024 * 1024;
+const SCROLLBACK_MANIFEST_AEAD_DOMAIN: &[u8] =
+    b"frankenterm.scrollback-manifest-authentication.v1\0";
+const SCROLLBACK_MANIFEST_AUTH_PREFIX: &str = "ftsma1e:";
+const SCROLLBACK_MANIFEST_AUTH_VERSION: u32 = 1;
+const SCROLLBACK_MANIFEST_AUTH_BYTES: usize = 56;
+const SCROLLBACK_MANIFEST_AUTH_ENCODED_BYTES: usize = 75;
+const SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES: u32 = 1024 * 1024;
+
+/// Opaque guardian authentication seal for one canonical v3 scrollback
+/// generation/pointer manifest.
+///
+/// The seal contains no manifest plaintext. Its AEAD tag authenticates the
+/// caller-supplied canonical manifest bytes as associated data under the
+/// historical key ID embedded in this record.
+pub struct GuardianScrollbackManifestAuthentication {
+    key_id: [u8; KEY_ID_BYTES],
+    canonical_bytes: u32,
+    nonce: [u8; NONCE_BYTES],
+    authentication_tag: [u8; AEAD_TAG_BYTES_USIZE],
+}
+
+impl GuardianScrollbackManifestAuthentication {
+    #[must_use]
+    pub fn has_authenticated_prefix(record: &str) -> bool {
+        record.starts_with(SCROLLBACK_MANIFEST_AUTH_PREFIX)
+    }
+
+    pub fn parse(record: &str) -> Result<Self, GuardianScrollbackManifestError> {
+        let encoded = record
+            .strip_prefix(SCROLLBACK_MANIFEST_AUTH_PREFIX)
+            .ok_or(GuardianScrollbackManifestError::MalformedRecord)?;
+        if encoded.len() != SCROLLBACK_MANIFEST_AUTH_ENCODED_BYTES {
+            return Err(GuardianScrollbackManifestError::MalformedRecord);
+        }
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| GuardianScrollbackManifestError::MalformedRecord)?;
+        if bytes.len() != SCROLLBACK_MANIFEST_AUTH_BYTES {
+            return Err(GuardianScrollbackManifestError::MalformedRecord);
+        }
+        if base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes) != encoded {
+            return Err(GuardianScrollbackManifestError::NonCanonicalRecord);
+        }
+        let version = read_u32(&bytes[0..4]);
+        if version != SCROLLBACK_MANIFEST_AUTH_VERSION {
+            return Err(GuardianScrollbackManifestError::UnsupportedVersion { observed: version });
+        }
+        let mut key_id = [0; KEY_ID_BYTES];
+        key_id.copy_from_slice(&bytes[4..12]);
+        let canonical_bytes = read_u32(&bytes[12..16]);
+        if canonical_bytes == 0 || canonical_bytes > SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES {
+            return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        nonce.copy_from_slice(&bytes[16..40]);
+        let mut authentication_tag = [0; AEAD_TAG_BYTES_USIZE];
+        authentication_tag.copy_from_slice(&bytes[40..56]);
+        Ok(Self {
+            key_id,
+            canonical_bytes,
+            nonce,
+            authentication_tag,
+        })
+    }
+
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; KEY_ID_BYTES] {
+        self.key_id
+    }
+
+    pub fn encode(&self) -> String {
+        let mut bytes = Vec::with_capacity(SCROLLBACK_MANIFEST_AUTH_BYTES);
+        bytes.extend_from_slice(&SCROLLBACK_MANIFEST_AUTH_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.key_id);
+        bytes.extend_from_slice(&self.canonical_bytes.to_le_bytes());
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&self.authentication_tag);
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+        format!("{SCROLLBACK_MANIFEST_AUTH_PREFIX}{encoded}")
+    }
+}
+
+impl std::fmt::Debug for GuardianScrollbackManifestAuthentication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianScrollbackManifestAuthentication")
+            .field("key_id", &"[REDACTED]")
+            .field("canonical_bytes", &self.canonical_bytes)
+            .field("nonce", &"[REDACTED]")
+            .field("authentication_tag", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianScrollbackManifestError {
+    #[error("authenticated scrollback manifest record is malformed")]
+    MalformedRecord,
+    #[error("authenticated scrollback manifest record is not canonical")]
+    NonCanonicalRecord,
+    #[error("unsupported authenticated scrollback manifest version {observed}")]
+    UnsupportedVersion { observed: u32 },
+    #[error("canonical scrollback manifest exceeds its hard byte limit")]
+    CanonicalByteLimit,
+    #[error("authenticated scrollback manifest key identity does not match")]
+    KeyIdentityMismatch,
+    #[error("operating system entropy is unavailable for manifest authentication")]
+    EntropyUnavailable,
+    #[error("scrollback manifest authentication failed")]
+    AuthenticationFailed,
+}
 
 /// Authenticated storage identity for one exact semantic cold-scrollback row.
 ///
@@ -582,6 +693,79 @@ impl GuardianOutputCipher {
         Ok(plaintext)
     }
 
+    /// Authenticate one canonical v3 scrollback manifest without persisting
+    /// either generic metadata ciphertext or raw key material.
+    pub fn authenticate_scrollback_manifest(
+        &self,
+        canonical_manifest: &[u8],
+    ) -> Result<GuardianScrollbackManifestAuthentication, GuardianScrollbackManifestError> {
+        let canonical_bytes = u32::try_from(canonical_manifest.len())
+            .map_err(|_| GuardianScrollbackManifestError::CanonicalByteLimit)?;
+        if canonical_bytes == 0 || canonical_bytes > SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES {
+            return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        if OsRng.try_fill_bytes(&mut nonce).is_err() {
+            nonce.zeroize();
+            return Err(GuardianScrollbackManifestError::EntropyUnavailable);
+        }
+        let aad = scrollback_manifest_aad(self.key_id, canonical_bytes, canonical_manifest);
+        let authentication_tag = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &[],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackManifestError::AuthenticationFailed)?;
+        let authentication_tag: [u8; AEAD_TAG_BYTES_USIZE] = authentication_tag
+            .try_into()
+            .map_err(|_| GuardianScrollbackManifestError::AuthenticationFailed)?;
+        Ok(GuardianScrollbackManifestAuthentication {
+            key_id: self.key_id,
+            canonical_bytes,
+            nonce,
+            authentication_tag,
+        })
+    }
+
+    /// Verify that a canonical v3 scrollback manifest matches its guardian
+    /// authentication seal under this historical key.
+    pub fn verify_scrollback_manifest(
+        &self,
+        authentication: &GuardianScrollbackManifestAuthentication,
+        canonical_manifest: &[u8],
+    ) -> Result<(), GuardianScrollbackManifestError> {
+        if authentication.key_id != self.key_id {
+            return Err(GuardianScrollbackManifestError::KeyIdentityMismatch);
+        }
+        let canonical_bytes = u32::try_from(canonical_manifest.len())
+            .map_err(|_| GuardianScrollbackManifestError::CanonicalByteLimit)?;
+        if canonical_bytes == 0
+            || canonical_bytes > SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES
+            || canonical_bytes != authentication.canonical_bytes
+        {
+            return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
+        }
+        let aad = scrollback_manifest_aad(self.key_id, canonical_bytes, canonical_manifest);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                XNonce::from_slice(&authentication.nonce),
+                Payload {
+                    msg: &authentication.authentication_tag,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackManifestError::AuthenticationFailed)?;
+        if !plaintext.is_empty() {
+            return Err(GuardianScrollbackManifestError::AuthenticationFailed);
+        }
+        Ok(())
+    }
+
     /// Seal guardian-owned journal metadata under a caller-supplied,
     /// domain-separated associated-data envelope.
     ///
@@ -695,6 +879,22 @@ fn scrollback_row_aad(
     aad.extend_from_slice(&identity.stable_row.to_le_bytes());
     aad.extend_from_slice(&identity.sequence.to_le_bytes());
     aad.extend_from_slice(&plaintext_bytes.to_le_bytes());
+    aad
+}
+
+fn scrollback_manifest_aad(
+    key_id: [u8; KEY_ID_BYTES],
+    canonical_bytes: u32,
+    canonical_manifest: &[u8],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        SCROLLBACK_MANIFEST_AEAD_DOMAIN.len() + 4 + KEY_ID_BYTES + 4 + canonical_manifest.len(),
+    );
+    aad.extend_from_slice(SCROLLBACK_MANIFEST_AEAD_DOMAIN);
+    aad.extend_from_slice(&SCROLLBACK_MANIFEST_AUTH_VERSION.to_le_bytes());
+    aad.extend_from_slice(&key_id);
+    aad.extend_from_slice(&canonical_bytes.to_le_bytes());
+    aad.extend_from_slice(canonical_manifest);
     aad
 }
 
@@ -867,6 +1067,7 @@ pub struct GuardianOutputAppendReceipt {
     segment_id: Uuid,
     sequence: u64,
     payload_bytes: u32,
+    cumulative_plaintext_bytes: u64,
     committed_log_bytes: u64,
     record_digest: [u8; 32],
 }
@@ -885,6 +1086,13 @@ impl GuardianOutputAppendReceipt {
     #[must_use]
     pub const fn payload_bytes(self) -> u32 {
         self.payload_bytes
+    }
+
+    /// Exact cumulative plaintext stream endpoint through this authenticated,
+    /// synchronized record within its segment.
+    #[must_use]
+    pub const fn cumulative_plaintext_bytes(self) -> u64 {
+        self.cumulative_plaintext_bytes
     }
 
     #[must_use]
@@ -914,6 +1122,10 @@ impl std::fmt::Debug for GuardianOutputAppendReceipt {
             .field("segment_id", &self.segment_id)
             .field("sequence", &self.sequence)
             .field("payload_bytes", &self.payload_bytes)
+            .field(
+                "cumulative_plaintext_bytes",
+                &self.cumulative_plaintext_bytes,
+            )
             .field("committed_log_bytes", &self.committed_log_bytes)
             .field("record_digest", &"[REDACTED]")
             .finish()
@@ -1012,6 +1224,7 @@ pub enum GuardianOutputJournalError {
 struct JournalScan {
     committed_bytes: u64,
     record_count: u64,
+    cumulative_plaintext_bytes: u64,
     next_sequence: Option<u64>,
     tail: GuardianOutputJournalTail,
 }
@@ -1024,6 +1237,7 @@ pub struct GuardianOutputJournal {
     limits: GuardianOutputJournalLimits,
     committed_bytes: u64,
     record_count: u64,
+    cumulative_plaintext_bytes: u64,
     next_sequence: Option<u64>,
     tail: GuardianOutputJournalTail,
     directory_entry_sync_required: bool,
@@ -1076,6 +1290,7 @@ impl GuardianOutputJournal {
             limits,
             committed_bytes: scan.committed_bytes,
             record_count: scan.record_count,
+            cumulative_plaintext_bytes: scan.cumulative_plaintext_bytes,
             next_sequence: scan.next_sequence,
             tail: scan.tail,
             directory_entry_sync_required: initialized_new_segment,
@@ -1096,6 +1311,11 @@ impl GuardianOutputJournal {
     #[must_use]
     pub const fn record_count(&self) -> u64 {
         self.record_count
+    }
+
+    #[must_use]
+    pub const fn cumulative_plaintext_bytes(&self) -> u64 {
+        self.cumulative_plaintext_bytes
     }
 
     #[must_use]
@@ -1182,6 +1402,10 @@ impl GuardianOutputJournal {
             .ok_or(GuardianOutputJournalError::SequenceExhausted)?;
         let payload_bytes = u32::try_from(payload.len())
             .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+        let cumulative_plaintext_bytes = self
+            .cumulative_plaintext_bytes
+            .checked_add(u64::from(payload_bytes))
+            .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
         let (nonce, ciphertext) = self
             .cipher
             .seal(self.identity, sequence, payload_bytes, payload)?;
@@ -1247,11 +1471,13 @@ impl GuardianOutputJournal {
             .record_count
             .checked_add(1)
             .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        self.cumulative_plaintext_bytes = cumulative_plaintext_bytes;
         self.next_sequence = sequence.checked_add(1);
         Ok(GuardianOutputAppendReceipt {
             segment_id: self.identity.segment_id,
             sequence,
             payload_bytes,
+            cumulative_plaintext_bytes,
             committed_log_bytes: projected_bytes,
             record_digest,
         })
@@ -1397,6 +1623,7 @@ fn scan_journal<R: Read + Seek>(
 
     let mut committed_bytes = FILE_HEADER_BYTES_U64;
     let mut record_count = 0_u64;
+    let mut cumulative_plaintext_bytes = 0_u64;
     let mut next_sequence = Some(identity.first_sequence);
     while committed_bytes < physical_bytes {
         let remaining = physical_bytes
@@ -1406,6 +1633,7 @@ fn scan_journal<R: Read + Seek>(
             return Ok(JournalScan {
                 committed_bytes,
                 record_count,
+                cumulative_plaintext_bytes,
                 next_sequence,
                 tail: GuardianOutputJournalTail::Incomplete {
                     committed_bytes,
@@ -1476,6 +1704,7 @@ fn scan_journal<R: Read + Seek>(
             return Ok(JournalScan {
                 committed_bytes,
                 record_count,
+                cumulative_plaintext_bytes,
                 next_sequence,
                 tail: GuardianOutputJournalTail::Incomplete {
                     committed_bytes,
@@ -1523,11 +1752,15 @@ fn scan_journal<R: Read + Seek>(
         record_count = record_count
             .checked_add(1)
             .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        cumulative_plaintext_bytes = cumulative_plaintext_bytes
+            .checked_add(u64::from(plaintext_bytes))
+            .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
         next_sequence = sequence.checked_add(1);
     }
     Ok(JournalScan {
         committed_bytes,
         record_count,
+        cumulative_plaintext_bytes,
         next_sequence,
         tail: GuardianOutputJournalTail::Clean,
     })
@@ -1686,6 +1919,81 @@ mod tests {
             GuardianEncryptedScrollbackRow::parse(&format!("{encoded}=")),
             Err(GuardianScrollbackRowError::MalformedRecord)
                 | Err(GuardianScrollbackRowError::NonCanonicalRecord)
+        ));
+    }
+
+    #[test]
+    fn scrollback_manifest_authentication_roundtrips_without_plaintext_or_debug_disclosure() {
+        let canonical = br#"{"schema":"frankenterm.live-scrollback.manifest.v3","secret":"FT-MANIFEST-SECRET"}"#;
+        let cipher = cipher();
+        let authentication = cipher
+            .authenticate_scrollback_manifest(canonical)
+            .expect("authenticate canonical manifest");
+        let encoded = authentication.encode();
+        assert!(!encoded.contains("FT-MANIFEST-SECRET"));
+        assert!(!format!("{authentication:?}").contains("FT-MANIFEST-SECRET"));
+        assert!(!format!("{authentication:?}").contains(&hex::encode(cipher.key_id())));
+
+        let parsed = GuardianScrollbackManifestAuthentication::parse(&encoded)
+            .expect("parse canonical authentication seal");
+        assert_eq!(parsed.encode(), encoded);
+        cipher
+            .verify_scrollback_manifest(&parsed, canonical)
+            .expect("verify canonical manifest");
+    }
+
+    #[test]
+    fn scrollback_manifest_authentication_rejects_tamper_wrong_manifest_and_wrong_key() {
+        let canonical = br#"{"schema":"frankenterm.live-scrollback.manifest.v3","revision":9}"#;
+        let cipher = cipher();
+        let mut authentication = cipher
+            .authenticate_scrollback_manifest(canonical)
+            .expect("authenticate canonical manifest");
+
+        assert!(matches!(
+            cipher.verify_scrollback_manifest(
+                &authentication,
+                br#"{"schema":"frankenterm.live-scrollback.manifest.v3","revision":10}"#,
+            ),
+            Err(GuardianScrollbackManifestError::AuthenticationFailed)
+                | Err(GuardianScrollbackManifestError::CanonicalByteLimit)
+        ));
+        let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
+            .expect("wrong-key fixture is structurally valid");
+        assert!(matches!(
+            wrong_cipher.verify_scrollback_manifest(&authentication, canonical),
+            Err(GuardianScrollbackManifestError::KeyIdentityMismatch)
+        ));
+
+        authentication.authentication_tag[0] ^= 0x80;
+        assert!(matches!(
+            cipher.verify_scrollback_manifest(&authentication, canonical),
+            Err(GuardianScrollbackManifestError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn scrollback_manifest_authentication_enforces_bounded_canonical_framing() {
+        let cipher = cipher();
+        assert!(matches!(
+            cipher.authenticate_scrollback_manifest(b""),
+            Err(GuardianScrollbackManifestError::CanonicalByteLimit)
+        ));
+        assert!(matches!(
+            GuardianScrollbackManifestAuthentication::parse(&format!(
+                "{SCROLLBACK_MANIFEST_AUTH_PREFIX}{}",
+                "A".repeat(SCROLLBACK_MANIFEST_AUTH_ENCODED_BYTES + 1)
+            )),
+            Err(GuardianScrollbackManifestError::MalformedRecord)
+        ));
+        let canonical = b"bounded manifest";
+        let encoded = cipher
+            .authenticate_scrollback_manifest(canonical)
+            .expect("authenticate bounded manifest")
+            .encode();
+        assert!(matches!(
+            GuardianScrollbackManifestAuthentication::parse(&format!("{encoded}=")),
+            Err(GuardianScrollbackManifestError::MalformedRecord)
         ));
     }
 
@@ -1967,6 +2275,7 @@ mod tests {
             segment_id: identity().segment_id(),
             sequence: 9,
             payload_bytes: 4,
+            cumulative_plaintext_bytes: 44,
             committed_log_bytes: 128,
             record_digest: [0xab; 32],
         };
@@ -2002,6 +2311,10 @@ mod tests {
             .append_and_sync(payload)
             .expect("append first synchronized record");
         assert_eq!(first.sequence(), 1);
+        assert_eq!(
+            first.cumulative_plaintext_bytes(),
+            u64::try_from(payload.len()).expect("fixture payload length fits u64")
+        );
         let committed_after_first = first.committed_log_bytes();
         drop(journal);
 
@@ -2029,10 +2342,19 @@ mod tests {
         assert!(!reopened.directory_entry_sync_required());
         assert_eq!(reopened.record_count(), 1);
         assert_eq!(reopened.next_sequence(), Some(2));
+        assert_eq!(
+            reopened.cumulative_plaintext_bytes(),
+            u64::try_from(payload.len()).expect("fixture payload length fits u64")
+        );
         let second = reopened
             .append_and_sync(b"second")
             .expect("append contiguous record after reopen");
         assert_eq!(second.sequence(), 2);
+        assert_eq!(
+            second.cumulative_plaintext_bytes(),
+            u64::try_from(payload.len() + b"second".len())
+                .expect("combined fixture payload length fits u64")
+        );
         assert!(second.committed_log_bytes() > committed_after_first);
     }
 

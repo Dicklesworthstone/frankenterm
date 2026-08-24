@@ -74876,6 +74876,10 @@ async fn handle_session_command(
                 "committed_log_bytes": export.committed_log_bytes,
                 "physical_log_bytes": export.physical_log_bytes,
                 "trailing_uncommitted_bytes": export.trailing_uncommitted_bytes,
+                "exact_semantic_records": export.exact_semantic_records,
+                "legacy_redacted_records": export.legacy_redacted_records,
+                "redaction_applied_before_persistence_to_all_records": export.redaction_applied_before_persistence,
+                "redaction_applied_before_persistence_to_any_record": export.redaction_applied_before_persistence_to_any_record,
                 "output_path": &display_output_path,
                 "transcript_bytes": artifact.bytes,
                 "transcript_sha256": &artifact.sha256,
@@ -74891,6 +74895,10 @@ async fn handle_session_command(
                 println!("  Source:          {display_source_path}");
                 println!("  Output:          {display_output_path}");
                 println!("  Rows:            {}", export.retained_rows);
+                println!(
+                    "  Fidelity:        {} exact semantic, {} legacy redacted",
+                    export.exact_semantic_records, export.legacy_redacted_records
+                );
                 println!("  Bytes:           {}", artifact.bytes);
                 println!("  SHA-256:         {}", artifact.sha256);
                 println!("  Safety:          source content was not opened for write; live PTY received no bytes");
