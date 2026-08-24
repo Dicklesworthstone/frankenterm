@@ -3448,12 +3448,29 @@ mod tests {
         cfg_test: bool,
         signature: &str,
     ) -> AuthorityMethodSurface {
+        let signature = syn::parse_str(signature)
+            .expect("parse frozen authority method signature");
         AuthorityMethodSurface {
             owner: owner.to_owned(),
             visibility: visibility.to_owned(),
             cfg_test,
-            signature: syn::parse_str(signature).expect("parse frozen authority method signature"),
+            signature: canonical_authority_signature(signature),
         }
+    }
+
+    fn canonical_authority_signature(mut signature: syn::Signature) -> syn::Signature {
+        if signature.inputs.trailing_punct() {
+            signature.inputs.pop_punct();
+        }
+        if signature.generics.params.trailing_punct() {
+            signature.generics.params.pop_punct();
+        }
+        if let Some(where_clause) = &mut signature.generics.where_clause {
+            if where_clause.predicates.trailing_punct() {
+                where_clause.predicates.pop_punct();
+            }
+        }
+        signature
     }
 
     fn sort_authority_fields(fields: &mut [AuthorityFieldSurface]) {
@@ -3486,7 +3503,27 @@ mod tests {
     }
 
     fn expected_use(item: &str) -> syn::ItemUse {
-        syn::parse_str(item).expect("parse frozen production use item")
+        let item = syn::parse_str(item).expect("parse frozen production use item");
+        canonical_use(item)
+    }
+
+    fn canonical_use(mut item: syn::ItemUse) -> syn::ItemUse {
+        fn normalize(tree: &mut syn::UseTree) {
+            match tree {
+                syn::UseTree::Path(path) => normalize(&mut path.tree),
+                syn::UseTree::Group(group) => {
+                    if group.items.trailing_punct() {
+                        group.items.pop_punct();
+                    }
+                    for item in &mut group.items {
+                        normalize(item);
+                    }
+                }
+                syn::UseTree::Name(_) | syn::UseTree::Rename(_) | syn::UseTree::Glob(_) => {}
+            }
+        }
+        normalize(&mut item.tree);
+        item
     }
 
     fn expected_item_macro(item: &str) -> syn::Macro {
@@ -3665,7 +3702,7 @@ mod tests {
                         owner: owner_label.to_owned(),
                         visibility: Self::visibility(visibility),
                         cfg_test,
-                        signature: function.clone(),
+                        signature: canonical_authority_signature(function.clone()),
                     });
             }
         }
@@ -3783,10 +3820,7 @@ mod tests {
         }
 
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-            if Self::cfg_test_only(&item.attrs) {
-                return;
-            }
-            self.uses.push(item.clone());
+            self.uses.push(canonical_use(item.clone()));
             visit::visit_item_use(self, item);
         }
 
@@ -3929,7 +3963,7 @@ mod tests {
                         owner: "GuardianCheckpointCipher".to_owned(),
                         visibility: Self::visibility(&function.vis),
                         cfg_test,
-                        signature: function.sig.clone(),
+                        signature: canonical_authority_signature(function.sig.clone()),
                     });
             }
             if let Some(owner) = owner.as_deref().filter(|name| Self::protected(name)) {
@@ -3944,7 +3978,7 @@ mod tests {
                         owner: owner.to_owned(),
                         visibility: Self::visibility(&function.vis),
                         cfg_test,
-                        signature: function.sig.clone(),
+                        signature: canonical_authority_signature(function.sig.clone()),
                     });
                 }
             }
@@ -4363,7 +4397,7 @@ mod tests {
                 owner: owner_label.to_owned(),
                 visibility: AuthoritySurfaceAstInventory::visibility(visibility),
                 cfg_test: false,
-                signature: signature.clone(),
+                signature: canonical_authority_signature(signature.clone()),
             };
             if Self::protected(owner_label)
                 || !Self::signature_names(signature, owner).is_empty()
@@ -4539,9 +4573,12 @@ mod tests {
         }
 
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-            self.uses.push(item.clone());
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            self.uses.push(canonical_use(item.clone()));
             if Self::use_tree_mentions_protected(&item.tree) {
-                self.protected_uses.push(item.clone());
+                self.protected_uses.push(canonical_use(item.clone()));
             }
             visit::visit_item_use(self, item);
         }

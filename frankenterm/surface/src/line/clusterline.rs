@@ -281,13 +281,17 @@ impl ClusteredLine {
             clusters.push(cluster);
         }
 
+        // Box allocation is the final potentially panicking construction
+        // step; complete it while the accumulated text is still guarded.
+        let is_double_wide = if any_double {
+            Some(Box::new(is_double_wide))
+        } else {
+            None
+        };
+
         Self {
             text: core::mem::take(&mut *text),
-            is_double_wide: if any_double {
-                Some(Box::new(is_double_wide))
-            } else {
-                None
-            },
+            is_double_wide,
             clusters,
             len: len.min(u32::MAX as usize) as u32,
             last_cell_width,

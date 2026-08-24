@@ -2326,7 +2326,7 @@ fn secure_writer_directory(
             0o700 => {}
             0o755 => {
                 use std::os::unix::fs::PermissionsExt as _;
-                if let Err(source) = handle.set_permissions(std::fs::Permissions::from_mode(0o700)) {
+                if let Err(_source) = handle.set_permissions(std::fs::Permissions::from_mode(0o700)) {
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                         .map_err(|source| MmapScrollbackError::Permissions {
                             path: path.to_path_buf(),
