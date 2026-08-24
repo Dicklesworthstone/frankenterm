@@ -950,12 +950,12 @@ struct RuntimeEffectError;
 
 /// An abstract PTY mutation error cannot prove that no effect occurred.
 ///
-/// On Unix the portable-pty implementation may first deliver `SIGHUP`, wait,
-/// and only then fail a stronger termination attempt. Treating that composite
-/// error as definitely-not-applied would allow the exact signal to be retried
-/// after an externally visible effect. `MasterPty::resize` similarly exposes no
-/// transactional error contract. The only safe generic classification is an
-/// indeterminate outcome and permanent protocol quarantine.
+/// Neither `ChildKiller::kill` nor `MasterPty::resize` promises that an error
+/// proves the underlying OS mutation was not observed. Treating an abstract
+/// implementation error as definitely-not-applied would therefore allow the
+/// exact mutation to be retried without a causal non-application proof. The
+/// only safe generic classification is an indeterminate outcome and permanent
+/// protocol quarantine.
 fn classify_external_mutation_result<E>(
     result: Result<(), E>,
 ) -> GuardianEffectOutcome<RuntimeEffectError> {
@@ -1257,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_composite_child_kill_is_never_classified_as_not_applied() {
+    fn failed_external_mutation_is_never_classified_as_not_applied() {
         assert!(matches!(
             classify_external_mutation_result::<std::io::Error>(Ok(())),
             GuardianEffectOutcome::Applied

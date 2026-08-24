@@ -283,7 +283,7 @@ dhat = "0.3.3"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 
 # Database
-rusqlite = { version = "0.40.1", features = ["bundled", "backup", "functions"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "backup", "functions", "hooks"] }
 
 # Allocator (optional)
 tikv-jemallocator = "0.7.0"

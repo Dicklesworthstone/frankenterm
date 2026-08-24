@@ -65,8 +65,10 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
 - Remembers explicit remote-domain attachment intent across GUI restarts in a
   bounded, checksummed two-slot manifest. Domain aliases are persisted only as
   domain-separated SHA-256 fingerprints; the authority directory is mode 0700,
-  while private files are mode 0600, no-follow, single-link, owner-matched, and
-  synchronized before the new generation becomes authoritative. A remembered
+  pinned by descriptor identity, and revalidated against its configured name;
+  lock and slot files are opened relative to that capability as mode 0600,
+  no-follow, single-link, owner-matched leaves and revalidated after I/O before
+  the synchronized generation becomes authoritative. A remembered
   attach overrides a false `connect_automatically` default, a remembered detach
   suppresses the built-in supervisor, and an absent record continues to follow configuration. Manual,
   command-palette, and Lua attach/detach paths durably publish intent before

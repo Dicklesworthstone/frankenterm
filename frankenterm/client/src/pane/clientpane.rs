@@ -4892,6 +4892,92 @@ mod tests {
     }
 
     #[test]
+    fn definitely_not_sent_retry_preserves_prior_reliable_key_ambiguity() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        peer.replace_ready_generation(
+            &inner.client,
+            RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION,
+        )
+        .expect("install exact traced reliable-key generation");
+        let pane = test_client_pane(&inner, 157, 143);
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register cumulative-ambiguity key pane");
+        inner.reliable_input_queue.state.lock().worker_running = true;
+
+        pane.key_down_with_trace_context(
+            KeyCode::Char('a'),
+            KeyModifiers::ALT,
+            sampled_reliable_key_context(),
+        )
+        .expect("traced key enters the exact reliable lane");
+        let entry = inner.reliable_input_queue.state.lock().pending[0].clone();
+        let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x55; 16]);
+        assert!(inner
+            .reliable_input_queue
+            .bind_front_pane_authority(
+                &entry,
+                pane_authority_binding(
+                    TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
+                    pane_registration,
+                ),
+            ));
+        let (prior_effect_attempt, _) = inner
+            .reliable_input_queue
+            .claim_front_wire_attempt(
+                &entry,
+                ReliableInputCodecDisposition::ReliableTraced,
+                TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
+            )
+            .expect("first authority-bound attempt reaches uncertain transport");
+        let ReliableInputWireAttempt::Traced(prior_effect_attempt) = prior_effect_attempt else {
+            panic!("first effect-eligible attempt must carry its sampled context");
+        };
+        assert_eq!(
+            prior_effect_attempt.request.pane_registration,
+            Some(pane_registration)
+        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_key_ambiguity(&entry, true));
+
+        inner
+            .reliable_input_queue
+            .arm_after_claim_generation_barrier(
+                peer.clone(),
+                RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION - 1,
+            );
+        let raced = promise::spawn::block_on(ReliableInputQueue::attempt(
+            &inner.reliable_input_queue,
+            &inner,
+            &entry,
+        ));
+        assert!(matches!(
+            raced,
+            ReliableInputAttempt::Retry(delay, "transport_retired")
+                if delay == RELIABLE_INPUT_TRANSPORT_RETRY_DELAY
+        ));
+        assert!(peer.is_empty());
+        assert!(matches!(
+            inner.reliable_input_queue.claim_front_legacy_key_attempt(
+                &entry,
+                TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
+            ),
+            Err(ReliableKeyClaimError::ReliableEffectMayHaveReached)
+        ));
+        assert!(matches!(
+            inner.reliable_input_queue.claim_front_legacy_key_attempt(
+                &entry,
+                SERVER_RESTART_RENDER_CONNECTION_IDENTITY.session_incarnation,
+            ),
+            Err(ReliableKeyClaimError::ServerRestartAfterAmbiguousAttempt)
+        ));
+    }
+
+    #[test]
     fn sampled_paste_uses_pdu99_once_and_preserves_operational_bytes() {
         let _scope = MuxTestScope::enter();
         let executor = promise::spawn::ScopedExecutor::new();
