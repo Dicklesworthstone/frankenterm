@@ -2326,13 +2326,14 @@ fn secure_writer_directory(
             0o700 => {}
             0o755 => {
                 use std::os::unix::fs::PermissionsExt as _;
-                handle
-                    .set_permissions(std::fs::Permissions::from_mode(0o700))
-                    .map_err(|source| MmapScrollbackError::Permissions {
-                        path: path.to_path_buf(),
-                        mode: 0o700,
-                        source,
-                    })?;
+                if let Err(source) = handle.set_permissions(std::fs::Permissions::from_mode(0o700)) {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|source| MmapScrollbackError::Permissions {
+                            path: path.to_path_buf(),
+                            mode: 0o700,
+                            source,
+                        })?;
+                }
             }
             _ => {
                 return Err(MmapScrollbackError::UnsafeReadSource {
@@ -2342,10 +2343,14 @@ fn secure_writer_directory(
             }
         }
     }
-    handle.sync_all().map_err(|source| MmapScrollbackError::Sync {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    if let Err(source) = handle.sync_all() {
+        if !matches!(source.raw_os_error(), Some(9 | 22 | 95)) {
+            return Err(MmapScrollbackError::Sync {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
 
     let after = directory.dir_metadata().map_err(|source| MmapScrollbackError::Metadata {
         path: path.to_path_buf(),

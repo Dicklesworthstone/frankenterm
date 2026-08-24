@@ -4930,6 +4930,12 @@ mod tests {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt, symlink};
     use std::time::{Duration, Instant};
 
+    fn zeroizing_test_bytes(bytes: &[u8]) -> Zeroizing<Vec<u8>> {
+        let mut owned = Zeroizing::new(Vec::with_capacity(bytes.len()));
+        owned.extend_from_slice(bytes);
+        owned
+    }
+
     fn kept_private_directory(prefix: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let canonical_temp = std::fs::canonicalize(std::env::temp_dir())?;
         let directory = tempfile::Builder::new()
@@ -5015,7 +5021,7 @@ mod tests {
             .try_submit(
                 pane_id,
                 journal.clone(),
-                Zeroizing::new(payload.to_vec()),
+                zeroizing_test_bytes(payload),
             )
             .map_err(|_| "output submission was unexpectedly rejected")?;
         completion(pipeline)?
@@ -5068,7 +5074,7 @@ mod tests {
         checkpoint_hasher.update(terminal_digest);
         let checkpoint_digest: [u8; 32] = checkpoint_hasher.finalize().into();
 
-        let mut wire = Zeroizing::new(vec![
+        let mut wire: Zeroizing<Vec<u8>> = Zeroizing::new(vec![
             0_u8;
             CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
         ]);
@@ -5213,6 +5219,25 @@ mod tests {
     #[test]
     fn checkpoint_stage_shared_logical_identities_are_content_stable_and_complete_only(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = include_str!("output.rs");
+        assert!(source.contains(concat!(
+            "fn zeroizing_test_bytes(bytes: &[u8]) -> ",
+            "Zeroizing<Vec<u8>>"
+        )));
+        for forbidden in [
+            concat!("Zeroizing::new(chunk", ".to_vec())"),
+            concat!(
+                "let mut wire = vec![0_u8; ",
+                "CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES"
+            ),
+            concat!(
+                "let mut wire = vec![\n            0_u8;\n            ",
+                "CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES"
+            ),
+        ] {
+            assert!(!source.contains(forbidden));
+        }
+
         let spawn_effect_id = Uuid::from_u128(0x31);
         let upload_id = Uuid::from_u128(0x32);
         let payload = b"manifest-layout-fixture";
@@ -5226,7 +5251,7 @@ mod tests {
             None,
         )?;
         let shape = CheckpointStageRequestShape::from_request(&begin)?;
-        let begin_payload = shape.begin_payload()?;
+        let begin_payload: Zeroizing<Vec<u8>> = shape.begin_payload()?;
         let candidate_identity =
             GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
                 &begin_payload,
@@ -5246,7 +5271,7 @@ mod tests {
             None,
         )?;
         let changed_shape = CheckpointStageRequestShape::from_request(&changed_begin)?;
-        let changed_begin_payload = changed_shape.begin_payload()?;
+        let changed_begin_payload: Zeroizing<Vec<u8>> = changed_shape.begin_payload()?;
         let changed_candidate_identity =
             GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
                 &changed_begin_payload,
@@ -5272,7 +5297,7 @@ mod tests {
             {
                 let index = u32::try_from(index).expect("test chunk index");
                 let offset = u64::from(index) * u64::from(shape.chunk_bytes);
-                let chunk = Zeroizing::new(chunk.to_vec());
+                let chunk: Zeroizing<Vec<u8>> = zeroizing_test_bytes(chunk);
                 builder.push_authenticated_chunk(index, offset, &chunk)?;
             }
             builder.finish()
@@ -5281,7 +5306,7 @@ mod tests {
         let exact_retry_chunk_set_identity = logical_chunk_set(payload)?;
         assert_eq!(chunk_set_identity, exact_retry_chunk_set_identity);
 
-        let mut changed_payload = Zeroizing::new(payload.to_vec());
+        let mut changed_payload: Zeroizing<Vec<u8>> = zeroizing_test_bytes(payload);
         changed_payload[0] ^= 1;
         let changed_chunk_set_identity = logical_chunk_set(changed_payload.as_slice())?;
         assert_ne!(chunk_set_identity, changed_chunk_set_identity);
@@ -5291,8 +5316,8 @@ mod tests {
             shape.chunk_bytes,
             shape.total_chunks,
         )?;
-        let first_chunk = Zeroizing::new(
-            payload[..usize::try_from(shape.chunk_bytes).expect("test first chunk")].to_vec(),
+        let first_chunk = zeroizing_test_bytes(
+            &payload[..usize::try_from(shape.chunk_bytes).expect("test first chunk")],
         );
         incomplete.push_authenticated_chunk(0, 0, &first_chunk)?;
         assert!(incomplete.finish().is_err());
@@ -6033,7 +6058,7 @@ mod tests {
 
         for (expected_sequence, payload) in [(1, b"first".as_slice()), (2, b"second".as_slice())] {
             pipeline
-                .try_submit(pane_id, journal.clone(), Zeroizing::new(payload.to_vec()))
+                .try_submit(pane_id, journal.clone(), zeroizing_test_bytes(payload))
                 .map_err(|_| "output submission was unexpectedly rejected")?;
             let completion = completion(&pipeline)?;
             let receipt = completion.result.map_err(|_| "durable append failed")?;
@@ -6303,7 +6328,7 @@ mod tests {
             .try_submit(
                 pane_id,
                 journal.clone(),
-                Zeroizing::new(b"must-not-commit".to_vec()),
+                zeroizing_test_bytes(b"must-not-commit"),
             )
             .map_err(|_| "output submission was unexpectedly rejected")?;
         assert!(completion(&pipeline)?.result.is_err());
@@ -6488,7 +6513,7 @@ mod tests {
             .try_submit(
                 pane_id,
                 journal.clone(),
-                Zeroizing::new(b"must-not-commit".to_vec()),
+                zeroizing_test_bytes(b"must-not-commit"),
             )
             .map_err(|_| "capacity probe submission was unexpectedly rejected")?;
         assert!(completion(&pipeline)?.result.is_err());
@@ -6539,7 +6564,7 @@ mod tests {
             .try_submit(
                 pane_id,
                 journal.clone(),
-                Zeroizing::new(b"x".to_vec()),
+                zeroizing_test_bytes(b"x"),
             )
             .map_err(|_| "disk capacity probe submission was unexpectedly rejected")?;
         assert!(completion(&pipeline)?.result.is_err());
@@ -6604,13 +6629,13 @@ mod tests {
         let first = OutputJob {
             pane_id,
             journal: journal.clone(),
-            payload: Zeroizing::new(b"reserved".to_vec()),
+            payload: zeroizing_test_bytes(b"reserved"),
         };
         assert!(queue.try_push(first).is_ok());
         let second = OutputJob {
             pane_id,
             journal,
-            payload: Zeroizing::new(b"backpressured".to_vec()),
+            payload: zeroizing_test_bytes(b"backpressured"),
         };
         let OutputQueuePushError::Saturated(mut second) =
             queue.try_push(second).expect_err("full queue must reject atomically as saturated")
@@ -6628,7 +6653,7 @@ mod tests {
         let after_shutdown = OutputJob {
             pane_id,
             journal: retained.journal,
-            payload: Zeroizing::new(b"unavailable".to_vec()),
+            payload: zeroizing_test_bytes(b"unavailable"),
         };
         let OutputQueuePushError::Shutdown(mut after_shutdown) = queue
             .try_push(after_shutdown)

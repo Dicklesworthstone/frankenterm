@@ -3783,6 +3783,9 @@ mod tests {
         }
 
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
             self.uses.push(item.clone());
             visit::visit_item_use(self, item);
         }
@@ -4146,6 +4149,8 @@ mod tests {
     struct ProtocolDeliveryStructSurface {
         name: String,
         visibility: String,
+        attributes: Vec<syn::Attribute>,
+        generics: syn::Generics,
         fields: syn::Fields,
     }
 
@@ -4153,6 +4158,7 @@ mod tests {
     struct ProtocolDeliveryStorageSurface {
         kind: String,
         owner: String,
+        owner_visibility: String,
         slot: String,
         visibility: String,
         ty: syn::Type,
@@ -4167,6 +4173,7 @@ mod tests {
         return_sites: Vec<String>,
         construction_sites: Vec<String>,
         storage: Vec<ProtocolDeliveryStorageSurface>,
+        uses: Vec<syn::ItemUse>,
         protected_uses: Vec<syn::ItemUse>,
         type_aliases: Vec<syn::ItemType>,
         impl_associated_types: Vec<(String, syn::ImplItemType)>,
@@ -4216,28 +4223,56 @@ mod tests {
             .map(|items| items.into_iter().collect())
         }
 
-        // True only when the cfg expression cannot be enabled with
-        // `cfg(test) == false`. Unknown platform/features remain conservative.
-        fn cfg_false_in_every_production_build(meta: &syn::Meta) -> bool {
+        // Possible `(false, true)` outcomes with `cfg(test) == false`.
+        // Unknown platform/features retain both possibilities so only a
+        // logically test-only item is skipped, including nested `all`/`any`/
+        // `not` expressions.
+        fn cfg_production_values(meta: &syn::Meta) -> (bool, bool) {
             match meta {
-                syn::Meta::Path(path) => path.is_ident("test"),
+                syn::Meta::Path(path) if path.is_ident("test") => (true, false),
+                syn::Meta::Path(_) | syn::Meta::NameValue(_) => (true, true),
                 syn::Meta::List(list) if list.path.is_ident("all") => {
-                    Self::parse_meta_list(list).is_some_and(|nested| {
-                        nested
-                            .iter()
-                            .any(Self::cfg_false_in_every_production_build)
-                    })
+                    let Some(nested) = Self::parse_meta_list(list) else {
+                        return (true, true);
+                    };
+                    let values = nested
+                        .iter()
+                        .map(Self::cfg_production_values)
+                        .collect::<Vec<_>>();
+                    (
+                        values.iter().any(|(can_be_false, _)| *can_be_false),
+                        values.iter().all(|(_, can_be_true)| *can_be_true),
+                    )
                 }
                 syn::Meta::List(list) if list.path.is_ident("any") => {
-                    Self::parse_meta_list(list).is_some_and(|nested| {
-                        !nested.is_empty()
-                            && nested
-                                .iter()
-                                .all(Self::cfg_false_in_every_production_build)
-                    })
+                    let Some(nested) = Self::parse_meta_list(list) else {
+                        return (true, true);
+                    };
+                    let values = nested
+                        .iter()
+                        .map(Self::cfg_production_values)
+                        .collect::<Vec<_>>();
+                    (
+                        values.iter().all(|(can_be_false, _)| *can_be_false),
+                        values.iter().any(|(_, can_be_true)| *can_be_true),
+                    )
                 }
-                syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+                syn::Meta::List(list) if list.path.is_ident("not") => {
+                    let Some(nested) = Self::parse_meta_list(list) else {
+                        return (true, true);
+                    };
+                    let [inner] = nested.as_slice() else {
+                        return (true, true);
+                    };
+                    let (can_be_false, can_be_true) = Self::cfg_production_values(inner);
+                    (can_be_true, can_be_false)
+                }
+                syn::Meta::List(_) => (true, true),
             }
+        }
+
+        fn cfg_false_in_every_production_build(meta: &syn::Meta) -> bool {
+            !Self::cfg_production_values(meta).1
         }
 
         fn cfg_test_only(attributes: &[syn::Attribute]) -> bool {
@@ -4500,10 +4535,25 @@ mod tests {
         }
 
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            self.uses.push(item.clone());
             if Self::use_tree_mentions_protected(&item.tree) {
                 self.protected_uses.push(item.clone());
             }
             visit::visit_item_use(self, item);
+        }
+
+        fn visit_field(&mut self, field: &'ast syn::Field) {
+            if Self::cfg_test_only(&field.attrs) {
+                return;
+            }
+            visit::visit_field(self, field);
+        }
+
+        fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+            if Self::cfg_test_only(&variant.attrs) {
+                return;
+            }
+            visit::visit_variant(self, variant);
         }
 
         fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
@@ -4515,6 +4565,13 @@ mod tests {
                 self.structs.push(ProtocolDeliveryStructSurface {
                     name: owner.clone(),
                     visibility: AuthoritySurfaceAstInventory::visibility(&item.vis),
+                    attributes: item
+                        .attrs
+                        .iter()
+                        .filter(|attribute| !attribute.path().is_ident("doc"))
+                        .cloned()
+                        .collect(),
+                    generics: item.generics.clone(),
                     fields: item.fields.clone(),
                 });
                 for derived in AuthoritySurfaceAstInventory::derive_names(&item.attrs) {
@@ -4523,10 +4580,14 @@ mod tests {
                 self.record_conditional(&format!("struct:{owner}"), &item.attrs);
             } else {
                 for (index, field) in item.fields.iter().enumerate() {
+                    if Self::cfg_test_only(&field.attrs) {
+                        continue;
+                    }
                     if Self::type_mentions_protected(&field.ty, Some(&owner)) {
                         self.storage.push(ProtocolDeliveryStorageSurface {
                             kind: "struct".to_owned(),
                             owner: owner.clone(),
+                            owner_visibility: AuthoritySurfaceAstInventory::visibility(&item.vis),
                             slot: field.ident.as_ref().map_or_else(
                                 || format!("<unnamed:{index}>"),
                                 ToString::to_string,
@@ -4535,6 +4596,10 @@ mod tests {
                             ty: field.ty.clone(),
                         });
                         self.record_conditional(&format!("struct:{owner}"), &item.attrs);
+                        self.record_conditional(
+                            &format!("struct:{owner}:field:{index}"),
+                            &field.attrs,
+                        );
                     }
                 }
             }
@@ -4547,16 +4612,38 @@ mod tests {
             }
             let owner = item.ident.to_string();
             for variant in &item.variants {
+                if Self::cfg_test_only(&variant.attrs) {
+                    continue;
+                }
                 for (index, field) in variant.fields.iter().enumerate() {
+                    if Self::cfg_test_only(&field.attrs) {
+                        continue;
+                    }
                     if Self::type_mentions_protected(&field.ty, Some(&owner)) {
                         self.storage.push(ProtocolDeliveryStorageSurface {
                             kind: "enum".to_owned(),
                             owner: owner.clone(),
-                            slot: format!("{}:<unnamed:{index}>", variant.ident),
+                            owner_visibility: AuthoritySurfaceAstInventory::visibility(&item.vis),
+                            slot: format!(
+                                "{}:{}",
+                                variant.ident,
+                                field.ident.as_ref().map_or_else(
+                                    || format!("<unnamed:{index}>"),
+                                    ToString::to_string,
+                                )
+                            ),
                             visibility: AuthoritySurfaceAstInventory::visibility(&field.vis),
                             ty: field.ty.clone(),
                         });
                         self.record_conditional(&format!("enum:{owner}"), &item.attrs);
+                        self.record_conditional(
+                            &format!("enum:{owner}:variant:{}", variant.ident),
+                            &variant.attrs,
+                        );
+                        self.record_conditional(
+                            &format!("enum:{owner}:variant:{}:field:{index}", variant.ident),
+                            &field.attrs,
+                        );
                     }
                 }
             }
@@ -4569,10 +4656,14 @@ mod tests {
             }
             let owner = item.ident.to_string();
             for field in &item.fields.named {
+                if Self::cfg_test_only(&field.attrs) {
+                    continue;
+                }
                 if Self::type_mentions_protected(&field.ty, Some(&owner)) {
                     self.storage.push(ProtocolDeliveryStorageSurface {
                         kind: "union".to_owned(),
                         owner: owner.clone(),
+                        owner_visibility: AuthoritySurfaceAstInventory::visibility(&item.vis),
                         slot: field
                             .ident
                             .as_ref()
@@ -4581,6 +4672,16 @@ mod tests {
                         ty: field.ty.clone(),
                     });
                     self.record_conditional(&format!("union:{owner}"), &item.attrs);
+                    self.record_conditional(
+                        &format!(
+                            "union:{owner}:field:{}",
+                            field
+                                .ident
+                                .as_ref()
+                                .map_or_else(|| "<unnamed>".to_owned(), ToString::to_string)
+                        ),
+                        &field.attrs,
+                    );
                 }
             }
             visit::visit_item_union(self, item);
@@ -4637,11 +4738,17 @@ mod tests {
         }
 
         fn visit_trait_item_fn(&mut self, function: &'ast syn::TraitItemFn) {
+            if Self::cfg_test_only(&function.attrs) {
+                return;
+            }
             self.record_signature(None, &function.sig, &syn::Visibility::Inherited);
             visit::visit_trait_item_fn(self, function);
         }
 
         fn visit_foreign_item_fn(&mut self, function: &'ast syn::ForeignItemFn) {
+            if Self::cfg_test_only(&function.attrs) {
+                return;
+            }
             self.record_signature(None, &function.sig, &function.vis);
             visit::visit_foreign_item_fn(self, function);
         }
@@ -4671,7 +4778,11 @@ mod tests {
                 ));
             }
             if expression.path.segments.len() == 1 {
-                let name = expression.path.segments[0].ident.to_string();
+                let name = expression
+                    .path
+                    .segments
+                    .first()
+                    .map_or_else(|| "<anonymous>".to_owned(), |segment| segment.ident.to_string());
                 if name == "GuardianCheckpointChunkNonDuplicable"
                     || (name == "Self"
                         && self
@@ -4694,33 +4805,50 @@ mod tests {
         }
 
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-            if !Self::cfg_test_only(&item.attrs) {
-                self.type_aliases.push(item.clone());
+            if Self::cfg_test_only(&item.attrs) {
+                return;
             }
+            self.type_aliases.push(item.clone());
             visit::visit_item_type(self, item);
         }
 
         fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
             self.record_typed_storage("static", &item.ident.to_string(), &item.ty);
             visit::visit_item_static(self, item);
         }
 
         fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
             self.record_typed_storage("const", &item.ident.to_string(), &item.ty);
             visit::visit_item_const(self, item);
         }
 
         fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
-            let owner = self.current_impl_owner.as_deref().unwrap_or("<unknown>");
-            if Self::protected(owner) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            let owner = self
+                .current_impl_owner
+                .as_deref()
+                .unwrap_or("<unknown>")
+                .to_owned();
+            if Self::protected(&owner) {
                 self.protected_associated_items
                     .push(format!("const:{owner}::{}", item.ident));
             }
-            self.record_typed_storage("impl-const", owner, &item.ty);
+            self.record_typed_storage("impl-const", &owner, &item.ty);
             visit::visit_impl_item_const(self, item);
         }
 
         fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
             let owner = self
                 .current_impl_owner
                 .as_deref()
@@ -4736,6 +4864,9 @@ mod tests {
         }
 
         fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
             if item
                 .default
                 .as_ref()
@@ -4748,21 +4879,51 @@ mod tests {
             visit::visit_trait_item_type(self, item);
         }
 
+        fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            self.record_typed_storage("trait-const", &item.ident.to_string(), &item.ty);
+            visit::visit_trait_item_const(self, item);
+        }
+
+        fn visit_foreign_item_static(&mut self, item: &'ast syn::ForeignItemStatic) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            self.record_typed_storage("foreign-static", &item.ident.to_string(), &item.ty);
+            visit::visit_foreign_item_static(self, item);
+        }
+
+        fn visit_foreign_item_type(&mut self, item: &'ast syn::ForeignItemType) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            self.protected_associated_items
+                .push(format!("foreign-type:{}", item.ident));
+            visit::visit_foreign_item_type(self, item);
+        }
+
         fn visit_impl_item_macro(&mut self, item: &'ast syn::ImplItemMacro) {
-            if self
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            let owner = self
                 .current_impl_owner
                 .as_deref()
-                .is_some_and(Self::protected)
-            {
-                self.protected_associated_items.push(format!(
-                    "macro:{}",
-                    self.current_impl_owner.as_deref().unwrap_or("<unknown>")
-                ));
+                .unwrap_or("<unknown>")
+                .to_owned();
+            if Self::protected(&owner) {
+                self.protected_associated_items
+                    .push(format!("macro:{owner}"));
             }
             visit::visit_impl_item_macro(self, item);
         }
 
         fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
             self.item_macros.push(item.mac.clone());
             visit::visit_item_macro(self, item);
         }
@@ -4810,6 +4971,12 @@ mod tests {
         ProtocolDeliveryStructSurface {
             name: item.ident.to_string(),
             visibility: AuthoritySurfaceAstInventory::visibility(&item.vis),
+            attributes: item
+                .attrs
+                .into_iter()
+                .filter(|attribute| !attribute.path().is_ident("doc"))
+                .collect(),
+            generics: item.generics,
             fields: item.fields,
         }
     }
@@ -4817,12 +4984,14 @@ mod tests {
     fn expected_protocol_delivery_storage(
         kind: &str,
         owner: &str,
+        owner_visibility: &str,
         slot: &str,
         ty: &str,
     ) -> ProtocolDeliveryStorageSurface {
         ProtocolDeliveryStorageSurface {
             kind: kind.to_owned(),
             owner: owner.to_owned(),
+            owner_visibility: owner_visibility.to_owned(),
             slot: slot.to_owned(),
             visibility: "private".to_owned(),
             ty: syn::parse_str(ty).expect("parse frozen protocol delivery storage type"),
@@ -4837,6 +5006,392 @@ mod tests {
         storage.sort_by(|left, right| {
             (&left.kind, &left.owner, &left.slot).cmp(&(&right.kind, &right.owner, &right.slot))
         });
+    }
+
+    fn assert_protocol_delivery_surface_is_closed() {
+        let syntax = syn::parse_file(include_str!("guardian_protocol.rs"))
+            .expect("parse the complete guardian protocol module as Rust syntax");
+        let mut inventory = ProtocolDeliveryAstInventory::default();
+        inventory.visit_file(&syntax);
+
+        sort_protocol_delivery_structs(&mut inventory.structs);
+        let mut expected_structs = vec![
+            expected_protocol_delivery_struct(
+                "struct GuardianCheckpointChunkNonDuplicable;",
+            ),
+            expected_protocol_delivery_struct(
+                r#"
+                    pub struct GuardianCheckpointStageChunkDeliveryV1 {
+                        index: u32,
+                        offset: u64,
+                        chunk_digest: Zeroizing<[u8; 32]>,
+                        bytes: Zeroizing<Vec<u8>>,
+                        _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+                    }
+                "#,
+            ),
+            expected_protocol_delivery_struct(
+                r#"
+                    pub struct GuardianCheckpointChunkDelivery {
+                        descriptor: GuardianCheckpointDescriptorV1,
+                        offset: u64,
+                        chunk_digest: Zeroizing<[u8; 32]>,
+                        bytes: Zeroizing<Vec<u8>>,
+                        _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+                    }
+                "#,
+            ),
+        ];
+        sort_protocol_delivery_structs(&mut expected_structs);
+        assert_eq!(inventory.structs, expected_structs);
+
+        inventory.derives.sort();
+        assert_eq!(inventory.derives, Vec::<String>::new());
+
+        inventory.impls.sort();
+        let mut expected_impls = vec![
+            "GuardianCheckpointStageChunkDeliveryV1:std::fmt::Debug",
+            "GuardianCheckpointStageChunkDeliveryV1:ZeroizeOnDrop",
+            "GuardianCheckpointStageChunkDeliveryV1:Drop",
+            "GuardianCheckpointStageChunkDeliveryV1:<inherent>",
+            "GuardianCheckpointChunkDelivery:std::fmt::Debug",
+            "GuardianCheckpointChunkDelivery:ZeroizeOnDrop",
+            "GuardianCheckpointChunkDelivery:Drop",
+            "GuardianCheckpointChunkDelivery:<inherent>",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_impls.sort();
+        assert_eq!(inventory.impls, expected_impls);
+
+        sort_authority_methods(&mut inventory.methods);
+        let mut expected_methods = vec![
+            expected_authority_method(
+                "GuardianCheckpointStageChunkDeliveryV1",
+                "private",
+                false,
+                "fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageChunkDeliveryV1",
+                "private",
+                false,
+                "fn drop(&mut self)",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageChunkDeliveryV1",
+                "pub",
+                false,
+                "const fn position(&self) -> (u32, u64)",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageChunkDeliveryV1",
+                "pub",
+                false,
+                "fn chunk_digest(&self) -> &[u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageChunkDeliveryV1",
+                "pub",
+                false,
+                "fn bytes(&self) -> &[u8]",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageChunkDeliveryV1",
+                "pub",
+                false,
+                "fn into_bytes(mut self) -> Zeroizing<Vec<u8>>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn into_chunk(self) -> Result<GuardianCheckpointStageChunkDeliveryV1, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointChunkDelivery",
+                "private",
+                false,
+                "fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointChunkDelivery",
+                "private",
+                false,
+                "fn drop(&mut self)",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointChunkDelivery",
+                "pub",
+                false,
+                "fn new(descriptor: GuardianCheckpointDescriptorV1, offset: u64, bytes: Zeroizing<Vec<u8>>) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointChunkDelivery",
+                "pub",
+                false,
+                "const fn descriptor(&self) -> GuardianCheckpointDescriptorV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointChunkDelivery",
+                "pub",
+                false,
+                "const fn offset(&self) -> u64",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointChunkDelivery",
+                "pub",
+                false,
+                "fn chunk_digest(&self) -> &[u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointChunkDelivery",
+                "pub",
+                false,
+                "fn byte_len(&self) -> usize",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointChunkDelivery",
+                "pub",
+                false,
+                "fn write_all_bounded<W: std::io::Write>(self, writer: &mut W, max_payload_bytes: u32) -> Result<(GuardianCheckpointDescriptorV1, u64, u32), GuardianReplayDeliveryError>",
+            ),
+        ];
+        sort_authority_methods(&mut expected_methods);
+        assert_eq!(inventory.methods, expected_methods);
+
+        inventory.return_sites.sort();
+        assert_eq!(
+            inventory.return_sites,
+            vec![
+                "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new:pub:production".to_owned(),
+                "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::into_chunk:pub:production".to_owned(),
+            ]
+        );
+
+        inventory.construction_sites.sort();
+        let mut expected_construction_sites = vec![
+            "GuardianCheckpointChunkDelivery@<free>::decode_replay_page_body",
+            "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new",
+            "GuardianCheckpointChunkNonDuplicable@<free>::decode_replay_page_body",
+            "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointChunkDelivery::new",
+            "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointStageRequestV1::chunk",
+            "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointStageRequestV1::decode",
+            "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::chunk",
+            "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::decode",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_construction_sites.sort();
+        assert_eq!(inventory.construction_sites, expected_construction_sites);
+
+        sort_protocol_delivery_storage(&mut inventory.storage);
+        let mut expected_storage = vec![
+            expected_protocol_delivery_storage(
+                "enum",
+                "GuardianCheckpointStageBodyV1",
+                "private",
+                "Chunk:<unnamed:0>",
+                "GuardianCheckpointStageChunkDeliveryV1",
+            ),
+            expected_protocol_delivery_storage(
+                "enum",
+                "GuardianReplayPageBodyDelivery",
+                "pub",
+                "CheckpointChunk:<unnamed:0>",
+                "GuardianCheckpointChunkDelivery",
+            ),
+        ];
+        sort_protocol_delivery_storage(&mut expected_storage);
+        assert_eq!(inventory.storage, expected_storage);
+
+        assert_eq!(
+            inventory.uses,
+            vec![
+                expected_use(
+                    "use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};",
+                ),
+                expected_use(
+                    "use frankenterm_term::{RecoveryTerminalCheckpointV2, terminalstate::checkpoint::TerminalCheckpointLimits};",
+                ),
+                expected_use("use hmac::{Hmac, KeyInit, Mac};"),
+                expected_use("use portable_pty::{PtySize, cmdbuilder::CommandBuilder};"),
+                expected_use("use sha2::{Digest as _, Sha256};"),
+                expected_use(
+                    "use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};",
+                ),
+                expected_use("use std::convert::TryFrom;"),
+                expected_use("use std::panic::AssertUnwindSafe;"),
+                expected_use("use thiserror::Error;"),
+                expected_use("use uuid::Uuid;"),
+                expected_use("use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};"),
+                expected_use(
+                    "use crate::guardian_checkpoint::{GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointOriginV1, LiveParserCheckpointAck};",
+                ),
+            ]
+        );
+        assert_eq!(inventory.protected_uses, Vec::<syn::ItemUse>::new());
+        assert_eq!(
+            inventory.type_aliases,
+            vec![
+                syn::parse_str::<syn::ItemType>("type HmacSha256 = Hmac<Sha256>;")
+                    .expect("parse frozen guardian protocol type alias")
+            ]
+        );
+        assert_eq!(
+            inventory.impl_associated_types,
+            vec![(
+                "AuthenticatedGuardianRequest".to_owned(),
+                syn::parse_str::<syn::ImplItemType>(
+                    "type Target = GuardianRequestEnvelope;"
+                )
+                .expect("parse frozen guardian protocol associated type"),
+            )]
+        );
+        assert_eq!(
+            inventory.trait_associated_types,
+            Vec::<syn::TraitItemType>::new()
+        );
+        assert_eq!(inventory.typed_storage, Vec::<String>::new());
+        assert_eq!(inventory.protected_associated_items, Vec::<String>::new());
+        assert_eq!(
+            inventory.clone_like_factories,
+            Vec::<AuthorityMethodSurface>::new()
+        );
+        assert_eq!(inventory.conditional_surfaces, Vec::<String>::new());
+        assert_eq!(inventory.out_of_line_modules, Vec::<String>::new());
+        assert_eq!(inventory.item_macros, Vec::<syn::Macro>::new());
+        assert_eq!(inventory.unexpected_macros, Vec::<syn::Macro>::new());
+        assert_eq!(
+            inventory.projection_sites,
+            vec!["AuthenticatedGuardianRequest::deref".to_owned()]
+        );
+        assert_eq!(inventory.unexpected_attributes, Vec::<String>::new());
+        assert_eq!(inventory.unexpected_derives, Vec::<String>::new());
+
+        let production_clone_mutation = syn::parse_file(
+            r#"
+                pub struct GuardianCheckpointStageChunkDeliveryV1;
+                #[cfg(not(test))]
+                impl Clone for GuardianCheckpointStageChunkDeliveryV1 {
+                    fn clone(&self) -> Self { loop {} }
+                }
+            "#,
+        )
+        .expect("parse production-only manual Clone mutation");
+        let mut production_clone_inventory = ProtocolDeliveryAstInventory::default();
+        production_clone_inventory.visit_file(&production_clone_mutation);
+        assert!(production_clone_inventory
+            .impls
+            .contains(&"GuardianCheckpointStageChunkDeliveryV1:Clone".to_owned()));
+        assert_eq!(production_clone_inventory.clone_like_factories.len(), 1);
+        assert_eq!(production_clone_inventory.conditional_surfaces.len(), 1);
+
+        let coordinated_derive_mutation = syn::parse_file(
+            r#"
+                #[cfg_attr(not(test), derive(Clone))]
+                struct GuardianCheckpointChunkNonDuplicable;
+                #[cfg_attr(not(test), derive(Clone))]
+                pub struct GuardianCheckpointStageChunkDeliveryV1 {
+                    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+                }
+                #[cfg_attr(not(test), derive(Clone))]
+                pub struct GuardianCheckpointChunkDelivery {
+                    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+                }
+            "#,
+        )
+        .expect("parse coordinated production marker and holder derives");
+        let mut coordinated_derive_inventory = ProtocolDeliveryAstInventory::default();
+        coordinated_derive_inventory.visit_file(&coordinated_derive_mutation);
+        coordinated_derive_inventory.derives.sort();
+        assert_eq!(
+            coordinated_derive_inventory.derives,
+            vec![
+                "GuardianCheckpointChunkDelivery:Clone".to_owned(),
+                "GuardianCheckpointChunkNonDuplicable:Clone".to_owned(),
+                "GuardianCheckpointStageChunkDeliveryV1:Clone".to_owned(),
+            ]
+        );
+        assert_eq!(coordinated_derive_inventory.conditional_surfaces.len(), 3);
+
+        let duplicate_factory_mutation = syn::parse_file(
+            r#"
+                struct GuardianCheckpointChunkNonDuplicable;
+                pub struct GuardianCheckpointChunkDelivery {
+                    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+                }
+                impl GuardianCheckpointChunkDelivery {
+                    fn duplicate(&self) -> Self {
+                        Self {
+                            _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+                        }
+                    }
+                }
+            "#,
+        )
+        .expect("parse bespoke duplicate delivery factory");
+        let mut duplicate_factory_inventory = ProtocolDeliveryAstInventory::default();
+        duplicate_factory_inventory.visit_file(&duplicate_factory_mutation);
+        assert_eq!(duplicate_factory_inventory.clone_like_factories.len(), 1);
+        assert_eq!(duplicate_factory_inventory.return_sites.len(), 1);
+        assert_eq!(duplicate_factory_inventory.construction_sites.len(), 2);
+
+        let escape_surface_mutation = syn::parse_file(
+            r#"
+                use self::GuardianCheckpointChunkDelivery as DuplicableDelivery;
+                #[delivery_factory]
+                mod hidden_delivery_factory;
+                type DeliveryAlias = GuardianCheckpointChunkDelivery;
+                struct DeliveryVault {
+                    delivery: GuardianCheckpointChunkDelivery,
+                }
+                struct ProjectionVault {
+                    delivery: <Factory as DeliveryFactory>::Delivery,
+                }
+                impl DeliveryVault {
+                    fn fork_delivery(&self) -> GuardianCheckpointChunkDelivery {
+                        mint_delivery!()
+                    }
+                }
+                construct_delivery!();
+            "#,
+        )
+        .expect("parse protocol alias, wrapper, module, and macro escapes");
+        let mut escape_surface_inventory = ProtocolDeliveryAstInventory::default();
+        escape_surface_inventory.visit_file(&escape_surface_mutation);
+        assert_eq!(escape_surface_inventory.protected_uses.len(), 1);
+        assert_eq!(escape_surface_inventory.out_of_line_modules.len(), 1);
+        assert_eq!(escape_surface_inventory.type_aliases.len(), 1);
+        assert_eq!(escape_surface_inventory.storage.len(), 1);
+        assert_eq!(escape_surface_inventory.clone_like_factories.len(), 1);
+        assert_eq!(escape_surface_inventory.item_macros.len(), 1);
+        assert_eq!(escape_surface_inventory.unexpected_macros.len(), 2);
+        assert_eq!(escape_surface_inventory.projection_sites.len(), 1);
+        assert_eq!(escape_surface_inventory.unexpected_attributes.len(), 1);
+
+        let nested_test_module = syn::parse_file(
+            r#"
+                #[cfg(not(not(test)))]
+                mod nested {
+                    mod deeper {
+                        impl Clone for GuardianCheckpointChunkDelivery {
+                            fn clone(&self) -> Self { loop {} }
+                        }
+                    }
+                }
+            "#,
+        )
+        .expect("parse nested test-only delivery surface");
+        let mut nested_test_inventory = ProtocolDeliveryAstInventory::default();
+        nested_test_inventory.visit_file(&nested_test_module);
+        assert_eq!(nested_test_inventory.impls, Vec::<String>::new());
+        assert_eq!(
+            nested_test_inventory.clone_like_factories,
+            Vec::<AuthorityMethodSurface>::new()
+        );
     }
 
     #[derive(Debug)]
@@ -6458,6 +7013,8 @@ mod tests {
     #[test]
     fn authority_surface_ast_is_closed_and_records_retain_only_persisted_claims() {
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+        assert_protocol_delivery_surface_is_closed();
 
         assert_zeroize_on_drop::<Sha256>();
         assert!(std::mem::needs_drop::<GuardianCheckpointStageSealIntentV1>());

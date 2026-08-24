@@ -105,13 +105,21 @@ impl ClusteredLine {
         }
     }
 
-    pub fn to_cell_vec(&self) -> Vec<Cell> {
+    fn materialize_cell_vec(&self) -> (Vec<Cell>, *const Cell, usize, usize) {
         // A growing Vec bitwise-moves initialized Cells into each replacement
         // allocation.  Inline TeenyString bytes would then remain in the old
         // allocation without running Cell::drop.  Count the exact materialized
         // width first so the plaintext-bearing Cell buffer never reallocates.
-        let cell_count = self.iter().map(|cell| cell.width()).sum();
+        // Iterator widths are normalized to 1 or 2 and its grapheme count is
+        // bounded by the backing String allocation.  Saturation is therefore
+        // unreachable for a valid allocation, while still keeping arithmetic
+        // bounded if a malformed representation reaches this private type.
+        let cell_count = self
+            .iter()
+            .fold(0usize, |count, cell| count.saturating_add(cell.width()));
         let mut cells = Vec::with_capacity(cell_count);
+        let reserved_ptr = cells.as_ptr();
+        let reserved_capacity = cells.capacity();
 
         for c in self.iter() {
             cells.push(c.as_cell());
@@ -120,6 +128,26 @@ impl ClusteredLine {
             }
         }
 
+        (cells, reserved_ptr, reserved_capacity, cell_count)
+    }
+
+    pub fn to_cell_vec(&self) -> Vec<Cell> {
+        let (cells, reserved_ptr, reserved_capacity, cell_count) = self.materialize_cell_vec();
+        assert_eq!(
+            cells.len(),
+            cell_count,
+            "clustered line materialization diverged from its bounded width census"
+        );
+        assert_eq!(
+            cells.as_ptr(),
+            reserved_ptr,
+            "plaintext-bearing Cell buffer reallocated during materialization"
+        );
+        assert_eq!(
+            cells.capacity(),
+            reserved_capacity,
+            "plaintext-bearing Cell buffer capacity changed during materialization"
+        );
         cells
     }
 
@@ -579,18 +607,20 @@ mod test {
     }
 
     #[test]
-    fn to_cell_vec_allocates_the_exact_materialized_cell_count() {
+    fn to_cell_vec_does_not_reallocate_the_materialized_cell_buffer() {
         let mut line = ClusteredLine::new();
         line.append_grapheme("a", 1, CellAttributes::default());
         line.append_grapheme("\u{4e2d}", 2, CellAttributes::default());
 
-        let cells = line.to_cell_vec();
+        let (cells, reserved_ptr, reserved_capacity, cell_count) = line.materialize_cell_vec();
 
         assert_eq!(cells.len(), 3);
+        assert_eq!(cells.len(), cell_count);
+        assert_eq!(cells.as_ptr(), reserved_ptr);
         assert_eq!(
             cells.capacity(),
-            cells.len(),
-            "materialization must not grow a plaintext-bearing Cell buffer"
+            reserved_capacity,
+            "materialization must not reallocate its plaintext-bearing Cell buffer"
         );
     }
 

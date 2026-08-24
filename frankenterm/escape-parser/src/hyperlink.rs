@@ -3,7 +3,7 @@ use core::hash::{Hash, Hasher};
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::allocate::*;
 
@@ -58,22 +58,38 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn decode_percent_escapes(input: &str) -> Result<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+fn decode_percent_escapes(input: &[u8]) -> Result<Zeroizing<String>> {
+    // Percent decoding cannot expand its input, so this reservation prevents
+    // a plaintext-bearing scratch reallocation.  The guard is installed at
+    // the allocation site rather than after validation.
+    let mut out = Zeroizing::new(Vec::with_capacity(input.len()));
     let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2])) {
+    while idx < input.len() {
+        if input[idx] == b'%' && idx + 2 < input.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(input[idx + 1]), hex_value(input[idx + 2])) {
                 out.push((hi << 4) | lo);
                 idx += 3;
                 continue;
             }
         }
-        out.push(bytes[idx]);
+        out.push(input[idx]);
         idx += 1;
     }
-    Ok(String::from_utf8(out)?)
+
+    match String::from_utf8(core::mem::take(&mut *out)) {
+        Ok(text) => Ok(Zeroizing::new(text)),
+        Err(error) => {
+            let utf8_error = error.utf8_error();
+            let valid_up_to = utf8_error.valid_up_to();
+            let error_len = utf8_error.error_len();
+            let mut rejected = Zeroizing::new(error.into_bytes());
+            rejected.zeroize();
+            Err(crate::error::StringWrap(format!(
+                "percent-decoded hyperlink field is not valid UTF-8 at byte {valid_up_to} (error_len={error_len:?})"
+            ))
+            .into())
+        }
+    }
 }
 
 #[cfg_attr(feature = "use_serde", derive(Deserialize))]
@@ -121,7 +137,8 @@ impl Hyperlink {
                 v.hash(hasher);
             }
         } else {
-            let mut params: Vec<_> = self.params.iter().collect();
+            let mut params = Vec::with_capacity(self.params.len());
+            params.extend(self.params.iter());
             params.sort_unstable_by(|(ka, va), (kb, vb)| ka.cmp(kb).then_with(|| va.cmp(vb)));
             for (k, v) in params {
                 k.hash(hasher);
@@ -197,20 +214,53 @@ impl Hyperlink {
             // Clearing current hyperlink
             Ok(None)
         } else {
-            let param_str = String::from_utf8(osc[1].to_vec())?;
-            let uri = decode_percent_escapes(&String::from_utf8(osc[2].to_vec())?)?;
+            let uri = decode_percent_escapes(osc[2])?;
+            let param_count = if osc[1].is_empty() {
+                0
+            } else {
+                osc[1].split(|byte| *byte == b':').count()
+            };
+            let mut guarded_params = Vec::with_capacity(param_count);
+            if !osc[1].is_empty() {
+                for pair in osc[1].split(|byte| *byte == b':') {
+                    let separator = pair
+                        .iter()
+                        .position(|byte| *byte == b'=')
+                        .ok_or_else(|| format_err!("bad params"))?;
+                    let key = decode_percent_escapes(&pair[..separator])?;
+                    let value = decode_percent_escapes(&pair[separator + 1..])?;
 
-            let mut params = HashMap::new();
-            if !param_str.is_empty() {
-                for pair in param_str.split(':') {
-                    let mut iter = pair.splitn(2, '=');
-                    let key = iter.next().ok_or_else(|| format_err!("bad params"))?;
-                    let value = iter.next().ok_or_else(|| format_err!("bad params"))?;
-                    params.insert(decode_percent_escapes(key)?, decode_percent_escapes(value)?);
+                    if let Some((_, prior_value)) = guarded_params
+                        .iter_mut()
+                        .find(|(prior_key, _)| prior_key.as_str() == key.as_str())
+                    {
+                        prior_value.zeroize();
+                        *prior_value = value;
+                    } else {
+                        guarded_params.push((key, value));
+                    }
                 }
             }
 
-            Ok(Some(Hyperlink::new_with_params(uri, params)))
+            // All recoverable validation is complete.  Construct the final
+            // Drop-hardened owner before copying any guarded string into its
+            // raw String fields, so a later unwind cannot bypass Hyperlink's
+            // wipe contract.
+            let mut link = Hyperlink::new(uri.as_str());
+            #[cfg(feature = "std")]
+            link.params.reserve(guarded_params.len());
+            for (key, value) in &guarded_params {
+                if let Some(final_value) = link.params.get_mut(key.as_str()) {
+                    final_value.zeroize();
+                    final_value.push_str(value.as_str());
+                    continue;
+                }
+                let final_value = link.params.entry(key.as_str().to_string()).or_default();
+                final_value.zeroize();
+                final_value.push_str(value.as_str());
+            }
+
+            Ok(Some(link))
         }
     }
 
@@ -240,7 +290,8 @@ impl zeroize::ZeroizeOnDrop for Hyperlink {}
 impl core::fmt::Display for Hyperlink {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(f, "8;")?;
-        let mut params: Vec<_> = self.params.iter().collect();
+        let mut params = Vec::with_capacity(self.params.len());
+        params.extend(self.params.iter());
         params.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
             left_key
                 .cmp(right_key)
@@ -485,6 +536,34 @@ mod tests {
         assert_eq!(link.params().len(), 2);
         assert_eq!(link.params().get("id"), Some(&"link1".to_string()));
         assert_eq!(link.params().get("class"), Some(&"external".to_string()));
+    }
+
+    #[test]
+    fn parse_duplicate_param_keeps_the_last_guarded_value() {
+        let osc: Vec<&[u8]> = vec![
+            b"8",
+            b"id=first:id=second",
+            b"https://example.com/private",
+        ];
+
+        let link = Hyperlink::parse(&osc).unwrap().unwrap();
+
+        assert_eq!(link.params().len(), 1);
+        assert_eq!(link.params().get("id"), Some(&"second".to_string()));
+    }
+
+    #[test]
+    fn percent_decode_rejects_invalid_utf8_with_a_content_free_error() {
+        let error = decode_percent_escapes(b"private-uri-%FF")
+            .expect_err("decoded 0xff must be rejected as invalid UTF-8");
+        let message = error.to_string();
+
+        assert!(message.contains("not valid UTF-8"));
+        assert!(message.contains("byte 12"));
+        assert!(
+            !message.contains("private-uri"),
+            "UTF-8 errors must not retain or disclose rejected hyperlink bytes"
+        );
     }
 
     #[test]

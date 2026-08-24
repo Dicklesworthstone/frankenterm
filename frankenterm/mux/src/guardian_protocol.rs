@@ -1671,10 +1671,10 @@ impl GuardianCheckpointStageRequestV1 {
     /// `Vec` copies. Chunk callers must consume the request through
     /// [`Self::into_zeroizing_payload`].
     pub fn encode(&self) -> Result<Vec<u8>, GuardianProtocolError> {
-        self.validate()?;
         if matches!(&self.body, GuardianCheckpointStageBodyV1::Chunk(_)) {
             return Err(GuardianProtocolError::CheckpointStageChunkRequiresConsumingEncoding);
         }
+        self.validate()?;
         let capacity = self.encoded_capacity()?;
         let mut payload = Vec::with_capacity(capacity);
         self.encode_into(&mut payload, capacity)?;
@@ -4767,7 +4767,7 @@ impl GuardianBoundedPayloadBuffer {
     }
 
     fn into_inner(mut self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(std::mem::take(&mut *self.bytes))
+        std::mem::take(&mut self.bytes)
     }
 }
 
@@ -4889,7 +4889,7 @@ impl CorrelatedGuardianResponse {
         {
             return Err(GuardianProtocolError::ResponseRequestMismatch);
         }
-        let payload = Zeroizing::new(std::mem::take(&mut *response.payload));
+        let payload = std::mem::take(&mut response.payload);
         let page = GuardianReplayPageDelivery::decode(payload)?;
         page.validate_for_request(request)?;
         Ok(page)
@@ -4928,7 +4928,7 @@ impl AuthenticatedGuardianRequest {
     /// Consume the authenticated envelope and transfer its sensitive payload
     /// into an allocation that remains zeroizing at the next ownership layer.
     pub fn into_zeroizing_payload(mut self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(std::mem::take(&mut *self.envelope.payload))
+        std::mem::take(&mut self.envelope.payload)
     }
 }
 
@@ -9028,8 +9028,8 @@ fn validate_response_envelope(
             if header.status != GuardianResponseStatus::Success {
                 return Err(GuardianProtocolError::InvalidReplyPayload);
             }
-            let page = GuardianReplayPageDelivery::decode(Zeroizing::new(
-                response.payload.as_slice().to_vec(),
+            let page = GuardianReplayPageDelivery::decode(zeroizing_vec_from_slice(
+                response.payload.as_slice(),
             ))?;
             if header.pane_id != Some(page.header.pane_id)
                 || header.lease_generation != page.header.generation
@@ -15076,6 +15076,8 @@ mod tests {
                 "payload[REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES..]",
                 ".to_vec()"
             ),
+            concat!("response.payload.as_slice()", ".to_vec()"),
+            concat!("Zeroizing::new(std::mem::", "take"),
         ] {
             assert!(!source.contains(forbidden));
         }
