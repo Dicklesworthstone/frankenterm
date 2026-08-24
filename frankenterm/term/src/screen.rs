@@ -1,6 +1,8 @@
 #![allow(clippy::range_plus_one)]
 use super::*;
-use crate::config::BidiMode;
+use crate::config::{
+    BidiMode, ScrollbackSnapshotFidelity, ScrollbackSnapshotLimits, ScrollbackSpillError,
+};
 use crossbeam::thread;
 use frankenterm_surface::line::{
     LineWrapScorecard as MonospaceLineWrapScorecard, LineWrapWidthPrefixScratch,
@@ -100,6 +102,7 @@ pub(crate) struct ScreenCheckpointParts {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScreenCheckpointLimits {
     pub max_total_lines: usize,
+    pub max_total_cell_records: usize,
     pub max_total_cells: usize,
     pub max_total_cell_text_bytes: usize,
     pub max_total_hyperlink_bytes: usize,
@@ -110,16 +113,22 @@ pub(crate) struct ScreenCheckpointLimits {
     pub max_keyboard_stack_depth: usize,
     pub max_rows: usize,
     pub max_cols: usize,
+    pub max_visible_grid_cells: usize,
+    pub max_retained_capture_bytes: usize,
+    pub estimated_bytes_per_line: usize,
+    pub estimated_bytes_per_cell: usize,
 }
 
 #[cfg(feature = "use_serde")]
 #[derive(Default, Debug)]
 pub(crate) struct ScreenCheckpointUsage {
     pub lines: usize,
+    pub cell_records: usize,
     pub cells: usize,
     pub cell_text_bytes: usize,
     pub hyperlink_bytes: usize,
     pub hyperlink_params: usize,
+    pub retained_capture_bytes: usize,
 }
 
 #[cfg(feature = "use_serde")]
@@ -131,13 +140,13 @@ pub(crate) enum ScreenCheckpointCaptureError {
         maximum: usize,
     },
     ArithmeticOverflow(&'static str),
-    InvalidLineGeometry {
-        stored_cells: usize,
-        semantic_cells: usize,
-    },
+    ResourceAllocation(&'static str),
+    InvalidLineGeometry,
     UnsupportedGraphicsState,
     ColdScrollbackMetadataInconsistent,
     ColdScrollbackRowMissing(StableRowIndex),
+    ColdScrollbackSnapshot(ScrollbackSpillError),
+    ColdScrollbackNotRecoveryGrade,
 }
 
 #[cfg_attr(feature = "use_serde", derive(Deserialize, Serialize))]
@@ -977,20 +986,41 @@ impl Screen {
                 "screen_lines",
             )?;
             accumulate(
+                &mut usage.retained_capture_bytes,
+                limits.estimated_bytes_per_line,
+                limits.max_retained_capture_bytes,
+                "retained_capture_bytes",
+            )?;
+            accumulate(
                 &mut usage.cells,
                 line.len(),
                 limits.max_total_cells,
                 "screen_cells",
             )?;
+            let cell_structural_bytes = line
+                .len()
+                .checked_mul(limits.estimated_bytes_per_cell)
+                .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                    "retained_capture_bytes",
+                ))?;
+            accumulate(
+                &mut usage.retained_capture_bytes,
+                cell_structural_bytes,
+                limits.max_retained_capture_bytes,
+                "retained_capture_bytes",
+            )?;
 
             let mut semantic_cells = 0usize;
             for cell in line.visible_cells() {
+                accumulate(
+                    &mut usage.cell_records,
+                    1,
+                    limits.max_total_cell_records,
+                    "screen_cell_records",
+                )?;
                 let width = cell.width();
                 if !(1..=2).contains(&width) {
-                    return Err(ScreenCheckpointCaptureError::InvalidLineGeometry {
-                        stored_cells: line.len(),
-                        semantic_cells: width,
-                    });
+                    return Err(ScreenCheckpointCaptureError::InvalidLineGeometry);
                 }
                 semantic_cells = semantic_cells.checked_add(width).ok_or(
                     ScreenCheckpointCaptureError::ArithmeticOverflow("semantic_line_cells"),
@@ -1009,6 +1039,12 @@ impl Screen {
                     text_bytes,
                     limits.max_total_cell_text_bytes,
                     "cell_text_bytes",
+                )?;
+                accumulate(
+                    &mut usage.retained_capture_bytes,
+                    text_bytes,
+                    limits.max_retained_capture_bytes,
+                    "retained_capture_bytes",
                 )?;
 
                 if let Some(link) = cell.attrs().hyperlink() {
@@ -1062,14 +1098,17 @@ impl Screen {
                         limits.max_total_hyperlink_bytes,
                         "hyperlink_bytes",
                     )?;
+                    accumulate(
+                        &mut usage.retained_capture_bytes,
+                        link_bytes,
+                        limits.max_retained_capture_bytes,
+                        "retained_capture_bytes",
+                    )?;
                 }
             }
 
             if semantic_cells != line.len() {
-                return Err(ScreenCheckpointCaptureError::InvalidLineGeometry {
-                    stored_cells: line.len(),
-                    semantic_cells,
-                });
+                return Err(ScreenCheckpointCaptureError::InvalidLineGeometry);
             }
             Ok(())
         }
@@ -1088,6 +1127,19 @@ impl Screen {
                 maximum: limits.max_cols,
             });
         }
+        let visible_grid_cells = self
+            .physical_rows
+            .checked_mul(self.physical_cols)
+            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                "visible_grid_cells",
+            ))?;
+        if visible_grid_cells > limits.max_visible_grid_cells {
+            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                resource: "visible_grid_cells",
+                observed: visible_grid_cells,
+                maximum: limits.max_visible_grid_cells,
+            });
+        }
         if self.keyboard_stack.len() > limits.max_keyboard_stack_depth {
             return Err(ScreenCheckpointCaptureError::ResourceLimit {
                 resource: "keyboard_stack_depth",
@@ -1097,92 +1149,100 @@ impl Screen {
         }
 
         let hot_top = self.stable_row_index_offset;
-        let (cold_sink, oldest, retained_rows, retained_bytes) = if !self.allow_scrollback {
-            (None, hot_top, 0, 0)
-        } else {
-            match self.config.scrollback_spill_sink() {
-                Some(sink) => {
-                    let retained_rows = sink.retained_scrollback_rows();
-                    let retained_bytes = sink.retained_scrollback_bytes();
-                    let oldest = match (retained_rows, sink.oldest_scrollback_row()) {
-                        (0, None) => hot_top,
-                        (0, Some(row)) if usize::try_from(row).ok() == Some(hot_top) => hot_top,
-                        (_, Some(row)) => usize::try_from(row).map_err(|_| {
-                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
-                        })?,
-                        _ => {
-                            return Err(
-                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                            );
-                        }
-                    };
-                    if oldest > hot_top
-                        || hot_top.checked_sub(oldest) != Some(retained_rows)
-                        || retained_bytes > limits.max_cold_scrollback_bytes
-                    {
-                        if retained_bytes > limits.max_cold_scrollback_bytes {
-                            return Err(ScreenCheckpointCaptureError::ResourceLimit {
-                                resource: "cold_scrollback_bytes",
-                                observed: retained_bytes,
-                                maximum: limits.max_cold_scrollback_bytes,
-                            });
-                        }
-                        return Err(
-                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                        );
-                    }
-                    (Some(sink), oldest, retained_rows, retained_bytes)
-                }
-                None => (None, hot_top, 0, 0),
-            }
-        };
 
-        let total_lines = retained_rows
-            .checked_add(self.lines.len())
-            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
-                "screen_lines",
-            ))?;
-        let prospective_lines = usage.lines.checked_add(total_lines).ok_or(
-            ScreenCheckpointCaptureError::ArithmeticOverflow("screen_lines"),
-        )?;
-        if prospective_lines > limits.max_total_lines {
-            return Err(ScreenCheckpointCaptureError::ResourceLimit {
-                resource: "screen_lines",
-                observed: prospective_lines,
-                maximum: limits.max_total_lines,
-            });
-        }
-
-        // Inspect every resident line before cloning any of them.  Cold rows
-        // necessarily cross the sink boundary one at a time, but their declared
-        // count and byte ledger have already passed the hard preflight above.
+        // Inspect every resident line before asking the sink to allocate or
+        // decode a cold snapshot. This also establishes the remaining global
+        // checkpoint budget supplied to the sink.
         for line in &self.lines {
             inspect_line(line, limits, usage)?;
         }
 
-        let mut cold_lines = Vec::with_capacity(retained_rows);
-        if let Some(sink) = cold_sink.as_ref() {
-            for stable in oldest..hot_top {
-                let stable = StableRowIndex::try_from(stable).map_err(|_| {
+        let (oldest, mut cold_lines) = if self.allow_scrollback {
+            if let Some(sink) = self.config.scrollback_spill_sink() {
+                let expected_newest_exclusive = StableRowIndex::try_from(hot_top).map_err(|_| {
                     ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
                 })?;
-                let line = sink
-                    .load_scrollback_line(stable)
-                    .ok_or(ScreenCheckpointCaptureError::ColdScrollbackRowMissing(stable))?;
-                inspect_line(&line, limits, usage)?;
-                cold_lines.push(line.semantic_checkpoint_clone());
+                let max_cold_bytes = u64::try_from(limits.max_cold_scrollback_bytes).map_err(
+                    |_| ScreenCheckpointCaptureError::ArithmeticOverflow("cold_scrollback_bytes"),
+                )?;
+                let snapshot = sink
+                    .snapshot_scrollback(
+                        expected_newest_exclusive,
+                        ScrollbackSnapshotLimits {
+                            max_rows: limits.max_total_lines.saturating_sub(usage.lines),
+                            max_stored_bytes: max_cold_bytes,
+                            max_decoded_bytes: limits
+                                .max_retained_capture_bytes
+                                .saturating_sub(usage.retained_capture_bytes),
+                            max_physical_bytes: max_cold_bytes,
+                        },
+                    )
+                    .map_err(ScreenCheckpointCaptureError::ColdScrollbackSnapshot)?;
+                if !snapshot.rows().is_empty()
+                    && snapshot.fidelity() != ScrollbackSnapshotFidelity::ExactSemantic
+                {
+                    return Err(ScreenCheckpointCaptureError::ColdScrollbackNotRecoveryGrade);
+                }
+                if snapshot.newest_stable_row_exclusive() != expected_newest_exclusive
+                    || snapshot.stored_bytes() > max_cold_bytes
+                    || snapshot.decoded_bytes()
+                        > limits
+                            .max_retained_capture_bytes
+                            .saturating_sub(usage.retained_capture_bytes)
+                {
+                    return Err(
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                    );
+                }
+                let oldest = match (snapshot.oldest_stable_row(), snapshot.rows().is_empty()) {
+                    (None, true) => hot_top,
+                    (Some(oldest), false) => usize::try_from(oldest).map_err(|_| {
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
+                    })?,
+                    _ => {
+                        return Err(
+                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                        );
+                    }
+                };
+                if oldest > hot_top
+                    || hot_top.checked_sub(oldest) != Some(snapshot.rows().len())
+                {
+                    return Err(
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                    );
+                }
+                let mut cold_lines = snapshot.into_rows();
+                for line in &mut cold_lines {
+                    inspect_line(line, limits, usage)?;
+                    *line = line.semantic_checkpoint_clone();
+                }
+                (oldest, cold_lines)
+            } else {
+                (hot_top, Vec::new())
             }
+        } else {
+            (hot_top, Vec::new())
+        };
 
-            if sink.retained_scrollback_rows() != retained_rows
-                || sink.retained_scrollback_bytes() != retained_bytes
-                || sink.oldest_scrollback_row().and_then(|row| usize::try_from(row).ok())
-                    != Some(oldest)
-            {
-                return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
-            }
+        let total_lines = cold_lines
+            .len()
+            .checked_add(self.lines.len())
+            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                "screen_lines",
+            ))?;
+        if usage.lines > limits.max_total_lines {
+            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                resource: "screen_lines",
+                observed: usage.lines,
+                maximum: limits.max_total_lines,
+            });
         }
 
-        let mut lines = Vec::with_capacity(total_lines);
+        let mut lines = Vec::new();
+        lines
+            .try_reserve_exact(total_lines)
+            .map_err(|_| ScreenCheckpointCaptureError::ResourceAllocation("screen_lines"))?;
         lines.append(&mut cold_lines);
         lines.extend(self.lines.iter().map(Line::semantic_checkpoint_clone));
 
@@ -1208,7 +1268,7 @@ impl Screen {
         config: &Arc<dyn TerminalConfiguration>,
         seqno: SequenceNo,
         bidi_mode: BidiMode,
-    ) -> Self {
+    ) -> Result<Self, ScreenCheckpointCaptureError> {
         let size = TerminalSize {
             rows: parts.physical_rows,
             cols: parts.physical_cols,
@@ -1216,12 +1276,20 @@ impl Screen {
             pixel_height: 0,
             dpi: parts.dpi,
         };
-        let mut screen = Self::new(size, config, parts.allow_scrollback, seqno, bidi_mode);
+        let mut screen = Self::try_new(
+            size,
+            config,
+            parts.allow_scrollback,
+            seqno,
+            bidi_mode,
+            true,
+        )
+        .map_err(|_| ScreenCheckpointCaptureError::ResourceAllocation("screen"))?;
         screen.lines = parts.lines.into();
         screen.stable_row_index_offset = parts.stable_row_index_offset;
         screen.keyboard_stack = parts.keyboard_stack;
         screen.saved_cursor = parts.saved_cursor;
-        screen
+        Ok(screen)
     }
 
     /// Create a new Screen with the specified dimensions.
@@ -1234,18 +1302,39 @@ impl Screen {
         seqno: SequenceNo,
         bidi_mode: BidiMode,
     ) -> Screen {
+        Self::try_new(size, config, allow_scrollback, seqno, bidi_mode, false)
+            .unwrap_or_else(|()| panic!("unable to allocate terminal screen"))
+    }
+
+    fn try_new(
+        size: TerminalSize,
+        config: &Arc<dyn TerminalConfiguration>,
+        allow_scrollback: bool,
+        seqno: SequenceNo,
+        bidi_mode: BidiMode,
+        checkpoint_restore: bool,
+    ) -> Result<Screen, ()> {
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
 
-        let mut lines =
-            VecDeque::with_capacity(physical_rows + scrollback_hot_size(config, allow_scrollback));
-        for _ in 0..physical_rows {
-            let mut line = Line::new(seqno);
-            bidi_mode.apply_to_line(&mut line, seqno);
-            lines.push_back(line);
+        let capacity = if checkpoint_restore {
+            0
+        } else {
+            physical_rows
+                .checked_add(scrollback_hot_size(config, allow_scrollback))
+                .ok_or(())?
+        };
+        let mut lines = VecDeque::new();
+        lines.try_reserve_exact(capacity).map_err(|_| ())?;
+        if !checkpoint_restore {
+            for _ in 0..physical_rows {
+                let mut line = Line::new(seqno);
+                bidi_mode.apply_to_line(&mut line, seqno);
+                lines.push_back(line);
+            }
         }
 
-        Screen {
+        Ok(Screen {
             lines,
             config: Arc::clone(config),
             scrollback_tiering: ScrollbackTieringState::default(),
@@ -1274,7 +1363,7 @@ impl Screen {
             rewrap_line_cache_hits: 0,
             #[cfg(test)]
             forced_rollback_cause: None,
-        }
+        })
     }
 
     pub fn full_reset(&mut self) {
@@ -1407,11 +1496,12 @@ impl Screen {
         if !tier.enabled {
             return true;
         }
-        if let Some(sink) = self.config.scrollback_spill_sink() {
-            let max_retained_rows = self.cold_sink_retention_rows();
-            if max_retained_rows > 0
-                && !sink.store_scrollback_line(stable_row, line, max_retained_rows)
-            {
+        let max_retained_rows = self.cold_sink_retention_rows();
+        if max_retained_rows > 0 {
+            let Some(sink) = self.config.scrollback_spill_sink() else {
+                return false;
+            };
+            if !sink.store_scrollback_line(stable_row, line, max_retained_rows) {
                 return false;
             }
         }
@@ -3502,7 +3592,13 @@ impl Screen {
         }
     }
 
-    pub fn erase_scrollback(&mut self) {
+    pub fn erase_scrollback(&mut self) -> Result<(), ScrollbackSpillError> {
+        // The durable logical clear is the commit point. Keep every hot row and
+        // all accounting untouched when it fails so callers can retry without
+        // having created a split-brain history between memory and the sink.
+        if let Some(sink) = self.config.scrollback_spill_sink() {
+            let _commit = sink.clear_scrollback()?;
+        }
         self.invalidate_last_good_frame(LastGoodFrameTransition::ScrollbackErase, None);
         let len = self.lines.len();
         let to_clear = len.saturating_sub(self.physical_rows);
@@ -3513,14 +3609,12 @@ impl Screen {
             }
         }
         self.scrollback_tiering.reset();
-        if let Some(sink) = self.config.scrollback_spill_sink() {
-            sink.clear_scrollback();
-        }
         self.cold_scrollback_worker.reset();
         // Reclaim memory from the VecDeque after bulk removal.
         // Without this, the ring buffer retains capacity for the
         // evicted scrollback lines indefinitely.
         self.lines.shrink_to_fit();
+        Ok(())
     }
 
     /// ```text
@@ -3971,6 +4065,7 @@ mod tests {
     use frankenterm_surface::{CursorShape, CursorVisibility};
 
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -4141,6 +4236,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestColdScrollbackSink {
         rows: Mutex<BTreeMap<StableRowIndex, Line>>,
+        fail_clear: AtomicBool,
     }
 
     impl crate::config::ScrollbackSpillSink for TestColdScrollbackSink {
@@ -4195,8 +4291,95 @@ mod tests {
                 .sum()
         }
 
-        fn clear_scrollback(&self) {
+        fn snapshot_scrollback(
+            &self,
+            expected_newest_exclusive: StableRowIndex,
+            limits: crate::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            crate::config::ScrollbackSnapshot,
+            crate::config::ScrollbackSpillError,
+        > {
+            let rows = self.rows.lock().expect("test sink mutex");
+            if rows.len() > limits.max_rows {
+                return Err(crate::config::ScrollbackSpillError::ResourceLimit {
+                    resource: "rows",
+                    observed: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
+                });
+            }
+            let stored_bytes = rows.values().try_fold(0usize, |total, line| {
+                total.checked_add(Screen::estimate_line_bytes(line))
+            }).ok_or(crate::config::ScrollbackSpillError::ArithmeticOverflow(
+                "decoded_bytes",
+            ))?;
+            let stored_bytes_u64 = u64::try_from(stored_bytes).map_err(|_| {
+                crate::config::ScrollbackSpillError::ArithmeticOverflow("stored_bytes")
+            })?;
+            if stored_bytes_u64 > limits.max_stored_bytes {
+                return Err(crate::config::ScrollbackSpillError::ResourceLimit {
+                    resource: "stored_bytes",
+                    observed: stored_bytes_u64,
+                    maximum: limits.max_stored_bytes,
+                });
+            }
+            if stored_bytes > limits.max_decoded_bytes {
+                return Err(crate::config::ScrollbackSpillError::ResourceLimit {
+                    resource: "decoded_bytes",
+                    observed: stored_bytes_u64,
+                    maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
+                });
+            }
+            if stored_bytes_u64 > limits.max_physical_bytes {
+                return Err(crate::config::ScrollbackSpillError::ResourceLimit {
+                    resource: "physical_bytes",
+                    observed: stored_bytes_u64,
+                    maximum: limits.max_physical_bytes,
+                });
+            }
+
+            let oldest = rows.keys().next().copied();
+            let mut expected = oldest;
+            let mut snapshot_rows = Vec::new();
+            snapshot_rows.try_reserve_exact(rows.len()).map_err(|_| {
+                crate::config::ScrollbackSpillError::StorageUnavailable
+            })?;
+            for (stable_row, line) in rows.iter() {
+                if Some(*stable_row) != expected {
+                    return Err(crate::config::ScrollbackSpillError::SnapshotRangeMismatch);
+                }
+                expected = stable_row.checked_add(1);
+                snapshot_rows.push(line.clone());
+            }
+            if expected.unwrap_or(expected_newest_exclusive) != expected_newest_exclusive {
+                return Err(crate::config::ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            crate::config::ScrollbackSnapshot::from_contiguous_rows(
+                crate::config::ScrollbackSnapshotGeneration::new(
+                    [0; 16],
+                    u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                ),
+                crate::config::ScrollbackSnapshotFidelity::ExactSemantic,
+                oldest,
+                expected_newest_exclusive,
+                stored_bytes_u64,
+                stored_bytes,
+                snapshot_rows,
+            )
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            crate::config::ScrollbackClearCommit,
+            crate::config::ScrollbackSpillError,
+        > {
+            if self.fail_clear.load(Ordering::Relaxed) {
+                return Err(crate::config::ScrollbackSpillError::StorageUnavailable);
+            }
             self.rows.lock().expect("test sink mutex").clear();
+            Ok(crate::config::ScrollbackClearCommit::new(
+                crate::config::ScrollbackSnapshotGeneration::new([1; 16], 0),
+            ))
         }
     }
 
@@ -4227,6 +4410,36 @@ mod tests {
 
         fn retained_scrollback_bytes(&self) -> usize {
             0
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            expected_newest_exclusive: StableRowIndex,
+            _limits: crate::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            crate::config::ScrollbackSnapshot,
+            crate::config::ScrollbackSpillError,
+        > {
+            crate::config::ScrollbackSnapshot::from_contiguous_rows(
+                crate::config::ScrollbackSnapshotGeneration::new([0; 16], 0),
+                crate::config::ScrollbackSnapshotFidelity::ExactSemantic,
+                None,
+                expected_newest_exclusive,
+                0,
+                0,
+                Vec::new(),
+            )
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            crate::config::ScrollbackClearCommit,
+            crate::config::ScrollbackSpillError,
+        > {
+            Ok(crate::config::ScrollbackClearCommit::new(
+                crate::config::ScrollbackSnapshotGeneration::new([0; 16], 0),
+            ))
         }
     }
 
@@ -5834,6 +6047,82 @@ mod tests {
     }
 
     #[test]
+    fn erase_scrollback_retains_hot_and_cold_state_when_clear_does_not_commit() {
+        let cold_sink = Arc::new(TestColdScrollbackSink::default());
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 10,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(cold_sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+        for seq in 1..=8 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+        let lines_before: Vec<_> = screen
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.as_str().into_owned(),
+                    line.current_seqno(),
+                    line.last_cell_was_wrapped(),
+                )
+            })
+            .collect();
+        let offset_before = screen.stable_row_index_offset;
+        let tiering_before = (
+            screen.scrollback_tiering.warm_line_bytes.clone(),
+            screen.scrollback_tiering.warm_bytes,
+            screen.scrollback_tiering.warm_spill_lines_total,
+            screen.scrollback_tiering.warm_spill_bytes_total,
+            screen.scrollback_tiering.cold_spill_lines_total,
+            screen.scrollback_tiering.cold_spill_bytes_total,
+        );
+        let cold_rows_before = cold_sink.retained_scrollback_rows();
+        cold_sink.fail_clear.store(true, Ordering::Relaxed);
+
+        assert_eq!(
+            screen.erase_scrollback(),
+            Err(crate::config::ScrollbackSpillError::StorageUnavailable)
+        );
+        let lines_after: Vec<_> = screen
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.as_str().into_owned(),
+                    line.current_seqno(),
+                    line.last_cell_was_wrapped(),
+                )
+            })
+            .collect();
+        assert_eq!(lines_after, lines_before);
+        assert_eq!(screen.stable_row_index_offset, offset_before);
+        assert_eq!(
+            (
+                screen.scrollback_tiering.warm_line_bytes.clone(),
+                screen.scrollback_tiering.warm_bytes,
+                screen.scrollback_tiering.warm_spill_lines_total,
+                screen.scrollback_tiering.warm_spill_bytes_total,
+                screen.scrollback_tiering.cold_spill_lines_total,
+                screen.scrollback_tiering.cold_spill_bytes_total,
+            ),
+            tiering_before
+        );
+        assert_eq!(cold_sink.retained_scrollback_rows(), cold_rows_before);
+    }
+
+    #[test]
     fn erase_scrollback_resets_tiered_scrollback_state_and_worker_metrics() {
         let warm_max_bytes = std::mem::size_of::<Line>() * 2;
         let mut screen = test_screen_with_config(
@@ -5869,7 +6158,9 @@ mod tests {
             "test requires pre-existing cold spill worker activity"
         );
 
-        screen.erase_scrollback();
+        screen
+            .erase_scrollback()
+            .expect("test scrollback clear should commit");
 
         assert_eq!(
             screen.scrollback_rows(),
@@ -5976,7 +6267,9 @@ mod tests {
         for seq in 1..=32 {
             screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
         }
-        screen.erase_scrollback();
+        screen
+            .erase_scrollback()
+            .expect("test scrollback clear should commit");
 
         let status = screen.tiered_scrollback_status();
         assert!(status.tiering_enabled);

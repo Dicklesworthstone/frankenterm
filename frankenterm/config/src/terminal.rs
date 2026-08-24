@@ -322,6 +322,28 @@ mod tests {
         fn retained_scrollback_bytes(&self) -> usize {
             1
         }
+
+        fn snapshot_scrollback(
+            &self,
+            _expected_newest_exclusive: frankenterm_term::StableRowIndex,
+            _limits: frankenterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackSnapshot,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackClearCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Ok(frankenterm_term::config::ScrollbackClearCommit::new(
+                frankenterm_term::config::ScrollbackSnapshotGeneration::new([0; 16], 0),
+            ))
+        }
     }
 
     fn overridden_config_for_test(overrides: Value) -> ConfigHandle {

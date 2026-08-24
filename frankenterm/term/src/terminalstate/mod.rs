@@ -837,7 +837,10 @@ impl TerminalState {
         // we need to ensure that we increment the seqno in
         // order to correctly invalidate the display
         self.increment_seqno();
-        self.erase_in_display(EraseInDisplay::EraseScrollback);
+        if let Err(error) = self.screen_mut().erase_scrollback() {
+            log::error!("refused scrollback-and-viewport erase: {error}");
+            return;
+        }
 
         let row_index = self.screen.phys_row(self.cursor.y);
         let rows = self
@@ -860,7 +863,9 @@ impl TerminalState {
         // we need to ensure that we increment the seqno in
         // order to correctly invalidate the display
         self.increment_seqno();
-        self.screen_mut().erase_scrollback();
+        if let Err(error) = self.screen_mut().erase_scrollback() {
+            log::error!("refused scrollback erase: {error}");
+        }
     }
 
     /// Returns true if the associated application has enabled any of the
@@ -2307,7 +2312,9 @@ impl TerminalState {
             }
             EraseInDisplay::EraseDisplay => 0..rows,
             EraseInDisplay::EraseScrollback => {
-                self.screen_mut().erase_scrollback();
+                if let Err(error) = self.screen_mut().erase_scrollback() {
+                    log::error!("refused escape-sequence scrollback erase: {error}");
+                }
                 return;
             }
         };

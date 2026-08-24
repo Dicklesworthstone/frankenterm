@@ -71,7 +71,6 @@ fn client_domains(config: &config::ConfigHandle) -> Vec<ClientDomainConfig> {
     domains
 }
 
-#[derive(Debug)]
 struct LiveScrollbackSpillSink {
     pane_id: u64,
     durable_pane_id: [u8; 16],
@@ -79,15 +78,78 @@ struct LiveScrollbackSpillSink {
     source_domain_id: usize,
     command_description: String,
     manifest_path: PathBuf,
+    mutation_gate: std::sync::Mutex<()>,
     store: std::sync::Mutex<frankenterm_core::storage::mmap_store::MmapScrollbackStore>,
     state: std::sync::Mutex<LiveScrollbackSpillState>,
     redactor: frankenterm_core::redactor::Redactor,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+impl std::fmt::Debug for LiveScrollbackSpillSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveScrollbackSpillSink")
+            .field("pane_id", &self.pane_id)
+            .field("source_pane_id", &self.source_pane_id)
+            .field("source_domain_id", &self.source_domain_id)
+            .field("durable_pane_id", &"[REDACTED]")
+            .field("command_description", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy)]
 struct LiveScrollbackSpillState {
     initial_stable_row: Option<wezterm_term::StableRowIndex>,
     max_retained_rows: usize,
+    content_epoch: [u8; 16],
+    revision: u64,
+    clear_pending_physical_reclamation: bool,
+    transaction_quarantined: bool,
+}
+
+impl std::fmt::Debug for LiveScrollbackSpillState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveScrollbackSpillState")
+            .field("initial_stable_row", &self.initial_stable_row)
+            .field("max_retained_rows", &self.max_retained_rows)
+            .field("content_epoch", &"[REDACTED]")
+            .field("revision", &self.revision)
+            .field(
+                "clear_pending_physical_reclamation",
+                &self.clear_pending_physical_reclamation,
+            )
+            .field("transaction_quarantined", &self.transaction_quarantined)
+            .finish()
+    }
+}
+
+impl LiveScrollbackSpillState {
+    fn empty(content_epoch: [u8; 16]) -> Self {
+        Self {
+            initial_stable_row: None,
+            max_retained_rows: 0,
+            content_epoch,
+            revision: 0,
+            clear_pending_physical_reclamation: false,
+            transaction_quarantined: false,
+        }
+    }
+
+    fn snapshot_generation(&self) -> wezterm_term::config::ScrollbackSnapshotGeneration {
+        wezterm_term::config::ScrollbackSnapshotGeneration::new(
+            self.content_epoch,
+            self.revision,
+        )
+    }
+
+    fn advance_revision(&mut self) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(wezterm_term::config::ScrollbackSpillError::RevisionExhausted)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +167,95 @@ struct LiveScrollbackManifestV1 {
     retained_rows: u64,
     next_seq: u64,
     content_log: String,
+    /// Present and mandatory in schema v2. These optional fields allow a
+    /// checksum-preserving read of v1 so it can be validated and immediately
+    /// republished as v2 without treating it as generation-aware state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<u64>,
     manifest_sha256: String,
+}
+
+fn live_scrollback_manifest_generation(
+    manifest: &LiveScrollbackManifestV1,
+) -> anyhow::Result<Option<([u8; 16], u64)>> {
+    match manifest.schema.as_str() {
+        "frankenterm.live-scrollback-manifest.v1" => {
+            anyhow::ensure!(
+                manifest.content_epoch.is_none() && manifest.revision.is_none(),
+                "legacy scrollback manifest contains generation fields"
+            );
+            Ok(None)
+        }
+        "frankenterm.live-scrollback-manifest.v2" => {
+            let encoded_epoch = manifest
+                .content_epoch
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("scrollback manifest content epoch is missing"))?;
+            anyhow::ensure!(
+                encoded_epoch.len() == 32
+                    && encoded_epoch
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "scrollback manifest content epoch is not canonical"
+            );
+            let mut content_epoch = [0u8; 16];
+            hex::decode_to_slice(encoded_epoch, &mut content_epoch)
+                .map_err(|_| anyhow::anyhow!("scrollback manifest content epoch is invalid"))?;
+            anyhow::ensure!(
+                content_epoch != [0; 16],
+                "scrollback manifest content epoch is invalid"
+            );
+            let revision = manifest
+                .revision
+                .ok_or_else(|| anyhow::anyhow!("scrollback manifest revision is missing"))?;
+            Ok(Some((content_epoch, revision)))
+        }
+        _ => anyhow::bail!("unsupported live scrollback manifest schema"),
+    }
+}
+
+#[derive(Debug)]
+struct LiveScrollbackManifestPublishError {
+    outcome_indeterminate: bool,
+    source: anyhow::Error,
+}
+
+impl LiveScrollbackManifestPublishError {
+    fn before_publication(source: anyhow::Error) -> Self {
+        Self {
+            outcome_indeterminate: false,
+            source,
+        }
+    }
+
+    fn after_publication(source: anyhow::Error) -> Self {
+        Self {
+            outcome_indeterminate: true,
+            source,
+        }
+    }
+
+    fn outcome_indeterminate(&self) -> bool {
+        self.outcome_indeterminate
+    }
+}
+
+impl std::fmt::Display for LiveScrollbackManifestPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.outcome_indeterminate {
+            formatter.write_str("scrollback manifest publication outcome is indeterminate")
+        } else {
+            formatter.write_str("scrollback manifest was not published")
+        }
+    }
+}
+
+impl std::error::Error for LiveScrollbackManifestPublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 /// Discovery metadata for one continuously persisted mux pane.
@@ -226,6 +376,7 @@ impl LiveScrollbackSpillSink {
         context: &config::ScrollbackSpillSinkContext,
     ) -> anyhow::Result<Self> {
         let pane_id = 0;
+        let content_epoch = *uuid::Uuid::new_v4().as_bytes();
         let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
             .simple()
             .to_string();
@@ -279,10 +430,20 @@ impl LiveScrollbackSpillSink {
         store.ensure_pane(pane_id)?;
         let redactor = frankenterm_core::redactor::Redactor::new();
         let command_description = redactor.redact(&context.command_description);
-        let (state, repair_complete_manifest) = match Self::read_manifest(&manifest_path)? {
+        let (state, repair_manifest_publication) = match Self::read_manifest(&manifest_path)? {
             Some(manifest) => {
-                if manifest.schema != "frankenterm.live-scrollback-manifest.v1"
-                    || manifest.durable_pane_id != durable_pane_id
+                let persisted_generation = live_scrollback_manifest_generation(&manifest)
+                    .with_context(|| {
+                        format!(
+                            "validate scrollback manifest generation at {}",
+                            manifest_path.display()
+                        )
+                    })?;
+                let (state_content_epoch, mut state_revision, schema_upgrade_required) =
+                    persisted_generation
+                        .map(|(epoch, revision)| (epoch, revision, false))
+                        .unwrap_or((content_epoch, 0, true));
+                if manifest.durable_pane_id != durable_pane_id
                     || manifest.content_log != "0.log"
                     || !matches!(
                         manifest.publication_state.as_str(),
@@ -301,7 +462,12 @@ impl LiveScrollbackSpillSink {
                             manifest_path.display()
                         )
                     })?;
-                    (LiveScrollbackSpillState::default(), false)
+                    let mut state = LiveScrollbackSpillState::empty(state_content_epoch);
+                    state.revision = state_revision;
+                    (
+                        state,
+                        schema_upgrade_required.then_some("cleared"),
+                    )
                 } else {
                     let actual_retained_rows = u64::try_from(store.line_count(pane_id))
                         .map_err(|_| anyhow::anyhow!("scrollback row count exceeds u64"))?;
@@ -356,11 +522,21 @@ impl LiveScrollbackSpillSink {
                             manifest_path.display()
                         );
                     }
-                    let repair_complete_manifest = actual_retained_rows != manifest.retained_rows
+                    let content_repair_required = actual_retained_rows != manifest.retained_rows
                         || actual_oldest_seq != manifest.oldest_seq
                         || actual_next_seq != manifest.next_seq
                         || (manifest.publication_state == "prepared"
                             && actual_retained_rows > 0);
+                    if persisted_generation.is_some()
+                        && manifest.publication_state == "complete"
+                        && content_repair_required
+                    {
+                        state_revision = state_revision.checked_add(1).ok_or_else(|| {
+                            anyhow::anyhow!("scrollback manifest revision exhausted during repair")
+                        })?;
+                    }
+                    let repair_complete_manifest =
+                        schema_upgrade_required || content_repair_required;
                     (
                         LiveScrollbackSpillState {
                             initial_stable_row: Some(manifest.initial_stable_row.ok_or_else(
@@ -373,8 +549,12 @@ impl LiveScrollbackSpillSink {
                             max_retained_rows: usize::try_from(manifest.max_retained_rows).map_err(
                                 |_| anyhow::anyhow!("scrollback retention exceeds platform usize"),
                             )?,
+                            content_epoch: state_content_epoch,
+                            revision: state_revision,
+                            clear_pending_physical_reclamation: false,
+                            transaction_quarantined: false,
                         },
-                        repair_complete_manifest,
+                        repair_complete_manifest.then_some("complete"),
                     )
                 }
             }
@@ -385,7 +565,7 @@ impl LiveScrollbackSpillSink {
                         manifest_path.display()
                     );
                 }
-                (LiveScrollbackSpillState::default(), false)
+                (LiveScrollbackSpillState::empty(content_epoch), None)
             }
         };
         let sink = Self {
@@ -395,12 +575,13 @@ impl LiveScrollbackSpillSink {
             source_domain_id: context.domain_id,
             command_description,
             manifest_path,
+            mutation_gate: std::sync::Mutex::new(()),
             store: std::sync::Mutex::new(store),
             state: std::sync::Mutex::new(state),
             redactor,
         };
-        if repair_complete_manifest {
-            sink.persist_manifest("complete").with_context(|| {
+        if let Some(publication_state) = repair_manifest_publication {
+            sink.persist_manifest(publication_state).with_context(|| {
                 format!(
                     "repair interrupted scrollback manifest publication {}",
                     sink.manifest_path.display()
@@ -510,19 +691,30 @@ impl LiveScrollbackSpillSink {
         Ok(Some(manifest))
     }
 
-    fn persist_manifest(&self, publication_state: &'static str) -> anyhow::Result<()> {
+    fn persist_manifest(
+        &self,
+        publication_state: &'static str,
+    ) -> Result<(), LiveScrollbackManifestPublishError> {
+        let mut published = false;
+        let result = (|| -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(publication_state, "prepared" | "complete" | "cleared"),
             "invalid scrollback manifest publication state"
         );
-        let state = self.lock_state("persist_manifest state");
+        let state = self
+            .lock_state("persist_manifest state")
+            .map_err(anyhow::Error::new)?;
         let initial_stable_row = state.initial_stable_row;
         let max_retained_rows = state.max_retained_rows;
+        let content_epoch = state.content_epoch;
+        let revision = state.revision;
         drop(state);
 
-        let store = self.lock_store("persist_manifest store");
+        let store = self
+            .lock_store("persist_manifest store")
+            .map_err(anyhow::Error::new)?;
         let mut manifest = LiveScrollbackManifestV1 {
-            schema: "frankenterm.live-scrollback-manifest.v1".to_string(),
+            schema: "frankenterm.live-scrollback-manifest.v2".to_string(),
             publication_state: publication_state.to_string(),
             durable_pane_id: uuid::Uuid::from_bytes(self.durable_pane_id)
                 .simple()
@@ -540,6 +732,8 @@ impl LiveScrollbackSpillSink {
                 .map_err(|_| anyhow::anyhow!("scrollback row count exceeds u64"))?,
             next_seq: store.next_seq(self.pane_id)?,
             content_log: "0.log".to_string(),
+            content_epoch: Some(hex::encode(content_epoch)),
+            revision: Some(revision),
             manifest_sha256: String::new(),
         };
         drop(store);
@@ -583,6 +777,7 @@ impl LiveScrollbackSpillSink {
                 )
             });
         }
+        published = true;
         #[cfg(not(windows))]
         {
             let directory = std::fs::File::open(parent).with_context(|| {
@@ -596,21 +791,49 @@ impl LiveScrollbackSpillSink {
             })?;
         }
         Ok(())
+        })();
+
+        result.map_err(|source| {
+            if published {
+                LiveScrollbackManifestPublishError::after_publication(source)
+            } else {
+                LiveScrollbackManifestPublishError::before_publication(source)
+            }
+        })
     }
 
     #[cfg(test)]
     fn physical_scrollback_bytes(&self) -> u64 {
         self.lock_store("physical_scrollback_bytes")
-            .file_bytes(self.pane_id)
+            .map(|store| store.file_bytes(self.pane_id))
+            .unwrap_or(0)
     }
 
-    fn lock_state(&self, context: &str) -> MutexGuard<'_, LiveScrollbackSpillState> {
+    fn lock_mutation_gate(
+        &self,
+        context: &str,
+    ) -> Result<MutexGuard<'_, ()>, wezterm_term::config::ScrollbackSpillError> {
+        match self.mutation_gate.lock() {
+            Ok(gate) => Ok(gate),
+            Err(_) => {
+                log::error!("live scrollback mutation gate poisoned during {context}");
+                Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
+            }
+        }
+    }
+
+    fn lock_state(
+        &self,
+        context: &str,
+    ) -> Result<
+        MutexGuard<'_, LiveScrollbackSpillState>,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
         match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
+            Ok(state) => Ok(state),
+            Err(_) => {
                 log::error!("live scrollback spill state mutex poisoned during {context}");
-                self.state.clear_poison();
-                poisoned.into_inner()
+                Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
             }
         }
     }
@@ -618,13 +841,15 @@ impl LiveScrollbackSpillSink {
     fn lock_store(
         &self,
         context: &str,
-    ) -> MutexGuard<'_, frankenterm_core::storage::mmap_store::MmapScrollbackStore> {
+    ) -> Result<
+        MutexGuard<'_, frankenterm_core::storage::mmap_store::MmapScrollbackStore>,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
         match self.store.lock() {
-            Ok(store) => store,
-            Err(poisoned) => {
+            Ok(store) => Ok(store),
+            Err(_) => {
                 log::error!("live scrollback spill store mutex poisoned during {context}");
-                self.store.clear_poison();
-                poisoned.into_inner()
+                Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
             }
         }
     }
@@ -691,7 +916,11 @@ fn encode_scrollback_line_record(
     ))
 }
 
-fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
+fn decode_scrollback_line_record_with_limit(
+    record: &str,
+    max_decoded_bytes: u64,
+) -> Option<(wezterm_term::Line, usize)> {
+    let max_decoded_bytes = max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES);
     let (compressed, expected_sha256, encoded) = if let Some(record) =
         record.strip_prefix(LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED)
     {
@@ -709,9 +938,32 @@ fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
         (true, None, encoded)
     };
 
+    let hard_max_encoded_bytes = LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES
+        .checked_add(2)?
+        .checked_div(3)?
+        .checked_mul(4)?;
+    if u64::try_from(encoded.len()).ok()? > hard_max_encoded_bytes {
+        return None;
+    }
+
+    // Uncompressed base64 expands by at most four bytes for each three input
+    // bytes. Reject an impossible-to-fit record before the decoder allocates.
+    if !compressed {
+        let max_encoded_bytes = max_decoded_bytes
+            .checked_add(2)?
+            .checked_div(3)?
+            .checked_mul(4)?;
+        if u64::try_from(encoded.len()).ok()? > max_encoded_bytes {
+            return None;
+        }
+    }
+
     let payload = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(encoded)
         .ok()?;
+    if !compressed && u64::try_from(payload.len()).ok()? > max_decoded_bytes {
+        return None;
+    }
     if u64::try_from(payload.len()).ok()? > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES {
         return None;
     }
@@ -732,10 +984,10 @@ fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
         let decoder = zstd::Decoder::new(payload.as_slice()).ok()?;
         let mut decompressed = Vec::new();
         decoder
-            .take(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES + 1)
+            .take(max_decoded_bytes.checked_add(1)?)
             .read_to_end(&mut decompressed)
             .ok()?;
-        if decompressed.len() as u64 > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES {
+        if u64::try_from(decompressed.len()).ok()? > max_decoded_bytes {
             return None;
         }
         decompressed
@@ -749,8 +1001,18 @@ fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
     // The 16 MB input cap above bounds bytes; this bounds the decoded structure
     // independently of serde-version `size_hint::cautious` behavior. Wire-format
     // compatible with the `varbincode::serialize` on the encode side.
+    let decoded_bytes = decoded_payload.len();
     let mut reader = decoded_payload.as_slice();
-    codec::bounded_varbincode_deserialize(&mut reader).ok()
+    let line = codec::bounded_varbincode_deserialize(&mut reader).ok()?;
+    if !reader.is_empty() {
+        return None;
+    }
+    Some((line, decoded_bytes))
+}
+
+fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
+    decode_scrollback_line_record_with_limit(record, LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES)
+        .map(|(line, _decoded_bytes)| line)
 }
 
 fn scrollback_line_records_are_equivalent(left: &str, right: &str) -> bool {
@@ -784,27 +1046,68 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return false;
         };
 
-        let (manifest_prepare_required, desired_seq) = {
-            let mut state = self.lock_state("store_scrollback_line initial row");
+        let Ok(_mutation_gate) = self.lock_mutation_gate("store_scrollback_line") else {
+            return false;
+        };
+        let clear_pending = match self.lock_state("store_scrollback_line pending clear") {
+            Ok(state) if state.transaction_quarantined => return false,
+            Ok(state) => state.clear_pending_physical_reclamation,
+            Err(_) => return false,
+        };
+        if clear_pending {
+            let Ok(mut store) = self.lock_store("store_scrollback_line reclaim committed clear")
+            else {
+                return false;
+            };
+            if store.clear_pane(self.pane_id).is_err() {
+                return false;
+            }
+            drop(store);
+            let Ok(mut state) = self.lock_state("store_scrollback_line complete deferred clear")
+            else {
+                return false;
+            };
+            state.clear_pending_physical_reclamation = false;
+        }
+
+        let (previous_state, manifest_prepare_required, desired_seq) = {
+            let Ok(mut state) = self.lock_state("store_scrollback_line initial row") else {
+                return false;
+            };
             let manifest_prepare_required = state.initial_stable_row.is_none();
-            let initial = *state.initial_stable_row.get_or_insert(stable_row);
+            let initial = state.initial_stable_row.unwrap_or(stable_row);
             if stable_row < initial {
                 return false;
             }
             let Ok(desired_seq) = u64::try_from(stable_row - initial) else {
                 return false;
             };
+            let previous_state = *state;
+            if state.advance_revision().is_err() {
+                return false;
+            }
+            state.initial_stable_row = Some(initial);
             state.max_retained_rows = max_retained_rows;
-            (manifest_prepare_required, desired_seq)
+            (previous_state, manifest_prepare_required, desired_seq)
         };
-        if manifest_prepare_required && self.persist_manifest("prepared").is_err() {
-            *self.lock_state("store_scrollback_line prepare rollback") =
-                LiveScrollbackSpillState::default();
-            return false;
+        if manifest_prepare_required {
+            if let Err(error) = self.persist_manifest("prepared") {
+                let Ok(mut state) = self.lock_state("store_scrollback_line prepare failure") else {
+                    return false;
+                };
+                if error.outcome_indeterminate() {
+                    state.transaction_quarantined = true;
+                } else {
+                    *state = previous_state;
+                }
+                return false;
+            }
         }
 
         {
-            let mut store = self.lock_store("store_scrollback_line append");
+            let Ok(mut store) = self.lock_store("store_scrollback_line append") else {
+                return false;
+            };
             let Ok(next_seq) = store.next_seq(self.pane_id) else {
                 return false;
             };
@@ -858,25 +1161,46 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             }
         }
 
-        self.lock_state("store_scrollback_line retention")
-            .max_retained_rows = max_retained_rows;
+        let Ok(mut state) = self.lock_state("store_scrollback_line retention") else {
+            return false;
+        };
+        state.max_retained_rows = max_retained_rows;
+        drop(state);
 
-        self.persist_manifest("complete").is_ok()
+        match self.persist_manifest("complete") {
+            Ok(()) => true,
+            Err(error) => {
+                if error.outcome_indeterminate() {
+                    if let Ok(mut state) =
+                        self.lock_state("store_scrollback_line quarantine publication")
+                    {
+                        state.transaction_quarantined = true;
+                    }
+                }
+                false
+            }
+        }
     }
 
     fn load_scrollback_line(
         &self,
         stable_row: wezterm_term::StableRowIndex,
     ) -> Option<wezterm_term::Line> {
-        let initial = self
-            .lock_state("load_scrollback_line initial row")
-            .initial_stable_row?;
+        let _mutation_gate = self.lock_mutation_gate("load_scrollback_line").ok()?;
+        let state = self.lock_state("load_scrollback_line logical state").ok()?;
+        if state.clear_pending_physical_reclamation || state.transaction_quarantined {
+            return None;
+        }
+        let initial = state.initial_stable_row;
+        drop(state);
+        let initial = initial?;
         if stable_row < initial {
             return None;
         }
         let seq = u64::try_from(stable_row - initial).ok()?;
         let record = self
             .lock_store("load_scrollback_line read")
+            .ok()?
             .line_at(self.pane_id, seq)
             .ok()
             .flatten()?;
@@ -896,10 +1220,15 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
     }
 
     fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
-        let initial = self
-            .lock_state("oldest_scrollback_row initial row")
-            .initial_stable_row?;
+        let _mutation_gate = self.lock_mutation_gate("oldest_scrollback_row").ok()?;
+        let state = self.lock_state("oldest_scrollback_row initial row").ok()?;
+        if state.clear_pending_physical_reclamation || state.transaction_quarantined {
+            return None;
+        }
+        let initial = state.initial_stable_row?;
+        drop(state);
         self.lock_store("oldest_scrollback_row oldest seq")
+            .ok()?
             .oldest_seq(self.pane_id)
             .and_then(|seq| {
                 wezterm_term::StableRowIndex::try_from(seq)
@@ -909,38 +1238,258 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
     }
 
     fn retained_scrollback_rows(&self) -> usize {
+        let Ok(_mutation_gate) = self.lock_mutation_gate("retained_scrollback_rows") else {
+            return 0;
+        };
+        let Ok(state) = self.lock_state("retained_scrollback_rows logical state") else {
+            return 0;
+        };
+        if state.clear_pending_physical_reclamation || state.transaction_quarantined {
+            return 0;
+        }
+        drop(state);
         self.lock_store("retained_scrollback_rows")
-            .line_count(self.pane_id)
+            .map(|store| store.line_count(self.pane_id))
+            .unwrap_or(0)
     }
 
     fn retained_scrollback_bytes(&self) -> usize {
+        let Ok(_mutation_gate) = self.lock_mutation_gate("retained_scrollback_bytes") else {
+            return 0;
+        };
+        let Ok(state) = self.lock_state("retained_scrollback_bytes logical state") else {
+            return 0;
+        };
+        if state.clear_pending_physical_reclamation || state.transaction_quarantined {
+            return 0;
+        }
+        drop(state);
         self.lock_store("retained_scrollback_bytes")
-            .retained_bytes(self.pane_id)
+            .map(|store| store.retained_bytes(self.pane_id))
+            .unwrap_or(0)
             .try_into()
             .unwrap_or(usize::MAX)
     }
 
-    fn clear_scrollback(&self) {
+    fn snapshot_scrollback(
+        &self,
+        expected_newest_exclusive: wezterm_term::StableRowIndex,
+        limits: wezterm_term::config::ScrollbackSnapshotLimits,
+    ) -> Result<
+        wezterm_term::config::ScrollbackSnapshot,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
+        use wezterm_term::config::{
+            ScrollbackSnapshot, ScrollbackSnapshotFidelity, ScrollbackSpillError,
+        };
+
+        let _mutation_gate = self.lock_mutation_gate("snapshot_scrollback")?;
+        let state = *self.lock_state("snapshot_scrollback state")?;
+
+        if state.transaction_quarantined {
+            return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+        }
+        if state.clear_pending_physical_reclamation {
+            return ScrollbackSnapshot::from_contiguous_rows(
+                state.snapshot_generation(),
+                ScrollbackSnapshotFidelity::LegacyRedacted,
+                None,
+                expected_newest_exclusive,
+                0,
+                0,
+                Vec::new(),
+            );
+        }
+        let store = self.lock_store("snapshot_scrollback store")?;
+
+        let retained_rows = store.line_count(self.pane_id);
+        let retained_rows_u64 = u64::try_from(retained_rows)
+            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+        if retained_rows > limits.max_rows {
+            return Err(ScrollbackSpillError::ResourceLimit {
+                resource: "rows",
+                observed: retained_rows_u64,
+                maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
+            });
+        }
+        let stored_bytes = store.retained_bytes(self.pane_id);
+        if stored_bytes > limits.max_stored_bytes {
+            return Err(ScrollbackSpillError::ResourceLimit {
+                resource: "stored_bytes",
+                observed: stored_bytes,
+                maximum: limits.max_stored_bytes,
+            });
+        }
+        let physical_bytes = store.file_bytes(self.pane_id);
+        if physical_bytes > limits.max_physical_bytes {
+            return Err(ScrollbackSpillError::ResourceLimit {
+                resource: "physical_bytes",
+                observed: physical_bytes,
+                maximum: limits.max_physical_bytes,
+            });
+        }
+
+        let next_seq = store
+            .next_seq(self.pane_id)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let Some(initial_stable_row) = state.initial_stable_row else {
+            if retained_rows != 0 || store.oldest_seq(self.pane_id).is_some() || next_seq != 0 {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            return ScrollbackSnapshot::from_contiguous_rows(
+                state.snapshot_generation(),
+                ScrollbackSnapshotFidelity::LegacyRedacted,
+                None,
+                expected_newest_exclusive,
+                stored_bytes,
+                0,
+                Vec::new(),
+            );
+        };
+        let next_stable_offset = wezterm_term::StableRowIndex::try_from(next_seq)
+            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+        let observed_newest_exclusive = initial_stable_row
+            .checked_add(next_stable_offset)
+            .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+        if observed_newest_exclusive != expected_newest_exclusive {
+            return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+        }
+
+        let oldest_seq = store.oldest_seq(self.pane_id);
+        if (retained_rows == 0) != oldest_seq.is_none() {
+            return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+        }
+        let oldest_stable_row = match oldest_seq {
+            Some(oldest_seq) => {
+                let oldest_offset = wezterm_term::StableRowIndex::try_from(oldest_seq)
+                    .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                Some(
+                    initial_stable_row
+                        .checked_add(oldest_offset)
+                        .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?,
+                )
+            }
+            None => None,
+        };
+
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(retained_rows)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let mut decoded_bytes = 0usize;
+        if let Some(oldest_seq) = oldest_seq {
+            for offset in 0..retained_rows_u64 {
+                let seq = oldest_seq
+                    .checked_add(offset)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("sequence"))?;
+                let record = store
+                    .line_at(self.pane_id, seq)
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                    .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
+                let remaining_decoded_bytes = limits
+                    .max_decoded_bytes
+                    .checked_sub(decoded_bytes)
+                    .ok_or(ScrollbackSpillError::ResourceLimit {
+                        resource: "decoded_bytes",
+                        observed: u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
+                        maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
+                    })?;
+                let (line, line_decoded_bytes) = if record
+                    .starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_UNCOMPRESSED)
+                    || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD)
+                    || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED)
+                    || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_ZSTD)
+                {
+                    decode_scrollback_line_record_with_limit(
+                        &record,
+                        u64::try_from(remaining_decoded_bytes).unwrap_or(u64::MAX),
+                    )
+                    .ok_or(ScrollbackSpillError::StorageUnavailable)?
+                } else {
+                    if record.len() > remaining_decoded_bytes {
+                        return Err(ScrollbackSpillError::ResourceLimit {
+                            resource: "decoded_bytes",
+                            observed: u64::try_from(decoded_bytes.saturating_add(record.len()))
+                                .unwrap_or(u64::MAX),
+                            maximum: u64::try_from(limits.max_decoded_bytes)
+                                .unwrap_or(u64::MAX),
+                        });
+                    }
+                    (legacy_text_scrollback_line(&record), record.len())
+                };
+                decoded_bytes = decoded_bytes.checked_add(line_decoded_bytes).ok_or(
+                    ScrollbackSpillError::ArithmeticOverflow("decoded_bytes"),
+                )?;
+                rows.push(line);
+            }
+        }
+
+        ScrollbackSnapshot::from_contiguous_rows(
+            state.snapshot_generation(),
+            ScrollbackSnapshotFidelity::LegacyRedacted,
+            oldest_stable_row,
+            expected_newest_exclusive,
+            stored_bytes,
+            decoded_bytes,
+            rows,
+        )
+    }
+
+    fn clear_scrollback(
+        &self,
+    ) -> Result<
+        wezterm_term::config::ScrollbackClearCommit,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
+        use wezterm_term::config::{ScrollbackClearCommit, ScrollbackSpillError};
+
+        let _mutation_gate = self.lock_mutation_gate("clear_scrollback")?;
         let previous = {
-            let mut state = self.lock_state("clear_scrollback state reset");
+            let mut state = self.lock_state("clear_scrollback state reset")?;
+            if state.transaction_quarantined {
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
             let previous = *state;
-            *state = LiveScrollbackSpillState::default();
+            *state = LiveScrollbackSpillState {
+                initial_stable_row: None,
+                max_retained_rows: 0,
+                content_epoch: *uuid::Uuid::new_v4().as_bytes(),
+                revision: 0,
+                clear_pending_physical_reclamation: true,
+                transaction_quarantined: false,
+            };
             previous
         };
         // Publish the clear intent before truncating the content log. If the
         // process dies between these operations, constructor recovery observes
         // `cleared` and completes the idempotent clear before accepting data.
         if let Err(error) = self.persist_manifest("cleared") {
-            *self.lock_state("clear_scrollback manifest rollback") = previous;
-            log::error!("failed to persist scrollback clear intent: {error:#}");
-            return;
+            if error.outcome_indeterminate() {
+                self.lock_state("clear_scrollback quarantine publication")?
+                    .transaction_quarantined = true;
+                log::error!("scrollback clear publication outcome is indeterminate");
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            *self.lock_state("clear_scrollback manifest rollback")? = previous;
+            log::error!("failed to publish scrollback clear intent");
+            return Err(ScrollbackSpillError::StorageUnavailable);
         }
-        if let Err(error) = self
-            .lock_store("clear_scrollback store reset")
-            .clear_pane(self.pane_id)
-        {
-            log::error!("failed to complete persisted scrollback clear intent: {error}");
+        let physical_reclaimed = match self.lock_store("clear_scrollback store reset") {
+            Ok(mut store) => store.clear_pane(self.pane_id).is_ok(),
+            Err(_) => false,
+        };
+        if physical_reclaimed {
+            self.lock_state("clear_scrollback physical completion")?
+                .clear_pending_physical_reclamation = false;
+        } else {
+            // The `cleared` manifest is already durable, so the logical clear
+            // is committed. Keep the old bytes unreachable and retry their
+            // physical reclamation before accepting a later row.
+            log::error!("deferred physical reclamation after committed scrollback clear");
         }
+        let generation = self
+            .lock_state("clear_scrollback commit generation")?
+            .snapshot_generation();
+        Ok(ScrollbackClearCommit::new(generation))
     }
 }
 
@@ -949,11 +1498,12 @@ fn validate_live_scrollback_manifest_identity(
     durable_pane_id: &str,
     manifest_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        manifest.schema == "frankenterm.live-scrollback-manifest.v1",
-        "unsupported live scrollback manifest schema at {}",
-        manifest_path.display()
-    );
+    live_scrollback_manifest_generation(manifest).with_context(|| {
+        format!(
+            "validate live scrollback manifest generation at {}",
+            manifest_path.display()
+        )
+    })?;
     anyhow::ensure!(
         manifest.durable_pane_id == durable_pane_id,
         "live scrollback manifest identity mismatch at {}",
@@ -1674,6 +2224,7 @@ mod tests {
                 .expect("encode durable unpublished row");
             assert_eq!(
                 sink.lock_store("test interrupted complete publication")
+                    .expect("test store lock")
                     .append_line(sink.pane_id, &record)
                     .expect("durably append unpublished row"),
                 1
@@ -1722,7 +2273,9 @@ mod tests {
                 let stable_row = isize::try_from(stable_row).expect("stable row fits isize");
                 assert!(sink.store_scrollback_line(stable_row, &line, 8));
             }
-            let mut store = sink.lock_store("test empty forward retention state");
+            let mut store = sink
+                .lock_store("test empty forward retention state")
+                .expect("test store lock");
             store.prune_before(sink.pane_id, 4).expect("persist full logical prune");
             assert!(
                 store
@@ -2017,8 +2570,11 @@ mod tests {
         };
         let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
             .expect("create live spill sink");
-        sink.lock_state("test corrupt record").initial_stable_row = Some(0);
+        sink.lock_state("test corrupt record")
+            .expect("test state lock")
+            .initial_stable_row = Some(0);
         sink.lock_store("test corrupt record")
+            .expect("test store lock")
             .append_line(sink.pane_id, "ftsl1u:not-valid-base64")
             .expect("append corrupt fixture");
         assert!(sink.load_scrollback_line(0).is_none());
@@ -2166,7 +2722,8 @@ mod tests {
         assert!(sink.store_scrollback_line(4, &before, 8));
         assert!(sink.load_scrollback_line(4).is_some());
 
-        sink.clear_scrollback();
+        sink.clear_scrollback()
+            .expect("logical scrollback clear should commit");
 
         assert_eq!(sink.retained_scrollback_rows(), 0);
         assert_eq!(sink.oldest_scrollback_row(), None);
@@ -2186,7 +2743,67 @@ mod tests {
     }
 
     #[test]
-    fn live_scrollback_spill_sink_recovers_poisoned_locks() {
+    fn live_scrollback_snapshot_is_contiguous_bounded_and_explicitly_legacy() {
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 13,
+            domain_id: 3,
+            durable_pane_id: [13; 16],
+            command_description: "snapshot-shell".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create live spill sink");
+        let attrs = CellAttributes::blank();
+        assert!(sink.store_scrollback_line(
+            4,
+            &Line::from_text("snapshot-row-four", &attrs, 1, None),
+            8,
+        ));
+        assert!(sink.store_scrollback_line(
+            5,
+            &Line::from_text("snapshot-row-five", &attrs, 2, None),
+            8,
+        ));
+
+        let limits = wezterm_term::config::ScrollbackSnapshotLimits {
+            max_rows: 8,
+            max_stored_bytes: 1024 * 1024,
+            max_decoded_bytes: 1024 * 1024,
+            max_physical_bytes: 1024 * 1024,
+        };
+        let snapshot = sink
+            .snapshot_scrollback(6, limits)
+            .expect("capture coherent legacy snapshot");
+        assert_eq!(
+            snapshot.fidelity(),
+            wezterm_term::config::ScrollbackSnapshotFidelity::LegacyRedacted
+        );
+        assert_eq!(snapshot.oldest_stable_row(), Some(4));
+        assert_eq!(snapshot.newest_stable_row_exclusive(), 6);
+        assert_eq!(snapshot.rows().len(), 2);
+        assert!(!format!("{snapshot:?}").contains("snapshot-row"));
+
+        let generation_before_clear = snapshot.generation();
+        let clear_commit = sink
+            .clear_scrollback()
+            .expect("logical scrollback clear should commit");
+        assert_ne!(clear_commit.generation(), generation_before_clear);
+        let empty = sink
+            .snapshot_scrollback(6, limits)
+            .expect("snapshot committed empty generation");
+        assert!(empty.rows().is_empty());
+        assert_eq!(empty.oldest_stable_row(), None);
+
+        let manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read v2 manifest")
+            .expect("v2 manifest exists");
+        assert_eq!(manifest.schema, "frankenterm.live-scrollback-manifest.v2");
+        assert!(manifest.content_epoch.is_some());
+        assert_eq!(manifest.revision, Some(0));
+    }
+
+    #[test]
+    fn live_scrollback_spill_sink_fails_closed_on_poisoned_locks() {
         let dir = tempfile::tempdir().expect("temp scrollback dir");
         let context = config::ScrollbackSpillSinkContext {
             pane_id: 11,
@@ -2198,7 +2815,6 @@ mod tests {
             .expect("create live spill sink");
         let attrs = CellAttributes::blank();
         let first = Line::from_text("before-poison", &attrs, 1, None);
-        let second = Line::from_text("after-poison", &attrs, 2, None);
 
         let state_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _state = sink.state.lock().expect("state lock for poison test");
@@ -2206,31 +2822,32 @@ mod tests {
         }));
         assert!(state_poisoned.is_err());
         assert!(sink.state.is_poisoned());
-        assert!(sink.store_scrollback_line(0, &first, 8));
-        assert!(!sink.state.is_poisoned());
-        assert!(sink.load_scrollback_line(0).is_some());
+        assert!(!sink.store_scrollback_line(0, &first, 8));
+        assert!(sink.state.is_poisoned());
+        assert!(sink.load_scrollback_line(0).is_none());
+        assert_eq!(sink.retained_scrollback_rows(), 0);
+        assert!(sink.clear_scrollback().is_err());
+
+        let store_context = config::ScrollbackSpillSinkContext {
+            pane_id: 12,
+            domain_id: 3,
+            durable_pane_id: [12; 16],
+            command_description: "poisoned-store-shell".to_string(),
+        };
+        let store_sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &store_context)
+            .expect("create store-poison live spill sink");
+        assert!(store_sink.store_scrollback_line(0, &first, 8));
 
         let store_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _store = sink.store.lock().expect("store lock for poison test");
+            let _store = store_sink.store.lock().expect("store lock for poison test");
             panic!("poison store lock for regression coverage");
         }));
         assert!(store_poisoned.is_err());
-        assert!(sink.store.is_poisoned());
-        assert_eq!(sink.retained_scrollback_rows(), 1);
-        assert!(!sink.store.is_poisoned());
-        assert!(sink.store_scrollback_line(1, &second, 8));
-        assert_eq!(sink.retained_scrollback_rows(), 2);
-        assert_eq!(
-            sink.load_scrollback_line(1)
-                .expect("row stored after poison should hydrate")
-                .as_str()
-                .as_ref(),
-            "after-poison"
-        );
-
-        sink.clear_scrollback();
-        assert_eq!(sink.retained_scrollback_rows(), 0);
-        assert_eq!(sink.oldest_scrollback_row(), None);
+        assert!(store_sink.store.is_poisoned());
+        assert_eq!(store_sink.retained_scrollback_rows(), 0);
+        assert!(store_sink.store.is_poisoned());
+        assert!(store_sink.load_scrollback_line(0).is_none());
+        assert!(store_sink.clear_scrollback().is_err());
     }
 
     #[test]

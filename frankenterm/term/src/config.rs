@@ -477,6 +477,239 @@ pub struct ScrollbackTierConfig {
     pub warm_max_bytes: usize,
 }
 
+/// Identity of one immutable cold-scrollback snapshot generation.
+///
+/// The epoch changes after a committed logical clear. The revision changes
+/// whenever rows in that epoch may have changed. The epoch bytes are kept
+/// private and omitted from `Debug` so diagnostics cannot accidentally turn a
+/// durable storage identity into an operator-visible capability.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbackSnapshotGeneration {
+    content_epoch: [u8; 16],
+    revision: u64,
+}
+
+impl ScrollbackSnapshotGeneration {
+    pub fn new(content_epoch: [u8; 16], revision: u64) -> Self {
+        Self {
+            content_epoch,
+            revision,
+        }
+    }
+
+}
+
+impl std::fmt::Debug for ScrollbackSnapshotGeneration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScrollbackSnapshotGeneration")
+            .field("content_epoch", &"[REDACTED]")
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+/// Hard limits enforced by a cold sink while it holds its snapshot boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollbackSnapshotLimits {
+    pub max_rows: usize,
+    pub max_stored_bytes: u64,
+    pub max_decoded_bytes: usize,
+    pub max_physical_bytes: u64,
+}
+
+/// Whether the cold rows can participate in a semantic terminal checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbackSnapshotFidelity {
+    /// Full `Line` semantics, including authoritative cell widths and
+    /// attributes, are retained without content mutation.
+    ExactSemantic,
+    /// The current operator-transcript store redacts content and uses a legacy
+    /// row codec. It is coherent for transcript reads but is not a lossless
+    /// terminal-recovery source.
+    LegacyRedacted,
+}
+
+/// Content-free failure reported by a cold-scrollback durability operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbackSpillError {
+    ResourceLimit {
+        resource: &'static str,
+        observed: u64,
+        maximum: u64,
+    },
+    ArithmeticOverflow(&'static str),
+    SnapshotRangeMismatch,
+    SnapshotRowMissing,
+    StorageUnavailable,
+    RevisionExhausted,
+    /// A manifest rename may have published, but its parent-directory sync
+    /// failed. The sink is quarantined until reopen verifies disk state.
+    CommitOutcomeIndeterminate,
+}
+
+impl std::fmt::Display for ScrollbackSpillError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResourceLimit {
+                resource,
+                observed,
+                maximum,
+            } => write!(
+                formatter,
+                "cold scrollback {resource} exceeds limit ({observed} > {maximum})"
+            ),
+            Self::ArithmeticOverflow(resource) => {
+                write!(formatter, "cold scrollback {resource} arithmetic overflow")
+            }
+            Self::SnapshotRangeMismatch => {
+                formatter.write_str("cold scrollback snapshot range mismatch")
+            }
+            Self::SnapshotRowMissing => {
+                formatter.write_str("cold scrollback snapshot row missing")
+            }
+            Self::StorageUnavailable => {
+                formatter.write_str("cold scrollback storage unavailable")
+            }
+            Self::RevisionExhausted => {
+                formatter.write_str("cold scrollback snapshot revision exhausted")
+            }
+            Self::CommitOutcomeIndeterminate => {
+                formatter.write_str("cold scrollback commit outcome indeterminate")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScrollbackSpillError {}
+
+/// Immutable, contiguous rows captured under one sink-owned mutation boundary.
+///
+/// `Debug` deliberately reports only structural metadata; it never prints row
+/// content. Construction validates the exact half-open range represented by
+/// the row vector.
+pub struct ScrollbackSnapshot {
+    generation: ScrollbackSnapshotGeneration,
+    fidelity: ScrollbackSnapshotFidelity,
+    oldest_stable_row: Option<StableRowIndex>,
+    newest_stable_row_exclusive: StableRowIndex,
+    stored_bytes: u64,
+    decoded_bytes: usize,
+    rows: Vec<Line>,
+}
+
+impl ScrollbackSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_contiguous_rows(
+        generation: ScrollbackSnapshotGeneration,
+        fidelity: ScrollbackSnapshotFidelity,
+        oldest_stable_row: Option<StableRowIndex>,
+        newest_stable_row_exclusive: StableRowIndex,
+        stored_bytes: u64,
+        decoded_bytes: usize,
+        rows: Vec<Line>,
+    ) -> Result<Self, ScrollbackSpillError> {
+        match (oldest_stable_row, rows.is_empty()) {
+            (None, true) => {}
+            (Some(oldest), false) => {
+                let row_count = StableRowIndex::try_from(rows.len())
+                    .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+                let observed_newest = oldest
+                    .checked_add(row_count)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                if observed_newest != newest_stable_row_exclusive {
+                    return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+                }
+            }
+            _ => return Err(ScrollbackSpillError::SnapshotRangeMismatch),
+        }
+        Ok(Self {
+            generation,
+            fidelity,
+            oldest_stable_row,
+            newest_stable_row_exclusive,
+            stored_bytes,
+            decoded_bytes,
+            rows,
+        })
+    }
+
+    pub fn generation(&self) -> ScrollbackSnapshotGeneration {
+        self.generation
+    }
+
+    pub fn fidelity(&self) -> ScrollbackSnapshotFidelity {
+        self.fidelity
+    }
+
+    pub fn oldest_stable_row(&self) -> Option<StableRowIndex> {
+        self.oldest_stable_row
+    }
+
+    pub fn newest_stable_row_exclusive(&self) -> StableRowIndex {
+        self.newest_stable_row_exclusive
+    }
+
+    pub fn stored_bytes(&self) -> u64 {
+        self.stored_bytes
+    }
+
+    pub fn decoded_bytes(&self) -> usize {
+        self.decoded_bytes
+    }
+
+    pub fn rows(&self) -> &[Line] {
+        &self.rows
+    }
+
+    pub fn into_rows(self) -> Vec<Line> {
+        self.rows
+    }
+}
+
+impl std::fmt::Debug for ScrollbackSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScrollbackSnapshot")
+            .field("generation", &self.generation)
+            .field("fidelity", &self.fidelity)
+            .field("oldest_stable_row", &self.oldest_stable_row)
+            .field(
+                "newest_stable_row_exclusive",
+                &self.newest_stable_row_exclusive,
+            )
+            .field("stored_bytes", &self.stored_bytes)
+            .field("decoded_bytes", &self.decoded_bytes)
+            .field("row_count", &self.rows.len())
+            .finish()
+    }
+}
+
+/// Receipt proving that a logical clear reached its durable commit point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbackClearCommit {
+    generation: ScrollbackSnapshotGeneration,
+}
+
+impl ScrollbackClearCommit {
+    pub fn new(generation: ScrollbackSnapshotGeneration) -> Self {
+        Self { generation }
+    }
+
+    pub fn generation(&self) -> ScrollbackSnapshotGeneration {
+        self.generation
+    }
+}
+
+impl std::fmt::Debug for ScrollbackClearCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScrollbackClearCommit")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
 impl Default for ScrollbackTierConfig {
     fn default() -> Self {
         Self {
@@ -520,8 +753,28 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     /// Approximate bytes retained outside the hot in-memory screen buffer.
     fn retained_scrollback_bytes(&self) -> usize;
 
-    /// Clear retained cold rows for terminal erasure/reset paths.
-    fn clear_scrollback(&self) {}
+    /// Capture one exact, contiguous logical generation ending immediately
+    /// before the current in-memory hot tier.
+    ///
+    /// Implementations must hold their mutation boundary from metadata capture
+    /// through the final row decode and enforce every supplied limit before
+    /// returning. A successful result must represent exactly
+    /// `[oldest_stable_row, expected_newest_exclusive)`.
+    fn snapshot_scrollback(
+        &self,
+        expected_newest_exclusive: StableRowIndex,
+        limits: ScrollbackSnapshotLimits,
+    ) -> Result<ScrollbackSnapshot, ScrollbackSpillError>;
+
+    /// Commit a logical clear before returning success.
+    ///
+    /// Physical reclamation may be retried after this method returns, but
+    /// Callers must retain their in-memory rows on every `Err`. Ordinary errors
+    /// mean no logical clear was committed. The explicit
+    /// [`ScrollbackSpillError::CommitOutcomeIndeterminate`] variant means the
+    /// sink has quarantined itself until reopen verifies whether publication
+    /// reached durable storage.
+    fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError>;
 }
 
 /// TerminalConfiguration allows for the embedding application to pass configuration
