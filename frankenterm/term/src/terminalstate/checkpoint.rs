@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// Current semantic terminal checkpoint schema.
 pub const TERMINAL_CHECKPOINT_VERSION: u32 = 2;
@@ -68,7 +69,7 @@ fn u64_from_usize(value: usize, field: &'static str) -> Result<u64, TerminalChec
 }
 
 struct BoundedCheckpointWriter {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
     maximum: usize,
     failure: Option<BoundedWriterFailure>,
 }
@@ -82,14 +83,14 @@ enum BoundedWriterFailure {
 impl BoundedCheckpointWriter {
     fn new(maximum: usize) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Zeroizing::new(Vec::new()),
             maximum,
             failure: None,
         }
     }
 
-    fn into_inner(self) -> Vec<u8> {
-        self.bytes
+    fn into_inner(mut self) -> Zeroizing<Vec<u8>> {
+        std::mem::take(&mut self.bytes)
     }
 }
 
@@ -3829,7 +3830,7 @@ impl TerminalCheckpointV2 {
     pub fn to_canonical_json(
         &self,
         limits: TerminalCheckpointLimits,
-    ) -> Result<Vec<u8>, TerminalCheckpointError> {
+    ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
         self.validate(limits)?;
         let mut writer = BoundedCheckpointWriter::new(limits.max_encoded_bytes);
         if serde_json::to_writer(&mut writer, self).is_err() {

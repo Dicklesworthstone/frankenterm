@@ -756,11 +756,9 @@ impl Terminal {
                 limits,
             )
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
-        let canonical_payload = Zeroizing::new(
-            checkpoint
-                .to_canonical_json(limits)
-                .map_err(RecoveryTerminalCheckpointError::Checkpoint)?,
-        );
+        let canonical_payload = checkpoint
+            .to_canonical_json(limits)
+            .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
         let size = self.state.get_size();
         Ok(RecoveryTerminalCheckpointV2 {
             canonical_payload,
