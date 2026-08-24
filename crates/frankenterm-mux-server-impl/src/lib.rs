@@ -913,6 +913,23 @@ fn decode_live_scrollback_canonical_digest(
     Ok(digest)
 }
 
+fn decode_live_scrollback_epoch(
+    encoded: &str,
+    field: &'static str,
+) -> anyhow::Result<[u8; 16]> {
+    anyhow::ensure!(
+        encoded.len() == 32
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "{field} is not canonical lowercase hex"
+    );
+    let mut epoch = [0; 16];
+    hex::decode_to_slice(encoded, &mut epoch).with_context(|| format!("decode {field}"))?;
+    anyhow::ensure!(epoch != [0; 16], "{field} is the reserved zero epoch");
+    Ok(epoch)
+}
+
 fn live_scrollback_append_wal_target_digest<F>(
     wal: &LiveScrollbackAppendWalV1,
     mut record_at: F,
