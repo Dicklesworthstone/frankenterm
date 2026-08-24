@@ -886,14 +886,14 @@ impl std::fmt::Debug for GuardianCheckpointOrderedChunkSetBuilderV1 {
 
 /// Opaque proof that Phase-A storage inspected one exact authenticated
 /// candidate plus its complete ordered chunk set and derived the two manifest
-/// component identities from those records.
+/// component logical identities from the authenticated canonical plaintexts.
 ///
 /// There is intentionally no production constructor in this module. The
 /// upcoming guardian-runtime/journal integration must mint this witness only
 /// after authenticating the exact Seal request, fencing the live incarnation,
 /// and inspecting the complete stored assembly. Until then final publication
-/// is fail-closed. In particular, raw request fields or digest arrays cannot
-/// construct this type.
+/// is fail-closed. In particular, raw request fields, ciphertext digests, or
+/// digest arrays cannot construct this type.
 #[must_use = "validated stage assembly authority must be consumed by final sealing"]
 pub struct GuardianCheckpointValidatedStageAssemblyV1 {
     seal_request: GuardianCheckpointStageRequestV1,
@@ -3384,6 +3384,7 @@ mod tests {
         fields: Vec<String>,
         impls: Vec<String>,
         inherent_methods: Vec<String>,
+        cipher_methods: Vec<String>,
         return_sites: Vec<String>,
         construction_sites: Vec<String>,
         aliases_or_storage: Vec<String>,
@@ -3440,13 +3441,10 @@ mod tests {
             }
         }
 
-        fn protected_return_names(
-            output: &syn::ReturnType,
+        fn protected_names_in_type(
+            ty: &syn::Type,
             owner: Option<&str>,
         ) -> Vec<String> {
-            let syn::ReturnType::Type(_, ty) = output else {
-                return Vec::new();
-            };
             struct ReturnTypeVisitor<'a> {
                 owner: Option<&'a str>,
                 names: BTreeSet<String>,
@@ -3472,6 +3470,48 @@ mod tests {
             };
             visitor.visit_type(ty);
             visitor.names.into_iter().collect()
+        }
+
+        fn all_names_in_type(ty: &syn::Type) -> Vec<String> {
+            #[derive(Default)]
+            struct TypeNameVisitor {
+                names: BTreeSet<String>,
+            }
+            impl<'ast> Visit<'ast> for TypeNameVisitor {
+                fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+                    if let Some(name) = path.path.segments.last() {
+                        self.names.insert(name.ident.to_string());
+                    }
+                    visit::visit_type_path(self, path);
+                }
+            }
+            let mut visitor = TypeNameVisitor::default();
+            visitor.visit_type(ty);
+            visitor.names.into_iter().collect()
+        }
+
+        fn input_type_fingerprint(signature: &syn::Signature) -> String {
+            signature
+                .inputs
+                .iter()
+                .filter_map(|argument| match argument {
+                    syn::FnArg::Receiver(_) => None,
+                    syn::FnArg::Typed(argument) => {
+                        Some(Self::all_names_in_type(&argument.ty).join("+"))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn protected_return_names(
+            output: &syn::ReturnType,
+            owner: Option<&str>,
+        ) -> Vec<String> {
+            let syn::ReturnType::Type(_, ty) = output else {
+                return Vec::new();
+            };
+            Self::protected_names_in_type(ty, owner)
         }
 
         fn record_return_sites(
@@ -3518,8 +3558,7 @@ mod tests {
             name: &str,
             ty: &syn::Type,
         ) {
-            let output = syn::ReturnType::Type(Default::default(), Box::new(ty.clone()));
-            for protected in Self::protected_return_names(&output, None) {
+            for protected in Self::protected_names_in_type(ty, None) {
                 self.aliases_or_storage
                     .push(format!("{kind}:{name}:{protected}"));
             }
@@ -3584,6 +3623,16 @@ mod tests {
 
         fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
             let owner = self.current_impl_owner.clone();
+            if owner.as_deref() == Some("GuardianCheckpointCipher")
+                && self.current_impl_is_inherent
+            {
+                self.cipher_methods.push(format!(
+                    "{}:{}:{}",
+                    function.sig.ident,
+                    Self::visibility(&function.vis),
+                    Self::input_type_fingerprint(&function.sig)
+                ));
+            }
             if let Some(owner) = owner.as_deref().filter(|name| Self::protected(name)) {
                 let cfg_test = Self::cfg_test(&function.attrs);
                 if self.current_impl_is_inherent {
@@ -3850,6 +3899,42 @@ mod tests {
             .finish()
             .expect("finish complete ordered chunk-set identity");
         (candidate_identity, ordered_chunk_set_identity)
+    }
+
+    fn ordered_chunk_set_identity_fixture(
+        canonical_payload: &[u8],
+        chunk_bytes: u32,
+    ) -> GuardianCheckpointOrderedChunkSetIdentityV1 {
+        let total_bytes = u64::try_from(canonical_payload.len())
+            .expect("fixture payload length fits u64");
+        let total_chunks = u32::try_from(
+            total_bytes
+                .checked_sub(1)
+                .expect("fixture payload is nonempty")
+                .checked_div(u64::from(chunk_bytes))
+                .expect("fixture chunk size is nonzero")
+                .checked_add(1)
+                .expect("fixture chunk count fits u64"),
+        )
+        .expect("fixture chunk count fits u32");
+        let mut builder = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+        )
+        .expect("construct fixture ordered chunk set");
+        let chunk_bytes_usize = usize::try_from(chunk_bytes).expect("chunk size fits usize");
+        for (index, chunk) in canonical_payload.chunks(chunk_bytes_usize).enumerate() {
+            let index = u32::try_from(index).expect("chunk index fits u32");
+            let offset = u64::from(index)
+                .checked_mul(u64::from(chunk_bytes))
+                .expect("chunk offset fits u64");
+            let plaintext = Zeroizing::new(chunk.to_vec());
+            builder
+                .push_authenticated_chunk(index, offset, &plaintext)
+                .expect("push exact fixture chunk");
+        }
+        builder.finish().expect("finish fixture chunk set")
     }
 
     fn stage_plaintext(plaintext: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -4816,6 +4901,316 @@ mod tests {
     }
 
     #[test]
+    fn candidate_identity_is_canonical_content_stable_and_nonce_independent() {
+        let (descriptor, _, _, capture) = record_descriptor();
+        let binding = record_stage_binding(descriptor, 7);
+        let upload_id = Uuid::new_v4();
+        let publication_id = Uuid::new_v4();
+        let begin = record_begin_request(&binding, &capture, upload_id);
+        let first_plaintext = Zeroizing::new(
+            begin
+                .encode()
+                .expect("encode exact canonical candidate plaintext"),
+        );
+        assert_eq!(
+            first_plaintext.len(),
+            usize::try_from(GUARDIAN_CHECKPOINT_BEGIN_REQUEST_BYTES)
+                .expect("Begin request length fits usize")
+        );
+        let first = GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+            &first_plaintext,
+        )
+        .expect("derive first logical candidate identity");
+        let second_plaintext = Zeroizing::new(
+            begin
+                .encode()
+                .expect("re-encode exact canonical candidate plaintext"),
+        );
+        let second = GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+            &second_plaintext,
+        )
+        .expect("derive repeat logical candidate identity");
+        assert_eq!(first, second);
+
+        let mut expected = Sha256::new();
+        expected.update(CHECKPOINT_CANDIDATE_IDENTITY_DOMAIN);
+        expected.update(first_plaintext.as_slice());
+        let expected = Zeroizing::new(<[u8; 32]>::from(expected.finalize()));
+        assert!(checkpoint_stage_digests_match(first.digest(), &expected));
+
+        let cipher = checkpoint_stage_cipher(0x44);
+        let first_record = cipher
+            .seal(
+                GuardianCheckpointStageSealIntentV1::candidate_metadata(
+                    &binding,
+                    upload_id,
+                    publication_id,
+                    first_plaintext,
+                )
+                .expect("consume first canonical candidate plaintext"),
+            )
+            .expect("seal first candidate record");
+        let second_record = cipher
+            .seal(
+                GuardianCheckpointStageSealIntentV1::candidate_metadata(
+                    &binding,
+                    upload_id,
+                    publication_id,
+                    second_plaintext,
+                )
+                .expect("consume second canonical candidate plaintext"),
+            )
+            .expect("seal second candidate record");
+        assert_ne!(first_record.fixed_header(), second_record.fixed_header());
+        assert_ne!(first_record.ciphertext(), second_record.ciphertext());
+
+        let changed_upload = record_begin_request(&binding, &capture, Uuid::new_v4());
+        let changed_upload = Zeroizing::new(
+            changed_upload
+                .encode()
+                .expect("encode changed-upload Begin request"),
+        );
+        let changed_upload =
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+                &changed_upload,
+            )
+            .expect("derive changed-upload identity");
+        assert_ne!(first, changed_upload);
+
+        let changed_generation_binding = record_stage_binding(descriptor, 8);
+        let changed_generation =
+            record_begin_request(&changed_generation_binding, &capture, upload_id);
+        let changed_generation = Zeroizing::new(
+            changed_generation
+                .encode()
+                .expect("encode changed-scope Begin request"),
+        );
+        let changed_generation =
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+                &changed_generation,
+            )
+            .expect("derive changed-scope identity");
+        assert_ne!(first, changed_generation);
+
+        let (other_descriptor, _, _, other_capture) = record_descriptor();
+        let other_binding = record_stage_binding(other_descriptor, 7);
+        let changed_descriptor = record_begin_request(&other_binding, &other_capture, upload_id);
+        let changed_descriptor = Zeroizing::new(
+            changed_descriptor
+                .encode()
+                .expect("encode changed-descriptor Begin request"),
+        );
+        let changed_descriptor =
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+                &changed_descriptor,
+            )
+            .expect("derive changed-descriptor identity");
+        assert_ne!(first, changed_descriptor);
+
+        let (pane_id, generation) = binding
+            .scope()
+            .pane_identity()
+            .expect("candidate fixture uses pane scope");
+        let changed_geometry = GuardianCheckpointStageRequestV1::begin(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id,
+                generation,
+            },
+            upload_id,
+            GuardianCheckpointDescriptorV1::from_live_capture(&capture, generation)
+                .expect("construct changed-geometry descriptor"),
+            2_048,
+        )
+        .expect("construct changed-geometry Begin request");
+        let changed_geometry = Zeroizing::new(
+            changed_geometry
+                .encode()
+                .expect("encode changed-geometry Begin request"),
+        );
+        let changed_geometry =
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+                &changed_geometry,
+            )
+            .expect("derive changed-geometry identity");
+        assert_ne!(first, changed_geometry);
+
+        let seal_plaintext = Zeroizing::new(
+            record_seal_request(&binding, &capture, upload_id)
+                .encode()
+                .expect("encode kind-substitution Seal request"),
+        );
+        assert!(matches!(
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+                &seal_plaintext,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidCandidateIdentityPreimage)
+        ));
+        let mut reserved_mutation = Zeroizing::new(
+            begin
+                .encode()
+                .expect("encode reserved-byte mutation fixture"),
+        );
+        reserved_mutation[7] = 1;
+        assert!(GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
+            &reserved_mutation,
+        )
+        .is_err());
+        let mut truncated = Zeroizing::new(
+            begin
+                .encode()
+                .expect("encode truncated candidate fixture"),
+        );
+        truncated.pop();
+        assert!(matches!(
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(&truncated),
+            Err(GuardianCheckpointCipherError::InvalidCandidateIdentityPreimage)
+        ));
+        let mut extended = Zeroizing::new(
+            begin
+                .encode()
+                .expect("encode extended candidate fixture"),
+        );
+        extended.push(0);
+        assert!(matches!(
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(&extended),
+            Err(GuardianCheckpointCipherError::InvalidCandidateIdentityPreimage)
+        ));
+        let debug = format!("{first:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&format!("{:02x?}", first.digest())));
+    }
+
+    #[test]
+    fn ordered_chunk_set_identity_has_one_exact_geometry_and_preimage() {
+        let payload = b"ordered-chunk-set-fixture";
+        let chunk_bytes = 7_u32;
+        let identity = ordered_chunk_set_identity_fixture(payload, chunk_bytes);
+        let total_bytes = u64::try_from(payload.len()).expect("payload length fits u64");
+        let total_chunks = u32::try_from(payload.len().div_ceil(7))
+            .expect("chunk count fits u32");
+
+        let mut expected = Sha256::new();
+        expected.update(CHECKPOINT_ORDERED_CHUNK_SET_IDENTITY_DOMAIN);
+        expected.update(total_bytes.to_le_bytes());
+        expected.update(chunk_bytes.to_le_bytes());
+        expected.update(total_chunks.to_le_bytes());
+        for (index, chunk) in payload.chunks(7).enumerate() {
+            let index = u32::try_from(index).expect("chunk index fits u32");
+            let offset = u64::from(index) * u64::from(chunk_bytes);
+            let plaintext_bytes = u32::try_from(chunk.len()).expect("chunk length fits u32");
+            let chunk = Zeroizing::new(chunk.to_vec());
+            let chunk_identity = checkpoint_chunk_identity(index, offset, &chunk)
+                .expect("derive exact logical chunk identity");
+            expected.update(index.to_le_bytes());
+            expected.update(offset.to_le_bytes());
+            expected.update(plaintext_bytes.to_le_bytes());
+            expected.update(chunk_identity.as_slice());
+        }
+        let expected = Zeroizing::new(<[u8; 32]>::from(expected.finalize()));
+        assert!(checkpoint_stage_digests_match(identity.digest(), &expected));
+
+        let same = ordered_chunk_set_identity_fixture(payload, chunk_bytes);
+        assert_eq!(identity, same);
+        let changed_plaintext = ordered_chunk_set_identity_fixture(
+            b"ordered-chunk-set-fixturz",
+            chunk_bytes,
+        );
+        assert_ne!(identity, changed_plaintext);
+        let changed_geometry = ordered_chunk_set_identity_fixture(payload, 5);
+        assert_ne!(identity, changed_geometry);
+
+        assert!(matches!(
+            GuardianCheckpointOrderedChunkSetBuilderV1::new(total_bytes, chunk_bytes, 1),
+            Err(GuardianCheckpointCipherError::InvalidChunkSetGeometry)
+        ));
+        assert!(matches!(
+            GuardianCheckpointOrderedChunkSetBuilderV1::new(0, chunk_bytes, 1),
+            Err(GuardianCheckpointCipherError::InvalidChunkSetGeometry)
+        ));
+        assert!(matches!(
+            GuardianCheckpointOrderedChunkSetBuilderV1::new(total_bytes, 0, total_chunks),
+            Err(GuardianCheckpointCipherError::InvalidChunkSetGeometry)
+        ));
+        assert!(matches!(
+            GuardianCheckpointOrderedChunkSetBuilderV1::new(
+                total_bytes,
+                chunk_bytes,
+                CHECKPOINT_STAGE_MAX_CHUNKS + 1,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidChunkSetGeometry)
+        ));
+
+        let first_chunk = Zeroizing::new(payload[..7].to_vec());
+        let mut wrong_index = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+        )
+        .expect("construct wrong-index fixture");
+        assert!(matches!(
+            wrong_index.push_authenticated_chunk(1, 7, &first_chunk),
+            Err(GuardianCheckpointCipherError::InvalidChunkSetSequence)
+        ));
+        let mut wrong_offset = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+        )
+        .expect("construct wrong-offset fixture");
+        assert!(matches!(
+            wrong_offset.push_authenticated_chunk(0, 1, &first_chunk),
+            Err(GuardianCheckpointCipherError::InvalidChunkSetSequence)
+        ));
+        let short_chunk = Zeroizing::new(payload[..6].to_vec());
+        let mut wrong_length = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+        )
+        .expect("construct wrong-length fixture");
+        assert!(matches!(
+            wrong_length.push_authenticated_chunk(0, 0, &short_chunk),
+            Err(GuardianCheckpointCipherError::InvalidChunkSetSequence)
+        ));
+        let mut incomplete = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+        )
+        .expect("construct incomplete fixture");
+        incomplete
+            .push_authenticated_chunk(0, 0, &first_chunk)
+            .expect("push exact first chunk");
+        assert!(matches!(
+            incomplete.finish(),
+            Err(GuardianCheckpointCipherError::IncompleteChunkSet)
+        ));
+
+        let mut complete = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+        )
+        .expect("construct complete fixture");
+        for (index, bytes) in payload.chunks(7).enumerate() {
+            let index = u32::try_from(index).expect("chunk index fits u32");
+            let offset = u64::from(index) * u64::from(chunk_bytes);
+            let plaintext = Zeroizing::new(bytes.to_vec());
+            complete
+                .push_authenticated_chunk(index, offset, &plaintext)
+                .expect("push exact complete fixture chunk");
+        }
+        let extra = Zeroizing::new(vec![0]);
+        assert!(matches!(
+            complete.push_authenticated_chunk(total_chunks, total_bytes, &extra),
+            Err(GuardianCheckpointCipherError::InvalidChunkSetSequence)
+        ));
+        let debug = format!("{complete:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&format!("{:02x?}", identity.digest())));
+    }
+
+    #[test]
     fn checkpoint_cipher_round_trips_every_typed_record_and_fixed_header() {
         let plaintext = b"bounded checkpoint staging plaintext";
         let (descriptor, _, _, capture) = record_descriptor();
@@ -4917,7 +5312,10 @@ mod tests {
     }
 
     #[test]
-    fn seal_intent_is_single_use_and_records_retain_only_persisted_claims() {
+    fn authority_surface_ast_is_closed_and_records_retain_only_persisted_claims() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<Sha256>();
         assert!(std::mem::needs_drop::<GuardianCheckpointStageSealIntentV1>());
         assert!(std::mem::needs_drop::<
             GuardianCheckpointValidatedManifestOperationV1
