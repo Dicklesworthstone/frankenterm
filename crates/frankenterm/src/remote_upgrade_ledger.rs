@@ -1917,6 +1917,88 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_rolled_back_record_bound_to_wrong_pre_effect_authority() {
+        let (_fixture, root, effective_uid) = root_fixture();
+        let upgrade_claim = claim('a');
+        let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim.clone())
+            .expect("create wrong-authority rollback transaction");
+        ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization")
+            .consume_publication()
+            .expect("consume publication permit");
+        ledger
+            .authorize_selector_after_publication(SelectorAuthority::Missing)
+            .expect("commit Activating selector authorization")
+            .consume_selector()
+            .expect("consume selector effect permit");
+        let authorization = ledger.latest().expect("Activating authorization");
+        let wrong_generation = "d".repeat(64);
+        let wrong_target = format!("generations/{wrong_generation}");
+        let wrong_authority = SelectorAuthority::selected(
+            &wrong_generation,
+            Path::new(&wrong_target),
+            59,
+            61,
+        )
+        .expect("create wrong restored authority");
+        let forged = RemoteUpgradeRecord {
+            schema: RECORD_SCHEMA.to_string(),
+            transaction_id: ledger.claim.transaction_id.clone(),
+            claim_sha256: ledger.claim_sha256.clone(),
+            claim: ledger.claim.clone(),
+            sequence: authorization.sequence + 1,
+            attempt: authorization.attempt,
+            state: RemoteUpgradeState::RolledBack,
+            generation_id: ledger.claim.generation_id.clone(),
+            selector_before: wrong_authority.clone(),
+            selector_after: wrong_authority,
+            receipt: format!(
+                "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:rolled_back:{}\n",
+                ledger.claim.generation_id
+            ),
+        };
+        let bytes = forged
+            .canonical_bytes(&ledger.claim, &ledger.claim_sha256)
+            .expect("wrong-authority rollback is internally canonical");
+        assert!(!record_authority_transition_is_valid(
+            authorization,
+            &forged
+        ));
+        let digest = domain_hash(RECORD_HASH_DOMAIN, &bytes);
+        let record_name = format!(
+            "record-{:04}-{digest}-{:02}.json",
+            forged.sequence, forged.attempt
+        );
+        create_synchronized_file(
+            &ledger.transaction,
+            Path::new(&record_name),
+            &bytes,
+            effective_uid,
+            ledger.device,
+        )
+        .expect("plant internally canonical wrong-authority rollback record");
+        let commit_name = format!("commit-{:04}-{digest}.v1", forged.sequence);
+        create_synchronized_file(
+            &ledger.transaction,
+            Path::new(&commit_name),
+            &[],
+            effective_uid,
+            ledger.device,
+        )
+        .expect("commit internally canonical wrong-authority rollback record");
+        sync_capability_directory(&ledger.transaction)
+            .expect("sync forged rollback record and marker");
+
+        let error = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim)
+            .err()
+            .expect("wrong-authority rollback must poison durable replay");
+        assert!(error
+            .to_string()
+            .contains("illegal state or attempt transition"));
+    }
+
+    #[test]
     fn exact_canonical_outcome_orphan_is_adopted_without_a_second_record() {
         let (_fixture, root, effective_uid) = root_fixture();
         let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))

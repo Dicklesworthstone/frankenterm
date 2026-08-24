@@ -930,6 +930,81 @@ impl GuardianPaneOutputJournal {
     pub(crate) const fn initial_remaining_records(&self) -> u64 {
         self.initial_remaining_records
     }
+
+    fn validated_checkpoint_seal_witness(
+        &self,
+        descriptor: &GuardianCheckpointArtifactDescriptorV1,
+        canonical_terminal_payload: &[u8],
+    ) -> Result<GuardianCheckpointValidatedSealWitnessV1, GuardianCheckpointStageStoreError> {
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        authority
+            .validate_path_authority()
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+        let origin = descriptor.origin();
+        let durable_pane_id = origin
+            .durable_pane_id()
+            .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+        let segment_id = origin
+            .segment_id()
+            .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+        let output_sequence = origin
+            .output_sequence()
+            .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+        if authority.manifest.snapshot.durable_pane_id != durable_pane_id {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        validate_replayable_segment_chain(
+            &authority.directory,
+            &authority.directory_path,
+            &authority.segments,
+            &authority.cipher,
+            authority.policy,
+        )?;
+        let segment = authority
+            .segments
+            .iter()
+            .find(|segment| segment.segment_identity.segment_id() == segment_id)
+            .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+        validate_file_identity_at(
+            &authority.directory,
+            &authority.directory_path,
+            &segment.path,
+            segment.file_identity,
+        )?;
+        let file = open_private_file_at(
+            &authority.directory,
+            &authority.directory_path,
+            &segment.path,
+            false,
+        )?;
+        let journal = GuardianOutputJournal::open(
+            file,
+            segment.segment_identity,
+            authority.cipher.clone(),
+            authority.policy.journal_limits,
+        )?;
+        let mut cursor = journal.recovery_cursor(
+            output_sequence,
+            authority.policy.journal_limits.max_record_bytes,
+        )?;
+        let recovered = cursor
+            .next_record()?
+            .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+        let receipt = recovered.receipt();
+        drop(recovered);
+        let witness = descriptor.validated_record_seal_witness(
+            canonical_terminal_payload,
+            segment.segment_identity,
+            receipt,
+        )?;
+        authority
+            .validate_path_authority()
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+        Ok(witness)
+    }
 }
 
 /// Descriptor-pinned encrypted input WAL owned by the live-input worker while
