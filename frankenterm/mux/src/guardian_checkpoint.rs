@@ -3361,6 +3361,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs::File;
     use std::sync::Arc;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
     use syn::visit::{self, Visit};
     use tempfile::tempdir;
 
@@ -3375,19 +3376,128 @@ mod tests {
         "GuardianCheckpointValidatedManifestOperationV1",
         "GuardianCheckpointManifestRetryCapabilityV1",
         "GuardianCheckpointManifestSealCapabilitiesV1",
+        "LiveParserCheckpointAck",
     ];
+
+    assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointValidatedStageAssemblyV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointValidatedManifestAuthorityV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointStageSealIntentV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointValidatedManifestOperationV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointManifestRetryCapabilityV1: Clone, Copy);
+    assert_not_impl_any!(GuardianCheckpointManifestSealCapabilitiesV1: Clone, Copy);
+    assert_not_impl_any!(LiveParserCheckpointAck: Clone, Copy);
+    assert_impl_all!(Sha256: zeroize::ZeroizeOnDrop);
+    assert_impl_all!(Zeroizing<[u8; 32]>: zeroize::ZeroizeOnDrop);
+    assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);
+    assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct AuthorityFieldSurface {
+        owner: String,
+        name: String,
+        visibility: String,
+        ty: syn::Type,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct AuthorityMethodSurface {
+        owner: String,
+        visibility: String,
+        cfg_test: bool,
+        signature: syn::Signature,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct AuthorityMacroSurface {
+        owner: String,
+        function: String,
+        invocation: syn::Macro,
+    }
+
+    fn expected_authority_field(
+        owner: &str,
+        name: &str,
+        ty: &str,
+    ) -> AuthorityFieldSurface {
+        AuthorityFieldSurface {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+            visibility: "private".to_owned(),
+            ty: syn::parse_str(ty).expect("parse frozen authority field type"),
+        }
+    }
+
+    fn expected_authority_method(
+        owner: &str,
+        visibility: &str,
+        cfg_test: bool,
+        signature: &str,
+    ) -> AuthorityMethodSurface {
+        AuthorityMethodSurface {
+            owner: owner.to_owned(),
+            visibility: visibility.to_owned(),
+            cfg_test,
+            signature: syn::parse_str(signature).expect("parse frozen authority method signature"),
+        }
+    }
+
+    fn sort_authority_fields(fields: &mut [AuthorityFieldSurface]) {
+        fields.sort_by(|left, right| {
+            (&left.owner, &left.name).cmp(&(&right.owner, &right.name))
+        });
+    }
+
+    fn sort_authority_methods(methods: &mut [AuthorityMethodSurface]) {
+        methods.sort_by(|left, right| {
+            (&left.owner, left.signature.ident.to_string()).cmp(&(
+                &right.owner,
+                right.signature.ident.to_string(),
+            ))
+        });
+    }
+
+    fn expected_authority_macro(
+        owner: &str,
+        function: &str,
+        expression: &str,
+    ) -> AuthorityMacroSurface {
+        let expression: syn::ExprMacro =
+            syn::parse_str(expression).expect("parse frozen production macro expression");
+        AuthorityMacroSurface {
+            owner: owner.to_owned(),
+            function: function.to_owned(),
+            invocation: expression.mac,
+        }
+    }
 
     #[derive(Default)]
     struct AuthoritySurfaceAstInventory {
         derives: Vec<String>,
         fields: Vec<String>,
+        field_surfaces: Vec<AuthorityFieldSurface>,
         impls: Vec<String>,
         inherent_methods: Vec<String>,
+        method_surfaces: Vec<AuthorityMethodSurface>,
+        authority_signature_surfaces: Vec<AuthorityMethodSurface>,
         cipher_methods: Vec<String>,
+        cipher_method_surfaces: Vec<AuthorityMethodSurface>,
         return_sites: Vec<String>,
         construction_sites: Vec<String>,
         aliases_or_storage: Vec<String>,
         item_macros: Vec<String>,
+        expression_macros: Vec<AuthorityMacroSurface>,
+        uses: Vec<syn::ItemUse>,
+        modules: Vec<String>,
+        traits: Vec<String>,
+        associated_items: Vec<String>,
+        external_storage_sites: Vec<String>,
+        projection_sites: Vec<String>,
+        unexpected_attributes: Vec<String>,
+        unexpected_derives: Vec<String>,
         current_impl_owner: Option<String>,
         current_impl_is_inherent: bool,
         current_function: Option<String>,
@@ -3440,6 +3550,37 @@ mod tests {
             }
         }
 
+        fn derive_names_from_meta(meta: &syn::Meta, names: &mut Vec<String>) {
+            let syn::Meta::List(list) = meta else {
+                return;
+            };
+            let Ok(nested) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return;
+            };
+            if list.path.is_ident("derive") {
+                names.extend(nested.iter().filter_map(|meta| match meta {
+                    syn::Meta::Path(path) => Self::path_name(path),
+                    syn::Meta::List(_) | syn::Meta::NameValue(_) => None,
+                }));
+                return;
+            }
+            if list.path.is_ident("cfg_attr") {
+                for nested_meta in nested.iter().skip(1) {
+                    Self::derive_names_from_meta(nested_meta, names);
+                }
+            }
+        }
+
+        fn derive_names(attributes: &[syn::Attribute]) -> Vec<String> {
+            let mut names = Vec::new();
+            for attribute in attributes {
+                Self::derive_names_from_meta(&attribute.meta, &mut names);
+            }
+            names
+        }
+
         fn protected_names_in_type(
             ty: &syn::Type,
             owner: Option<&str>,
@@ -3450,15 +3591,15 @@ mod tests {
             }
             impl<'ast> Visit<'ast> for ReturnTypeVisitor<'_> {
                 fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
-                    if let Some(name) = path.path.segments.last().map(|segment| {
-                        if segment.ident == "Self" {
+                    for segment in &path.path.segments {
+                        let name = if segment.ident == "Self" {
                             self.owner.unwrap_or("Self").to_owned()
                         } else {
                             segment.ident.to_string()
+                        };
+                        if AuthoritySurfaceAstInventory::protected(&name) {
+                            self.names.insert(name);
                         }
-                    }) && AuthoritySurfaceAstInventory::protected(&name)
-                    {
-                        self.names.insert(name);
                     }
                     visit::visit_type_path(self, path);
                 }
@@ -3469,6 +3610,43 @@ mod tests {
             };
             visitor.visit_type(ty);
             visitor.names.into_iter().collect()
+        }
+
+        fn protected_names_in_signature(
+            signature: &syn::Signature,
+            owner: Option<&str>,
+        ) -> Vec<String> {
+            let mut names = BTreeSet::new();
+            for argument in &signature.inputs {
+                let ty = match argument {
+                    syn::FnArg::Receiver(receiver) => receiver.ty.as_ref(),
+                    syn::FnArg::Typed(argument) => argument.ty.as_ref(),
+                };
+                names.extend(Self::protected_names_in_type(ty, owner));
+            }
+            names.extend(Self::protected_return_names(&signature.output, owner));
+            names.into_iter().collect()
+        }
+
+        fn record_authority_signature(
+            &mut self,
+            owner: Option<&str>,
+            function: &syn::Signature,
+            visibility: &syn::Visibility,
+            cfg_test: bool,
+        ) {
+            let owner_label = owner.unwrap_or("<free>");
+            if Self::protected(owner_label)
+                || !Self::protected_names_in_signature(function, owner).is_empty()
+            {
+                self.authority_signature_surfaces
+                    .push(AuthorityMethodSurface {
+                        owner: owner_label.to_owned(),
+                        visibility: Self::visibility(visibility),
+                        cfg_test,
+                        signature: function.clone(),
+                    });
+            }
         }
 
         fn all_names_in_type(ty: &syn::Type) -> Vec<String> {
@@ -3532,18 +3710,20 @@ mod tests {
         }
 
         fn record_construction(&mut self, path: &syn::Path) {
-            let Some(mut constructed) = Self::path_name(path) else {
+            let constructed = path.segments.iter().find_map(|segment| {
+                if segment.ident == "Self" {
+                    self.current_impl_owner
+                        .as_ref()
+                        .filter(|owner| Self::protected(owner))
+                        .cloned()
+                } else {
+                    let name = segment.ident.to_string();
+                    Self::protected(&name).then_some(name)
+                }
+            });
+            let Some(constructed) = constructed else {
                 return;
             };
-            if constructed == "Self" {
-                let Some(owner) = self.current_impl_owner.as_ref() else {
-                    return;
-                };
-                constructed.clone_from(owner);
-            }
-            if !Self::protected(&constructed) {
-                return;
-            }
             self.construction_sites.push(format!(
                 "{constructed}@{}::{}",
                 self.current_impl_owner.as_deref().unwrap_or("<free>"),
@@ -3569,36 +3749,122 @@ mod tests {
             if Self::cfg_test(&item.attrs) {
                 return;
             }
+            self.modules.push(format!(
+                "{}:{}",
+                if item.content.is_some() {
+                    "inline"
+                } else {
+                    "out-of-line"
+                },
+                item.ident
+            ));
             visit::visit_item_mod(self, item);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            self.uses.push(item.clone());
+            visit::visit_item_use(self, item);
+        }
+
+        fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+            let name = Self::path_name(attribute.path())
+                .unwrap_or_else(|| "<anonymous>".to_owned());
+            const INERT_ATTRIBUTES: &[&str] = &[
+                "allow", "cfg", "derive", "doc", "error", "must_use", "repr", "source",
+            ];
+            if !INERT_ATTRIBUTES.contains(&name.as_str()) {
+                self.unexpected_attributes.push(name);
+            }
+            if name == "derive" {
+                const EXPECTED_DERIVES: &[&str] =
+                    &["Clone", "Copy", "Debug", "Eq", "Error", "PartialEq"];
+                for derived in Self::derive_names(std::slice::from_ref(attribute)) {
+                    if !EXPECTED_DERIVES.contains(&derived.as_str()) {
+                        self.unexpected_derives.push(derived);
+                    }
+                }
+            }
+            visit::visit_attribute(self, attribute);
         }
 
         fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
             let target = item.ident.to_string();
             if Self::protected(&target) {
-                for attribute in &item.attrs {
-                    if attribute.path().is_ident("derive") {
-                        attribute
-                            .parse_nested_meta(|meta| {
-                                if let Some(derived) = meta.path.segments.last() {
-                                    self.derives.push(format!("{target}:{}", derived.ident));
-                                }
-                                Ok(())
-                            })
-                            .expect("parse authority-critical derive attribute");
-                    }
+                for derived in Self::derive_names(&item.attrs) {
+                    self.derives.push(format!("{target}:{derived}"));
                 }
                 for field in &item.fields {
+                    let name = field
+                        .ident
+                        .as_ref()
+                        .map_or_else(|| "<unnamed>".to_owned(), ToString::to_string);
                     self.fields.push(format!(
                         "{target}:{}:{}",
-                        field
-                            .ident
-                            .as_ref()
-                            .map_or_else(|| "<unnamed>".to_owned(), ToString::to_string),
+                        name,
                         Self::visibility(&field.vis)
                     ));
+                    self.field_surfaces.push(AuthorityFieldSurface {
+                        owner: target.clone(),
+                        name,
+                        visibility: Self::visibility(&field.vis),
+                        ty: field.ty.clone(),
+                    });
+                }
+            } else {
+                for field in &item.fields {
+                    for protected in Self::protected_names_in_type(&field.ty, Some(&target)) {
+                        self.external_storage_sites.push(format!(
+                            "struct:{target}:{}:{protected}",
+                            field
+                                .ident
+                                .as_ref()
+                                .map_or_else(|| "<unnamed>".to_owned(), ToString::to_string)
+                        ));
+                    }
                 }
             }
             visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            let owner = item.ident.to_string();
+            for variant in &item.variants {
+                for field in &variant.fields {
+                    for protected in Self::protected_names_in_type(&field.ty, Some(&owner)) {
+                        self.external_storage_sites.push(format!(
+                            "enum:{owner}:{}:{protected}",
+                            variant.ident
+                        ));
+                    }
+                }
+            }
+            visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            let owner = item.ident.to_string();
+            for field in &item.fields.named {
+                for protected in Self::protected_names_in_type(&field.ty, Some(&owner)) {
+                    self.external_storage_sites.push(format!(
+                        "union:{owner}:{}:{protected}",
+                        field
+                            .ident
+                            .as_ref()
+                            .map_or_else(|| "<unnamed>".to_owned(), ToString::to_string)
+                    ));
+                }
+            }
+            visit::visit_item_union(self, item);
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            self.traits.push(item.ident.to_string());
+            visit::visit_item_trait(self, item);
+        }
+
+        fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
+            self.associated_items.push("foreign-mod".to_owned());
+            visit::visit_item_foreign_mod(self, item);
         }
 
         fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
@@ -3622,6 +3888,7 @@ mod tests {
 
         fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
             let owner = self.current_impl_owner.clone();
+            let cfg_test = Self::cfg_test(&function.attrs);
             if owner.as_deref() == Some("GuardianCheckpointCipher")
                 && self.current_impl_is_inherent
             {
@@ -3631,9 +3898,15 @@ mod tests {
                     Self::visibility(&function.vis),
                     Self::input_type_fingerprint(&function.sig)
                 ));
+                self.cipher_method_surfaces
+                    .push(AuthorityMethodSurface {
+                        owner: "GuardianCheckpointCipher".to_owned(),
+                        visibility: Self::visibility(&function.vis),
+                        cfg_test,
+                        signature: function.sig.clone(),
+                    });
             }
             if let Some(owner) = owner.as_deref().filter(|name| Self::protected(name)) {
-                let cfg_test = Self::cfg_test(&function.attrs);
                 if self.current_impl_is_inherent {
                     self.inherent_methods.push(format!(
                         "{owner}::{}:{}:{}",
@@ -3641,29 +3914,67 @@ mod tests {
                         Self::visibility(&function.vis),
                         if cfg_test { "test" } else { "production" }
                     ));
+                    self.method_surfaces.push(AuthorityMethodSurface {
+                        owner: owner.to_owned(),
+                        visibility: Self::visibility(&function.vis),
+                        cfg_test,
+                        signature: function.sig.clone(),
+                    });
                 }
-                self.record_return_sites(
-                    Some(owner),
-                    &function.sig,
-                    &function.vis,
-                    cfg_test,
-                );
             }
+            self.record_return_sites(
+                owner.as_deref(),
+                &function.sig,
+                &function.vis,
+                cfg_test,
+            );
+            self.record_authority_signature(
+                owner.as_deref(),
+                &function.sig,
+                &function.vis,
+                cfg_test,
+            );
             let previous_function = self.current_function.replace(function.sig.ident.to_string());
-            visit::visit_impl_item_fn(self, function);
+            if !cfg_test {
+                visit::visit_impl_item_fn(self, function);
+            }
             self.current_function = previous_function;
         }
 
         fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            let cfg_test = Self::cfg_test(&function.attrs);
             self.record_return_sites(
                 None,
                 &function.sig,
                 &function.vis,
-                Self::cfg_test(&function.attrs),
+                cfg_test,
+            );
+            self.record_authority_signature(
+                None,
+                &function.sig,
+                &function.vis,
+                cfg_test,
             );
             let previous_function = self.current_function.replace(function.sig.ident.to_string());
-            visit::visit_item_fn(self, function);
+            if !cfg_test {
+                visit::visit_item_fn(self, function);
+            }
             self.current_function = previous_function;
+        }
+
+        fn visit_trait_item_fn(&mut self, function: &'ast syn::TraitItemFn) {
+            self.record_authority_signature(None, &function.sig, &syn::Visibility::Inherited, false);
+            visit::visit_trait_item_fn(self, function);
+        }
+
+        fn visit_foreign_item_fn(&mut self, function: &'ast syn::ForeignItemFn) {
+            self.record_authority_signature(
+                None,
+                &function.sig,
+                &function.vis,
+                false,
+            );
+            visit::visit_foreign_item_fn(self, function);
         }
 
         fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
@@ -3672,6 +3983,8 @@ mod tests {
         }
 
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            self.associated_items
+                .push(format!("type-alias:{}", item.ident));
             self.record_typed_item("type", &item.ident.to_string(), &item.ty);
             visit::visit_item_type(self, item);
         }
@@ -3691,6 +4004,103 @@ mod tests {
                 Self::path_name(&item.mac.path).unwrap_or_else(|| "<anonymous>".to_owned()),
             );
             visit::visit_item_macro(self, item);
+        }
+
+        fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
+            self.associated_items.push(format!(
+                "impl-const:{}::{}",
+                self.current_impl_owner.as_deref().unwrap_or("<unknown>"),
+                item.ident
+            ));
+            self.record_typed_item("impl-const", &item.ident.to_string(), &item.ty);
+            visit::visit_impl_item_const(self, item);
+        }
+
+        fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+            self.associated_items.push(format!(
+                "impl-type:{}::{}",
+                self.current_impl_owner.as_deref().unwrap_or("<unknown>"),
+                item.ident
+            ));
+            self.record_typed_item("impl-type", &item.ident.to_string(), &item.ty);
+            visit::visit_impl_item_type(self, item);
+        }
+
+        fn visit_impl_item_macro(&mut self, item: &'ast syn::ImplItemMacro) {
+            self.associated_items.push(format!(
+                "impl-macro:{}",
+                self.current_impl_owner.as_deref().unwrap_or("<unknown>")
+            ));
+            visit::visit_impl_item_macro(self, item);
+        }
+
+        fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
+            self.associated_items
+                .push(format!("trait-const:{}", item.ident));
+            visit::visit_trait_item_const(self, item);
+        }
+
+        fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
+            self.associated_items
+                .push(format!("trait-type:{}", item.ident));
+            visit::visit_trait_item_type(self, item);
+        }
+
+        fn visit_trait_item_macro(&mut self, item: &'ast syn::TraitItemMacro) {
+            self.associated_items.push("trait-macro".to_owned());
+            visit::visit_trait_item_macro(self, item);
+        }
+
+        fn visit_expr_macro(&mut self, expression: &'ast syn::ExprMacro) {
+            self.expression_macros.push(AuthorityMacroSurface {
+                owner: self
+                    .current_impl_owner
+                    .as_deref()
+                    .unwrap_or("<free>")
+                    .to_owned(),
+                function: self
+                    .current_function
+                    .as_deref()
+                    .unwrap_or("<item>")
+                    .to_owned(),
+                invocation: expression.mac.clone(),
+            });
+            visit::visit_expr_macro(self, expression);
+        }
+
+        fn visit_stmt_macro(&mut self, statement: &'ast syn::StmtMacro) {
+            self.expression_macros.push(AuthorityMacroSurface {
+                owner: self
+                    .current_impl_owner
+                    .as_deref()
+                    .unwrap_or("<free>")
+                    .to_owned(),
+                function: self
+                    .current_function
+                    .as_deref()
+                    .unwrap_or("<item>")
+                    .to_owned(),
+                invocation: statement.mac.clone(),
+            });
+            visit::visit_stmt_macro(self, statement);
+        }
+
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            let self_projection = path.qself.is_none()
+                && path.path.segments.len() > 1
+                && path
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|segment| segment.ident == "Self");
+            if path.qself.is_some() || self_projection {
+                self.projection_sites.push(format!(
+                    "{}::{}",
+                    self.current_impl_owner.as_deref().unwrap_or("<free>"),
+                    self.current_function.as_deref().unwrap_or("<item>")
+                ));
+            }
+            visit::visit_type_path(self, path);
         }
     }
 

@@ -91,7 +91,8 @@ criterion = "0.8.2"
 k9.workspace = true
 promise = { workspace = true, features = ["test-support"] }
 proptest = "1.8.0"
-syn = { workspace = true, features = ["full", "visit"] }
+static_assertions = "1.1.0"
+syn = { workspace = true, features = ["extra-traits", "full", "visit"] }
 tempfile.workspace = true
 
 [[bench]]
