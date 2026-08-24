@@ -1850,7 +1850,7 @@ mod tests {
     use std::io;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     fn runtime_for_input_rejection() -> (std::path::PathBuf, Poll, GuardianRuntime) {
@@ -2200,6 +2200,112 @@ mod tests {
         assert_eq!(runtime.pty_tokens.len(), pty_token_count_before);
         assert_eq!(runtime.buffered_output_bytes, buffered_output_before);
         assert_eq!(runtime.indeterminate_effect, indeterminate_before);
+    }
+
+    #[test]
+    fn owned_input_guard_wipes_route_rejection_and_quarantine_exits() {
+        let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
+        let route_probe = Arc::new(AtomicBool::new(false));
+        runtime.input_request_wipe_probe = Some(Arc::clone(&route_probe));
+        let request = authenticated_input_request_for(
+            Uuid::from_u128(101),
+            Uuid::from_u128(102),
+            Uuid::from_u128(103),
+            &[0xa5; 17],
+        );
+        let mismatched_route = GuardianInputRoute::new(
+            Token(7),
+            1,
+            Uuid::from_u128(104),
+            Uuid::from_u128(103),
+        )
+        .unwrap();
+        assert!(matches!(
+            runtime.submit_input(request, mismatched_route),
+            GuardianInputSubmission::Respond(_)
+        ));
+        assert!(route_probe.load(Ordering::SeqCst));
+
+        let quarantine_probe = Arc::new(AtomicBool::new(false));
+        runtime.input_request_wipe_probe = Some(Arc::clone(&quarantine_probe));
+        runtime.indeterminate_effect = true;
+        let request = authenticated_input_request_for(
+            Uuid::from_u128(105),
+            Uuid::from_u128(106),
+            Uuid::from_u128(107),
+            &[0x3c; 19],
+        );
+        let route = input_route(8, 2, &request);
+        assert!(matches!(
+            runtime.submit_input(request, route),
+            GuardianInputSubmission::CloseRetryably
+        ));
+        assert!(quarantine_probe.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn owned_input_guard_wipes_busy_and_unavailable_restoration_exits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
+            BlockingWriter {
+                calls,
+                entered: entered_tx,
+                release: release_rx,
+            },
+        ));
+        let first = authenticated_input_request_for(
+            Uuid::from_u128(111),
+            pane_id,
+            Uuid::from_u128(112),
+            &[0x71; 13],
+        );
+        let first_route = input_route(7, 1, &first);
+        assert!(matches!(
+            runtime.submit_input(first, first_route),
+            GuardianInputSubmission::Pending
+        ));
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first input owns protocol");
+
+        let busy_probe = Arc::new(AtomicBool::new(false));
+        runtime.input_request_wipe_probe = Some(Arc::clone(&busy_probe));
+        let busy = authenticated_input_request_for(
+            Uuid::from_u128(113),
+            pane_id,
+            Uuid::from_u128(114),
+            &[0x72; 15],
+        );
+        let busy_route = input_route(8, 2, &busy);
+        assert!(matches!(
+            runtime.submit_input(busy, busy_route),
+            GuardianInputSubmission::CloseRetryably
+        ));
+        assert!(busy_probe.load(Ordering::SeqCst));
+        release_tx.send(()).expect("release first input");
+        let _ = wait_for_input_completion(&mut runtime);
+
+        let unavailable_probe = Arc::new(AtomicBool::new(false));
+        runtime.input_request_wipe_probe = Some(Arc::clone(&unavailable_probe));
+        drop(runtime.input_pipeline.jobs.take());
+        let unavailable = authenticated_input_request_for(
+            Uuid::from_u128(115),
+            pane_id,
+            Uuid::from_u128(116),
+            &[0x73; 21],
+        );
+        let unavailable_route = input_route(9, 3, &unavailable);
+        assert!(matches!(
+            runtime.submit_input(unavailable, unavailable_route),
+            GuardianInputSubmission::CloseRetryably
+        ));
+        assert!(unavailable_probe.load(Ordering::SeqCst));
+        assert!(runtime.protocol.is_some());
+        let pane = runtime.panes.get(&pane_id).expect("pane authority restored");
+        assert!(pane.writer.is_some());
+        assert!(pane.input_journal.is_some());
     }
 
     #[test]

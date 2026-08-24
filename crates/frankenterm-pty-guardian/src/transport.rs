@@ -1283,6 +1283,65 @@ pub struct GuardianClient {
     secret: GuardianSecret,
     mux_incarnation: Uuid,
     guardian_incarnation: Uuid,
+    #[cfg(test)]
+    request_wipe_probe: Option<Arc<ClientRequestWipeProbe>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ClientRequestWipeProbe {
+    explicit_wipe: AtomicBool,
+    drop_wipe: AtomicBool,
+}
+
+/// Owned client request whose plaintext is retired on every encoding exit.
+struct OwnedClientRequest {
+    request: GuardianRequestEnvelope,
+    #[cfg(test)]
+    wipe_probe: Option<Arc<ClientRequestWipeProbe>>,
+}
+
+impl OwnedClientRequest {
+    fn new(request: GuardianRequestEnvelope) -> Self {
+        Self {
+            request,
+            #[cfg(test)]
+            wipe_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_wipe_probe(&mut self, probe: Option<Arc<ClientRequestWipeProbe>>) {
+        self.wipe_probe = probe;
+    }
+
+    fn envelope(&self) -> &GuardianRequestEnvelope {
+        &self.request
+    }
+
+    fn zeroize_payload(&mut self) {
+        self.request.zeroize_payload();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe.explicit_wipe.store(
+                self.request.payload().is_empty(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+}
+
+impl Drop for OwnedClientRequest {
+    fn drop(&mut self) {
+        self.request.zeroize_payload();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe.drop_wipe.store(
+                self.request.payload().is_empty(),
+                Ordering::SeqCst,
+            );
+        }
+    }
 }
 
 impl GuardianClient {
@@ -1308,6 +1367,8 @@ impl GuardianClient {
             secret,
             mux_incarnation,
             guardian_incarnation: Uuid::nil(),
+            #[cfg(test)]
+            request_wipe_probe: None,
         };
         let reply = client.exchange(GuardianRequestEnvelope::new(
             GuardianRequestHeader::new(
@@ -1677,10 +1738,15 @@ impl GuardianClient {
 
     fn exchange(
         &mut self,
-        mut request: GuardianRequestEnvelope,
+        request: GuardianRequestEnvelope,
     ) -> Result<GuardianReply, GuardianClientError> {
-        let mut frame = Zeroizing::new(encode_guardian_request(&self.secret, &request)?);
+        let mut request = OwnedClientRequest::new(request);
+        #[cfg(test)]
+        request.set_wipe_probe(self.request_wipe_probe.clone());
+        let encoded = encode_guardian_request(&self.secret, request.envelope());
         request.zeroize_payload();
+        let mut frame = Zeroizing::new(encoded?);
+        drop(request);
         let mut authenticated: AuthenticatedGuardianRequest =
             decode_guardian_request(&self.secret, &frame)?;
         retire_authenticated_input_plaintext(&mut authenticated);
@@ -3029,54 +3095,41 @@ mod tests {
     }
 
     #[test]
-    fn input_plaintext_can_die_before_write_without_losing_reply_validation() {
-        let secret =
-            GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
-        let pane_id = Uuid::from_u128(21);
-        let request_id = Uuid::from_u128(22);
-        let effect_id = Uuid::from_u128(23);
-        let payload = b"erase-before-socket-write".to_vec();
-        let payload_bytes = u32::try_from(payload.len()).unwrap();
+    fn exchange_explicitly_wipes_moved_request_before_encode_error_propagates() {
+        let (client_stream, _peer_stream) = BlockingUnixStream::pair().unwrap();
+        let secret = GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
+        let wipe_probe = Arc::new(ClientRequestWipeProbe::default());
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret,
+            mux_incarnation: Uuid::from_u128(21),
+            guardian_incarnation: Uuid::from_u128(22),
+            request_wipe_probe: Some(Arc::clone(&wipe_probe)),
+        };
+        let header_commitment_source = [0x19; 11];
         let request = GuardianRequestEnvelope::new(
             GuardianRequestHeader::new(
                 GuardianOperation::Input,
-                Uuid::from_u128(24),
-                Uuid::from_u128(25),
-                request_id,
-                Some(pane_id),
+                Uuid::from_u128(22),
+                Uuid::from_u128(21),
+                Uuid::from_u128(23),
+                Some(Uuid::from_u128(24)),
                 3,
                 7,
-                Some(effect_id),
-                &payload,
+                Some(Uuid::from_u128(25)),
+                &header_commitment_source,
             ),
-            payload,
+            vec![0xa5; 29],
         );
-        let mut frame =
-            Zeroizing::new(encode_guardian_request(&secret, &request).unwrap());
-        let frame_bytes = frame.len();
-        let mut authenticated = decode_guardian_request(&secret, &frame).unwrap();
 
-        retire_authenticated_input_plaintext(&mut authenticated);
-        assert!(authenticated.payload().is_empty());
-        assert_eq!(authenticated.authenticated_payload_bytes(), payload_bytes);
-
-        let reply = GuardianReply::InputReceipt {
-            pane_id,
-            generation: 3,
-            sequence: 7,
-            effect_id,
-            state: InputEffectState::DurableFull,
-        };
-        let response = GuardianResponseEnvelope::reply(&authenticated, &reply)
-            .expect("retained authenticated length validates the Input receipt");
-        let response_frame = encode_guardian_response(&secret, &response).unwrap();
-        let decoded = decode_guardian_response(&secret, &response_frame).unwrap();
-        let correlated = decoded.correlate(authenticated.header()).unwrap();
-        assert_eq!(correlated.success_reply(&authenticated).unwrap(), reply);
-
-        frame.as_mut_slice().zeroize();
-        assert_eq!(frame.len(), frame_bytes);
-        assert!(frame.iter().all(|byte| *byte == 0));
+        assert!(matches!(
+            client.exchange(request),
+            Err(GuardianClientError::Protocol(
+                GuardianProtocolError::PayloadDigestMismatch
+            ))
+        ));
+        assert!(wipe_probe.explicit_wipe.load(Ordering::SeqCst));
+        assert!(wipe_probe.drop_wipe.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -3179,6 +3232,7 @@ mod tests {
             secret: GuardianSecret::from_bytes(secret_bytes).unwrap(),
             mux_incarnation,
             guardian_incarnation,
+            request_wipe_probe: None,
         };
 
         assert_eq!(
