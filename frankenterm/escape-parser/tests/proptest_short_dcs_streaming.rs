@@ -159,12 +159,10 @@ fn overlong_short_dcs_chunked_recovers_after_terminator() {
     let short_dcs = collect_short_dcs(&chunked);
     assert_eq!(
         short_dcs.len(),
-        2,
-        "expected truncated over-limit DCS plus post-recovery DCS"
+        1,
+        "the over-limit DCS must be suppressed and only the post-recovery DCS emitted"
     );
-    assert_eq!(short_dcs[0].data.len(), SHORT_DCS_LIMIT_BYTES);
-    assert!(short_dcs[0].data.iter().all(|&byte| byte == b'x'));
-    assert_eq!(short_dcs[1].data, b"OK".to_vec());
+    assert_eq!(short_dcs[0].data, b"OK".to_vec());
     assert!(
         render(&chunked).ends_with("tail"),
         "parser must recover after the ST terminator and resume printable output"

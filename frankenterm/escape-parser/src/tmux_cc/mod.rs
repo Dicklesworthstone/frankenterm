@@ -855,15 +855,23 @@ pub fn parse_layout(layout: &str) -> Result<Vec<WindowLayout>> {
 pub struct Parser {
     buffer: Vec<u8>,
     begun: Option<Guarded>,
+    max_line_len: usize,
+    max_guarded_output_len: usize,
     discarding_line: bool,
     pending_sequence_error: Option<crate::StringSequenceError>,
 }
 
 impl Parser {
     pub fn new() -> Self {
+        Self::new_with_max_retained_bytes(usize::MAX)
+    }
+
+    pub(crate) fn new_with_max_retained_bytes(max_retained_bytes: usize) -> Self {
         Self {
             buffer: vec![],
             begun: None,
+            max_line_len: max_retained_bytes.min(MAX_LINE_LEN),
+            max_guarded_output_len: max_retained_bytes.min(MAX_GUARDED_OUTPUT_LEN),
             discarding_line: false,
             pending_sequence_error: None,
         }
@@ -892,25 +900,25 @@ impl Parser {
             self.process_line()
         } else {
             // [ft-kfy99] Discard the complete pre-newline line if it exceeds
-            // MAX_LINE_LEN. Retaining the tail after clearing the prefix would
-            // reinterpret attacker-selected suffix bytes as a fresh tmux
-            // command when the newline arrives.
-            if self.buffer.len() >= MAX_LINE_LEN {
+            // the effective line cap. Retaining the tail after clearing the
+            // prefix would reinterpret attacker-selected suffix bytes as a
+            // fresh tmux command when the newline arrives.
+            if self.buffer.len() >= self.max_line_len {
                 log::warn!(
                     "tmux CC line exceeded {} byte cap with no newline; \
                      discarding through newline and dropping any active begun block",
-                    MAX_LINE_LEN
+                    self.max_line_len
                 );
                 self.buffer.clear();
                 self.begun.take();
                 self.discarding_line = true;
                 self.record_sequence_error(crate::StringSequenceError::LimitExceeded {
                     kind: crate::StringSequenceKind::TmuxControl,
-                    maximum: MAX_LINE_LEN,
+                    maximum: self.max_line_len,
                 });
                 return Ok(None);
             }
-            if self.buffer.try_reserve_exact(1).is_err() {
+            if self.buffer.try_reserve(1).is_err() {
                 self.buffer.clear();
                 self.begun.take();
                 self.discarding_line = true;
@@ -1005,27 +1013,29 @@ impl Parser {
                     .len()
                     .checked_add(line.len())
                     .and_then(|len| len.checked_add(1))
-                    .is_none_or(|len| len > MAX_GUARDED_OUTPUT_LEN)
+                    .is_none_or(|len| len > self.max_guarded_output_len)
                 {
                     log::warn!(
                         "tmux CC guarded output exceeded {} byte cap; retaining a bounded error \
                          until the closing guard",
-                        MAX_GUARDED_OUTPUT_LEN
+                        self.max_guarded_output_len
                     );
                     begun.error = true;
                     begun.output.clear();
                     let message =
                         "tmux control response exceeded the bounded guarded-output limit";
-                    if begun.output.try_reserve_exact(message.len()).is_ok() {
+                    if message.len() <= self.max_guarded_output_len
+                        && begun.output.try_reserve(message.len()).is_ok()
+                    {
                         begun.output.push_str(message);
                     }
                     sequence_error = Some(crate::StringSequenceError::LimitExceeded {
                         kind: crate::StringSequenceKind::TmuxControl,
-                        maximum: MAX_GUARDED_OUTPUT_LEN,
+                        maximum: self.max_guarded_output_len,
                     });
                 } else if begun
                     .output
-                    .try_reserve_exact(line.len().saturating_add(1))
+                    .try_reserve(line.len().saturating_add(1))
                     .is_err()
                 {
                     begun.error = true;

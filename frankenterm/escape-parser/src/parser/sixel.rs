@@ -65,6 +65,7 @@ impl SixelBuilder {
         params: &[i64],
         max_retained_bytes: usize,
     ) -> Self {
+        let max_retained_bytes = max_retained_bytes.min(MAX_SIXEL_RETAINED_BYTES);
         let pan = match params.get(0).unwrap_or(&0) {
             7 | 8 | 9 => 1,
             0 | 1 | 5 | 6 => 2,
@@ -131,7 +132,7 @@ impl SixelBuilder {
             });
             return;
         }
-        if self.sixel.data.try_reserve_exact(1).is_err() {
+        if self.sixel.data.try_reserve(1).is_err() {
             log::warn!("sixel parser could not reserve bounded retained state; discarding command");
             self.reject(StringSequenceError::AllocationFailed {
                 kind: StringSequenceKind::Sixel,

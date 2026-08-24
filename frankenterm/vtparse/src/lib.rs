@@ -318,8 +318,11 @@ const MAX_PARAMS: usize = 256;
 /// many calls to [`VTParser::parse`]. Keeping this limit inside the parser is
 /// therefore essential: bounding individual input chunks does not bound the
 /// parser's retained state. Callers with a stricter protocol budget can use
-/// [`VTParser::new_with_max_string_sequence_bytes`].
-pub const DEFAULT_MAX_STRING_SEQUENCE_BYTES: usize = 8 * 1024 * 1024;
+/// [`VTParser::new_with_max_string_sequence_bytes`]. The 24 MiB live default
+/// admits a 16 MiB decoded Kitty image after base64 expansion plus command
+/// metadata while remaining finite; checkpoint replay supplies its own tighter
+/// explicit cap.
+pub const DEFAULT_MAX_STRING_SEQUENCE_BYTES: usize = 24 * 1024 * 1024;
 
 /// Identifies the string sequence whose retained payload was rejected.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -347,6 +350,22 @@ pub enum StringSequenceError {
     AllocationFailed {
         kind: StringSequenceKind,
     },
+}
+
+impl core::fmt::Display for StringSequenceError {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LimitExceeded { kind, maximum } => {
+                write!(
+                    fmt,
+                    "{kind:?} string-sequence limit exceeded (maximum={maximum})"
+                )
+            }
+            Self::AllocationFailed { kind } => {
+                write!(fmt, "{kind:?} string-sequence allocation failed")
+            }
+        }
+    }
 }
 
 struct OscState {
@@ -402,7 +421,7 @@ impl OscState {
 
             #[cfg(any(feature = "std", feature = "alloc"))]
             {
-                if self.buffer.try_reserve_exact(encoded.len()).is_err() {
+                if self.buffer.try_reserve(encoded.len()).is_err() {
                     self.buffer.clear();
                     self.discarding = true;
                     return Some(StringSequenceError::AllocationFailed {
@@ -781,7 +800,7 @@ impl VTParser {
                             kind: StringSequenceKind::ApplicationProgramCommand,
                             maximum: self.max_string_sequence_bytes,
                         });
-                    } else if self.apc_data.try_reserve_exact(1).is_err() {
+                    } else if self.apc_data.try_reserve(1).is_err() {
                         self.apc_data.clear();
                         self.apc_discarding = true;
                         self.record_string_sequence_error(StringSequenceError::AllocationFailed {
@@ -963,6 +982,42 @@ mod test {
                 b"0".to_vec(),
                 b"there".to_vec()
             ])]
+        );
+    }
+
+    #[test]
+    fn string_sequence_error_display_is_content_free() {
+        assert_eq!(
+            StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::OperatingSystemCommand,
+                maximum: 4096,
+            }
+            .to_string(),
+            "OperatingSystemCommand string-sequence limit exceeded (maximum=4096)"
+        );
+        assert_eq!(
+            StringSequenceError::AllocationFailed {
+                kind: StringSequenceKind::TmuxControl,
+            }
+            .to_string(),
+            "TmuxControl string-sequence allocation failed"
+        );
+    }
+
+    #[test]
+    fn default_string_limit_covers_kitty_base64_boundary_with_metadata_headroom() {
+        const DEFAULT_KITTY_DECODED_BYTES: usize = 16 * 1024 * 1024;
+        const METADATA_HEADROOM_BYTES: usize = 2 * 1024 * 1024;
+        let base64_bytes = DEFAULT_KITTY_DECODED_BYTES.div_ceil(3) * 4;
+
+        assert_eq!(DEFAULT_MAX_STRING_SEQUENCE_BYTES, 24 * 1024 * 1024);
+        assert!(
+            base64_bytes + METADATA_HEADROOM_BYTES <= DEFAULT_MAX_STRING_SEQUENCE_BYTES,
+            "the live parser default must admit the configured decoded Kitty payload"
+        );
+        assert_eq!(
+            VTParser::new().max_string_sequence_bytes(),
+            DEFAULT_MAX_STRING_SEQUENCE_BYTES
         );
     }
 
