@@ -423,6 +423,7 @@ struct GuardianCheckpointStageStoreInner {
     policy: GuardianCheckpointStagePolicy,
     name_max: usize,
     gate: Mutex<()>,
+    durable_records: Mutex<Vec<FileIdentity>>,
 }
 
 /// Descriptor-relative, synchronously durable Phase-A checkpoint staging.
@@ -436,7 +437,7 @@ pub(crate) struct GuardianCheckpointStageStore {
     inner: Arc<GuardianCheckpointStageStoreInner>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -1080,6 +1081,7 @@ impl GuardianCheckpointStageStore {
                 policy,
                 name_max,
                 gate: Mutex::new(()),
+                durable_records: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -1834,6 +1836,28 @@ fn checkpoint_write_created_record(
         path,
         identity,
     )?;
+    checkpoint_remember_durable_record(inner, identity)?;
+    Ok(())
+}
+
+fn checkpoint_remember_durable_record(
+    inner: &GuardianCheckpointStageStoreInner,
+    identity: FileIdentity,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let mut durable_records = inner
+        .durable_records
+        .lock()
+        .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+    if durable_records.contains(&identity) {
+        return Ok(());
+    }
+    if durable_records.len() >= inner.policy.max_stage_files {
+        return Err(GuardianCheckpointStageStoreError::Capacity);
+    }
+    durable_records
+        .try_reserve(1)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    durable_records.push(identity);
     Ok(())
 }
 
@@ -1911,6 +1935,38 @@ fn checkpoint_open_record(
     })?;
     if !identity.matches(&metadata_after) {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let durability_known = inner
+        .durable_records
+        .lock()
+        .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?
+        .contains(&identity);
+    if !durability_known {
+        // An O_EXCL creator can lose its reply after the data sync but before
+        // the directory sync, or a cooperating process can encounter a prior
+        // sync error. Re-synchronize each identity once per store incarnation
+        // before it can produce Ready/Progress/Sealed. The bounded cache avoids
+        // turning an ordered 1,024-chunk upload into quadratic fsync traffic.
+        file.sync_all().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-record-retry-sync", error)
+        })?;
+        inner.directory.sync_all().map_err(|error| {
+            GuardianCheckpointStageStoreError::io(
+                "checkpoint-record-retry-directory-sync",
+                error,
+            )
+        })?;
+        inner
+            .persistence
+            .validate(&inner.directory)
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+        validate_file_identity_at(
+            &inner.directory,
+            &inner.directory_path,
+            &entry.path,
+            identity,
+        )?;
+        checkpoint_remember_durable_record(inner, identity)?;
     }
     inner
         .persistence

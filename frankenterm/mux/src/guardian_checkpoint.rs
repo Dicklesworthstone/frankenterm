@@ -2951,6 +2951,7 @@ mod tests {
     use crate::guardian_output_journal::{
         GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
     };
+    use crate::guardian_protocol::GuardianCheckpointDescriptorV1;
     use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
     use frankenterm_term::{
         RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
@@ -3041,15 +3042,64 @@ mod tests {
         .expect("bind exact protocol capture generation")
     }
 
-    fn record_manifest_authority(
-        descriptor: &GuardianCheckpointArtifactDescriptorV1,
+    fn record_manifest_capabilities(
+        binding: &GuardianCheckpointStageBindingV1,
+        capture: LiveParserCheckpointAck,
+        upload_id: Uuid,
+        publication_id: Uuid,
+        candidate_record_digest: [u8; 32],
+        ordered_chunk_set_digest: [u8; 32],
+    ) -> GuardianCheckpointManifestSealCapabilitiesV1 {
+        let seal_request = record_seal_request(binding, &capture, upload_id);
+        GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(binding, capture)
+            .expect("consume exact record-backed seal authority")
+            .bind_seal_operation(
+                seal_request,
+                publication_id,
+                candidate_record_digest,
+                ordered_chunk_set_digest,
+            )
+            .expect("bind exact canonical manifest operation")
+    }
+
+    fn record_seal_request(
+        binding: &GuardianCheckpointStageBindingV1,
         capture: &LiveParserCheckpointAck,
-    ) -> GuardianCheckpointValidatedManifestAuthorityV1 {
-        GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(
-            descriptor,
-            capture,
+        upload_id: Uuid,
+    ) -> GuardianCheckpointStageRequestV1 {
+        let (pane_id, generation) = binding
+            .scope()
+            .pane_identity()
+            .expect("record manifest fixture uses pane scope");
+        let protocol_descriptor =
+            GuardianCheckpointDescriptorV1::from_live_capture(&capture, generation)
+                .expect("construct authoritative protocol descriptor");
+        let seal_request = GuardianCheckpointStageRequestV1::seal(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id,
+                generation,
+            },
+            upload_id,
+            protocol_descriptor,
+            4_096,
         )
-            .expect("validate exact record-backed seal authority")
+        .expect("construct canonical protocol Seal request")
+    }
+
+    fn default_record_manifest_capabilities(
+        binding: &GuardianCheckpointStageBindingV1,
+        capture: LiveParserCheckpointAck,
+        upload_id: Uuid,
+        publication_id: Uuid,
+    ) -> GuardianCheckpointManifestSealCapabilitiesV1 {
+        record_manifest_capabilities(
+            binding,
+            capture,
+            upload_id,
+            publication_id,
+            [0xa1; 32],
+            [0xb2; 32],
+        )
     }
 
     fn stage_plaintext(plaintext: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -3865,11 +3915,6 @@ mod tests {
         descriptor
             .validate_record_authority(segment, first)
             .expect("accept exact verified receipt");
-        GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(
-            &descriptor,
-            &capture,
-        )
-        .expect("exact live capture mints manifest authority");
         assert_eq!(
             descriptor.validate_record_authority(segment, second),
             Err(GuardianCheckpointBoundaryError::VerifiedOutputIdentityMismatch)
@@ -3918,13 +3963,31 @@ mod tests {
                 TerminalCheckpointLimits::default(),
             )
             .expect("claimed identity can match canonical caller bytes");
+        let claimed_binding = record_stage_binding(claimed_splice, 11);
         assert!(matches!(
             GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(
-                &claimed_splice,
-                &capture,
+                &claimed_binding,
+                capture,
             ),
             Err(GuardianCheckpointBoundaryError::LiveCaptureAuthorityMismatch)
         ));
+
+        let exact_capture = live_capture(
+            [2; 16],
+            pane,
+            segment,
+            first,
+            terminal_checkpoint(),
+        );
+        let exact_descriptor =
+            GuardianCheckpointArtifactDescriptorV1::from_live_capture(&exact_capture)
+                .expect("construct second exact descriptor");
+        let exact_binding = record_stage_binding(exact_descriptor, 11);
+        GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(
+            &exact_binding,
+            exact_capture,
+        )
+        .expect("only the consumed exact live capture mints authority");
     }
 
     fn checkpoint_stage_cipher(seed: u8) -> GuardianCheckpointCipher {
@@ -4007,7 +4070,6 @@ mod tests {
         let plaintext = b"bounded checkpoint staging plaintext";
         let (descriptor, _, _, capture) = record_descriptor();
         let binding = record_stage_binding(descriptor, 7);
-        let manifest_authority = record_manifest_authority(&descriptor, &capture);
         let upload_id = Uuid::new_v4();
         let publication_id = Uuid::new_v4();
         let intents = [
@@ -4027,14 +4089,6 @@ mod tests {
                 stage_plaintext(plaintext),
             )
             .expect("construct chunk intent"),
-            GuardianCheckpointStageSealIntentV1::seal_manifest(
-                &binding,
-                manifest_authority,
-                upload_id,
-                publication_id,
-                stage_plaintext(plaintext),
-            )
-            .expect("construct seal-manifest intent"),
         ];
         let cipher = checkpoint_stage_cipher(0x31);
 
@@ -4076,91 +4130,174 @@ mod tests {
             assert!(checkpoint_stage_bytes_match(opened.as_slice(), plaintext));
             drop(opened);
         }
+
+        let capabilities = default_record_manifest_capabilities(
+            &binding,
+            capture,
+            upload_id,
+            publication_id,
+        );
+        let (primary, retry) = capabilities.into_primary_and_retry();
+        let manifest_context = primary.context();
+        let manifest_record = cipher
+            .seal_manifest(primary)
+            .expect("seal typed canonical final manifest");
+        assert_eq!(
+            manifest_record.plaintext_bytes(),
+            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES
+        );
+        let reconstructed = GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+            &manifest_record.fixed_header(),
+            manifest_record.ciphertext().to_vec(),
+            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+        )
+        .expect("reconstruct bounded final manifest record");
+        assert_eq!(reconstructed.context(), manifest_context);
+        cipher
+            .open_manifest(retry.into_operation(), &reconstructed)
+            .expect("adopt only the exact canonical final manifest");
     }
 
     #[test]
     fn seal_intent_is_single_use_and_records_retain_only_persisted_claims() {
         assert!(std::mem::needs_drop::<GuardianCheckpointStageSealIntentV1>());
+        assert!(std::mem::needs_drop::<
+            GuardianCheckpointValidatedManifestOperationV1
+        >());
+        assert!(std::mem::needs_drop::<
+            GuardianCheckpointManifestRetryCapabilityV1
+        >());
+        assert!(std::mem::needs_drop::<
+            GuardianCheckpointManifestSealCapabilitiesV1
+        >());
         assert!(!std::mem::needs_drop::<
             GuardianCheckpointStageRecordContextV1
         >());
 
         let source = include_str!("guardian_checkpoint.rs");
-        let intent_start = source
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("isolate production source");
+        let intent_start = production
             .find("pub struct GuardianCheckpointStageSealIntentV1 {")
             .expect("find seal-intent declaration");
-        let intent_impl_start = source[intent_start..]
+        let intent_impl_start = production[intent_start..]
             .find("impl GuardianCheckpointStageSealIntentV1 {")
             .map(|offset| intent_start + offset)
             .expect("find seal-intent implementation");
-        let intent_debug_start = source[intent_impl_start..]
+        let intent_debug_start = production[intent_impl_start..]
             .find("impl std::fmt::Debug for GuardianCheckpointStageSealIntentV1")
             .map(|offset| intent_impl_start + offset)
             .expect("find seal-intent Debug implementation");
-        let intent_declaration = &source[intent_start..intent_impl_start];
-        let intent_implementation = &source[intent_impl_start..intent_debug_start];
+        let intent_declaration = &production[intent_start..intent_impl_start];
+        let intent_implementation = &production[intent_impl_start..intent_debug_start];
         assert!(intent_declaration.contains("Zeroizing<[u8; 32]>"));
         assert!(intent_declaration.contains("Zeroizing<Vec<u8>>"));
         assert!(!intent_declaration.contains("#[derive(Clone"));
-        assert_eq!(intent_implementation.matches("    pub fn ").count(), 3);
-        assert_eq!(
-            intent_implementation.matches("    pub const fn ").count(),
-            1
-        );
-        assert!(intent_implementation.contains("pub const fn context(&self)"));
-        assert!(intent_implementation
-            .contains("authority: GuardianCheckpointValidatedManifestAuthorityV1,"));
+        assert!(intent_implementation.contains("pub fn candidate_metadata("));
+        assert!(intent_implementation.contains("pub fn chunk("));
+        assert!(!intent_implementation.contains("seal_manifest"));
         assert!(!intent_implementation.contains("pub fn plaintext("));
-        assert!(!intent_implementation.contains("pub fn plaintext_digest("));
-        assert!(!intent_implementation.contains("pub const fn plaintext_digest("));
+        assert!(!intent_implementation.contains("plaintext_digest(&self"));
 
-        let cipher_impl_start = source
+        let authority_start = production
+            .find("pub struct GuardianCheckpointValidatedManifestAuthorityV1 {")
+            .expect("find manifest authority declaration");
+        let authority_impl_start = production[authority_start..]
+            .find("impl GuardianCheckpointValidatedManifestAuthorityV1 {")
+            .map(|offset| authority_start + offset)
+            .expect("find manifest authority implementation");
+        let authority_debug_start = production[authority_impl_start..]
+            .find("impl std::fmt::Debug for GuardianCheckpointValidatedManifestAuthorityV1")
+            .map(|offset| authority_impl_start + offset)
+            .expect("find manifest authority Debug implementation");
+        let authority_declaration = &production[authority_start..authority_impl_start];
+        let authority_implementation =
+            &production[authority_impl_start..authority_debug_start];
+        assert!(!authority_declaration.contains("#[derive(Clone"));
+        assert!(authority_implementation.contains("capture: LiveParserCheckpointAck,"));
+        assert!(!authority_implementation.contains("capture: &LiveParserCheckpointAck,"));
+        assert!(authority_implementation.contains("permit: GuardianCheckpointGenesisSpawnPermitV1,"));
+        assert!(!authority_implementation.contains("from_claimed"));
+        assert!(authority_implementation.contains("pub fn bind_seal_operation("));
+
+        let operation_start = production
+            .find("pub struct GuardianCheckpointValidatedManifestOperationV1 {")
+            .expect("find typed manifest operation declaration");
+        let operation_impl_start = production[operation_start..]
+            .find("impl GuardianCheckpointValidatedManifestOperationV1 {")
+            .map(|offset| operation_start + offset)
+            .expect("find typed manifest operation implementation");
+        let operation_declaration = &production[operation_start..operation_impl_start];
+        assert!(!operation_declaration.contains("#[derive(Clone"));
+        assert!(operation_declaration.contains("canonical_manifest: Zeroizing<Vec<u8>>"));
+        assert!(operation_declaration.contains("expected_manifest_digest: Zeroizing<[u8; 32]>"));
+        assert!(!operation_declaration.contains("pub canonical_manifest"));
+
+        let retry_start = production
+            .find("pub struct GuardianCheckpointManifestRetryCapabilityV1 {")
+            .expect("find retry capability declaration");
+        let retry_impl_start = production[retry_start..]
+            .find("impl GuardianCheckpointManifestRetryCapabilityV1 {")
+            .map(|offset| retry_start + offset)
+            .expect("find retry capability implementation");
+        let retry_declaration = &production[retry_start..retry_impl_start];
+        assert!(!retry_declaration.contains("#[derive(Clone"));
+        assert!(retry_declaration.contains("operation: GuardianCheckpointValidatedManifestOperationV1"));
+
+        let cipher_impl_start = production
             .find("impl GuardianCheckpointCipher {")
             .expect("find checkpoint cipher implementation");
-        let cipher_debug_start = source[cipher_impl_start..]
+        let cipher_debug_start = production[cipher_impl_start..]
             .find("impl std::fmt::Debug for GuardianCheckpointCipher")
             .map(|offset| cipher_impl_start + offset)
             .expect("find checkpoint cipher Debug implementation");
-        let cipher_implementation = &source[cipher_impl_start..cipher_debug_start];
-        assert!(cipher_implementation
-            .contains("intent: GuardianCheckpointStageSealIntentV1,"));
-        assert!(!cipher_implementation
-            .contains("intent: &GuardianCheckpointStageSealIntentV1,"));
+        let cipher_implementation = &production[cipher_impl_start..cipher_debug_start];
+        assert!(cipher_implementation.contains("intent: GuardianCheckpointStageSealIntentV1,"));
+        assert!(cipher_implementation.contains("operation: GuardianCheckpointValidatedManifestOperationV1,"));
+        let manifest_method_start = cipher_implementation
+            .find("    pub fn seal_manifest(")
+            .expect("find typed manifest cipher method");
+        let manifest_method_end = cipher_implementation[manifest_method_start..]
+            .find("    fn seal_exact_payload(")
+            .map(|offset| manifest_method_start + offset)
+            .expect("bound typed manifest cipher method");
+        let manifest_method = &cipher_implementation[manifest_method_start..manifest_method_end];
+        assert!(!manifest_method.contains("Zeroizing<Vec<u8>>"));
+        assert!(!manifest_method.contains("plaintext:"));
 
-        let permit_impl_start = source
+        let permit_impl_start = production
             .find("impl GuardianCheckpointGenesisSpawnPermitV1 {")
             .expect("find Genesis permit implementation");
-        let permit_debug_start = source[permit_impl_start..]
+        let permit_debug_start = production[permit_impl_start..]
             .find("impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1")
             .map(|offset| permit_impl_start + offset)
             .expect("find Genesis permit Debug implementation");
-        let permit_implementation = &source[permit_impl_start..permit_debug_start];
+        let permit_implementation = &production[permit_impl_start..permit_debug_start];
         assert!(permit_implementation.contains("#[cfg(test)]"));
-        assert!(permit_implementation.contains("fn issue_for_test(spawn_effect_id: Uuid)"));
         assert_eq!(permit_implementation.matches("fn ").count(), 1);
         assert!(!permit_implementation.contains("pub fn "));
-        assert!(!permit_implementation.contains("pub("));
-        assert!(!permit_implementation.contains("pub const fn "));
 
-        let context_start = source
+        let context_start = production
             .find("pub struct GuardianCheckpointStageRecordContextV1 {")
             .expect("find persisted context declaration");
-        let context_impl_start = source[context_start..]
+        let context_impl_start = production[context_start..]
             .find("impl GuardianCheckpointStageRecordContextV1 {")
             .map(|offset| context_start + offset)
             .expect("find persisted context implementation");
-        let context_declaration = &source[context_start..context_impl_start];
+        let context_declaration = &production[context_start..context_impl_start];
         assert!(!context_declaration.contains("plaintext_digest"));
         assert!(!context_declaration.contains("authority"));
 
-        let record_start = source
+        let record_start = production
             .find("pub struct GuardianEncryptedCheckpointStageRecordV1 {")
             .expect("find encrypted-record declaration");
-        let record_impl_start = source[record_start..]
+        let record_impl_start = production[record_start..]
             .find("impl GuardianEncryptedCheckpointStageRecordV1 {")
             .map(|offset| record_start + offset)
             .expect("find encrypted-record implementation");
-        let record_declaration = &source[record_start..record_impl_start];
+        let record_declaration = &production[record_start..record_impl_start];
         assert!(!record_declaration.contains("plaintext_digest"));
         assert!(!record_declaration.contains("authority"));
 
@@ -4188,8 +4325,8 @@ mod tests {
     }
 
     #[test]
-    fn repaired_checkpoint_format_rejects_source_exposed_v1_records() {
-        let plaintext = b"v2 checkpoint format fence";
+    fn repaired_checkpoint_format_rejects_source_exposed_v1_and_v2_records() {
+        let plaintext = b"v3 checkpoint format fence";
         let (descriptor, _, _, _) = record_descriptor();
         let binding = record_stage_binding(descriptor, 7);
         let intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
@@ -4198,32 +4335,35 @@ mod tests {
             Uuid::new_v4(),
             stage_plaintext(plaintext),
         )
-        .expect("construct v2 format intent");
+        .expect("construct v3 format intent");
         let cipher = checkpoint_stage_cipher(0x7b);
-        let record = cipher.seal(intent).expect("seal v2 format record");
+        let record = cipher.seal(intent).expect("seal v3 format record");
 
-        let mut v1_header = record.fixed_header();
-        v1_header[..8].copy_from_slice(b"FTGCPA01");
-        v1_header[8..12].copy_from_slice(&1_u32.to_le_bytes());
-        assert!(matches!(
-            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
-                &v1_header,
-                record.ciphertext().to_vec(),
-                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
-            ),
-            Err(GuardianCheckpointCipherError::InvalidFixedHeader)
-        ));
+        for (legacy_magic, legacy_version) in [(*b"FTGCPA01", 1_u32), (*b"FTGCPA02", 2_u32)] {
+            let mut legacy_header = record.fixed_header();
+            legacy_header[..8].copy_from_slice(&legacy_magic);
+            legacy_header[8..12].copy_from_slice(&legacy_version.to_le_bytes());
+            assert!(matches!(
+                GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                    &legacy_header,
+                    record.ciphertext().to_vec(),
+                    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+                ),
+                Err(GuardianCheckpointCipherError::InvalidFixedHeader)
+            ));
 
-        let mut version_only_splice = record.fixed_header();
-        version_only_splice[8..12].copy_from_slice(&1_u32.to_le_bytes());
-        assert!(matches!(
-            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
-                &version_only_splice,
-                record.ciphertext().to_vec(),
-                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
-            ),
-            Err(GuardianCheckpointCipherError::UnsupportedVersion { observed: 1 })
-        ));
+            let mut version_only_splice = record.fixed_header();
+            version_only_splice[8..12].copy_from_slice(&legacy_version.to_le_bytes());
+            assert!(matches!(
+                GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                    &version_only_splice,
+                    record.ciphertext().to_vec(),
+                    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+                ),
+                Err(GuardianCheckpointCipherError::UnsupportedVersion { observed })
+                    if observed == legacy_version
+            ));
+        }
     }
 
     #[test]
@@ -4351,9 +4491,9 @@ mod tests {
     }
 
     #[test]
-    fn seal_manifest_requires_exact_payload_and_origin_authority() {
-        let plaintext = b"authority-gated checkpoint record";
-        let (descriptor, _, _, capture) = record_descriptor();
+    fn seal_manifest_requires_consumed_origin_authority_and_exact_operation() {
+        let candidate_plaintext = b"authority-gated checkpoint record";
+        let (descriptor, segment, output, capture) = record_descriptor();
         let claimed_descriptor = GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
             descriptor
                 .recompute_boundary_identity_digest()
@@ -4379,7 +4519,7 @@ mod tests {
             &binding,
             upload_id,
             publication_id,
-            stage_plaintext(plaintext),
+            stage_plaintext(candidate_plaintext),
         )
         .expect("claimed descriptor authorizes candidate staging");
         cipher
@@ -4391,7 +4531,7 @@ mod tests {
             publication_id,
             0,
             0,
-            stage_plaintext(plaintext),
+            stage_plaintext(candidate_plaintext),
         )
         .expect("claimed descriptor authorizes chunk staging");
         cipher
@@ -4403,7 +4543,7 @@ mod tests {
                 &binding,
                 upload_id,
                 publication_id,
-                stage_plaintext(plaintext),
+                stage_plaintext(candidate_plaintext),
             )
             .expect("construct authority-kind mutation intent");
         manifest_without_authority.context.kind =
@@ -4413,62 +4553,173 @@ mod tests {
             Err(GuardianCheckpointCipherError::InvalidKindAuthority)
         ));
 
-        let manifest_authority =
-            GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(
-                &descriptor,
-                &capture,
-            )
-            .expect("derive manifest authority from exact live capture");
-        let mut candidate_with_manifest_authority =
-            GuardianCheckpointStageSealIntentV1::seal_manifest(
-                &binding,
-                manifest_authority,
-                upload_id,
-                publication_id,
-                stage_plaintext(plaintext),
-            )
-            .expect("construct validated manifest intent");
-        candidate_with_manifest_authority.context.kind =
-            GuardianCheckpointStageRecordKindV1::CandidateMetadata;
-        assert!(matches!(
-            cipher.seal(candidate_with_manifest_authority),
-            Err(GuardianCheckpointCipherError::InvalidKindAuthority)
-        ));
-
-        let manifest_authority =
-            GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(
-                &descriptor,
-                &capture,
-            )
-            .expect("derive one consumed manifest authority");
-        let manifest = GuardianCheckpointStageSealIntentV1::seal_manifest(
+        let capabilities = default_record_manifest_capabilities(
             &binding,
-            manifest_authority,
+            capture,
             upload_id,
             publication_id,
-            stage_plaintext(plaintext),
-        )
-        .expect("exact live capture authorizes manifest intent");
+        );
+        let (primary, retry) = capabilities.into_primary_and_retry();
+        assert_eq!(primary.context(), retry.context());
+        assert_eq!(
+            primary.context().kind(),
+            GuardianCheckpointStageRecordKindV1::SealManifest
+        );
+        assert_eq!(
+            primary.context().plaintext_bytes(),
+            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES
+        );
+        let record = cipher
+            .seal_manifest(primary)
+            .expect("seal internally constructed canonical manifest");
         cipher
-            .seal(manifest)
-            .expect("seal manifest under validated authority");
+            .open_manifest(retry.into_operation(), &record)
+            .expect("adopt only the separately bound exact retry");
 
         let (other_descriptor, _, _, other_capture) = record_descriptor();
-        let other_authority =
-            GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(
-                &other_descriptor,
-                &other_capture,
-            )
+        let other_binding = record_stage_binding(other_descriptor, 19);
+        let other_authority = GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture(
+            &other_binding,
+            other_capture,
+        )
             .expect("derive other exact live authority");
+        let target_capture = live_capture(
+            [3; 16],
+            descriptor
+                .origin()
+                .durable_pane_id()
+                .expect("target record pane"),
+            segment,
+            output,
+            terminal_checkpoint(),
+        );
+        let target_request = record_seal_request(&binding, &target_capture, upload_id);
         assert!(matches!(
-            GuardianCheckpointStageSealIntentV1::seal_manifest(
-                &binding,
-                other_authority,
-                upload_id,
+            other_authority.bind_seal_operation(
+                target_request,
                 publication_id,
-                stage_plaintext(plaintext),
+                [0xa1; 32],
+                [0xb2; 32],
             ),
             Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch)
+        ));
+
+        let pane_id = descriptor
+            .origin()
+            .durable_pane_id()
+            .expect("mutation fixture pane");
+        let fresh_operation = || {
+            let fresh_capture = live_capture(
+                [4; 16],
+                pane_id,
+                segment,
+                output,
+                terminal_checkpoint(),
+            );
+            let capabilities = default_record_manifest_capabilities(
+                &binding,
+                fresh_capture,
+                upload_id,
+                publication_id,
+            );
+            capabilities.into_primary_and_retry().0
+        };
+
+        let request_bytes = usize::try_from(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
+            .expect("request bytes fit usize");
+        let mut kind_substitution = fresh_operation();
+        kind_substitution.canonical_manifest[6] = 1;
+        assert!(kind_substitution.validate().is_err());
+
+        let mut scope_substitution = fresh_operation();
+        scope_substitution.canonical_manifest[16] ^= 1;
+        assert!(scope_substitution.validate().is_err());
+
+        let mut upload_substitution = fresh_operation();
+        upload_substitution.canonical_manifest[40] ^= 1;
+        assert!(upload_substitution.validate().is_err());
+
+        let mut descriptor_substitution = fresh_operation();
+        descriptor_substitution.canonical_manifest[56] ^= 1;
+        assert!(descriptor_substitution.validate().is_err());
+
+        let mut candidate_digest_substitution = fresh_operation();
+        candidate_digest_substitution.canonical_manifest[request_bytes] ^= 1;
+        assert!(matches!(
+            candidate_digest_substitution.validate(),
+            Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch)
+        ));
+
+        let mut chunk_set_digest_substitution = fresh_operation();
+        chunk_set_digest_substitution.canonical_manifest[request_bytes + 32] ^= 1;
+        assert!(matches!(
+            chunk_set_digest_substitution.validate(),
+            Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch)
+        ));
+
+        let mut zero_candidate_digest = fresh_operation();
+        zero_candidate_digest.canonical_manifest[request_bytes..request_bytes + 32].fill(0);
+        assert!(matches!(
+            zero_candidate_digest.validate(),
+            Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest)
+        ));
+
+        let mut length_substitution = fresh_operation();
+        length_substitution.canonical_manifest.pop();
+        assert!(matches!(
+            length_substitution.validate(),
+            Err(GuardianCheckpointCipherError::InvalidSealManifestLength)
+        ));
+
+        let mut context_kind_substitution = fresh_operation();
+        context_kind_substitution.context.kind =
+            GuardianCheckpointStageRecordKindV1::CandidateMetadata;
+        assert!(context_kind_substitution.validate().is_err());
+
+        let mut context_scope_substitution = fresh_operation();
+        context_scope_substitution.context.scope =
+            GuardianCheckpointStageScopeV1::pane(pane_id, 20)
+                .expect("construct substituted scope");
+        assert!(context_scope_substitution.validate().is_err());
+
+        let mut context_upload_substitution = fresh_operation();
+        context_upload_substitution.context.upload_id = Uuid::new_v4();
+        assert!(context_upload_substitution.validate().is_err());
+
+        let mut context_publication_substitution = fresh_operation();
+        context_publication_substitution.context.publication_id = Uuid::new_v4();
+        assert!(matches!(
+            context_publication_substitution.validate(),
+            Err(GuardianCheckpointCipherError::SealOperationIdentityMismatch)
+        ));
+
+        let mut context_boundary_substitution = fresh_operation();
+        context_boundary_substitution.context.boundary_identity_digest[0] ^= 1;
+        assert!(context_boundary_substitution.validate().is_err());
+
+        let mut context_checkpoint_substitution = fresh_operation();
+        context_checkpoint_substitution.context.checkpoint_identity_digest[0] ^= 1;
+        assert!(context_checkpoint_substitution.validate().is_err());
+
+        let mut plaintext_digest_substitution = fresh_operation();
+        plaintext_digest_substitution.expected_plaintext_digest[0] ^= 1;
+        assert!(matches!(
+            plaintext_digest_substitution.validate(),
+            Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
+        ));
+
+        let mut manifest_digest_substitution = fresh_operation();
+        manifest_digest_substitution.expected_manifest_digest[0] ^= 1;
+        assert!(matches!(
+            manifest_digest_substitution.validate(),
+            Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch)
+        ));
+
+        let mut operation_digest_substitution = fresh_operation();
+        operation_digest_substitution.expected_operation_digest[0] ^= 1;
+        assert!(matches!(
+            operation_digest_substitution.validate(),
+            Err(GuardianCheckpointCipherError::SealOperationIdentityMismatch)
         ));
 
         let spawn_effect_id = Uuid::new_v4();
@@ -4479,38 +4730,6 @@ mod tests {
                 &genesis_terminal,
             )
             .expect("construct Genesis authority descriptor");
-        assert!(matches!(
-            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
-                &genesis_descriptor,
-                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(Uuid::new_v4()),
-                &genesis_terminal,
-            ),
-            Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch)
-        ));
-        assert!(matches!(
-            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
-                &descriptor,
-                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
-                &genesis_terminal,
-            ),
-            Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority)
-        ));
-        let genesis_splice = terminal_checkpoint_with(24, 80, "guardian-checkpoint-tesz");
-        assert!(matches!(
-            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
-                &genesis_descriptor,
-                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
-                &genesis_splice,
-            ),
-            Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
-        ));
-        let genesis_authority =
-            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
-                &genesis_descriptor,
-                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
-                &genesis_terminal,
-            )
-            .expect("mint exact Genesis terminal and retained Spawn authority");
         let genesis_scope = GuardianCheckpointStageScopeV1::genesis(spawn_effect_id)
             .expect("construct exact Genesis scope");
         let genesis_binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
@@ -4519,17 +4738,69 @@ mod tests {
             GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION,
         )
         .expect("bind exact Genesis capture generation");
-        let genesis_manifest = GuardianCheckpointStageSealIntentV1::seal_manifest(
-            &genesis_binding,
-            genesis_authority,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            stage_plaintext(plaintext),
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                &genesis_binding,
+                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(Uuid::new_v4()),
+                &genesis_terminal,
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch)
+        ));
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                &binding,
+                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
+                &genesis_terminal,
+            ),
+            Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority)
+        ));
+        let genesis_splice = terminal_checkpoint_with(24, 80, "guardian-checkpoint-tesz");
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                &genesis_binding,
+                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
+                &genesis_splice,
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
+        ));
+        let genesis_authority =
+            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                &genesis_binding,
+                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
+                &genesis_terminal,
+            )
+            .expect("mint exact Genesis terminal and retained Spawn authority");
+        let genesis_upload_id = Uuid::new_v4();
+        let genesis_publication_id = Uuid::new_v4();
+        let genesis_protocol_descriptor =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(
+                spawn_effect_id,
+                &genesis_terminal,
+            )
+            .expect("construct authoritative Genesis protocol descriptor");
+        let genesis_request = GuardianCheckpointStageRequestV1::seal(
+            GuardianCheckpointScopeV1::Genesis { spawn_effect_id },
+            genesis_upload_id,
+            genesis_protocol_descriptor,
+            4_096,
         )
-        .expect("construct exact Genesis manifest authority");
+        .expect("construct canonical Genesis Seal request");
+        let genesis_capabilities = genesis_authority
+            .bind_seal_operation(
+                genesis_request,
+                genesis_publication_id,
+                [0xc3; 32],
+                [0xd4; 32],
+            )
+            .expect("bind exact Genesis manifest operation");
+        let (genesis_primary, genesis_retry) =
+            genesis_capabilities.into_primary_and_retry();
+        let genesis_record = cipher
+            .seal_manifest(genesis_primary)
+            .expect("seal Genesis manifest under retained Spawn authority");
         cipher
-            .seal(genesis_manifest)
-            .expect("seal Genesis manifest under validated authority");
+            .open_manifest(genesis_retry.into_operation(), &genesis_record)
+            .expect("adopt exact Genesis manifest retry");
     }
 
     #[test]
@@ -4859,50 +5130,33 @@ mod tests {
 
     #[test]
     fn checkpoint_cipher_uses_fresh_random_nonces() {
-        let plaintext = b"random nonce checkpoint fixture";
         let (descriptor, _, _, capture) = record_descriptor();
         let binding = record_stage_binding(descriptor, 13);
         let upload_id = Uuid::new_v4();
         let publication_id = Uuid::new_v4();
-        let first_intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
+        let capabilities = default_record_manifest_capabilities(
             &binding,
-            record_manifest_authority(&descriptor, &capture),
+            capture,
             upload_id,
             publication_id,
-            stage_plaintext(plaintext),
-        )
-        .expect("construct first manifest intent");
-        let context = first_intent.context();
-        let second_intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
-            &binding,
-            record_manifest_authority(&descriptor, &capture),
-            upload_id,
-            publication_id,
-            stage_plaintext(plaintext),
-        )
-        .expect("construct deterministic retry manifest intent");
-        assert_eq!(second_intent.context(), context);
+        );
+        let (primary, retry) = capabilities.into_primary_and_retry();
+        let context = primary.context();
+        assert_eq!(retry.context(), context);
         let cipher = checkpoint_stage_cipher(0x61);
-        let first = cipher.seal(first_intent).expect("seal first record");
+        let first = cipher
+            .seal_manifest(primary)
+            .expect("seal primary manifest record");
         let second = cipher
-            .seal(second_intent)
-            .expect("seal retry record");
+            .seal_manifest(retry.into_operation())
+            .expect("seal the one exact retry manifest record");
         let first_header = first.fixed_header();
         let second_header = second.fixed_header();
 
         assert_ne!(&first_header[24..48], &second_header[24..48]);
         assert_ne!(first.ciphertext(), second.ciphertext());
-        for record in [&first, &second] {
-            let opened = cipher
-                .open(
-                    &context,
-                    record,
-                    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
-                )
-                .expect("open independently randomized record");
-            assert!(checkpoint_stage_bytes_match(opened.as_slice(), plaintext));
-            drop(opened);
-        }
+        assert_eq!(first.context(), context);
+        assert_eq!(second.context(), context);
     }
 
     #[test]
@@ -4941,7 +5195,7 @@ mod tests {
         let expected_plaintext = b"alpha-secret";
         let substituted_plaintext = b"omega-secret";
         assert_eq!(expected_plaintext.len(), substituted_plaintext.len());
-        let (descriptor, _, _, capture) = record_descriptor();
+        let (descriptor, _, _, _) = record_descriptor();
         let binding = record_stage_binding(descriptor, 17);
         let candidate_intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
             &binding,
@@ -4951,29 +5205,20 @@ mod tests {
         )
         .expect("construct candidate intent");
         let candidate_context = candidate_intent.context();
-        let manifest_intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
-            &binding,
-            record_manifest_authority(&descriptor, &capture),
-            candidate_context.upload_id(),
-            candidate_context.publication_id(),
-            stage_plaintext(expected_plaintext),
-        )
-        .expect("construct manifest intent");
         let cipher = checkpoint_stage_cipher(0x72);
 
-        for mut intent in [candidate_intent, manifest_intent] {
-            for (destination, source) in intent
-                .plaintext
-                .iter_mut()
-                .zip(substituted_plaintext.iter())
-            {
-                *destination = *source;
-            }
-            assert!(matches!(
-                cipher.seal(intent),
-                Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
-            ));
+        let mut substituted_intent = candidate_intent;
+        for (destination, source) in substituted_intent
+            .plaintext
+            .iter_mut()
+            .zip(substituted_plaintext.iter())
+        {
+            *destination = *source;
         }
+        assert!(matches!(
+            cipher.seal(substituted_intent),
+            Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
+        ));
 
         let mut length_spliced_intent =
             GuardianCheckpointStageSealIntentV1::candidate_metadata(
