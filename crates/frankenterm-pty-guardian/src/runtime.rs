@@ -1936,7 +1936,9 @@ mod tests {
             payload,
         );
         let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
-        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        let frame = Zeroizing::new(
+            encode_guardian_request(&secret, &request).expect("test request encodes"),
+        );
         decode_guardian_request(&secret, &frame).expect("test request authenticates")
     }
 

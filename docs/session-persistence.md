@@ -506,10 +506,10 @@ must stop reads rather than allocate an unbounded per-pane backlog. A platform
 without a safe supported readiness/child-reaping implementation remains on the
 explicit legacy mux-owned path; it must not silently claim guardian continuity.
 
-#### Guardian protocol v3 freeze
+#### Guardian protocol v4 wire contract and activation status
 
-The first implementation must use one length-delimited binary frame with a
-fixed protocol version and a hard encoded-frame ceiling. Authentication is an
+The current protocol version is v4. It uses one length-delimited binary frame
+with a hard encoded-frame ceiling. Authentication is an
 HMAC-SHA-256 over the exact versioned header and payload bytes using a random
 32-byte token read from the private guardian token file; the token itself is
 never serialized, logged, or accepted from a command-line argument. The server
@@ -595,11 +595,18 @@ ceilings in addition to the global protocol cap. Each fixed-width row carries pa
 state, generation, claiming mux and next sequence when live, pending input
 identity, exit status, and quarantine reason.
 `Claim` names the observed prior generation and returns exactly the next
-generation; it cannot skip, wrap, or revive a terminal pane. The frozen base
-`Attach` reply acknowledges only the exact pane, generation, and next mutation
-sequence. Checkpoint and bounded raw-output replay transfer belong to the later
-output-journal protocol tranche; the identity-only base reply must not be
-described as continuity evidence.
+generation; it cannot skip, wrap, or revive a terminal pane. The base `Attach`
+reply acknowledges only the exact pane, generation, and next mutation sequence;
+that identity-only reply is not continuity evidence. Protocol v4 now defines
+bounded typed codecs for content-addressed `CheckpointStage` begin/chunk/seal
+requests and replies, `Checkpoint` publication intents and receipts, paginated
+`Replay` requests and pages, and cumulative `ReplayAck` requests and receipts.
+Those are wire and pure-state surfaces, not a live checkpoint service. The
+standalone guardian runtime still rejects `Checkpoint`, `CheckpointStage`,
+`Replay`, and `ReplayAck` instead of dispatching them. Durable checkpoint
+artifact storage/publication, runtime checkpoint dispatch, the replay service,
+retention-watermark advancement, and automated live migration remain
+unimplemented and withheld.
 
 `Input`, `Resize`, `Signal`, live-pane `Close`, `Checkpoint`, and
 `RetireLease` require the exact current lease. Mutation operations consume the
@@ -622,10 +629,11 @@ attempt; `KnownNotApplied` is a terminal proof that zero bytes were applied,
 while `disposition_unavailable` requires operator/runtime reconciliation
 without replay. A newly accepted input acknowledgement can contain only
 `accepted_not_durable`, `durable_full`, a valid exact `durable_prefix`, or
-`known_not_applied`, never either query-only state. Resize, signal,
-close, and checkpoint operations
+`known_not_applied`, never either query-only state. At the
+protocol/state-machine layer, resize, signal, close, and checkpoint operations
 have the same request-digest replay rule, so an ambiguous response is queried
-or replayed by identity rather than converted into a second effect.
+or replayed by identity rather than converted into a second effect. This
+checkpoint rule does not imply runtime checkpoint dispatch.
 
 The protocol contract requires runtime effects to pass through a transactional
 API rather than the pure observation surface. Authentication, incarnation,
@@ -640,21 +648,30 @@ reconciled by its exact effect UUID; it must never be reported as a safely
 retryable callback failure.
 
 The typed input and checkpoint protocol primitives implement that stronger
-pre-reserved commit pattern. Live guardian `Input` dispatch is nevertheless
-fail-closed before protocol admission, journal I/O, or a PTY write: the current
-transport requires an immediate response on its sole readiness thread and has
-no bounded delayed-response continuation owner. `GuardianService` exposes the
-content-free `input_activation_rejections` counter so operators and tests can
-distinguish this activation fence from transport loss. The generic in-memory
-transaction path for `Spawn`, `Resize`, `Signal`, live-pane `Close`, `Claim`,
-and `RetireLease` now pre-reserves its receipt maps, reverse indexes, protected
-identities, and
-queues and installs a conservative pane quarantine before invoking the external
-callback. A definitely-not-applied result restores the exact prior pane state;
-an applied result commits the already-reserved receipt; and a panic or
-indeterminate result retains both the exact effect identity and a non-retryable
-quarantine. Exact request/effect replay therefore cannot invoke the callback a
-second time merely because an in-process allocation or callback panic occurred.
+pre-reserved commit pattern. Live guardian `Input` now takes the owned transport
+path: the authenticated request and its exact connection-generation,
+request-ID, and effect-ID route move to one fixed worker through a capacity-one
+queue. That worker temporarily owns the protocol state, target pane writer, and
+descriptor-pinned encrypted input journal; it synchronizes admission before the
+one PTY write, records the exact outcome, wipes plaintext, and returns a delayed
+completion to the readiness loop. The loop delivers that completion only to the
+still-matching connection route. Saturation or an unavailable pre-submit worker
+or pane authority closes retryably before submission, without a write or a
+fabricated terminal rejection; a panic or indeterminate completion quarantines
+the effect instead of authorizing a retry.
+The borrowed `dispatch` path still rejects `Input` so transport cannot bypass
+this owned continuation; `input_activation_rejections` counts that invalid
+bypass, not ordinary live input activation. The generic in-memory transaction
+path for `Spawn`, `Resize`, `Signal`, live-pane `Close`, `Claim`, and
+`RetireLease` pre-reserves its receipt maps, reverse indexes, protected
+identities, and queues and installs a conservative pane quarantine before
+invoking the external callback. A definitely-not-applied result restores the
+exact prior pane state; an applied result commits the already-reserved receipt;
+and a panic or indeterminate result retains both the exact effect identity and
+a non-retryable quarantine. Exact request/effect replay therefore cannot invoke
+the callback a second time merely because an in-process allocation or callback
+panic occurred. These are current source paths, not executed restart or
+migration evidence.
 
 That is still only live guardian-process authority, not crash durability. The
 generic effect identities, receipts, and quarantine transitions are not yet
@@ -662,15 +679,15 @@ synchronized to a restart-recoverable protocol journal before the external
 boundary, and each runtime adapter must still prove that every error it labels
 definitely-not-applied really has zero observable effect. Response construction
 after a successful commit must also close the connection for exact receipt
-replay rather than emit a terminal negative acknowledgment. Guardian service
-activation and mux-upgrade continuity remain withheld until durable generic
-effect recovery, operation-specific reconciliation of ambiguous outcomes, and
+replay rather than emit a terminal negative acknowledgment. Guardian restart
+recovery and mux-upgrade continuity remain withheld until durable generic effect
+recovery, operation-specific reconciliation of ambiguous outcomes, and
 mutation-sensitive crash/fault cuts prove that no observable effect can execute
 twice across guardian restart.
 
-The guardian input-effect journal is a withheld storage primitive for making
-that callback rule crash-safe without persisting raw keystrokes. Before it can
-publish a new Intent, it reserves record, byte, and sequence capacity for the
+The guardian input-effect journal is the live `Input` storage primitive that
+synchronizes transaction evidence without persisting raw keystrokes. Before it
+can publish a new Intent, it reserves record, byte, and sequence capacity for the
 complete Intent + `accepted_not_durable` + terminal lifecycle, including every
 follow-up already promised to another incomplete effect. Capacity exhaustion
 therefore occurs before a write permit can exist. For each admitted input the
@@ -699,18 +716,17 @@ clear framing and predecessor digest, and scanning enforces monotonic journal
 order,
 lease-generation input order, exact legal transitions, bounded effect/record
 counts, and immutable torn-tail preservation. Per-phase synchronized receipts
-make an exact publication retry idempotent after acknowledgement loss. This is
-currently a storage primitive, not an active runtime path. Activation requires
-a bounded per-pane ordered worker/continuation pipeline that owns response
-correlation after the readiness callback returns. Restart recovery additionally
-requires a durable anti-rollback high-water authority: accepting only a valid
-file prefix is insufficient because removal of a terminal suffix could otherwise
-make executed input appear safely unapplied. Accordingly, a scanned Intent maps
-to `disposition_unavailable`, every reopened log (including a valid header-only
+make an exact publication retry idempotent after acknowledgement loss. The
+standalone runtime now opens this descriptor-pinned journal per pane and routes
+live `Input` through the bounded owned-input worker/continuation pipeline.
+Restart recovery additionally requires a durable anti-rollback high-water
+authority: accepting only a valid file prefix is insufficient because removal
+of a terminal suffix could otherwise make executed input appear safely
+unapplied. Accordingly, a scanned Intent maps to
+`disposition_unavailable`, every reopened log (including a valid header-only
 prefix) withholds append authority, and only exact idempotent receipt reads
-remain available. Until both mechanisms land and mutation-sensitive crash cuts
-pass, the runtime rejects `Input`; this is not live input-durability or
-mux-crash continuity evidence.
+remain available. Live input inside the current guardian process is therefore
+implemented, but guardian-restart recovery and mux-crash continuity are not.
 
 The older v1 journal first appeared after the latest tagged release and is not
 wired by any released runtime caller. Its fieldless `Durable` state cannot prove
@@ -738,19 +754,24 @@ uses an exact mux-incarnation retirement transition: unambiguous leases become
 `live_unclaimed`, while a pane with `accepted_not_durable` input remains pinned
 until its journal disposition resolves, after which retirement is retried. The
 transition is idempotent, rejects nil identity, and cannot affect panes already
-claimed by a successor incarnation. Child exit preserves census, replay, checkpoint, effect-query, and
-retention-close authority but permanently rejects new PTY/process mutations.
+claimed by a successor incarnation. The pure state machine preserves the
+identities required for future replay, checkpoint, effect-query, and
+retention-close authority after child exit, while permanently rejecting new
+PTY/process mutations. The current runtime exposes census and effect-query
+behavior but does not yet dispatch checkpoint, replay, or retention advancement.
 An accepted input whose
 durable/terminal disposition is still ambiguous survives child exit and blocks
 lease takeover, retirement, and terminal close until that exact effect identity
 is reconciled. `closed_terminal` is queryable through the bounded idempotency
 window but cannot be claimed or spawned under the same durable pane UUID.
-Full terminal output/checkpoint state may be compacted under the declared
-retention policy, but the pane UUID and original spawn request/effect identity
-remain as a durable tombstone. Reaching the pane/tombstone ceiling fails closed;
-it never auto-evicts a tombstone to admit a new spawn. Reclamation requires a
-separately authenticated explicit retention transaction with a durable receipt,
-and a reclaimed UUID is never implicitly reusable as a new process identity.
+A future retention service may compact full terminal output/checkpoint state
+under the declared policy, but it must retain the pane UUID and original spawn
+request/effect identity as a durable tombstone. No live retention advancement
+or reclamation transaction is implemented today. The state-machine ceiling
+fails closed rather than auto-evicting a tombstone to admit a new spawn; future
+reclamation requires a separately authenticated explicit transaction with a
+durable receipt, and a reclaimed UUID must never be implicitly reusable as a
+new process identity.
 Guardian incarnation rollover invalidates all transport sessions and requires a
 fresh census; persisted pane generation never decreases. Exhaustion of a
 generation, mutation sequence, output sequence, or idempotency counter is a
@@ -765,13 +786,15 @@ implementation must first prove them with deterministic pure-state tests and
 bounded-codec negative controls; only the later real PTY and SIGKILL lanes can
 prove live-process survival.
 
-A transactional mux upgrade may therefore stage and verify a same-build mux,
+An eventual transactional mux upgrade may stage and verify a same-build mux,
 capture and verify a content dump, stop accepting new mux mutations, retire the
 old mux lease, start the successor, claim/replay every guardian pane, verify
 topology and content digests, and only then commit the service-manager pointer.
-Before the guardian contract is live, the same command must fail closed when a
-mux owns live PTYs; it may offer a verified content dump and a disruptive
-restart, but it must never label that path lossless.
+That automated live-migration transaction is not implemented. Until durable
+checkpoint storage, checkpoint runtime dispatch, replay, retention advancement,
+and restart recovery are all live and proven, an upgrade command must fail
+closed when a mux owns live PTYs; it may offer a verified content dump and a
+disruptive restart, but it must never label that path lossless.
 
 ### Live mux content dump
 
