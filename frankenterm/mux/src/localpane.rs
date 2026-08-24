@@ -1,4 +1,5 @@
 use crate::domain::DomainId;
+use crate::guardian_checkpoint::{LiveParserCaptureAuthority, LiveParserPaneCaptureError};
 use crate::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
     SearchResult, WithPaneLines,
@@ -16,8 +17,10 @@ use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
     Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
-    SemanticZone, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
+    RecoveryTerminalCheckpointV2, SemanticZone, StableRowIndex, Terminal, TerminalConfiguration,
+    TerminalSize,
 };
+use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use procinfo::LocalProcessInfo;
@@ -1185,6 +1188,24 @@ impl Pane for LocalPane {
             // ft-87qfi: lock-free SPSC staging — see `perform_actions_disruptor`.
             self.perform_actions_disruptor(actions);
         }
+    }
+
+    fn capture_live_parser_checkpoint(
+        &self,
+        _authority: LiveParserCaptureAuthority,
+        pending_actions: &mut Vec<Action>,
+        ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<RecoveryTerminalCheckpointV2, LiveParserPaneCaptureError> {
+        // `locked_terminal` drains the optional disruptor ring before it
+        // returns. Apply this parser's still-local actions under the same lock,
+        // then retain the lock through model serialization so no observer can
+        // splice a newer model onto the parser witness.
+        let mut terminal = self.locked_terminal();
+        terminal.perform_actions(std::mem::take(pending_actions));
+        terminal
+            .capture_recovery_checkpoint_at_external_parser_ground(ground, limits)
+            .map_err(LiveParserPaneCaptureError::Terminal)
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {

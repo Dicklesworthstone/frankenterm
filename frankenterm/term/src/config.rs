@@ -496,6 +496,18 @@ impl ScrollbackSnapshotGeneration {
             revision,
         }
     }
+
+    /// Opaque durable-content lineage used by authenticated recovery data.
+    ///
+    /// Callers must keep this value inside the same confidentiality boundary as
+    /// terminal checkpoint content; `Debug` intentionally never exposes it.
+    pub const fn content_epoch(self) -> [u8; 16] {
+        self.content_epoch
+    }
+
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
 }
 
 impl std::fmt::Debug for ScrollbackSnapshotGeneration {
@@ -539,6 +551,7 @@ pub enum ScrollbackSpillError {
     },
     ArithmeticOverflow(&'static str),
     SnapshotRangeMismatch,
+    SnapshotGenerationMismatch,
     SnapshotRowMissing,
     StorageUnavailable,
     RevisionExhausted,
@@ -564,6 +577,9 @@ impl std::fmt::Display for ScrollbackSpillError {
             Self::SnapshotRangeMismatch => {
                 formatter.write_str("cold scrollback snapshot range mismatch")
             }
+            Self::SnapshotGenerationMismatch => {
+                formatter.write_str("cold scrollback snapshot generation mismatch")
+            }
             Self::SnapshotRowMissing => {
                 formatter.write_str("cold scrollback snapshot row missing")
             }
@@ -581,6 +597,59 @@ impl std::fmt::Display for ScrollbackSpillError {
 }
 
 impl std::error::Error for ScrollbackSpillError {}
+
+/// Content-free failure of the recovery-to-live scrollback retiering
+/// transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbackActivationError {
+    MissingRecoveryBoundary,
+    InvalidRecoveryBoundary,
+    ConfiguredRetentionInsufficient,
+    MissingStorageCapability,
+    Spill(ScrollbackSpillError),
+    /// The sink reported success, but its receipt did not prove the exact
+    /// publication requested by the terminal. Publication may already be
+    /// durable, so this outcome must never be retried against the stale
+    /// checkpoint generation.
+    CommitOutcomeIndeterminate,
+}
+
+impl ScrollbackActivationError {
+    /// Whether retrying this activation against the checkpoint generation
+    /// could overwrite or conflict with a publication that may already be
+    /// durable.
+    pub const fn outcome_is_indeterminate(self) -> bool {
+        matches!(
+            self,
+            Self::CommitOutcomeIndeterminate
+                | Self::Spill(ScrollbackSpillError::CommitOutcomeIndeterminate)
+        )
+    }
+}
+
+impl std::fmt::Display for ScrollbackActivationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingRecoveryBoundary => {
+                formatter.write_str("recovery cold-prefix boundary is missing")
+            }
+            Self::InvalidRecoveryBoundary => {
+                formatter.write_str("recovery cold-prefix boundary is inconsistent")
+            }
+            Self::ConfiguredRetentionInsufficient => formatter
+                .write_str("live scrollback retention cannot preserve every recovered row"),
+            Self::MissingStorageCapability => {
+                formatter.write_str("live configuration has no required cold-store capability")
+            }
+            Self::Spill(error) => std::fmt::Display::fmt(error, formatter),
+            Self::CommitOutcomeIndeterminate => {
+                formatter.write_str("cold-store replacement outcome is indeterminate")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScrollbackActivationError {}
 
 /// Immutable, contiguous rows captured under one sink-owned mutation boundary.
 ///
@@ -684,6 +753,132 @@ impl std::fmt::Debug for ScrollbackSnapshot {
     }
 }
 
+/// Borrowed exact-semantic prefix offered to an atomic cold-store replacement.
+///
+/// A `VecDeque` may wrap, so the prefix is represented as at most two slices.
+/// Construction proves that those slices exactly cover the declared stable-row
+/// range. `Debug` reports only bounded structural metadata and never row
+/// content.
+pub struct ScrollbackPrefix<'rows> {
+    oldest_stable_row: Option<StableRowIndex>,
+    newest_stable_row_exclusive: StableRowIndex,
+    first: &'rows [Line],
+    second: &'rows [Line],
+}
+
+impl<'rows> ScrollbackPrefix<'rows> {
+    pub fn from_slices(
+        oldest_stable_row: Option<StableRowIndex>,
+        newest_stable_row_exclusive: StableRowIndex,
+        first: &'rows [Line],
+        second: &'rows [Line],
+    ) -> Result<Self, ScrollbackSpillError> {
+        let row_count = first
+            .len()
+            .checked_add(second.len())
+            .ok_or(ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+        match (oldest_stable_row, row_count) {
+            (None, 0) => {}
+            (Some(oldest), count) if count != 0 => {
+                let count = StableRowIndex::try_from(count)
+                    .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+                let observed_newest = oldest.checked_add(count).ok_or(
+                    ScrollbackSpillError::ArithmeticOverflow("stable_row_range"),
+                )?;
+                if observed_newest != newest_stable_row_exclusive {
+                    return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+                }
+            }
+            _ => return Err(ScrollbackSpillError::SnapshotRangeMismatch),
+        }
+        Ok(Self {
+            oldest_stable_row,
+            newest_stable_row_exclusive,
+            first,
+            second,
+        })
+    }
+
+    pub const fn oldest_stable_row(&self) -> Option<StableRowIndex> {
+        self.oldest_stable_row
+    }
+
+    pub const fn newest_stable_row_exclusive(&self) -> StableRowIndex {
+        self.newest_stable_row_exclusive
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.first.len() + self.second.len()
+    }
+
+    pub fn rows(&self) -> impl Iterator<Item = &'rows Line> + '_ {
+        self.first.iter().chain(self.second.iter())
+    }
+}
+
+impl std::fmt::Debug for ScrollbackPrefix<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScrollbackPrefix")
+            .field("oldest_stable_row", &self.oldest_stable_row)
+            .field(
+                "newest_stable_row_exclusive",
+                &self.newest_stable_row_exclusive,
+            )
+            .field("row_count", &self.row_count())
+            .finish()
+    }
+}
+
+/// Receipt proving that a complete cold-prefix replacement reached its durable
+/// logical commit point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbackReplaceCommit {
+    generation: ScrollbackSnapshotGeneration,
+    oldest_stable_row: Option<StableRowIndex>,
+    newest_stable_row_exclusive: StableRowIndex,
+}
+
+impl ScrollbackReplaceCommit {
+    pub const fn new(
+        generation: ScrollbackSnapshotGeneration,
+        oldest_stable_row: Option<StableRowIndex>,
+        newest_stable_row_exclusive: StableRowIndex,
+    ) -> Self {
+        Self {
+            generation,
+            oldest_stable_row,
+            newest_stable_row_exclusive,
+        }
+    }
+
+    pub const fn generation(self) -> ScrollbackSnapshotGeneration {
+        self.generation
+    }
+
+    pub const fn oldest_stable_row(self) -> Option<StableRowIndex> {
+        self.oldest_stable_row
+    }
+
+    pub const fn newest_stable_row_exclusive(self) -> StableRowIndex {
+        self.newest_stable_row_exclusive
+    }
+}
+
+impl std::fmt::Debug for ScrollbackReplaceCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScrollbackReplaceCommit")
+            .field("generation", &self.generation)
+            .field("oldest_stable_row", &self.oldest_stable_row)
+            .field(
+                "newest_stable_row_exclusive",
+                &self.newest_stable_row_exclusive,
+            )
+            .finish()
+    }
+}
+
 /// Receipt proving that a logical clear reached its durable commit point.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ScrollbackClearCommit {
@@ -765,6 +960,37 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         limits: ScrollbackSnapshotLimits,
     ) -> Result<ScrollbackSnapshot, ScrollbackSpillError>;
 
+    /// Compare-and-swap the complete logical cold store to one exact prefix.
+    ///
+    /// The implementation must hold a single mutation boundary while it:
+    ///
+    /// 1. verifies `expected_generation` equals the currently published
+    ///    generation (or, for `None`, verifies that no logical rows exist),
+    /// 2. validates and stages every exact-semantic row without truncation,
+    /// 3. durably publishes a manifest that names exactly `prefix`, and
+    /// 4. removes every stale logical prefix or suffix from reachability.
+    ///
+    /// A successful empty prefix is an atomic logical replacement with an
+    /// empty set, not a clear-then-store sequence. If `prefix.row_count()`
+    /// exceeds `max_retained_rows`, the method must reject it rather than drop
+    /// rows. The returned receipt must name the exact requested half-open
+    /// range. Its generation must preserve the predecessor content epoch and
+    /// advance its revision by exactly one when `expected_generation` is
+    /// `Some`; after `None`, the returned revision must be nonzero. Ordinary
+    /// errors prove that no logical publication occurred; indeterminate
+    /// publication must quarantine the sink and return
+    /// [`ScrollbackSpillError::CommitOutcomeIndeterminate`]. A caller that
+    /// observes a malformed success receipt must likewise treat publication as
+    /// indeterminate and must not retry until reopening the sink reconciles its
+    /// authenticated manifest. Physical reclamation of superseded ledgers may
+    /// happen after the durable commit.
+    fn replace_scrollback_prefix(
+        &self,
+        expected_generation: Option<ScrollbackSnapshotGeneration>,
+        prefix: ScrollbackPrefix<'_>,
+        max_retained_rows: usize,
+    ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError>;
+
     /// Commit a logical clear before returning success.
     ///
     /// Physical reclamation may be retried after this method returns, but
@@ -775,6 +1001,19 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     /// reached durable storage.
     fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError>;
 }
+
+/// Bounded synchronous exclusion held across recovery activation.
+///
+/// The default lease is appropriate only for immutable configuration
+/// implementations. Any implementation with interior mutation must override
+/// [`TerminalConfiguration::acquire_recovery_activation_lease`] and make every
+/// semantic setter acquire the same exclusion gate before mutation.
+pub trait RecoveryActivationLease: std::fmt::Debug {}
+
+#[derive(Debug)]
+struct ImmutableRecoveryActivationLease;
+
+impl RecoveryActivationLease for ImmutableRecoveryActivationLease {}
 
 /// Complete identity of the terminal configuration visible to recovery code.
 ///
@@ -815,6 +1054,17 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// overlay inherit the legacy generation as their base revision.
     fn revision(&self) -> TerminalConfigurationRevision {
         TerminalConfigurationRevision::new(self.generation(), 0)
+    }
+
+    /// Exclude semantic configuration mutation across the final verified
+    /// restore-to-activation transaction.
+    ///
+    /// This lease is deliberately synchronous and bounded: activation performs
+    /// no async work while holding it. Immutable implementations may inherit
+    /// the no-op lease. Interior-mutable implementations must override this
+    /// method and route every setter through the same gate.
+    fn acquire_recovery_activation_lease(&self) -> Box<dyn RecoveryActivationLease + '_> {
+        Box::new(ImmutableRecoveryActivationLease)
     }
 
     /// Returns the size of the scrollback in terms of the number of rows.

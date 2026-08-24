@@ -11,7 +11,8 @@ use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
 };
 use frankenterm_term::{
-    RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID, RecoveryTerminalCheckpointV2,
+    RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID, RecoveryTerminalCheckpointError,
+    RecoveryTerminalCheckpointV2,
 };
 use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
@@ -23,9 +24,11 @@ const REPLAY_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-replay-identity.v1\0";
 const TERMINAL_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-terminal-payload.v1\0";
+const LIVE_PARSER_BOUNDARY_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.live-parser-checkpoint-boundary.v1\0";
 
 /// Version of the cross-subsystem checkpoint-boundary contract.
-pub const GUARDIAN_CHECKPOINT_BOUNDARY_VERSION: u32 = 1;
+pub const GUARDIAN_CHECKPOINT_BOUNDARY_VERSION: u32 = 2;
 
 /// Exact synchronized raw-output position at which a terminal checkpoint was
 /// captured while the parser was recovery-ground.
@@ -36,6 +39,8 @@ pub struct GuardianCheckpointBoundary {
     segment_id: Uuid,
     output_sequence: u64,
     output_record_digest: [u8; 32],
+    journal_segment_plaintext_bytes: u64,
+    parser_stream_bytes: u64,
     replay_identity_digest: [u8; 32],
     rows: u32,
     cols: u32,
@@ -48,7 +53,7 @@ impl GuardianCheckpointBoundary {
     /// the guardian and an opaque payload produced from the same terminal's own
     /// recovery-ground parser/model boundary. The terminal must include that
     /// record and no later record when this method is called.
-    pub fn capture(
+    fn capture(
         expected_durable_pane_id: Uuid,
         segment: GuardianOutputSegmentIdentity,
         output: GuardianOutputAppendReceipt,
@@ -71,6 +76,8 @@ impl GuardianCheckpointBoundary {
             segment_id: output.segment_id(),
             output_sequence: output.sequence(),
             output_record_digest: output.record_digest(),
+            journal_segment_plaintext_bytes: output.cumulative_plaintext_bytes(),
+            parser_stream_bytes: terminal_checkpoint.parser_stream_bytes(),
             replay_identity_digest: current_replay_identity_digest(),
             rows,
             cols,
@@ -105,6 +112,9 @@ impl GuardianCheckpointBoundary {
         if self.output_sequence == 0 {
             return Err(GuardianCheckpointBoundaryError::ZeroOutputSequence);
         }
+        if self.journal_segment_plaintext_bytes == 0 {
+            return Err(GuardianCheckpointBoundaryError::ZeroJournalPlaintextWatermark);
+        }
         if self.rows == 0 || self.cols == 0 {
             return Err(GuardianCheckpointBoundaryError::ZeroGeometry);
         }
@@ -126,6 +136,8 @@ impl GuardianCheckpointBoundary {
         if self.segment_id != verified_segment.segment_id()
             || self.output_sequence != verified_output.sequence()
             || self.output_record_digest != verified_output.record_digest()
+            || self.journal_segment_plaintext_bytes
+                != verified_output.cumulative_plaintext_bytes()
         {
             return Err(GuardianCheckpointBoundaryError::VerifiedOutputIdentityMismatch);
         }
@@ -165,6 +177,19 @@ impl GuardianCheckpointBoundary {
         self.output_record_digest
     }
 
+    /// Authenticated plaintext endpoint within `segment_id`. This is not the
+    /// parser-global watermark: segment rollover resets this counter.
+    #[must_use]
+    pub const fn journal_segment_plaintext_bytes(&self) -> u64 {
+        self.journal_segment_plaintext_bytes
+    }
+
+    /// Cumulative bytes consumed by the one live parser incarnation.
+    #[must_use]
+    pub const fn parser_stream_bytes(&self) -> u64 {
+        self.parser_stream_bytes
+    }
+
     #[must_use]
     pub const fn replay_identity_digest(&self) -> [u8; 32] {
         self.replay_identity_digest
@@ -200,6 +225,11 @@ impl std::fmt::Debug for GuardianCheckpointBoundary {
             .field("segment_id", &self.segment_id)
             .field("output_sequence", &self.output_sequence)
             .field("output_record_digest", &"[REDACTED]")
+            .field(
+                "journal_segment_plaintext_bytes",
+                &self.journal_segment_plaintext_bytes,
+            )
+            .field("parser_stream_bytes", &self.parser_stream_bytes)
             .field("replay_identity_digest", &"[REDACTED]")
             .field("rows", &self.rows)
             .field("cols", &self.cols)
@@ -207,6 +237,155 @@ impl std::fmt::Debug for GuardianCheckpointBoundary {
             .field("terminal_payload_digest", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Non-constructible authority passed only by the live parser barrier while
+/// its parser-ground witness and delivery fence are both held.
+pub struct LiveParserCaptureAuthority {
+    _private: (),
+}
+
+impl LiveParserCaptureAuthority {
+    pub(crate) const fn issue() -> Self {
+        Self { _private: () }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum LiveParserPaneCaptureError {
+    #[error("pane backend does not expose a live terminal checkpoint boundary")]
+    Unsupported,
+    #[error("terminal model checkpoint capture failed: {0}")]
+    Terminal(#[source] RecoveryTerminalCheckpointError),
+}
+
+/// The only crate-internal publication authority for a checkpoint captured
+/// from the reader-owned live parser. All fields are private so callers cannot
+/// splice a terminal payload, journal receipt, or registration generation.
+pub(crate) struct LiveParserCheckpointAck {
+    registration_wire_identity: [u8; 16],
+    boundary: GuardianCheckpointBoundary,
+    boundary_digest: [u8; 32],
+    terminal_checkpoint: RecoveryTerminalCheckpointV2,
+}
+
+impl LiveParserCheckpointAck {
+    pub(crate) fn capture(
+        registration_wire_identity: [u8; 16],
+        durable_pane_id: Uuid,
+        segment: GuardianOutputSegmentIdentity,
+        output: GuardianOutputAppendReceipt,
+        target_parser_stream_bytes: u64,
+        terminal_checkpoint: RecoveryTerminalCheckpointV2,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        if registration_wire_identity == [0; 16] {
+            return Err(GuardianCheckpointBoundaryError::NilRegistrationWireIdentity);
+        }
+        if terminal_checkpoint.parser_stream_bytes() != target_parser_stream_bytes {
+            return Err(GuardianCheckpointBoundaryError::ParserWatermarkMismatch);
+        }
+        let boundary = GuardianCheckpointBoundary::capture(
+            durable_pane_id,
+            segment,
+            output,
+            &terminal_checkpoint,
+        )?;
+        let boundary_digest = live_parser_boundary_digest(registration_wire_identity, &boundary);
+        Ok(Self {
+            registration_wire_identity,
+            boundary,
+            boundary_digest,
+            terminal_checkpoint,
+        })
+    }
+
+    pub(crate) const fn registration_wire_identity(&self) -> [u8; 16] {
+        self.registration_wire_identity
+    }
+
+    pub(crate) const fn durable_pane_id(&self) -> Uuid {
+        self.boundary.durable_pane_id()
+    }
+
+    pub(crate) const fn segment_id(&self) -> Uuid {
+        self.boundary.segment_id()
+    }
+
+    pub(crate) const fn output_sequence(&self) -> u64 {
+        self.boundary.output_sequence()
+    }
+
+    pub(crate) const fn output_record_digest(&self) -> [u8; 32] {
+        self.boundary.output_record_digest()
+    }
+
+    pub(crate) const fn journal_segment_plaintext_bytes(&self) -> u64 {
+        self.boundary.journal_segment_plaintext_bytes()
+    }
+
+    pub(crate) const fn parser_stream_bytes(&self) -> u64 {
+        self.boundary.parser_stream_bytes()
+    }
+
+    pub(crate) const fn terminal_payload_bytes(&self) -> u64 {
+        self.boundary.terminal_payload_bytes()
+    }
+
+    pub(crate) const fn terminal_payload_digest(&self) -> [u8; 32] {
+        self.boundary.terminal_payload_digest()
+    }
+
+    pub(crate) const fn boundary_digest(&self) -> [u8; 32] {
+        self.boundary_digest
+    }
+
+    pub(crate) const fn boundary(&self) -> &GuardianCheckpointBoundary {
+        &self.boundary
+    }
+
+    pub(crate) const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV2 {
+        &self.terminal_checkpoint
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV2) {
+        (self.boundary, self.terminal_checkpoint)
+    }
+}
+
+impl std::fmt::Debug for LiveParserCheckpointAck {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveParserCheckpointAck")
+            .field("registration_wire_identity", &self.registration_wire_identity)
+            .field("boundary", &self.boundary)
+            .field("boundary_digest", &"[REDACTED]")
+            .field("terminal_checkpoint", &self.terminal_checkpoint)
+            .finish()
+    }
+}
+
+fn live_parser_boundary_digest(
+    registration_wire_identity: [u8; 16],
+    boundary: &GuardianCheckpointBoundary,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(LIVE_PARSER_BOUNDARY_DIGEST_DOMAIN);
+    hasher.update(registration_wire_identity);
+    hasher.update(boundary.version().to_le_bytes());
+    hasher.update(boundary.durable_pane_id().as_bytes());
+    hasher.update(boundary.segment_id().as_bytes());
+    hasher.update(boundary.output_sequence().to_le_bytes());
+    hasher.update(boundary.output_record_digest());
+    hasher.update(boundary.journal_segment_plaintext_bytes().to_le_bytes());
+    hasher.update(boundary.parser_stream_bytes().to_le_bytes());
+    hasher.update(boundary.replay_identity_digest());
+    hasher.update(boundary.rows().to_le_bytes());
+    hasher.update(boundary.cols().to_le_bytes());
+    hasher.update(boundary.terminal_payload_bytes().to_le_bytes());
+    hasher.update(boundary.terminal_payload_digest());
+    hasher.finalize().into()
 }
 
 fn validate_output_identity(
@@ -278,6 +457,12 @@ pub enum GuardianCheckpointBoundaryError {
     NilSegmentIdentity,
     #[error("guardian checkpoint output sequence must be nonzero")]
     ZeroOutputSequence,
+    #[error("guardian checkpoint journal plaintext watermark must be nonzero")]
+    ZeroJournalPlaintextWatermark,
+    #[error("live parser checkpoint registration wire identity must be nonnil")]
+    NilRegistrationWireIdentity,
+    #[error("live parser checkpoint terminal payload has the wrong parser watermark")]
+    ParserWatermarkMismatch,
     #[error("guardian checkpoint replay semantics identity is incompatible")]
     ReplayIdentityMismatch,
     #[error("guardian checkpoint terminal payload must be nonempty")]

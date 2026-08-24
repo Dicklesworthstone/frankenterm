@@ -2161,11 +2161,45 @@ impl CheckpointSavedCursor {
     }
 }
 
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointScrollbackGeneration {
+    content_epoch: [u8; 16],
+    revision: u64,
+}
+
+impl std::fmt::Debug for CheckpointScrollbackGeneration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheckpointScrollbackGeneration")
+            .field("content_epoch", &"[REDACTED]")
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+impl From<crate::config::ScrollbackSnapshotGeneration> for CheckpointScrollbackGeneration {
+    fn from(generation: crate::config::ScrollbackSnapshotGeneration) -> Self {
+        Self {
+            content_epoch: generation.content_epoch(),
+            revision: generation.revision(),
+        }
+    }
+}
+
+impl CheckpointScrollbackGeneration {
+    fn into_live(self) -> crate::config::ScrollbackSnapshotGeneration {
+        crate::config::ScrollbackSnapshotGeneration::new(self.content_epoch, self.revision)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointScreen {
     lines: Vec<CheckpointLine>,
     stable_row_index_offset: u64,
+    cold_snapshot_generation: Option<CheckpointScrollbackGeneration>,
+    cold_prefix_line_count: u64,
     allow_scrollback: bool,
     keyboard_stack: Vec<CheckpointKeyboardEncoding>,
     physical_rows: u32,
@@ -2185,18 +2219,26 @@ impl CheckpointScreen {
         for line in &value.lines {
             lines.push(CheckpointLine::capture(line)?);
         }
+        let mut keyboard_stack = Vec::new();
+        keyboard_stack
+            .try_reserve_exact(value.keyboard_stack.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.keyboard_stack"))?;
+        for encoding in value.keyboard_stack {
+            keyboard_stack.push(CheckpointKeyboardEncoding::from(encoding));
+        }
         Ok(Self {
             lines,
             stable_row_index_offset: u64_from_usize(
                 value.stable_row_index_offset,
                 "screen.stable_row_index_offset",
             )?,
+            cold_snapshot_generation: value.cold_snapshot_generation.map(Into::into),
+            cold_prefix_line_count: u64_from_usize(
+                value.cold_prefix_line_count,
+                "screen.cold_prefix_line_count",
+            )?,
             allow_scrollback: value.allow_scrollback,
-            keyboard_stack: value
-                .keyboard_stack
-                .into_iter()
-                .map(CheckpointKeyboardEncoding::from)
-                .collect(),
+            keyboard_stack,
             physical_rows: u32::try_from(value.physical_rows).map_err(|_| {
                 TerminalCheckpointError::InvalidField {
                     field: "screen.physical_rows",
@@ -2238,6 +2280,13 @@ impl CheckpointScreen {
             stable_row_index_offset: usize_from_u64(
                 self.stable_row_index_offset,
                 "screen.stable_row_index_offset",
+            )?,
+            cold_snapshot_generation: self
+                .cold_snapshot_generation
+                .map(CheckpointScrollbackGeneration::into_live),
+            cold_prefix_line_count: usize_from_u64(
+                self.cold_prefix_line_count,
+                "screen.cold_prefix_line_count",
             )?,
             allow_scrollback: self.allow_scrollback,
             keyboard_stack,
@@ -2329,8 +2378,27 @@ impl CheckpointScreen {
                 reason: "screen has fewer lines than its visible height",
             });
         }
+        let cold_prefix_line_count = usize_from_u64(
+            self.cold_prefix_line_count,
+            "screen.cold_prefix_line_count",
+        )?;
+        if cold_prefix_line_count > self.lines.len().saturating_sub(rows) {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "screen.cold_prefix_line_count",
+                reason: "cold prefix must be wholly contained in scrollback",
+            });
+        }
+        if cold_prefix_line_count != 0 && self.cold_snapshot_generation.is_none() {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "screen.cold_snapshot_generation",
+                reason: "a nonempty cold prefix requires its exact source generation",
+            });
+        }
         if !expected_scrollback {
-            if self.stable_row_index_offset != 0 {
+            if self.stable_row_index_offset != 0
+                || self.cold_prefix_line_count != 0
+                || self.cold_snapshot_generation.is_some()
+            {
                 return Err(TerminalCheckpointError::InvalidField {
                     field: "alternate_screen",
                     reason: "alternate screen cannot retain scrollback metadata",
@@ -2803,6 +2871,14 @@ impl std::fmt::Debug for TerminalCheckpointV2 {
             .field("rows", &self.primary_screen.physical_rows)
             .field("cols", &self.primary_screen.physical_cols)
             .field("primary_lines", &self.primary_screen.lines.len())
+            .field(
+                "primary_cold_prefix_lines",
+                &self.primary_screen.cold_prefix_line_count,
+            )
+            .field(
+                "primary_cold_generation_present",
+                &self.primary_screen.cold_snapshot_generation.is_some(),
+            )
             .field("alternate_lines", &self.alternate_screen.lines.len())
             .field("alternate_screen_active", &self.alternate_screen_active)
             .field("title_bytes", &self.title.len())
@@ -3192,8 +3268,16 @@ impl TerminalCheckpointV2 {
             .preflight_resident_checkpoint_usage(&screen_limits, &mut usage)?;
         terminal
             .screen
+            .screen
+            .preflight_recovery_checkpoint_boundary()?;
+        terminal
+            .screen
             .alt_screen
             .preflight_resident_checkpoint_usage(&screen_limits, &mut usage)?;
+        terminal
+            .screen
+            .alt_screen
+            .preflight_recovery_checkpoint_boundary()?;
         Ok(())
     }
 
@@ -3210,7 +3294,8 @@ impl TerminalCheckpointV2 {
         limits: TerminalCheckpointLimits,
     ) -> Result<Self, TerminalCheckpointError> {
         limits.validate_policy()?;
-        let config_revision = terminal.config.revision();
+        let lease_config = Arc::clone(&terminal.config);
+        let _config_lease = lease_config.acquire_recovery_activation_lease();
         let pending_replay_config =
             PendingReplayConfigV2::capture(terminal.config.as_ref(), limits)?;
         for entry in &terminal.unicode_version_stack {
@@ -3400,9 +3485,6 @@ impl TerminalCheckpointV2 {
             bidi_enabled: terminal.bidi_enabled,
             bidi_hint: terminal.bidi_hint.map(CheckpointBidiHint::from),
         };
-        if terminal.config.revision() != config_revision {
-            return Err(TerminalCheckpointError::ConfigurationChangedDuringProjection);
-        }
         checkpoint.validate(limits)?;
         Ok(checkpoint)
     }
@@ -3847,21 +3929,19 @@ impl ValidatedTerminalCheckpointV2 {
     ) -> Result<crate::InertTerminal, TerminalCheckpointError> {
         let custom_cell_width_maps =
             decode_custom_cell_width_maps(&self.checkpoint.custom_cell_width_maps)?;
-        let intended_live_config_revision = intended_live_config.revision();
-        if !self
-            .checkpoint
-            .replay_config
-            .matches_stable(
-                intended_live_config.as_ref(),
+        let lease_config = Arc::clone(&intended_live_config);
+        let intended_live_config_revision = {
+            let _lease = lease_config.acquire_recovery_activation_lease();
+            let revision = lease_config.revision();
+            if !self.checkpoint.replay_config.matches_stable(
+                lease_config.as_ref(),
                 self.limits,
                 &custom_cell_width_maps,
-            )?
-        {
-            return Err(TerminalCheckpointError::ReplayConfigurationMismatch);
-        }
-        if intended_live_config.revision() != intended_live_config_revision {
-            return Err(TerminalCheckpointError::ConfigurationChangedDuringProjection);
-        }
+            )? {
+                return Err(TerminalCheckpointError::ReplayConfigurationMismatch);
+            }
+            revision
+        };
         let replay_projection = self.checkpoint.replay_config.clone();
         let replay_config: Arc<dyn TerminalConfiguration> = Arc::new(
             replay_projection
@@ -4343,6 +4423,7 @@ impl std::error::Error for TerminalCheckpointError {}
 mod tests {
     use super::*;
     use crate::Terminal;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -4399,6 +4480,121 @@ mod tests {
                 enabled: true,
                 hint: ParagraphDirectionHint::AutoRightToLeft,
             }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MalformedReplacementReceiptSink {
+        replace_calls: AtomicUsize,
+        published_rows: AtomicUsize,
+    }
+
+    impl crate::config::ScrollbackSpillSink for MalformedReplacementReceiptSink {
+        fn store_scrollback_line(
+            &self,
+            _stable_row: StableRowIndex,
+            _line: &Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            false
+        }
+
+        fn load_scrollback_line(&self, _stable_row: StableRowIndex) -> Option<Line> {
+            None
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            None
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.published_rows.load(Ordering::Relaxed)
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            0
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            _expected_newest_exclusive: StableRowIndex,
+            _limits: crate::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            crate::config::ScrollbackSnapshot,
+            crate::config::ScrollbackSpillError,
+        > {
+            Err(crate::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            expected_generation: Option<crate::config::ScrollbackSnapshotGeneration>,
+            prefix: crate::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<
+            crate::config::ScrollbackReplaceCommit,
+            crate::config::ScrollbackSpillError,
+        > {
+            if expected_generation.is_some() {
+                return Err(crate::config::ScrollbackSpillError::SnapshotGenerationMismatch);
+            }
+            self.replace_calls.fetch_add(1, Ordering::Relaxed);
+            self.published_rows
+                .store(prefix.row_count(), Ordering::Relaxed);
+
+            // Model a sink that reached its durable publication point but
+            // returned a malformed, non-advanced generation receipt.
+            Ok(crate::config::ScrollbackReplaceCommit::new(
+                crate::config::ScrollbackSnapshotGeneration::new([9; 16], 0),
+                prefix.oldest_stable_row(),
+                prefix.newest_stable_row_exclusive(),
+            ))
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            crate::config::ScrollbackClearCommit,
+            crate::config::ScrollbackSpillError,
+        > {
+            self.published_rows.store(0, Ordering::Relaxed);
+            Ok(crate::config::ScrollbackClearCommit::new(
+                crate::config::ScrollbackSnapshotGeneration::new([9; 16], 1),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReplacementActivationConfig {
+        tier_enabled: bool,
+        sink: Arc<MalformedReplacementReceiptSink>,
+    }
+
+    impl TerminalConfiguration for ReplacementActivationConfig {
+        fn scrollback_size(&self) -> usize {
+            128
+        }
+
+        fn scrollback_tier_config(&self) -> crate::config::ScrollbackTierConfig {
+            crate::config::ScrollbackTierConfig {
+                enabled: self.tier_enabled,
+                hot_lines: if self.tier_enabled { 1 } else { 128 },
+                warm_max_bytes: 0,
+            }
+        }
+
+        fn scrollback_spill_sink(
+            &self,
+        ) -> Option<Arc<dyn crate::config::ScrollbackSpillSink>> {
+            if self.tier_enabled {
+                Some(self.sink.clone())
+            } else {
+                None
+            }
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
         }
     }
 
@@ -4685,6 +4881,39 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_rejects_unbound_or_alternate_cold_prefix_metadata() {
+        let limits = TerminalCheckpointLimits::default();
+        let checkpoint = TerminalCheckpointV2::capture_with_limits(&terminal(), limits)
+            .expect("capture cold-prefix validation fixture");
+
+        let mut unbound = checkpoint.clone();
+        let inserted_line = unbound.primary_screen.lines[0].clone();
+        unbound.primary_screen.lines.insert(0, inserted_line);
+        unbound.primary_screen.cold_prefix_line_count = 1;
+        assert!(matches!(
+            unbound.validate(limits),
+            Err(TerminalCheckpointError::InvalidField {
+                field: "screen.cold_snapshot_generation",
+                ..
+            })
+        ));
+
+        let mut alternate = checkpoint;
+        alternate.alternate_screen.cold_snapshot_generation =
+            Some(CheckpointScrollbackGeneration {
+                content_epoch: [7; 16],
+                revision: 9,
+            });
+        assert!(matches!(
+            alternate.validate(limits),
+            Err(TerminalCheckpointError::InvalidField {
+                field: "alternate_screen",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn canonical_restore_roundtrips_complete_semantic_projection() {
         let config: Arc<dyn TerminalConfiguration> = Arc::new(RichCheckpointTestConfig);
         let mut terminal = Terminal::new(
@@ -4743,6 +4972,113 @@ mod tests {
                 .expect("encode restored rich terminal"),
             canonical,
         );
+    }
+
+    #[test]
+    fn writer_preparation_failure_returns_the_complete_retryable_inert_model() {
+        let limits = TerminalCheckpointLimits::default();
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(RichCheckpointTestConfig);
+        let mut live = Terminal::new(
+            TerminalSize::default(),
+            Arc::clone(&config),
+            "FrankenTerm",
+            "checkpoint-writer-preparation-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        for index in 0..48 {
+            live.advance_bytes(format!("retained-{index}\r\n").as_bytes());
+        }
+        let checkpoint = TerminalCheckpointV2::capture_with_limits(&live, limits)
+            .expect("capture writer-preparation fixture");
+        let canonical = checkpoint
+            .to_canonical_json(limits)
+            .expect("encode writer-preparation fixture");
+        let mut inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+            .expect("decode writer-preparation fixture")
+            .restore_inert(config)
+            .expect("restore writer-preparation fixture");
+        inert.force_writer_preparation_failure_for_test();
+
+        let failure = match inert.into_live(Box::new(Vec::<u8>::new())) {
+            Ok(_) => panic!("forced writer preparation must fail"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.error(), &crate::InertTerminalError::WriterActivation);
+        let (_error, recovered) = failure.into_parts();
+        assert_eq!(
+            recovered
+                .checkpoint()
+                .expect("recapture retryable inert model")
+                .to_canonical_json(limits)
+                .expect("encode retryable inert model"),
+            canonical,
+        );
+    }
+
+    #[test]
+    fn malformed_published_receipt_poisons_activation_without_writer_swap_or_retry() {
+        let limits = TerminalCheckpointLimits::default();
+        let sink = Arc::new(MalformedReplacementReceiptSink::default());
+        let capture_config: Arc<dyn TerminalConfiguration> =
+            Arc::new(ReplacementActivationConfig {
+                tier_enabled: false,
+                sink: Arc::clone(&sink),
+            });
+        let mut live = Terminal::new(
+            TerminalSize::default(),
+            capture_config,
+            "FrankenTerm",
+            "checkpoint-malformed-receipt-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        for index in 0..48 {
+            live.advance_bytes(format!("retained-{index}\r\n").as_bytes());
+        }
+        let checkpoint = TerminalCheckpointV2::capture_with_limits(&live, limits)
+            .expect("capture resident-only recovery fixture");
+        let activation_config: Arc<dyn TerminalConfiguration> =
+            Arc::new(ReplacementActivationConfig {
+                tier_enabled: true,
+                sink: Arc::clone(&sink),
+            });
+        let inert = checkpoint
+            .restore_inert(activation_config)
+            .expect("restore retiering fixture off topology");
+
+        let first_failure = match inert.into_live(Box::new(Vec::<u8>::new())) {
+            Ok(_) => panic!("malformed replacement receipt must not activate a terminal"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            first_failure.error(),
+            &crate::InertTerminalError::ScrollbackActivation(
+                crate::config::ScrollbackActivationError::CommitOutcomeIndeterminate,
+            ),
+        );
+        assert_eq!(sink.replace_calls.load(Ordering::Relaxed), 1);
+        assert!(sink.published_rows.load(Ordering::Relaxed) > 0);
+        let (_error, mut recovered) = first_failure.into_parts();
+        assert!(recovered.writer_is_inert_for_test());
+        assert_eq!(
+            recovered.checkpoint(),
+            Err(crate::InertTerminalError::ActivationPoisoned),
+        );
+        assert_eq!(
+            recovered.replay_bytes(b"must-not-cross-quarantine"),
+            Err(crate::InertTerminalError::ActivationPoisoned),
+        );
+
+        let retry_failure = match recovered.into_live(Box::new(Vec::<u8>::new())) {
+            Ok(_) => panic!("poisoned activation must not install a live writer"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            retry_failure.error(),
+            &crate::InertTerminalError::ActivationPoisoned,
+        );
+        assert_eq!(sink.replace_calls.load(Ordering::Relaxed), 1);
+        let (_error, still_inert) = retry_failure.into_parts();
+        assert!(still_inert.writer_is_inert_for_test());
     }
 
     #[test]

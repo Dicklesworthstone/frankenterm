@@ -1,4 +1,5 @@
 use crate::domain::DomainId;
+use crate::guardian_checkpoint::{LiveParserCaptureAuthority, LiveParserPaneCaptureError};
 use crate::renderable::*;
 use crate::ExitBehavior;
 use async_trait::async_trait;
@@ -8,8 +9,9 @@ use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
     Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
-    StableRowIndex, TerminalConfiguration, TerminalSize,
+    RecoveryTerminalCheckpointV2, StableRowIndex, TerminalConfiguration, TerminalSize,
 };
+use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 use parking_lot::MappedMutexGuard;
 use rangeset::RangeSet;
 use serde::{Deserialize, Serialize};
@@ -512,6 +514,19 @@ pub trait Pane: Downcast + Send + Sync {
     }
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()>;
     fn perform_actions(&self, _actions: Vec<termwiz::escape::Action>) {}
+
+    /// Apply parser-pending actions and capture the terminal model while the
+    /// caller's typed external-parser ground witness remains live. Only the mux
+    /// barrier can mint `authority`; backend defaults fail closed.
+    fn capture_live_parser_checkpoint(
+        &self,
+        _authority: LiveParserCaptureAuthority,
+        _pending_actions: &mut Vec<termwiz::escape::Action>,
+        _ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
+        _limits: TerminalCheckpointLimits,
+    ) -> Result<RecoveryTerminalCheckpointV2, LiveParserPaneCaptureError> {
+        Err(LiveParserPaneCaptureError::Unsupported)
+    }
     fn is_dead(&self) -> bool;
     fn kill(&self) {}
     fn palette(&self) -> ColorPalette;

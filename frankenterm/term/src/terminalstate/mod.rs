@@ -310,6 +310,32 @@ impl ScreenOrAlt {
         self.screen.set_config(config);
         self.alt_screen.set_config(config);
     }
+
+    #[cfg(feature = "use_serde")]
+    fn install_prepared_config(
+        &mut self,
+        config: &Arc<dyn TerminalConfiguration>,
+        resize_wrap_policy: crate::screen::ResizeWrapPolicy,
+    ) {
+        self.screen
+            .install_prepared_config(config, resize_wrap_policy);
+        self.alt_screen
+            .install_prepared_config(config, resize_wrap_policy);
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn activate_recovered_scrollback(
+        &mut self,
+        config: &Arc<dyn TerminalConfiguration>,
+    ) -> Result<(), crate::config::ScrollbackActivationError> {
+        // Validate every non-primary invariant before the primary screen may
+        // publish a durable replacement. After that publication succeeds, the
+        // remaining operations are infallible marker/config transitions.
+        self.alt_screen.preflight_recovery_without_scrollback()?;
+        self.screen.activate_recovered_scrollback(config)?;
+        self.alt_screen.finish_recovery_without_scrollback();
+        Ok(())
+    }
 }
 
 /// Manages the state for the terminal
@@ -535,6 +561,18 @@ enum ThreadedWriter {
     Failed,
 }
 
+#[cfg(feature = "use_serde")]
+pub(crate) struct PreparedTerminalWriter(BufWriter<ThreadedWriter>);
+
+#[cfg(feature = "use_serde")]
+pub(crate) struct PreparedRecoveryConfiguration {
+    config: Arc<dyn TerminalConfiguration>,
+    resize_wrap_policy: crate::screen::ResizeWrapPolicy,
+    kitty_image_budget_bytes: usize,
+    kitty_image_max_transmission_bytes: usize,
+    refreshed_unicode_version: Option<UnicodeVersion>,
+}
+
 enum WriterMessage {
     Data(Vec<u8>),
     Flush(Sender<std::io::Result<()>>),
@@ -553,9 +591,15 @@ impl ThreadedWriter {
 
     fn try_new(mut writer: Box<dyn std::io::Write + Send>) -> std::io::Result<Self> {
         let (sender, receiver) = channel::<WriterMessage>();
+        const THREAD_NAME: &str = "terminal-threaded-writer";
+        let mut thread_name = String::new();
+        thread_name
+            .try_reserve_exact(THREAD_NAME.len())
+            .map_err(|_| std::io::Error::other("terminal writer name allocation failed"))?;
+        thread_name.push_str(THREAD_NAME);
 
         std::thread::Builder::new()
-            .name("terminal-threaded-writer".to_string())
+            .name(thread_name)
             .spawn(move || {
                 while let Ok(msg) = receiver.recv() {
                     match msg {
@@ -768,21 +812,77 @@ impl TerminalState {
         }
     }
 
-    pub(crate) fn activate_inert_writer(
-        &mut self,
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn prepare_inert_writer(
+        &self,
         writer: Box<dyn std::io::Write + Send>,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<PreparedTerminalWriter> {
         if !self.writer_is_inert {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "terminal writer is already live",
             ));
         }
-        let live = BufWriter::new(ThreadedWriter::try_new(writer)?);
-        let inert = std::mem::replace(&mut self.writer, live);
+        // Capacity zero avoids an infallible allocation in the activation
+        // transaction. ThreadedWriter already owns the asynchronous buffering
+        // boundary and fallibly allocates each outbound message.
+        Ok(PreparedTerminalWriter(BufWriter::with_capacity(
+            0,
+            ThreadedWriter::try_new(writer)?,
+        )))
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn prepare_recovery_configuration(
+        &self,
+        config: Arc<dyn TerminalConfiguration>,
+    ) -> PreparedRecoveryConfiguration {
+        let previous_unicode_version = self.config.unicode_version();
+        let should_refresh_unicode_version = self.unicode_version_stack.is_empty()
+            && self.unicode_version == previous_unicode_version;
+        let refreshed_unicode_version =
+            should_refresh_unicode_version.then(|| config.unicode_version());
+        let resize_wrap_policy =
+            crate::screen::ResizeWrapPolicy::from_terminal_configuration(config.as_ref());
+        let kitty_image_budget_bytes = config.kitty_image_budget_bytes();
+        let kitty_image_max_transmission_bytes = config.kitty_image_max_transmission_bytes();
+        PreparedRecoveryConfiguration {
+            config,
+            resize_wrap_policy,
+            kitty_image_budget_bytes,
+            kitty_image_max_transmission_bytes,
+            refreshed_unicode_version,
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn finish_recovery_activation(
+        &mut self,
+        prepared_config: PreparedRecoveryConfiguration,
+        prepared_writer: PreparedTerminalWriter,
+    ) -> Result<(), crate::config::ScrollbackActivationError> {
+        self.screen
+            .activate_recovered_scrollback(&prepared_config.config)?;
+        self.screen.install_prepared_config(
+            &prepared_config.config,
+            prepared_config.resize_wrap_policy,
+        );
+        self.kitty_img.image_budget_bytes = prepared_config.kitty_image_budget_bytes;
+        self.kitty_img
+            .set_max_transmission_bytes(prepared_config.kitty_image_max_transmission_bytes);
+        if let Some(unicode_version) = prepared_config.refreshed_unicode_version {
+            self.unicode_version = unicode_version;
+        }
+        self.config = prepared_config.config;
+        let inert = std::mem::replace(&mut self.writer, prepared_writer.0);
         self.writer_is_inert = false;
         drop(inert);
         Ok(())
+    }
+
+    #[cfg(all(test, feature = "use_serde"))]
+    pub(crate) fn writer_is_inert_for_test(&self) -> bool {
+        self.writer_is_inert
     }
 
     pub fn enable_conpty_quirks(&mut self) {

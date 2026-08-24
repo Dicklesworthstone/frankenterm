@@ -286,6 +286,11 @@ const MAX_SHORT_DCS_BYTES: usize = 8 * 1024 * 1024;
 pub struct Parser {
     state_machine: VTParser,
     state: RefCell<ParseState>,
+    /// Total raw bytes accepted by this parser's streaming API. `None` means
+    /// the position overflowed and can no longer authorize a durable recovery
+    /// boundary.  The parser remains usable for ordinary terminal rendering in
+    /// that case, but checkpoint admission must fail closed.
+    recovery_stream_bytes: Option<u64>,
     /// Round-5 D1 (ft-round5-gauntlet-lw0s7.10): when set, [`Parser::parse`]
     /// coalesces maximal ground-state printable UTF-8 runs into a single
     /// `Action::PrintString` instead of emitting one `Action::Print(char)` per
@@ -296,14 +301,45 @@ pub struct Parser {
     print_batching: bool,
 }
 
+/// Non-constructible witness that one exact parser was recovery-ground after
+/// consuming [`Self::stream_bytes`] raw bytes.
+///
+/// The witness borrows the parser, so that parser cannot consume later bytes
+/// until the caller has finished the boundary operation.  Durable mux capture
+/// must additionally fence delivery at the same byte watermark and bind the
+/// witness to the corresponding authenticated output-journal receipt; this
+/// type proves parser state, not journal durability by itself.
+#[must_use = "a recovery-ground witness must be consumed by the exact boundary operation"]
+pub struct RecoveryGroundBoundary<'parser> {
+    _parser: &'parser Parser,
+    stream_bytes: u64,
+}
+
+impl RecoveryGroundBoundary<'_> {
+    /// Cumulative raw bytes consumed by the witnessed parser incarnation.
+    #[must_use]
+    pub const fn stream_bytes(&self) -> u64 {
+        self.stream_bytes
+    }
+}
+
+impl core::fmt::Debug for RecoveryGroundBoundary<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("RecoveryGroundBoundary")
+            .field("stream_bytes", &self.stream_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Versioned identity for the parser state contract used by durable terminal
 /// checkpoints.
 ///
 /// A checkpoint may be restored with a fresh parser only when it was captured
-/// at [`Parser::is_recovery_ground`] and carries this exact identity. Any
-/// change that alters the interpretation of retained raw terminal bytes must
-/// change this value so an older checkpoint fails closed instead of silently
-/// reconstructing different terminal state.
+/// with a [`Parser::recovery_ground_boundary`] witness and carries this exact
+/// identity. Any change that alters the interpretation of retained raw
+/// terminal bytes must change this value so an older checkpoint fails closed
+/// instead of silently reconstructing different terminal state.
 pub const RECOVERY_CHECKPOINT_PARSER_ID: &str = "frankenterm.escape-parser.recovery-ground.v3";
 
 impl Default for Parser {
@@ -334,8 +370,17 @@ impl Parser {
                 max_string_sequence_bytes,
             ),
             state: RefCell::new(state),
+            recovery_stream_bytes: Some(0),
             print_batching: default_print_batching(),
         }
+    }
+
+    fn finish_recovery_stream_advance(&mut self, prior: Option<u64>, consumed: usize) {
+        let Ok(consumed) = u64::try_from(consumed) else {
+            self.recovery_stream_bytes = None;
+            return;
+        };
+        self.recovery_stream_bytes = prior.and_then(|position| position.checked_add(consumed));
     }
 
     /// Consume the first retained control-string resource failure not yet
@@ -362,7 +407,9 @@ impl Parser {
     /// checkpoints must reject all of those states as well. Callers must bind
     /// a positive result to the exact processed raw-output sequence; using an
     /// earlier sequence with a newer terminal model would duplicate output on
-    /// replay.
+    /// replay. This boolean is diagnostic state only; durable callers must use
+    /// [`Self::recovery_ground_boundary`] so the parser remains borrowed and
+    /// the exact byte watermark is carried into the transaction.
     #[must_use]
     pub fn is_recovery_ground(&self) -> bool {
         if !self.state_machine.is_ground() {
@@ -384,6 +431,20 @@ impl Parser {
                     true
                 }
             }
+    }
+
+    /// Mint a typed witness for this parser's exact raw-stream position only
+    /// when no incremental parse state would be lost by replacement.
+    ///
+    /// Returning `None` on position overflow is intentional: a caller cannot
+    /// bind a journal receipt to an ambiguous parser watermark.
+    #[must_use]
+    pub fn recovery_ground_boundary(&self) -> Option<RecoveryGroundBoundary<'_>> {
+        let stream_bytes = self.recovery_stream_bytes?;
+        self.is_recovery_ground().then_some(RecoveryGroundBoundary {
+            _parser: self,
+            stream_bytes,
+        })
     }
 
     /// Enable or disable ground-state printable-run coalescing (Round-5 D1,
@@ -456,6 +517,11 @@ impl Parser {
     }
 
     pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F) {
+        // Taking the prior position before invoking caller code makes unwind
+        // fail closed. If a callback panics after the parser consumed any part
+        // of this slice, the position remains `None` and this parser can never
+        // mint an ambiguously old recovery watermark after the panic is caught.
+        let prior_stream_bytes = self.recovery_stream_bytes.take();
         #[cfg(feature = "tmux_cc")]
         let is_tmux_mode: bool = self.state.borrow().tmux_state.is_some();
         #[cfg(feature = "tmux_cc")]
@@ -479,19 +545,24 @@ impl Parser {
                         .parse(unparsed_str.as_bytes(), &mut perform);
                 }
             }
+            self.finish_recovery_stream_advance(prior_stream_bytes, bytes.len());
             return;
         }
 
         if self.print_batching {
             self.parse_ground_batched(bytes, &mut callback);
+            self.finish_recovery_stream_advance(prior_stream_bytes, bytes.len());
             return;
         }
 
-        let mut perform = Performer {
-            callback: &mut callback,
-            state: &mut self.state.borrow_mut(),
-        };
-        self.state_machine.parse(bytes, &mut perform);
+        {
+            let mut perform = Performer {
+                callback: &mut callback,
+                state: &mut self.state.borrow_mut(),
+            };
+            self.state_machine.parse(bytes, &mut perform);
+        }
+        self.finish_recovery_stream_advance(prior_stream_bytes, bytes.len());
     }
 
     /// Streaming fast path for [`Parser::parse`] that coalesces maximal
@@ -558,6 +629,7 @@ impl Parser {
     /// that was recognized and the length of the byte stream that was fed in
     /// to the parser to yield it.
     pub fn parse_first(&mut self, bytes: &[u8]) -> Option<(Action, usize)> {
+        let prior_stream_bytes = self.recovery_stream_bytes.take();
         // holds the first action.  We need to use RefCell to deal with
         // the Performer holding a reference to this via the closure we set up.
         let first = RefCell::new(None);
@@ -585,12 +657,17 @@ impl Parser {
             }
         }
 
-        match (first.into_inner(), first_idx) {
+        let result = match (first.into_inner(), first_idx) {
             // if we matched an action, transform the iterator index to
             // the length of the string that was consumed (+1)
             (Some(action), Some(idx)) => Some((action, idx + 1)),
             _ => None,
-        }
+        };
+        let consumed = result
+            .as_ref()
+            .map_or(bytes.len(), |(_, consumed)| *consumed);
+        self.finish_recovery_stream_advance(prior_stream_bytes, consumed);
+        result
     }
 
     pub fn parse_as_vec(&mut self, bytes: &[u8]) -> Vec<Action> {
@@ -603,6 +680,7 @@ impl Parser {
     /// and guarantees the state machine is in the ground state at the end of this
     /// sequence.
     pub fn parse_first_as_vec(&mut self, bytes: &[u8]) -> Option<(Vec<Action>, usize)> {
+        let prior_stream_bytes = self.recovery_stream_bytes.take();
         let mut actions = Vec::new();
         let mut first_idx = None;
         for (idx, b) in bytes.iter().enumerate() {
@@ -619,7 +697,12 @@ impl Parser {
                 break;
             }
         }
-        first_idx.map(|idx| (actions, idx + 1))
+        let result = first_idx.map(|idx| (actions, idx + 1));
+        let consumed = result
+            .as_ref()
+            .map_or(bytes.len(), |(_, consumed)| *consumed);
+        self.finish_recovery_stream_advance(prior_stream_bytes, consumed);
+        result
     }
 }
 
@@ -1016,6 +1099,99 @@ mod test {
         assert!(!parser.is_recovery_ground());
         parser.parse(&[0xac], |_| {});
         assert!(parser.is_recovery_ground());
+    }
+
+    #[test]
+    fn recovery_ground_boundary_tracks_the_exact_consumed_stream_watermark() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser
+                .recovery_ground_boundary()
+                .expect("fresh parser is ground")
+                .stream_bytes(),
+            0
+        );
+
+        parser.parse(b"prefix\x1b[38;2", |_| {});
+        assert!(
+            parser.recovery_ground_boundary().is_none(),
+            "a typed boundary must not be minted for an incomplete CSI"
+        );
+
+        parser.parse(b";1;2;3m", |_| {});
+        assert_eq!(
+            parser
+                .recovery_ground_boundary()
+                .expect("completed CSI returns to ground")
+                .stream_bytes(),
+            u64::try_from(b"prefix\x1b[38;2;1;2;3m".len()).expect("fixture length fits")
+        );
+    }
+
+    #[test]
+    fn recovery_ground_boundary_counts_only_parse_first_consumption() {
+        let mut parser = Parser::new();
+        let (action, consumed) = parser
+            .parse_first(b"a\x1b[partial")
+            .expect("first printable action");
+        assert_eq!(action, Action::Print('a'));
+        assert_eq!(consumed, 1);
+        assert_eq!(
+            parser
+                .recovery_ground_boundary()
+                .expect("parser stopped at a ground boundary")
+                .stream_bytes(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_ground_boundary_fails_closed_after_watermark_overflow() {
+        let mut parser = Parser::new();
+        parser.recovery_stream_bytes = Some(u64::MAX);
+        parser.parse(b"x", |_| {});
+
+        assert!(parser.is_recovery_ground());
+        assert!(parser.recovery_ground_boundary().is_none());
+    }
+
+    #[test]
+    fn recovery_ground_boundary_fails_closed_after_callback_unwind() {
+        let mut parser = Parser::new();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.parse(b"printable", |_| panic!("injected callback panic"));
+        }));
+
+        assert!(unwind.is_err());
+        assert!(parser.is_recovery_ground());
+        assert!(
+            parser.recovery_ground_boundary().is_none(),
+            "a caught callback unwind must not leave the old stream watermark reusable"
+        );
+
+        parser.parse(b"later-ground-data", |_| {});
+        assert!(
+            parser.recovery_ground_boundary().is_none(),
+            "later successful parsing must not resurrect an ambiguous pre-unwind watermark"
+        );
+    }
+
+    #[test]
+    fn recovery_ground_boundary_counts_parse_first_as_vec_consumption() {
+        let mut parser = Parser::new();
+        let (actions, consumed) = parser
+            .parse_first_as_vec(b"a\x1b[partial")
+            .expect("first ground action batch");
+
+        assert_eq!(actions, vec![Action::Print('a')]);
+        assert_eq!(consumed, 1);
+        assert_eq!(
+            parser
+                .recovery_ground_boundary()
+                .expect("parser stopped at the first exact ground boundary")
+                .stream_bytes(),
+            1
+        );
     }
 
     #[cfg(feature = "tmux_cc")]

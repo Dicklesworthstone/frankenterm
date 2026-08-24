@@ -134,6 +134,7 @@ pub struct RecoveryTerminalCheckpointV2 {
     canonical_payload: Vec<u8>,
     rows: usize,
     cols: usize,
+    parser_stream_bytes: u64,
 }
 
 #[cfg(feature = "use_serde")]
@@ -153,6 +154,15 @@ impl RecoveryTerminalCheckpointV2 {
         self.cols
     }
 
+    /// Exact cumulative raw-byte watermark of the parser-ground witness used
+    /// for this model capture. Guardian code must bind this number to the
+    /// authenticated output-journal receipt; it is not inferred from payload
+    /// size or record sequence.
+    #[must_use]
+    pub const fn parser_stream_bytes(&self) -> u64 {
+        self.parser_stream_bytes
+    }
+
     #[must_use]
     pub fn into_canonical_payload(self) -> Vec<u8> {
         self.canonical_payload
@@ -168,6 +178,7 @@ impl std::fmt::Debug for RecoveryTerminalCheckpointV2 {
             .field("payload_bytes", &self.canonical_payload.len())
             .field("rows", &self.rows)
             .field("cols", &self.cols)
+            .field("parser_stream_bytes", &self.parser_stream_bytes)
             .finish()
     }
 }
@@ -208,6 +219,9 @@ pub struct InertTerminal {
     replayed_records: usize,
     replayed_bytes: usize,
     replay_failed: bool,
+    activation_poisoned: bool,
+    #[cfg(test)]
+    force_writer_preparation_failure: bool,
 }
 
 #[cfg(feature = "use_serde")]
@@ -223,11 +237,12 @@ pub enum InertTerminalError {
     ReplayActionAllocation,
     ReplayStringSequence(frankenterm_escape_parser::StringSequenceError),
     ReplayPoisoned,
+    ActivationPoisoned,
     ParserNotRecoveryGround,
     UnsupportedGraphicsAction,
     ReplayConfigurationMismatch,
     LiveConfigurationChanged,
-    RetieringRequired,
+    ScrollbackActivation(crate::config::ScrollbackActivationError),
     WriterActivation,
     Checkpoint(crate::terminalstate::checkpoint::TerminalCheckpointError),
 }
@@ -259,6 +274,9 @@ impl std::fmt::Display for InertTerminalError {
             Self::ReplayPoisoned => {
                 formatter.write_str("guardian replay was permanently poisoned by an earlier error")
             }
+            Self::ActivationPoisoned => formatter.write_str(
+                "guardian activation is quarantined after an indeterminate cold-store publication",
+            ),
             Self::ParserNotRecoveryGround => formatter.write_str(
                 "guardian replay parser is not at a recoverable output boundary",
             ),
@@ -271,9 +289,7 @@ impl std::fmt::Display for InertTerminalError {
             Self::LiveConfigurationChanged => formatter.write_str(
                 "intended live configuration changed during guardian recovery",
             ),
-            Self::RetieringRequired => formatter.write_str(
-                "guardian activation requires checked scrollback re-tiering",
-            ),
+            Self::ScrollbackActivation(error) => std::fmt::Display::fmt(error, formatter),
             Self::WriterActivation => {
                 formatter.write_str("guardian replay could not activate the live writer")
             }
@@ -284,6 +300,50 @@ impl std::fmt::Display for InertTerminalError {
 
 #[cfg(feature = "use_serde")]
 impl std::error::Error for InertTerminalError {}
+
+/// A failed consuming activation that returns ownership of the intact inert
+/// model so callers can retry an ordinary pre-publication failure. An
+/// indeterminate publication permanently poisons the returned model: callers
+/// must reopen and reconcile the sink's authenticated manifest rather than
+/// blindly retrying the checkpoint generation. The contained error is
+/// content-free; `Debug` never prints terminal rows.
+#[cfg(feature = "use_serde")]
+pub struct InertTerminalActivationFailure {
+    error: InertTerminalError,
+    inert_terminal: InertTerminal,
+}
+
+#[cfg(feature = "use_serde")]
+impl InertTerminalActivationFailure {
+    pub const fn error(&self) -> &InertTerminalError {
+        &self.error
+    }
+
+    pub fn into_parts(self) -> (InertTerminalError, InertTerminal) {
+        (self.error, self.inert_terminal)
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Debug for InertTerminalActivationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InertTerminalActivationFailure")
+            .field("error", &self.error)
+            .field("inert_terminal", &self.inert_terminal)
+            .finish()
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Display for InertTerminalActivationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::error::Error for InertTerminalActivationFailure {}
 
 #[cfg(feature = "use_serde")]
 impl std::fmt::Debug for InertTerminal {
@@ -318,7 +378,20 @@ impl InertTerminal {
             replayed_records: 0,
             replayed_bytes: 0,
             replay_failed: false,
+            activation_poisoned: false,
+            #[cfg(test)]
+            force_writer_preparation_failure: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_writer_preparation_failure_for_test(&mut self) {
+        self.force_writer_preparation_failure = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writer_is_inert_for_test(&self) -> bool {
+        self.terminal.state.writer_is_inert_for_test()
     }
 
     /// Replay one authenticated raw-output journal record through this
@@ -333,6 +406,9 @@ impl InertTerminal {
         use frankenterm_escape_parser::osc::ITermProprietary;
         use frankenterm_escape_parser::{Action, OperatingSystemCommand};
 
+        if self.activation_poisoned {
+            return Err(InertTerminalError::ActivationPoisoned);
+        }
         if self.replay_failed {
             return Err(InertTerminalError::ReplayPoisoned);
         }
@@ -481,6 +557,9 @@ impl InertTerminal {
     pub fn checkpoint(
         &self,
     ) -> Result<crate::terminalstate::checkpoint::TerminalCheckpointV2, InertTerminalError> {
+        if self.activation_poisoned {
+            return Err(InertTerminalError::ActivationPoisoned);
+        }
         if self.replay_failed {
             return Err(InertTerminalError::ReplayPoisoned);
         }
@@ -500,54 +579,83 @@ impl InertTerminal {
     pub fn into_live(
         mut self,
         writer: Box<dyn std::io::Write + Send>,
-    ) -> Result<Terminal, InertTerminalError> {
+    ) -> Result<Terminal, InertTerminalActivationFailure> {
+        if self.activation_poisoned {
+            return Err(InertTerminalActivationFailure {
+                error: InertTerminalError::ActivationPoisoned,
+                inert_terminal: self,
+            });
+        }
         if self.replay_failed {
-            return Err(InertTerminalError::ReplayPoisoned);
+            return Err(InertTerminalActivationFailure {
+                error: InertTerminalError::ReplayPoisoned,
+                inert_terminal: self,
+            });
         }
         if !self.terminal.parser.is_recovery_ground() {
-            return Err(InertTerminalError::ParserNotRecoveryGround);
+            return Err(InertTerminalActivationFailure {
+                error: InertTerminalError::ParserNotRecoveryGround,
+                inert_terminal: self,
+            });
         }
-        if self.intended_live_config.revision() != self.intended_live_config_revision {
-            return Err(InertTerminalError::LiveConfigurationChanged);
+        #[cfg(test)]
+        if self.force_writer_preparation_failure {
+            return Err(InertTerminalActivationFailure {
+                error: InertTerminalError::WriterActivation,
+                inert_terminal: self,
+            });
         }
-        if self.intended_live_config.scrollback_tier_config().enabled {
-            return Err(InertTerminalError::RetieringRequired);
+        let prepared_writer = match self.terminal.state.prepare_inert_writer(writer) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                return Err(InertTerminalActivationFailure {
+                    error: InertTerminalError::WriterActivation,
+                    inert_terminal: self,
+                });
+            }
+        };
+        let live_config = Arc::clone(&self.intended_live_config);
+        let activation = {
+            let _lease = live_config.acquire_recovery_activation_lease();
+            (|| -> Result<(), InertTerminalError> {
+                if live_config.revision() != self.intended_live_config_revision {
+                    return Err(InertTerminalError::LiveConfigurationChanged);
+                }
+                let live_projection_matches = self
+                    .replay_projection
+                    .matches_stable(
+                        live_config.as_ref(),
+                        self.checkpoint_limits,
+                        &self.custom_cell_width_maps,
+                    )
+                    .map_err(InertTerminalError::Checkpoint)?;
+                if !live_projection_matches {
+                    return Err(InertTerminalError::ReplayConfigurationMismatch);
+                }
+                let prepared_config = self
+                    .terminal
+                    .state
+                    .prepare_recovery_configuration(Arc::clone(&live_config));
+                self.terminal
+                    .state
+                    .finish_recovery_activation(prepared_config, prepared_writer)
+                    .map_err(InertTerminalError::ScrollbackActivation)?;
+                Ok(())
+            })()
+        };
+        if let Err(error) = activation {
+            if matches!(
+                &error,
+                InertTerminalError::ScrollbackActivation(activation_error)
+                    if activation_error.outcome_is_indeterminate()
+            ) {
+                self.activation_poisoned = true;
+            }
+            return Err(InertTerminalActivationFailure {
+                error,
+                inert_terminal: self,
+            });
         }
-        let live_projection_matches = self
-            .replay_projection
-            .matches_stable(
-                self.intended_live_config.as_ref(),
-                self.checkpoint_limits,
-                &self.custom_cell_width_maps,
-            )
-            .map_err(InertTerminalError::Checkpoint)?;
-        if self.intended_live_config.revision() != self.intended_live_config_revision {
-            return Err(InertTerminalError::LiveConfigurationChanged);
-        }
-        if !live_projection_matches {
-            return Err(InertTerminalError::ReplayConfigurationMismatch);
-        }
-        self.terminal
-            .state
-            .set_config(Arc::clone(&self.intended_live_config));
-        let installed_projection_matches = self
-            .replay_projection
-            .matches_stable(
-                self.terminal.state.get_config().as_ref(),
-                self.checkpoint_limits,
-                &self.custom_cell_width_maps,
-            )
-            .map_err(InertTerminalError::Checkpoint)?;
-        if self.intended_live_config.revision() != self.intended_live_config_revision {
-            return Err(InertTerminalError::LiveConfigurationChanged);
-        }
-        if !installed_projection_matches {
-            return Err(InertTerminalError::ReplayConfigurationMismatch);
-        }
-        self.terminal
-            .state
-            .activate_inert_writer(writer)
-            .map_err(|_| InertTerminalError::WriterActivation)?;
         Ok(self.terminal)
     }
 }
@@ -607,9 +715,37 @@ impl Terminal {
         &self,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
-        if !self.parser.is_recovery_ground() {
-            return Err(RecoveryTerminalCheckpointError::ParserNotRecoveryGround);
-        }
+        let ground = self
+            .parser
+            .recovery_ground_boundary()
+            .ok_or(RecoveryTerminalCheckpointError::ParserNotRecoveryGround)?;
+        self.capture_recovery_checkpoint_at_stream_watermark(ground.stream_bytes(), limits)
+    }
+
+    /// Capture the model at a typed ground boundary from the external parser
+    /// that actually feeds this terminal.
+    ///
+    /// The witness is non-constructible and immutably borrows its parser, so
+    /// that parser cannot consume more bytes until this capture returns. The
+    /// embedding mux must additionally hold the terminal/model lock and bind
+    /// [`RecoveryTerminalCheckpointV2::parser_stream_bytes`] to its durable
+    /// output-journal receipt; this method does not claim that higher-level
+    /// delivery ordering on its own.
+    #[cfg(feature = "use_serde")]
+    pub fn capture_recovery_checkpoint_at_external_parser_ground(
+        &self,
+        ground: frankenterm_escape_parser::RecoveryGroundBoundary<'_>,
+        limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
+    ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
+        self.capture_recovery_checkpoint_at_stream_watermark(ground.stream_bytes(), limits)
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn capture_recovery_checkpoint_at_stream_watermark(
+        &self,
+        parser_stream_bytes: u64,
+        limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
+    ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
         let checkpoint =
             crate::terminalstate::checkpoint::TerminalCheckpointV2::capture_with_limits(
                 &self.state,
@@ -624,6 +760,7 @@ impl Terminal {
             canonical_payload,
             rows: size.rows,
             cols: size.cols,
+            parser_stream_bytes,
         })
     }
 
@@ -846,6 +983,40 @@ mod tests {
             "test",
             Box::new(Vec::new()),
         )
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn recovery_checkpoint_carries_the_exact_owned_parser_watermark() {
+        let mut terminal = make_prop_term(4, 8);
+        terminal.advance_bytes(b"abc");
+        terminal.advance_bytes(b"defg");
+
+        let checkpoint = terminal
+            .capture_recovery_checkpoint(
+                crate::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+            )
+            .expect("capture owned-parser checkpoint");
+        assert_eq!(checkpoint.parser_stream_bytes(), 7);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn external_recovery_ground_witness_supplies_the_checkpoint_watermark() {
+        let terminal = make_prop_term(4, 8);
+        let mut external_parser = Parser::new();
+        external_parser.parse(b"external-stream", |_| {});
+        let ground = external_parser
+            .recovery_ground_boundary()
+            .expect("external parser is ground");
+
+        let checkpoint = terminal
+            .capture_recovery_checkpoint_at_external_parser_ground(
+                ground,
+                crate::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+            )
+            .expect("capture external-parser checkpoint");
+        assert_eq!(checkpoint.parser_stream_bytes(), 15);
     }
 
     fn snapshot_line(line: &Line) -> LineSnapshot {

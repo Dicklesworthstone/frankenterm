@@ -60,6 +60,12 @@ compile_error!(
 use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
+use crate::guardian_checkpoint::{
+    LiveParserCaptureAuthority, LiveParserCheckpointAck, LiveParserPaneCaptureError,
+};
+use crate::guardian_output_journal::{
+    GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
+};
 use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, SplitRequest, Tab, TabId};
@@ -75,6 +81,7 @@ use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
+use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 #[cfg(unix)]
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use log::error;
@@ -1830,6 +1837,706 @@ struct PaneRetirementCompletion {
     kill: bool,
     lifecycle_notification: PaneLifecycleNotificationTicket,
     cleanup_complete: Arc<AtomicBool>,
+}
+
+const LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Error)]
+pub(crate) enum LiveParserCheckpointError {
+    #[error("live parser checkpoint timeout must be nonzero and no greater than {LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT:?}")]
+    InvalidTimeout,
+    #[error("pane registration is no longer current")]
+    StaleRegistration,
+    #[error("pane does not expose a durable UUID")]
+    MissingDurablePaneIdentity,
+    #[error("pane durable UUID must be nonnil")]
+    NilDurablePaneIdentity,
+    #[error("pane reader has no live parser checkpoint control channel")]
+    ReaderUnavailable,
+    #[error("pane reader/parser has terminated")]
+    ReaderDead,
+    #[error("another live parser checkpoint is already pending")]
+    CheckpointBusy,
+    #[error("guardian output delivery has not been registered for this parser incarnation")]
+    GuardianDeliveryUnavailable,
+    #[error("a guardian output delivery is already awaiting exact socket publication")]
+    GuardianDeliveryBusy,
+    #[error("guardian output receipt does not match the registered durable pane or segment")]
+    GuardianDeliveryIdentityMismatch,
+    #[error("guardian output receipts are not a contiguous authenticated sequence")]
+    GuardianDeliverySequenceMismatch,
+    #[error("guardian output segment rollover does not match the prior terminal receipt")]
+    GuardianDeliveryRolloverMismatch,
+    #[error("guardian output plaintext watermark is not a checked cumulative endpoint")]
+    GuardianDeliveryWatermarkMismatch,
+    #[error("guardian output delivery cannot start after unjournaled parser bytes")]
+    GuardianDeliveryStartedLate,
+    #[error("guardian output delivery byte accounting overflowed")]
+    GuardianDeliveryOverflow,
+    #[error("raw parser delivery attempted bytes without an authenticated guardian receipt")]
+    UnauthorizedGuardianDelivery,
+    #[error("live parser checkpoint receipt is not the current registered guardian delivery")]
+    CheckpointReceiptMismatch,
+    #[error(
+        "live parser boundary incomplete: delivered={delivered}, parsed={parsed}, target={target}"
+    )]
+    IncompleteBoundary {
+        delivered: u64,
+        parsed: u64,
+        target: u64,
+    },
+    #[error(
+        "live parser boundary overshot: delivered={delivered}, parsed={parsed}, target={target}"
+    )]
+    BoundaryOvershot {
+        delivered: u64,
+        parsed: u64,
+        target: u64,
+    },
+    #[error("live parser is retaining an incomplete escape sequence at the exact boundary")]
+    ParserNotRecoveryGround,
+    #[error("live parser recovery watermark is unavailable or does not equal the delivery fence")]
+    ParserWatermarkMismatch,
+    #[error("live parser is inside synchronized-output hold at the exact boundary")]
+    SynchronizedOutputHold,
+    #[error("pane terminal checkpoint callback failed: {0}")]
+    PaneCapture(String),
+    #[error("pane terminal checkpoint callback panicked after model mutation may have begun")]
+    PaneCapturePanicked,
+    #[error("live parser checkpoint identity binding failed: {0}")]
+    BoundaryBinding(String),
+    #[error("live parser delivery fence is poisoned: {0}")]
+    Poisoned(&'static str),
+    #[error("timed out waiting for the exact live parser checkpoint boundary")]
+    Timeout,
+    #[error("live parser checkpoint completion channel disconnected")]
+    CompletionDisconnected,
+}
+
+#[derive(Clone, Copy)]
+struct LiveParserGuardianCursor {
+    segment_id: uuid::Uuid,
+    output_sequence: u64,
+    output_record_digest: [u8; 32],
+    segment_plaintext_bytes: u64,
+    parser_global_endpoint: u64,
+}
+
+impl LiveParserGuardianCursor {
+    fn matches_receipt(
+        self,
+        segment: GuardianOutputSegmentIdentity,
+        output: GuardianOutputAppendReceipt,
+    ) -> bool {
+        segment.segment_id() == self.segment_id
+            && output.segment_id() == self.segment_id
+            && output.sequence() == self.output_sequence
+            && output.record_digest() == self.output_record_digest
+            && output.cumulative_plaintext_bytes() == self.segment_plaintext_bytes
+    }
+}
+
+struct PendingLiveParserCheckpoint {
+    request_id: u64,
+    target: u64,
+    durable_pane_id: uuid::Uuid,
+    segment: GuardianOutputSegmentIdentity,
+    output: GuardianOutputAppendReceipt,
+    limits: TerminalCheckpointLimits,
+    completion:
+        Option<std::sync::mpsc::SyncSender<Result<LiveParserCheckpointAck, LiveParserCheckpointError>>>,
+    capturing: bool,
+    cancelled: bool,
+}
+
+struct LiveParserCheckpointState {
+    attached: bool,
+    dead: bool,
+    poison: Option<&'static str>,
+    delivered_bytes: u64,
+    parsed_bytes: u64,
+    guardian_mode: bool,
+    guardian_cursor: Option<LiveParserGuardianCursor>,
+    authorized_delivery: Option<LiveParserGuardianCursor>,
+    next_request_id: u64,
+    pending: Option<PendingLiveParserCheckpoint>,
+}
+
+impl Default for LiveParserCheckpointState {
+    fn default() -> Self {
+        Self {
+            attached: false,
+            dead: false,
+            poison: None,
+            delivered_bytes: 0,
+            parsed_bytes: 0,
+            guardian_mode: false,
+            guardian_cursor: None,
+            authorized_delivery: None,
+            next_request_id: 1,
+            pending: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct LiveParserCheckpointControl {
+    state: Mutex<LiveParserCheckpointState>,
+    delivery_gate: Condvar,
+    wake_writer: Mutex<Option<FileDescriptor>>,
+}
+
+struct LiveParserCaptureRequest {
+    request_id: u64,
+    target: u64,
+    durable_pane_id: uuid::Uuid,
+    segment: GuardianOutputSegmentIdentity,
+    output: GuardianOutputAppendReceipt,
+    limits: TerminalCheckpointLimits,
+}
+
+enum LiveParserAttemptOutcome {
+    NoRequest,
+    Completed,
+    Fatal,
+}
+
+impl LiveParserCheckpointControl {
+    fn attach_wake_writer(&self, writer: FileDescriptor) -> Result<(), LiveParserCheckpointError> {
+        {
+            let mut state = self.state.lock();
+            if state.dead {
+                return Err(LiveParserCheckpointError::ReaderDead);
+            }
+            if state.attached {
+                return Err(LiveParserCheckpointError::ReaderUnavailable);
+            }
+            state.attached = true;
+        }
+        *self.wake_writer.lock() = Some(writer);
+        Ok(())
+    }
+
+    fn wake_parser(&self) {
+        let result = {
+            let mut writer = self.wake_writer.lock();
+            match writer.as_mut() {
+                Some(writer) => writer.write(&[1_u8]),
+                None => return self.poison("checkpoint control writer is unavailable"),
+            }
+        };
+        match result {
+            Ok(1) => {}
+            Ok(_) => self.poison("checkpoint control wake was partially written"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // A prior wake remains queued. The parser will observe it.
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => self.wake_parser(),
+            Err(_) => self.poison("checkpoint control wake failed"),
+        }
+    }
+
+    fn fail_pending_locked(
+        state: &mut LiveParserCheckpointState,
+        error: LiveParserCheckpointError,
+    ) {
+        let completion = state
+            .pending
+            .take()
+            .and_then(|mut pending| pending.completion.take());
+        if let Some(completion) = completion {
+            let _ = completion.send(Err(error));
+        }
+    }
+
+    fn poison(&self, reason: &'static str) {
+        {
+            let mut state = self.state.lock();
+            if state.poison.is_none() {
+                state.poison = Some(reason);
+            }
+            Self::fail_pending_locked(&mut state, LiveParserCheckpointError::Poisoned(reason));
+        }
+        self.delivery_gate.notify_all();
+    }
+
+    fn mark_dead(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.dead {
+                return;
+            }
+            state.dead = true;
+            if let Some(pending) = state.pending.as_ref() {
+                let error = LiveParserCheckpointError::IncompleteBoundary {
+                    delivered: state.delivered_bytes,
+                    parsed: state.parsed_bytes,
+                    target: pending.target,
+                };
+                Self::fail_pending_locked(&mut state, error);
+            }
+        }
+        self.delivery_gate.notify_all();
+    }
+
+    fn authorize_guardian_delivery(
+        &self,
+        durable_pane_id: uuid::Uuid,
+        segment: GuardianOutputSegmentIdentity,
+        output: GuardianOutputAppendReceipt,
+    ) -> Result<u64, LiveParserCheckpointError> {
+        let mut state = self.state.lock();
+        if !state.attached {
+            return Err(LiveParserCheckpointError::ReaderUnavailable);
+        }
+        if state.dead {
+            return Err(LiveParserCheckpointError::ReaderDead);
+        }
+        if let Some(reason) = state.poison {
+            return Err(LiveParserCheckpointError::Poisoned(reason));
+        }
+        if state.authorized_delivery.is_some() {
+            return Err(LiveParserCheckpointError::GuardianDeliveryBusy);
+        }
+        if state.pending.is_some() {
+            return Err(LiveParserCheckpointError::CheckpointBusy);
+        }
+        if segment.durable_pane_id() != durable_pane_id
+            || segment.segment_id() != output.segment_id()
+            || output.sequence() < segment.first_sequence()
+        {
+            return Err(LiveParserCheckpointError::GuardianDeliveryIdentityMismatch);
+        }
+
+        let payload_bytes = u64::from(output.payload_bytes());
+        if payload_bytes == 0 {
+            return Err(LiveParserCheckpointError::GuardianDeliveryWatermarkMismatch);
+        }
+        let (expected_segment_bytes, parser_base) = match state.guardian_cursor {
+            None => {
+                if state.guardian_mode
+                    || state.delivered_bytes != 0
+                    || state.parsed_bytes != 0
+                    || segment.first_sequence() != 1
+                    || segment.predecessor().is_some()
+                    || output.sequence() != 1
+                {
+                    return Err(LiveParserCheckpointError::GuardianDeliveryStartedLate);
+                }
+                (payload_bytes, 0)
+            }
+            Some(previous) if previous.segment_id == segment.segment_id() => {
+                let expected_sequence = previous
+                    .output_sequence
+                    .checked_add(1)
+                    .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
+                if output.sequence() != expected_sequence {
+                    return Err(LiveParserCheckpointError::GuardianDeliverySequenceMismatch);
+                }
+                let expected_segment_bytes = previous
+                    .segment_plaintext_bytes
+                    .checked_add(payload_bytes)
+                    .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
+                (expected_segment_bytes, previous.parser_global_endpoint)
+            }
+            Some(previous) => {
+                let Some(predecessor) = segment.predecessor() else {
+                    return Err(LiveParserCheckpointError::GuardianDeliveryRolloverMismatch);
+                };
+                let expected_sequence = previous
+                    .output_sequence
+                    .checked_add(1)
+                    .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
+                if predecessor.segment_id() != previous.segment_id
+                    || predecessor.last_sequence() != previous.output_sequence
+                    || predecessor.terminal_record_digest() != previous.output_record_digest
+                    || segment.first_sequence() != expected_sequence
+                    || output.sequence() != expected_sequence
+                {
+                    return Err(LiveParserCheckpointError::GuardianDeliveryRolloverMismatch);
+                }
+                (payload_bytes, previous.parser_global_endpoint)
+            }
+        };
+        if output.cumulative_plaintext_bytes() != expected_segment_bytes {
+            return Err(LiveParserCheckpointError::GuardianDeliveryWatermarkMismatch);
+        }
+        if let Some(previous) = state.guardian_cursor {
+            if state.delivered_bytes != previous.parser_global_endpoint {
+                return Err(LiveParserCheckpointError::GuardianDeliveryBusy);
+            }
+        }
+        let parser_global_endpoint = parser_base
+            .checked_add(payload_bytes)
+            .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
+        state.guardian_mode = true;
+        state.authorized_delivery = Some(LiveParserGuardianCursor {
+            segment_id: output.segment_id(),
+            output_sequence: output.sequence(),
+            output_record_digest: output.record_digest(),
+            segment_plaintext_bytes: output.cumulative_plaintext_bytes(),
+            parser_global_endpoint,
+        });
+        drop(state);
+        self.delivery_gate.notify_all();
+        Ok(parser_global_endpoint)
+    }
+
+    fn register_checkpoint(
+        &self,
+        durable_pane_id: uuid::Uuid,
+        segment: GuardianOutputSegmentIdentity,
+        output: GuardianOutputAppendReceipt,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<
+        (
+            u64,
+            std::sync::mpsc::Receiver<
+                Result<LiveParserCheckpointAck, LiveParserCheckpointError>,
+            >,
+        ),
+        LiveParserCheckpointError,
+    > {
+        let (completion, receiver) = std::sync::mpsc::sync_channel(1);
+        let request_id = {
+            let mut state = self.state.lock();
+            if !state.attached {
+                return Err(LiveParserCheckpointError::ReaderUnavailable);
+            }
+            if state.dead {
+                return Err(LiveParserCheckpointError::ReaderDead);
+            }
+            if let Some(reason) = state.poison {
+                return Err(LiveParserCheckpointError::Poisoned(reason));
+            }
+            if state.pending.is_some() {
+                return Err(LiveParserCheckpointError::CheckpointBusy);
+            }
+            let registered = state
+                .authorized_delivery
+                .filter(|cursor| cursor.matches_receipt(segment, output))
+                .or_else(|| {
+                    state
+                        .guardian_cursor
+                        .filter(|cursor| cursor.matches_receipt(segment, output))
+                })
+                .ok_or_else(|| {
+                    if state.guardian_mode {
+                        LiveParserCheckpointError::CheckpointReceiptMismatch
+                    } else {
+                        LiveParserCheckpointError::GuardianDeliveryUnavailable
+                    }
+                })?;
+            let target = registered.parser_global_endpoint;
+            if state.delivered_bytes > target || state.parsed_bytes > target {
+                return Err(LiveParserCheckpointError::BoundaryOvershot {
+                    delivered: state.delivered_bytes,
+                    parsed: state.parsed_bytes,
+                    target,
+                });
+            }
+            let request_id = state.next_request_id;
+            state.next_request_id = state
+                .next_request_id
+                .checked_add(1)
+                .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
+            state.pending = Some(PendingLiveParserCheckpoint {
+                request_id,
+                target,
+                durable_pane_id,
+                segment,
+                output,
+                limits,
+                completion: Some(completion),
+                capturing: false,
+                cancelled: false,
+            });
+            request_id
+        };
+        self.wake_parser();
+        Ok((request_id, receiver))
+    }
+
+    fn cancel_checkpoint(&self, request_id: u64) {
+        {
+            let mut state = self.state.lock();
+            let remove = match state.pending.as_mut() {
+                Some(pending) if pending.request_id == request_id && pending.capturing => {
+                    pending.cancelled = true;
+                    false
+                }
+                Some(pending) if pending.request_id == request_id => true,
+                _ => false,
+            };
+            if remove {
+                state.pending.take();
+            }
+        }
+        self.delivery_gate.notify_all();
+        self.wake_parser();
+    }
+
+    fn parser_read_allowance(&self, requested: usize) -> Result<usize, LiveParserCheckpointError> {
+        let state = self.state.lock();
+        if state.dead {
+            return Err(LiveParserCheckpointError::ReaderDead);
+        }
+        if let Some(reason) = state.poison {
+            return Err(LiveParserCheckpointError::Poisoned(reason));
+        }
+        let Some(pending) = state.pending.as_ref() else {
+            return Ok(requested);
+        };
+        if state.parsed_bytes > pending.target {
+            return Err(LiveParserCheckpointError::BoundaryOvershot {
+                delivered: state.delivered_bytes,
+                parsed: state.parsed_bytes,
+                target: pending.target,
+            });
+        }
+        let remaining = pending.target - state.parsed_bytes;
+        Ok(requested.min(usize::try_from(remaining).unwrap_or(usize::MAX)))
+    }
+
+    fn record_parsed_bytes(&self, parsed: usize) -> Result<u64, LiveParserCheckpointError> {
+        let mut state = self.state.lock();
+        let parsed = u64::try_from(parsed)
+            .map_err(|_| LiveParserCheckpointError::GuardianDeliveryOverflow)?;
+        state.parsed_bytes = state
+            .parsed_bytes
+            .checked_add(parsed)
+            .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
+        if state.parsed_bytes > state.delivered_bytes {
+            state.poison = Some("parser byte watermark exceeded counted socket delivery");
+            return Err(LiveParserCheckpointError::Poisoned(
+                "parser byte watermark exceeded counted socket delivery",
+            ));
+        }
+        Ok(state.parsed_bytes)
+    }
+
+    fn ready_checkpoint_target(&self) -> Result<Option<u64>, LiveParserCheckpointError> {
+        let state = self.state.lock();
+        let Some(pending) = state.pending.as_ref() else {
+            return Ok(None);
+        };
+        if state.delivered_bytes > pending.target || state.parsed_bytes > pending.target {
+            return Err(LiveParserCheckpointError::BoundaryOvershot {
+                delivered: state.delivered_bytes,
+                parsed: state.parsed_bytes,
+                target: pending.target,
+            });
+        }
+        Ok((state.delivered_bytes == pending.target && state.parsed_bytes == pending.target)
+            .then_some(pending.target))
+    }
+
+    fn begin_capture(
+        &self,
+        target: u64,
+    ) -> Result<Option<LiveParserCaptureRequest>, LiveParserCheckpointError> {
+        let mut state = self.state.lock();
+        let Some(pending) = state.pending.as_mut() else {
+            return Ok(None);
+        };
+        if pending.cancelled {
+            state.pending.take();
+            drop(state);
+            self.delivery_gate.notify_all();
+            return Ok(None);
+        }
+        if pending.target != target
+            || state.delivered_bytes != target
+            || state.parsed_bytes != target
+        {
+            return Err(LiveParserCheckpointError::ParserWatermarkMismatch);
+        }
+        if pending.capturing {
+            return Ok(None);
+        }
+        pending.capturing = true;
+        Ok(Some(LiveParserCaptureRequest {
+            request_id: pending.request_id,
+            target,
+            durable_pane_id: pending.durable_pane_id,
+            segment: pending.segment,
+            output: pending.output,
+            limits: pending.limits,
+        }))
+    }
+
+    fn reject_ready_checkpoint(&self, error: LiveParserCheckpointError) {
+        {
+            let mut state = self.state.lock();
+            Self::fail_pending_locked(&mut state, error);
+        }
+        self.delivery_gate.notify_all();
+    }
+
+    fn complete_capture(
+        &self,
+        request_id: u64,
+        result: Result<LiveParserCheckpointAck, LiveParserCheckpointError>,
+    ) {
+        let completion = {
+            let mut state = self.state.lock();
+            match state.pending.take() {
+                Some(mut pending) if pending.request_id == request_id => {
+                    if pending.cancelled {
+                        None
+                    } else {
+                        pending.completion.take()
+                    }
+                }
+                Some(pending) => {
+                    state.pending = Some(pending);
+                    None
+                }
+                None => None,
+            }
+        };
+        self.delivery_gate.notify_all();
+        if let Some(completion) = completion {
+            let _ = completion.send(result);
+        }
+    }
+
+    fn write_delivered_bytes(
+        &self,
+        writer: &mut FileDescriptor,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let mut offset = 0;
+        let mut wrote_any = false;
+        while offset < bytes.len() {
+            let mut state = self.state.lock();
+            loop {
+                if state.dead {
+                    return Err(std::io::Error::other(
+                        LiveParserCheckpointError::ReaderDead.to_string(),
+                    ));
+                }
+                if let Some(reason) = state.poison {
+                    return Err(std::io::Error::other(
+                        LiveParserCheckpointError::Poisoned(reason).to_string(),
+                    ));
+                }
+                if state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| state.delivered_bytes == pending.target)
+                {
+                    self.delivery_gate.wait(&mut state);
+                    continue;
+                }
+                break;
+            }
+
+            if state.guardian_mode && state.authorized_delivery.is_none() {
+                state.poison = Some("unauthorized bytes followed an authenticated delivery");
+                Self::fail_pending_locked(
+                    &mut state,
+                    LiveParserCheckpointError::UnauthorizedGuardianDelivery,
+                );
+                drop(state);
+                self.delivery_gate.notify_all();
+                return Err(std::io::Error::other(
+                    LiveParserCheckpointError::UnauthorizedGuardianDelivery.to_string(),
+                ));
+            }
+
+            let mut allowance = bytes.len() - offset;
+            if let Some(delivery) = state.authorized_delivery {
+                if state.delivered_bytes > delivery.parser_global_endpoint {
+                    state.poison = Some("guardian delivery endpoint was overshot");
+                    drop(state);
+                    self.poison("guardian delivery endpoint was overshot");
+                    return Err(std::io::Error::other("guardian delivery endpoint was overshot"));
+                }
+                let remaining = delivery.parser_global_endpoint - state.delivered_bytes;
+                allowance = allowance.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            }
+            if let Some(pending) = state.pending.as_ref() {
+                if state.delivered_bytes > pending.target {
+                    state.poison = Some("live parser delivery fence was overshot");
+                    drop(state);
+                    self.poison("live parser delivery fence was overshot");
+                    return Err(std::io::Error::other("live parser delivery fence was overshot"));
+                }
+                let remaining = pending.target - state.delivered_bytes;
+                allowance = allowance.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            }
+            if allowance == 0 {
+                drop(state);
+                continue;
+            }
+
+            match writer.write(&bytes[offset..offset + allowance]) {
+                Ok(0) => {
+                    state.poison = Some(if wrote_any {
+                        "partial socket write left delivery ambiguous"
+                    } else {
+                        "parser socket write returned zero"
+                    });
+                    let reason = state.poison.expect("poison just assigned");
+                    Self::fail_pending_locked(
+                        &mut state,
+                        LiveParserCheckpointError::Poisoned(reason),
+                    );
+                    drop(state);
+                    self.delivery_gate.notify_all();
+                    return Err(std::io::Error::other(reason));
+                }
+                Ok(written) => {
+                    wrote_any = true;
+                    let written_u64 = u64::try_from(written)
+                        .map_err(|_| std::io::Error::other("socket write length overflow"))?;
+                    state.delivered_bytes = match state.delivered_bytes.checked_add(written_u64) {
+                        Some(delivered) => delivered,
+                        None => {
+                            state.poison = Some("socket delivery watermark overflowed");
+                            drop(state);
+                            self.poison("socket delivery watermark overflowed");
+                            return Err(std::io::Error::other(
+                                "socket delivery watermark overflowed",
+                            ));
+                        }
+                    };
+                    offset += written;
+                    if state.authorized_delivery.is_some_and(|delivery| {
+                        delivery.parser_global_endpoint == state.delivered_bytes
+                    }) {
+                        state.guardian_cursor = state.authorized_delivery.take();
+                    }
+                    let wake = state
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.target == state.delivered_bytes);
+                    drop(state);
+                    if wake {
+                        self.wake_parser();
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let reason = if wrote_any {
+                        "partial socket write left delivery ambiguous"
+                    } else {
+                        "parser socket write failed"
+                    };
+                    state.poison = Some(reason);
+                    Self::fail_pending_locked(
+                        &mut state,
+                        LiveParserCheckpointError::Poisoned(reason),
+                    );
+                    drop(state);
+                    self.delivery_gate.notify_all();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
