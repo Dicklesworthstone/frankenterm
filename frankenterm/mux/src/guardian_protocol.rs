@@ -2710,7 +2710,6 @@ impl GuardianCheckpointDescriptorV1 {
 
     /// Construct a pre-spawn checkpoint whose durable pane identity will be
     /// assigned only after the exact spawn effect adopts it.
-    #[allow(clippy::too_many_arguments)]
     pub fn for_genesis_artifact(
         spawn_effect_id: Uuid,
         terminal: &RecoveryTerminalCheckpointV2,
@@ -13655,6 +13654,77 @@ mod tests {
         assert_eq!(
             checkpoint_total_chunks(1, 0),
             Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+    }
+
+    #[test]
+    fn checkpoint_wire_descriptor_routes_every_stable_preimage_through_canonical_authority() {
+        let pane = id(78);
+        let generation = 7;
+        let terminal = terminal_checkpoint();
+        let descriptor =
+            record_checkpoint_descriptor(pane, generation, terminal.canonical_payload());
+        let wire = descriptor.encode();
+
+        for (field, offset) in [
+            ("checkpoint identity", 0_usize),
+            ("boundary identity", 32),
+            ("replay semantics", 72),
+            ("rows", 104),
+            ("columns", 108),
+            ("terminal payload length", 112),
+            ("terminal payload digest", 120),
+            ("durable pane", 152),
+            ("record segment", 192),
+            ("record sequence", 208),
+            ("record digest", 216),
+            ("committed log bytes", 248),
+            ("cumulative plaintext bytes", 256),
+            ("parser watermark", 264),
+        ] {
+            let mut mutated = wire;
+            mutated[offset] ^= 1;
+            assert_eq!(
+                GuardianCheckpointDescriptorV1::decode(&mutated),
+                Err(GuardianProtocolError::InvalidReplyPayload),
+                "wire mutation escaped canonical identity validation: {field}"
+            );
+        }
+
+        // Registration generation is intentionally absent from the stable
+        // artifact identity, but the stage scope must still fence it exactly.
+        let mut generation_mutation = wire;
+        generation_mutation[64..72].copy_from_slice(&(generation + 1).to_be_bytes());
+        let decoded = GuardianCheckpointDescriptorV1::decode(&generation_mutation).unwrap();
+        assert_eq!(
+            decoded.validate_stage_scope(GuardianCheckpointScopeV1::Pane {
+                pane_id: pane,
+                generation,
+            }),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+
+        let spawn_effect_id = id(79);
+        let genesis = GuardianCheckpointDescriptorV1::for_genesis_artifact(
+            spawn_effect_id,
+            &terminal,
+        )
+        .unwrap();
+        let mut genesis_origin_mutation = genesis.encode();
+        genesis_origin_mutation[176] ^= 1;
+        assert_eq!(
+            GuardianCheckpointDescriptorV1::decode(&genesis_origin_mutation),
+            Err(GuardianProtocolError::InvalidReplyPayload),
+            "Genesis effect identity is part of the canonical boundary"
+        );
+
+        let mut genesis_generation_mutation = genesis.encode();
+        genesis_generation_mutation[64..72]
+            .copy_from_slice(&(GUARDIAN_GENESIS_CAPTURE_GENERATION + 1).to_be_bytes());
+        assert_eq!(
+            GuardianCheckpointDescriptorV1::decode(&genesis_generation_mutation),
+            Err(GuardianProtocolError::InvalidReplyPayload),
+            "Genesis capture generation is structurally fixed even though it is not a stable identity preimage"
         );
     }
 
