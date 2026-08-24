@@ -709,10 +709,7 @@ impl GuardianCheckpointStageScopeV1 {
                 generation,
             } if !pane_id.is_nil() && generation > 0 => Ok(()),
             GuardianCheckpointStageScopeKindV1::Genesis { spawn_effect_id }
-                if !spawn_effect_id.is_nil() =>
-            {
-                Ok(())
-            }
+                if !spawn_effect_id.is_nil() => Ok(()),
             _ => Err(GuardianCheckpointCipherError::InvalidScope),
         }
     }
@@ -763,6 +760,12 @@ impl std::fmt::Debug for GuardianCheckpointStageScopeV1 {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GuardianCheckpointStageContextAuthorityV1 {
+    CanonicalDescriptor,
+    PersistedClaim,
+}
+
 /// Complete authenticated identity of one encrypted Phase-A staging record.
 ///
 /// Private fields prevent unchecked construction. Production constructors
@@ -770,7 +773,8 @@ impl std::fmt::Debug for GuardianCheckpointStageScopeV1 {
 /// derive the content identity from the exact plaintext. The persisted-parts
 /// constructor validates an untrusted fixed header; successful opening still
 /// requires a separately supplied exact expected context and re-identifies the
-/// decrypted plaintext.
+/// decrypted plaintext. A persisted claim can be authenticated and opened but
+/// cannot authorize a new seal.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianCheckpointStageRecordContextV1 {
     kind: GuardianCheckpointStageRecordKindV1,
@@ -782,6 +786,7 @@ pub struct GuardianCheckpointStageRecordContextV1 {
     chunk_position: Option<(u32, u64)>,
     plaintext_bytes: u32,
     plaintext_digest: [u8; 32],
+    authority: GuardianCheckpointStageContextAuthorityV1,
 }
 
 impl GuardianCheckpointStageRecordContextV1 {
@@ -868,6 +873,7 @@ impl GuardianCheckpointStageRecordContextV1 {
             chunk_position,
             plaintext_bytes,
             plaintext_digest,
+            authority: GuardianCheckpointStageContextAuthorityV1::PersistedClaim,
         };
         context.validate()?;
         Ok(context)
@@ -944,7 +950,7 @@ impl GuardianCheckpointStageRecordContextV1 {
                 return Err(GuardianCheckpointCipherError::InvalidChunkIdentity);
             }
         }
-        Self::from_persisted_parts(
+        let mut context = Self::from_persisted_parts(
             kind,
             scope,
             upload_id,
@@ -954,7 +960,9 @@ impl GuardianCheckpointStageRecordContextV1 {
             chunk_position,
             plaintext_bytes,
             plaintext_digest,
-        )
+        )?;
+        context.authority = GuardianCheckpointStageContextAuthorityV1::CanonicalDescriptor;
+        Ok(context)
     }
 
     fn validate(&self) -> Result<(), GuardianCheckpointCipherError> {
@@ -1134,6 +1142,9 @@ impl GuardianCheckpointCipher {
         plaintext: &[u8],
     ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
         context.validate()?;
+        if context.authority != GuardianCheckpointStageContextAuthorityV1::CanonicalDescriptor {
+            return Err(GuardianCheckpointCipherError::UntrustedPersistedContext);
+        }
         let (plaintext_bytes, plaintext_digest) = checkpoint_stage_plaintext_identity(plaintext)?;
         if plaintext_bytes != context.plaintext_bytes
             || !checkpoint_stage_digests_match(plaintext_digest, context.plaintext_digest)
@@ -1201,6 +1212,13 @@ impl std::fmt::Debug for GuardianCheckpointCipher {
     }
 }
 
+struct GuardianCheckpointStageDecodedHeaderV1 {
+    version: u32,
+    key_id: [u8; CHECKPOINT_STAGE_KEY_ID_BYTES],
+    nonce: [u8; CHECKPOINT_STAGE_NONCE_BYTES],
+    context: GuardianCheckpointStageRecordContextV1,
+}
+
 /// One authenticated encrypted Phase-A checkpoint record.
 ///
 /// This envelope deliberately is not `Clone`. Its fixed header and ciphertext
@@ -1215,12 +1233,40 @@ pub struct GuardianEncryptedCheckpointStageRecordV1 {
 }
 
 impl GuardianEncryptedCheckpointStageRecordV1 {
+    /// Validate only the fixed header and return the one exact bounded body
+    /// length a storage reader may allocate and read next.
+    pub fn persisted_ciphertext_bytes(
+        header: &[u8],
+        max_plaintext_bytes: u32,
+    ) -> Result<usize, GuardianCheckpointCipherError> {
+        let decoded = Self::decode_fixed_header(header)?;
+        checkpoint_stage_expected_ciphertext_bytes(&decoded.context, max_plaintext_bytes)
+    }
+
     /// Reconstruct and validate one private fixed-layout record from storage.
     pub fn from_persisted(
         header: &[u8],
         ciphertext: Vec<u8>,
         max_plaintext_bytes: u32,
     ) -> Result<Self, GuardianCheckpointCipherError> {
+        let decoded = Self::decode_fixed_header(header)?;
+        let expected_ciphertext_bytes =
+            checkpoint_stage_expected_ciphertext_bytes(&decoded.context, max_plaintext_bytes)?;
+        if ciphertext.len() != expected_ciphertext_bytes {
+            return Err(GuardianCheckpointCipherError::CiphertextLengthMismatch);
+        }
+        Ok(Self {
+            version: decoded.version,
+            key_id: decoded.key_id,
+            nonce: decoded.nonce,
+            context: decoded.context,
+            ciphertext,
+        })
+    }
+
+    fn decode_fixed_header(
+        header: &[u8],
+    ) -> Result<GuardianCheckpointStageDecodedHeaderV1, GuardianCheckpointCipherError> {
         if header.len() != GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES
             || header[..8] != CHECKPOINT_STAGE_RECORD_MAGIC
             || header[12..16] != [0; 4]
@@ -1241,15 +1287,12 @@ impl GuardianEncryptedCheckpointStageRecordV1 {
         let mut encoded_context = [0_u8; CHECKPOINT_STAGE_CONTEXT_BYTES];
         encoded_context.copy_from_slice(&header[48..]);
         let context = GuardianCheckpointStageRecordContextV1::decode_canonical(&encoded_context)?;
-        let record = Self {
+        Ok(GuardianCheckpointStageDecodedHeaderV1 {
             version,
             key_id,
             nonce,
             context,
-            ciphertext,
-        };
-        record.validate_bounded(max_plaintext_bytes)?;
-        Ok(record)
+        })
     }
 
     #[must_use]
@@ -1278,6 +1321,11 @@ impl GuardianEncryptedCheckpointStageRecordV1 {
     }
 
     #[must_use]
+    pub fn ciphertext_bytes(&self) -> usize {
+        self.ciphertext.len()
+    }
+
+    #[must_use]
     pub fn fixed_header(&self) -> [u8; GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES] {
         let mut header = [0_u8; GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES];
         header[..8].copy_from_slice(&CHECKPOINT_STAGE_RECORD_MAGIC);
@@ -1301,19 +1349,8 @@ impl GuardianEncryptedCheckpointStageRecordV1 {
             return Err(GuardianCheckpointCipherError::InvalidKeyIdentity);
         }
         self.context.validate()?;
-        if max_plaintext_bytes == 0
-            || max_plaintext_bytes > GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES
-        {
-            return Err(GuardianCheckpointCipherError::InvalidCallerLimit);
-        }
-        if self.context.plaintext_bytes > max_plaintext_bytes {
-            return Err(GuardianCheckpointCipherError::PlaintextByteLimit);
-        }
-        let plaintext_bytes = usize::try_from(self.context.plaintext_bytes)
-            .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?;
-        let expected_ciphertext_bytes = plaintext_bytes
-            .checked_add(CHECKPOINT_STAGE_AEAD_TAG_BYTES)
-            .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+        let expected_ciphertext_bytes =
+            checkpoint_stage_expected_ciphertext_bytes(&self.context, max_plaintext_bytes)?;
         if self.ciphertext.len() != expected_ciphertext_bytes {
             return Err(GuardianCheckpointCipherError::CiphertextLengthMismatch);
         }
@@ -1373,6 +1410,8 @@ pub enum GuardianCheckpointCipherError {
     KeyIdentityMismatch,
     #[error("checkpoint staging context mismatch")]
     ContextMismatch,
+    #[error("persisted checkpoint context cannot authorize a new seal")]
+    UntrustedPersistedContext,
     #[error("checkpoint staging ciphertext length mismatch")]
     CiphertextLengthMismatch,
     #[error("checkpoint staging encryption failed")]
@@ -1398,6 +1437,25 @@ fn checkpoint_stage_plaintext_identity(
     hasher.update(plaintext_bytes.to_le_bytes());
     hasher.update(plaintext);
     Ok((plaintext_bytes, hasher.finalize().into()))
+}
+
+fn checkpoint_stage_expected_ciphertext_bytes(
+    context: &GuardianCheckpointStageRecordContextV1,
+    max_plaintext_bytes: u32,
+) -> Result<usize, GuardianCheckpointCipherError> {
+    context.validate()?;
+    if max_plaintext_bytes == 0
+        || max_plaintext_bytes > GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES
+    {
+        return Err(GuardianCheckpointCipherError::InvalidCallerLimit);
+    }
+    if context.plaintext_bytes > max_plaintext_bytes {
+        return Err(GuardianCheckpointCipherError::PlaintextByteLimit);
+    }
+    usize::try_from(context.plaintext_bytes)
+        .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?
+        .checked_add(CHECKPOINT_STAGE_AEAD_TAG_BYTES)
+        .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)
 }
 
 fn checkpoint_stage_record_aad(
@@ -3158,12 +3216,24 @@ mod tests {
                 u32::try_from(plaintext.len()).expect("fixture plaintext length fits u32")
             );
             let header = record.fixed_header();
+            assert_eq!(
+                GuardianEncryptedCheckpointStageRecordV1::persisted_ciphertext_bytes(
+                    &header,
+                    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+                )
+                .expect("derive bounded persisted body length"),
+                record.ciphertext_bytes()
+            );
             let reconstructed = GuardianEncryptedCheckpointStageRecordV1::from_persisted(
                 &header,
                 record.ciphertext().to_vec(),
                 GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
             )
             .expect("reconstruct bounded fixed-layout record");
+            assert!(matches!(
+                cipher.seal(reconstructed.context(), plaintext),
+                Err(GuardianCheckpointCipherError::UntrustedPersistedContext)
+            ));
             let opened: Zeroizing<Vec<u8>> = cipher
                 .open(
                     &context,
@@ -3460,6 +3530,24 @@ mod tests {
             plaintext,
         )
         .expect("construct candidate context");
+        let oversized_plaintext = Zeroizing::new(vec![
+            0x5a;
+            usize::try_from(
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES + 1
+            )
+            .expect("staging bound fits usize")
+        ]);
+        assert!(matches!(
+            GuardianCheckpointStageRecordContextV1::candidate_metadata(
+                scope,
+                Uuid::new_v4(),
+                &descriptor,
+                Uuid::new_v4(),
+                oversized_plaintext.as_slice(),
+            ),
+            Err(GuardianCheckpointCipherError::PlaintextByteLimit)
+        ));
+        drop(oversized_plaintext);
         let cipher = checkpoint_stage_cipher(0x51);
         let record = cipher
             .seal(context, plaintext)
@@ -3528,6 +3616,29 @@ mod tests {
                 GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES + 1,
             ),
             Err(GuardianCheckpointCipherError::InvalidCallerLimit)
+        ));
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::persisted_ciphertext_bytes(&header, 0),
+            Err(GuardianCheckpointCipherError::InvalidCallerLimit)
+        ));
+
+        let mut wrong_magic = header;
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::persisted_ciphertext_bytes(
+                &wrong_magic,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidFixedHeader)
+        ));
+        let mut noncanonical_reserved = header;
+        noncanonical_reserved[12] = 1;
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::persisted_ciphertext_bytes(
+                &noncanonical_reserved,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidFixedHeader)
         ));
     }
 
@@ -3643,6 +3754,10 @@ mod tests {
         for context in [candidate_context, manifest_context] {
             assert!(matches!(
                 cipher.seal(context, substituted_plaintext),
+                Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
+            ));
+            assert!(matches!(
+                cipher.seal(context, b"short"),
                 Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
             ));
         }
