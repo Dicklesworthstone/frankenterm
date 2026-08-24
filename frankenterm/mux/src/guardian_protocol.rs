@@ -8417,11 +8417,27 @@ fn validate_response_envelope(
         header.status,
         GuardianResponseStatus::Success | GuardianResponseStatus::Indeterminate
     ) {
-        let reply = GuardianReply::decode_for_operation(header.operation, &response.payload)?;
-        if reply.response_status() != header.status {
-            return Err(GuardianProtocolError::InvalidReplyPayload);
+        if header.operation == GuardianOperation::Replay {
+            if header.status != GuardianResponseStatus::Success {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+            let page = GuardianReplayPageDelivery::decode(Zeroizing::new(
+                response.payload.as_slice().to_vec(),
+            ))?;
+            if header.pane_id != Some(page.header.pane_id)
+                || header.lease_generation != page.header.generation
+                || header.lease_sequence != 0
+                || header.effect_id.is_some()
+            {
+                return Err(GuardianProtocolError::ResponseRequestMismatch);
+            }
+        } else {
+            let reply = GuardianReply::decode_for_operation(header.operation, &response.payload)?;
+            if reply.response_status() != header.status {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+            reply.require_response_identity(header)?;
         }
-        reply.require_response_identity(header)?;
     } else {
         GuardianRejectionCode::decode(header.status, &response.payload)?;
     }
@@ -8435,6 +8451,19 @@ fn validate_operation_scope(
     lease_generation: u64,
     lease_sequence: u64,
 ) -> Result<(), GuardianProtocolError> {
+    if operation == GuardianOperation::CheckpointStage {
+        let valid = lease_sequence == 0
+            && match (pane_id, effect_id, lease_generation) {
+                (Some(pane_id), None, generation) => !pane_id.is_nil() && generation > 0,
+                (None, Some(effect_id), 0) => !effect_id.is_nil(),
+                _ => false,
+            };
+        return if valid {
+            Ok(())
+        } else {
+            Err(GuardianProtocolError::InvalidOperationScope { operation })
+        };
+    }
     let pane_required = !matches!(
         operation,
         GuardianOperation::Census
@@ -8470,6 +8499,7 @@ fn validate_operation_scope(
         || !guarded_stop_scope_ok
         || !claim_scope_ok
         || !sequence_scope_ok
+        || (lease_required && lease_generation == 0)
     {
         Err(GuardianProtocolError::InvalidOperationScope { operation })
     } else {
@@ -8540,12 +8570,21 @@ fn validate_request_envelope(
         GuardianOperation::Checkpoint => {
             GuardianCheckpointIntent::decode(&request.payload)?;
         }
+        GuardianOperation::CheckpointStage => {
+            let stage = GuardianCheckpointStageRequestV1::decode(request.payload())?;
+            stage.validate_header(header)?;
+        }
+        GuardianOperation::Replay => {
+            GuardianReplayRequestV1::decode(request.payload())?;
+        }
+        GuardianOperation::ReplayAck => {
+            GuardianReplayAckV1::decode(request.payload())?;
+        }
         GuardianOperation::Hello
         | GuardianOperation::GuardedStop
         | GuardianOperation::Claim
         | GuardianOperation::Attach
         | GuardianOperation::Close
-        | GuardianOperation::Replay
         | GuardianOperation::RetireLease
             if !request.payload.is_empty() =>
         {
@@ -8562,6 +8601,11 @@ fn require_nonzero(value: Uuid, label: &'static str) -> Result<(), GuardianProto
     } else {
         Ok(())
     }
+}
+
+#[must_use]
+fn digest_is_zero(digest: [u8; 32]) -> bool {
+    digest.iter().all(|byte| *byte == 0)
 }
 
 fn push_uuid(buffer: &mut Vec<u8>, value: Uuid) {

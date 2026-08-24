@@ -660,7 +660,9 @@ impl GuardianRuntime {
                 return None;
             }
             GuardianOperation::Checkpoint
+            | GuardianOperation::CheckpointStage
             | GuardianOperation::Replay
+            | GuardianOperation::ReplayAck
             | GuardianOperation::GuardedStop => Err(GuardianRejectionCode::InvalidRequest),
             GuardianOperation::Hello => {
                 if request.payload().is_empty() {
@@ -719,6 +721,7 @@ impl GuardianRuntime {
         request: AuthenticatedGuardianRequest,
         route: GuardianInputRoute,
     ) -> GuardianInputSubmission {
+        #[cfg_attr(not(test), allow(unused_mut))]
         let mut request = OwnedInputRequest::new(request);
         #[cfg(test)]
         request.set_wipe_probe(self.input_request_wipe_probe.clone());
@@ -2850,7 +2853,9 @@ mod tests {
             GuardianOperation::Signal,
             GuardianOperation::Close,
             GuardianOperation::Checkpoint,
+            GuardianOperation::CheckpointStage,
             GuardianOperation::Replay,
+            GuardianOperation::ReplayAck,
             GuardianOperation::GuardedStop,
             GuardianOperation::RetireLease,
         ] {

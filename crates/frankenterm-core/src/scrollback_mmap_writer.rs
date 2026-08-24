@@ -364,14 +364,17 @@ impl MmapScrollback {
         let path = config.bin_path();
         let lock_path = config.lock_path();
         let expected_pane_uuid = pane_uuid_bytes(&config.pane_uuid);
-        let lock_leaf = lock_path.file_name().ok_or_else(|| {
-            MmapScrollbackError::UnsafeReadSource {
-                path: lock_path.clone(),
-                reason: "writer lock has no file name",
-            }
-        })?;
+        let lock_leaf = lock_path
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                MmapScrollbackError::UnsafeReadSource {
+                    path: lock_path.clone(),
+                    reason: "writer lock has no file name",
+                }
+            })?;
         let opened_lock =
-            open_writer_file(&base_directory, Path::new(lock_leaf), &lock_path)?;
+            open_writer_file(&base_directory, &lock_leaf, &lock_path)?;
         let lock_file = opened_lock.file;
         match lock_file.try_lock_exclusive() {
             Ok(()) => {}
@@ -390,7 +393,7 @@ impl MmapScrollback {
         after_lock();
         revalidate_writer_file(
             &base_directory,
-            Path::new(lock_leaf),
+            &lock_leaf,
             &lock_path,
             &lock_file,
             opened_lock.identity,
@@ -403,16 +406,17 @@ impl MmapScrollback {
 
         let data_leaf = path
             .file_name()
+            .map(PathBuf::from)
             .ok_or_else(|| MmapScrollbackError::UnsafeReadSource {
                 path: path.clone(),
                 reason: "writer data file has no file name",
             })?;
         let opened_data =
-            open_writer_file(&base_directory, Path::new(data_leaf), &path)?;
+            open_writer_file(&base_directory, &data_leaf, &path)?;
         let mut file = opened_data.file;
         revalidate_writer_file(
             &base_directory,
-            Path::new(data_leaf),
+            &data_leaf,
             &path,
             &file,
             opened_data.identity,
@@ -523,15 +527,15 @@ impl MmapScrollback {
         }
         revalidate_writer_file(
             &base_directory,
-            Path::new(data_leaf),
-            &path,
+            &data_leaf,
+            &writer.path,
             &writer.file,
             opened_data.identity,
         )?;
         revalidate_writer_file(
             &base_directory,
-            Path::new(lock_leaf),
-            &lock_path,
+            &lock_leaf,
+            &writer.lock_path,
             &writer.lock_file,
             opened_lock.identity,
         )?;

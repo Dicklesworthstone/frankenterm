@@ -9741,6 +9741,105 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_v1_append_wal_wrong_target_digest_cannot_claim_v4_migration_target() {
+        let (dir, context, sink, wal, appended) = legacy_v1_append_wal_fixture(218);
+        sink.persist_authenticated_append_wal(&wal)
+            .expect("publish valid v1 WAL before v4 migration");
+        drop(sink);
+
+        let migrated = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("recover valid v1 WAL into a v4 migration target");
+        assert_eq!(
+            migrated
+                .load_scrollback_line(11)
+                .expect("valid v1 WAL migration target is readable")
+                .as_str()
+                .as_ref(),
+            appended.as_str().as_ref()
+        );
+        let manifest = LiveScrollbackSpillSink::read_manifest(&migrated.manifest_path)
+            .expect("read v4 migration target")
+            .expect("v4 migration target exists");
+        assert_eq!(manifest.schema, LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
+        let manifest_bytes =
+            std::fs::read(&migrated.manifest_path).expect("read v4 migration target bytes");
+        let pane_dir = migrated
+            .manifest_path
+            .parent()
+            .expect("v4 migration target has a parent");
+        let log_path = pane_dir.join(&manifest.content_log);
+        let sequence_path = pane_dir.join(
+            manifest
+                .content_sequence
+                .as_deref()
+                .expect("v4 migration target names a sequence journal"),
+        );
+        let log_bytes = std::fs::read(&log_path).expect("read v4 migration target log bytes");
+        let sequence_bytes =
+            std::fs::read(&sequence_path).expect("read v4 migration target sequence bytes");
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&migrated.manifest_path)
+            .expect("derive v1 WAL migration path");
+
+        let mut wrong = wal.clone();
+        let wrong_digest = hex::encode([0xa5; 32]);
+        assert_ne!(
+            wrong.target_record_set_sha256.as_deref(),
+            Some(wrong_digest.as_str())
+        );
+        wrong.target_record_set_sha256 = Some(wrong_digest);
+        seal_append_wal_fixture(&migrated, &mut wrong);
+        overwrite_private_append_wal_fixture(&wal_path, &wrong);
+        drop(migrated);
+
+        let error = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect_err("wrong v1 target digest must not claim an authenticated v4 target");
+        assert!(
+            format!("{error:#}").contains("verify v1 target-set digest during v4 migration"),
+            "v1-to-v4 wrong-digest rejection remains migration-specific: {error:#}"
+        );
+        let manifest_path = dir
+            .path()
+            .join(uuid::Uuid::from_bytes(context.durable_pane_id).simple().to_string())
+            .join("manifest.json");
+        assert_eq!(
+            std::fs::read(&manifest_path).expect("re-read v4 migration target bytes"),
+            manifest_bytes
+        );
+        assert_eq!(
+            std::fs::read(&log_path).expect("re-read v4 migration target log bytes"),
+            log_bytes
+        );
+        assert_eq!(
+            std::fs::read(&sequence_path)
+                .expect("re-read v4 migration target sequence bytes"),
+            sequence_bytes
+        );
+
+        overwrite_private_append_wal_fixture(&wal_path, &wal);
+        let recovered = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("exact v1 WAL still claims the authenticated v4 target");
+        assert_eq!(
+            recovered
+                .load_scrollback_line(11)
+                .expect("exact v1 WAL target survives restored cold reopen")
+                .as_str()
+                .as_ref(),
+            appended.as_str().as_ref()
+        );
+        let current = LiveScrollbackSpillSink::read_manifest(&recovered.manifest_path)
+            .expect("read restored v4 migration target")
+            .expect("restored v4 migration target exists");
+        let acknowledged = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .expect("read restored v1 WAL acknowledgement")
+            .expect("restored v1 WAL acknowledgement exists");
+        assert!(LiveScrollbackSpillSink::append_wal_supersession_matches_manifest(
+            &acknowledged,
+            &current,
+        )
+        .expect("bind restored v1 WAL migration acknowledgement"));
+    }
+
+    #[test]
     fn authenticated_append_wal_supersession_recovers_ack_crash_and_advances_generations() {
         let dir = tempfile::tempdir().expect("create WAL supersession fixture");
         let context = config::ScrollbackSpillSinkContext {

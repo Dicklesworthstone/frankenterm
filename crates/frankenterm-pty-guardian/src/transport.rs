@@ -26,7 +26,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream as BlockingUnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -945,7 +945,7 @@ impl GuardianService {
     fn read_connection_frame(&mut self, token: Token, connection: &mut Connection) -> bool {
         loop {
             let mut chunk = Zeroizing::new([0_u8; 8192]);
-            match connection.stream.read(&mut chunk) {
+            match connection.stream.read(&mut chunk[..]) {
                 Ok(0) => return false,
                 Ok(count) => {
                     let Some(next_len) = connection.read_buf.len().checked_add(count) else {
@@ -3261,6 +3261,11 @@ mod tests {
             .observe_disconnect(initially_authenticated, Some(mux_incarnation))
             .unwrap();
         let first_disconnect = tracker.pending_retirements[0];
+        assert_eq!(
+            tracker.next_replayable_retirement().unwrap(),
+            None,
+            "a pre-disconnect unauthenticated accept must hold retirement until its identity resolves"
+        );
 
         tracker
             .observe_authenticated_hello(delayed_lower_generation, mux_incarnation)
@@ -3325,6 +3330,130 @@ mod tests {
     }
 
     #[test]
+    fn retirement_candidate_cutoff_is_bounded_and_resolves_without_mux_aliasing() {
+        let mux_incarnation = Uuid::from_u128(221);
+        let other_mux = Uuid::from_u128(222);
+
+        let mut unrelated_hello = MuxConnectionTracker::new(4).unwrap();
+        let candidate = ConnectionIdentity {
+            token: Token(1),
+            generation: 1,
+        };
+        let incumbent = ConnectionIdentity {
+            token: Token(2),
+            generation: 2,
+        };
+        unrelated_hello.observe_accept(candidate).unwrap();
+        unrelated_hello.observe_accept(incumbent).unwrap();
+        unrelated_hello
+            .observe_authenticated_hello(incumbent, mux_incarnation)
+            .unwrap();
+        unrelated_hello
+            .observe_disconnect(incumbent, Some(mux_incarnation))
+            .unwrap();
+        let retirement = unrelated_hello.pending_retirements[0];
+        assert_eq!(
+            unrelated_hello.next_replayable_retirement().unwrap(),
+            None
+        );
+        unrelated_hello
+            .observe_authenticated_hello(candidate, other_mux)
+            .unwrap();
+        assert_eq!(
+            unrelated_hello.next_replayable_retirement().unwrap(),
+            Some(retirement),
+            "an unrelated authenticated identity resolves the bounded candidate without cancelling the old mux retirement"
+        );
+
+        let mut disconnected_candidate = MuxConnectionTracker::new(4).unwrap();
+        disconnected_candidate.observe_accept(candidate).unwrap();
+        disconnected_candidate.observe_accept(incumbent).unwrap();
+        disconnected_candidate
+            .observe_authenticated_hello(incumbent, mux_incarnation)
+            .unwrap();
+        disconnected_candidate
+            .observe_disconnect(incumbent, Some(mux_incarnation))
+            .unwrap();
+        let retirement = disconnected_candidate.pending_retirements[0];
+        disconnected_candidate
+            .observe_disconnect(candidate, None)
+            .unwrap();
+        assert_eq!(
+            disconnected_candidate.next_replayable_retirement().unwrap(),
+            Some(retirement),
+            "an unauthenticated disconnect resolves the bounded candidate"
+        );
+
+        let mut later_accept = MuxConnectionTracker::new(4).unwrap();
+        later_accept.observe_accept(incumbent).unwrap();
+        later_accept
+            .observe_authenticated_hello(incumbent, mux_incarnation)
+            .unwrap();
+        later_accept
+            .observe_disconnect(incumbent, Some(mux_incarnation))
+            .unwrap();
+        let retirement = later_accept.pending_retirements[0];
+        let post_cutoff = ConnectionIdentity {
+            token: Token(3),
+            generation: 3,
+        };
+        later_accept.observe_accept(post_cutoff).unwrap();
+        assert!(
+            later_accept.live_connections[&post_cutoff].accepted_observation_epoch
+                > retirement.unauthenticated_accept_cutoff_epoch
+        );
+        assert_eq!(
+            later_accept.next_replayable_retirement().unwrap(),
+            Some(retirement),
+            "an accept linearized after the immutable cutoff cannot extend the old retirement barrier"
+        );
+    }
+
+    #[test]
+    fn copied_stale_ready_event_cannot_remove_a_recycled_connection_identity() {
+        let token = Token(7);
+        let (old_stream, _old_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        old_stream.set_nonblocking(true).unwrap();
+        let mut connections = HashMap::new();
+        connections.insert(
+            token,
+            Connection::new(UnixStream::from_std(old_stream), 12),
+        );
+
+        let stale = ReadyEvent {
+            token,
+            connection_identity: Some(ConnectionIdentity {
+                token,
+                generation: 11,
+            }),
+            readable: true,
+            writable: false,
+            closed: true,
+        };
+        assert!(take_exact_ready_connection(&mut connections, stale).is_none());
+        assert_eq!(connections[&token].generation, 12);
+
+        let missing_snapshot = ReadyEvent {
+            connection_identity: None,
+            ..stale
+        };
+        assert!(
+            take_exact_ready_connection(&mut connections, missing_snapshot).is_none()
+        );
+        assert_eq!(connections[&token].generation, 12);
+
+        let exact = ReadyEvent {
+            connection_identity: Some(ConnectionIdentity {
+                token,
+                generation: 12,
+            }),
+            ..stale
+        };
+        assert!(take_exact_ready_connection(&mut connections, exact).is_some());
+        assert!(connections.is_empty());
+    }
+
+    #[test]
     fn replay_fails_closed_if_exact_authenticated_membership_is_active() {
         let mux_incarnation = Uuid::from_u128(211);
         let identity = ConnectionIdentity {
@@ -3341,6 +3470,7 @@ mod tests {
             .push(PendingMuxRetirementObservation {
                 mux_incarnation,
                 disconnect_observation_epoch: 1,
+                unauthenticated_accept_cutoff_epoch: 1,
             });
 
         assert_eq!(
@@ -3349,6 +3479,10 @@ mod tests {
         );
         assert!(tracker.has_authenticated_membership(mux_incarnation));
         assert_eq!(tracker.pending_retirements.len(), 1);
+        assert_eq!(
+            tracker.next_replayable_retirement(),
+            Err(MuxConnectionTrackingError::Poisoned)
+        );
     }
 
     #[test]
@@ -3366,6 +3500,15 @@ mod tests {
         let handle_input_completions = poll_once_source
             .find("self.handle_input_completions();")
             .expect("input authority restoration is wired into poll_once");
+        let accept_batch = poll_once_source
+            .find("self.accept_connections()?;")
+            .expect("listener accept batch is wired into poll_once");
+        let connection_event_loop = poll_once_source
+            .find("for index in 0..self.ready.len()")
+            .expect("captured connection event loop is wired into poll_once");
+        let authentication_expiry = poll_once_source
+            .find("self.expire_unauthenticated_connections();")
+            .expect("bounded authentication expiry is wired into poll_once");
         let retirement_replay = poll_once_source
             .find("self.replay_deferred_mux_retirements();")
             .expect("retirement replay is wired into poll_once");
@@ -3378,12 +3521,16 @@ mod tests {
             .expect("finish_connection production body is present");
 
         assert!(service_source.contains("self.mux_connections.observe_accept(identity)"));
+        assert!(service_source.contains("connection_identity: self"));
+        assert!(service_source.contains("take_exact_ready_connection(&mut self.connections, event)"));
         assert!(service_source.contains(".observe_authenticated_hello(\n                            connection.identity(token),\n                            mux_incarnation,"));
         assert!(
             service_source
                 .contains(".observe_disconnect(identity, connection.mux_incarnation)")
         );
-        assert!(retirement_replay > handle_input_completions);
+        assert!(accept_batch < connection_event_loop);
+        assert!(authentication_expiry > handle_input_completions);
+        assert!(retirement_replay > authentication_expiry);
         assert_eq!(
             poll_once_source
                 .matches("self.replay_deferred_mux_retirements();")
@@ -3436,6 +3583,7 @@ mod tests {
         assert!(wipe_probe.drop_wipe.load(Ordering::SeqCst));
         assert!(!wipe_probe.authenticated_input_wipe.load(Ordering::SeqCst));
         assert!(!wipe_probe.encoded_frame_wipe.load(Ordering::SeqCst));
+        assert!(!wipe_probe.encoded_frame_drop_wipe.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -3454,12 +3602,12 @@ mod tests {
         let ordered_boundaries = [
             boundary("let encoded = encode_guardian_request"),
             boundary("request.zeroize_payload();"),
-            boundary("Zeroizing::new(encoded?)"),
+            boundary("OwnedEncodedFrame::new(encoded?)"),
             boundary("drop(request);"),
             boundary("decode_guardian_request"),
             boundary("retire_authenticated_input_plaintext(&mut authenticated);"),
-            boundary("self.stream.write_all(&frame)?;"),
-            boundary("frame.as_mut_slice().zeroize();"),
+            boundary("self.stream.write_all(frame.as_slice())?;"),
+            boundary("frame.zeroize_after_write();"),
             boundary("read_blocking_frame(&mut self.stream)?"),
         ];
 
@@ -3494,10 +3642,14 @@ mod tests {
         let server_wipe_probe = Arc::clone(&wipe_probe);
         let server = std::thread::spawn(move || {
             let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
-            let frame = read_blocking_frame(&mut server_stream).unwrap();
-            let request = decode_guardian_request(&secret, &frame).unwrap();
+            let mut frame = read_blocking_frame(&mut server_stream).unwrap();
+            let mut request = decode_guardian_request(&secret, &frame).unwrap();
             assert_eq!(request.header().operation, GuardianOperation::Input);
             assert_eq!(request.authenticated_payload_bytes(), 23);
+            frame.as_mut_slice().zeroize();
+            request.zeroize_payload();
+            assert!(frame.iter().all(|byte| *byte == 0));
+            assert!(request.payload().is_empty());
             let wipe_deadline = Instant::now() + Duration::from_secs(3);
             while (!server_wipe_probe
                 .authenticated_input_wipe
@@ -3550,7 +3702,41 @@ mod tests {
         assert!(wipe_probe.drop_wipe.load(Ordering::SeqCst));
         assert!(wipe_probe.authenticated_input_wipe.load(Ordering::SeqCst));
         assert!(wipe_probe.encoded_frame_wipe.load(Ordering::SeqCst));
+        assert!(wipe_probe.encoded_frame_drop_wipe.load(Ordering::SeqCst));
         server.join().expect("input test server exits cleanly");
+    }
+
+    #[test]
+    fn encoded_input_frame_wipes_on_socket_write_error() {
+        let (client_stream, _peer_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+        let wipe_probe = Arc::new(ClientRequestWipeProbe::default());
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap(),
+            mux_incarnation: Uuid::from_u128(41),
+            guardian_incarnation: Uuid::from_u128(42),
+            request_wipe_probe: Some(Arc::clone(&wipe_probe)),
+        };
+
+        assert!(matches!(
+            client.input(
+                Uuid::from_u128(43),
+                4,
+                9,
+                Uuid::from_u128(44),
+                Uuid::from_u128(45),
+                vec![0x6d; 23],
+            ),
+            Err(GuardianClientError::Io(_))
+        ));
+        assert!(wipe_probe.explicit_wipe.load(Ordering::SeqCst));
+        assert!(wipe_probe.drop_wipe.load(Ordering::SeqCst));
+        assert!(wipe_probe.authenticated_input_wipe.load(Ordering::SeqCst));
+        assert!(!wipe_probe.encoded_frame_wipe.load(Ordering::SeqCst));
+        assert!(wipe_probe.encoded_frame_drop_wipe.load(Ordering::SeqCst));
     }
 
     #[test]

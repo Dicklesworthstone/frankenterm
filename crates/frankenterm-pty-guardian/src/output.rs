@@ -2605,7 +2605,7 @@ fn open_and_validate_segment_chain(
             segment.file_identity,
         )?;
         let file = open_private_file_at(directory, directory_path, &segment.path, false)?;
-        let mut journal = GuardianOutputJournal::open(
+        let journal = GuardianOutputJournal::open(
             file,
             segment.segment_identity,
             cipher.clone(),
