@@ -611,15 +611,19 @@ impl OrphanCandidate {
                 reason: "opened data identity changed during discard",
             });
         }
-        directory
+        if let Err(source) = directory
             .directory
-            .try_clone()
-            .and_then(|handle| handle.into_std_file().sync_all())
-            .map_err(|source| LegacyRecoveryDiscardError::Io {
-                path: directory.display_path.clone(),
-                phase: "directory fsync",
-                source,
-            })?;
+            .open(".")
+            .and_then(|handle| handle.sync_all())
+        {
+            if !matches!(source.raw_os_error(), Some(9 | 22 | 95)) {
+                return Err(LegacyRecoveryDiscardError::Io {
+                    path: directory.display_path.clone(),
+                    phase: "directory fsync",
+                    source,
+                });
+            }
+        }
         lease
             .revalidate()
             .map_err(|source| LegacyRecoveryDiscardError::Io {

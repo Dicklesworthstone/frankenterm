@@ -2629,7 +2629,14 @@ fn sync_directory_for_publication(
     directory: &CapDir,
     expected_identity: LinearRecordSourceIdentity,
 ) -> std::io::Result<()> {
-    directory.try_clone()?.into_std_file().sync_all()?;
+    if let Err(err) = directory
+        .open(".")
+        .and_then(|handle| handle.sync_all())
+    {
+        if !matches!(err.raw_os_error(), Some(9 | 22 | 95)) {
+            return Err(err);
+        }
+    }
     let metadata = directory.dir_metadata()?;
     if metadata_identity(&metadata) != expected_identity {
         return Err(std::io::Error::other(
