@@ -2,8 +2,11 @@
 
 use crate::{configuration, ConfigHandle, NewlineCanon};
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::config::{BidiMode, ScrollbackSpillSink};
+use frankenterm_term::config::{
+    BidiMode, ScrollbackSpillSink, TerminalConfigurationRevision,
+};
 use frankenterm_term::MonospaceKpCostModel;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use termwiz::cell::UnicodeVersion;
 
@@ -59,7 +62,28 @@ fn scrollback_spill_sink_for(
 pub struct TermConfig {
     config: Mutex<Option<ConfigHandle>>,
     client_palette: Mutex<Option<ColorPalette>>,
+    overlay_generation: AtomicUsize,
     scrollback_spill_sink: Option<Arc<dyn ScrollbackSpillSink>>,
+}
+
+fn bump_overlay_generation(generation: &AtomicUsize) {
+    let mut current = generation.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).unwrap_or_else(|| {
+            panic!(
+                "terminal configuration overlay generation exhausted; refusing to reuse an identity"
+            )
+        });
+        match generation.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 impl TermConfig {
@@ -67,6 +91,7 @@ impl TermConfig {
         Self {
             config: Mutex::new(None),
             client_palette: Mutex::new(None),
+            overlay_generation: AtomicUsize::new(0),
             scrollback_spill_sink: None,
         }
     }
@@ -87,6 +112,7 @@ impl TermConfig {
         Self {
             config: Mutex::new(None),
             client_palette: Mutex::new(None),
+            overlay_generation: AtomicUsize::new(0),
             scrollback_spill_sink,
         }
     }
@@ -95,6 +121,7 @@ impl TermConfig {
         Self {
             config: Mutex::new(Some(config)),
             client_palette: Mutex::new(None),
+            overlay_generation: AtomicUsize::new(0),
             scrollback_spill_sink: None,
         }
     }
@@ -106,17 +133,21 @@ impl TermConfig {
         Self {
             config: Mutex::new(Some(config)),
             client_palette: Mutex::new(None),
+            overlay_generation: AtomicUsize::new(0),
             scrollback_spill_sink,
         }
     }
 
     pub fn set_config(&self, config: ConfigHandle) {
-        let _previous = lock_terminal_mutex(&self.config, "terminal config").replace(config);
+        let mut current = lock_terminal_mutex(&self.config, "terminal config");
+        bump_overlay_generation(&self.overlay_generation);
+        let _previous = current.replace(config);
     }
 
     pub fn set_client_palette(&self, palette: ColorPalette) {
-        let _previous =
-            lock_terminal_mutex(&self.client_palette, "terminal client palette").replace(palette);
+        let mut current = lock_terminal_mutex(&self.client_palette, "terminal client palette");
+        bump_overlay_generation(&self.overlay_generation);
+        let _previous = current.replace(palette);
     }
 
     fn configuration(&self) -> ConfigHandle {
@@ -134,6 +165,16 @@ impl TermConfig {
 impl frankenterm_term::TerminalConfiguration for TermConfig {
     fn generation(&self) -> usize {
         self.configuration().generation()
+    }
+
+    fn revision(&self) -> TerminalConfigurationRevision {
+        loop {
+            let overlay_generation = self.overlay_generation.load(Ordering::Acquire);
+            let base_generation = self.configuration().generation();
+            if self.overlay_generation.load(Ordering::Acquire) == overlay_generation {
+                return TerminalConfigurationRevision::new(base_generation, overlay_generation);
+            }
+        }
     }
 
     fn scrollback_size(&self) -> usize {
@@ -497,6 +538,20 @@ mod tests {
         let palette = ColorPalette::default();
         term_config.set_client_palette(palette.clone());
         assert_eq!(term_config.color_palette(), palette);
+    }
+
+    #[test]
+    fn term_config_revision_tracks_same_generation_overlays() {
+        let handle = ConfigHandle::default_config();
+        let term_config = TermConfig::with_config(handle.clone());
+        let initial = term_config.revision();
+
+        term_config.set_config(handle);
+        let after_same_generation_config_swap = term_config.revision();
+        assert_ne!(after_same_generation_config_swap, initial);
+
+        term_config.set_client_palette(ColorPalette::default());
+        assert_ne!(term_config.revision(), after_same_generation_config_swap);
     }
 
     #[test]

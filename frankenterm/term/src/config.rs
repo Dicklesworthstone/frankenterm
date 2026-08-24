@@ -496,7 +496,6 @@ impl ScrollbackSnapshotGeneration {
             revision,
         }
     }
-
 }
 
 impl std::fmt::Debug for ScrollbackSnapshotGeneration {
@@ -777,6 +776,25 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError>;
 }
 
+/// Complete identity of the terminal configuration visible to recovery code.
+///
+/// `base_generation` retains the long-standing configuration generation,
+/// while `overlay_generation` fences independently mutable runtime overlays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalConfigurationRevision {
+    pub base_generation: usize,
+    pub overlay_generation: usize,
+}
+
+impl TerminalConfigurationRevision {
+    pub const fn new(base_generation: usize, overlay_generation: usize) -> Self {
+        Self {
+            base_generation,
+            overlay_generation,
+        }
+    }
+}
+
 /// TerminalConfiguration allows for the embedding application to pass configuration
 /// information to the Terminal.
 /// The configuration can be changed at runtime; provided that the implementation
@@ -790,6 +808,13 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// by the terminal can be flushed.
     fn generation(&self) -> usize {
         0
+    }
+
+    /// Returns the complete configuration revision used to fence checkpoint
+    /// capture and recovery. Implementations with no independently mutable
+    /// overlay inherit the legacy generation as their base revision.
+    fn revision(&self) -> TerminalConfigurationRevision {
+        TerminalConfigurationRevision::new(self.generation(), 0)
     }
 
     /// Returns the size of the scrollback in terms of the number of rows.

@@ -944,175 +944,185 @@ fn scrollback_hot_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback
     tier.hot_lines.max(1).min(total)
 }
 
-impl Screen {
-    #[cfg(feature = "use_serde")]
-    pub(crate) fn checkpoint_parts(
-        &self,
-        limits: &ScreenCheckpointLimits,
-        usage: &mut ScreenCheckpointUsage,
-    ) -> Result<ScreenCheckpointParts, ScreenCheckpointCaptureError> {
-        fn accumulate(
-            current: &mut usize,
-            additional: usize,
-            maximum: usize,
-            resource: &'static str,
-        ) -> Result<(), ScreenCheckpointCaptureError> {
-            let observed = current
-                .checked_add(additional)
-                .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(resource))?;
-            if observed > maximum {
+#[cfg(feature = "use_serde")]
+fn accumulate_checkpoint_usage(
+    current: &mut usize,
+    additional: usize,
+    maximum: usize,
+    resource: &'static str,
+) -> Result<(), ScreenCheckpointCaptureError> {
+    let observed = current
+        .checked_add(additional)
+        .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(resource))?;
+    if observed > maximum {
+        return Err(ScreenCheckpointCaptureError::ResourceLimit {
+            resource,
+            observed,
+            maximum,
+        });
+    }
+    *current = observed;
+    Ok(())
+}
+
+#[cfg(feature = "use_serde")]
+fn inspect_checkpoint_line(
+    line: &Line,
+    limits: &ScreenCheckpointLimits,
+    usage: &mut ScreenCheckpointUsage,
+) -> Result<(), ScreenCheckpointCaptureError> {
+    if line.has_image_attachments() {
+        return Err(ScreenCheckpointCaptureError::UnsupportedGraphicsState);
+    }
+    accumulate_checkpoint_usage(
+        &mut usage.lines,
+        1,
+        limits.max_total_lines,
+        "screen_lines",
+    )?;
+    accumulate_checkpoint_usage(
+        &mut usage.retained_capture_bytes,
+        limits.estimated_bytes_per_line,
+        limits.max_retained_capture_bytes,
+        "retained_capture_bytes",
+    )?;
+    accumulate_checkpoint_usage(
+        &mut usage.cells,
+        line.len(),
+        limits.max_total_cells,
+        "screen_cells",
+    )?;
+    let cell_structural_bytes = line
+        .len()
+        .checked_mul(limits.estimated_bytes_per_cell)
+        .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+            "retained_capture_bytes",
+        ))?;
+    accumulate_checkpoint_usage(
+        &mut usage.retained_capture_bytes,
+        cell_structural_bytes,
+        limits.max_retained_capture_bytes,
+        "retained_capture_bytes",
+    )?;
+
+    let mut semantic_cells = 0usize;
+    for cell in line.visible_cells() {
+        accumulate_checkpoint_usage(
+            &mut usage.cell_records,
+            1,
+            limits.max_total_cell_records,
+            "screen_cell_records",
+        )?;
+        let width = cell.width();
+        if !(1..=2).contains(&width) {
+            return Err(ScreenCheckpointCaptureError::InvalidLineGeometry);
+        }
+        semantic_cells = semantic_cells
+            .checked_add(width)
+            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                "semantic_line_cells",
+            ))?;
+
+        let text_bytes = cell.str().len();
+        if text_bytes > limits.max_string_bytes {
+            return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                resource: "cell_text_bytes",
+                observed: text_bytes,
+                maximum: limits.max_string_bytes,
+            });
+        }
+        accumulate_checkpoint_usage(
+            &mut usage.cell_text_bytes,
+            text_bytes,
+            limits.max_total_cell_text_bytes,
+            "cell_text_bytes",
+        )?;
+        accumulate_checkpoint_usage(
+            &mut usage.retained_capture_bytes,
+            text_bytes,
+            limits.max_retained_capture_bytes,
+            "retained_capture_bytes",
+        )?;
+
+        if let Some(link) = cell.attrs().hyperlink() {
+            if link.params().len() > limits.max_hyperlink_params_per_link {
                 return Err(ScreenCheckpointCaptureError::ResourceLimit {
-                    resource,
-                    observed,
-                    maximum,
+                    resource: "hyperlink_params_per_link",
+                    observed: link.params().len(),
+                    maximum: limits.max_hyperlink_params_per_link,
                 });
             }
-            *current = observed;
-            Ok(())
-        }
+            accumulate_checkpoint_usage(
+                &mut usage.hyperlink_params,
+                link.params().len(),
+                limits.max_total_hyperlink_params,
+                "hyperlink_params",
+            )?;
 
-        fn inspect_line(
-            line: &Line,
-            limits: &ScreenCheckpointLimits,
-            usage: &mut ScreenCheckpointUsage,
-        ) -> Result<(), ScreenCheckpointCaptureError> {
-            if line.has_image_attachments() {
-                return Err(ScreenCheckpointCaptureError::UnsupportedGraphicsState);
+            let mut link_bytes = link.uri().len();
+            if link.uri().len() > limits.max_string_bytes {
+                return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                    resource: "hyperlink_uri_bytes",
+                    observed: link.uri().len(),
+                    maximum: limits.max_string_bytes,
+                });
             }
-            accumulate(
-                &mut usage.lines,
-                1,
-                limits.max_total_lines,
-                "screen_lines",
-            )?;
-            accumulate(
-                &mut usage.retained_capture_bytes,
-                limits.estimated_bytes_per_line,
-                limits.max_retained_capture_bytes,
-                "retained_capture_bytes",
-            )?;
-            accumulate(
-                &mut usage.cells,
-                line.len(),
-                limits.max_total_cells,
-                "screen_cells",
-            )?;
-            let cell_structural_bytes = line
-                .len()
-                .checked_mul(limits.estimated_bytes_per_cell)
-                .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
-                    "retained_capture_bytes",
-                ))?;
-            accumulate(
-                &mut usage.retained_capture_bytes,
-                cell_structural_bytes,
-                limits.max_retained_capture_bytes,
-                "retained_capture_bytes",
-            )?;
-
-            let mut semantic_cells = 0usize;
-            for cell in line.visible_cells() {
-                accumulate(
-                    &mut usage.cell_records,
-                    1,
-                    limits.max_total_cell_records,
-                    "screen_cell_records",
-                )?;
-                let width = cell.width();
-                if !(1..=2).contains(&width) {
-                    return Err(ScreenCheckpointCaptureError::InvalidLineGeometry);
-                }
-                semantic_cells = semantic_cells.checked_add(width).ok_or(
-                    ScreenCheckpointCaptureError::ArithmeticOverflow("semantic_line_cells"),
-                )?;
-
-                let text_bytes = cell.str().len();
-                if text_bytes > limits.max_string_bytes {
+            for (key, value) in link.params() {
+                if key.len() > limits.max_string_bytes {
                     return Err(ScreenCheckpointCaptureError::ResourceLimit {
-                        resource: "cell_text_bytes",
-                        observed: text_bytes,
+                        resource: "hyperlink_param_key_bytes",
+                        observed: key.len(),
                         maximum: limits.max_string_bytes,
                     });
                 }
-                accumulate(
-                    &mut usage.cell_text_bytes,
-                    text_bytes,
-                    limits.max_total_cell_text_bytes,
-                    "cell_text_bytes",
-                )?;
-                accumulate(
-                    &mut usage.retained_capture_bytes,
-                    text_bytes,
-                    limits.max_retained_capture_bytes,
-                    "retained_capture_bytes",
-                )?;
-
-                if let Some(link) = cell.attrs().hyperlink() {
-                    if link.params().len() > limits.max_hyperlink_params_per_link {
-                        return Err(ScreenCheckpointCaptureError::ResourceLimit {
-                            resource: "hyperlink_params_per_link",
-                            observed: link.params().len(),
-                            maximum: limits.max_hyperlink_params_per_link,
-                        });
-                    }
-                    accumulate(
-                        &mut usage.hyperlink_params,
-                        link.params().len(),
-                        limits.max_total_hyperlink_params,
-                        "hyperlink_params",
-                    )?;
-
-                    let mut link_bytes = link.uri().len();
-                    if link.uri().len() > limits.max_string_bytes {
-                        return Err(ScreenCheckpointCaptureError::ResourceLimit {
-                            resource: "hyperlink_uri_bytes",
-                            observed: link.uri().len(),
-                            maximum: limits.max_string_bytes,
-                        });
-                    }
-                    for (key, value) in link.params() {
-                        if key.len() > limits.max_string_bytes {
-                            return Err(ScreenCheckpointCaptureError::ResourceLimit {
-                                resource: "hyperlink_param_key_bytes",
-                                observed: key.len(),
-                                maximum: limits.max_string_bytes,
-                            });
-                        }
-                        if value.len() > limits.max_string_bytes {
-                            return Err(ScreenCheckpointCaptureError::ResourceLimit {
-                                resource: "hyperlink_param_value_bytes",
-                                observed: value.len(),
-                                maximum: limits.max_string_bytes,
-                            });
-                        }
-                        link_bytes = link_bytes
-                            .checked_add(key.len())
-                            .and_then(|bytes| bytes.checked_add(value.len()))
-                            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
-                                "hyperlink_bytes",
-                            ))?;
-                    }
-                    accumulate(
-                        &mut usage.hyperlink_bytes,
-                        link_bytes,
-                        limits.max_total_hyperlink_bytes,
-                        "hyperlink_bytes",
-                    )?;
-                    accumulate(
-                        &mut usage.retained_capture_bytes,
-                        link_bytes,
-                        limits.max_retained_capture_bytes,
-                        "retained_capture_bytes",
-                    )?;
+                if value.len() > limits.max_string_bytes {
+                    return Err(ScreenCheckpointCaptureError::ResourceLimit {
+                        resource: "hyperlink_param_value_bytes",
+                        observed: value.len(),
+                        maximum: limits.max_string_bytes,
+                    });
                 }
+                link_bytes = link_bytes
+                    .checked_add(key.len())
+                    .and_then(|bytes| bytes.checked_add(value.len()))
+                    .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                        "hyperlink_bytes",
+                    ))?;
             }
-
-            if semantic_cells != line.len() {
-                return Err(ScreenCheckpointCaptureError::InvalidLineGeometry);
-            }
-            Ok(())
+            accumulate_checkpoint_usage(
+                &mut usage.hyperlink_bytes,
+                link_bytes,
+                limits.max_total_hyperlink_bytes,
+                "hyperlink_bytes",
+            )?;
+            accumulate_checkpoint_usage(
+                &mut usage.retained_capture_bytes,
+                link_bytes,
+                limits.max_retained_capture_bytes,
+                "retained_capture_bytes",
+            )?;
         }
+    }
 
+    if semantic_cells != line.len() {
+        return Err(ScreenCheckpointCaptureError::InvalidLineGeometry);
+    }
+    Ok(())
+}
+
+impl Screen {
+    /// Validate and account only the resident screen model.
+    ///
+    /// This is intentionally non-cloning and never crosses the cold-storage
+    /// capability boundary. Inert replay uses it after each raw journal record
+    /// to fail before an attacker can accumulate semantic state beyond the
+    /// checkpoint admission envelope.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn preflight_resident_checkpoint_usage(
+        &self,
+        limits: &ScreenCheckpointLimits,
+        usage: &mut ScreenCheckpointUsage,
+    ) -> Result<(), ScreenCheckpointCaptureError> {
         if self.physical_rows == 0 || self.physical_rows > limits.max_rows {
             return Err(ScreenCheckpointCaptureError::ResourceLimit {
                 resource: "physical_rows",
@@ -1147,15 +1157,24 @@ impl Screen {
                 maximum: limits.max_keyboard_stack_depth,
             });
         }
+        for line in &self.lines {
+            inspect_checkpoint_line(line, limits, usage)?;
+        }
+        Ok(())
+    }
 
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn checkpoint_parts(
+        &self,
+        limits: &ScreenCheckpointLimits,
+        usage: &mut ScreenCheckpointUsage,
+    ) -> Result<ScreenCheckpointParts, ScreenCheckpointCaptureError> {
         let hot_top = self.stable_row_index_offset;
 
         // Inspect every resident line before asking the sink to allocate or
         // decode a cold snapshot. This also establishes the remaining global
         // checkpoint budget supplied to the sink.
-        for line in &self.lines {
-            inspect_line(line, limits, usage)?;
-        }
+        self.preflight_resident_checkpoint_usage(limits, usage)?;
 
         let (oldest, mut cold_lines) = if self.allow_scrollback {
             if let Some(sink) = self.config.scrollback_spill_sink() {
@@ -1214,7 +1233,7 @@ impl Screen {
                 }
                 let mut cold_lines = snapshot.into_rows();
                 for line in &mut cold_lines {
-                    inspect_line(line, limits, usage)?;
+                    inspect_checkpoint_line(line, limits, usage)?;
                     *line = line.semantic_checkpoint_clone();
                 }
                 (oldest, cold_lines)

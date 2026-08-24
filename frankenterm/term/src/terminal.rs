@@ -199,6 +199,8 @@ impl std::error::Error for RecoveryTerminalCheckpointError {}
 pub struct InertTerminal {
     terminal: Terminal,
     replay_projection: crate::terminalstate::checkpoint::CheckpointReplayConfigV1,
+    intended_live_config: Arc<dyn TerminalConfiguration>,
+    intended_live_config_revision: crate::config::TerminalConfigurationRevision,
     checkpoint_limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
     replayed_records: usize,
     replayed_bytes: usize,
@@ -221,6 +223,7 @@ pub enum InertTerminalError {
     ParserNotRecoveryGround,
     UnsupportedGraphicsAction,
     ReplayConfigurationMismatch,
+    LiveConfigurationChanged,
     RetieringRequired,
     WriterActivation,
     Checkpoint(crate::terminalstate::checkpoint::TerminalCheckpointError),
@@ -262,6 +265,9 @@ impl std::fmt::Display for InertTerminalError {
             Self::ReplayConfigurationMismatch => formatter.write_str(
                 "guardian replay configuration does not match the intended live configuration",
             ),
+            Self::LiveConfigurationChanged => formatter.write_str(
+                "intended live configuration changed during guardian recovery",
+            ),
             Self::RetieringRequired => formatter.write_str(
                 "guardian activation requires checked scrollback re-tiering",
             ),
@@ -291,11 +297,18 @@ impl InertTerminal {
     pub(crate) fn from_restored_state(
         state: TerminalState,
         replay_projection: crate::terminalstate::checkpoint::CheckpointReplayConfigV1,
+        intended_live_config: Arc<dyn TerminalConfiguration>,
+        intended_live_config_revision: crate::config::TerminalConfigurationRevision,
         checkpoint_limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
     ) -> Self {
+        let parser_string_limit = checkpoint_limits
+            .max_string_bytes
+            .min(checkpoint_limits.max_replay_total_bytes);
         Self {
-            terminal: Terminal::from_restored_state(state),
+            terminal: Terminal::from_restored_state(state, parser_string_limit),
             replay_projection,
+            intended_live_config,
+            intended_live_config_revision,
             checkpoint_limits,
             replayed_records: 0,
             replayed_bytes: 0,
@@ -305,10 +318,12 @@ impl InertTerminal {
 
     /// Replay one authenticated raw-output journal record through this
     /// terminal's owned parser. The full record is parsed into a fallibly grown
-    /// batch and capability-checked before Performer sees its first action, so
-    /// rejection cannot partially mutate terminal state. Any error permanently
-    /// poisons this inert terminal because its parser may already have consumed
-    /// bytes that cannot safely be skipped or retried.
+    /// batch and capability-checked before Performer sees its first action.
+    /// Persistent model usage is re-audited after the batch; a violating batch
+    /// may transiently exceed the semantic envelope by at most one bounded
+    /// record, but permanently poisons the off-topology terminal before it can
+    /// be checkpointed or activated. Any error poisons replay because its
+    /// parser may already have consumed bytes that cannot be skipped or retried.
     pub fn replay_bytes(&mut self, bytes: &[u8]) -> Result<(), InertTerminalError> {
         use frankenterm_escape_parser::osc::ITermProprietary;
         use frankenterm_escape_parser::{Action, OperatingSystemCommand};
@@ -417,6 +432,14 @@ impl InertTerminal {
             return Err(InertTerminalError::UnsupportedGraphicsAction);
         }
         self.terminal.perform_actions(actions);
+        if let Err(error) = crate::terminalstate::checkpoint::TerminalCheckpointV1::validate_inert_replay_resources(
+            &self.terminal,
+            &self.replay_projection,
+            self.checkpoint_limits,
+        ) {
+            self.replay_failed = true;
+            return Err(InertTerminalError::Checkpoint(error));
+        }
         self.replayed_bytes = next_total_bytes;
         self.replayed_records = next_record_count;
         Ok(())
@@ -443,7 +466,6 @@ impl InertTerminal {
     /// the discarded writer object and cannot cross this transition.
     pub fn into_live(
         mut self,
-        live_config: Arc<dyn TerminalConfiguration>,
         writer: Box<dyn std::io::Write + Send>,
     ) -> Result<Terminal, InertTerminalError> {
         if self.replay_failed {
@@ -452,17 +474,28 @@ impl InertTerminal {
         if !self.terminal.parser.is_recovery_ground() {
             return Err(InertTerminalError::ParserNotRecoveryGround);
         }
-        if live_config.scrollback_tier_config().enabled {
+        if self.intended_live_config.revision() != self.intended_live_config_revision {
+            return Err(InertTerminalError::LiveConfigurationChanged);
+        }
+        if self.intended_live_config.scrollback_tier_config().enabled {
             return Err(InertTerminalError::RetieringRequired);
         }
         let live_projection_matches = self
             .replay_projection
-            .matches_stable(live_config.as_ref(), self.checkpoint_limits)
+            .matches_stable(
+                self.intended_live_config.as_ref(),
+                self.checkpoint_limits,
+            )
             .map_err(InertTerminalError::Checkpoint)?;
+        if self.intended_live_config.revision() != self.intended_live_config_revision {
+            return Err(InertTerminalError::LiveConfigurationChanged);
+        }
         if !live_projection_matches {
             return Err(InertTerminalError::ReplayConfigurationMismatch);
         }
-        self.terminal.state.set_config(live_config);
+        self.terminal
+            .state
+            .set_config(Arc::clone(&self.intended_live_config));
         let installed_projection_matches = self
             .replay_projection
             .matches_stable(
@@ -470,6 +503,9 @@ impl InertTerminal {
                 self.checkpoint_limits,
             )
             .map_err(InertTerminalError::Checkpoint)?;
+        if self.intended_live_config.revision() != self.intended_live_config_revision {
+            return Err(InertTerminalError::LiveConfigurationChanged);
+        }
         if !installed_projection_matches {
             return Err(InertTerminalError::ReplayConfigurationMismatch);
         }
@@ -518,10 +554,13 @@ impl Default for TerminalSize {
 }
 
 impl Terminal {
-    pub(crate) fn from_restored_state(state: TerminalState) -> Self {
+    pub(crate) fn from_restored_state(
+        state: TerminalState,
+        max_string_sequence_bytes: usize,
+    ) -> Self {
         Self {
             state,
-            parser: Parser::new(),
+            parser: Parser::new_with_max_string_sequence_bytes(max_string_sequence_bytes),
         }
     }
 
@@ -596,6 +635,11 @@ impl Terminal {
             let mut performer = Performer::new(&mut self.state);
 
             self.parser.parse(bytes, |action| performer.perform(action));
+        }
+        if let Some(error) = self.parser.take_string_sequence_error() {
+            log::warn!(
+                "terminal parser discarded an oversized or unallocatable string sequence: {error}"
+            );
         }
         self.trigger_unseen_output_notif();
     }

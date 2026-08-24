@@ -23,6 +23,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const KEY_PREFIX: &str = "key-";
@@ -37,6 +38,8 @@ const ACTIVATION_BYTES: usize = 64;
 const ACTIVATION_BYTES_U32: u32 = 64;
 const ACTIVATION_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-key-activation.v1\0";
 const MAX_KEYRING_ENTRIES: usize = 4096;
+const SCROLLBACK_KEYRING_SIBLING: &str = "guardian-output-keys";
+static SCROLLBACK_KEYRING_PROVISION_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Error)]
 pub enum GuardianOutputKeyringError {
@@ -109,6 +112,36 @@ impl std::fmt::Debug for GuardianOutputKeyring {
 }
 
 impl GuardianOutputKeyring {
+    /// Open the one guardian output keyring shared by encrypted scrollback and
+    /// guardian journals, provisioning it only in the deterministic private
+    /// sibling of the scrollback store.
+    pub fn open_or_provision_scrollback_sibling(
+        scrollback_base_dir: &Path,
+    ) -> Result<Self, GuardianOutputKeyringError> {
+        let _provision_gate = SCROLLBACK_KEYRING_PROVISION_GATE
+            .lock()
+            .map_err(|_| GuardianOutputKeyringError::AuthorityChanged)?;
+        let path = scrollback_keyring_path(scrollback_base_dir)?;
+        match create_private_directory(&path) {
+            Ok(()) => {
+                sync_parent_path(&path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        Self::open_or_provision(open_private_path(&path)?)
+    }
+
+    /// Open the existing shared keyring without creating filesystem state.
+    /// Read-only transcript export uses this path only after it encounters a
+    /// v3 encrypted row.
+    pub fn open_existing_scrollback_sibling(
+        scrollback_base_dir: &Path,
+    ) -> Result<Self, GuardianOutputKeyringError> {
+        let path = scrollback_keyring_path(scrollback_base_dir)?;
+        Self::open_existing(open_private_path(&path)?)
+    }
+
     /// Open a pinned key directory, provisioning its first key only when the
     /// directory is completely empty.
     pub fn open_or_provision(directory: CapDir) -> Result<Self, GuardianOutputKeyringError> {
@@ -118,23 +151,17 @@ impl GuardianOutputKeyring {
         if inventory.entries == 0 {
             return provision_first(directory);
         }
-        let active = inventory
-            .latest
-            .ok_or(GuardianOutputKeyringError::OrphanedKeyMaterial)?;
-        let active_key = load_key(&directory, active.key_id)
-            .map_err(|error| match error {
-                GuardianOutputKeyringError::Io(ref io)
-                    if io.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    GuardianOutputKeyringError::MissingActivatedKey
-                }
-                other => other,
-            })?;
-        Ok(Self {
-            directory,
-            active,
-            active_key,
-        })
+        open_inventory(directory, inventory)
+    }
+
+    fn open_existing(directory: CapDir) -> Result<Self, GuardianOutputKeyringError> {
+        validate_directory(&directory)?;
+        let inventory = inventory(&directory)?;
+        validate_directory(&directory)?;
+        if inventory.entries == 0 {
+            return Err(GuardianOutputKeyringError::MissingActivatedKey);
+        }
+        open_inventory(directory, inventory)
     }
 
     #[must_use]
@@ -195,6 +222,90 @@ impl GuardianOutputKeyring {
         self.active_key = new_key;
         Ok(key_id)
     }
+}
+
+fn open_inventory(
+    directory: CapDir,
+    inventory: Inventory,
+) -> Result<GuardianOutputKeyring, GuardianOutputKeyringError> {
+    let active = inventory
+        .latest
+        .ok_or(GuardianOutputKeyringError::OrphanedKeyMaterial)?;
+    let active_key = load_key(&directory, active.key_id).map_err(|error| match error {
+        GuardianOutputKeyringError::Io(ref io)
+            if io.kind() == std::io::ErrorKind::NotFound =>
+        {
+            GuardianOutputKeyringError::MissingActivatedKey
+        }
+        other => other,
+    })?;
+    Ok(GuardianOutputKeyring {
+        directory,
+        active,
+        active_key,
+    })
+}
+
+fn scrollback_keyring_path(
+    scrollback_base_dir: &Path,
+) -> Result<PathBuf, GuardianOutputKeyringError> {
+    let parent = scrollback_base_dir
+        .parent()
+        .ok_or_else(|| std::io::Error::other("scrollback storage path has no parent"))?;
+    Ok(parent.join(SCROLLBACK_KEYRING_SIBLING))
+}
+
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn sync_parent_path(path: &Path) -> Result<(), GuardianOutputKeyringError> {
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("guardian keyring path has no parent"))?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn open_private_path(path: &Path) -> Result<CapDir, GuardianOutputKeyringError> {
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_dir() {
+        return Err(GuardianOutputKeyringError::DirectoryNotPrivate);
+    }
+    #[cfg(unix)]
+    if before.permissions().mode() & 0o7777 != 0o700 {
+        return Err(GuardianOutputKeyringError::DirectoryNotPrivate);
+    }
+    let directory = CapDir::open_ambient_dir(path, cap_std::ambient_authority())?;
+    validate_directory(&directory)?;
+    let after = std::fs::symlink_metadata(path)?;
+    if !after.file_type().is_dir() {
+        return Err(GuardianOutputKeyringError::IdentityChanged);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let opened = directory.dir_metadata()?;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || opened.dev() != after.dev()
+            || opened.ino() != after.ino()
+        {
+            return Err(GuardianOutputKeyringError::IdentityChanged);
+        }
+    }
+    Ok(directory)
 }
 
 #[derive(Default)]

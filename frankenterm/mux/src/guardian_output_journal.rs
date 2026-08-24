@@ -24,6 +24,7 @@ use chacha20poly1305::{
         rand_core::{OsRng, RngCore as _},
     },
 };
+use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
 use std::fs::File;
@@ -48,6 +49,261 @@ const AEAD_TAG_BYTES_USIZE: usize = 16;
 const FILE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-file.v1\0";
 const RECORD_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-record.v1\0";
 const RECORD_AAD_DOMAIN: &[u8] = b"frankenterm.guardian-output-aead.v1\0";
+const SCROLLBACK_ROW_AEAD_DOMAIN: &[u8] = b"frankenterm.scrollback-row-aead.v3\0";
+const SCROLLBACK_ROW_RECORD_PREFIX: &str = "ftsl3e:";
+const SCROLLBACK_ROW_FORMAT_VERSION: u32 = 3;
+const SCROLLBACK_ROW_HEADER_BYTES: usize = 96;
+const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Authenticated storage identity for one exact semantic cold-scrollback row.
+///
+/// The revision is the spill transaction revision at which the row was
+/// admitted.  A clear creates a fresh content epoch, so a ciphertext from a
+/// prior logical generation cannot be replayed into the same row/sequence.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianScrollbackRowIdentity {
+    durable_pane_id: [u8; 16],
+    content_epoch: [u8; 16],
+    revision: u64,
+    stable_row: i64,
+    sequence: u64,
+}
+
+impl GuardianScrollbackRowIdentity {
+    pub fn new(
+        durable_pane_id: [u8; 16],
+        content_epoch: [u8; 16],
+        revision: u64,
+        stable_row: i64,
+        sequence: u64,
+    ) -> Result<Self, GuardianScrollbackRowError> {
+        if durable_pane_id == [0; 16] {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "durable pane ID must be nonzero",
+            ));
+        }
+        if content_epoch == [0; 16] {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "content epoch must be nonzero",
+            ));
+        }
+        if revision == 0 {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "revision must be nonzero",
+            ));
+        }
+        Ok(Self {
+            durable_pane_id,
+            content_epoch,
+            revision,
+            stable_row,
+            sequence,
+        })
+    }
+
+    #[must_use]
+    pub const fn durable_pane_id(self) -> [u8; 16] {
+        self.durable_pane_id
+    }
+
+    #[must_use]
+    pub const fn content_epoch(self) -> [u8; 16] {
+        self.content_epoch
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn stable_row(self) -> i64 {
+        self.stable_row
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+impl std::fmt::Debug for GuardianScrollbackRowIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianScrollbackRowIdentity")
+            .field("durable_pane_id", &"[REDACTED]")
+            .field("content_epoch", &"[REDACTED]")
+            .field("revision", &self.revision)
+            .field("stable_row", &self.stable_row)
+            .field("sequence", &self.sequence)
+            .finish()
+    }
+}
+
+/// Parsed, encrypted v3 cold-scrollback record.
+///
+/// Ciphertext and nonce remain private.  The only exposed field is the
+/// nonsecret key fingerprint needed for historical keyring lookup.
+pub struct GuardianEncryptedScrollbackRow {
+    key_id: [u8; KEY_ID_BYTES],
+    identity: GuardianScrollbackRowIdentity,
+    plaintext_bytes: u32,
+    nonce: [u8; NONCE_BYTES],
+    ciphertext: Vec<u8>,
+}
+
+impl GuardianEncryptedScrollbackRow {
+    #[must_use]
+    pub fn has_encrypted_prefix(record: &str) -> bool {
+        record.starts_with(SCROLLBACK_ROW_RECORD_PREFIX)
+    }
+
+    /// Parse the canonical bounded text envelope stored by the scrollback log.
+    pub fn parse(record: &str) -> Result<Self, GuardianScrollbackRowError> {
+        let encoded = record
+            .strip_prefix(SCROLLBACK_ROW_RECORD_PREFIX)
+            .ok_or(GuardianScrollbackRowError::MalformedRecord)?;
+        let maximum_binary_bytes = SCROLLBACK_ROW_HEADER_BYTES
+            .checked_add(SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES as usize)
+            .and_then(|bytes| bytes.checked_add(AEAD_TAG_BYTES_USIZE))
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        let maximum_encoded_bytes = maximum_binary_bytes
+            .checked_add(2)
+            .and_then(|bytes| bytes.checked_div(3))
+            .and_then(|bytes| bytes.checked_mul(4))
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        if encoded.len() > maximum_encoded_bytes {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| GuardianScrollbackRowError::MalformedRecord)?;
+        if base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes) != encoded {
+            return Err(GuardianScrollbackRowError::NonCanonicalRecord);
+        }
+        if bytes.len() < SCROLLBACK_ROW_HEADER_BYTES + AEAD_TAG_BYTES_USIZE {
+            return Err(GuardianScrollbackRowError::MalformedRecord);
+        }
+        let version = read_u32(&bytes[0..4]);
+        if version != SCROLLBACK_ROW_FORMAT_VERSION {
+            return Err(GuardianScrollbackRowError::UnsupportedVersion { observed: version });
+        }
+        let mut key_id = [0; KEY_ID_BYTES];
+        key_id.copy_from_slice(&bytes[4..12]);
+        let mut durable_pane_id = [0; 16];
+        durable_pane_id.copy_from_slice(&bytes[12..28]);
+        let mut content_epoch = [0; 16];
+        content_epoch.copy_from_slice(&bytes[28..44]);
+        let revision = read_u64(&bytes[44..52]);
+        let stable_row = read_i64(&bytes[52..60]);
+        let sequence = read_u64(&bytes[60..68]);
+        let plaintext_bytes = read_u32(&bytes[68..72]);
+        if plaintext_bytes == 0 || plaintext_bytes > SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let expected_ciphertext_bytes = usize::try_from(plaintext_bytes)
+            .map_err(|_| GuardianScrollbackRowError::ArithmeticOverflow)?
+            .checked_add(AEAD_TAG_BYTES_USIZE)
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        if bytes.len() != SCROLLBACK_ROW_HEADER_BYTES + expected_ciphertext_bytes {
+            return Err(GuardianScrollbackRowError::CiphertextLengthMismatch);
+        }
+        let identity = GuardianScrollbackRowIdentity::new(
+            durable_pane_id,
+            content_epoch,
+            revision,
+            stable_row,
+            sequence,
+        )?;
+        let mut nonce = [0; NONCE_BYTES];
+        nonce.copy_from_slice(&bytes[72..SCROLLBACK_ROW_HEADER_BYTES]);
+        Ok(Self {
+            key_id,
+            identity,
+            plaintext_bytes,
+            nonce,
+            ciphertext: bytes[SCROLLBACK_ROW_HEADER_BYTES..].to_vec(),
+        })
+    }
+
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; KEY_ID_BYTES] {
+        self.key_id
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> GuardianScrollbackRowIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn plaintext_bytes(&self) -> u32 {
+        self.plaintext_bytes
+    }
+
+    /// Encode the canonical opaque storage record.
+    pub fn encode(&self) -> Result<String, GuardianScrollbackRowError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(SCROLLBACK_ROW_HEADER_BYTES + self.ciphertext.len())
+            .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
+        bytes.extend_from_slice(&SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.key_id);
+        bytes.extend_from_slice(&self.identity.durable_pane_id);
+        bytes.extend_from_slice(&self.identity.content_epoch);
+        bytes.extend_from_slice(&self.identity.revision.to_le_bytes());
+        bytes.extend_from_slice(&self.identity.stable_row.to_le_bytes());
+        bytes.extend_from_slice(&self.identity.sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.plaintext_bytes.to_le_bytes());
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&self.ciphertext);
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+        Ok(format!("{SCROLLBACK_ROW_RECORD_PREFIX}{encoded}"))
+    }
+}
+
+impl std::fmt::Debug for GuardianEncryptedScrollbackRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianEncryptedScrollbackRow")
+            .field("key_id", &"[REDACTED]")
+            .field("identity", &self.identity)
+            .field("plaintext_bytes", &self.plaintext_bytes)
+            .field("nonce", &"[REDACTED]")
+            .field("ciphertext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianScrollbackRowError {
+    #[error("invalid encrypted scrollback row identity: {0}")]
+    InvalidIdentity(&'static str),
+    #[error("encrypted scrollback row is malformed")]
+    MalformedRecord,
+    #[error("encrypted scrollback row encoding is not canonical")]
+    NonCanonicalRecord,
+    #[error("unsupported encrypted scrollback row version {observed}")]
+    UnsupportedVersion { observed: u32 },
+    #[error("encrypted scrollback row exceeds its hard byte limit")]
+    RecordByteLimit,
+    #[error("encrypted scrollback row ciphertext length is invalid")]
+    CiphertextLengthMismatch,
+    #[error("encrypted scrollback row key identity does not match")]
+    KeyIdentityMismatch,
+    #[error("encrypted scrollback row storage identity does not match")]
+    StorageIdentityMismatch,
+    #[error("encrypted scrollback row allocation failed")]
+    AllocationFailed,
+    #[error("encrypted scrollback row arithmetic overflow")]
+    ArithmeticOverflow,
+    #[error("operating system entropy is unavailable for scrollback encryption")]
+    EntropyUnavailable,
+    #[error("scrollback row encryption failed")]
+    EncryptionFailed,
+    #[error("scrollback row authentication or decryption failed")]
+    DecryptionFailed,
+}
 
 /// Hard admission limits for one immutable guardian output-log segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +484,103 @@ impl GuardianOutputCipher {
         Ok(Self { cipher, key_id })
     }
 
+    /// Seal one lossless semantic cold-scrollback row under the guardian key.
+    ///
+    /// This is deliberately narrower than a generic metadata-encryption API:
+    /// the authenticated envelope always carries the complete scrollback
+    /// storage identity and the v3 domain/version discriminator.
+    pub fn seal_scrollback_row(
+        &self,
+        identity: GuardianScrollbackRowIdentity,
+        plaintext: &[u8],
+    ) -> Result<GuardianEncryptedScrollbackRow, GuardianScrollbackRowError> {
+        let plaintext_bytes = u32::try_from(plaintext.len())
+            .map_err(|_| GuardianScrollbackRowError::RecordByteLimit)?;
+        if plaintext_bytes == 0 || plaintext_bytes > SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        if OsRng.try_fill_bytes(&mut nonce).is_err() {
+            nonce.zeroize();
+            return Err(GuardianScrollbackRowError::EntropyUnavailable);
+        }
+        let aad = scrollback_row_aad(self.key_id, identity, plaintext_bytes);
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackRowError::EncryptionFailed)?;
+        Ok(GuardianEncryptedScrollbackRow {
+            key_id: self.key_id,
+            identity,
+            plaintext_bytes,
+            nonce,
+            ciphertext,
+        })
+    }
+
+    /// Authenticate and open one exact row at its expected durable location.
+    ///
+    /// The per-record revision is authenticated from the envelope.  The
+    /// caller supplies the durable pane, content generation, stable row and
+    /// sequence from the surrounding store so cross-pane, cross-clear and
+    /// cross-row transplants fail before plaintext is returned.
+    pub fn open_scrollback_row(
+        &self,
+        record: &GuardianEncryptedScrollbackRow,
+        expected_durable_pane_id: [u8; 16],
+        expected_content_epoch: [u8; 16],
+        expected_stable_row: i64,
+        expected_sequence: u64,
+        max_plaintext_bytes: u32,
+    ) -> Result<Vec<u8>, GuardianScrollbackRowError> {
+        if record.key_id != self.key_id {
+            return Err(GuardianScrollbackRowError::KeyIdentityMismatch);
+        }
+        let identity = record.identity;
+        if identity.durable_pane_id != expected_durable_pane_id
+            || identity.content_epoch != expected_content_epoch
+            || identity.stable_row != expected_stable_row
+            || identity.sequence != expected_sequence
+        {
+            return Err(GuardianScrollbackRowError::StorageIdentityMismatch);
+        }
+        let maximum = max_plaintext_bytes.min(SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES);
+        if record.plaintext_bytes == 0 || record.plaintext_bytes > maximum {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let expected_ciphertext_bytes = usize::try_from(record.plaintext_bytes)
+            .map_err(|_| GuardianScrollbackRowError::ArithmeticOverflow)?
+            .checked_add(AEAD_TAG_BYTES_USIZE)
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        if record.ciphertext.len() != expected_ciphertext_bytes {
+            return Err(GuardianScrollbackRowError::CiphertextLengthMismatch);
+        }
+        let aad = scrollback_row_aad(record.key_id, identity, record.plaintext_bytes);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                XNonce::from_slice(&record.nonce),
+                Payload {
+                    msg: &record.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackRowError::DecryptionFailed)?;
+        if plaintext.len()
+            != usize::try_from(record.plaintext_bytes)
+                .map_err(|_| GuardianScrollbackRowError::ArithmeticOverflow)?
+        {
+            return Err(GuardianScrollbackRowError::CiphertextLengthMismatch);
+        }
+        Ok(plaintext)
+    }
+
     /// Seal guardian-owned journal metadata under a caller-supplied,
     /// domain-separated associated-data envelope.
     ///
@@ -324,6 +677,24 @@ impl GuardianOutputCipher {
             )
             .map_err(|_| GuardianOutputJournalError::DecryptionFailed)
     }
+}
+
+fn scrollback_row_aad(
+    key_id: [u8; KEY_ID_BYTES],
+    identity: GuardianScrollbackRowIdentity,
+    plaintext_bytes: u32,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(SCROLLBACK_ROW_AEAD_DOMAIN.len() + 72);
+    aad.extend_from_slice(SCROLLBACK_ROW_AEAD_DOMAIN);
+    aad.extend_from_slice(&SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes());
+    aad.extend_from_slice(&key_id);
+    aad.extend_from_slice(&identity.durable_pane_id);
+    aad.extend_from_slice(&identity.content_epoch);
+    aad.extend_from_slice(&identity.revision.to_le_bytes());
+    aad.extend_from_slice(&identity.stable_row.to_le_bytes());
+    aad.extend_from_slice(&identity.sequence.to_le_bytes());
+    aad.extend_from_slice(&plaintext_bytes.to_le_bytes());
+    aad
 }
 
 impl std::fmt::Debug for GuardianOutputCipher {
@@ -1173,6 +1544,12 @@ fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(fixed)
 }
 
+fn read_i64(bytes: &[u8]) -> i64 {
+    let mut fixed = [0_u8; 8];
+    fixed.copy_from_slice(bytes);
+    i64::from_le_bytes(fixed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,6 +1585,92 @@ mod tests {
     fn cipher() -> GuardianOutputCipher {
         GuardianOutputCipher::try_from_key_slice(&[0x71; 32])
             .expect("fixture encryption key is valid")
+    }
+
+    fn scrollback_identity() -> GuardianScrollbackRowIdentity {
+        GuardianScrollbackRowIdentity::new([0x42; 16], [0x24; 16], 7, -3, 11)
+            .expect("fixture scrollback identity is valid")
+    }
+
+    #[test]
+    fn encrypted_scrollback_row_roundtrips_without_plaintext_or_debug_disclosure() {
+        let plaintext = b"semantic-row-secret-with-style-width-and-link";
+        let cipher = cipher();
+        let sealed = cipher
+            .seal_scrollback_row(scrollback_identity(), plaintext)
+            .expect("seal exact row");
+        let encoded = sealed.encode().expect("encode exact row");
+        assert!(!encoded.contains("semantic-row-secret"));
+        let debug = format!("{sealed:?}");
+        assert!(!debug.contains("semantic-row-secret"));
+        assert!(!debug.contains(&hex::encode(cipher.key_id())));
+
+        let parsed = GuardianEncryptedScrollbackRow::parse(&encoded).expect("parse exact row");
+        let opened = cipher
+            .open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 1024)
+            .expect("authenticate exact row");
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn encrypted_scrollback_row_rejects_tamper_wrong_location_and_wrong_key() {
+        let cipher = cipher();
+        let sealed = cipher
+            .seal_scrollback_row(scrollback_identity(), b"authenticated row")
+            .expect("seal exact row");
+        let encoded = sealed.encode().expect("encode exact row");
+        let parsed = GuardianEncryptedScrollbackRow::parse(&encoded).expect("parse exact row");
+        assert!(matches!(
+            cipher.open_scrollback_row(&parsed, [0x43; 16], [0x24; 16], -3, 11, 1024),
+            Err(GuardianScrollbackRowError::StorageIdentityMismatch)
+        ));
+        assert!(matches!(
+            cipher.open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -2, 11, 1024),
+            Err(GuardianScrollbackRowError::StorageIdentityMismatch)
+        ));
+        let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
+            .expect("wrong-key fixture is structurally valid");
+        assert!(matches!(
+            wrong_cipher.open_scrollback_row(
+                &parsed,
+                [0x42; 16],
+                [0x24; 16],
+                -3,
+                11,
+                1024,
+            ),
+            Err(GuardianScrollbackRowError::KeyIdentityMismatch)
+        ));
+
+        let mut tampered = parsed;
+        tampered.ciphertext[0] ^= 0x80;
+        assert!(matches!(
+            cipher.open_scrollback_row(&tampered, [0x42; 16], [0x24; 16], -3, 11, 1024),
+            Err(GuardianScrollbackRowError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn encrypted_scrollback_row_enforces_bounded_canonical_framing() {
+        let cipher = cipher();
+        assert!(matches!(
+            cipher.seal_scrollback_row(scrollback_identity(), b""),
+            Err(GuardianScrollbackRowError::RecordByteLimit)
+        ));
+        let sealed = cipher
+            .seal_scrollback_row(scrollback_identity(), b"bounded")
+            .expect("seal bounded row");
+        let encoded = sealed.encode().expect("encode bounded row");
+        let parsed = GuardianEncryptedScrollbackRow::parse(&encoded).expect("parse bounded row");
+        assert!(matches!(
+            cipher.open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 6),
+            Err(GuardianScrollbackRowError::RecordByteLimit)
+        ));
+        assert!(matches!(
+            GuardianEncryptedScrollbackRow::parse(&format!("{encoded}=")),
+            Err(GuardianScrollbackRowError::MalformedRecord)
+                | Err(GuardianScrollbackRowError::NonCanonicalRecord)
+        ));
     }
 
     fn journal_bytes_for(
