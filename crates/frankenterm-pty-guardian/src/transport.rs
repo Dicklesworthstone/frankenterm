@@ -3095,6 +3095,136 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_epochs_order_delayed_hello_and_exact_recycled_membership() {
+        let mux_incarnation = Uuid::from_u128(201);
+        let other_mux = Uuid::from_u128(202);
+        let delayed_lower_generation = ConnectionIdentity {
+            token: Token(1),
+            generation: 2,
+        };
+        let initially_authenticated = ConnectionIdentity {
+            token: Token(2),
+            generation: 9,
+        };
+        let mut tracker = MuxConnectionTracker::new(8).unwrap();
+        tracker.observe_accept(delayed_lower_generation).unwrap();
+        tracker.observe_accept(initially_authenticated).unwrap();
+        tracker
+            .observe_authenticated_hello(initially_authenticated, mux_incarnation)
+            .unwrap();
+        tracker
+            .observe_disconnect(initially_authenticated, Some(mux_incarnation))
+            .unwrap();
+        let first_disconnect = tracker.pending_retirements[0];
+
+        tracker
+            .observe_authenticated_hello(delayed_lower_generation, mux_incarnation)
+            .expect("processed Hello order, not accept generation, cancels retirement");
+        assert!(tracker.pending_retirements.is_empty());
+        assert!(tracker.has_authenticated_membership(mux_incarnation));
+
+        tracker
+            .observe_disconnect(delayed_lower_generation, Some(mux_incarnation))
+            .unwrap();
+        let later_disconnect = tracker.pending_retirements[0];
+        assert!(
+            later_disconnect.disconnect_observation_epoch
+                > first_disconnect.disconnect_observation_epoch
+        );
+
+        let unrelated = ConnectionIdentity {
+            token: Token(3),
+            generation: 3,
+        };
+        tracker.observe_accept(unrelated).unwrap();
+        tracker
+            .observe_authenticated_hello(unrelated, other_mux)
+            .unwrap();
+        assert_eq!(
+            tracker.next_replayable_retirement().unwrap(),
+            Some(later_disconnect),
+            "another mux's exact live membership cannot block this retirement"
+        );
+
+        let stale = ConnectionIdentity {
+            token: Token(4),
+            generation: 40,
+        };
+        let recycled = ConnectionIdentity {
+            token: Token(4),
+            generation: 41,
+        };
+        tracker.observe_accept(stale).unwrap();
+        tracker.observe_disconnect(stale, None).unwrap();
+        tracker.observe_accept(recycled).unwrap();
+        assert_eq!(
+            tracker.observe_authenticated_hello(stale, mux_incarnation),
+            Err(MuxConnectionTrackingError::StaleConnection)
+        );
+        assert_eq!(
+            tracker.observe_disconnect(stale, None),
+            Err(MuxConnectionTrackingError::StaleConnection)
+        );
+        assert_eq!(tracker.pending_retirements, [later_disconnect]);
+        tracker
+            .observe_authenticated_hello(recycled, mux_incarnation)
+            .unwrap();
+        assert!(tracker.pending_retirements.is_empty());
+        tracker
+            .observe_disconnect(recycled, Some(mux_incarnation))
+            .unwrap();
+        assert!(
+            tracker.pending_retirements[0].disconnect_observation_epoch
+                > later_disconnect.disconnect_observation_epoch
+        );
+    }
+
+    #[test]
+    fn replay_fails_closed_if_exact_authenticated_membership_is_active() {
+        let mux_incarnation = Uuid::from_u128(211);
+        let identity = ConnectionIdentity {
+            token: Token(5),
+            generation: 7,
+        };
+        let mut tracker = MuxConnectionTracker::new(4).unwrap();
+        tracker.observe_accept(identity).unwrap();
+        tracker
+            .observe_authenticated_hello(identity, mux_incarnation)
+            .unwrap();
+        tracker
+            .pending_retirements
+            .push(PendingMuxRetirementObservation {
+                mux_incarnation,
+                disconnect_observation_epoch: 1,
+            });
+
+        assert_eq!(
+            tracker.next_replayable_retirement(),
+            Err(MuxConnectionTrackingError::ActiveMembershipAtReplay)
+        );
+        assert!(tracker.has_authenticated_membership(mux_incarnation));
+        assert_eq!(tracker.pending_retirements.len(), 1);
+    }
+
+    #[test]
+    fn guardian_service_source_wires_exact_lifecycle_tracker_at_every_boundary() {
+        let source = include_str!("transport.rs");
+        let service_source = source
+            .split("/// Blocking client used by mux integration")
+            .next()
+            .expect("service implementation precedes client implementation");
+
+        assert!(service_source.contains("self.mux_connections.observe_accept(identity)"));
+        assert!(service_source.contains(".observe_authenticated_hello(\n                            connection.identity(token),\n                            mux_incarnation,"));
+        assert!(service_source.contains(".observe_disconnect(identity, connection.mux_incarnation)"));
+        assert!(service_source.contains("self.replay_deferred_mux_retirements();"));
+        assert!(service_source.contains(".next_replayable_retirement()"));
+        assert!(service_source.contains(".retire_disconnected_mux(retirement.mux_incarnation)"));
+        assert!(!service_source.contains("active_mux_connections"));
+        assert!(!service_source.contains("observe_connected_mux"));
+    }
+
+    #[test]
     fn exchange_explicitly_wipes_moved_request_before_encode_error_propagates() {
         let (client_stream, _peer_stream) = BlockingUnixStream::pair().unwrap();
         let secret = GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
@@ -3130,6 +3260,70 @@ mod tests {
         ));
         assert!(wipe_probe.explicit_wipe.load(Ordering::SeqCst));
         assert!(wipe_probe.drop_wipe.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn production_input_exchange_validates_reply_after_both_plaintext_copies_die() {
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        client_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        let secret_bytes = [0x5a; GUARDIAN_AUTH_TOKEN_BYTES];
+        let guardian_incarnation = Uuid::from_u128(31);
+        let mux_incarnation = Uuid::from_u128(32);
+        let pane_id = Uuid::from_u128(33);
+        let request_id = Uuid::from_u128(34);
+        let effect_id = Uuid::from_u128(35);
+        let wipe_probe = Arc::new(ClientRequestWipeProbe::default());
+        let server = std::thread::spawn(move || {
+            let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
+            let frame = read_blocking_frame(&mut server_stream).unwrap();
+            let request = decode_guardian_request(&secret, &frame).unwrap();
+            assert_eq!(request.header().operation, GuardianOperation::Input);
+            assert_eq!(request.authenticated_payload_bytes(), 23);
+            let response = GuardianResponseEnvelope::reply(
+                &request,
+                &GuardianReply::InputReceipt {
+                    pane_id,
+                    generation: 4,
+                    sequence: 9,
+                    effect_id,
+                    state: InputEffectState::DurableFull,
+                },
+            )
+            .unwrap();
+            let frame = encode_guardian_response(&secret, &response).unwrap();
+            server_stream.write_all(&frame).unwrap();
+        });
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes(secret_bytes).unwrap(),
+            mux_incarnation,
+            guardian_incarnation,
+            request_wipe_probe: Some(Arc::clone(&wipe_probe)),
+        };
+
+        assert!(matches!(
+            client
+                .input(pane_id, 4, 9, request_id, effect_id, vec![0x6d; 23])
+                .unwrap(),
+            GuardianReply::InputReceipt {
+                state: InputEffectState::DurableFull,
+                ..
+            }
+        ));
+        assert!(wipe_probe.explicit_wipe.load(Ordering::SeqCst));
+        assert!(wipe_probe.drop_wipe.load(Ordering::SeqCst));
+        server.join().expect("input test server exits cleanly");
     }
 
     #[test]

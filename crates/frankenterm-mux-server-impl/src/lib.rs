@@ -554,6 +554,17 @@ struct LiveScrollbackAppendWalV1 {
     target_chain_tail_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evicted_record_count: Option<u64>,
+    /// A consumed WAL is retained as bounded crash evidence. Replacement and
+    /// clear generations advance this authenticated pointer instead of
+    /// deleting the evidence or mistaking it for an unconsumed transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseding_content_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseding_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseding_ledger_pane_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseding_manifest_sha256: Option<String>,
     encrypted_record: String,
     guardian_authentication: Option<String>,
     wal_sha256: String,
@@ -594,11 +605,25 @@ impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
             .field("target_chain_anchor_sha256", &"[REDACTED]")
             .field("target_chain_tail_sha256", &"[REDACTED]")
             .field("evicted_record_count", &self.evicted_record_count)
+            .field("superseding_content_epoch", &"[REDACTED]")
+            .field("superseding_revision", &self.superseding_revision)
+            .field(
+                "superseding_ledger_pane_id",
+                &self.superseding_ledger_pane_id,
+            )
+            .field("superseding_manifest_sha256", &"[REDACTED]")
             .field("encrypted_record", &"[REDACTED]")
             .field("guardian_authentication", &"[REDACTED]")
             .field("wal_sha256", &"[REDACTED]")
             .finish()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveScrollbackAppendWalSupersession {
+    generation: wezterm_term::config::ScrollbackSnapshotGeneration,
+    ledger_pane_id: u64,
+    manifest_sha256: [u8; 32],
 }
 
 /// In-memory proof that one exact retained interval was authenticated by a
@@ -1867,6 +1892,57 @@ impl LiveScrollbackSpillSink {
         serde_json::to_vec(&canonical).context("serialize canonical scrollback append WAL")
     }
 
+    fn append_wal_target_generation(
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<wezterm_term::config::ScrollbackSnapshotGeneration> {
+        Ok(wezterm_term::config::ScrollbackSnapshotGeneration::new(
+            decode_live_scrollback_epoch(
+                &wal.target_content_epoch,
+                "append WAL target epoch",
+            )?,
+            wal.target_revision,
+        ))
+    }
+
+    fn append_wal_supersession(
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<Option<LiveScrollbackAppendWalSupersession>> {
+        match (
+            wal.superseding_content_epoch.as_deref(),
+            wal.superseding_revision,
+            wal.superseding_ledger_pane_id,
+            wal.superseding_manifest_sha256.as_deref(),
+        ) {
+            (None, None, None, None) => Ok(None),
+            (Some(encoded_epoch), Some(revision), Some(ledger_pane_id), Some(encoded_digest)) => {
+                Ok(Some(LiveScrollbackAppendWalSupersession {
+                    generation: wezterm_term::config::ScrollbackSnapshotGeneration::new(
+                        decode_live_scrollback_epoch(
+                            encoded_epoch,
+                            "append WAL superseding epoch",
+                        )?,
+                        revision,
+                    ),
+                    ledger_pane_id,
+                    manifest_sha256: decode_live_scrollback_canonical_digest(
+                        encoded_digest,
+                        "append WAL superseding manifest digest",
+                    )?,
+                }))
+            }
+            _ => anyhow::bail!("append WAL supersession authority is incomplete"),
+        }
+    }
+
+    fn append_wal_effective_generation(
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<wezterm_term::config::ScrollbackSnapshotGeneration> {
+        Ok(Self::append_wal_supersession(wal)?
+            .map_or(Self::append_wal_target_generation(wal)?, |supersession| {
+                supersession.generation
+            }))
+    }
+
     fn validate_append_wal_identity(
         wal: &LiveScrollbackAppendWalV1,
         durable_pane_id: [u8; 16],
@@ -1891,6 +1967,7 @@ impl LiveScrollbackSpillSink {
         )?;
         let target_epoch =
             decode_live_scrollback_epoch(&wal.target_content_epoch, "append WAL target epoch")?;
+        Self::append_wal_supersession(wal)?;
         anyhow::ensure!(
             target_epoch == predecessor_epoch
                 && wal.target_revision
@@ -2166,6 +2243,49 @@ impl LiveScrollbackSpillSink {
             && chain_matches)
     }
 
+    fn append_wal_supersession_matches_manifest(
+        wal: &LiveScrollbackAppendWalV1,
+        manifest: &LiveScrollbackManifestV1,
+    ) -> anyhow::Result<bool> {
+        let Some(supersession) = Self::append_wal_supersession(wal)? else {
+            return Ok(false);
+        };
+        let manifest_generation = live_scrollback_manifest_generation(manifest)?.map(
+            |(content_epoch, revision)| {
+                wezterm_term::config::ScrollbackSnapshotGeneration::new(content_epoch, revision)
+            },
+        );
+        Ok(live_scrollback_manifest_is_authenticated(manifest)
+            && manifest_generation == Some(supersession.generation)
+            && Self::manifest_ledger_pane_id(manifest)? == supersession.ledger_pane_id
+            && decode_live_scrollback_canonical_digest(
+                &manifest.manifest_sha256,
+                "superseding scrollback manifest digest",
+            )? == supersession.manifest_sha256)
+    }
+
+    /// True only when the current authenticated manifest directly extends
+    /// the latest generation named by this retained WAL evidence. Advancing
+    /// the marker one signed edge at a time prevents a stale or future WAL
+    /// replay from being silently discarded across replacement or clear.
+    fn append_wal_is_immediately_superseded_by_manifest(
+        wal: &LiveScrollbackAppendWalV1,
+        manifest: &LiveScrollbackManifestV1,
+    ) -> anyhow::Result<bool> {
+        Ok(live_scrollback_manifest_is_authenticated(manifest)
+            && live_scrollback_manifest_predecessor(manifest)?
+                == Some(Self::append_wal_effective_generation(wal)?))
+    }
+
+    fn append_wal_is_consumed_or_superseded(
+        wal: &LiveScrollbackAppendWalV1,
+        manifest: &LiveScrollbackManifestV1,
+    ) -> anyhow::Result<bool> {
+        Ok(Self::append_wal_matches_target_manifest(wal, manifest)?
+            || Self::append_wal_supersession_matches_manifest(wal, manifest)?
+            || Self::append_wal_is_immediately_superseded_by_manifest(wal, manifest)?)
+    }
+
     fn verify_append_wal_target_store(
         wal: &LiveScrollbackAppendWalV1,
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
@@ -2274,6 +2394,15 @@ impl LiveScrollbackSpillSink {
                 store,
             )
             .context("bind consumed append WAL to its authenticated target manifest")?;
+            return Ok(None);
+        }
+        if Self::append_wal_supersession_matches_manifest(wal, manifest)?
+            || Self::append_wal_is_immediately_superseded_by_manifest(wal, manifest)?
+        {
+            // The current signed manifest either is the exact generation
+            // recorded by the retirement marker or extends it by one signed
+            // predecessor edge. The WAL remains intact as bounded evidence;
+            // it must not be replayed into the superseding ledger.
             return Ok(None);
         }
         anyhow::ensure!(
@@ -2466,6 +2595,10 @@ impl LiveScrollbackSpillSink {
             target_chain_anchor_sha256: Some(hex::encode(target_authority.chain_anchor)),
             target_chain_tail_sha256: Some(hex::encode(target_authority.chain_tail)),
             evicted_record_count: Some(evicted_record_count),
+            superseding_content_epoch: None,
+            superseding_revision: None,
+            superseding_ledger_pane_id: None,
+            superseding_manifest_sha256: None,
             encrypted_record: encrypted_record.to_string(),
             guardian_authentication: None,
             wal_sha256: String::new(),
