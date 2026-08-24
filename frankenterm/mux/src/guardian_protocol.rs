@@ -322,10 +322,10 @@ impl GuardianRequestHeader {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct GuardianRequestEnvelope {
     pub header: GuardianRequestHeader,
-    payload: Vec<u8>,
+    payload: Zeroizing<Vec<u8>>,
 }
 
 impl std::fmt::Debug for GuardianRequestEnvelope {
@@ -341,7 +341,10 @@ impl std::fmt::Debug for GuardianRequestEnvelope {
 impl GuardianRequestEnvelope {
     #[must_use]
     pub fn new(header: GuardianRequestHeader, payload: Vec<u8>) -> Self {
-        Self { header, payload }
+        Self {
+            header,
+            payload: Zeroizing::new(payload),
+        }
     }
 
     #[must_use]
@@ -362,7 +365,7 @@ impl Drop for GuardianRequestEnvelope {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct AuthenticatedGuardianRequest {
     envelope: GuardianRequestEnvelope,
     /// Authenticated length retained independently of the wipeable plaintext.
@@ -574,10 +577,10 @@ impl GuardianResponseHeader {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct GuardianResponseEnvelope {
     header: GuardianResponseHeader,
-    payload: Vec<u8>,
+    payload: Zeroizing<Vec<u8>>,
 }
 
 impl GuardianResponseEnvelope {
@@ -595,7 +598,7 @@ impl GuardianResponseEnvelope {
         request: &AuthenticatedGuardianRequest,
         reply: &GuardianReply,
     ) -> Result<Self, GuardianProtocolError> {
-        let payload = reply.encode_for_operation(request.header.operation)?;
+        let payload = Zeroizing::new(reply.encode_for_operation(request.header.operation)?);
         let response = Self {
             header: GuardianResponseHeader::new(
                 &request.header,
@@ -625,11 +628,32 @@ impl GuardianResponseEnvelope {
         request: &AuthenticatedGuardianRequest,
         code: GuardianRejectionCode,
     ) -> Self {
-        let payload = code.encode().to_vec();
+        let payload = Zeroizing::new(code.encode().to_vec());
         Self {
             header: GuardianResponseHeader::new(&request.header, code.status(), &payload),
             payload,
         }
+    }
+
+    /// Build the only success response that may contain replay plaintext.
+    /// The page is consumed into the response's zeroizing allocation and is
+    /// never represented by the cloneable, metadata-only `GuardianReply`.
+    pub fn replay_page(
+        request: &AuthenticatedGuardianRequest,
+        page: GuardianReplayPageDelivery,
+    ) -> Result<Self, GuardianProtocolError> {
+        page.validate_for_request(request)?;
+        let payload = page.into_payload()?;
+        let response = Self {
+            header: GuardianResponseHeader::new(
+                &request.header,
+                GuardianResponseStatus::Success,
+                &payload,
+            ),
+            payload,
+        };
+        validate_response_envelope(&response)?;
+        Ok(response)
     }
 }
 
@@ -645,7 +669,7 @@ impl std::fmt::Debug for GuardianResponseEnvelope {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct AuthenticatedGuardianResponse(GuardianResponseEnvelope);
 
 impl std::fmt::Debug for AuthenticatedGuardianResponse {
@@ -3266,6 +3290,899 @@ impl GuardianCheckpointChunkDelivery {
     }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianReplayGapReasonV1 {
+    Retention = 1,
+    MissingSegment = 2,
+    InvalidChain = 3,
+    NoRecoveryBase = 4,
+}
+
+impl GuardianReplayGapReasonV1 {
+    fn from_wire(value: u8) -> Result<Self, GuardianProtocolError> {
+        match value {
+            1 => Ok(Self::Retention),
+            2 => Ok(Self::MissingSegment),
+            3 => Ok(Self::InvalidChain),
+            4 => Ok(Self::NoRecoveryBase),
+            _ => Err(GuardianProtocolError::InvalidReplyPayload),
+        }
+    }
+}
+
+/// Typed replay outcome. Plaintext-bearing variants wrap non-cloneable,
+/// consuming delivery capabilities; terminal variants contain metadata only.
+#[derive(Debug)]
+pub enum GuardianReplayPageBodyDelivery {
+    CheckpointChunk(GuardianCheckpointChunkDelivery),
+    OutputRecords(GuardianReplayOutputRecordsDelivery),
+    Complete {
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        through_sequence: u64,
+        terminal_record_digest: [u8; 32],
+        cumulative_plaintext_bytes: u64,
+    },
+    Gap {
+        requested_sequence: u64,
+        oldest_retained_sequence: u64,
+        verified_through_sequence: u64,
+        reason: GuardianReplayGapReasonV1,
+    },
+    Compacted {
+        requested_checkpoint: GuardianCheckpointIdentityDigest,
+        replacement: GuardianCheckpointDescriptorV1,
+        retained_first_sequence: u64,
+        compaction_generation: u64,
+    },
+    SnapshotExpired {
+        snapshot_id: Uuid,
+    },
+}
+
+impl GuardianReplayPageBodyDelivery {
+    const fn kind(&self) -> u8 {
+        match self {
+            Self::CheckpointChunk(_) => 1,
+            Self::OutputRecords(_) => 2,
+            Self::Complete { .. } => 3,
+            Self::Gap { .. } => 4,
+            Self::Compacted { .. } => 5,
+            Self::SnapshotExpired { .. } => 6,
+        }
+    }
+
+    fn validate(&self) -> Result<(), GuardianProtocolError> {
+        match self {
+            Self::CheckpointChunk(chunk) => {
+                chunk.descriptor.validate()?;
+                let observed = u64::try_from(chunk.bytes.len())
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+                if chunk.bytes.is_empty()
+                    || observed > u64::from(GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES)
+                    || chunk
+                        .offset
+                        .checked_add(observed)
+                        .is_none_or(|end| end > chunk.descriptor.total_bytes)
+                    || <[u8; 32]>::from(Sha256::digest(chunk.bytes.as_slice()))
+                        != chunk.chunk_digest
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                Ok(())
+            }
+            Self::OutputRecords(records) => {
+                let observed = validate_replay_records(
+                    records.first_sequence,
+                    records.previous_record_digest,
+                    &records.records,
+                )?;
+                if observed != records.plaintext_bytes {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                Ok(())
+            }
+            Self::Complete {
+                through_sequence,
+                terminal_record_digest,
+                cumulative_plaintext_bytes,
+                ..
+            } => {
+                if (*through_sequence == 0)
+                    != (digest_is_zero(*terminal_record_digest)
+                        && *cumulative_plaintext_bytes == 0)
+                    || (*through_sequence > 0
+                        && (digest_is_zero(*terminal_record_digest)
+                            || *cumulative_plaintext_bytes == 0))
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                Ok(())
+            }
+            Self::Gap {
+                requested_sequence,
+                oldest_retained_sequence,
+                verified_through_sequence,
+                reason,
+            } => {
+                let valid = match reason {
+                    GuardianReplayGapReasonV1::NoRecoveryBase => {
+                        *requested_sequence > 0
+                            && *oldest_retained_sequence == 0
+                            && *verified_through_sequence == 0
+                    }
+                    GuardianReplayGapReasonV1::Retention => {
+                        *requested_sequence > 0
+                            && *oldest_retained_sequence > *requested_sequence
+                            && *verified_through_sequence < *requested_sequence
+                    }
+                    GuardianReplayGapReasonV1::MissingSegment
+                    | GuardianReplayGapReasonV1::InvalidChain => {
+                        *requested_sequence > 0
+                            && *oldest_retained_sequence > 0
+                            && *verified_through_sequence < *requested_sequence
+                    }
+                };
+                if valid {
+                    Ok(())
+                } else {
+                    Err(GuardianProtocolError::InvalidReplyPayload)
+                }
+            }
+            Self::Compacted {
+                requested_checkpoint,
+                replacement,
+                retained_first_sequence,
+                compaction_generation,
+            } => {
+                replacement.validate()?;
+                if *requested_checkpoint == replacement.checkpoint_id
+                    || *retained_first_sequence == 0
+                    || *compaction_generation == 0
+                    || replacement
+                        .suffix_start()
+                        .is_none_or(|(sequence, _)| sequence != *retained_first_sequence)
+                {
+                    Err(GuardianProtocolError::InvalidReplyPayload)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::SnapshotExpired { snapshot_id } => {
+                if snapshot_id.is_nil() {
+                    Err(GuardianProtocolError::InvalidReplyPayload)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn plaintext_bytes(&self) -> Result<u32, GuardianProtocolError> {
+        match self {
+            Self::CheckpointChunk(chunk) => u32::try_from(chunk.bytes.len())
+                .map_err(|_| GuardianProtocolError::InvalidReplyPayload),
+            Self::OutputRecords(records) => Ok(records.plaintext_bytes),
+            Self::Complete { .. }
+            | Self::Gap { .. }
+            | Self::Compacted { .. }
+            | Self::SnapshotExpired { .. } => Ok(0),
+        }
+    }
+
+    const fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Complete { .. }
+                | Self::Gap { .. }
+                | Self::Compacted { .. }
+                | Self::SnapshotExpired { .. }
+        )
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianReplayPageHeaderV1 {
+    pane_id: Uuid,
+    generation: u64,
+    snapshot_id: Uuid,
+    snapshot_digest: [u8; 32],
+    incoming_cursor_digest: [u8; 32],
+    page_index: u32,
+    page_digest: [u8; 32],
+    next_cursor: Option<GuardianReplayCursorV1>,
+}
+
+impl std::fmt::Debug for GuardianReplayPageHeaderV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianReplayPageHeaderV1")
+            .field("pane_id", &self.pane_id)
+            .field("generation", &self.generation)
+            .field("snapshot_id", &self.snapshot_id)
+            .field("page_index", &self.page_index)
+            .field("has_next_cursor", &self.next_cursor.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianReplayPageHeaderV1 {
+    #[must_use]
+    pub const fn pane_id(self) -> Uuid {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(self) -> Uuid {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn snapshot_digest(self) -> [u8; 32] {
+        self.snapshot_digest
+    }
+
+    #[must_use]
+    pub const fn incoming_cursor_digest(self) -> [u8; 32] {
+        self.incoming_cursor_digest
+    }
+
+    #[must_use]
+    pub const fn page_index(self) -> u32 {
+        self.page_index
+    }
+
+    #[must_use]
+    pub const fn page_digest(self) -> [u8; 32] {
+        self.page_digest
+    }
+
+    #[must_use]
+    pub const fn next_cursor(self) -> Option<GuardianReplayCursorV1> {
+        self.next_cursor
+    }
+}
+
+/// Authenticated, non-cloneable replay page. The header is reusable metadata;
+/// the body is available only by consuming the page.
+pub struct GuardianReplayPageDelivery {
+    header: GuardianReplayPageHeaderV1,
+    body: GuardianReplayPageBodyDelivery,
+}
+
+impl std::fmt::Debug for GuardianReplayPageDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianReplayPageDelivery")
+            .field("header", &self.header)
+            .field("body_kind", &self.body.kind())
+            .field("plaintext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl GuardianReplayPageDelivery {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pane_id: Uuid,
+        generation: u64,
+        snapshot_id: Uuid,
+        snapshot_digest: [u8; 32],
+        incoming_cursor_digest: [u8; 32],
+        page_index: u32,
+        next_cursor: Option<GuardianReplayCursorV1>,
+        body: GuardianReplayPageBodyDelivery,
+    ) -> Result<Self, GuardianProtocolError> {
+        let mut page = Self {
+            header: GuardianReplayPageHeaderV1 {
+                pane_id,
+                generation,
+                snapshot_id,
+                snapshot_digest,
+                incoming_cursor_digest,
+                page_index,
+                page_digest: [0; 32],
+                next_cursor,
+            },
+            body,
+        };
+        page.validate_shape()?;
+        let encoded = page.encode_with_page_digest([0; 32])?;
+        page.header.page_digest = compute_replay_page_digest(&encoded)?;
+        Ok(page)
+    }
+
+    #[must_use]
+    pub const fn header(&self) -> &GuardianReplayPageHeaderV1 {
+        &self.header
+    }
+
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.body.is_terminal()
+    }
+
+    pub fn into_body(self) -> GuardianReplayPageBodyDelivery {
+        self.body
+    }
+
+    fn into_payload(self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+        self.validate_shape()?;
+        let payload = self.encode_with_page_digest(self.header.page_digest)?;
+        if compute_replay_page_digest(&payload)? != self.header.page_digest {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        Ok(payload)
+    }
+
+    fn encode_with_page_digest(
+        &self,
+        page_digest: [u8; 32],
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+        self.body.validate()?;
+        let body_bytes = self.encode_body()?;
+        let total = REPLAY_PAGE_HEADER_BYTES
+            .checked_add(body_bytes.len())
+            .ok_or(GuardianProtocolError::PayloadTooLarge)?;
+        if total > GUARDIAN_MAX_PAYLOAD_BYTES {
+            return Err(GuardianProtocolError::PayloadTooLarge);
+        }
+        let mut payload = Zeroizing::new(Vec::with_capacity(total));
+        payload.extend_from_slice(&REPLAY_PAGE_PAYLOAD_MAGIC);
+        payload.extend_from_slice(&REPLAY_WIRE_VERSION.to_be_bytes());
+        payload.push(self.body.kind());
+        payload.push(u8::from(self.header.next_cursor.is_some()));
+        push_uuid(&mut payload, self.header.pane_id);
+        payload.extend_from_slice(&self.header.generation.to_be_bytes());
+        push_uuid(&mut payload, self.header.snapshot_id);
+        payload.extend_from_slice(&self.header.snapshot_digest);
+        payload.extend_from_slice(&self.header.incoming_cursor_digest);
+        payload.extend_from_slice(&self.header.page_index.to_be_bytes());
+        payload.extend_from_slice(&[0; 4]);
+        payload.extend_from_slice(&page_digest);
+        payload.extend_from_slice(
+            &u32::try_from(body_bytes.len())
+                .map_err(|_| GuardianProtocolError::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
+        if let Some(cursor) = self.header.next_cursor {
+            payload.extend_from_slice(&cursor.encode());
+        } else {
+            payload.extend_from_slice(&[0; REPLAY_CURSOR_BYTES]);
+        }
+        payload.extend_from_slice(body_bytes.as_slice());
+        if payload.len() != total {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "replay-page-encoded-size",
+            ));
+        }
+        Ok(payload)
+    }
+
+    fn encode_body(&self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+        let mut body = Zeroizing::new(Vec::new());
+        match &self.body {
+            GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
+                let capacity = REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES
+                    .checked_add(chunk.bytes.len())
+                    .ok_or(GuardianProtocolError::PayloadTooLarge)?;
+                body.try_reserve_exact(capacity)
+                    .map_err(|_| GuardianProtocolError::PayloadTooLarge)?;
+                body.extend_from_slice(&chunk.descriptor.encode());
+                body.extend_from_slice(&chunk.offset.to_be_bytes());
+                body.extend_from_slice(&chunk.chunk_digest);
+                body.extend_from_slice(
+                    &u32::try_from(chunk.bytes.len())
+                        .map_err(|_| GuardianProtocolError::PayloadTooLarge)?
+                        .to_be_bytes(),
+                );
+                body.extend_from_slice(chunk.bytes.as_slice());
+            }
+            GuardianReplayPageBodyDelivery::OutputRecords(records) => {
+                body.extend_from_slice(&records.first_sequence.to_be_bytes());
+                body.extend_from_slice(
+                    &u16::try_from(records.records.len())
+                        .map_err(|_| GuardianProtocolError::PayloadTooLarge)?
+                        .to_be_bytes(),
+                );
+                body.extend_from_slice(&[0; 6]);
+                body.extend_from_slice(&records.previous_record_digest);
+                for record in &records.records {
+                    let metadata = record.metadata;
+                    push_uuid(&mut body, metadata.segment_id);
+                    body.extend_from_slice(&metadata.segment_first_sequence.to_be_bytes());
+                    body.push(u8::from(metadata.predecessor.is_some()));
+                    body.extend_from_slice(&[0; 7]);
+                    if let Some(predecessor) = metadata.predecessor {
+                        push_uuid(&mut body, predecessor.segment_id);
+                        body.extend_from_slice(&predecessor.last_sequence.to_be_bytes());
+                        body.extend_from_slice(&predecessor.terminal_record_digest);
+                        body.extend_from_slice(&predecessor.cumulative_plaintext_bytes.to_be_bytes());
+                        body.extend_from_slice(&predecessor.committed_log_bytes.to_be_bytes());
+                    } else {
+                        body.extend_from_slice(&[0; 72]);
+                    }
+                    body.extend_from_slice(&metadata.sequence.to_be_bytes());
+                    body.extend_from_slice(&metadata.payload_bytes.to_be_bytes());
+                    body.extend_from_slice(&[0; 4]);
+                    body.extend_from_slice(&metadata.cumulative_plaintext_bytes.to_be_bytes());
+                    body.extend_from_slice(&metadata.committed_log_bytes.to_be_bytes());
+                    body.extend_from_slice(&metadata.record_digest);
+                    body.extend_from_slice(record.plaintext.as_slice());
+                }
+            }
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id,
+                through_sequence,
+                terminal_record_digest,
+                cumulative_plaintext_bytes,
+            } => {
+                body.extend_from_slice(&checkpoint_id.0);
+                body.extend_from_slice(&through_sequence.to_be_bytes());
+                body.extend_from_slice(terminal_record_digest);
+                body.extend_from_slice(&cumulative_plaintext_bytes.to_be_bytes());
+            }
+            GuardianReplayPageBodyDelivery::Gap {
+                requested_sequence,
+                oldest_retained_sequence,
+                verified_through_sequence,
+                reason,
+            } => {
+                body.extend_from_slice(&requested_sequence.to_be_bytes());
+                body.extend_from_slice(&oldest_retained_sequence.to_be_bytes());
+                body.extend_from_slice(&verified_through_sequence.to_be_bytes());
+                body.push(*reason as u8);
+                body.extend_from_slice(&[0; 7]);
+            }
+            GuardianReplayPageBodyDelivery::Compacted {
+                requested_checkpoint,
+                replacement,
+                retained_first_sequence,
+                compaction_generation,
+            } => {
+                body.extend_from_slice(&requested_checkpoint.0);
+                body.extend_from_slice(&replacement.encode());
+                body.extend_from_slice(&retained_first_sequence.to_be_bytes());
+                body.extend_from_slice(&compaction_generation.to_be_bytes());
+            }
+            GuardianReplayPageBodyDelivery::SnapshotExpired { snapshot_id } => {
+                push_uuid(&mut body, *snapshot_id);
+            }
+        }
+        Ok(body)
+    }
+
+    fn decode(payload: Zeroizing<Vec<u8>>) -> Result<Self, GuardianProtocolError> {
+        if payload.len() < REPLAY_PAGE_HEADER_BYTES
+            || payload.len() > GUARDIAN_MAX_PAYLOAD_BYTES
+            || payload.get(..4) != Some(REPLAY_PAGE_PAYLOAD_MAGIC.as_slice())
+            || read_u16(&payload, 4)? != REPLAY_WIRE_VERSION
+            || payload[7] > 1
+            || payload[116..120].iter().any(|byte| *byte != 0)
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let body_len = usize::try_from(read_u32(&payload, 152)?)
+            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        if REPLAY_PAGE_HEADER_BYTES.checked_add(body_len) != Some(payload.len()) {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let next_cursor = match payload[7] {
+            0 if payload[156..REPLAY_PAGE_HEADER_BYTES]
+                .iter()
+                .all(|byte| *byte == 0) => None,
+            1 => Some(GuardianReplayCursorV1::decode(
+                &payload[156..REPLAY_PAGE_HEADER_BYTES],
+            )?),
+            _ => return Err(GuardianProtocolError::InvalidReplyPayload),
+        };
+        let mut snapshot_digest = [0; 32];
+        snapshot_digest.copy_from_slice(&payload[48..80]);
+        let mut incoming_cursor_digest = [0; 32];
+        incoming_cursor_digest.copy_from_slice(&payload[80..112]);
+        let mut page_digest = [0; 32];
+        page_digest.copy_from_slice(&payload[120..152]);
+        if digest_is_zero(page_digest) || compute_replay_page_digest(&payload)? != page_digest {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let body = decode_replay_page_body(payload[6], &payload[REPLAY_PAGE_HEADER_BYTES..])?;
+        let page = Self {
+            header: GuardianReplayPageHeaderV1 {
+                pane_id: read_required_uuid(&payload, 8)?,
+                generation: read_u64(&payload, 24)?,
+                snapshot_id: read_required_uuid(&payload, 32)?,
+                snapshot_digest,
+                incoming_cursor_digest,
+                page_index: read_u32(&payload, 112)?,
+                page_digest,
+                next_cursor,
+            },
+            body,
+        };
+        page.validate_shape()?;
+        Ok(page)
+    }
+
+    fn validate_shape(&self) -> Result<(), GuardianProtocolError> {
+        self.body.validate()?;
+        if self.header.pane_id.is_nil()
+            || self.header.generation == 0
+            || self.header.snapshot_id.is_nil()
+            || digest_is_zero(self.header.snapshot_digest)
+            || (!digest_is_zero(self.header.page_digest)
+                && self.header.page_digest == self.header.snapshot_digest)
+            || self.body.plaintext_bytes()? > GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES
+            || self.body.is_terminal() != self.header.next_cursor.is_none()
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        if let Some(next) = self.header.next_cursor {
+            if next.snapshot_id != self.header.snapshot_id
+                || next.snapshot_digest != self.header.snapshot_digest
+                || next.page_index != self.header.page_index.checked_add(1).ok_or(
+                    GuardianProtocolError::InvalidReplyPayload,
+                )?
+                || next.compute_digest() != next.cursor_digest
+            {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+        }
+        if let GuardianReplayPageBodyDelivery::SnapshotExpired { snapshot_id } = &self.body {
+            if *snapshot_id != self.header.snapshot_id {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_for_request(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<(), GuardianProtocolError> {
+        if request.header.operation != GuardianOperation::Replay
+            || request.header.pane_id != Some(self.header.pane_id)
+            || request.header.lease_generation != self.header.generation
+        {
+            return Err(GuardianProtocolError::ResponseRequestMismatch);
+        }
+        let replay = GuardianReplayRequestV1::decode(request.payload())?;
+        let (max_plaintext_bytes, max_records) = replay.limits();
+        if self.body.plaintext_bytes()? > max_plaintext_bytes
+            || matches!(&self.body, GuardianReplayPageBodyDelivery::OutputRecords(records)
+                if records.records.len() > usize::from(max_records))
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        match replay {
+            GuardianReplayRequestV1::Open { selector, .. } => {
+                if self.header.page_index != 0
+                    || !digest_is_zero(self.header.incoming_cursor_digest)
+                    || self.header.next_cursor.is_some_and(|cursor| {
+                        cursor.max_plaintext_bytes != max_plaintext_bytes
+                            || cursor.max_records != max_records
+                    })
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                if let GuardianReplaySelectorV1::Resume {
+                    next_sequence,
+                    previous_record_digest,
+                    ..
+                } = selector
+                {
+                    validate_page_start(&self.body, next_sequence, previous_record_digest)?;
+                }
+            }
+            GuardianReplayRequestV1::Continue { cursor } => {
+                if self.header.snapshot_id != cursor.snapshot_id
+                    || self.header.snapshot_digest != cursor.snapshot_digest
+                    || self.header.incoming_cursor_digest != cursor.cursor_digest
+                    || self.header.page_index != cursor.page_index
+                    || self.header.next_cursor.is_some_and(|next| {
+                        next.compaction_generation != cursor.compaction_generation
+                            || next.max_plaintext_bytes != cursor.max_plaintext_bytes
+                            || next.max_records != cursor.max_records
+                    })
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                validate_page_start(
+                    &self.body,
+                    cursor.next_sequence,
+                    cursor.previous_record_digest,
+                )?;
+                if let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) = &self.body {
+                    if cursor.phase != GuardianReplayPhaseV1::Checkpoint
+                        || cursor.checkpoint_offset != chunk.offset
+                    {
+                        return Err(GuardianProtocolError::InvalidReplyPayload);
+                    }
+                } else if matches!(&self.body, GuardianReplayPageBodyDelivery::OutputRecords(_))
+                    && cursor.phase != GuardianReplayPhaseV1::Output
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+            }
+        }
+        validate_next_cursor(&self.body, self.header.next_cursor)?;
+        Ok(())
+    }
+}
+
+fn validate_page_start(
+    body: &GuardianReplayPageBodyDelivery,
+    expected_sequence: u64,
+    expected_previous_digest: [u8; 32],
+) -> Result<(), GuardianProtocolError> {
+    match body {
+        GuardianReplayPageBodyDelivery::OutputRecords(records) => {
+            if records.first_sequence != expected_sequence
+                || records.previous_record_digest != expected_previous_digest
+            {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+        }
+        GuardianReplayPageBodyDelivery::Complete {
+            through_sequence,
+            terminal_record_digest,
+            ..
+        } => {
+            if through_sequence.checked_add(1) != Some(expected_sequence)
+                || *terminal_record_digest != expected_previous_digest
+            {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+        }
+        GuardianReplayPageBodyDelivery::Gap {
+            requested_sequence, ..
+        } => {
+            if *requested_sequence != expected_sequence {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+        }
+        GuardianReplayPageBodyDelivery::CheckpointChunk(_)
+        | GuardianReplayPageBodyDelivery::Compacted { .. }
+        | GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_next_cursor(
+    body: &GuardianReplayPageBodyDelivery,
+    next: Option<GuardianReplayCursorV1>,
+) -> Result<(), GuardianProtocolError> {
+    match (body, next) {
+        (GuardianReplayPageBodyDelivery::CheckpointChunk(chunk), Some(next)) => {
+            let chunk_end = chunk
+                .offset
+                .checked_add(u64::try_from(chunk.bytes.len()).map_err(|_| {
+                    GuardianProtocolError::InvalidReplyPayload
+                })?)
+                .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+            if chunk_end < chunk.descriptor.total_bytes {
+                if next.phase != GuardianReplayPhaseV1::Checkpoint
+                    || next.checkpoint_offset != chunk_end
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+            } else {
+                let (sequence, digest) = chunk
+                    .descriptor
+                    .suffix_start()
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                if chunk_end != chunk.descriptor.total_bytes
+                    || next.phase != GuardianReplayPhaseV1::Output
+                    || next.checkpoint_offset != 0
+                    || next.next_sequence != sequence
+                    || next.previous_record_digest != digest
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+            }
+        }
+        (GuardianReplayPageBodyDelivery::OutputRecords(records), Some(next)) => {
+            let last = records
+                .records
+                .last()
+                .ok_or(GuardianProtocolError::InvalidReplyPayload)?
+                .metadata;
+            if next.phase != GuardianReplayPhaseV1::Output
+                || next.checkpoint_offset != 0
+                || last.sequence.checked_add(1) != Some(next.next_sequence)
+                || next.previous_record_digest != last.record_digest
+            {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+        }
+        (body, None) if body.is_terminal() => {}
+        _ => return Err(GuardianProtocolError::InvalidReplyPayload),
+    }
+    Ok(())
+}
+
+fn decode_replay_page_body(
+    kind: u8,
+    payload: &[u8],
+) -> Result<GuardianReplayPageBodyDelivery, GuardianProtocolError> {
+    let body = match kind {
+        1 if payload.len() >= REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES => {
+            let descriptor = GuardianCheckpointDescriptorV1::decode(
+                &payload[..REPLAY_CHECKPOINT_DESCRIPTOR_BYTES],
+            )?;
+            let offset = read_u64(payload, REPLAY_CHECKPOINT_DESCRIPTOR_BYTES)?;
+            let mut chunk_digest = [0; 32];
+            chunk_digest.copy_from_slice(
+                &payload[REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 8
+                    ..REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 40],
+            );
+            let chunk_len = usize::try_from(read_u32(
+                payload,
+                REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 40,
+            )?)
+            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+            if REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES.checked_add(chunk_len) != Some(payload.len()) {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+            let bytes = Zeroizing::new(payload[REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES..].to_vec());
+            let chunk = GuardianCheckpointChunkDelivery {
+                descriptor,
+                offset,
+                chunk_digest,
+                bytes,
+            };
+            GuardianReplayPageBodyDelivery::CheckpointChunk(chunk)
+        }
+        2 if payload.len() >= REPLAY_OUTPUT_RECORDS_HEADER_BYTES => {
+            let first_sequence = read_u64(payload, 0)?;
+            let count = usize::from(read_u16(payload, 8)?);
+            if payload[10..16].iter().any(|byte| *byte != 0)
+                || count == 0
+                || count > usize::from(GUARDIAN_MAX_REPLAY_RECORDS)
+            {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+            let mut previous_record_digest = [0; 32];
+            previous_record_digest.copy_from_slice(&payload[16..48]);
+            let mut offset = REPLAY_OUTPUT_RECORDS_HEADER_BYTES;
+            let mut records = Vec::with_capacity(count);
+            for _ in 0..count {
+                let fixed_end = offset
+                    .checked_add(REPLAY_OUTPUT_RECORD_FIXED_BYTES)
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                let fixed = payload
+                    .get(offset..fixed_end)
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                if fixed[25..32].iter().any(|byte| *byte != 0)
+                    || fixed[116..120].iter().any(|byte| *byte != 0)
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                let predecessor = match fixed[24] {
+                    0 if fixed[32..104].iter().all(|byte| *byte == 0) => None,
+                    1 => {
+                        let mut terminal_record_digest = [0; 32];
+                        terminal_record_digest.copy_from_slice(&fixed[56..88]);
+                        Some(GuardianReplayPredecessorV1::new(
+                            read_required_uuid(fixed, 32)?,
+                            read_u64(fixed, 48)?,
+                            terminal_record_digest,
+                            read_u64(fixed, 88)?,
+                            read_u64(fixed, 96)?,
+                        )?)
+                    }
+                    _ => return Err(GuardianProtocolError::InvalidReplyPayload),
+                };
+                let payload_bytes = read_u32(fixed, 112)?;
+                let plaintext_end = fixed_end
+                    .checked_add(
+                        usize::try_from(payload_bytes)
+                            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                    )
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                let plaintext = payload
+                    .get(fixed_end..plaintext_end)
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                let mut record_digest = [0; 32];
+                record_digest.copy_from_slice(&fixed[136..168]);
+                let metadata = GuardianReplayRecordMetadataV1::new(
+                    read_required_uuid(fixed, 0)?,
+                    read_u64(fixed, 16)?,
+                    predecessor,
+                    read_u64(fixed, 104)?,
+                    payload_bytes,
+                    read_u64(fixed, 120)?,
+                    read_u64(fixed, 128)?,
+                    record_digest,
+                )?;
+                records.push(GuardianReplayRecordDelivery::new(
+                    metadata,
+                    Zeroizing::new(plaintext.to_vec()),
+                )?);
+                offset = plaintext_end;
+            }
+            if offset != payload.len() {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+            GuardianReplayPageBodyDelivery::OutputRecords(
+                GuardianReplayOutputRecordsDelivery::new(
+                    first_sequence,
+                    previous_record_digest,
+                    records,
+                )?,
+            )
+        }
+        3 if payload.len() == REPLAY_COMPLETE_BYTES => {
+            let mut checkpoint_id = [0; 32];
+            checkpoint_id.copy_from_slice(&payload[..32]);
+            let mut terminal_record_digest = [0; 32];
+            terminal_record_digest.copy_from_slice(&payload[40..72]);
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                through_sequence: read_u64(payload, 32)?,
+                terminal_record_digest,
+                cumulative_plaintext_bytes: read_u64(payload, 72)?,
+            }
+        }
+        4 if payload.len() == REPLAY_GAP_BYTES
+            && payload[25..32].iter().all(|byte| *byte == 0) =>
+        {
+            GuardianReplayPageBodyDelivery::Gap {
+                requested_sequence: read_u64(payload, 0)?,
+                oldest_retained_sequence: read_u64(payload, 8)?,
+                verified_through_sequence: read_u64(payload, 16)?,
+                reason: GuardianReplayGapReasonV1::from_wire(payload[24])?,
+            }
+        }
+        5 if payload.len() == REPLAY_COMPACTED_BYTES => {
+            let mut requested_checkpoint = [0; 32];
+            requested_checkpoint.copy_from_slice(&payload[..32]);
+            GuardianReplayPageBodyDelivery::Compacted {
+                requested_checkpoint: GuardianCheckpointIdentityDigest::from_bytes(
+                    requested_checkpoint,
+                )
+                .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                replacement: GuardianCheckpointDescriptorV1::decode(
+                    &payload[32..32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES],
+                )?,
+                retained_first_sequence: read_u64(
+                    payload,
+                    32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES,
+                )?,
+                compaction_generation: read_u64(
+                    payload,
+                    40 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES,
+                )?,
+            }
+        }
+        6 if payload.len() == REPLAY_SNAPSHOT_EXPIRED_BYTES => {
+            GuardianReplayPageBodyDelivery::SnapshotExpired {
+                snapshot_id: read_required_uuid(payload, 0)?,
+            }
+        }
+        _ => return Err(GuardianProtocolError::InvalidReplyPayload),
+    };
+    body.validate()?;
+    Ok(body)
+}
+
+fn compute_replay_page_digest(payload: &[u8]) -> Result<[u8; 32], GuardianProtocolError> {
+    if payload.len() < REPLAY_PAGE_HEADER_BYTES {
+        return Err(GuardianProtocolError::InvalidReplyPayload);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(REPLAY_PAGE_DIGEST_DOMAIN);
+    hasher.update(&payload[..REPLAY_PAGE_DIGEST_OFFSET]);
+    hasher.update([0; 32]);
+    hasher.update(&payload[REPLAY_PAGE_DIGEST_END..]);
+    Ok(hasher.finalize().into())
+}
+
 struct GuardianBoundedPayloadBuffer {
     bytes: Zeroizing<Vec<u8>>,
     max_bytes: usize,
@@ -3311,7 +4228,7 @@ impl std::io::Write for GuardianBoundedPayloadBuffer {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct CorrelatedGuardianResponse(GuardianResponseEnvelope);
 
 impl std::fmt::Debug for CorrelatedGuardianResponse {
@@ -3327,16 +4244,6 @@ impl CorrelatedGuardianResponse {
     #[must_use]
     pub const fn header(&self) -> &GuardianResponseHeader {
         &self.0.header
-    }
-
-    #[must_use]
-    pub fn payload(&self) -> &[u8] {
-        &self.0.payload
-    }
-
-    #[must_use]
-    pub const fn envelope(&self) -> &GuardianResponseEnvelope {
-        &self.0
     }
 
     pub fn success_reply(
@@ -3389,6 +4296,32 @@ impl CorrelatedGuardianResponse {
     pub fn rejection_code(&self) -> Result<GuardianRejectionCode, GuardianProtocolError> {
         GuardianRejectionCode::decode(self.0.header.status, &self.0.payload)
     }
+
+    /// Consume an authenticated Replay response into a non-cloneable page.
+    /// No raw payload getter exists on the correlated response or delivery.
+    pub fn into_replay_page(
+        self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReplayPageDelivery, GuardianProtocolError> {
+        let response = self.0;
+        if response.header.status != GuardianResponseStatus::Success
+            || response.header.operation != GuardianOperation::Replay
+            || response.header.protocol_version != request.header.protocol_version
+            || response.header.guardian_incarnation != request.header.guardian_incarnation
+            || response.header.mux_incarnation != request.header.mux_incarnation
+            || response.header.request_id != request.header.request_id
+            || response.header.request_payload_sha256 != request.header.payload_sha256
+            || response.header.pane_id != request.header.pane_id
+            || response.header.lease_generation != request.header.lease_generation
+            || response.header.lease_sequence != request.header.lease_sequence
+            || response.header.effect_id != request.header.effect_id
+        {
+            return Err(GuardianProtocolError::ResponseRequestMismatch);
+        }
+        let page = GuardianReplayPageDelivery::decode(response.payload)?;
+        page.validate_for_request(request)?;
+        Ok(page)
+    }
 }
 
 impl AuthenticatedGuardianRequest {
@@ -3423,7 +4356,7 @@ impl AuthenticatedGuardianRequest {
     /// Consume the authenticated envelope and transfer its sensitive payload
     /// into an allocation that remains zeroizing at the next ownership layer.
     pub fn into_zeroizing_payload(mut self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(std::mem::take(&mut self.envelope.payload))
+        Zeroizing::new(std::mem::take(&mut *self.envelope.payload))
     }
 }
 
@@ -3815,10 +4748,12 @@ pub enum GuardianReply {
         state: InputEffectState,
     },
     CheckpointReceipt(GuardianCheckpointReceipt),
+    CheckpointStage(GuardianCheckpointStageReplyV1),
     MutationApplied { pane_id: Uuid, generation: u64, sequence: u64 },
     LeaseRetired { pane_id: Uuid, generation: u64 },
     InputEffect { effect_id: Uuid, state: InputEffectState },
     ReplayReady { pane_id: Uuid, generation: u64 },
+    ReplayAcked(GuardianReplayAckReceiptV1),
     /// The exact authenticated effect identity was committed, but its external
     /// callback may or may not have applied. The pane is permanently
     /// quarantined; this receipt is diagnostic/reconciliation authority, never
@@ -3916,7 +4851,9 @@ impl GuardianReply {
             | Self::MutationApplied { .. } => 32,
             Self::InputReceipt { .. } => INPUT_RECEIPT_PAYLOAD_BYTES,
             Self::CheckpointReceipt(..) => GUARDIAN_CHECKPOINT_RECEIPT_BYTES,
+            Self::CheckpointStage(..) => CHECKPOINT_STAGE_REPLY_BYTES,
             Self::InputEffect { .. } => INPUT_EFFECT_REPLY_PAYLOAD_BYTES,
+            Self::ReplayAcked(..) => REPLAY_ACK_REPLY_BYTES,
             Self::EffectOutcomeIndeterminate { .. } => 48,
         };
         if capacity > GUARDIAN_MAX_PAYLOAD_BYTES {
@@ -3997,6 +4934,7 @@ impl GuardianReply {
                 payload.extend_from_slice(&applied_bytes.to_be_bytes());
             }
             Self::CheckpointReceipt(receipt) => payload.extend_from_slice(&receipt.encode()),
+            Self::CheckpointStage(reply) => payload.extend_from_slice(&reply.encode()?),
             Self::MutationApplied {
                 pane_id,
                 generation,
@@ -4012,6 +4950,7 @@ impl GuardianReply {
                 payload.push(disposition);
                 payload.extend_from_slice(&applied_bytes.to_be_bytes());
             }
+            Self::ReplayAcked(receipt) => payload.extend_from_slice(&receipt.encode()?),
             Self::EffectOutcomeIndeterminate {
                 pane_id,
                 generation,
@@ -4158,6 +5097,9 @@ impl GuardianReply {
             GuardianOperation::Checkpoint => {
                 Self::CheckpointReceipt(GuardianCheckpointReceipt::decode(payload)?)
             }
+            GuardianOperation::CheckpointStage => {
+                Self::CheckpointStage(GuardianCheckpointStageReplyV1::decode(payload)?)
+            }
             GuardianOperation::Replay => {
                 require_reply_len(payload, 24)?;
                 Self::ReplayReady {
@@ -4178,6 +5120,9 @@ impl GuardianReply {
                     pane_id: read_required_uuid(payload, 0)?,
                     generation: read_u64(payload, 16)?,
                 }
+            }
+            GuardianOperation::ReplayAck => {
+                Self::ReplayAcked(GuardianReplayAckReceiptV1::decode(payload)?)
             }
         };
         reply.require_operation(operation)?;
@@ -4205,12 +5150,17 @@ impl GuardianReply {
                     Self::CheckpointReceipt(..)
                 )
                 | (
+                    GuardianOperation::CheckpointStage,
+                    Self::CheckpointStage(..)
+                )
+                | (
                     GuardianOperation::Resize
                         | GuardianOperation::Signal
                         | GuardianOperation::Close,
                     Self::MutationApplied { .. }
                 )
                 | (GuardianOperation::Replay, Self::ReplayReady { .. })
+                | (GuardianOperation::ReplayAck, Self::ReplayAcked(..))
                 | (
                     GuardianOperation::QueryInputEffect,
                     Self::InputEffect { .. }
@@ -4284,6 +5234,7 @@ impl GuardianReply {
                         && receipt.sequence > 0
                         && !receipt.effect_id.is_nil()
                 }
+                Self::CheckpointStage(reply) => reply.validate().is_ok(),
                 Self::MutationApplied {
                     pane_id,
                     generation,
@@ -4304,6 +5255,7 @@ impl GuardianReply {
                     !effect_id.is_nil() && state.has_canonical_wire_count()
                 }
                 Self::ReplayReady { pane_id, .. } => !pane_id.is_nil(),
+                Self::ReplayAcked(receipt) => receipt.validate().is_ok(),
                 Self::EffectOutcomeIndeterminate {
                     pane_id,
                     generation,
@@ -4394,6 +5346,10 @@ impl GuardianReply {
                     && header.lease_sequence == receipt.sequence
                     && header.effect_id == Some(receipt.effect_id)
             }
+            Self::CheckpointStage(_) => {
+                header.operation == GuardianOperation::CheckpointStage
+                    && header.lease_sequence == 0
+            }
             Self::MutationApplied {
                 pane_id,
                 generation,
@@ -4412,6 +5368,12 @@ impl GuardianReply {
                 generation,
             } => header.pane_id == Some(*pane_id) && header.lease_generation == *generation,
             Self::InputEffect { effect_id, .. } => header.effect_id == Some(*effect_id),
+            Self::ReplayAcked(_) => {
+                header.pane_id.is_some()
+                    && header.lease_generation > 0
+                    && header.lease_sequence == 0
+                    && header.effect_id.is_none()
+            }
             Self::EffectOutcomeIndeterminate {
                 pane_id,
                 generation,
@@ -4504,6 +5466,54 @@ impl GuardianReply {
             Self::CheckpointReceipt(receipt) => {
                 let identity = GuardianCheckpointEffectIdentity::from_authenticated_request(request)?;
                 if receipt.matches_identity(identity) {
+                    Ok(())
+                } else {
+                    Err(GuardianProtocolError::ResponseRequestMismatch)
+                }
+            }
+            Self::CheckpointStage(reply) => {
+                let stage = GuardianCheckpointStageRequestV1::decode(request.payload())?;
+                if reply.upload_id() != stage.upload_id() {
+                    return Err(GuardianProtocolError::ResponseRequestMismatch);
+                }
+                match *reply {
+                    GuardianCheckpointStageReplyV1::Ready {
+                        next_index,
+                        committed_bytes,
+                        ..
+                    }
+                    | GuardianCheckpointStageReplyV1::Progress {
+                        next_index,
+                        committed_bytes,
+                        ..
+                    } => {
+                        let expected = u64::from(next_index)
+                            .checked_mul(u64::from(stage.chunk_bytes()))
+                            .map(|bytes| bytes.min(stage.total_bytes()))
+                            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                        if next_index <= stage.total_chunks() && committed_bytes == expected {
+                            Ok(())
+                        } else {
+                            Err(GuardianProtocolError::InvalidReplyPayload)
+                        }
+                    }
+                    GuardianCheckpointStageReplyV1::Sealed {
+                        checkpoint_id,
+                        boundary_id,
+                        total_bytes,
+                        ..
+                    } if checkpoint_id == stage.checkpoint_id()
+                        && boundary_id == stage.boundary_id()
+                        && total_bytes == stage.total_bytes() => Ok(()),
+                    GuardianCheckpointStageReplyV1::Sealed { .. } => {
+                        Err(GuardianProtocolError::ResponseRequestMismatch)
+                    }
+                }
+            }
+            Self::ReplayAcked(receipt) => {
+                let ack = GuardianReplayAckV1::decode(request.payload())?;
+                let expected = GuardianReplayAckReceiptV1::from_ack(ack);
+                if *receipt == expected {
                     Ok(())
                 } else {
                     Err(GuardianProtocolError::ResponseRequestMismatch)
@@ -7232,7 +8242,7 @@ pub fn decode_guardian_request(
     };
     let request = GuardianRequestEnvelope {
         header,
-        payload: payload.to_vec(),
+        payload: Zeroizing::new(payload.to_vec()),
     };
     validate_request_envelope(&request)?;
     Ok(AuthenticatedGuardianRequest {
@@ -7358,7 +8368,7 @@ pub fn decode_guardian_response(
             lease_sequence: read_u64(frame, 148)?,
             effect_id: read_optional_uuid(frame, 156)?,
         },
-        payload: payload.to_vec(),
+        payload: Zeroizing::new(payload.to_vec()),
     };
     validate_response_envelope(&response)?;
     Ok(AuthenticatedGuardianResponse(response))
