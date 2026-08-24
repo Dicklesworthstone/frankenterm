@@ -8212,6 +8212,32 @@ mod tests {
         write_private_stage_fixture(path, &bytes);
     }
 
+    fn overwrite_private_append_wal_fixture(
+        path: &std::path::Path,
+        wal: &LiveScrollbackAppendWalV1,
+    ) {
+        let mut bytes = serde_json::to_vec_pretty(wal)
+            .expect("serialize private append WAL fixture");
+        bytes.push(b'\n');
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open private append WAL fixture for overwrite");
+        file.write_all(&bytes)
+            .expect("overwrite private append WAL fixture");
+        file.sync_all()
+            .expect("synchronize private append WAL fixture");
+        #[cfg(not(windows))]
+        std::fs::File::open(
+            path.parent()
+                .expect("append WAL fixture path has a parent"),
+        )
+        .expect("open append WAL fixture parent")
+        .sync_all()
+        .expect("synchronize append WAL fixture parent");
+    }
+
     fn materialize_append_wal_target_for_test(
         sink: &LiveScrollbackSpillSink,
         wal: &LiveScrollbackAppendWalV1,
