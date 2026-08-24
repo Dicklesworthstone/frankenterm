@@ -620,63 +620,73 @@ mod tests {
 
     #[test]
     fn recovery_activation_lease_excludes_every_overlay_setter() {
-        use std::sync::mpsc;
-        use std::time::Duration;
+        use std::sync::TryLockError;
+        use std::time::{Duration, Instant};
+
+        fn wait_until_setter_owns_activation_gate(term_config: &TermConfig) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match term_config.recovery_activation_gate.try_lock() {
+                    Err(TryLockError::WouldBlock) => return,
+                    Err(TryLockError::Poisoned(_)) => {
+                        panic!("terminal recovery activation gate was poisoned")
+                    }
+                    Ok(guard) => drop(guard),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "setter never acquired the shared recovery activation gate",
+                );
+                std::thread::yield_now();
+            }
+        }
 
         let term_config = Arc::new(TermConfig::with_config(ConfigHandle::default_config()));
+
+        let revision_before_config = term_config.overlay_generation.load(Ordering::Relaxed);
         let lease = term_config.acquire_recovery_activation_lease();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (finished_tx, finished_rx) = mpsc::channel();
-        let palette_config = Arc::clone(&term_config);
-        let palette_started_tx = started_tx.clone();
-        let palette_finished_tx = finished_tx.clone();
-        let palette_setter = std::thread::spawn(move || {
-            palette_started_tx
-                .send("palette")
-                .expect("report palette setter start");
-            palette_config.set_client_palette(ColorPalette::default());
-            palette_finished_tx
-                .send("palette")
-                .expect("report palette setter completion");
-        });
+        let config_guard = lock_terminal_mutex(&term_config.config, "config setter exclusion test");
         let config_setter_config = Arc::clone(&term_config);
         let config_setter = std::thread::spawn(move || {
-            started_tx
-                .send("config")
-                .expect("report config setter start");
             config_setter_config.set_config(ConfigHandle::default_config());
-            finished_tx
-                .send("config")
-                .expect("report config setter completion");
         });
-
-        let mut started = [
-            started_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("first setter reached its mutation call"),
-            started_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("second setter reached its mutation call"),
-        ];
-        started.sort_unstable();
-        assert_eq!(started, ["config", "palette"]);
-        assert!(
-            finished_rx.recv_timeout(Duration::from_millis(25)).is_err(),
-            "all semantic setters must remain excluded while activation owns the lease",
+        assert_eq!(
+            term_config.overlay_generation.load(Ordering::Relaxed),
+            revision_before_config,
+            "config mutation must not cross the held activation lease",
         );
         drop(lease);
-        let mut finished = [
-            finished_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("first setter completes after activation releases its lease"),
-            finished_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("second setter completes after activation releases its lease"),
-        ];
-        finished.sort_unstable();
-        assert_eq!(finished, ["config", "palette"]);
-        palette_setter.join().expect("palette setter thread joins");
+        wait_until_setter_owns_activation_gate(&term_config);
+        assert_eq!(
+            term_config.overlay_generation.load(Ordering::Relaxed),
+            revision_before_config,
+            "config revision cannot advance before the protected value is mutable",
+        );
+        drop(config_guard);
         config_setter.join().expect("config setter thread joins");
+
+        let revision_before_palette = term_config.overlay_generation.load(Ordering::Relaxed);
+        let lease = term_config.acquire_recovery_activation_lease();
+        let palette_guard =
+            lock_terminal_mutex(&term_config.client_palette, "palette setter exclusion test");
+        let palette_config = Arc::clone(&term_config);
+        let palette_setter = std::thread::spawn(move || {
+            palette_config.set_client_palette(ColorPalette::default());
+        });
+        assert_eq!(
+            term_config.overlay_generation.load(Ordering::Relaxed),
+            revision_before_palette,
+            "palette mutation must not cross the held activation lease",
+        );
+        drop(lease);
+        wait_until_setter_owns_activation_gate(&term_config);
+        assert_eq!(
+            term_config.overlay_generation.load(Ordering::Relaxed),
+            revision_before_palette,
+            "palette revision cannot advance before the protected value is mutable",
+        );
+        drop(palette_guard);
+        palette_setter.join().expect("palette setter thread joins");
     }
 
     #[test]

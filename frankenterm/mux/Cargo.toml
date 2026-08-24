@@ -57,6 +57,7 @@ procinfo = { path = "../procinfo", default-features = false }
 promise.workspace = true
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
+serde_json.workspace = true
 sha2.workspace = true
 serial2.workspace = true
 shell-words.workspace = true
@@ -90,7 +91,6 @@ criterion = "0.8.2"
 k9.workspace = true
 promise = { workspace = true, features = ["test-support"] }
 proptest = "1.8.0"
-serde_json.workspace = true
 tempfile.workspace = true
 
 [[bench]]

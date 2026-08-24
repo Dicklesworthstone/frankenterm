@@ -26,7 +26,7 @@ pub struct TlsDomainServer {
     pub pem_root_certs: Vec<PathBuf>,
 }
 
-#[derive(Default, Debug, Clone, FromDynamic, ToDynamic)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, FromDynamic, ToDynamic)]
 pub struct TlsDomainClient {
     /// The name of this specific domain.  Must be unique amongst
     /// all types of domain in the configuration file.

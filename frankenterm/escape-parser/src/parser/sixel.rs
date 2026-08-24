@@ -57,6 +57,7 @@ pub struct SixelBuilder {
 }
 
 impl SixelBuilder {
+    #[cfg(test)]
     pub fn new(params: &[i64]) -> Self {
         Self::new_with_max_retained_bytes(params, MAX_SIXEL_RETAINED_BYTES)
     }

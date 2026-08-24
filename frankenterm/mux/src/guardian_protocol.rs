@@ -3,20 +3,27 @@
 //! This module deliberately contains no sockets, PTYs, subprocesses, or mux-global lookups.
 //! A transport must decode and authenticate a complete frame here before it is allowed to
 //! route the request to a pane runtime.  The pure state machine is the authority for spawn
-//! idempotency, lease generations, mutation sequencing, and ambiguous input reconciliation.
+//! idempotency, lease generations, mutation sequencing, ambiguous input reconciliation, and
+//! typed durable-checkpoint publication fences.
 //! A fresh mux first uses the authenticated `Hello` operation to learn the current guardian
 //! incarnation; nil incarnation scope is otherwise forbidden.
 
+use crate::guardian_input_journal::{
+    GuardianInputDisposition, GuardianInputJournal, GuardianInputJournalError,
+    GuardianInputTerminalPermit, GuardianInputWriteCompletion, GuardianInputWritePermit,
+};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use hmac::{Hmac, KeyInit, Mac};
 use portable_pty::{PtySize, cmdbuilder::CommandBuilder};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
+use std::panic::AssertUnwindSafe;
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub const GUARDIAN_PROTOCOL_VERSION: u16 = 1;
+pub const GUARDIAN_PROTOCOL_VERSION: u16 = 3;
 pub const GUARDIAN_AUTH_TOKEN_BYTES: usize = 32;
 pub const GUARDIAN_MAC_BYTES: usize = 32;
 pub const GUARDIAN_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -29,9 +36,12 @@ pub const GUARDIAN_MAX_CENSUS_ENTRIES: u16 = 256;
 pub const GUARDIAN_MAX_CENSUS_BYTES: u32 = 256 * 1024;
 pub const GUARDIAN_MAX_CENSUS_SNAPSHOTS: usize = 8;
 pub const GUARDIAN_CENSUS_PAGE_HEADER_BYTES: u32 = 34;
-pub const GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES: u32 = 71;
+pub const GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES: u32 = 87;
 pub const GUARDIAN_MIN_CENSUS_PAGE_BYTES: u32 =
     GUARDIAN_CENSUS_PAGE_HEADER_BYTES + GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES;
+pub const GUARDIAN_CHECKPOINT_INTENT_VERSION: u16 = 1;
+pub const GUARDIAN_CHECKPOINT_INTENT_BYTES: usize = 72;
+pub const GUARDIAN_CHECKPOINT_RECEIPT_BYTES: usize = 120;
 
 const FRAME_MAGIC: [u8; 4] = *b"FTG1";
 const RESPONSE_FRAME_MAGIC: [u8; 4] = *b"FTR1";
@@ -50,11 +60,15 @@ const SPAWN_PAYLOAD_MAGIC: [u8; 4] = *b"GSP1";
 const RESIZE_PAYLOAD_MAGIC: [u8; 4] = *b"GRS1";
 const SIGNAL_PAYLOAD_MAGIC: [u8; 4] = *b"GSG1";
 const INPUT_EFFECT_QUERY_PAYLOAD_MAGIC: [u8; 4] = *b"GIQ1";
+const CHECKPOINT_INTENT_PAYLOAD_MAGIC: [u8; 4] = *b"GCP1";
+const CHECKPOINT_RECEIPT_PAYLOAD_MAGIC: [u8; 4] = *b"GCR1";
 const REJECTION_PAYLOAD_MAGIC: [u8; 4] = *b"GRE1";
 const SPAWN_PAYLOAD_FIXED_BYTES: usize = 16;
 const RESIZE_PAYLOAD_BYTES: usize = 12;
 const SIGNAL_PAYLOAD_BYTES: usize = 5;
-const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 44;
+const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 48;
+const INPUT_RECEIPT_PAYLOAD_BYTES: usize = 53;
+const INPUT_EFFECT_REPLY_PAYLOAD_BYTES: usize = 21;
 const REJECTION_PAYLOAD_BYTES: usize = 6;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -292,6 +306,9 @@ pub enum GuardianResponseStatus {
     Success = 0,
     Rejected = 1,
     Terminal = 2,
+    /// The request was authenticated and executed, but durable publication
+    /// may have occurred and therefore cannot be retried blindly.
+    Indeterminate = 3,
 }
 
 impl GuardianResponseStatus {
@@ -300,6 +317,7 @@ impl GuardianResponseStatus {
             0 => Ok(Self::Success),
             1 => Ok(Self::Rejected),
             2 => Ok(Self::Terminal),
+            3 => Ok(Self::Indeterminate),
             other => Err(GuardianProtocolError::UnknownResponseStatus(other)),
         }
     }
@@ -329,6 +347,8 @@ pub enum GuardianRejectionCode {
     CensusSnapshotIdentityConflict = 19,
     InvalidCensusCursor = 20,
     InternalInvariant = 21,
+    CheckpointOutcomeIndeterminate = 22,
+    CheckpointIdentityMismatch = 23,
 }
 
 impl GuardianRejectionCode {
@@ -339,7 +359,8 @@ impl GuardianRejectionCode {
             | Self::SequenceGap
             | Self::CapacityExhausted
             | Self::RequestAliasCapacityExhausted
-            | Self::InputDurabilityPending => GuardianResponseStatus::Rejected,
+            | Self::InputDurabilityPending
+            | Self::CheckpointOutcomeIndeterminate => GuardianResponseStatus::Rejected,
             _ => GuardianResponseStatus::Terminal,
         }
     }
@@ -356,7 +377,10 @@ impl GuardianRejectionCode {
         status: GuardianResponseStatus,
         payload: &[u8],
     ) -> Result<Self, GuardianProtocolError> {
-        if status == GuardianResponseStatus::Success
+        if matches!(
+            status,
+            GuardianResponseStatus::Success | GuardianResponseStatus::Indeterminate
+        )
             || payload.len() != REJECTION_PAYLOAD_BYTES
             || payload.get(..4) != Some(REJECTION_PAYLOAD_MAGIC.as_slice())
         {
@@ -384,6 +408,8 @@ impl GuardianRejectionCode {
             19 => Self::CensusSnapshotIdentityConflict,
             20 => Self::InvalidCensusCursor,
             21 => Self::InternalInvariant,
+            22 => Self::CheckpointOutcomeIndeterminate,
+            23 => Self::CheckpointIdentityMismatch,
             _ => return Err(GuardianProtocolError::InvalidRejectionPayload),
         };
         if code.status() != status {
@@ -468,7 +494,7 @@ impl GuardianResponseEnvelope {
         &self.payload
     }
 
-    pub fn success(
+    pub fn reply(
         request: &AuthenticatedGuardianRequest,
         reply: &GuardianReply,
     ) -> Result<Self, GuardianProtocolError> {
@@ -476,7 +502,7 @@ impl GuardianResponseEnvelope {
         let response = Self {
             header: GuardianResponseHeader::new(
                 &request.header,
-                GuardianResponseStatus::Success,
+                reply.response_status(),
                 &payload,
             ),
             payload,
@@ -484,6 +510,18 @@ impl GuardianResponseEnvelope {
         reply.require_response_identity(&response.header)?;
         reply.require_request_payload(request)?;
         Ok(response)
+    }
+
+    pub fn success(
+        request: &AuthenticatedGuardianRequest,
+        reply: &GuardianReply,
+    ) -> Result<Self, GuardianProtocolError> {
+        let response = Self::reply(request, reply)?;
+        if response.header.status == GuardianResponseStatus::Success {
+            Ok(response)
+        } else {
+            Err(GuardianProtocolError::NonSuccessResponse)
+        }
     }
 
     pub fn rejection(
@@ -727,6 +765,393 @@ impl GuardianSignal {
     }
 }
 
+/// Opaque identity of one immutable checkpoint artifact.
+///
+/// The bytes may be content-derived, so diagnostics deliberately expose only
+/// the type name. The all-zero value is reserved as an absent identity.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct GuardianCheckpointIdentityDigest([u8; 32]);
+
+impl GuardianCheckpointIdentityDigest {
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, GuardianProtocolError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(GuardianProtocolError::InvalidCheckpointIntent);
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointIdentityDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GuardianCheckpointIdentityDigest([REDACTED])")
+    }
+}
+
+/// Opaque identity of the exact durable output boundary included by a
+/// checkpoint. It is a separate type so callers cannot accidentally swap the
+/// artifact and output-boundary digests.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct GuardianOutputBoundaryIdentityDigest([u8; 32]);
+
+impl GuardianOutputBoundaryIdentityDigest {
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, GuardianProtocolError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(GuardianProtocolError::InvalidCheckpointIntent);
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for GuardianOutputBoundaryIdentityDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GuardianOutputBoundaryIdentityDigest([REDACTED])")
+    }
+}
+
+/// Versioned, fixed-width checkpoint publication intent.
+///
+/// This payload binds the request header's pane, mux incarnation, lease
+/// generation, mutation sequence, request nonce, and effect nonce to both the
+/// checkpoint artifact and the exact durable output boundary it covers.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct GuardianCheckpointIntent {
+    checkpoint_identity: GuardianCheckpointIdentityDigest,
+    output_boundary_identity: GuardianOutputBoundaryIdentityDigest,
+}
+
+impl std::fmt::Debug for GuardianCheckpointIntent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointIntent")
+            .field("version", &GUARDIAN_CHECKPOINT_INTENT_VERSION)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianCheckpointIntent {
+    #[must_use]
+    pub const fn new(
+        checkpoint_identity: GuardianCheckpointIdentityDigest,
+        output_boundary_identity: GuardianOutputBoundaryIdentityDigest,
+    ) -> Self {
+        Self {
+            checkpoint_identity,
+            output_boundary_identity,
+        }
+    }
+
+    #[must_use]
+    pub const fn checkpoint_identity(self) -> GuardianCheckpointIdentityDigest {
+        self.checkpoint_identity
+    }
+
+    #[must_use]
+    pub const fn output_boundary_identity(self) -> GuardianOutputBoundaryIdentityDigest {
+        self.output_boundary_identity
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; GUARDIAN_CHECKPOINT_INTENT_BYTES] {
+        let mut payload = [0_u8; GUARDIAN_CHECKPOINT_INTENT_BYTES];
+        payload[..4].copy_from_slice(&CHECKPOINT_INTENT_PAYLOAD_MAGIC);
+        payload[4..6].copy_from_slice(&GUARDIAN_CHECKPOINT_INTENT_VERSION.to_be_bytes());
+        payload[8..40].copy_from_slice(&self.checkpoint_identity.0);
+        payload[40..72].copy_from_slice(&self.output_boundary_identity.0);
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != GUARDIAN_CHECKPOINT_INTENT_BYTES
+            || payload.get(..4) != Some(CHECKPOINT_INTENT_PAYLOAD_MAGIC.as_slice())
+            || read_u16(payload, 4)? != GUARDIAN_CHECKPOINT_INTENT_VERSION
+            || payload[6] != 0
+            || payload[7] != 0
+        {
+            return Err(GuardianProtocolError::InvalidCheckpointIntent);
+        }
+        let mut checkpoint_identity = [0_u8; 32];
+        checkpoint_identity.copy_from_slice(&payload[8..40]);
+        let mut output_boundary_identity = [0_u8; 32];
+        output_boundary_identity.copy_from_slice(&payload[40..72]);
+        Ok(Self::new(
+            GuardianCheckpointIdentityDigest::from_bytes(checkpoint_identity)?,
+            GuardianOutputBoundaryIdentityDigest::from_bytes(output_boundary_identity)?,
+        ))
+    }
+}
+
+/// Retained durable-publication disposition for a checkpoint effect.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianCheckpointDisposition {
+    Committed = 1,
+    /// Publication may have become durable, so the operation is pinned and
+    /// must not be retried until the exact identity is reconciled.
+    OutcomeIndeterminate = 2,
+}
+
+impl GuardianCheckpointDisposition {
+    fn from_wire(value: u8) -> Result<Self, GuardianProtocolError> {
+        match value {
+            1 => Ok(Self::Committed),
+            2 => Ok(Self::OutcomeIndeterminate),
+            _ => Err(GuardianProtocolError::InvalidReplyPayload),
+        }
+    }
+}
+
+/// Exact authenticated identity handed to the checkpoint publisher and later
+/// required for reconciliation. Digest fields remain opaque in diagnostics.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct GuardianCheckpointEffectIdentity {
+    pane_id: Uuid,
+    mux_incarnation: Uuid,
+    request_id: Uuid,
+    generation: u64,
+    sequence: u64,
+    effect_id: Uuid,
+    intent: GuardianCheckpointIntent,
+}
+
+impl std::fmt::Debug for GuardianCheckpointEffectIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointEffectIdentity")
+            .field("pane_id", &self.pane_id)
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("request_id", &self.request_id)
+            .field("generation", &self.generation)
+            .field("sequence", &self.sequence)
+            .field("effect_id", &self.effect_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianCheckpointEffectIdentity {
+    fn from_authenticated_request(
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<Self, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.operation != GuardianOperation::Checkpoint {
+            return Err(GuardianProtocolError::CheckpointIdentityMismatch);
+        }
+        Ok(Self {
+            pane_id: request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::CheckpointIdentityMismatch)?,
+            mux_incarnation: request.header.mux_incarnation,
+            request_id: request.header.request_id,
+            generation: request.header.lease_generation,
+            sequence: request.header.lease_sequence,
+            effect_id: request
+                .header
+                .effect_id
+                .ok_or(GuardianProtocolError::CheckpointIdentityMismatch)?,
+            intent: GuardianCheckpointIntent::decode(&request.payload)?,
+        })
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    const fn pane_id(self) -> Uuid {
+        self.pane_id
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    const fn mux_incarnation(self) -> Uuid {
+        self.mux_incarnation
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    const fn request_id(self) -> Uuid {
+        self.request_id
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    const fn effect_id(self) -> Uuid {
+        self.effect_id
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    const fn intent(self) -> GuardianCheckpointIntent {
+        self.intent
+    }
+}
+
+/// Nonconstructible pending-publication authority passed only by the protocol
+/// state machine after every fence and capacity check succeeds.
+struct GuardianCheckpointPending {
+    identity: GuardianCheckpointEffectIdentity,
+}
+
+impl std::fmt::Debug for GuardianCheckpointPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointPending")
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+impl GuardianCheckpointPending {
+    #[must_use]
+    #[cfg(test)]
+    const fn identity(&self) -> GuardianCheckpointEffectIdentity {
+        self.identity
+    }
+}
+
+/// Authenticated checkpoint receipt. `OutcomeIndeterminate` is terminal for
+/// blind retry and is encoded under a distinct response status.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianCheckpointReceipt {
+    pane_id: Uuid,
+    generation: u64,
+    sequence: u64,
+    effect_id: Uuid,
+    intent: GuardianCheckpointIntent,
+    disposition: GuardianCheckpointDisposition,
+}
+
+impl std::fmt::Debug for GuardianCheckpointReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointReceipt")
+            .field("pane_id", &self.pane_id)
+            .field("generation", &self.generation)
+            .field("sequence", &self.sequence)
+            .field("effect_id", &self.effect_id)
+            .field("disposition", &self.disposition)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianCheckpointReceipt {
+    fn from_identity(
+        identity: GuardianCheckpointEffectIdentity,
+        disposition: GuardianCheckpointDisposition,
+    ) -> Self {
+        Self {
+            pane_id: identity.pane_id,
+            generation: identity.generation,
+            sequence: identity.sequence,
+            effect_id: identity.effect_id,
+            intent: identity.intent,
+            disposition,
+        }
+    }
+
+    #[must_use]
+    pub const fn pane_id(self) -> Uuid {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn effect_id(self) -> Uuid {
+        self.effect_id
+    }
+
+    #[must_use]
+    pub const fn intent(self) -> GuardianCheckpointIntent {
+        self.intent
+    }
+
+    #[must_use]
+    pub const fn disposition(self) -> GuardianCheckpointDisposition {
+        self.disposition
+    }
+
+    fn encode(self) -> [u8; GUARDIAN_CHECKPOINT_RECEIPT_BYTES] {
+        let mut payload = [0_u8; GUARDIAN_CHECKPOINT_RECEIPT_BYTES];
+        payload[..4].copy_from_slice(&CHECKPOINT_RECEIPT_PAYLOAD_MAGIC);
+        payload[4..6].copy_from_slice(&GUARDIAN_CHECKPOINT_INTENT_VERSION.to_be_bytes());
+        payload[6] = self.disposition as u8;
+        payload[8..24].copy_from_slice(self.pane_id.as_bytes());
+        payload[24..32].copy_from_slice(&self.generation.to_be_bytes());
+        payload[32..40].copy_from_slice(&self.sequence.to_be_bytes());
+        payload[40..56].copy_from_slice(self.effect_id.as_bytes());
+        payload[56..88].copy_from_slice(&self.intent.checkpoint_identity.0);
+        payload[88..120].copy_from_slice(&self.intent.output_boundary_identity.0);
+        payload
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != GUARDIAN_CHECKPOINT_RECEIPT_BYTES
+            || payload.get(..4) != Some(CHECKPOINT_RECEIPT_PAYLOAD_MAGIC.as_slice())
+            || read_u16(payload, 4)? != GUARDIAN_CHECKPOINT_INTENT_VERSION
+            || payload[7] != 0
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let mut checkpoint_identity = [0_u8; 32];
+        checkpoint_identity.copy_from_slice(&payload[56..88]);
+        let mut output_boundary_identity = [0_u8; 32];
+        output_boundary_identity.copy_from_slice(&payload[88..120]);
+        let receipt = Self {
+            pane_id: read_required_uuid(payload, 8)?,
+            generation: read_u64(payload, 24)?,
+            sequence: read_u64(payload, 32)?,
+            effect_id: read_required_uuid(payload, 40)?,
+            intent: GuardianCheckpointIntent::new(
+                GuardianCheckpointIdentityDigest::from_bytes(checkpoint_identity)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                GuardianOutputBoundaryIdentityDigest::from_bytes(output_boundary_identity)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+            ),
+            disposition: GuardianCheckpointDisposition::from_wire(payload[6])?,
+        };
+        if receipt.generation == 0 || receipt.sequence == 0 {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        Ok(receipt)
+    }
+
+    fn matches_identity(self, identity: GuardianCheckpointEffectIdentity) -> bool {
+        self.pane_id == identity.pane_id
+            && self.generation == identity.generation
+            && self.sequence == identity.sequence
+            && self.effect_id == identity.effect_id
+            && self.intent == identity.intent
+    }
+}
+
 struct GuardianBoundedPayloadBuffer {
     bytes: Vec<u8>,
     max_bytes: usize,
@@ -807,6 +1232,22 @@ impl CorrelatedGuardianResponse {
         if self.0.header.status != GuardianResponseStatus::Success {
             return Err(GuardianProtocolError::NonSuccessResponse);
         }
+        self.typed_reply(request)
+    }
+
+    /// Decode an authenticated typed reply, including a checkpoint whose
+    /// publication outcome is explicitly indeterminate. Rejections remain on
+    /// the separate rejection-code path.
+    pub fn typed_reply(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReply, GuardianProtocolError> {
+        if !matches!(
+            self.0.header.status,
+            GuardianResponseStatus::Success | GuardianResponseStatus::Indeterminate
+        ) {
+            return Err(GuardianProtocolError::NonSuccessResponse);
+        }
         let header = &self.0.header;
         let request_header = &request.header;
         if header.protocol_version != request_header.protocol_version
@@ -823,6 +1264,9 @@ impl CorrelatedGuardianResponse {
             return Err(GuardianProtocolError::ResponseRequestMismatch);
         }
         let reply = GuardianReply::decode_for_operation(self.0.header.operation, &self.0.payload)?;
+        if reply.response_status() != self.0.header.status {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
         reply.require_response_identity(&self.0.header)?;
         reply.require_request_payload(request)?;
         Ok(reply)
@@ -933,8 +1377,9 @@ impl GuardianCensusPageRequest {
 pub enum InputEffectState {
     NotSeen,
     AcceptedNotDurable,
-    DurableEffect,
-    TerminalRejected,
+    DurableFull,
+    DurablePrefix { applied_bytes: u32 },
+    KnownNotApplied,
     DispositionUnavailable,
 }
 
@@ -952,6 +1397,7 @@ pub struct GuardianInputEffectIdentity {
     generation: u64,
     sequence: u64,
     effect_id: Uuid,
+    input_bytes: u32,
     payload_sha256: [u8; 32],
 }
 
@@ -964,6 +1410,7 @@ impl std::fmt::Debug for GuardianInputEffectIdentity {
             .field("generation", &self.generation)
             .field("sequence", &self.sequence)
             .field("effect_id", &self.effect_id)
+            .field("input_bytes", &self.input_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -975,12 +1422,17 @@ impl GuardianInputEffectIdentity {
         generation: u64,
         sequence: u64,
         effect_id: Uuid,
+        input_bytes: u32,
         payload_sha256: [u8; 32],
     ) -> Result<Self, GuardianProtocolError> {
         require_nonzero(pane_id, "pane id")?;
         require_nonzero(mux_incarnation, "mux incarnation")?;
         require_nonzero(effect_id, "effect id")?;
-        if generation == 0 || sequence == 0 {
+        if generation == 0
+            || sequence == 0
+            || input_bytes == 0
+            || usize::try_from(input_bytes).map_or(true, |bytes| bytes > GUARDIAN_MAX_INPUT_BYTES)
+        {
             return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
         }
         Ok(Self {
@@ -989,6 +1441,7 @@ impl GuardianInputEffectIdentity {
             generation,
             sequence,
             effect_id,
+            input_bytes,
             payload_sha256,
         })
     }
@@ -1012,6 +1465,8 @@ impl GuardianInputEffectIdentity {
                 .header
                 .effect_id
                 .ok_or(GuardianProtocolError::InputDurabilityIdentityMismatch)?,
+            u32::try_from(request.payload.len())
+                .map_err(|_| GuardianProtocolError::InputDurabilityIdentityMismatch)?,
             request.header.payload_sha256,
         )
     }
@@ -1042,6 +1497,11 @@ impl GuardianInputEffectIdentity {
     }
 
     #[must_use]
+    pub const fn input_bytes(self) -> u32 {
+        self.input_bytes
+    }
+
+    #[must_use]
     pub const fn payload_sha256(self) -> [u8; 32] {
         self.payload_sha256
     }
@@ -1050,6 +1510,7 @@ impl GuardianInputEffectIdentity {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianInputEffectQuery {
     sequence: u64,
+    input_bytes: u32,
     payload_sha256: [u8; 32],
 }
 
@@ -1058,6 +1519,7 @@ impl std::fmt::Debug for GuardianInputEffectQuery {
         formatter
             .debug_struct("GuardianInputEffectQuery")
             .field("sequence", &self.sequence)
+            .field("input_bytes", &self.input_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -1065,13 +1527,18 @@ impl std::fmt::Debug for GuardianInputEffectQuery {
 impl GuardianInputEffectQuery {
     pub fn new(
         sequence: u64,
+        input_bytes: u32,
         payload_sha256: [u8; 32],
     ) -> Result<Self, GuardianProtocolError> {
-        if sequence == 0 {
+        if sequence == 0
+            || input_bytes == 0
+            || usize::try_from(input_bytes).map_or(true, |bytes| bytes > GUARDIAN_MAX_INPUT_BYTES)
+        {
             return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         Ok(Self {
             sequence,
+            input_bytes,
             payload_sha256,
         })
     }
@@ -1081,7 +1548,8 @@ impl GuardianInputEffectQuery {
         let mut payload = [0_u8; INPUT_EFFECT_QUERY_PAYLOAD_BYTES];
         payload[..4].copy_from_slice(&INPUT_EFFECT_QUERY_PAYLOAD_MAGIC);
         payload[4..12].copy_from_slice(&self.sequence.to_be_bytes());
-        payload[12..].copy_from_slice(&self.payload_sha256);
+        payload[12..16].copy_from_slice(&self.input_bytes.to_be_bytes());
+        payload[16..].copy_from_slice(&self.payload_sha256);
         payload
     }
 
@@ -1092,31 +1560,80 @@ impl GuardianInputEffectQuery {
             return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         let mut payload_sha256 = [0_u8; 32];
-        payload_sha256.copy_from_slice(&payload[12..]);
-        Self::new(read_u64(payload, 4)?, payload_sha256)
+        payload_sha256.copy_from_slice(&payload[16..]);
+        Self::new(
+            read_u64(payload, 4)?,
+            read_u32(payload, 12)?,
+            payload_sha256,
+        )
     }
 }
 
 impl InputEffectState {
-    const fn to_wire(self) -> u8 {
+    const fn to_wire(self) -> (u8, u32) {
         match self {
-            Self::NotSeen => 0,
-            Self::AcceptedNotDurable => 1,
-            Self::DurableEffect => 2,
-            Self::TerminalRejected => 3,
-            Self::DispositionUnavailable => 4,
+            Self::NotSeen => (0, 0),
+            Self::AcceptedNotDurable => (1, 0),
+            Self::DurableFull => (2, 0),
+            Self::KnownNotApplied => (3, 0),
+            Self::DispositionUnavailable => (4, 0),
+            Self::DurablePrefix { applied_bytes } => (5, applied_bytes),
         }
     }
 
-    fn from_wire(value: u8) -> Result<Self, GuardianProtocolError> {
-        match value {
-            0 => Ok(Self::NotSeen),
-            1 => Ok(Self::AcceptedNotDurable),
-            2 => Ok(Self::DurableEffect),
-            3 => Ok(Self::TerminalRejected),
-            4 => Ok(Self::DispositionUnavailable),
+    fn from_wire(value: u8, applied_bytes: u32) -> Result<Self, GuardianProtocolError> {
+        match (value, applied_bytes) {
+            (0, 0) => Ok(Self::NotSeen),
+            (1, 0) => Ok(Self::AcceptedNotDurable),
+            (2, 0) => Ok(Self::DurableFull),
+            (3, 0) => Ok(Self::KnownNotApplied),
+            (4, 0) => Ok(Self::DispositionUnavailable),
+            (5, applied_bytes)
+                if applied_bytes > 0
+                    && usize::try_from(applied_bytes)
+                        .is_ok_and(|bytes| bytes <= GUARDIAN_MAX_INPUT_BYTES) =>
+            {
+                Ok(Self::DurablePrefix { applied_bytes })
+            }
             _ => Err(GuardianProtocolError::InvalidReplyPayload),
         }
+    }
+
+    fn is_input_receipt(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptedNotDurable
+                | Self::DurableFull
+                | Self::DurablePrefix { .. }
+                | Self::KnownNotApplied
+        ) && self.has_canonical_wire_count()
+    }
+
+    fn has_canonical_wire_count(self) -> bool {
+        !matches!(
+            self,
+            Self::DurablePrefix { applied_bytes }
+                if applied_bytes == 0
+                    || usize::try_from(applied_bytes)
+                        .map_or(true, |bytes| bytes > GUARDIAN_MAX_INPUT_BYTES)
+        )
+    }
+
+    fn validate_for_input_bytes(self, input_bytes: u32) -> Result<(), GuardianProtocolError> {
+        if input_bytes == 0
+            || usize::try_from(input_bytes)
+                .map_or(true, |bytes| bytes > GUARDIAN_MAX_INPUT_BYTES)
+        {
+            return Err(GuardianProtocolError::InvalidInputDisposition);
+        }
+        if matches!(
+            self,
+            Self::DurablePrefix { applied_bytes }
+                if applied_bytes == 0 || applied_bytes >= input_bytes
+        ) {
+            return Err(GuardianProtocolError::InvalidInputDisposition);
+        }
+        Ok(())
     }
 }
 
@@ -1137,6 +1654,7 @@ pub struct GuardianCensusEntry {
     pub mux_incarnation: Option<Uuid>,
     pub next_sequence: Option<u64>,
     pub pending_input_effect: Option<Uuid>,
+    pub indeterminate_checkpoint_effect: Option<Uuid>,
     pub exit_status: Option<i32>,
     pub quarantine_reason: Option<GuardianQuarantineReason>,
 }
@@ -1162,6 +1680,7 @@ pub enum GuardianReply {
         effect_id: Uuid,
         state: InputEffectState,
     },
+    CheckpointReceipt(GuardianCheckpointReceipt),
     MutationApplied { pane_id: Uuid, generation: u64, sequence: u64 },
     LeaseRetired { pane_id: Uuid, generation: u64 },
     InputEffect { effect_id: Uuid, state: InputEffectState },
@@ -1169,6 +1688,17 @@ pub enum GuardianReply {
 }
 
 impl GuardianReply {
+    const fn response_status(&self) -> GuardianResponseStatus {
+        match self {
+            Self::CheckpointReceipt(receipt)
+                if matches!(
+                    receipt.disposition,
+                    GuardianCheckpointDisposition::OutcomeIndeterminate
+                ) => GuardianResponseStatus::Indeterminate,
+            _ => GuardianResponseStatus::Success,
+        }
+    }
+
     pub fn encode_for_operation(
         &self,
         operation: GuardianOperation,
@@ -1189,8 +1719,9 @@ impl GuardianReply {
             Self::Claimed { .. }
             | Self::Attached { .. }
             | Self::MutationApplied { .. } => 32,
-            Self::InputReceipt { .. } => 49,
-            Self::InputEffect { .. } => 17,
+            Self::InputReceipt { .. } => INPUT_RECEIPT_PAYLOAD_BYTES,
+            Self::CheckpointReceipt(..) => GUARDIAN_CHECKPOINT_RECEIPT_BYTES,
+            Self::InputEffect { .. } => INPUT_EFFECT_REPLY_PAYLOAD_BYTES,
         };
         if capacity > GUARDIAN_MAX_PAYLOAD_BYTES {
             return Err(GuardianProtocolError::PayloadTooLarge);
@@ -1264,8 +1795,11 @@ impl GuardianReply {
                 payload.extend_from_slice(&generation.to_be_bytes());
                 payload.extend_from_slice(&sequence.to_be_bytes());
                 push_uuid(&mut payload, *effect_id);
-                payload.push(state.to_wire());
+                let (disposition, applied_bytes) = state.to_wire();
+                payload.push(disposition);
+                payload.extend_from_slice(&applied_bytes.to_be_bytes());
             }
+            Self::CheckpointReceipt(receipt) => payload.extend_from_slice(&receipt.encode()),
             Self::MutationApplied {
                 pane_id,
                 generation,
@@ -1277,7 +1811,9 @@ impl GuardianReply {
             }
             Self::InputEffect { effect_id, state } => {
                 push_uuid(&mut payload, *effect_id);
-                payload.push(state.to_wire());
+                let (disposition, applied_bytes) = state.to_wire();
+                payload.push(disposition);
+                payload.extend_from_slice(&applied_bytes.to_be_bytes());
             }
         }
         if payload.len() != capacity {
@@ -1378,25 +1914,27 @@ impl GuardianReply {
                 }
             }
             GuardianOperation::Input => {
-                require_reply_len(payload, 49)?;
+                require_reply_len(payload, INPUT_RECEIPT_PAYLOAD_BYTES)?;
                 Self::InputReceipt {
                     pane_id: read_required_uuid(payload, 0)?,
                     generation: read_u64(payload, 16)?,
                     sequence: read_u64(payload, 24)?,
                     effect_id: read_required_uuid(payload, 32)?,
-                    state: InputEffectState::from_wire(payload[48])?,
+                    state: InputEffectState::from_wire(payload[48], read_u32(payload, 49)?)?,
                 }
             }
             GuardianOperation::Resize
             | GuardianOperation::Signal
-            | GuardianOperation::Close
-            | GuardianOperation::Checkpoint => {
+            | GuardianOperation::Close => {
                 require_reply_len(payload, 32)?;
                 Self::MutationApplied {
                     pane_id: read_required_uuid(payload, 0)?,
                     generation: read_u64(payload, 16)?,
                     sequence: read_u64(payload, 24)?,
                 }
+            }
+            GuardianOperation::Checkpoint => {
+                Self::CheckpointReceipt(GuardianCheckpointReceipt::decode(payload)?)
             }
             GuardianOperation::Replay => {
                 require_reply_len(payload, 24)?;
@@ -1406,10 +1944,10 @@ impl GuardianReply {
                 }
             }
             GuardianOperation::QueryInputEffect => {
-                require_reply_len(payload, 17)?;
+                require_reply_len(payload, INPUT_EFFECT_REPLY_PAYLOAD_BYTES)?;
                 Self::InputEffect {
                     effect_id: read_required_uuid(payload, 0)?,
-                    state: InputEffectState::from_wire(payload[16])?,
+                    state: InputEffectState::from_wire(payload[16], read_u32(payload, 17)?)?,
                 }
             }
             GuardianOperation::RetireLease => {
@@ -1437,10 +1975,13 @@ impl GuardianReply {
                 | (GuardianOperation::Attach, Self::Attached { .. })
                 | (GuardianOperation::Input, Self::InputReceipt { .. })
                 | (
+                    GuardianOperation::Checkpoint,
+                    Self::CheckpointReceipt(..)
+                )
+                | (
                     GuardianOperation::Resize
                         | GuardianOperation::Signal
-                        | GuardianOperation::Close
-                        | GuardianOperation::Checkpoint,
+                        | GuardianOperation::Close,
                     Self::MutationApplied { .. }
                 )
                 | (GuardianOperation::Replay, Self::ReplayReady { .. })
@@ -1499,12 +2040,13 @@ impl GuardianReply {
                         && *generation > 0
                         && *sequence > 0
                         && !effect_id.is_nil()
-                        && matches!(
-                            state,
-                            InputEffectState::AcceptedNotDurable
-                                | InputEffectState::DurableEffect
-                                | InputEffectState::TerminalRejected
-                        )
+                        && state.is_input_receipt()
+                }
+                Self::CheckpointReceipt(receipt) => {
+                    !receipt.pane_id.is_nil()
+                        && receipt.generation > 0
+                        && receipt.sequence > 0
+                        && !receipt.effect_id.is_nil()
                 }
                 Self::MutationApplied {
                     pane_id,
@@ -1522,7 +2064,9 @@ impl GuardianReply {
                     pane_id,
                     generation,
                 } => !pane_id.is_nil() && *generation > 0,
-                Self::InputEffect { effect_id, .. } => !effect_id.is_nil(),
+                Self::InputEffect { effect_id, state } => {
+                    !effect_id.is_nil() && state.has_canonical_wire_count()
+                }
                 Self::ReplayReady { pane_id, .. } => !pane_id.is_nil(),
             };
             if valid {
@@ -1580,6 +2124,12 @@ impl GuardianReply {
                     && header.lease_sequence == *sequence
                     && header.effect_id == Some(*effect_id)
             }
+            Self::CheckpointReceipt(receipt) => {
+                header.pane_id == Some(receipt.pane_id)
+                    && header.lease_generation == receipt.generation
+                    && header.lease_sequence == receipt.sequence
+                    && header.effect_id == Some(receipt.effect_id)
+            }
             Self::MutationApplied {
                 pane_id,
                 generation,
@@ -1610,44 +2160,61 @@ impl GuardianReply {
         &self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<(), GuardianProtocolError> {
-        let Self::CensusPage {
-            snapshot_id,
-            entries,
-            next_cursor,
-            total_panes,
-        } = self
-        else {
-            return Ok(());
-        };
-        let page = GuardianCensusPageRequest::decode(&request.payload)?;
-        let entry_count =
-            u64::try_from(entries.len()).map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        let encoded_bytes = GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES
-            .checked_mul(
-                u32::try_from(entries.len())
-                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
-            )
-            .and_then(|entries_bytes| {
-                GUARDIAN_CENSUS_PAGE_HEADER_BYTES.checked_add(entries_bytes)
-            })
-            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
-        let end = page
-            .cursor
-            .checked_add(entry_count)
-            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
-        let expected_next = (end < *total_panes).then_some(end);
-        if entries.len() > usize::from(page.max_entries)
-            || encoded_bytes > page.max_bytes
-            || (page.cursor == 0 && snapshot_id.is_nil())
-            || (page.cursor > 0 && *snapshot_id != page.snapshot_id)
-            || page.cursor > *total_panes
-            || end > *total_panes
-            || (end < *total_panes && entries.is_empty())
-            || *next_cursor != expected_next
-        {
-            return Err(GuardianProtocolError::InvalidReplyPayload);
+        match self {
+            Self::InputReceipt { state, .. } => state.validate_for_input_bytes(
+                u32::try_from(request.payload.len())
+                    .map_err(|_| GuardianProtocolError::InvalidInputDisposition)?,
+            ),
+            Self::InputEffect { state, .. } => {
+                let query = GuardianInputEffectQuery::decode(&request.payload)?;
+                state.validate_for_input_bytes(query.input_bytes)
+            }
+            Self::CensusPage {
+                snapshot_id,
+                entries,
+                next_cursor,
+                total_panes,
+            } => {
+                let page = GuardianCensusPageRequest::decode(&request.payload)?;
+                let entry_count = u64::try_from(entries.len())
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+                let encoded_bytes = GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES
+                    .checked_mul(
+                        u32::try_from(entries.len())
+                            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                    )
+                    .and_then(|entries_bytes| {
+                        GUARDIAN_CENSUS_PAGE_HEADER_BYTES.checked_add(entries_bytes)
+                    })
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                let end = page
+                    .cursor
+                    .checked_add(entry_count)
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                let expected_next = (end < *total_panes).then_some(end);
+                if entries.len() > usize::from(page.max_entries)
+                    || encoded_bytes > page.max_bytes
+                    || (page.cursor == 0 && snapshot_id.is_nil())
+                    || (page.cursor > 0 && *snapshot_id != page.snapshot_id)
+                    || page.cursor > *total_panes
+                    || end > *total_panes
+                    || (end < *total_panes && entries.is_empty())
+                    || *next_cursor != expected_next
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                Ok(())
+            }
+            Self::CheckpointReceipt(receipt) => {
+                let identity = GuardianCheckpointEffectIdentity::from_authenticated_request(request)?;
+                if receipt.matches_identity(identity) {
+                    Ok(())
+                } else {
+                    Err(GuardianProtocolError::ResponseRequestMismatch)
+                }
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -1684,6 +2251,7 @@ pub enum GuardianPaneState {
 pub struct GuardianMuxLeaseRetirement {
     pub retired_panes: usize,
     pub pending_input_panes: usize,
+    pub indeterminate_checkpoint_panes: usize,
 }
 
 impl GuardianPaneState {
@@ -1700,7 +2268,11 @@ impl GuardianPaneState {
 }
 
 impl GuardianCensusEntry {
-    fn from_state(pane_id: Uuid, state: &GuardianPaneState) -> Self {
+    fn from_state(
+        pane_id: Uuid,
+        state: &GuardianPaneState,
+        indeterminate_checkpoint_effect: Option<Uuid>,
+    ) -> Self {
         match state {
             GuardianPaneState::LiveUnclaimed { generation } => Self {
                 pane_id,
@@ -1709,6 +2281,7 @@ impl GuardianCensusEntry {
                 mux_incarnation: None,
                 next_sequence: None,
                 pending_input_effect: None,
+                indeterminate_checkpoint_effect,
                 exit_status: None,
                 quarantine_reason: None,
             },
@@ -1724,6 +2297,7 @@ impl GuardianCensusEntry {
                 mux_incarnation: Some(*mux_incarnation),
                 next_sequence: Some(*next_sequence),
                 pending_input_effect: *pending_input_effect,
+                indeterminate_checkpoint_effect,
                 exit_status: None,
                 quarantine_reason: None,
             },
@@ -1738,6 +2312,7 @@ impl GuardianCensusEntry {
                 mux_incarnation: None,
                 next_sequence: None,
                 pending_input_effect: *pending_input_effect,
+                indeterminate_checkpoint_effect,
                 exit_status: Some(*exit_status),
                 quarantine_reason: None,
             },
@@ -1751,6 +2326,7 @@ impl GuardianCensusEntry {
                 mux_incarnation: None,
                 next_sequence: None,
                 pending_input_effect: None,
+                indeterminate_checkpoint_effect,
                 exit_status: *exit_status,
                 quarantine_reason: None,
             },
@@ -1765,6 +2341,7 @@ impl GuardianCensusEntry {
                 mux_incarnation: None,
                 next_sequence: None,
                 pending_input_effect: None,
+                indeterminate_checkpoint_effect,
                 exit_status: *exit_status,
                 quarantine_reason: Some(*reason),
             },
@@ -1780,6 +2357,7 @@ impl GuardianCensusEntry {
         push_optional_uuid(payload, self.mux_incarnation);
         payload.extend_from_slice(&self.next_sequence.unwrap_or(0).to_be_bytes());
         push_optional_uuid(payload, self.pending_input_effect);
+        push_optional_uuid(payload, self.indeterminate_checkpoint_effect);
         payload.extend_from_slice(&self.exit_status.unwrap_or(0).to_be_bytes());
         payload.push(
             self.quarantine_reason
@@ -1807,11 +2385,11 @@ impl GuardianCensusEntry {
             0 => None,
             value => Some(value),
         };
-        let flags = payload[70];
+        let flags = payload[86];
         if flags & !1 != 0 {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
-        let encoded_exit_status = read_i32(payload, 65)?;
+        let encoded_exit_status = read_i32(payload, 81)?;
         let exit_status = if flags & 1 == 0 {
             if encoded_exit_status != 0 {
                 return Err(GuardianProtocolError::InvalidReplyPayload);
@@ -1827,8 +2405,9 @@ impl GuardianCensusEntry {
             mux_incarnation: read_optional_uuid(payload, 25)?,
             next_sequence,
             pending_input_effect: read_optional_uuid(payload, 49)?,
+            indeterminate_checkpoint_effect: read_optional_uuid(payload, 65)?,
             exit_status,
-            quarantine_reason: GuardianQuarantineReason::from_wire(payload[69])?,
+            quarantine_reason: GuardianQuarantineReason::from_wire(payload[85])?,
         };
         entry.validate_wire_shape()?;
         Ok(entry)
@@ -1839,6 +2418,11 @@ impl GuardianCensusEntry {
             || self.next_sequence == Some(0)
             || self.mux_incarnation.is_some_and(|value| value.is_nil())
             || self.pending_input_effect.is_some_and(|value| value.is_nil())
+            || self
+                .indeterminate_checkpoint_effect
+                .is_some_and(|value| value.is_nil())
+            || (self.pending_input_effect.is_some()
+                && self.indeterminate_checkpoint_effect.is_some())
         {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
@@ -1847,6 +2431,7 @@ impl GuardianCensusEntry {
                 self.mux_incarnation.is_none()
                     && self.next_sequence.is_none()
                     && self.pending_input_effect.is_none()
+                    && self.indeterminate_checkpoint_effect.is_none()
                     && self.exit_status.is_none()
                     && self.quarantine_reason.is_none()
             }
@@ -1867,12 +2452,14 @@ impl GuardianCensusEntry {
                 self.mux_incarnation.is_none()
                     && self.next_sequence.is_none()
                     && self.pending_input_effect.is_none()
+                    && self.indeterminate_checkpoint_effect.is_none()
                     && self.quarantine_reason.is_none()
             }
             GuardianCensusPaneStatus::Quarantined => {
                 self.mux_incarnation.is_none()
                     && self.next_sequence.is_none()
                     && self.pending_input_effect.is_none()
+                    && self.indeterminate_checkpoint_effect.is_none()
                     && self.quarantine_reason.is_some()
             }
         };
@@ -1933,7 +2520,7 @@ impl GuardianQuarantineReason {
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum GuardianProtocolError {
-    #[error("guardian frame is shorter than the authenticated v1 envelope")]
+    #[error("guardian frame is shorter than the authenticated protocol envelope")]
     TruncatedFrame,
     #[error("guardian frame length {actual} does not match declared length {declared}")]
     FrameLengthMismatch { declared: usize, actual: usize },
@@ -2006,6 +2593,10 @@ pub enum GuardianProtocolError {
     InputDurabilityPending,
     #[error("guardian input durability acknowledgement does not match the pending pane effect")]
     InputDurabilityIdentityMismatch,
+    #[error("guardian input disposition is invalid for the authenticated input length")]
+    InvalidInputDisposition,
+    #[error("guardian input effects require the typed journal-before-write transaction")]
+    InputRequiresTypedTransaction,
     #[error("guardian census page has an invalid encoding or exceeds its entry/byte cap")]
     InvalidCensusPage,
     #[error("guardian census cursor {cursor} exceeds pane count {pane_count}")]
@@ -2014,7 +2605,7 @@ pub enum GuardianProtocolError {
     CensusSnapshotNotFound(Uuid),
     #[error("guardian census snapshot UUID was reused by a different mux incarnation")]
     CensusSnapshotIdentityConflict,
-    #[error("guardian success reply payload is malformed or violates its operation schema")]
+    #[error("guardian typed reply payload is malformed or violates its operation schema")]
     InvalidReplyPayload,
     #[error("guardian reply variant does not match operation {operation:?}")]
     ReplyOperationMismatch { operation: GuardianOperation },
@@ -2024,6 +2615,14 @@ pub enum GuardianProtocolError {
     InvalidRejectionPayload,
     #[error("guardian operation payload is malformed or violates its frozen schema")]
     InvalidOperationPayload,
+    #[error("guardian checkpoint intent is malformed, unsupported, or has an absent identity")]
+    InvalidCheckpointIntent,
+    #[error("guardian checkpoint effects require the typed durable-publication transaction")]
+    CheckpointRequiresTypedTransaction,
+    #[error("guardian checkpoint publication outcome is indeterminate and cannot be retried")]
+    CheckpointOutcomeIndeterminate,
+    #[error("guardian checkpoint acknowledgement does not match the pending publication identity")]
+    CheckpointIdentityMismatch,
 }
 
 impl GuardianRejectionCode {
@@ -2060,6 +2659,12 @@ impl GuardianRejectionCode {
             }
             GuardianProtocolError::InvalidCensusCursor { .. } => Self::InvalidCensusCursor,
             GuardianProtocolError::StateInvariantViolation(_) => Self::InternalInvariant,
+            GuardianProtocolError::CheckpointOutcomeIndeterminate => {
+                Self::CheckpointOutcomeIndeterminate
+            }
+            GuardianProtocolError::CheckpointIdentityMismatch => {
+                Self::CheckpointIdentityMismatch
+            }
             GuardianProtocolError::TruncatedFrame
             | GuardianProtocolError::FrameLengthMismatch { .. }
             | GuardianProtocolError::FrameTooLarge
@@ -2077,20 +2682,32 @@ impl GuardianRejectionCode {
             | GuardianProtocolError::ZeroIdentity(_)
             | GuardianProtocolError::InvalidOperationScope { .. }
             | GuardianProtocolError::MissingEffectQueryIdentity
+            | GuardianProtocolError::InvalidInputDisposition
+            | GuardianProtocolError::InputRequiresTypedTransaction
             | GuardianProtocolError::InvalidCensusPage
             | GuardianProtocolError::InvalidReplyPayload
             | GuardianProtocolError::ReplyOperationMismatch { .. }
             | GuardianProtocolError::NonSuccessResponse
             | GuardianProtocolError::InvalidRejectionPayload
-            | GuardianProtocolError::InvalidOperationPayload => Self::InvalidRequest,
+            | GuardianProtocolError::InvalidOperationPayload
+            | GuardianProtocolError::InvalidCheckpointIntent
+            | GuardianProtocolError::CheckpointRequiresTypedTransaction => Self::InvalidRequest,
         }
     }
 }
 
-#[derive(Debug)]
 pub enum GuardianEffectTransactionError<E> {
     Protocol(GuardianProtocolError),
     Effect(E),
+}
+
+impl<E> std::fmt::Debug for GuardianEffectTransactionError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(error) => formatter.debug_tuple("Protocol").field(error).finish(),
+            Self::Effect(_) => formatter.debug_tuple("Effect").field(&"[REDACTED]").finish(),
+        }
+    }
 }
 
 impl<E> From<GuardianProtocolError> for GuardianEffectTransactionError<E> {
@@ -2099,11 +2716,11 @@ impl<E> From<GuardianProtocolError> for GuardianEffectTransactionError<E> {
     }
 }
 
-impl<E: std::fmt::Display> std::fmt::Display for GuardianEffectTransactionError<E> {
+impl<E> std::fmt::Display for GuardianEffectTransactionError<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protocol(error) => std::fmt::Display::fmt(error, formatter),
-            Self::Effect(error) => write!(formatter, "guardian runtime effect failed: {error}"),
+            Self::Effect(_) => formatter.write_str("guardian runtime effect failed"),
         }
     }
 }
@@ -2112,7 +2729,85 @@ impl<E: std::error::Error + 'static> std::error::Error for GuardianEffectTransac
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Protocol(error) => Some(error),
-            Self::Effect(error) => Some(error),
+            Self::Effect(_) => None,
+        }
+    }
+}
+
+/// Content-safe failures before or after the one authorized PTY write attempt.
+///
+/// A journal failure after the writer runs leaves the already committed
+/// protocol state at `AcceptedNotDurable`; recovery must inspect the exact
+/// journal identity and must never retry the write.
+pub enum GuardianInputTransactionError {
+    Protocol(GuardianProtocolError),
+    Journal(GuardianInputJournalError),
+}
+
+impl std::fmt::Debug for GuardianInputTransactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(error) => formatter.debug_tuple("Protocol").field(error).finish(),
+            Self::Journal(_) => formatter.debug_tuple("Journal").field(&"[REDACTED]").finish(),
+        }
+    }
+}
+
+impl From<GuardianProtocolError> for GuardianInputTransactionError {
+    fn from(error: GuardianProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<GuardianInputJournalError> for GuardianInputTransactionError {
+    fn from(error: GuardianInputJournalError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+impl std::fmt::Display for GuardianInputTransactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Journal(_) => formatter.write_str("guardian input journal transaction failed"),
+        }
+    }
+}
+
+impl std::error::Error for GuardianInputTransactionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::Journal(_) => None,
+        }
+    }
+}
+
+impl GuardianInputTerminalPermit {
+    /// Consume this journal-issued authority and reconcile its exact terminal
+    /// disposition into the protocol. The protocol transition primitives are
+    /// private so no production module can detach an applied byte count from
+    /// the durable identity that authorized it.
+    pub fn reconcile_protocol(
+        self,
+        protocol: &mut GuardianProtocolState,
+    ) -> Result<GuardianReply, GuardianProtocolError> {
+        let (identity, disposition) = self.into_protocol_parts();
+        match disposition {
+            GuardianInputDisposition::DurableFull => {
+                protocol.mark_input_durable_full(identity)
+            }
+            GuardianInputDisposition::DurablePrefix { applied_bytes } => {
+                protocol.mark_input_durable_prefix(identity, applied_bytes)
+            }
+            GuardianInputDisposition::KnownNotApplied => {
+                protocol.mark_input_known_not_applied(identity)
+            }
+            GuardianInputDisposition::Intent | GuardianInputDisposition::AcceptedNotDurable => {
+                Err(GuardianProtocolError::StateInvariantViolation(
+                    "input-terminal-permit-disposition",
+                ))
+            }
         }
     }
 }
@@ -2124,7 +2819,20 @@ struct EffectFingerprint {
     mux_incarnation: Uuid,
     lease_generation: u64,
     lease_sequence: u64,
+    payload_bytes: u32,
     payload_sha256: [u8; 32],
+}
+
+impl EffectFingerprint {
+    fn matches_input_identity(&self, identity: GuardianInputEffectIdentity) -> bool {
+        self.operation == GuardianOperation::Input
+            && self.pane_id == identity.pane_id()
+            && self.mux_incarnation == identity.mux_incarnation()
+            && self.lease_generation == identity.generation()
+            && self.lease_sequence == identity.sequence()
+            && self.payload_bytes == identity.input_bytes()
+            && self.payload_sha256 == identity.payload_sha256()
+    }
 }
 
 impl std::fmt::Debug for EffectFingerprint {
@@ -2136,7 +2844,31 @@ impl std::fmt::Debug for EffectFingerprint {
             .field("mux_incarnation", &self.mux_incarnation)
             .field("lease_generation", &self.lease_generation)
             .field("lease_sequence", &self.lease_sequence)
+            .field("payload_bytes", &self.payload_bytes)
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredEffectState {
+    Applied,
+    Input(InputEffectState),
+    Checkpoint {
+        disposition: GuardianCheckpointDisposition,
+        identity: GuardianCheckpointEffectIdentity,
+    },
+}
+
+impl StoredEffectState {
+    const fn is_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Input(InputEffectState::AcceptedNotDurable)
+                | Self::Checkpoint {
+                    disposition: GuardianCheckpointDisposition::OutcomeIndeterminate,
+                    ..
+                }
+        )
     }
 }
 
@@ -2144,7 +2876,7 @@ impl std::fmt::Debug for EffectFingerprint {
 struct StoredEffect {
     fingerprint: EffectFingerprint,
     reply: GuardianReply,
-    state: InputEffectState,
+    state: StoredEffectState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2169,6 +2901,7 @@ struct ReceiptCapacityPlan {
 }
 
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone, Eq, PartialEq))]
 pub struct GuardianProtocolState {
     incarnation: Uuid,
     panes: BTreeMap<Uuid, GuardianPaneState>,
@@ -2178,6 +2911,7 @@ pub struct GuardianProtocolState {
     requests: HashMap<Uuid, StoredRequest>,
     effects: HashMap<Uuid, StoredEffect>,
     effect_request_ids: HashMap<Uuid, HashSet<Uuid>>,
+    indeterminate_checkpoints_by_pane: HashMap<Uuid, Uuid>,
     // Original spawn identities are deliberately absent from these queues:
     // forgetting one could turn a delayed retry into a second child. Every
     // other effect is protected after eviction by its pane generation and
@@ -2201,6 +2935,7 @@ impl GuardianProtocolState {
             requests: HashMap::new(),
             effects: HashMap::new(),
             effect_request_ids: HashMap::new(),
+            indeterminate_checkpoints_by_pane: HashMap::new(),
             transient_request_order: VecDeque::new(),
             transient_effect_order: VecDeque::new(),
             protected_spawn_requests: HashSet::new(),
@@ -2238,16 +2973,16 @@ impl GuardianProtocolState {
     /// authenticated connection for `mux_incarnation` remains. The exact
     /// incarnation fence makes a delayed disconnect notification harmless
     /// after a successor has claimed the pane. A pane with an
-    /// `AcceptedNotDurable` input remains claimed and blocks takeover until the
-    /// journal resolves that effect; the caller invokes this method again after
-    /// reconciliation.
+    /// `AcceptedNotDurable` input or indeterminate checkpoint remains claimed
+    /// and blocks takeover until its exact identity is reconciled; the caller
+    /// invokes this method again afterward.
     pub fn retire_disconnected_mux_leases(
         &mut self,
         mux_incarnation: Uuid,
     ) -> Result<GuardianMuxLeaseRetirement, GuardianProtocolError> {
         require_nonzero(mux_incarnation, "mux incarnation")?;
         let mut result = GuardianMuxLeaseRetirement::default();
-        for state in self.panes.values_mut() {
+        for (pane_id, state) in &mut self.panes {
             let GuardianPaneState::LiveClaimed {
                 generation,
                 mux_incarnation: owner,
@@ -2262,6 +2997,13 @@ impl GuardianProtocolState {
             }
             if pending_input_effect.is_some() {
                 result.pending_input_panes += 1;
+                continue;
+            }
+            if self
+                .indeterminate_checkpoints_by_pane
+                .contains_key(pane_id)
+            {
+                result.indeterminate_checkpoint_panes += 1;
                 continue;
             }
             let generation = *generation;
@@ -2343,6 +3085,156 @@ impl GuardianProtocolState {
         }
     }
 
+    /// Journal, authorize, and reconcile one authenticated input write.
+    ///
+    /// For a new identity this method synchronizes `Intent` and then
+    /// `AcceptedNotDurable` inside the protocol's preflight callback. Only
+    /// after the protocol has committed that conservative receipt does the
+    /// supplied writer receive a non-cloneable permit. The writer must consume
+    /// the permit to return a full, exact-prefix, or known-zero completion.
+    /// Writer error or recovered panic is deliberately reduced to the retained
+    /// `AcceptedNotDurable` receipt: it can never roll the sequence back or
+    /// authorize replay. A terminal journal marker is synchronized before the
+    /// same identity-bound permit reconciles the protocol receipt.
+    ///
+    /// Exact request/effect retries return their retained receipt without
+    /// invoking `attempt_write`. A terminal journal record whose protocol
+    /// acknowledgement was lost is reconciled without issuing a new permit.
+    pub fn apply_input_transactionally<E>(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+        journal: &mut GuardianInputJournal,
+        attempt_write: impl FnOnce(
+            GuardianInputWritePermit,
+        ) -> Result<GuardianInputWriteCompletion, E>,
+    ) -> Result<GuardianReply, GuardianInputTransactionError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch.into());
+        }
+        if request.header.operation != GuardianOperation::Input {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            }
+            .into());
+        }
+        let identity = GuardianInputEffectIdentity::from_authenticated_request(request)?;
+        let retained_input_state = match self.effects.get(&identity.effect_id()) {
+            Some(stored) if stored.fingerprint.matches_input_identity(identity) => {
+                let StoredEffectState::Input(state) = stored.state else {
+                    return Err(GuardianProtocolError::StateInvariantViolation(
+                        "input-identity-retained-with-noninput-state",
+                    )
+                    .into());
+                };
+                Some(state)
+            }
+            _ => None,
+        };
+        if let Some(protocol_state) = retained_input_state {
+            let journal_disposition = journal.disposition_for_identity(identity)?;
+            let terminal = journal.terminal_protocol_permit(identity)?;
+            let terminal_state = terminal.as_ref().map(|permit| permit.protocol_state());
+            match (protocol_state, journal_disposition, terminal_state) {
+                (
+                    InputEffectState::AcceptedNotDurable,
+                    GuardianInputDisposition::AcceptedNotDurable,
+                    None,
+                ) => {}
+                (InputEffectState::AcceptedNotDurable, _, Some(_)) => {
+                    terminal
+                        .expect("terminal permit exists after read-only preflight")
+                        .reconcile_protocol(self)?;
+                }
+                (protocol_state, _, Some(journal_state)) if protocol_state == journal_state => {
+                    terminal
+                        .expect("terminal permit exists after read-only preflight")
+                        .reconcile_protocol(self)?;
+                }
+                _ => {
+                    return Err(GuardianProtocolError::StateInvariantViolation(
+                        "input-protocol-journal-disposition-mismatch",
+                    )
+                    .into());
+                }
+            }
+        }
+        let mut write_permit = None;
+        let accepted_or_replay = match self.apply_effect_transaction_inner(request, |_| {
+            journal.append_intent_and_sync(identity)?;
+            write_permit = journal
+                .append_acceptance_and_sync(identity)?
+                .into_first_pty_write_permit();
+            Ok::<(), GuardianInputJournalError>(())
+        }) {
+            Ok(reply) => reply,
+            Err(GuardianEffectTransactionError::Protocol(error)) => {
+                return Err(GuardianInputTransactionError::Protocol(error));
+            }
+            Err(GuardianEffectTransactionError::Effect(error)) => {
+                return Err(GuardianInputTransactionError::Journal(error));
+            }
+        };
+
+        if let Some(terminal) = journal.terminal_protocol_permit(identity)? {
+            return terminal.reconcile_protocol(self).map_err(Into::into);
+        }
+        let Some(write_permit) = write_permit else {
+            // Either the protocol returned an exact replay without invoking
+            // the admission callback, or recovery found an already accepted
+            // marker that must remain ambiguous. Neither path may write.
+            if !matches!(
+                accepted_or_replay,
+                GuardianReply::InputReceipt {
+                    state: InputEffectState::AcceptedNotDurable,
+                    ..
+                }
+            ) || journal.disposition_for_identity(identity)?
+                != GuardianInputDisposition::AcceptedNotDurable
+            {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "input-replay-without-matching-journal-disposition",
+                )
+                .into());
+            }
+            return Ok(accepted_or_replay);
+        };
+        if !matches!(
+            accepted_or_replay,
+            GuardianReply::InputReceipt {
+                state: InputEffectState::AcceptedNotDurable,
+                ..
+            }
+        ) {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "input-write-permit-without-accepted-receipt",
+            )
+            .into());
+        }
+
+        let completion = match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| attempt_write(write_permit)),
+        ) {
+            Ok(Ok(completion)) => completion,
+            Ok(Err(error)) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| drop(error)),
+                );
+                return Ok(accepted_or_replay);
+            }
+            Err(_) => return Ok(accepted_or_replay),
+        };
+        let terminal = journal
+            .append_write_completion_and_sync(completion)?
+            .into_terminal_protocol_permit()
+            .ok_or(GuardianProtocolError::StateInvariantViolation(
+                "input-write-completion-without-terminal-permit",
+            ))?;
+        terminal.reconcile_protocol(self).map_err(Into::into)
+    }
+
     /// Fence, execute, and commit one effect-producing request.
     ///
     /// The callback is invoked only for a new effect identity, after authentication,
@@ -2353,10 +3245,8 @@ impl GuardianProtocolState {
     /// and terminally quarantines the pane so wrapped authority can never be revived.
     ///
     /// A callback error MUST mean that the runtime effect was not externally observable.
-    /// In particular, an input write that may have written any bytes must return `Ok(())` so
-    /// the protocol records `AcceptedNotDurable`; the runtime must then reconcile that exact
-    /// effect through `mark_input_durable` or `mark_input_terminal_rejected`. Blindly treating
-    /// a partial/ambiguous input write as `Err` would make retry duplication possible.
+    /// Input is excluded from this generic surface because a partial write can
+    /// violate that contract; it must use [`Self::apply_input_transactionally`].
     pub fn apply_effect_transactionally<E>(
         &mut self,
         request: &AuthenticatedGuardianRequest,
@@ -2365,6 +3255,12 @@ impl GuardianProtocolState {
         validate_request_envelope(request)?;
         if request.header.guardian_incarnation != self.incarnation {
             return Err(GuardianProtocolError::GuardianIncarnationMismatch.into());
+        }
+        if request.header.operation == GuardianOperation::Checkpoint {
+            return Err(GuardianProtocolError::CheckpointRequiresTypedTransaction.into());
+        }
+        if request.header.operation == GuardianOperation::Input {
+            return Err(GuardianProtocolError::InputRequiresTypedTransaction.into());
         }
         if !request.header.operation.creates_effect() {
             return Err(GuardianProtocolError::InvalidOperationScope {
@@ -2375,13 +3271,533 @@ impl GuardianProtocolState {
         self.apply_effect_transaction_inner(request, perform_effect)
     }
 
+    /// Publish one checkpoint under a typed, exact, non-retryable lifecycle.
+    ///
+    /// The caller must complete every fallible step that can *prove* no
+    /// publication was attempted before entering this method. The callback is
+    /// the publication boundary: `Ok(())` means the exact checkpoint and output
+    /// boundary are durably committed. Any returned error or recovered panic is
+    /// conservatively recorded as `OutcomeIndeterminate`; its value is disposed
+    /// inside the audited recoverable-panic boundary and never reaches Debug,
+    /// Display, or the wire. Exact request/effect replays return the retained
+    /// receipt without invoking the callback. A different mutation cannot pass
+    /// the pane fence while an indeterminate publication awaits reconciliation.
+    // Intentionally private until a guardian-service dispatcher owns the
+    // durable publisher and exposes a deliberately typed integration seam.
+    #[allow(dead_code)]
+    fn apply_checkpoint_transactionally<E>(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+        publish: impl FnOnce(&GuardianCheckpointPending) -> Result<(), E>,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+        }
+        if request.header.operation != GuardianOperation::Checkpoint {
+            return Err(GuardianProtocolError::CheckpointRequiresTypedTransaction);
+        }
+
+        let identity = GuardianCheckpointEffectIdentity::from_authenticated_request(request)?;
+        let fingerprint = EffectFingerprint {
+            operation: GuardianOperation::Checkpoint,
+            pane_id: identity.pane_id,
+            mux_incarnation: identity.mux_incarnation,
+            lease_generation: identity.generation,
+            lease_sequence: identity.sequence,
+            payload_bytes: u32::try_from(request.payload.len())
+                .map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
+            payload_sha256: request.header.payload_sha256,
+        };
+
+        if let Some(stored) = self.requests.get(&identity.request_id) {
+            if stored.fingerprint == fingerprint && stored.effect_id == identity.effect_id {
+                return Self::checkpoint_receipt_from_reply(&stored.reply);
+            }
+            return Err(GuardianProtocolError::RequestIdentityConflict);
+        }
+        if let Some(stored) = self.effects.get(&identity.effect_id) {
+            if stored.fingerprint != fingerprint {
+                return Err(GuardianProtocolError::EffectIdentityConflict);
+            }
+            let receipt = Self::checkpoint_receipt_from_reply(&stored.reply)?;
+            let disposition_is_pending = stored.state.is_pending();
+            if !matches!(stored.state, StoredEffectState::Checkpoint { .. }) {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-effect-state-kind",
+                ));
+            }
+            if disposition_is_pending
+                && self
+                    .effect_request_ids
+                    .get(&identity.effect_id)
+                    .map_or(0, HashSet::len)
+                    >= GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT
+            {
+                return Err(GuardianProtocolError::RequestAliasCapacityExhausted {
+                    effect_id: identity.effect_id,
+                    max_aliases: GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT,
+                });
+            }
+            let capacity = self.plan_receipt_capacity(true, false)?;
+            self.requests
+                .try_reserve(1)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+            self.effect_request_ids
+                .get_mut(&identity.effect_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-effect-request-alias-set",
+                ))?
+                .try_reserve(1)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+            if !disposition_is_pending {
+                self.transient_request_order
+                    .try_reserve(1)
+                    .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+            }
+            self.commit_receipt_capacity(capacity);
+            self.requests.insert(
+                identity.request_id,
+                StoredRequest {
+                    fingerprint,
+                    effect_id: identity.effect_id,
+                    reply: GuardianReply::CheckpointReceipt(receipt),
+                },
+            );
+            self.effect_request_ids
+                .get_mut(&identity.effect_id)
+                .expect("checkpoint alias set exists after capacity preflight")
+                .insert(identity.request_id);
+            if !disposition_is_pending {
+                self.transient_request_order.push_back(identity.request_id);
+            }
+            return Ok(receipt);
+        }
+
+        let (sequence, next_pane_state) = self.plan_exact_sequence(identity.pane_id, request)?;
+        if sequence != identity.sequence {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-planned-sequence-identity",
+            ));
+        }
+        let capacity = self.plan_receipt_capacity(true, true)?;
+        self.requests
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.effects
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.effect_request_ids
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.indeterminate_checkpoints_by_pane
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.transient_request_order
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.transient_effect_order
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        let mut request_ids = HashSet::new();
+        request_ids
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        request_ids.insert(identity.request_id);
+
+        let pending = GuardianCheckpointPending { identity };
+        let publication = catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| publish(&pending)),
+        );
+        let disposition = match publication {
+            Ok(Ok(())) => GuardianCheckpointDisposition::Committed,
+            Ok(Err(error)) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| drop(error)),
+                );
+                GuardianCheckpointDisposition::OutcomeIndeterminate
+            }
+            Err(_) => GuardianCheckpointDisposition::OutcomeIndeterminate,
+        };
+        let receipt = GuardianCheckpointReceipt::from_identity(identity, disposition);
+        let reply = GuardianReply::CheckpointReceipt(receipt);
+
+        // Every allocation was reserved before publication. From this point
+        // forward, the exact receipt and sequence fence are installed without
+        // a retryable branch.
+        self.commit_receipt_capacity(capacity);
+        self.panes.insert(identity.pane_id, next_pane_state);
+        self.effects.insert(
+            identity.effect_id,
+            StoredEffect {
+                fingerprint: fingerprint.clone(),
+                reply: reply.clone(),
+                state: StoredEffectState::Checkpoint {
+                    disposition,
+                    identity,
+                },
+            },
+        );
+        self.requests.insert(
+            identity.request_id,
+            StoredRequest {
+                fingerprint,
+                effect_id: identity.effect_id,
+                reply,
+            },
+        );
+        self.effect_request_ids
+            .insert(identity.effect_id, request_ids);
+        if disposition == GuardianCheckpointDisposition::Committed {
+            self.transient_request_order.push_back(identity.request_id);
+            self.transient_effect_order.push_back(identity.effect_id);
+        } else {
+            self.indeterminate_checkpoints_by_pane
+                .insert(identity.pane_id, identity.effect_id);
+        }
+        Ok(receipt)
+    }
+
+    /// Reconcile a previously indeterminate publication as durably committed.
+    /// The exact originating request nonce, effect nonce, generation, sequence,
+    /// checkpoint digest, and output-boundary digest must all match.
+    #[allow(dead_code)]
+    fn mark_checkpoint_committed(
+        &mut self,
+        identity: GuardianCheckpointEffectIdentity,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
+        let stored = self
+            .effects
+            .get(&identity.effect_id)
+            .ok_or(GuardianProtocolError::CheckpointIdentityMismatch)?;
+        let StoredEffectState::Checkpoint {
+            disposition,
+            identity: stored_identity,
+        } = stored.state
+        else {
+            return Err(GuardianProtocolError::CheckpointIdentityMismatch);
+        };
+        if stored_identity != identity {
+            return Err(GuardianProtocolError::CheckpointIdentityMismatch);
+        }
+        if disposition == GuardianCheckpointDisposition::Committed {
+            let receipt = Self::checkpoint_receipt_from_reply(&stored.reply)?;
+            if receipt.disposition == GuardianCheckpointDisposition::Committed
+                && receipt.matches_identity(identity)
+                && !self
+                    .indeterminate_checkpoints_by_pane
+                    .contains_key(&identity.pane_id)
+            {
+                return Ok(receipt);
+            }
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-committed-state",
+            ));
+        }
+        if self
+            .indeterminate_checkpoints_by_pane
+            .get(&identity.pane_id)
+            .copied()
+            != Some(identity.effect_id)
+        {
+            return Err(GuardianProtocolError::CheckpointIdentityMismatch);
+        }
+        let expected_next_sequence = identity
+            .sequence
+            .checked_add(1)
+            .ok_or(GuardianProtocolError::CheckpointIdentityMismatch)?;
+        let pane_fence_matches = match self.panes.get(&identity.pane_id) {
+            Some(GuardianPaneState::LiveClaimed {
+                generation,
+                mux_incarnation,
+                next_sequence,
+                pending_input_effect,
+            }) => {
+                *generation == identity.generation
+                    && *mux_incarnation == identity.mux_incarnation
+                    && *next_sequence == expected_next_sequence
+                    && pending_input_effect.is_none()
+            }
+            Some(GuardianPaneState::ExitedUnclaimed {
+                generation,
+                pending_input_effect,
+                ..
+            }) => *generation == identity.generation && pending_input_effect.is_none(),
+            _ => false,
+        };
+        if !pane_fence_matches {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-pane-fence",
+            ));
+        }
+
+        let pending_reply = stored.reply.clone();
+        let pending_receipt = Self::checkpoint_receipt_from_reply(&pending_reply)?;
+        if pending_receipt.disposition
+            != GuardianCheckpointDisposition::OutcomeIndeterminate
+            || !pending_receipt.matches_identity(identity)
+        {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-pending-reply",
+            ));
+        }
+        let fingerprint = stored.fingerprint.clone();
+        let request_id_set = self
+            .effect_request_ids
+            .get(&identity.effect_id)
+            .ok_or(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-reverse-index",
+            ))?;
+        if request_id_set.is_empty() {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-empty-reverse-index",
+            ));
+        }
+        if self.requests.iter().any(|(request_id, request)| {
+            request.effect_id == identity.effect_id && !request_id_set.contains(request_id)
+        }) {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-incomplete-reverse-index",
+            ));
+        }
+        let mut request_ids = Vec::new();
+        request_ids
+            .try_reserve(request_id_set.len())
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        request_ids.extend(request_id_set.iter().copied());
+        request_ids.sort_unstable();
+        for request_id in &request_ids {
+            let request = self.requests.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-reconciliation-request-alias",
+                ),
+            )?;
+            if request.effect_id != identity.effect_id
+                || request.fingerprint != fingerprint
+                || request.reply != pending_reply
+            {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-reconciliation-request-identity",
+                ));
+            }
+        }
+        if self.transient_effect_order.contains(&identity.effect_id)
+            || request_ids
+                .iter()
+                .any(|request_id| self.transient_request_order.contains(request_id))
+        {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-pending-fifo",
+            ));
+        }
+        self.transient_request_order
+            .try_reserve(request_ids.len())
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.transient_effect_order
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+
+        let receipt = GuardianCheckpointReceipt::from_identity(
+            identity,
+            GuardianCheckpointDisposition::Committed,
+        );
+        let reply = GuardianReply::CheckpointReceipt(receipt);
+        let stored = self
+            .effects
+            .get_mut(&identity.effect_id)
+            .expect("checkpoint effect exists after reconciliation preflight");
+        stored.reply = reply.clone();
+        stored.state = StoredEffectState::Checkpoint {
+            disposition: GuardianCheckpointDisposition::Committed,
+            identity,
+        };
+        for request_id in &request_ids {
+            let request = self
+                .requests
+                .get_mut(request_id)
+                .expect("checkpoint request alias exists after reconciliation preflight");
+            request.reply = reply.clone();
+        }
+        let removed_barrier = self
+            .indeterminate_checkpoints_by_pane
+            .remove(&identity.pane_id);
+        debug_assert_eq!(removed_barrier, Some(identity.effect_id));
+        self.transient_request_order.extend(request_ids);
+        self.transient_effect_order.push_back(identity.effect_id);
+        Ok(receipt)
+    }
+
+    /// Reconcile an indeterminate attempt only after the publication owner has
+    /// proved that the exact artifact was definitely not published. The
+    /// consumed sequence is rolled back only while the exact original claimed
+    /// lease remains otherwise untouched; terminal panes stay terminal.
+    #[allow(dead_code)]
+    fn mark_checkpoint_definitely_not_published(
+        &mut self,
+        identity: GuardianCheckpointEffectIdentity,
+    ) -> Result<(), GuardianProtocolError> {
+        let stored = self
+            .effects
+            .get(&identity.effect_id)
+            .ok_or(GuardianProtocolError::CheckpointIdentityMismatch)?;
+        if !matches!(
+            stored.state,
+            StoredEffectState::Checkpoint {
+                disposition: GuardianCheckpointDisposition::OutcomeIndeterminate,
+                identity: stored_identity,
+            } if stored_identity == identity
+        ) || self
+            .indeterminate_checkpoints_by_pane
+            .get(&identity.pane_id)
+            .copied()
+            != Some(identity.effect_id)
+        {
+            return Err(GuardianProtocolError::CheckpointIdentityMismatch);
+        }
+
+        let pending_reply = stored.reply.clone();
+        let pending_receipt = Self::checkpoint_receipt_from_reply(&pending_reply)?;
+        if pending_receipt.disposition
+            != GuardianCheckpointDisposition::OutcomeIndeterminate
+            || !pending_receipt.matches_identity(identity)
+        {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-definite-not-published-pending-reply",
+            ));
+        }
+        let fingerprint = stored.fingerprint.clone();
+        let expected_next_sequence = identity
+            .sequence
+            .checked_add(1)
+            .ok_or(GuardianProtocolError::CheckpointIdentityMismatch)?;
+        let rollback_live_sequence = match self.panes.get(&identity.pane_id) {
+            Some(GuardianPaneState::LiveClaimed {
+                generation,
+                mux_incarnation,
+                next_sequence,
+                pending_input_effect,
+            }) if *generation == identity.generation
+                && *mux_incarnation == identity.mux_incarnation
+                && *next_sequence == expected_next_sequence
+                && pending_input_effect.is_none() =>
+            {
+                true
+            }
+            Some(GuardianPaneState::ExitedUnclaimed {
+                generation,
+                pending_input_effect,
+                ..
+            }) if *generation == identity.generation && pending_input_effect.is_none() => false,
+            _ => return Err(GuardianProtocolError::CheckpointIdentityMismatch),
+        };
+
+        let request_ids = self
+            .effect_request_ids
+            .get(&identity.effect_id)
+            .ok_or(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-definite-not-published-reverse-index",
+            ))?;
+        if request_ids.is_empty() {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-definite-not-published-empty-reverse-index",
+            ));
+        }
+        if self.requests.iter().any(|(request_id, request)| {
+            request.effect_id == identity.effect_id && !request_ids.contains(request_id)
+        }) {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-definite-not-published-incomplete-reverse-index",
+            ));
+        }
+        for request_id in request_ids {
+            let request = self.requests.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-definite-not-published-request-alias",
+                ),
+            )?;
+            if request.effect_id != identity.effect_id
+                || request.fingerprint != fingerprint
+                || request.reply != pending_reply
+            {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-definite-not-published-request-identity",
+                ));
+            }
+        }
+        if self.transient_effect_order.contains(&identity.effect_id)
+            || request_ids
+                .iter()
+                .any(|request_id| self.transient_request_order.contains(request_id))
+        {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-definite-not-published-pending-fifo",
+            ));
+        }
+
+        if rollback_live_sequence {
+            let GuardianPaneState::LiveClaimed { next_sequence, .. } = self
+                .panes
+                .get_mut(&identity.pane_id)
+                .expect("checkpoint pane exists after definite-failure preflight")
+            else {
+                unreachable!("checkpoint pane shape was checked before definite-failure rollback");
+            };
+            *next_sequence = identity.sequence;
+        }
+        let request_ids = self
+            .effect_request_ids
+            .remove(&identity.effect_id)
+            .expect("checkpoint reverse index exists after definite-failure preflight");
+        for request_id in request_ids {
+            let removed = self.requests.remove(&request_id);
+            debug_assert!(removed.is_some());
+        }
+        let removed_effect = self.effects.remove(&identity.effect_id);
+        debug_assert!(removed_effect.is_some());
+        let removed_barrier = self
+            .indeterminate_checkpoints_by_pane
+            .remove(&identity.pane_id);
+        debug_assert_eq!(removed_barrier, Some(identity.effect_id));
+        Ok(())
+    }
+
+    fn checkpoint_receipt_from_reply(
+        reply: &GuardianReply,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
+        let GuardianReply::CheckpointReceipt(receipt) = reply else {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-stored-reply-kind",
+            ));
+        };
+        Ok(*receipt)
+    }
+
     #[cfg(test)]
     fn apply(
         &mut self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        if request.header.operation.creates_effect() {
-            match self.apply_effect_transactionally(request, |_| Ok::<(), std::convert::Infallible>(()))) {
+        if request.header.operation == GuardianOperation::Checkpoint {
+            self.apply_checkpoint_transactionally(request, |_| Ok::<(), std::convert::Infallible>(()))
+                .map(GuardianReply::CheckpointReceipt)
+        } else if request.header.operation == GuardianOperation::Input {
+            // Pure protocol fixtures deliberately bypass the descriptor-backed
+            // journal. Production callers cannot: the public generic effect
+            // surface rejects Input and the typed input transaction owns the
+            // only write permit.
+            match self.apply_effect_transaction_inner(request, |_| {
+                Ok::<(), std::convert::Infallible>(())
+            }) {
+                Ok(reply) => Ok(reply),
+                Err(GuardianEffectTransactionError::Protocol(error)) => Err(error),
+                Err(GuardianEffectTransactionError::Effect(never)) => match never {},
+            }
+        } else if request.header.operation.creates_effect() {
+            match self.apply_effect_transactionally(request, |_| {
+                Ok::<(), std::convert::Infallible>(())
+            }) {
                 Ok(reply) => Ok(reply),
                 Err(GuardianEffectTransactionError::Protocol(error)) => Err(error),
                 Err(GuardianEffectTransactionError::Effect(never)) => match never {},
@@ -2391,18 +3807,32 @@ impl GuardianProtocolState {
         }
     }
 
-    pub fn mark_input_durable(
+    // Production completion flows through the opaque terminal permit so the
+    // durable disposition/count is supplied exactly once. Tests in this
+    // module can still mutation-check these private state-machine primitives.
+    fn mark_input_durable_full(
         &mut self,
         identity: GuardianInputEffectIdentity,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        self.transition_pending_input(identity, InputEffectState::DurableEffect)
+        self.transition_pending_input(identity, InputEffectState::DurableFull)
     }
 
-    pub fn mark_input_terminal_rejected(
+    fn mark_input_durable_prefix(
+        &mut self,
+        identity: GuardianInputEffectIdentity,
+        applied_bytes: u32,
+    ) -> Result<GuardianReply, GuardianProtocolError> {
+        self.transition_pending_input(
+            identity,
+            InputEffectState::DurablePrefix { applied_bytes },
+        )
+    }
+
+    fn mark_input_known_not_applied(
         &mut self,
         identity: GuardianInputEffectIdentity,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        self.transition_pending_input(identity, InputEffectState::TerminalRejected)
+        self.transition_pending_input(identity, InputEffectState::KnownNotApplied)
     }
 
     fn census(
@@ -2424,7 +3854,15 @@ impl GuardianProtocolState {
             let entries = self
                 .panes
                 .iter()
-                .map(|(pane_id, state)| GuardianCensusEntry::from_state(*pane_id, state))
+                .map(|(pane_id, state)| {
+                    GuardianCensusEntry::from_state(
+                        *pane_id,
+                        state,
+                        self.indeterminate_checkpoints_by_pane
+                            .get(pane_id)
+                            .copied(),
+                    )
+                })
                 .collect::<Vec<_>>();
             while self.census_snapshots.len() >= GUARDIAN_MAX_CENSUS_SNAPSHOTS {
                 let retired = self
@@ -2508,10 +3946,13 @@ impl GuardianProtocolState {
     ) -> Result<GuardianReply, GuardianProtocolError> {
         if !matches!(
             target,
-            InputEffectState::DurableEffect | InputEffectState::TerminalRejected
+            InputEffectState::DurableFull
+                | InputEffectState::DurablePrefix { .. }
+                | InputEffectState::KnownNotApplied
         ) {
             return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
         }
+        target.validate_for_input_bytes(identity.input_bytes)?;
         let effect_id = identity.effect_id;
         let stored = self
             .effects
@@ -2522,45 +3963,129 @@ impl GuardianProtocolState {
             || stored.fingerprint.mux_incarnation != identity.mux_incarnation
             || stored.fingerprint.lease_generation != identity.generation
             || stored.fingerprint.lease_sequence != identity.sequence
+            || stored.fingerprint.payload_bytes != identity.input_bytes
             || stored.fingerprint.payload_sha256 != identity.payload_sha256
         {
             return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
         }
-        if stored.state == target {
-            return Ok(stored.reply.clone());
+        if stored.state == StoredEffectState::Input(target) {
+            let reply = GuardianReply::InputReceipt {
+                pane_id: identity.pane_id,
+                generation: identity.generation,
+                sequence: identity.sequence,
+                effect_id,
+                state: target,
+            };
+            if stored.reply == reply {
+                return Ok(reply);
+            }
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-terminal-reply",
+            ));
         }
-        if stored.state != InputEffectState::AcceptedNotDurable {
+        if stored.state != StoredEffectState::Input(InputEffectState::AcceptedNotDurable) {
             return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
         }
         let pane_id = stored.fingerprint.pane_id;
         let generation = stored.fingerprint.lease_generation;
         let sequence = stored.fingerprint.lease_sequence;
-        let pending = match self.panes.get(&pane_id) {
-            Some(GuardianPaneState::LiveClaimed {
-                pending_input_effect,
-                ..
-            })
-            | Some(GuardianPaneState::ExitedUnclaimed {
-                pending_input_effect,
-                ..
-            }) => *pending_input_effect,
-            _ => None,
+        let fingerprint = stored.fingerprint.clone();
+        let pending_reply = GuardianReply::InputReceipt {
+            pane_id,
+            generation,
+            sequence,
+            effect_id,
+            state: InputEffectState::AcceptedNotDurable,
         };
-        if pending != Some(effect_id) {
-            return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
+        if stored.reply != pending_reply {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-pending-reply",
+            ));
+        }
+        let expected_next_sequence = sequence.checked_add(1).ok_or(
+            GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-sequence-fence",
+            ),
+        )?;
+        let pane_fence_matches = match self.panes.get(&pane_id) {
+            Some(GuardianPaneState::LiveClaimed {
+                generation: pane_generation,
+                mux_incarnation,
+                next_sequence,
+                pending_input_effect,
+            }) => {
+                *pane_generation == generation
+                    && *mux_incarnation == identity.mux_incarnation
+                    && *next_sequence == expected_next_sequence
+                    && *pending_input_effect == Some(effect_id)
+            }
+            Some(GuardianPaneState::ExitedUnclaimed {
+                generation: pane_generation,
+                pending_input_effect,
+                ..
+            }) => *pane_generation == generation && *pending_input_effect == Some(effect_id),
+            _ => false,
+        };
+        if !pane_fence_matches {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-pane-fence",
+            ));
         }
 
-        match self.panes.get_mut(&pane_id) {
-            Some(GuardianPaneState::LiveClaimed {
-                pending_input_effect,
-                ..
-            })
-            | Some(GuardianPaneState::ExitedUnclaimed {
-                pending_input_effect,
-                ..
-            }) => *pending_input_effect = None,
-            _ => return Err(GuardianProtocolError::InputDurabilityIdentityMismatch),
+        let request_id_set = self.effect_request_ids.get(&effect_id).ok_or(
+            GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-reverse-index",
+            ),
+        )?;
+        if request_id_set.is_empty() {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-empty-reverse-index",
+            ));
         }
+        if self.requests.iter().any(|(request_id, request)| {
+            request.effect_id == effect_id && !request_id_set.contains(request_id)
+        }) {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-incomplete-reverse-index",
+            ));
+        }
+        let mut request_ids = Vec::new();
+        request_ids
+            .try_reserve(request_id_set.len())
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        request_ids.extend(request_id_set.iter().copied());
+        request_ids.sort_unstable();
+        for request_id in &request_ids {
+            let request = self.requests.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
+                    "input-reconciliation-request-alias",
+                ),
+            )?;
+            if request.effect_id != effect_id
+                || request.fingerprint != fingerprint
+                || request.reply != pending_reply
+            {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "input-reconciliation-request-identity",
+                ));
+            }
+        }
+        if self.transient_effect_order.contains(&effect_id)
+            || request_ids
+                .iter()
+                .any(|request_id| self.transient_request_order.contains(request_id))
+        {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-pending-fifo",
+            ));
+        }
+        self.transient_request_order
+            .try_reserve(request_ids.len())
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.transient_effect_order
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+
         let reply = GuardianReply::InputReceipt {
             pane_id,
             generation,
@@ -2568,22 +4093,32 @@ impl GuardianProtocolState {
             effect_id,
             state: target,
         };
+        match self
+            .panes
+            .get_mut(&pane_id)
+            .expect("input pane exists after reconciliation preflight")
+        {
+            GuardianPaneState::LiveClaimed {
+                pending_input_effect,
+                ..
+            }
+            | GuardianPaneState::ExitedUnclaimed {
+                pending_input_effect,
+                ..
+            } => *pending_input_effect = None,
+            _ => unreachable!("input pane shape was checked before reconciliation"),
+        }
         let stored = self
             .effects
             .get_mut(&effect_id)
-            .ok_or(GuardianProtocolError::InputDurabilityIdentityMismatch)?;
-        stored.state = target;
+            .expect("input effect exists after reconciliation preflight");
+        stored.state = StoredEffectState::Input(target);
         stored.reply = reply.clone();
-        let mut request_ids = self
-            .effect_request_ids
-            .get(&effect_id)
-            .map(|request_ids| request_ids.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
-        request_ids.sort_unstable();
         for request_id in &request_ids {
-            let Some(request) = self.requests.get_mut(request_id) else {
-                continue;
-            };
+            let request = self
+                .requests
+                .get_mut(request_id)
+                .expect("input request alias exists after reconciliation preflight");
             request.reply = reply.clone();
         }
         // Pending input identities are deliberately not evictable. Once the
@@ -2681,11 +4216,17 @@ impl GuardianProtocolState {
             Some(stored)
                 if stored.fingerprint.pane_id == pane_id
                     && stored.fingerprint.operation == GuardianOperation::Input
+                    && stored.fingerprint.mux_incarnation == request.header.mux_incarnation
                     && stored.fingerprint.lease_generation == request.header.lease_generation
                     && stored.fingerprint.lease_sequence == query.sequence
+                    && stored.fingerprint.payload_bytes == query.input_bytes
                     && stored.fingerprint.payload_sha256 == query.payload_sha256 =>
             {
-                stored.state
+                let StoredEffectState::Input(state) = stored.state else {
+                    return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
+                };
+                state.validate_for_input_bytes(query.input_bytes)?;
+                state
             }
             Some(_) => {
                 return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
@@ -2770,6 +4311,8 @@ impl GuardianProtocolState {
             mux_incarnation: request.header.mux_incarnation,
             lease_generation: request.header.lease_generation,
             lease_sequence: request.header.lease_sequence,
+            payload_bytes: u32::try_from(request.payload.len())
+                .map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
             payload_sha256: request.header.payload_sha256,
         };
 
@@ -2782,9 +4325,7 @@ impl GuardianProtocolState {
         if let Some(stored) = self.effects.get(&effect_id) {
             if stored.fingerprint == fingerprint {
                 let reply = stored.reply.clone();
-                let disposition_is_pending = stored.fingerprint.operation
-                    == GuardianOperation::Input
-                    && stored.state == InputEffectState::AcceptedNotDurable;
+                let disposition_is_pending = stored.state.is_pending();
                 if disposition_is_pending
                     && self
                         .effect_request_ids
@@ -2837,9 +4378,9 @@ impl GuardianProtocolState {
                 fingerprint: fingerprint.clone(),
                 reply: reply.clone(),
                 state: if request.header.operation == GuardianOperation::Input {
-                    InputEffectState::AcceptedNotDurable
+                    StoredEffectState::Input(InputEffectState::AcceptedNotDurable)
                 } else {
-                    InputEffectState::DurableEffect
+                    StoredEffectState::Applied
                 },
             },
         );
@@ -2919,6 +4460,12 @@ impl GuardianProtocolState {
                 ) {
                     return Err(GuardianProtocolError::InputDurabilityPending);
                 }
+                if self
+                    .indeterminate_checkpoints_by_pane
+                    .contains_key(&pane_id)
+                {
+                    return Err(GuardianProtocolError::CheckpointOutcomeIndeterminate);
+                }
                 let Some(generation) = current.checked_add(1) else {
                     self.panes.insert(
                         pane_id,
@@ -2980,8 +4527,7 @@ impl GuardianProtocolState {
                 ))
             }
             GuardianOperation::Resize
-            | GuardianOperation::Signal
-            | GuardianOperation::Checkpoint => {
+            | GuardianOperation::Signal => {
                 let (sequence, next_state) = self.plan_exact_sequence(pane_id, request)?;
                 Ok((
                     GuardianReply::MutationApplied {
@@ -2993,6 +4539,12 @@ impl GuardianProtocolState {
                 ))
             }
             GuardianOperation::Close => {
+                if self
+                    .indeterminate_checkpoints_by_pane
+                    .contains_key(&pane_id)
+                {
+                    return Err(GuardianProtocolError::CheckpointOutcomeIndeterminate);
+                }
                 if let Some(GuardianPaneState::ExitedUnclaimed {
                     generation,
                     exit_status,
@@ -3058,6 +4610,12 @@ impl GuardianProtocolState {
             }
         ) {
             return Err(GuardianProtocolError::InputDurabilityPending);
+        }
+        if self
+            .indeterminate_checkpoints_by_pane
+            .contains_key(&pane_id)
+        {
+            return Err(GuardianProtocolError::CheckpointOutcomeIndeterminate);
         }
         if request.header.lease_sequence < expected {
             return Err(GuardianProtocolError::RepeatedSequence {
@@ -3475,8 +5033,14 @@ fn validate_response_envelope(
         header.lease_generation,
         header.lease_sequence,
     )?;
-    if header.status == GuardianResponseStatus::Success {
+    if matches!(
+        header.status,
+        GuardianResponseStatus::Success | GuardianResponseStatus::Indeterminate
+    ) {
         let reply = GuardianReply::decode_for_operation(header.operation, &response.payload)?;
+        if reply.response_status() != header.status {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
         reply.require_response_identity(header)?;
     } else {
         GuardianRejectionCode::decode(header.status, &response.payload)?;
@@ -3580,11 +5144,13 @@ fn validate_request_envelope(
         GuardianOperation::QueryInputEffect => {
             GuardianInputEffectQuery::decode(&request.payload)?;
         }
+        GuardianOperation::Checkpoint => {
+            GuardianCheckpointIntent::decode(&request.payload)?;
+        }
         GuardianOperation::Hello
         | GuardianOperation::Claim
         | GuardianOperation::Attach
         | GuardianOperation::Close
-        | GuardianOperation::Checkpoint
         | GuardianOperation::Replay
         | GuardianOperation::RetireLease
             if !request.payload.is_empty() =>
@@ -3761,10 +5327,45 @@ mod tests {
         assert_eq!(request.header.operation, GuardianOperation::Input);
         GuardianInputEffectQuery::new(
             request.header.lease_sequence,
+            u32::try_from(request.payload.len()).expect("fixture input length fits u32"),
             request.header.payload_sha256,
         )
         .expect("test input request carries a nonzero mutation sequence")
         .encode()
+    }
+
+    #[cfg(unix)]
+    fn input_journal_fixture(
+        pane_id: Uuid,
+        key_byte: u8,
+    ) -> (tempfile::TempDir, GuardianInputJournal) {
+        use crate::guardian_input_journal::GuardianInputJournalLimits;
+        use crate::guardian_output_journal::GuardianOutputCipher;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let temp = tempfile::tempdir().expect("create input journal tempdir");
+        let path = temp.path().join("input.journal");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create private input journal");
+        let mut journal = GuardianInputJournal::open(
+            file,
+            pane_id,
+            GuardianOutputCipher::try_from_key_slice(&[key_byte; 32])
+                .expect("valid fixture journal key"),
+            GuardianInputJournalLimits::default(),
+        )
+        .expect("initialize input journal");
+        journal
+            .sync_parent_directory_and_activate(
+                &std::fs::File::open(temp.path()).expect("open journal parent"),
+            )
+            .expect("activate input journal");
+        (temp, journal)
     }
 
     fn pty_size(rows: u16, cols: u16) -> PtySize {
@@ -3823,6 +5424,48 @@ mod tests {
         )
     }
 
+    fn checkpoint_intent(
+        checkpoint_byte: u8,
+        output_boundary_byte: u8,
+    ) -> GuardianCheckpointIntent {
+        GuardianCheckpointIntent::new(
+            GuardianCheckpointIdentityDigest::from_bytes([checkpoint_byte; 32]).unwrap(),
+            GuardianOutputBoundaryIdentityDigest::from_bytes([output_boundary_byte; 32]).unwrap(),
+        )
+    }
+
+    fn checkpoint_request(
+        guardian: Uuid,
+        mux: Uuid,
+        pane: Uuid,
+        generation: u64,
+        sequence: u64,
+        request_byte: u8,
+        effect_byte: u8,
+        checkpoint_byte: u8,
+        output_boundary_byte: u8,
+    ) -> GuardianRequestEnvelope {
+        let intent = checkpoint_intent(checkpoint_byte, output_boundary_byte).encode();
+        request(
+            GuardianOperation::Checkpoint,
+            guardian,
+            mux,
+            id(request_byte),
+            Some(pane),
+            generation,
+            sequence,
+            Some(id(effect_byte)),
+            &intent,
+        )
+    }
+
+    fn checkpoint_effect_identity(
+        request: &GuardianRequestEnvelope,
+    ) -> GuardianCheckpointEffectIdentity {
+        GuardianCheckpointEffectIdentity::from_authenticated_request(&authenticate(request))
+            .expect("test checkpoint carries an exact authenticated publication identity")
+    }
+
     #[test]
     fn effect_payloads_are_typed_bounded_and_content_free_in_debug() {
         let mut command = CommandBuilder::new("fixture-program");
@@ -3870,7 +5513,7 @@ mod tests {
             Err(GuardianProtocolError::InvalidOperationPayload)
         );
 
-        let query = GuardianInputEffectQuery::new(7, [0x3c; 32]).unwrap();
+        let query = GuardianInputEffectQuery::new(7, 19, [0x3c; 32]).unwrap();
         assert!(
             !format!("{query:?}").contains(&format!("{:?}", [0x3c; 32])),
             "query diagnostics must not expose a dictionary-testable input digest"
@@ -3880,7 +5523,11 @@ mod tests {
             query
         );
         assert_eq!(
-            GuardianInputEffectQuery::new(0, [0x3c; 32]),
+            GuardianInputEffectQuery::new(0, 19, [0x3c; 32]),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        assert_eq!(
+            GuardianInputEffectQuery::new(7, 0, [0x3c; 32]),
             Err(GuardianProtocolError::InvalidOperationPayload)
         );
         let mut query_with_trailing_bytes = query.encode().to_vec();
@@ -3902,6 +5549,95 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_intent_is_versioned_fixed_width_canonical_and_content_free() {
+        let checkpoint_bytes = [0x41; 32];
+        let output_boundary_bytes = [0x52; 32];
+        let intent = GuardianCheckpointIntent::new(
+            GuardianCheckpointIdentityDigest::from_bytes(checkpoint_bytes).unwrap(),
+            GuardianOutputBoundaryIdentityDigest::from_bytes(output_boundary_bytes).unwrap(),
+        );
+        let encoded = intent.encode();
+        assert_eq!(encoded.len(), GUARDIAN_CHECKPOINT_INTENT_BYTES);
+        assert_eq!(&encoded[..4], CHECKPOINT_INTENT_PAYLOAD_MAGIC.as_slice());
+        assert_eq!(read_u16(&encoded, 4).unwrap(), GUARDIAN_CHECKPOINT_INTENT_VERSION);
+        assert_eq!(&encoded[6..8], &[0, 0]);
+        assert_eq!(GuardianCheckpointIntent::decode(&encoded).unwrap(), intent);
+
+        let checkpoint_debug = format!("{checkpoint_bytes:?}");
+        let output_boundary_debug = format!("{output_boundary_bytes:?}");
+        for diagnostic in [
+            format!("{:?}", intent.checkpoint_identity()),
+            format!("{:?}", intent.output_boundary_identity()),
+            format!("{intent:?}"),
+        ] {
+            assert!(!diagnostic.contains(&checkpoint_debug));
+            assert!(!diagnostic.contains(&output_boundary_debug));
+        }
+        assert_eq!(intent.checkpoint_identity().into_bytes(), checkpoint_bytes);
+        assert_eq!(
+            intent.output_boundary_identity().into_bytes(),
+            output_boundary_bytes
+        );
+
+        let mut noncanonical_reserved = encoded;
+        noncanonical_reserved[7] = 1;
+        assert_eq!(
+            GuardianCheckpointIntent::decode(&noncanonical_reserved),
+            Err(GuardianProtocolError::InvalidCheckpointIntent)
+        );
+        let mut unsupported_intent_version = encoded;
+        unsupported_intent_version[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            GuardianCheckpointIntent::decode(&unsupported_intent_version),
+            Err(GuardianProtocolError::InvalidCheckpointIntent)
+        );
+        let mut absent_checkpoint_identity = encoded;
+        absent_checkpoint_identity[8..40].fill(0);
+        assert_eq!(
+            GuardianCheckpointIntent::decode(&absent_checkpoint_identity),
+            Err(GuardianProtocolError::InvalidCheckpointIntent)
+        );
+        let mut absent_output_boundary_identity = encoded;
+        absent_output_boundary_identity[40..72].fill(0);
+        assert_eq!(
+            GuardianCheckpointIntent::decode(&absent_output_boundary_identity),
+            Err(GuardianProtocolError::InvalidCheckpointIntent)
+        );
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            GuardianCheckpointIntent::decode(&trailing),
+            Err(GuardianProtocolError::InvalidCheckpointIntent)
+        );
+
+        let checkpoint = checkpoint_request(id(1), id(2), id(3), 1, 1, 60, 61, 0x41, 0x52);
+        let identity = checkpoint_effect_identity(&checkpoint);
+        let pending = GuardianCheckpointPending { identity };
+        let receipt = GuardianCheckpointReceipt::from_identity(
+            identity,
+            GuardianCheckpointDisposition::OutcomeIndeterminate,
+        );
+        for diagnostic in [
+            format!("{identity:?}"),
+            format!("{pending:?}"),
+            format!("{receipt:?}"),
+        ] {
+            assert!(!diagnostic.contains(&checkpoint_debug));
+            assert!(!diagnostic.contains(&output_boundary_debug));
+        }
+
+        let mut protocol_v1 = encode_guardian_request(&secret(), &checkpoint).unwrap();
+        protocol_v1[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        let mac_start = protocol_v1.len() - GUARDIAN_MAC_BYTES;
+        let tag = secret().mac(&protocol_v1[..mac_start]).unwrap();
+        protocol_v1[mac_start..].copy_from_slice(&tag);
+        assert_eq!(
+            decode_guardian_request(&secret(), &protocol_v1),
+            Err(GuardianProtocolError::UnsupportedVersion(1))
+        );
+    }
+
+    #[test]
     fn payload_free_operations_reject_authenticated_trailing_bytes() {
         let guardian = id(1);
         let mux = id(2);
@@ -3910,7 +5646,6 @@ mod tests {
             GuardianOperation::Claim,
             GuardianOperation::Attach,
             GuardianOperation::Close,
-            GuardianOperation::Checkpoint,
             GuardianOperation::Replay,
             GuardianOperation::RetireLease,
         ]
@@ -4033,6 +5768,20 @@ mod tests {
 
     #[test]
     fn failed_runtime_effect_does_not_publish_spawn_or_consume_replay_identity() {
+        let sensitive_effect_error = GuardianEffectTransactionError::Effect(
+            std::io::Error::other("raw-input-or-dictionary-testable-digest"),
+        );
+        assert!(
+            !format!("{sensitive_effect_error:?}")
+                .contains("raw-input-or-dictionary-testable-digest")
+        );
+        assert!(
+            !sensitive_effect_error
+                .to_string()
+                .contains("raw-input-or-dictionary-testable-digest")
+        );
+        assert!(std::error::Error::source(&sensitive_effect_error).is_none());
+
         let guardian = id(1);
         let mux = id(2);
         let pane = id(3);
@@ -4044,6 +5793,14 @@ mod tests {
             invocations.set(invocations.get() + 1);
             Err("injected spawn failure")
         });
+        assert!(!format!("{failed:?}").contains("injected spawn failure"));
+        assert!(
+            !failed
+                .as_ref()
+                .expect_err("fixture effect fails")
+                .to_string()
+                .contains("injected spawn failure")
+        );
         assert!(matches!(
             failed,
             Err(GuardianEffectTransactionError::Effect("injected spawn failure"))
@@ -4137,7 +5894,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_runtime_mutation_does_not_advance_lease_sequence() {
+    fn generic_input_callback_is_rejected_without_advancing_lease_sequence() {
         let guardian = id(1);
         let mux = id(2);
         let pane = id(3);
@@ -4160,42 +5917,807 @@ mod tests {
             b"effect-once",
         ));
 
-        let failed = state.apply_effect_transactionally(&input, |_| Err("zero-byte write"));
+        let before = state.clone();
+        let callback_invoked = std::cell::Cell::new(false);
+        let failed = state.apply_effect_transactionally(&input, |_| {
+            callback_invoked.set(true);
+            Ok::<(), &str>(())
+        });
         assert!(matches!(
             failed,
-            Err(GuardianEffectTransactionError::Effect("zero-byte write"))
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::InputRequiresTypedTransaction
+            ))
+        ));
+        assert!(!callback_invoked.get());
+        assert_eq!(state, before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_input_writer_error_and_panic_remain_accepted_and_never_reinvoke() {
+        let guardian = id(1);
+        let mux = id(2);
+        let error_pane = id(70);
+        let panic_pane = id(71);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        for (pane, spawn_request_byte, spawn_effect_byte, claim_request_byte, claim_effect_byte) in [
+            (error_pane, 80_u8, 81_u8, 82_u8, 83_u8),
+            (panic_pane, 84_u8, 85_u8, 86_u8, 87_u8),
+        ] {
+            let payload = spawn_payload("typed-input-ambiguity-fixture");
+            apply_request(
+                &mut state,
+                &request(
+                    GuardianOperation::Spawn,
+                    guardian,
+                    mux,
+                    id(spawn_request_byte),
+                    Some(pane),
+                    0,
+                    0,
+                    Some(id(spawn_effect_byte)),
+                    &payload,
+                ),
+            )
+            .unwrap();
+            apply_request(
+                &mut state,
+                &claim_request(
+                    guardian,
+                    mux,
+                    pane,
+                    0,
+                    claim_request_byte,
+                    claim_effect_byte,
+                ),
+            )
+            .unwrap();
+        }
+
+        let error_input = request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(76),
+            Some(error_pane),
+            1,
+            1,
+            Some(id(77)),
+            b"raw-input-error-fixture",
+        );
+        let panic_input = request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(78),
+            Some(panic_pane),
+            1,
+            1,
+            Some(id(79)),
+            b"raw-input-panic-fixture",
+        );
+        let error_identity = input_effect_identity(&error_input);
+        let panic_identity = input_effect_identity(&panic_input);
+        let (_error_temp, mut error_journal) = input_journal_fixture(error_pane, 0x92);
+        let (_panic_temp, mut panic_journal) = input_journal_fixture(panic_pane, 0x93);
+        let sensitive = "raw-input-or-dictionary-testable-digest";
+
+        let error_invocations = std::cell::Cell::new(0_u32);
+        let error_receipt = state
+            .apply_input_transactionally(
+                &authenticate(&error_input),
+                &mut error_journal,
+                |write_permit| {
+                    error_invocations.set(error_invocations.get() + 1);
+                    assert_eq!(write_permit.identity(), error_identity);
+                    Err::<GuardianInputWriteCompletion, _>(std::io::Error::other(sensitive))
+                },
+            )
+            .unwrap();
+        assert_eq!(error_invocations.get(), 1);
+        assert!(matches!(
+            error_receipt,
+            GuardianReply::InputReceipt {
+                state: InputEffectState::AcceptedNotDurable,
+                ..
+            }
         ));
         assert_eq!(
-            state.pane_state(pane),
-            Some(&GuardianPaneState::LiveClaimed {
-                generation: 1,
-                mux_incarnation: mux,
-                next_sequence: 1,
-                pending_input_effect: None,
-            })
+            error_journal
+                .effect(error_identity.effect_id())
+                .expect("error effect retained")
+                .disposition(),
+            GuardianInputDisposition::AcceptedNotDurable
         );
+        let error_retry_invoked = std::cell::Cell::new(false);
+        assert_eq!(
+            state
+                .apply_input_transactionally(
+                    &authenticate(&error_input),
+                    &mut error_journal,
+                    |write_permit| {
+                        error_retry_invoked.set(true);
+                        Ok::<_, std::convert::Infallible>(write_permit.durable_full())
+                    },
+                )
+                .unwrap(),
+            error_receipt
+        );
+        assert!(!error_retry_invoked.get());
 
-        let accepted = state
-            .apply_effect_transactionally(&input, |_| Ok::<(), &str>(()))
+        let panic_invocations = std::cell::Cell::new(0_u32);
+        let panic_receipt = state
+            .apply_input_transactionally(
+                &authenticate(&panic_input),
+                &mut panic_journal,
+                |write_permit| -> Result<
+                    GuardianInputWriteCompletion,
+                    std::convert::Infallible,
+                > {
+                    panic_invocations.set(panic_invocations.get() + 1);
+                    assert_eq!(write_permit.identity(), panic_identity);
+                    panic!("{sensitive}");
+                },
+            )
+            .unwrap();
+        assert_eq!(panic_invocations.get(), 1);
+        assert!(matches!(
+            panic_receipt,
+            GuardianReply::InputReceipt {
+                state: InputEffectState::AcceptedNotDurable,
+                ..
+            }
+        ));
+        assert_eq!(
+            panic_journal
+                .effect(panic_identity.effect_id())
+                .expect("panic effect retained")
+                .disposition(),
+            GuardianInputDisposition::AcceptedNotDurable
+        );
+        let panic_retry_invoked = std::cell::Cell::new(false);
+        assert_eq!(
+            state
+                .apply_input_transactionally(
+                    &authenticate(&panic_input),
+                    &mut panic_journal,
+                    |write_permit| {
+                        panic_retry_invoked.set(true);
+                        Ok::<_, std::convert::Infallible>(write_permit.durable_full())
+                    },
+                )
+                .unwrap(),
+            panic_receipt
+        );
+        assert!(!panic_retry_invoked.get());
+
+        let error_digest = format!("{:?}", error_identity.payload_sha256());
+        let panic_digest = format!("{:?}", panic_identity.payload_sha256());
+        for diagnostic in [
+            format!("{state:?}"),
+            format!("{error_receipt:?}"),
+            format!("{panic_receipt:?}"),
+            format!(
+                "{:?}",
+                error_journal.effect(error_identity.effect_id()).unwrap()
+            ),
+            format!(
+                "{:?}",
+                panic_journal.effect(panic_identity.effect_id()).unwrap()
+            ),
+        ] {
+            assert!(!diagnostic.contains("raw-input-error-fixture"));
+            assert!(!diagnostic.contains("raw-input-panic-fixture"));
+            assert!(!diagnostic.contains(sensitive));
+            assert!(!diagnostic.contains(&error_digest));
+            assert!(!diagnostic.contains(&panic_digest));
+        }
+        let sensitive_journal_error = GuardianInputTransactionError::Journal(
+            GuardianInputJournalError::Io(std::io::Error::other(sensitive)),
+        );
+        assert!(!format!("{sensitive_journal_error:?}").contains(sensitive));
+        assert!(!sensitive_journal_error.to_string().contains(sensitive));
+        assert!(std::error::Error::source(&sensitive_journal_error).is_none());
+    }
+
+    #[test]
+    fn committed_checkpoint_is_typed_and_exact_replays_never_publish_twice() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let checkpoint = checkpoint_request(guardian, mux, pane, 1, 1, 8, 9, 0x31, 0x32);
+        let authenticated_checkpoint = authenticate(&checkpoint);
+        let expected_identity = checkpoint_effect_identity(&checkpoint);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 6, 7),
+        )
+        .unwrap();
+
+        let generic_invocations = std::cell::Cell::new(0_usize);
+        let generic = state.apply_effect_transactionally(&authenticated_checkpoint, |_| {
+            generic_invocations.set(generic_invocations.get() + 1);
+            Ok::<(), &str>(())
+        });
+        assert!(matches!(
+            generic,
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::CheckpointRequiresTypedTransaction
+            ))
+        ));
+        assert_eq!(generic_invocations.get(), 0);
+
+        let invocations = std::cell::Cell::new(0_usize);
+        let observed_identity = std::cell::Cell::new(None);
+        let receipt = state
+            .apply_checkpoint_transactionally(&authenticated_checkpoint, |pending| {
+                invocations.set(invocations.get() + 1);
+                observed_identity.set(Some(pending.identity()));
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(invocations.get(), 1);
+        assert_eq!(observed_identity.get(), Some(expected_identity));
+        assert_eq!(expected_identity.pane_id(), pane);
+        assert_eq!(expected_identity.mux_incarnation(), mux);
+        assert_eq!(expected_identity.request_id(), id(8));
+        assert_eq!(expected_identity.generation(), 1);
+        assert_eq!(expected_identity.sequence(), 1);
+        assert_eq!(expected_identity.effect_id(), id(9));
+        assert_eq!(expected_identity.intent(), checkpoint_intent(0x31, 0x32));
+        assert_eq!(receipt.disposition(), GuardianCheckpointDisposition::Committed);
+        assert_eq!(receipt.pane_id(), pane);
+        assert_eq!(receipt.generation(), 1);
+        assert_eq!(receipt.sequence(), 1);
+        assert_eq!(receipt.effect_id(), id(9));
+        assert_eq!(receipt.intent(), checkpoint_intent(0x31, 0x32));
+
+        let exact_replay = state
+            .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(exact_replay, receipt);
+        assert_eq!(invocations.get(), 1);
+
+        let mut alias_envelope = checkpoint.clone();
+        alias_envelope.header.request_id = id(10);
+        let authenticated_alias = authenticate(&alias_envelope);
+        let alias_receipt = state
+            .apply_checkpoint_transactionally(&authenticated_alias, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(alias_receipt, receipt);
+        assert_eq!(invocations.get(), 1);
+
+        let response = GuardianResponseEnvelope::reply(
+            &authenticated_alias,
+            &GuardianReply::CheckpointReceipt(alias_receipt),
+        )
+        .unwrap();
+        assert_eq!(response.header.status, GuardianResponseStatus::Success);
+        let frame = encode_guardian_response(&secret(), &response).unwrap();
+        let correlated = decode_guardian_response(&secret(), &frame)
+            .unwrap()
+            .correlate(&authenticated_alias.header)
             .unwrap();
         assert_eq!(
-            accepted,
-            GuardianReply::InputReceipt {
-                pane_id: pane,
+            correlated.success_reply(&authenticated_alias).unwrap(),
+            GuardianReply::CheckpointReceipt(receipt)
+        );
+        let mut forged_indeterminate = frame;
+        forged_indeterminate[11] = GuardianResponseStatus::Indeterminate as u8;
+        let mac_start = forged_indeterminate.len() - GUARDIAN_MAC_BYTES;
+        let tag = secret().mac(&forged_indeterminate[..mac_start]).unwrap();
+        forged_indeterminate[mac_start..].copy_from_slice(&tag);
+        assert_eq!(
+            decode_guardian_response(&secret(), &forged_indeterminate),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
+
+        let conflicting = checkpoint_request(guardian, mux, pane, 1, 1, 11, 9, 0x31, 0x33);
+        let authenticated_conflicting = authenticate(&conflicting);
+        assert_eq!(
+            state.apply_checkpoint_transactionally(&authenticated_conflicting, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            }),
+            Err(GuardianProtocolError::EffectIdentityConflict)
+        );
+        assert_eq!(invocations.get(), 1);
+    }
+
+    #[test]
+    fn indeterminate_checkpoint_is_retained_fenced_visible_and_exactly_reconciled() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let checkpoint_effect = id(9);
+        let checkpoint = checkpoint_request(guardian, mux, pane, 1, 1, 8, 9, 0x41, 0x52);
+        let authenticated_checkpoint = authenticate(&checkpoint);
+        let identity = checkpoint_effect_identity(&checkpoint);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 6, 7),
+        )
+        .unwrap();
+
+        let invocations = std::cell::Cell::new(0_usize);
+        let receipt = state
+            .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
+                invocations.set(invocations.get() + 1);
+                Err("content-derived-publisher-error-must-not-escape")
+            })
+            .unwrap();
+        assert_eq!(invocations.get(), 1);
+        assert_eq!(
+            receipt.disposition(),
+            GuardianCheckpointDisposition::OutcomeIndeterminate
+        );
+        assert!(matches!(
+            state.pane_state(pane),
+            Some(GuardianPaneState::LiveClaimed {
                 generation: 1,
-                sequence: 1,
-                effect_id: id(9),
-                state: InputEffectState::AcceptedNotDurable,
-            }
+                mux_incarnation,
+                next_sequence: 2,
+                pending_input_effect: None,
+            }) if *mux_incarnation == mux
+        ));
+
+        let exact_replay = state
+            .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(exact_replay, receipt);
+        let mut alias_envelope = checkpoint.clone();
+        alias_envelope.header.request_id = id(10);
+        let authenticated_alias = authenticate(&alias_envelope);
+        let alias_receipt = state
+            .apply_checkpoint_transactionally(&authenticated_alias, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(alias_receipt, receipt);
+        assert_eq!(invocations.get(), 1);
+
+        for index in 0..(GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT - 2) {
+            let mut bounded_alias = checkpoint.clone();
+            bounded_alias.header.request_id =
+                Uuid::from_u128(0x1000 + u128::try_from(index).unwrap());
+            assert_eq!(
+                state
+                    .apply_checkpoint_transactionally(&authenticate(&bounded_alias), |_| {
+                        invocations.set(invocations.get() + 1);
+                        Ok::<(), &str>(())
+                    })
+                    .unwrap(),
+                receipt
+            );
+        }
+        let mut over_alias_ceiling = checkpoint.clone();
+        over_alias_ceiling.header.request_id = Uuid::from_u128(0x2000);
+        assert_eq!(
+            state.apply_checkpoint_transactionally(&authenticate(&over_alias_ceiling), |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            }),
+            Err(GuardianProtocolError::RequestAliasCapacityExhausted {
+                effect_id: checkpoint_effect,
+                max_aliases: GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT,
+            })
+        );
+        assert_eq!(invocations.get(), 1);
+
+        let response = GuardianResponseEnvelope::reply(
+            &authenticated_alias,
+            &GuardianReply::CheckpointReceipt(alias_receipt),
+        )
+        .unwrap();
+        assert_eq!(
+            response.header.status,
+            GuardianResponseStatus::Indeterminate
         );
         assert_eq!(
-            state.pane_state(pane),
-            Some(&GuardianPaneState::LiveClaimed {
-                generation: 1,
-                mux_incarnation: mux,
-                next_sequence: 2,
-                pending_input_effect: Some(id(9)),
+            GuardianResponseEnvelope::success(
+                &authenticated_alias,
+                &GuardianReply::CheckpointReceipt(alias_receipt),
+            ),
+            Err(GuardianProtocolError::NonSuccessResponse)
+        );
+        let frame = encode_guardian_response(&secret(), &response).unwrap();
+        let correlated = decode_guardian_response(&secret(), &frame)
+            .unwrap()
+            .correlate(&authenticated_alias.header)
+            .unwrap();
+        assert_eq!(
+            correlated.typed_reply(&authenticated_alias).unwrap(),
+            GuardianReply::CheckpointReceipt(receipt)
+        );
+        assert_eq!(
+            correlated.success_reply(&authenticated_alias),
+            Err(GuardianProtocolError::NonSuccessResponse)
+        );
+        assert_eq!(
+            correlated.rejection_code(),
+            Err(GuardianProtocolError::InvalidRejectionPayload)
+        );
+        let mut forged_success = frame;
+        forged_success[11] = GuardianResponseStatus::Success as u8;
+        let mac_start = forged_success.len() - GUARDIAN_MAC_BYTES;
+        let tag = secret().mac(&forged_success[..mac_start]).unwrap();
+        forged_success[mac_start..].copy_from_slice(&tag);
+        assert_eq!(
+            decode_guardian_response(&secret(), &forged_success),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
+
+        let blocked_effects = vec![
+            request(
+                GuardianOperation::Claim,
+                guardian,
+                mux,
+                id(20),
+                Some(pane),
+                1,
+                0,
+                Some(id(21)),
+                b"",
+            ),
+            request(
+                GuardianOperation::Input,
+                guardian,
+                mux,
+                id(22),
+                Some(pane),
+                1,
+                2,
+                Some(id(23)),
+                b"blocked-input",
+            ),
+            request(
+                GuardianOperation::Resize,
+                guardian,
+                mux,
+                id(24),
+                Some(pane),
+                1,
+                2,
+                Some(id(25)),
+                &resize_payload(30, 100),
+            ),
+            request(
+                GuardianOperation::Signal,
+                guardian,
+                mux,
+                id(26),
+                Some(pane),
+                1,
+                2,
+                Some(id(27)),
+                &GuardianSignal::Terminate.encode(),
+            ),
+            request(
+                GuardianOperation::RetireLease,
+                guardian,
+                mux,
+                id(28),
+                Some(pane),
+                1,
+                2,
+                Some(id(29)),
+                b"",
+            ),
+            request(
+                GuardianOperation::Close,
+                guardian,
+                mux,
+                id(30),
+                Some(pane),
+                1,
+                2,
+                Some(id(31)),
+                b"",
+            ),
+        ];
+        let blocked_callbacks = std::cell::Cell::new(0_usize);
+        for blocked in blocked_effects {
+            let authenticated_blocked = authenticate(&blocked);
+            assert!(matches!(
+                state.apply_effect_transaction_inner(&authenticated_blocked, |_| {
+                    blocked_callbacks.set(blocked_callbacks.get() + 1);
+                    Ok::<(), &str>(())
+                }),
+                Err(GuardianEffectTransactionError::Protocol(
+                    GuardianProtocolError::CheckpointOutcomeIndeterminate
+                ))
+            ));
+        }
+        let second_checkpoint = checkpoint_request(
+            guardian, mux, pane, 1, 2, 32, 33, 0x61, 0x62,
+        );
+        assert_eq!(
+            state.apply_checkpoint_transactionally(&authenticate(&second_checkpoint), |_| {
+                blocked_callbacks.set(blocked_callbacks.get() + 1);
+                Ok::<(), &str>(())
+            }),
+            Err(GuardianProtocolError::CheckpointOutcomeIndeterminate)
+        );
+        assert_eq!(blocked_callbacks.get(), 0);
+        assert_eq!(
+            state.retire_disconnected_mux_leases(mux).unwrap(),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 0,
+                pending_input_panes: 0,
+                indeterminate_checkpoint_panes: 1,
+            }
+        );
+
+        let census_page = GuardianCensusPageRequest::new(
+            Uuid::nil(),
+            0,
+            1,
+            GUARDIAN_MIN_CENSUS_PAGE_BYTES,
+        )
+        .unwrap();
+        let census_request = request(
+            GuardianOperation::Census,
+            guardian,
+            mux,
+            id(34),
+            None,
+            0,
+            0,
+            None,
+            &census_page.encode(),
+        );
+        let census = apply_request(&mut state, &census_request).unwrap();
+        assert!(matches!(
+            census,
+            GuardianReply::CensusPage { entries, .. }
+                if entries.len() == 1
+                    && entries[0].pane_id == pane
+                    && entries[0].next_sequence == Some(2)
+                    && entries[0].indeterminate_checkpoint_effect == Some(checkpoint_effect)
+        ));
+
+        let removed_alias = state.requests.remove(&id(10)).unwrap();
+        let corrupted_before_reconciliation = state.clone();
+        assert_eq!(
+            state.mark_checkpoint_committed(identity),
+            Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-request-alias"
+            ))
+        );
+        assert_eq!(state, corrupted_before_reconciliation);
+        state.requests.insert(id(10), removed_alias);
+
+        let alias_identity = checkpoint_effect_identity(&alias_envelope);
+        let before_alias_identity_mismatch = state.clone();
+        assert_eq!(
+            state.mark_checkpoint_committed(alias_identity),
+            Err(GuardianProtocolError::CheckpointIdentityMismatch)
+        );
+        assert_eq!(state, before_alias_identity_mismatch);
+        let mut wrong_output_boundary = identity;
+        wrong_output_boundary.intent = checkpoint_intent(0x41, 0x53);
+        let before_output_boundary_mismatch = state.clone();
+        assert_eq!(
+            state.mark_checkpoint_committed(wrong_output_boundary),
+            Err(GuardianProtocolError::CheckpointIdentityMismatch)
+        );
+        assert_eq!(state, before_output_boundary_mismatch);
+
+        let committed = state.mark_checkpoint_committed(identity).unwrap();
+        assert_eq!(
+            committed.disposition(),
+            GuardianCheckpointDisposition::Committed
+        );
+        assert_eq!(state.mark_checkpoint_committed(identity).unwrap(), committed);
+        let committed_alias = state
+            .apply_checkpoint_transactionally(&authenticated_alias, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
             })
+            .unwrap();
+        assert_eq!(committed_alias, committed);
+        assert_eq!(invocations.get(), 1);
+        assert_eq!(
+            state.mark_checkpoint_definitely_not_published(identity),
+            Err(GuardianProtocolError::CheckpointIdentityMismatch)
+        );
+
+        let successor = request(
+            GuardianOperation::Resize,
+            guardian,
+            mux,
+            id(35),
+            Some(pane),
+            1,
+            2,
+            Some(id(36)),
+            &resize_payload(31, 101),
+        );
+        assert!(apply_request(&mut state, &successor).is_ok());
+
+        let checkpoint_debug = format!("{:?}", [0x41_u8; 32]);
+        let output_boundary_debug = format!("{:?}", [0x52_u8; 32]);
+        let state_debug = format!("{state:?}");
+        assert!(!state_debug.contains("content-derived-publisher-error-must-not-escape"));
+        assert!(!state_debug.contains(&checkpoint_debug));
+        assert!(!state_debug.contains(&output_boundary_debug));
+    }
+
+    #[test]
+    fn checkpoint_panic_and_preflight_failures_are_non_reinvoking_and_rollback_is_exact() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let checkpoint = checkpoint_request(guardian, mux, pane, 1, 1, 8, 9, 0x71, 0x72);
+        let authenticated_checkpoint = authenticate(&checkpoint);
+        let identity = checkpoint_effect_identity(&checkpoint);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 6, 7),
+        )
+        .unwrap();
+
+        let sequence_gap = checkpoint_request(guardian, mux, pane, 1, 2, 10, 11, 0x73, 0x74);
+        let preflight_invocations = std::cell::Cell::new(0_usize);
+        let before_sequence_gap = state.clone();
+        assert_eq!(
+            state.apply_checkpoint_transactionally(&authenticate(&sequence_gap), |_| {
+                preflight_invocations.set(preflight_invocations.get() + 1);
+                Ok::<(), &str>(())
+            }),
+            Err(GuardianProtocolError::SequenceGap {
+                expected: 1,
+                observed: 2,
+            })
+        );
+        assert_eq!(preflight_invocations.get(), 0);
+        assert_eq!(state, before_sequence_gap);
+
+        let saved_request_order = state.transient_request_order.clone();
+        let saved_effect_order = state.transient_effect_order.clone();
+        let saved_capacity = state.receipt_capacity;
+        state.receipt_capacity = state.requests.len();
+        state.transient_request_order.clear();
+        state.transient_effect_order.clear();
+        let before_capacity_failure = state.clone();
+        assert_eq!(
+            state.apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
+                preflight_invocations.set(preflight_invocations.get() + 1);
+                Ok::<(), &str>(())
+            }),
+            Err(GuardianProtocolError::CapacityExhausted)
+        );
+        assert_eq!(preflight_invocations.get(), 0);
+        assert_eq!(state, before_capacity_failure);
+        assert!(matches!(
+            state.pane_state(pane),
+            Some(GuardianPaneState::LiveClaimed {
+                next_sequence: 1,
+                ..
+            })
+        ));
+        state.receipt_capacity = saved_capacity;
+        state.transient_request_order = saved_request_order;
+        state.transient_effect_order = saved_effect_order;
+
+        let invocations = std::cell::Cell::new(0_usize);
+        let indeterminate = state
+            .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| -> Result<(), &str> {
+                invocations.set(invocations.get() + 1);
+                panic!("checkpoint publisher panic");
+            })
+            .unwrap();
+        assert_eq!(invocations.get(), 1);
+        assert_eq!(
+            indeterminate.disposition(),
+            GuardianCheckpointDisposition::OutcomeIndeterminate
+        );
+        assert_eq!(
+            state
+                .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
+                    invocations.set(invocations.get() + 1);
+                    Ok::<(), &str>(())
+                })
+                .unwrap(),
+            indeterminate
+        );
+        assert_eq!(invocations.get(), 1);
+
+        let reverse_index = state
+            .effect_request_ids
+            .remove(&identity.effect_id())
+            .unwrap();
+        let missing_reverse_index = state.clone();
+        assert_eq!(
+            state.mark_checkpoint_definitely_not_published(identity),
+            Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-definite-not-published-reverse-index"
+            ))
+        );
+        assert_eq!(state, missing_reverse_index);
+        state
+            .effect_request_ids
+            .insert(identity.effect_id(), reverse_index);
+
+        let removed_request = state.requests.remove(&identity.request_id()).unwrap();
+        let missing_request_alias = state.clone();
+        assert_eq!(
+            state.mark_checkpoint_definitely_not_published(identity),
+            Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-definite-not-published-request-alias"
+            ))
+        );
+        assert_eq!(state, missing_request_alias);
+        state
+            .requests
+            .insert(identity.request_id(), removed_request);
+
+        let mut wrong_request_nonce = identity;
+        wrong_request_nonce.request_id = id(12);
+        let before_wrong_identity = state.clone();
+        assert_eq!(
+            state.mark_checkpoint_definitely_not_published(wrong_request_nonce),
+            Err(GuardianProtocolError::CheckpointIdentityMismatch)
+        );
+        assert_eq!(state, before_wrong_identity);
+        let GuardianPaneState::LiveClaimed { next_sequence, .. } =
+            state.panes.get_mut(&pane).unwrap()
+        else {
+            panic!("checkpoint pane must remain claimed while reconciliation is pending");
+        };
+        *next_sequence = 3;
+        assert_eq!(
+            state.mark_checkpoint_definitely_not_published(identity),
+            Err(GuardianProtocolError::CheckpointIdentityMismatch)
+        );
+        assert!(state.effects.contains_key(&identity.effect_id()));
+        let GuardianPaneState::LiveClaimed { next_sequence, .. } =
+            state.panes.get_mut(&pane).unwrap()
+        else {
+            panic!("checkpoint pane must remain claimed after rejected reconciliation");
+        };
+        *next_sequence = 2;
+        state
+            .mark_checkpoint_definitely_not_published(identity)
+            .unwrap();
+        assert!(matches!(
+            state.pane_state(pane),
+            Some(GuardianPaneState::LiveClaimed {
+                next_sequence: 1,
+                ..
+            })
+        ));
+        assert!(!state.effects.contains_key(&identity.effect_id()));
+        assert!(!state.requests.contains_key(&identity.request_id()));
+        assert!(!state.indeterminate_checkpoints_by_pane.contains_key(&pane));
+
+        let committed = state
+            .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(invocations.get(), 2);
+        assert_eq!(
+            committed.disposition(),
+            GuardianCheckpointDisposition::Committed
         );
     }
 
@@ -4377,6 +6899,8 @@ mod tests {
             GuardianRejectionCode::CensusSnapshotIdentityConflict,
             GuardianRejectionCode::InvalidCensusCursor,
             GuardianRejectionCode::InternalInvariant,
+            GuardianRejectionCode::CheckpointOutcomeIndeterminate,
+            GuardianRejectionCode::CheckpointIdentityMismatch,
         ];
         for code in all_codes {
             let response = GuardianResponseEnvelope::rejection(&authenticated_request, code);
@@ -4430,6 +6954,26 @@ mod tests {
             .status(),
             GuardianResponseStatus::Rejected
         );
+        assert_eq!(
+            GuardianRejectionCode::CheckpointOutcomeIndeterminate.status(),
+            GuardianResponseStatus::Rejected,
+            "a mutation blocked behind reconciliation is retryable after the exact fence clears"
+        );
+
+        let checkpoint_fence = GuardianResponseEnvelope::rejection(
+            &authenticated_request,
+            GuardianRejectionCode::CheckpointOutcomeIndeterminate,
+        );
+        let mut forged_terminal =
+            encode_guardian_response(&secret(), &checkpoint_fence).unwrap();
+        forged_terminal[11] = GuardianResponseStatus::Terminal as u8;
+        let mac_start = forged_terminal.len() - GUARDIAN_MAC_BYTES;
+        let tag = secret().mac(&forged_terminal[..mac_start]).unwrap();
+        forged_terminal[mac_start..].copy_from_slice(&tag);
+        assert_eq!(
+            decode_guardian_response(&secret(), &forged_terminal),
+            Err(GuardianProtocolError::InvalidRejectionPayload)
+        );
 
         let mut mismatched_status = terminal.clone();
         mismatched_status.header.status = GuardianResponseStatus::Rejected;
@@ -4458,6 +7002,7 @@ mod tests {
                     mux_incarnation: None,
                     next_sequence: None,
                     pending_input_effect: None,
+                    indeterminate_checkpoint_effect: None,
                     exit_status: None,
                     quarantine_reason: None,
                 },
@@ -4468,6 +7013,7 @@ mod tests {
                     mux_incarnation: Some(id(30)),
                     next_sequence: Some(7),
                     pending_input_effect: Some(id(31)),
+                    indeterminate_checkpoint_effect: None,
                     exit_status: None,
                     quarantine_reason: None,
                 },
@@ -4478,6 +7024,7 @@ mod tests {
                     mux_incarnation: None,
                     next_sequence: None,
                     pending_input_effect: None,
+                    indeterminate_checkpoint_effect: None,
                     exit_status: Some(-9),
                     quarantine_reason: None,
                 },
@@ -4488,6 +7035,7 @@ mod tests {
                     mux_incarnation: None,
                     next_sequence: None,
                     pending_input_effect: None,
+                    indeterminate_checkpoint_effect: None,
                     exit_status: Some(i32::MIN),
                     quarantine_reason: None,
                 },
@@ -4498,6 +7046,7 @@ mod tests {
                     mux_incarnation: None,
                     next_sequence: None,
                     pending_input_effect: None,
+                    indeterminate_checkpoint_effect: None,
                     exit_status: None,
                     quarantine_reason: Some(GuardianQuarantineReason::GenerationExhausted),
                 },
@@ -4519,7 +7068,7 @@ mod tests {
         );
         let mut noncanonical_absent_exit_status = encoded.clone();
         let first_exit_status_byte = usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap()
-            + 65;
+            + 81;
         noncanonical_absent_exit_status[first_exit_status_byte] = 1;
         assert_eq!(
             GuardianReply::decode_for_operation(
@@ -4635,7 +7184,7 @@ mod tests {
 
         let mut malformed_flags = encoded;
         let first_entry_flags =
-            usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap() + 70;
+            usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap() + 86;
         malformed_flags[first_entry_flags] = 0x80;
         assert_eq!(
             GuardianReply::decode_for_operation(GuardianOperation::Census, &malformed_flags),
@@ -4853,6 +7402,7 @@ mod tests {
                 && entry.mux_incarnation.is_none()
                 && entry.next_sequence.is_none()
                 && entry.pending_input_effect.is_none()
+                && entry.indeterminate_checkpoint_effect.is_none()
                 && entry.exit_status.is_none()
                 && entry.quarantine_reason.is_none()
         }));
@@ -4916,6 +7466,7 @@ mod tests {
                     mux_incarnation: None,
                     next_sequence: None,
                     pending_input_effect: None,
+                    indeterminate_checkpoint_effect: None,
                     exit_status: None,
                     quarantine_reason: None,
                 }],
@@ -5194,6 +7745,7 @@ mod tests {
             GuardianMuxLeaseRetirement {
                 retired_panes: 1,
                 pending_input_panes: 1,
+                indeterminate_checkpoint_panes: 0,
             }
         );
         assert!(matches!(
@@ -5244,13 +7796,14 @@ mod tests {
         )
         .unwrap();
         state
-            .mark_input_durable(input_effect_identity(&pending_input))
+            .mark_input_durable_full(input_effect_identity(&pending_input))
             .unwrap();
         assert_eq!(
             state.retire_disconnected_mux_leases(old_mux).unwrap(),
             GuardianMuxLeaseRetirement {
                 retired_panes: 1,
                 pending_input_panes: 0,
+                indeterminate_checkpoint_panes: 0,
             }
         );
         apply_request(
@@ -5465,14 +8018,14 @@ mod tests {
         );
         assert_eq!(
             state
-                .mark_input_durable(input_effect_identity(&input))
+                .mark_input_durable_full(input_effect_identity(&input))
                 .unwrap(),
             GuardianReply::InputReceipt {
                 pane_id: pane,
                 generation: 1,
                 sequence: 1,
                 effect_id: effect,
-                state: InputEffectState::DurableEffect,
+                state: InputEffectState::DurableFull,
             }
         );
         assert_eq!(
@@ -5482,7 +8035,7 @@ mod tests {
                 generation: 1,
                 sequence: 1,
                 effect_id: effect,
-                state: InputEffectState::DurableEffect,
+                state: InputEffectState::DurableFull,
             }
         );
         assert_eq!(
@@ -5492,7 +8045,7 @@ mod tests {
                 generation: 1,
                 sequence: 1,
                 effect_id: effect,
-                state: InputEffectState::DurableEffect,
+                state: InputEffectState::DurableFull,
             },
             "durability acknowledgement must update every retained alias"
         );
@@ -5508,7 +8061,7 @@ mod tests {
             apply_request(&mut state, &query).unwrap(),
             GuardianReply::InputEffect {
                 effect_id: effect,
-                state: InputEffectState::DurableEffect,
+                state: InputEffectState::DurableFull,
             }
         );
         assert!(apply_request(&mut state, &successor).is_ok());
@@ -5540,7 +8093,7 @@ mod tests {
             apply_request(&mut state, &terminal_query).unwrap(),
             GuardianReply::InputEffect {
                 effect_id: effect,
-                state: InputEffectState::DurableEffect,
+                state: InputEffectState::DurableFull,
             }
         );
         state.mark_exited(pane, 129).unwrap();
@@ -5551,6 +8104,262 @@ mod tests {
                 exit_status: Some(129),
             })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_partial_input_is_count_bound_and_exact_retries_never_reapply_prefix() {
+        use crate::guardian_input_journal::{GuardianInputJournal, GuardianInputJournalLimits};
+        use crate::guardian_output_journal::GuardianOutputCipher;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let effect = id(60);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 6, 7),
+        )
+        .unwrap();
+        let input = request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(61),
+            Some(pane),
+            1,
+            1,
+            Some(effect),
+            b"abcdef",
+        );
+        let authenticated_input = authenticate(&input);
+        let identity = input_effect_identity(&input);
+        let journal_temp = tempfile::tempdir().expect("create input journal tempdir");
+        let journal_path = journal_temp.path().join("input.journal");
+        let journal_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&journal_path)
+            .expect("create private input journal");
+        let mut journal = GuardianInputJournal::open(
+            journal_file,
+            pane,
+            GuardianOutputCipher::try_from_key_slice(&[0x91; 32])
+                .expect("valid journal fixture key"),
+            GuardianInputJournalLimits::default(),
+        )
+        .expect("initialize input journal");
+        journal
+            .sync_parent_directory_and_activate(
+                &std::fs::File::open(journal_temp.path()).expect("open journal directory"),
+            )
+            .expect("activate input journal");
+
+        let writer_invocations = std::cell::Cell::new(0_u32);
+        let partial = state
+            .apply_input_transactionally(&authenticated_input, &mut journal, |write_permit| {
+                writer_invocations.set(writer_invocations.get() + 1);
+                assert_eq!(write_permit.identity(), identity);
+                write_permit.durable_prefix(3)
+            })
+            .unwrap();
+        assert_eq!(writer_invocations.get(), 1);
+        assert_eq!(
+            partial,
+            GuardianReply::InputReceipt {
+                pane_id: pane,
+                generation: 1,
+                sequence: 1,
+                effect_id: effect,
+                state: InputEffectState::DurablePrefix { applied_bytes: 3 },
+            }
+        );
+
+        let before_invalid_count = state.clone();
+        assert_eq!(
+            state.mark_input_durable_prefix(identity, 0),
+            Err(GuardianProtocolError::InvalidInputDisposition)
+        );
+        assert_eq!(state, before_invalid_count);
+        assert_eq!(
+            state.mark_input_durable_prefix(identity, identity.input_bytes()),
+            Err(GuardianProtocolError::InvalidInputDisposition)
+        );
+        assert_eq!(state, before_invalid_count);
+        assert_eq!(
+            state.mark_input_durable_prefix(identity, 3).unwrap(),
+            partial,
+            "an exact terminal acknowledgement retry must return the original receipt"
+        );
+        let terminal_state = state.clone();
+        assert_eq!(
+            state.mark_input_durable_prefix(identity, 2),
+            Err(GuardianProtocolError::InputDurabilityIdentityMismatch)
+        );
+        assert_eq!(state, terminal_state);
+
+        let exact_replay_callback = std::cell::Cell::new(false);
+        assert_eq!(
+            state
+                .apply_input_transactionally(
+                    &authenticated_input,
+                    &mut journal,
+                    |write_permit| {
+                        exact_replay_callback.set(true);
+                        Ok::<_, std::convert::Infallible>(write_permit.durable_full())
+                    },
+                )
+                .unwrap(),
+            partial
+        );
+        assert!(!exact_replay_callback.get());
+        let mut alias = input.clone();
+        alias.header.request_id = id(62);
+        let alias_callback = std::cell::Cell::new(false);
+        assert_eq!(
+            state
+                .apply_input_transactionally(
+                    &authenticate(&alias),
+                    &mut journal,
+                    |write_permit| {
+                        alias_callback.set(true);
+                        Ok::<_, std::convert::Infallible>(write_permit.durable_full())
+                    },
+                )
+                .unwrap(),
+            partial
+        );
+        assert!(!alias_callback.get());
+
+        let before_payload_splice = state.clone();
+        let mut same_length_payload_splice = input.clone();
+        same_length_payload_splice.header.request_id = id(65);
+        same_length_payload_splice.payload = b"abcxef".to_vec();
+        same_length_payload_splice.header.payload_sha256 =
+            Sha256::digest(&same_length_payload_splice.payload).into();
+        let splice_callback = std::cell::Cell::new(false);
+        assert!(matches!(
+            state.apply_input_transactionally(
+                &authenticate(&same_length_payload_splice),
+                &mut journal,
+                |write_permit| {
+                    splice_callback.set(true);
+                    Ok::<_, std::convert::Infallible>(write_permit.durable_full())
+                },
+            ),
+            Err(GuardianInputTransactionError::Protocol(
+                GuardianProtocolError::EffectIdentityConflict
+            ))
+        ));
+        assert!(!splice_callback.get());
+        assert_eq!(state, before_payload_splice);
+
+        let query = request(
+            GuardianOperation::QueryInputEffect,
+            guardian,
+            mux,
+            id(63),
+            Some(pane),
+            1,
+            0,
+            Some(effect),
+            &input_effect_query_payload(&input),
+        );
+        assert_eq!(
+            apply_request(&mut state, &query).unwrap(),
+            GuardianReply::InputEffect {
+                effect_id: effect,
+                state: InputEffectState::DurablePrefix { applied_bytes: 3 },
+            }
+        );
+
+        let mut exited_state = state.clone();
+        exited_state.mark_exited(pane, 0).unwrap();
+        let before_wrong_mux_query = exited_state.clone();
+        let wrong_mux_query = request(
+            GuardianOperation::QueryInputEffect,
+            guardian,
+            id(90),
+            id(66),
+            Some(pane),
+            1,
+            0,
+            Some(effect),
+            &input_effect_query_payload(&input),
+        );
+        assert_eq!(
+            apply_request(&mut exited_state, &wrong_mux_query),
+            Err(GuardianProtocolError::InputDurabilityIdentityMismatch),
+            "a retained disposition remains bound to its authenticated mux incarnation"
+        );
+        assert_eq!(exited_state, before_wrong_mux_query);
+
+        let before_wrong_length_query = state.clone();
+        let wrong_length_query_payload = GuardianInputEffectQuery::new(
+            identity.sequence(),
+            identity.input_bytes() - 1,
+            identity.payload_sha256(),
+        )
+        .unwrap()
+        .encode();
+        let wrong_length_query = request(
+            GuardianOperation::QueryInputEffect,
+            guardian,
+            mux,
+            id(64),
+            Some(pane),
+            1,
+            0,
+            Some(effect),
+            &wrong_length_query_payload,
+        );
+        assert_eq!(
+            apply_request(&mut state, &wrong_length_query),
+            Err(GuardianProtocolError::InputDurabilityIdentityMismatch)
+        );
+        assert_eq!(state, before_wrong_length_query);
+
+        let response = GuardianResponseEnvelope::success(&authenticated_input, &partial).unwrap();
+        let encoded = encode_guardian_response(&secret(), &response).unwrap();
+        let decoded = decode_guardian_response(&secret(), &encoded).unwrap();
+        assert_eq!(decoded.success_reply(&authenticated_input).unwrap(), partial);
+        let mut same_length_splice = encoded;
+        let applied_offset = FRAME_LENGTH_BYTES + RESPONSE_FRAME_HEADER_BYTES + 49;
+        same_length_splice[applied_offset..applied_offset + 4]
+            .copy_from_slice(&2_u32.to_be_bytes());
+        assert!(
+            matches!(
+                decode_guardian_response(&secret(), &same_length_splice),
+                Err(GuardianProtocolError::AuthenticationFailed)
+            ),
+            "the exact applied byte count must be covered by the response MAC"
+        );
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &authenticated_input,
+                &GuardianReply::InputReceipt {
+                    pane_id: pane,
+                    generation: 1,
+                    sequence: 1,
+                    effect_id: effect,
+                    state: InputEffectState::DurablePrefix { applied_bytes: 6 },
+                },
+            ),
+            Err(GuardianProtocolError::InvalidInputDisposition)
+        );
+        assert_eq!(
+            GuardianReply::InputEffect {
+                effect_id: effect,
+                state: InputEffectState::DurablePrefix { applied_bytes: 0 },
+            }
+            .encode_for_operation(GuardianOperation::QueryInputEffect),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
     }
 
     #[test]
@@ -5673,10 +8482,10 @@ mod tests {
         assert_eq!(apply_request(&mut state, &input).unwrap(), pending_receipt);
         assert!(matches!(
             state
-                .mark_input_durable(input_effect_identity(&input))
+                .mark_input_durable_full(input_effect_identity(&input))
                 .unwrap(),
             GuardianReply::InputReceipt {
-                state: InputEffectState::DurableEffect,
+                state: InputEffectState::DurableFull,
                 ..
             }
         ));
@@ -5757,7 +8566,7 @@ mod tests {
             Err(GuardianProtocolError::InputDurabilityPending)
         );
         state
-            .mark_input_durable(input_effect_identity(&input))
+            .mark_input_durable_full(input_effect_identity(&input))
             .unwrap();
         assert_eq!(
             apply_request(&mut state, &close).unwrap(),
@@ -5777,7 +8586,79 @@ mod tests {
     }
 
     #[test]
-    fn definitively_unapplied_input_can_be_terminally_rejected_by_exact_identity() {
+    fn input_reconciliation_preflights_reverse_index_and_every_request_alias() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let effect = id(9);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 6, 7),
+        )
+        .unwrap();
+        let input = request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(8),
+            Some(pane),
+            1,
+            1,
+            Some(effect),
+            b"reconciliation-preflight",
+        );
+        let pending_reply = apply_request(&mut state, &input).unwrap();
+        let mut alias = input.clone();
+        alias.header.request_id = id(10);
+        assert_eq!(apply_request(&mut state, &alias).unwrap(), pending_reply);
+        let identity = input_effect_identity(&input);
+
+        let reverse_index = state.effect_request_ids.remove(&effect).unwrap();
+        let missing_reverse_index = state.clone();
+        assert_eq!(
+            state.mark_input_durable_full(identity),
+            Err(GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-reverse-index"
+            ))
+        );
+        assert_eq!(state, missing_reverse_index);
+        state.effect_request_ids.insert(effect, reverse_index);
+
+        let removed_alias = state.requests.remove(&id(10)).unwrap();
+        let missing_alias = state.clone();
+        assert_eq!(
+            state.mark_input_durable_full(identity),
+            Err(GuardianProtocolError::StateInvariantViolation(
+                "input-reconciliation-request-alias"
+            ))
+        );
+        assert_eq!(state, missing_alias);
+        state.requests.insert(id(10), removed_alias);
+
+        let durable = state.mark_input_durable_full(identity).unwrap();
+        assert!(matches!(
+            durable,
+            GuardianReply::InputReceipt {
+                state: InputEffectState::DurableFull,
+                ..
+            }
+        ));
+        for request_id in [id(8), id(10)] {
+            assert_eq!(&state.requests.get(&request_id).unwrap().reply, &durable);
+        }
+        assert!(matches!(
+            state.pane_state(pane),
+            Some(GuardianPaneState::LiveClaimed {
+                pending_input_effect: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn definitively_unapplied_input_is_distinct_and_exact_retries_are_inert() {
         let guardian = id(1);
         let mux = id(2);
         let pane = id(3);
@@ -5801,20 +8682,26 @@ mod tests {
             b"journal-first-input",
         );
         apply_request(&mut state, &input).unwrap();
+        let known_not_applied = state
+            .mark_input_known_not_applied(input_effect_identity(&input))
+            .unwrap();
         assert_eq!(
-            state
-                .mark_input_terminal_rejected(input_effect_identity(&input))
-                .unwrap(),
+            known_not_applied,
             GuardianReply::InputReceipt {
                 pane_id: pane,
                 generation: 1,
                 sequence: 1,
                 effect_id: effect,
-                state: InputEffectState::TerminalRejected,
+                state: InputEffectState::KnownNotApplied,
             }
         );
         assert_eq!(
-            state.mark_input_durable(input_effect_identity(&input)),
+            apply_request(&mut state, &input).unwrap(),
+            known_not_applied,
+            "a known-zero effect retry must return its original receipt without reapplying input"
+        );
+        assert_eq!(
+            state.mark_input_durable_full(input_effect_identity(&input)),
             Err(GuardianProtocolError::InputDurabilityIdentityMismatch)
         );
         let successor = request(
@@ -6021,7 +8908,7 @@ mod tests {
         ));
 
         state
-            .mark_input_durable(input_effect_identity(&input))
+            .mark_input_durable_prefix(input_effect_identity(&input), 5)
             .unwrap();
         assert!(state.transient_effect_order.contains(&input_effect));
         apply_request(&mut state, &resize(18, 19, 3)).unwrap();
@@ -6051,13 +8938,22 @@ mod tests {
             },
             "an evicted receipt below the durable sequence fence must never masquerade as safe to resend"
         );
-        assert_eq!(
-            apply_request(&mut state, &input),
-            Err(GuardianProtocolError::RepeatedSequence {
-                expected: 2,
-                observed: 1,
+        let stale_retry_callback = std::cell::Cell::new(false);
+        assert!(matches!(
+            state.apply_effect_transaction_inner(&authenticate(&input), |_| {
+                stale_retry_callback.set(true);
+                Ok::<(), std::convert::Infallible>(())
             }),
-            "receipt eviction must never permit a second input effect"
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::RepeatedSequence {
+                    expected: 2,
+                    observed: 1,
+                }
+            ))
+        ));
+        assert!(
+            !stale_retry_callback.get(),
+            "receipt eviction must never permit a known prefix to be applied again"
         );
 
         let stale_durability_identity = input_effect_identity(&input);
@@ -6131,7 +9027,7 @@ mod tests {
             "receipt-window uncertainty is a query result, never an acknowledgement of a newly accepted input"
         );
         assert_eq!(
-            state.mark_input_durable(stale_durability_identity),
+            state.mark_input_durable_prefix(stale_durability_identity, 5),
             Err(GuardianProtocolError::InputDurabilityIdentityMismatch),
             "a delayed journal acknowledgement must not complete a newer input that reused a rotated effect UUID"
         );
@@ -6144,11 +9040,11 @@ mod tests {
         ));
         assert!(matches!(
             state
-                .mark_input_durable(input_effect_identity(&reused_input))
+                .mark_input_durable_full(input_effect_identity(&reused_input))
                 .unwrap(),
             GuardianReply::InputReceipt {
                 sequence: 2,
-                state: InputEffectState::DurableEffect,
+                state: InputEffectState::DurableFull,
                 ..
             }
         ));

@@ -61,7 +61,8 @@ use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
 use crate::guardian_checkpoint::{
-    LiveParserCaptureAuthority, LiveParserCheckpointAck, LiveParserPaneCaptureError,
+    LiveParserCaptureAndBindError, LiveParserCheckpointAck,
+    capture_and_bind_live_parser_checkpoint,
 };
 use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
@@ -78,7 +79,9 @@ use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition, TermConfig};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{
+    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
+};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
@@ -1875,6 +1878,8 @@ pub(crate) enum LiveParserCheckpointError {
     GuardianDeliveryOverflow,
     #[error("raw parser delivery attempted bytes without an authenticated guardian receipt")]
     UnauthorizedGuardianDelivery,
+    #[error("guardian output delivery is still inside an exact socket-write reservation")]
+    DeliveryWriteInFlight,
     #[error("live parser checkpoint receipt is not the current registered guardian delivery")]
     CheckpointReceiptMismatch,
     #[error(
@@ -1899,12 +1904,8 @@ pub(crate) enum LiveParserCheckpointError {
     ParserWatermarkMismatch,
     #[error("live parser is inside synchronized-output hold at the exact boundary")]
     SynchronizedOutputHold,
-    #[error("pane terminal checkpoint callback failed: {0}")]
-    PaneCapture(String),
-    #[error("pane terminal checkpoint callback panicked after model mutation may have begun")]
-    PaneCapturePanicked,
-    #[error("live parser checkpoint identity binding failed: {0}")]
-    BoundaryBinding(String),
+    #[error("live parser terminal capture and identity binding failed")]
+    CaptureAndBind(#[source] LiveParserCaptureAndBindError),
     #[error("live parser delivery fence is poisoned: {0}")]
     Poisoned(&'static str),
     #[error("timed out waiting for the exact live parser checkpoint boundary")]
@@ -1918,8 +1919,14 @@ struct LiveParserGuardianCursor {
     segment_id: uuid::Uuid,
     output_sequence: u64,
     output_record_digest: [u8; 32],
-    segment_plaintext_bytes: u64,
+    output_committed_log_bytes: u64,
+    journal_cumulative_plaintext_bytes: u64,
     parser_global_endpoint: u64,
+}
+
+struct LiveParserAuthorizedDelivery {
+    cursor: LiveParserGuardianCursor,
+    payload: Arc<[u8]>,
 }
 
 impl LiveParserGuardianCursor {
@@ -1932,7 +1939,8 @@ impl LiveParserGuardianCursor {
             && output.segment_id() == self.segment_id
             && output.sequence() == self.output_sequence
             && output.record_digest() == self.output_record_digest
-            && output.cumulative_plaintext_bytes() == self.segment_plaintext_bytes
+            && output.committed_log_bytes() == self.output_committed_log_bytes
+            && output.cumulative_plaintext_bytes() == self.journal_cumulative_plaintext_bytes
     }
 }
 
@@ -1943,6 +1951,8 @@ struct PendingLiveParserCheckpoint {
     segment: GuardianOutputSegmentIdentity,
     output: GuardianOutputAppendReceipt,
     limits: TerminalCheckpointLimits,
+    expected_pane: Weak<dyn Pane>,
+    expected_generation: Weak<PaneRegistrationGeneration>,
     completion:
         Option<std::sync::mpsc::SyncSender<Result<LiveParserCheckpointAck, LiveParserCheckpointError>>>,
     capturing: bool,
@@ -1950,26 +1960,33 @@ struct PendingLiveParserCheckpoint {
 }
 
 struct LiveParserCheckpointState {
+    registration_wire_identity: [u8; 16],
     attached: bool,
     dead: bool,
     poison: Option<&'static str>,
     delivered_bytes: u64,
     parsed_bytes: u64,
+    delivery_call_in_flight: bool,
+    socket_write_in_flight: bool,
     guardian_mode: bool,
     guardian_cursor: Option<LiveParserGuardianCursor>,
-    authorized_delivery: Option<LiveParserGuardianCursor>,
+    authorized_delivery: Option<LiveParserAuthorizedDelivery>,
     next_request_id: u64,
     pending: Option<PendingLiveParserCheckpoint>,
 }
 
-impl Default for LiveParserCheckpointState {
-    fn default() -> Self {
+impl LiveParserCheckpointState {
+    fn new(registration_wire_identity: [u8; 16]) -> Self {
+        debug_assert_ne!(registration_wire_identity, [0; 16]);
         Self {
+            registration_wire_identity,
             attached: false,
             dead: false,
             poison: None,
             delivered_bytes: 0,
             parsed_bytes: 0,
+            delivery_call_in_flight: false,
+            socket_write_in_flight: false,
             guardian_mode: false,
             guardian_cursor: None,
             authorized_delivery: None,
@@ -1979,20 +1996,70 @@ impl Default for LiveParserCheckpointState {
     }
 }
 
-#[derive(Default)]
 struct LiveParserCheckpointControl {
     state: Mutex<LiveParserCheckpointState>,
     delivery_gate: Condvar,
     wake_writer: Mutex<Option<FileDescriptor>>,
 }
 
-struct LiveParserCaptureRequest {
-    request_id: u64,
-    target: u64,
-    durable_pane_id: uuid::Uuid,
-    segment: GuardianOutputSegmentIdentity,
-    output: GuardianOutputAppendReceipt,
-    limits: TerminalCheckpointLimits,
+struct LiveParserDeliveryReservation<'a> {
+    control: &'a LiveParserCheckpointControl,
+    active: bool,
+}
+
+impl LiveParserDeliveryReservation<'_> {
+    fn finish(mut self) -> std::io::Result<()> {
+        let result = self.control.finish_delivery_reservation();
+        self.active = false;
+        result
+    }
+
+    fn abort(mut self, reason: &'static str) {
+        self.control.abort_delivery_reservation(reason);
+        self.active = false;
+    }
+}
+
+impl Drop for LiveParserDeliveryReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.control.abort_delivery_reservation(
+                "delivery reservation exited before exact payload accounting",
+            );
+        }
+    }
+}
+
+struct LiveParserSocketWriteReservation<'a> {
+    control: &'a LiveParserCheckpointControl,
+    active: bool,
+}
+
+impl LiveParserSocketWriteReservation<'_> {
+    fn commit(mut self, written: usize) -> std::io::Result<()> {
+        let result = self.control.commit_socket_write(written);
+        self.active = false;
+        result
+    }
+
+    fn release_interrupted(mut self) {
+        self.control.release_socket_write_reservation();
+        self.active = false;
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for LiveParserSocketWriteReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.control.abort_socket_write_reservation(
+                "socket write reservation exited before exact byte accounting",
+            );
+        }
+    }
 }
 
 enum LiveParserAttemptOutcome {
@@ -2001,38 +2068,66 @@ enum LiveParserAttemptOutcome {
     Fatal,
 }
 
+struct LiveParserWorkerGuard {
+    control: Arc<LiveParserCheckpointControl>,
+    dead: Arc<AtomicBool>,
+}
+
+impl Drop for LiveParserWorkerGuard {
+    fn drop(&mut self) {
+        self.dead.store(true, Ordering::Release);
+        self.control.mark_dead();
+    }
+}
+
 impl LiveParserCheckpointControl {
-    fn attach_wake_writer(&self, writer: FileDescriptor) -> Result<(), LiveParserCheckpointError> {
-        {
-            let mut state = self.state.lock();
-            if state.dead {
-                return Err(LiveParserCheckpointError::ReaderDead);
-            }
-            if state.attached {
-                return Err(LiveParserCheckpointError::ReaderUnavailable);
-            }
-            state.attached = true;
+    fn new(registration_wire_identity: [u8; 16]) -> Self {
+        Self {
+            state: Mutex::new(LiveParserCheckpointState::new(registration_wire_identity)),
+            delivery_gate: Condvar::new(),
+            wake_writer: Mutex::new(None),
         }
-        *self.wake_writer.lock() = Some(writer);
+    }
+
+    fn attach_wake_writer(&self, writer: FileDescriptor) -> Result<(), LiveParserCheckpointError> {
+        let mut wake_writer = self.wake_writer.lock();
+        let mut state = self.state.lock();
+        if state.dead {
+            return Err(LiveParserCheckpointError::ReaderDead);
+        }
+        if state.attached || wake_writer.is_some() {
+            return Err(LiveParserCheckpointError::ReaderUnavailable);
+        }
+        *wake_writer = Some(writer);
+        state.attached = true;
         Ok(())
     }
 
     fn wake_parser(&self) {
-        let result = {
-            let mut writer = self.wake_writer.lock();
-            match writer.as_mut() {
-                Some(writer) => writer.write(&[1_u8]),
-                None => return self.poison("checkpoint control writer is unavailable"),
+        loop {
+            let result = {
+                let mut writer = self.wake_writer.lock();
+                match writer.as_mut() {
+                    Some(writer) => writer.write(&[1_u8]),
+                    None => return self.poison("checkpoint control writer is unavailable"),
+                }
+            };
+            match result {
+                Ok(1) => return,
+                Ok(_) => {
+                    self.poison("checkpoint control wake was partially written");
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // A prior wake remains queued. The parser will observe it.
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    self.poison("checkpoint control wake failed");
+                    return;
+                }
             }
-        };
-        match result {
-            Ok(1) => {}
-            Ok(_) => self.poison("checkpoint control wake was partially written"),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                // A prior wake remains queued. The parser will observe it.
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => self.wake_parser(),
-            Err(_) => self.poison("checkpoint control wake failed"),
         }
     }
 
@@ -2049,31 +2144,312 @@ impl LiveParserCheckpointControl {
         }
     }
 
+    fn poison_locked(
+        state: &mut LiveParserCheckpointState,
+        reason: &'static str,
+    ) -> &'static str {
+        let canonical_reason = match state.poison {
+            Some(canonical_reason) => canonical_reason,
+            None => {
+                state.poison = Some(reason);
+                reason
+            }
+        };
+        Self::fail_pending_locked(
+            state,
+            LiveParserCheckpointError::Poisoned(canonical_reason),
+        );
+        canonical_reason
+    }
+
     fn poison(&self, reason: &'static str) {
         {
             let mut state = self.state.lock();
-            if state.poison.is_none() {
-                state.poison = Some(reason);
-            }
-            Self::fail_pending_locked(&mut state, LiveParserCheckpointError::Poisoned(reason));
+            Self::poison_locked(&mut state, reason);
         }
         self.delivery_gate.notify_all();
+    }
+
+    fn begin_delivery_reservation<'a>(
+        &'a self,
+        bytes: &[u8],
+    ) -> std::io::Result<LiveParserDeliveryReservation<'a>> {
+        let mut state = self.state.lock();
+        loop {
+            if state.dead {
+                return Err(std::io::Error::other(
+                    LiveParserCheckpointError::ReaderDead.to_string(),
+                ));
+            }
+            if let Some(reason) = state.poison {
+                return Err(std::io::Error::other(
+                    LiveParserCheckpointError::Poisoned(reason).to_string(),
+                ));
+            }
+            if state.delivery_call_in_flight
+                || state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| state.delivered_bytes == pending.target)
+            {
+                self.delivery_gate.wait(&mut state);
+                continue;
+            }
+            break;
+        }
+
+        if state.guardian_mode && state.authorized_delivery.is_none() {
+            Self::poison_locked(
+                &mut state,
+                "unauthorized bytes followed an authenticated delivery",
+            );
+            drop(state);
+            self.delivery_gate.notify_all();
+            return Err(std::io::Error::other(
+                LiveParserCheckpointError::UnauthorizedGuardianDelivery.to_string(),
+            ));
+        }
+        if state.guardian_mode
+            && !state
+                .authorized_delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.payload.as_ref() == bytes)
+        {
+            Self::poison_locked(
+                &mut state,
+                "parser delivery bytes did not match the authenticated guardian payload",
+            );
+            drop(state);
+            self.delivery_gate.notify_all();
+            return Err(std::io::Error::other(
+                "parser delivery did not match authenticated guardian payload",
+            ));
+        }
+
+        state.delivery_call_in_flight = true;
+        Ok(LiveParserDeliveryReservation {
+            control: self,
+            active: true,
+        })
+    }
+
+    fn finish_delivery_reservation(&self) -> std::io::Result<()> {
+        let mut wake_parser = false;
+        let result = {
+            let mut state = self.state.lock();
+            if !state.delivery_call_in_flight || state.socket_write_in_flight {
+                Self::poison_locked(
+                    &mut state,
+                    "delivery reservation finished with uncommitted socket accounting",
+                );
+                state.delivery_call_in_flight = false;
+                state.socket_write_in_flight = false;
+                Err(std::io::Error::other(
+                    "delivery reservation finished without exact accounting",
+                ))
+            } else {
+                state.delivery_call_in_flight = false;
+                wake_parser = state.pending.as_ref().is_some_and(|pending| {
+                    state.delivered_bytes == pending.target
+                        && state.parsed_bytes == pending.target
+                });
+                if let Some(reason) = state.poison {
+                    Err(std::io::Error::other(
+                        LiveParserCheckpointError::Poisoned(reason).to_string(),
+                    ))
+                } else if state.dead {
+                    Err(std::io::Error::other(
+                        LiveParserCheckpointError::ReaderDead.to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        self.delivery_gate.notify_all();
+        if wake_parser {
+            self.wake_parser();
+        }
+        result
+    }
+
+    fn abort_delivery_reservation(&self, reason: &'static str) {
+        {
+            let mut state = self.state.lock();
+            state.delivery_call_in_flight = false;
+            state.socket_write_in_flight = false;
+            Self::poison_locked(&mut state, reason);
+        }
+        self.delivery_gate.notify_all();
+        self.wake_parser();
+    }
+
+    fn begin_socket_write_reservation(
+        &self,
+    ) -> std::io::Result<LiveParserSocketWriteReservation<'_>> {
+        let mut state = self.state.lock();
+        if !state.delivery_call_in_flight || state.socket_write_in_flight {
+            Self::poison_locked(
+                &mut state,
+                "socket write reservation violated single-writer accounting",
+            );
+            drop(state);
+            self.delivery_gate.notify_all();
+            return Err(std::io::Error::other(
+                "socket write reservation violated exact accounting",
+            ));
+        }
+        if state.dead {
+            return Err(std::io::Error::other(
+                LiveParserCheckpointError::ReaderDead.to_string(),
+            ));
+        }
+        if let Some(reason) = state.poison {
+            return Err(std::io::Error::other(
+                LiveParserCheckpointError::Poisoned(reason).to_string(),
+            ));
+        }
+        state.socket_write_in_flight = true;
+        Ok(LiveParserSocketWriteReservation {
+            control: self,
+            active: true,
+        })
+    }
+
+    fn release_socket_write_reservation(&self) {
+        {
+            let mut state = self.state.lock();
+            state.socket_write_in_flight = false;
+        }
+        self.delivery_gate.notify_all();
+    }
+
+    fn abort_socket_write_reservation(&self, reason: &'static str) {
+        {
+            let mut state = self.state.lock();
+            state.socket_write_in_flight = false;
+            Self::poison_locked(&mut state, reason);
+        }
+        self.delivery_gate.notify_all();
+        self.wake_parser();
+    }
+
+    fn commit_socket_write(&self, written: usize) -> std::io::Result<()> {
+        let mut wake_parser = false;
+        let result = {
+            let mut state = self.state.lock();
+            if !state.delivery_call_in_flight || !state.socket_write_in_flight || written == 0 {
+                state.socket_write_in_flight = false;
+                Self::poison_locked(
+                    &mut state,
+                    "socket write completed outside its exact accounting reservation",
+                );
+                Err(std::io::Error::other(
+                    "socket write completed outside exact accounting",
+                ))
+            } else {
+                let written = match u64::try_from(written) {
+                    Ok(written) => written,
+                    Err(_) => {
+                        state.socket_write_in_flight = false;
+                        Self::poison_locked(
+                            &mut state,
+                            "socket write length did not fit delivery accounting",
+                        );
+                        drop(state);
+                        self.delivery_gate.notify_all();
+                        self.wake_parser();
+                        return Err(std::io::Error::other(
+                            "socket write length overflowed delivery accounting",
+                        ));
+                    }
+                };
+                let next = match state.delivered_bytes.checked_add(written) {
+                    Some(next) => next,
+                    None => {
+                        state.socket_write_in_flight = false;
+                        Self::poison_locked(
+                            &mut state,
+                            "socket delivery watermark overflowed",
+                        );
+                        drop(state);
+                        self.delivery_gate.notify_all();
+                        self.wake_parser();
+                        return Err(std::io::Error::other(
+                            "socket delivery watermark overflowed",
+                        ));
+                    }
+                };
+                let authorized_target = state
+                    .authorized_delivery
+                    .as_ref()
+                    .map(|delivery| delivery.cursor.parser_global_endpoint);
+                let checkpoint_target = state.pending.as_ref().map(|pending| pending.target);
+                if authorized_target.is_some_and(|target| next > target)
+                    || checkpoint_target.is_some_and(|target| next > target)
+                {
+                    state.socket_write_in_flight = false;
+                    Self::poison_locked(
+                        &mut state,
+                        "socket write crossed an exact guardian delivery fence",
+                    );
+                    Err(std::io::Error::other(
+                        "socket write crossed an exact guardian delivery fence",
+                    ))
+                } else {
+                    state.delivered_bytes = next;
+                    if authorized_target == Some(next) {
+                        let completed = state.authorized_delivery.take();
+                        state.guardian_cursor = completed.map(|delivery| delivery.cursor);
+                    }
+                    wake_parser = checkpoint_target == Some(next);
+                    state.socket_write_in_flight = false;
+                    Ok(())
+                }
+            }
+        };
+        self.delivery_gate.notify_all();
+        if wake_parser || result.is_err() {
+            self.wake_parser();
+        }
+        result
     }
 
     fn mark_dead(&self) {
         {
             let mut state = self.state.lock();
-            if state.dead {
-                return;
-            }
             state.dead = true;
             if let Some(pending) = state.pending.as_ref() {
-                let error = LiveParserCheckpointError::IncompleteBoundary {
-                    delivered: state.delivered_bytes,
-                    parsed: state.parsed_bytes,
-                    target: pending.target,
+                let error = if state.delivered_bytes < pending.target
+                    || state.parsed_bytes < pending.target
+                {
+                    LiveParserCheckpointError::IncompleteBoundary {
+                        delivered: state.delivered_bytes,
+                        parsed: state.parsed_bytes,
+                        target: pending.target,
+                    }
+                } else {
+                    LiveParserCheckpointError::ReaderDead
                 };
                 Self::fail_pending_locked(&mut state, error);
+            }
+        }
+        self.delivery_gate.notify_all();
+    }
+
+    fn mark_registration_retired(&self) {
+        {
+            let mut state = self.state.lock();
+            state.dead = true;
+            let fail_now = state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| !pending.capturing);
+            if fail_now {
+                Self::fail_pending_locked(
+                    &mut state,
+                    LiveParserCheckpointError::StaleRegistration,
+                );
             }
         }
         self.delivery_gate.notify_all();
@@ -2084,6 +2460,7 @@ impl LiveParserCheckpointControl {
         durable_pane_id: uuid::Uuid,
         segment: GuardianOutputSegmentIdentity,
         output: GuardianOutputAppendReceipt,
+        payload: Arc<[u8]>,
     ) -> Result<u64, LiveParserCheckpointError> {
         let mut state = self.state.lock();
         if !state.attached {
@@ -2094,6 +2471,9 @@ impl LiveParserCheckpointControl {
         }
         if let Some(reason) = state.poison {
             return Err(LiveParserCheckpointError::Poisoned(reason));
+        }
+        if state.delivery_call_in_flight || state.socket_write_in_flight {
+            return Err(LiveParserCheckpointError::DeliveryWriteInFlight);
         }
         if state.authorized_delivery.is_some() {
             return Err(LiveParserCheckpointError::GuardianDeliveryBusy);
@@ -2107,12 +2487,15 @@ impl LiveParserCheckpointControl {
         {
             return Err(LiveParserCheckpointError::GuardianDeliveryIdentityMismatch);
         }
+        if !output.matches_payload(payload.as_ref()) {
+            return Err(LiveParserCheckpointError::GuardianDeliveryIdentityMismatch);
+        }
 
         let payload_bytes = u64::from(output.payload_bytes());
         if payload_bytes == 0 {
             return Err(LiveParserCheckpointError::GuardianDeliveryWatermarkMismatch);
         }
-        let (expected_segment_bytes, parser_base) = match state.guardian_cursor {
+        let (expected_journal_bytes, parser_base) = match state.guardian_cursor {
             None => {
                 if state.guardian_mode
                     || state.delivered_bytes != 0
@@ -2133,11 +2516,11 @@ impl LiveParserCheckpointControl {
                 if output.sequence() != expected_sequence {
                     return Err(LiveParserCheckpointError::GuardianDeliverySequenceMismatch);
                 }
-                let expected_segment_bytes = previous
-                    .segment_plaintext_bytes
+                let expected_journal_bytes = previous
+                    .journal_cumulative_plaintext_bytes
                     .checked_add(payload_bytes)
                     .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
-                (expected_segment_bytes, previous.parser_global_endpoint)
+                (expected_journal_bytes, previous.parser_global_endpoint)
             }
             Some(previous) => {
                 let Some(predecessor) = segment.predecessor() else {
@@ -2150,15 +2533,23 @@ impl LiveParserCheckpointControl {
                 if predecessor.segment_id() != previous.segment_id
                     || predecessor.last_sequence() != previous.output_sequence
                     || predecessor.terminal_record_digest() != previous.output_record_digest
+                    || predecessor.committed_log_bytes()
+                        != previous.output_committed_log_bytes
+                    || predecessor.cumulative_plaintext_bytes()
+                        != previous.journal_cumulative_plaintext_bytes
                     || segment.first_sequence() != expected_sequence
                     || output.sequence() != expected_sequence
                 {
                     return Err(LiveParserCheckpointError::GuardianDeliveryRolloverMismatch);
                 }
-                (payload_bytes, previous.parser_global_endpoint)
+                let expected_journal_bytes = previous
+                    .journal_cumulative_plaintext_bytes
+                    .checked_add(payload_bytes)
+                    .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
+                (expected_journal_bytes, previous.parser_global_endpoint)
             }
         };
-        if output.cumulative_plaintext_bytes() != expected_segment_bytes {
+        if output.cumulative_plaintext_bytes() != expected_journal_bytes {
             return Err(LiveParserCheckpointError::GuardianDeliveryWatermarkMismatch);
         }
         if let Some(previous) = state.guardian_cursor {
@@ -2170,12 +2561,16 @@ impl LiveParserCheckpointControl {
             .checked_add(payload_bytes)
             .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
         state.guardian_mode = true;
-        state.authorized_delivery = Some(LiveParserGuardianCursor {
-            segment_id: output.segment_id(),
-            output_sequence: output.sequence(),
-            output_record_digest: output.record_digest(),
-            segment_plaintext_bytes: output.cumulative_plaintext_bytes(),
-            parser_global_endpoint,
+        state.authorized_delivery = Some(LiveParserAuthorizedDelivery {
+            cursor: LiveParserGuardianCursor {
+                segment_id: output.segment_id(),
+                output_sequence: output.sequence(),
+                output_record_digest: output.record_digest(),
+                output_committed_log_bytes: output.committed_log_bytes(),
+                journal_cumulative_plaintext_bytes: output.cumulative_plaintext_bytes(),
+                parser_global_endpoint,
+            },
+            payload,
         });
         drop(state);
         self.delivery_gate.notify_all();
@@ -2184,6 +2579,8 @@ impl LiveParserCheckpointControl {
 
     fn register_checkpoint(
         &self,
+        pane: &Arc<dyn Pane>,
+        generation: &Arc<PaneRegistrationGeneration>,
         durable_pane_id: uuid::Uuid,
         segment: GuardianOutputSegmentIdentity,
         output: GuardianOutputAppendReceipt,
@@ -2209,11 +2606,23 @@ impl LiveParserCheckpointControl {
             if let Some(reason) = state.poison {
                 return Err(LiveParserCheckpointError::Poisoned(reason));
             }
+            if state.delivery_call_in_flight || state.socket_write_in_flight {
+                return Err(LiveParserCheckpointError::DeliveryWriteInFlight);
+            }
             if state.pending.is_some() {
                 return Err(LiveParserCheckpointError::CheckpointBusy);
             }
+            if !std::ptr::eq(
+                Arc::as_ref(&generation.live_parser_checkpoint),
+                self,
+            ) || state.registration_wire_identity != generation.wire_identity
+            {
+                return Err(LiveParserCheckpointError::StaleRegistration);
+            }
             let registered = state
                 .authorized_delivery
+                .as_ref()
+                .map(|delivery| delivery.cursor)
                 .filter(|cursor| cursor.matches_receipt(segment, output))
                 .or_else(|| {
                     state
@@ -2247,6 +2656,8 @@ impl LiveParserCheckpointControl {
                 segment,
                 output,
                 limits,
+                expected_pane: Arc::downgrade(pane),
+                expected_generation: Arc::downgrade(generation),
                 completion: Some(completion),
                 capturing: false,
                 cancelled: false,
@@ -2299,20 +2710,45 @@ impl LiveParserCheckpointControl {
     }
 
     fn record_parsed_bytes(&self, parsed: usize) -> Result<u64, LiveParserCheckpointError> {
+        let Ok(parsed) = u64::try_from(parsed) else {
+            self.poison("parser byte count did not fit the live watermark");
+            return Err(LiveParserCheckpointError::Poisoned(
+                "parser byte count did not fit the live watermark",
+            ));
+        };
         let mut state = self.state.lock();
-        let parsed = u64::try_from(parsed)
-            .map_err(|_| LiveParserCheckpointError::GuardianDeliveryOverflow)?;
-        state.parsed_bytes = state
-            .parsed_bytes
-            .checked_add(parsed)
-            .ok_or(LiveParserCheckpointError::GuardianDeliveryOverflow)?;
-        if state.parsed_bytes > state.delivered_bytes {
-            state.poison = Some("parser byte watermark exceeded counted socket delivery");
+        loop {
+            if state.dead {
+                return Err(LiveParserCheckpointError::ReaderDead);
+            }
+            if let Some(reason) = state.poison {
+                return Err(LiveParserCheckpointError::Poisoned(reason));
+            }
+            let Some(next) = state.parsed_bytes.checked_add(parsed) else {
+                drop(state);
+                self.poison("parser byte watermark overflowed");
+                return Err(LiveParserCheckpointError::Poisoned(
+                    "parser byte watermark overflowed",
+                ));
+            };
+            if next <= state.delivered_bytes {
+                state.parsed_bytes = next;
+                return Ok(next);
+            }
+            if state.socket_write_in_flight {
+                // The nonblocking socket write has published bytes to the
+                // reader but has not yet committed its exact returned length.
+                // Do not misclassify that short accounting window as an
+                // overshoot; wait for the RAII reservation to commit or poison.
+                self.delivery_gate.wait(&mut state);
+                continue;
+            }
+            drop(state);
+            self.poison("parser byte watermark exceeded counted socket delivery");
             return Err(LiveParserCheckpointError::Poisoned(
                 "parser byte watermark exceeded counted socket delivery",
             ));
         }
-        Ok(state.parsed_bytes)
     }
 
     fn ready_checkpoint_target(&self) -> Result<Option<u64>, LiveParserCheckpointError> {
@@ -2320,6 +2756,9 @@ impl LiveParserCheckpointControl {
         let Some(pending) = state.pending.as_ref() else {
             return Ok(None);
         };
+        if state.delivery_call_in_flight || state.socket_write_in_flight {
+            return Ok(None);
+        }
         if state.delivered_bytes > pending.target || state.parsed_bytes > pending.target {
             return Err(LiveParserCheckpointError::BoundaryOvershot {
                 delivered: state.delivered_bytes,
@@ -2329,40 +2768,6 @@ impl LiveParserCheckpointControl {
         }
         Ok((state.delivered_bytes == pending.target && state.parsed_bytes == pending.target)
             .then_some(pending.target))
-    }
-
-    fn begin_capture(
-        &self,
-        target: u64,
-    ) -> Result<Option<LiveParserCaptureRequest>, LiveParserCheckpointError> {
-        let mut state = self.state.lock();
-        let Some(pending) = state.pending.as_mut() else {
-            return Ok(None);
-        };
-        if pending.cancelled {
-            state.pending.take();
-            drop(state);
-            self.delivery_gate.notify_all();
-            return Ok(None);
-        }
-        if pending.target != target
-            || state.delivered_bytes != target
-            || state.parsed_bytes != target
-        {
-            return Err(LiveParserCheckpointError::ParserWatermarkMismatch);
-        }
-        if pending.capturing {
-            return Ok(None);
-        }
-        pending.capturing = true;
-        Ok(Some(LiveParserCaptureRequest {
-            request_id: pending.request_id,
-            target,
-            durable_pane_id: pending.durable_pane_id,
-            segment: pending.segment,
-            output: pending.output,
-            limits: pending.limits,
-        }))
     }
 
     fn reject_ready_checkpoint(&self, error: LiveParserCheckpointError) {
@@ -2406,17 +2811,29 @@ impl LiveParserCheckpointControl {
         writer: &mut FileDescriptor,
         bytes: &[u8],
     ) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let delivery_reservation = self.begin_delivery_reservation(bytes)?;
         let mut offset = 0;
         let mut wrote_any = false;
         while offset < bytes.len() {
             let mut state = self.state.lock();
             loop {
                 if state.dead {
+                    drop(state);
+                    delivery_reservation.abort(if wrote_any {
+                        "reader died after a partial exact delivery"
+                    } else {
+                        "reader died during an exact delivery reservation"
+                    });
                     return Err(std::io::Error::other(
                         LiveParserCheckpointError::ReaderDead.to_string(),
                     ));
                 }
                 if let Some(reason) = state.poison {
+                    drop(state);
+                    delivery_reservation.abort(reason);
                     return Err(std::io::Error::other(
                         LiveParserCheckpointError::Poisoned(reason).to_string(),
                     ));
@@ -2432,110 +2849,138 @@ impl LiveParserCheckpointControl {
                 break;
             }
 
-            if state.guardian_mode && state.authorized_delivery.is_none() {
-                state.poison = Some("unauthorized bytes followed an authenticated delivery");
-                Self::fail_pending_locked(
-                    &mut state,
-                    LiveParserCheckpointError::UnauthorizedGuardianDelivery,
-                );
-                drop(state);
-                self.delivery_gate.notify_all();
-                return Err(std::io::Error::other(
-                    LiveParserCheckpointError::UnauthorizedGuardianDelivery.to_string(),
-                ));
-            }
-
             let mut allowance = bytes.len() - offset;
-            if let Some(delivery) = state.authorized_delivery {
-                if state.delivered_bytes > delivery.parser_global_endpoint {
-                    state.poison = Some("guardian delivery endpoint was overshot");
+            if let Some(delivery_target) = state
+                .authorized_delivery
+                .as_ref()
+                .map(|delivery| delivery.cursor.parser_global_endpoint)
+            {
+                if state.delivered_bytes > delivery_target {
                     drop(state);
-                    self.poison("guardian delivery endpoint was overshot");
+                    delivery_reservation.abort("guardian delivery endpoint was overshot");
                     return Err(std::io::Error::other("guardian delivery endpoint was overshot"));
                 }
-                let remaining = delivery.parser_global_endpoint - state.delivered_bytes;
+                let remaining = delivery_target - state.delivered_bytes;
                 allowance = allowance.min(usize::try_from(remaining).unwrap_or(usize::MAX));
             }
-            if let Some(pending) = state.pending.as_ref() {
-                if state.delivered_bytes > pending.target {
-                    state.poison = Some("live parser delivery fence was overshot");
+            if let Some(pending_target) = state.pending.as_ref().map(|pending| pending.target) {
+                if state.delivered_bytes > pending_target {
                     drop(state);
-                    self.poison("live parser delivery fence was overshot");
+                    delivery_reservation.abort("live parser delivery fence was overshot");
                     return Err(std::io::Error::other("live parser delivery fence was overshot"));
                 }
-                let remaining = pending.target - state.delivered_bytes;
+                let remaining = pending_target - state.delivered_bytes;
                 allowance = allowance.min(usize::try_from(remaining).unwrap_or(usize::MAX));
             }
             if allowance == 0 {
                 drop(state);
-                continue;
+                delivery_reservation.abort(
+                    "delivery allowance reached zero before the exact payload completed",
+                );
+                return Err(std::io::Error::other(
+                    "delivery allowance reached zero before payload completion",
+                ));
             }
+            drop(state);
 
+            let mut socket_reservation = match self.begin_socket_write_reservation() {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    delivery_reservation.abort(if wrote_any {
+                        "partial delivery lost its socket accounting reservation"
+                    } else {
+                        "delivery lost its socket accounting reservation"
+                    });
+                    return Err(error);
+                }
+            };
             match writer.write(&bytes[offset..offset + allowance]) {
                 Ok(0) => {
-                    state.poison = Some(if wrote_any {
+                    socket_reservation.disarm();
+                    let reason = if wrote_any {
                         "partial socket write left delivery ambiguous"
                     } else {
                         "parser socket write returned zero"
-                    });
-                    let reason = state.poison.expect("poison just assigned");
-                    Self::fail_pending_locked(
-                        &mut state,
-                        LiveParserCheckpointError::Poisoned(reason),
-                    );
-                    drop(state);
-                    self.delivery_gate.notify_all();
+                    };
+                    delivery_reservation.abort(reason);
                     return Err(std::io::Error::other(reason));
                 }
                 Ok(written) => {
-                    wrote_any = true;
-                    let written_u64 = u64::try_from(written)
-                        .map_err(|_| std::io::Error::other("socket write length overflow"))?;
-                    state.delivered_bytes = match state.delivered_bytes.checked_add(written_u64) {
-                        Some(delivered) => delivered,
-                        None => {
-                            state.poison = Some("socket delivery watermark overflowed");
-                            drop(state);
-                            self.poison("socket delivery watermark overflowed");
-                            return Err(std::io::Error::other(
-                                "socket delivery watermark overflowed",
-                            ));
-                        }
-                    };
-                    offset += written;
-                    if state.authorized_delivery.is_some_and(|delivery| {
-                        delivery.parser_global_endpoint == state.delivered_bytes
-                    }) {
-                        state.guardian_cursor = state.authorized_delivery.take();
+                    if written > allowance {
+                        socket_reservation.disarm();
+                        delivery_reservation
+                            .abort("socket writer reported more bytes than were reserved");
+                        return Err(std::io::Error::other(
+                            "socket writer exceeded its exact reservation",
+                        ));
                     }
-                    let wake = state
-                        .pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.target == state.delivered_bytes);
-                    drop(state);
-                    if wake {
-                        self.wake_parser();
+                    if let Err(error) = socket_reservation.commit(written) {
+                        delivery_reservation
+                            .abort("socket write could not commit exact delivery accounting");
+                        return Err(error);
+                    }
+                    wrote_any = true;
+                    offset += written;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    socket_reservation.release_interrupted();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    socket_reservation.release_interrupted();
+                    if let Err(wait_error) = wait_for_parser_socket_writable(writer) {
+                        delivery_reservation.abort(if wrote_any {
+                            "partial socket delivery lost writable readiness"
+                        } else {
+                            "parser socket writable readiness failed"
+                        });
+                        return Err(wait_error);
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => {
+                    socket_reservation.disarm();
                     let reason = if wrote_any {
                         "partial socket write left delivery ambiguous"
                     } else {
                         "parser socket write failed"
                     };
-                    state.poison = Some(reason);
-                    Self::fail_pending_locked(
-                        &mut state,
-                        LiveParserCheckpointError::Poisoned(reason),
-                    );
-                    drop(state);
-                    self.delivery_gate.notify_all();
+                    delivery_reservation.abort(reason);
                     return Err(error);
                 }
             }
         }
-        Ok(())
+        delivery_reservation.finish()
+    }
+}
+
+fn wait_for_parser_socket_writable(writer: &FileDescriptor) -> std::io::Result<()> {
+    loop {
+        let mut readiness = [pollfd {
+            fd: writer.as_socket_descriptor(),
+            events: POLLOUT,
+            revents: 0,
+        }];
+        match poll(&mut readiness, None) {
+            Ok(0) => {}
+            Ok(_) => return Ok(()),
+            Err(error) if filedescriptor_error_is_interrupted(&error) => {}
+            Err(error) => return Err(filedescriptor_error_into_io(error)),
+        }
+    }
+}
+
+fn filedescriptor_error_is_interrupted(error: &filedescriptor::Error) -> bool {
+    match error {
+        filedescriptor::Error::Poll(source) | filedescriptor::Error::Io(source) => {
+            source.kind() == std::io::ErrorKind::Interrupted
+        }
+        _ => false,
+    }
+}
+
+fn filedescriptor_error_into_io(error: filedescriptor::Error) -> std::io::Error {
+    match error {
+        filedescriptor::Error::Poll(source) | filedescriptor::Error::Io(source) => source,
+        other => std::io::Error::other(other),
     }
 }
 
@@ -2583,12 +3028,13 @@ impl PaneRegistrationGeneration {
         retirement_tracker: &Arc<PaneRetirementTracker>,
         owner: Weak<Mux>,
     ) -> Arc<Self> {
+        let wire_identity = *uuid::Uuid::new_v4().as_bytes();
         Arc::new(Self {
             pane_id,
-            wire_identity: *uuid::Uuid::new_v4().as_bytes(),
+            wire_identity,
             operation_state: AtomicUsize::new(0),
             reader_dead: Arc::new(AtomicBool::new(false)),
-            live_parser_checkpoint: Arc::new(LiveParserCheckpointControl::default()),
+            live_parser_checkpoint: Arc::new(LiveParserCheckpointControl::new(wire_identity)),
             retirement_tracker: Arc::downgrade(retirement_tracker),
             owner,
             cleanup: Mutex::new(PaneRetirementCleanupState::Unattached),
@@ -2625,7 +3071,7 @@ impl PaneRegistrationGeneration {
 
     fn retire(self: &Arc<Self>) {
         self.reader_dead.store(true, Ordering::Release);
-        self.live_parser_checkpoint.mark_dead();
+        self.live_parser_checkpoint.mark_registration_retired();
         let mut state = self.operation_state.load(Ordering::Acquire);
         loop {
             if state & PANE_REGISTRATION_RETIRED != 0 {
@@ -3403,6 +3849,129 @@ mod pane_registration_handle {
         /// Clients must treat every same-ID successor as new authority.
         pub fn wire_identity(&self) -> [u8; 16] {
             self.generation.wire_identity
+        }
+
+        /// Register one authenticated guardian receipt as the exact next byte
+        /// span this reader may publish to its parser socket. The future
+        /// guardian journal caller must invoke this for every receipt, before
+        /// delivering that receipt's exact owned bytes; receipt length alone is
+        /// insufficient, and raw PTY delivery never synthesizes this authority.
+        #[allow(
+            dead_code,
+            reason = "production guardian journal delivery caller lands after the protocol effect"
+        )]
+        pub(crate) fn authorize_guardian_output_delivery(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            output: GuardianOutputAppendReceipt,
+            payload: Arc<[u8]>,
+        ) -> Result<u64, LiveParserCheckpointError> {
+            let pane = Arc::clone(&self.pane);
+            let mux = Arc::clone(&self.owner);
+            let durable_pane_id = pane
+                .durable_pane_id()
+                .map(uuid::Uuid::from_bytes)
+                .ok_or(LiveParserCheckpointError::MissingDurablePaneIdentity)?;
+            if durable_pane_id.is_nil() {
+                return Err(LiveParserCheckpointError::NilDurablePaneIdentity);
+            }
+            let endpoint = self.generation.live_parser_checkpoint.authorize_guardian_delivery(
+                durable_pane_id,
+                segment,
+                output,
+                payload,
+            )?;
+            let remains_current = {
+                let _registration = mux.pane_registration.lock();
+                mux.panes
+                    .read()
+                    .get(&self.generation.pane_id)
+                    .is_some_and(|registered| {
+                        Arc::ptr_eq(&registered.pane, &pane)
+                            && Arc::ptr_eq(&registered.generation, &self.generation)
+                    })
+            };
+            if remains_current {
+                Ok(endpoint)
+            } else {
+                Err(LiveParserCheckpointError::StaleRegistration)
+            }
+        }
+
+        /// Freeze this exact live parser registration at the authenticated
+        /// receipt already registered by `authorize_guardian_output_delivery`.
+        /// The operation lease spans registration, bounded wait, capture, and
+        /// final registry revalidation.
+        #[allow(
+            dead_code,
+            reason = "production guardian checkpoint caller lands after the protocol effect"
+        )]
+        pub(crate) fn capture_live_parser_checkpoint(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            output: GuardianOutputAppendReceipt,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+        ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
+            if timeout.is_zero() || timeout > LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT {
+                return Err(LiveParserCheckpointError::InvalidTimeout);
+            }
+            let pane = Arc::clone(&self.pane);
+            let mux = Arc::clone(&self.owner);
+            let durable_pane_id = pane
+                .durable_pane_id()
+                .map(uuid::Uuid::from_bytes)
+                .ok_or(LiveParserCheckpointError::MissingDurablePaneIdentity)?;
+            if durable_pane_id.is_nil() {
+                return Err(LiveParserCheckpointError::NilDurablePaneIdentity);
+            }
+            let (request_id, completion) = self
+                .generation
+                .live_parser_checkpoint
+                .register_checkpoint(
+                    &pane,
+                    &self.generation,
+                    durable_pane_id,
+                    segment,
+                    output,
+                    limits,
+                )?;
+            let result = match completion.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.generation
+                        .live_parser_checkpoint
+                        .cancel_checkpoint(request_id);
+                    Err(LiveParserCheckpointError::Timeout)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.generation
+                        .live_parser_checkpoint
+                        .cancel_checkpoint(request_id);
+                    Err(LiveParserCheckpointError::CompletionDisconnected)
+                }
+            };
+            if result.is_ok() {
+                let remains_current = {
+                    let _registration = mux.pane_registration.lock();
+                    mux.panes
+                        .read()
+                        .get(&self.generation.pane_id)
+                        .is_some_and(|registered| {
+                            Arc::ptr_eq(&registered.pane, &pane)
+                                && Arc::ptr_eq(&registered.generation, &self.generation)
+                        })
+                };
+                if !remains_current {
+                    return Err(LiveParserCheckpointError::StaleRegistration);
+                }
+            }
+            result
+        }
+
+        #[cfg(test)]
+        pub(super) fn live_parser_test_generation(&self) -> Arc<PaneRegistrationGeneration> {
+            Arc::clone(&self.generation)
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -8449,11 +9018,182 @@ fn send_actions_to_mux_with_scheduler_state(
     histogram!("send_actions_to_mux.rate").record(1.);
 }
 
+fn drain_live_parser_checkpoint_wake(
+    control: &LiveParserCheckpointControl,
+    wake_reader: &mut FileDescriptor,
+) -> bool {
+    let mut wake_bytes = [0_u8; 64];
+    loop {
+        match wake_reader.read(&mut wake_bytes) {
+            Ok(0) => {
+                control.poison("checkpoint control socket closed");
+                return false;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(_) => {
+                control.poison("checkpoint control socket read failed");
+                return false;
+            }
+        }
+    }
+}
+
+fn attempt_live_parser_checkpoint(
+    pane: &Weak<dyn Pane>,
+    generation: &Arc<PaneRegistrationGeneration>,
+    dead: &Arc<AtomicBool>,
+    parser: &termwiz::escape::parser::Parser,
+    actions: &mut Vec<Action>,
+    hold: &SynchronizedOutputHold,
+) -> LiveParserAttemptOutcome {
+    let control = &generation.live_parser_checkpoint;
+    let target = match control.ready_checkpoint_target() {
+        Ok(Some(target)) => target,
+        Ok(None) => return LiveParserAttemptOutcome::NoRequest,
+        Err(error) => {
+            control.reject_ready_checkpoint(error);
+            control.poison("live parser checkpoint target was overshot");
+            return LiveParserAttemptOutcome::Fatal;
+        }
+    };
+    if hold.is_holding() {
+        control.reject_ready_checkpoint(LiveParserCheckpointError::SynchronizedOutputHold);
+        return LiveParserAttemptOutcome::Completed;
+    }
+    let Some(ground) = parser.recovery_ground_boundary() else {
+        control.reject_ready_checkpoint(LiveParserCheckpointError::ParserNotRecoveryGround);
+        return LiveParserAttemptOutcome::Completed;
+    };
+    if ground.stream_bytes() != target {
+        control.poison("external parser recovery watermark disagreed with delivery fence");
+        return LiveParserAttemptOutcome::Fatal;
+    }
+    let request = match control.begin_capture(target) {
+        Ok(Some(request)) => request,
+        Ok(None) => return LiveParserAttemptOutcome::NoRequest,
+        Err(error) => {
+            control.reject_ready_checkpoint(error);
+            control.poison("live parser capture admission lost its exact watermark");
+            return LiveParserAttemptOutcome::Fatal;
+        }
+    };
+    let Some(pane) = pane.upgrade() else {
+        control.complete_capture(
+            request.request_id(),
+            Err(LiveParserCheckpointError::StaleRegistration),
+        );
+        return LiveParserAttemptOutcome::Completed;
+    };
+    if pane
+        .durable_pane_id()
+        .map(uuid::Uuid::from_bytes)
+        .is_none_or(|durable| durable != request.durable_pane_id())
+    {
+        control.complete_capture(
+            request.request_id(),
+            Err(LiveParserCheckpointError::StaleRegistration),
+        );
+        return LiveParserAttemptOutcome::Completed;
+    }
+    let Some(mux) = resolve_pane_reader_mux(&pane, generation) else {
+        control.complete_capture(
+            request.request_id(),
+            Err(LiveParserCheckpointError::StaleRegistration),
+        );
+        return LiveParserAttemptOutcome::Completed;
+    };
+    // This parser-side lease remains live even if the waiting caller times out
+    // and drops its own lease during a bounded terminal serialization.
+    let Some(capture_operation) = generation.try_acquire() else {
+        control.complete_capture(
+            request.request_id(),
+            Err(LiveParserCheckpointError::StaleRegistration),
+        );
+        return LiveParserAttemptOutcome::Completed;
+    };
+    let output = if actions.is_empty() {
+        None
+    } else {
+        match mux.reserve_pane_output_for_reader(
+            &pane,
+            generation,
+            promise::spawn::is_scheduler_configured(),
+        ) {
+            Some(output) => Some(output),
+            None => {
+                control.complete_capture(
+                    request.request_id(),
+                    Err(LiveParserCheckpointError::StaleRegistration),
+                );
+                return LiveParserAttemptOutcome::Completed;
+            }
+        }
+    };
+
+    let capture = catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        std::panic::AssertUnwindSafe(|| {
+            capture_and_bind_live_parser_checkpoint(
+                &pane,
+                &capture_operation,
+                &request,
+                actions,
+                ground,
+            )
+        }),
+    );
+    if let Some(output) = output {
+        output.finish();
+    }
+    let ack = match capture {
+        Err(_) => {
+            control.poison("pane checkpoint callback panicked");
+            dead.store(true, Ordering::Release);
+            return LiveParserAttemptOutcome::Fatal;
+        }
+        Ok(Err(error)) => {
+            if matches!(&error, LiveParserCaptureAndBindError::Pane(_)) {
+                control.complete_capture(
+                    request.request_id(),
+                    Err(LiveParserCheckpointError::CaptureAndBind(error)),
+                );
+                return LiveParserAttemptOutcome::Completed;
+            }
+            control.poison("live parser capture returned an inconsistent boundary");
+            dead.store(true, Ordering::Release);
+            return LiveParserAttemptOutcome::Fatal;
+        }
+        Ok(Ok(ack)) => ack,
+    };
+    let remains_current = {
+        let _registration = mux.pane_registration.lock();
+        mux.panes
+            .read()
+            .get(&generation.pane_id)
+            .is_some_and(|registered| {
+                Arc::ptr_eq(&registered.pane, &pane)
+                    && Arc::ptr_eq(&registered.generation, generation)
+            })
+    };
+    if !remains_current {
+        control.complete_capture(
+            request.request_id(),
+            Err(LiveParserCheckpointError::StaleRegistration),
+        );
+        return LiveParserAttemptOutcome::Completed;
+    }
+    control.complete_capture(request.request_id(), Ok(ack));
+    LiveParserAttemptOutcome::Completed
+}
+
 fn parse_buffered_data(
     pane: Weak<dyn Pane>,
     generation: Arc<PaneRegistrationGeneration>,
     dead: &Arc<AtomicBool>,
     mut rx: FileDescriptor,
+    mut checkpoint_wake_rx: FileDescriptor,
 ) {
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
@@ -8461,16 +9201,137 @@ fn parse_buffered_data(
     let mut hold = SynchronizedOutputHold::default();
     let mut action_size: usize = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
-    let mut deadline = None;
+    let mut deadline: Option<Instant> = None;
 
     loop {
-        match rx.read(&mut buf) {
-            Ok(size) if size == 0 => {
+        match attempt_live_parser_checkpoint(
+            &pane,
+            &generation,
+            dead,
+            &parser,
+            &mut actions,
+            &hold,
+        ) {
+            LiveParserAttemptOutcome::Fatal => break,
+            LiveParserAttemptOutcome::Completed if actions.is_empty() => {
+                action_size = 0;
+                deadline = None;
+            }
+            LiveParserAttemptOutcome::Completed | LiveParserAttemptOutcome::NoRequest => {}
+        }
+
+        let poll_delay = if !actions.is_empty() && !hold.is_holding() {
+            deadline.and_then(|target| target.checked_duration_since(Instant::now()))
+        } else {
+            None
+        };
+        let mut readiness = [
+            pollfd {
+                fd: rx.as_socket_descriptor(),
+                events: POLLIN,
+                revents: 0,
+            },
+            pollfd {
+                fd: checkpoint_wake_rx.as_socket_descriptor(),
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        match poll(&mut readiness, poll_delay) {
+            Ok(0) => {
+                if !actions.is_empty() && !hold.is_holding() {
+                    send_actions_to_mux(
+                        &pane,
+                        &generation,
+                        dead,
+                        std::mem::take(&mut actions),
+                    );
+                    action_size = 0;
+                    deadline = None;
+                }
+                continue;
+            }
+            Err(error) if filedescriptor_error_is_interrupted(&error) => continue,
+            Err(_) => {
+                dead.store(true, Ordering::Release);
+                generation.live_parser_checkpoint.mark_dead();
+                break;
+            }
+            Ok(_) => {}
+        }
+        if readiness[1].revents != 0 {
+            if !drain_live_parser_checkpoint_wake(
+                &generation.live_parser_checkpoint,
+                &mut checkpoint_wake_rx,
+            ) {
                 dead.store(true, Ordering::Release);
                 break;
             }
+            match attempt_live_parser_checkpoint(
+                &pane,
+                &generation,
+                dead,
+                &parser,
+                &mut actions,
+                &hold,
+            ) {
+                LiveParserAttemptOutcome::Fatal => break,
+                LiveParserAttemptOutcome::Completed if actions.is_empty() => {
+                    action_size = 0;
+                    deadline = None;
+                }
+                LiveParserAttemptOutcome::Completed | LiveParserAttemptOutcome::NoRequest => {}
+            }
+        }
+        if readiness[0].revents == 0 {
+            continue;
+        }
+        let allowance = match generation
+            .live_parser_checkpoint
+            .parser_read_allowance(buf.len())
+        {
+            Ok(0) => continue,
+            Ok(allowance) => allowance,
+            Err(error) => {
+                let fatal = matches!(
+                    &error,
+                    LiveParserCheckpointError::BoundaryOvershot { .. }
+                        | LiveParserCheckpointError::Poisoned(_)
+                        | LiveParserCheckpointError::ReaderDead
+                );
+                generation
+                    .live_parser_checkpoint
+                    .reject_ready_checkpoint(error);
+                if fatal {
+                    if !dead.load(Ordering::Acquire) {
+                        generation
+                            .live_parser_checkpoint
+                            .poison("live parser read allowance lost its exact fence");
+                    }
+                    dead.store(true, Ordering::Release);
+                    break;
+                }
+                continue;
+            }
+        };
+        match rx.read(&mut buf[..allowance]) {
+            Ok(size) if size == 0 => {
+                let _ = attempt_live_parser_checkpoint(
+                    &pane,
+                    &generation,
+                    dead,
+                    &parser,
+                    &mut actions,
+                    &hold,
+                );
+                dead.store(true, Ordering::Release);
+                generation.live_parser_checkpoint.mark_dead();
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => {
                 dead.store(true, Ordering::Release);
+                generation.live_parser_checkpoint.mark_dead();
                 break;
             }
             Ok(size) => {
@@ -8538,6 +9399,14 @@ fn parse_buffered_data(
                         action_size = 0;
                     }
                 });
+                if generation
+                    .live_parser_checkpoint
+                    .record_parsed_bytes(size)
+                    .is_err()
+                {
+                    dead.store(true, Ordering::Release);
+                    break;
+                }
                 if chunk_touched_hold && !chunk_admission_emitted && size > 0 {
                     notify_synchronized_output_event(
                         &pane,
@@ -8549,6 +9418,22 @@ fn parse_buffered_data(
                     );
                 }
                 action_size += size;
+                match attempt_live_parser_checkpoint(
+                    &pane,
+                    &generation,
+                    dead,
+                    &parser,
+                    &mut actions,
+                    &hold,
+                ) {
+                    LiveParserAttemptOutcome::Fatal => break,
+                    LiveParserAttemptOutcome::Completed if actions.is_empty() => {
+                        action_size = 0;
+                        deadline = None;
+                    }
+                    LiveParserAttemptOutcome::Completed
+                    | LiveParserAttemptOutcome::NoRequest => {}
+                }
                 if hold.is_holding() && action_size >= max_held_synchronized_output_bytes() {
                     // A buggy app can enter synchronized-output mode and never
                     // send the reset sequence. Bound buffered memory in that case.
@@ -8594,14 +9479,21 @@ fn parse_buffered_data(
                             Some(target) => target.checked_duration_since(Instant::now()),
                         };
                         if poll_delay.is_some() {
-                            let mut pfd = [pollfd {
-                                fd: rx.as_socket_descriptor(),
-                                events: POLLIN,
-                                revents: 0,
-                            }];
-                            if let Ok(1) = poll(&mut pfd, poll_delay) {
-                                // We can read now without blocking, so accumulate
-                                // more data into actions
+                            let mut pfd = [
+                                pollfd {
+                                    fd: rx.as_socket_descriptor(),
+                                    events: POLLIN,
+                                    revents: 0,
+                                },
+                                pollfd {
+                                    fd: checkpoint_wake_rx.as_socket_descriptor(),
+                                    events: POLLIN,
+                                    revents: 0,
+                                },
+                            ];
+                            if poll(&mut pfd, poll_delay).is_ok_and(|ready| ready > 0) {
+                                // Re-enter the joint poll/capture path before
+                                // applying actions when either fd wakes.
                                 continue;
                             }
 
@@ -8746,11 +9638,21 @@ fn read_from_pane_pty(
         None => return,
     };
 
+    let mut delivery_failed = false;
     if let Some(banner) = banner {
-        tx.write_all(banner.as_bytes()).ok();
+        if let Err(err) = generation
+            .live_parser_checkpoint
+            .write_delivered_bytes(&mut tx, banner.as_bytes())
+        {
+            error!(
+                "read_pty failed to write banner to parser: pane {} {:?}",
+                pane_id, err
+            );
+            delivery_failed = true;
+        }
     }
 
-    while !dead.load(Ordering::Acquire) {
+    while !delivery_failed && !dead.load(Ordering::Acquire) {
         match reader.read(&mut buf) {
             Ok(size) if size == 0 => {
                 log::trace!("read_pty EOF: pane_id {}", pane_id);
@@ -8763,7 +9665,10 @@ fn read_from_pane_pty(
             Ok(size) => {
                 histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
-                if let Err(err) = tx.write_all(&buf[..size]) {
+                if let Err(err) = generation
+                    .live_parser_checkpoint
+                    .write_delivered_bytes(&mut tx, &buf[..size])
+                {
                     error!(
                         "read_pty failed to write to parser: pane {} {:?}",
                         pane_id, err
@@ -12704,9 +13609,29 @@ impl Mux {
                     "injected pane reader socketpair failure for pane {pane_id}"
                 ));
             }
-            let (tx, rx) = allocate_socketpair().with_context(|| {
+            let (mut tx, rx) = allocate_socketpair().with_context(|| {
                 format!("failed to allocate pane reader socketpair for pane {pane_id}")
             })?;
+            tx.set_non_blocking(true)
+                .with_context(|| format!("make pane {pane_id} parser writer nonblocking"))?;
+            let (mut checkpoint_wake_tx, mut checkpoint_wake_rx) =
+                allocate_socketpair().with_context(|| {
+                    format!(
+                        "failed to allocate pane checkpoint control socketpair for pane {pane_id}"
+                    )
+                })?;
+            checkpoint_wake_tx
+                .set_non_blocking(true)
+                .with_context(|| format!("make pane {pane_id} checkpoint writer nonblocking"))?;
+            checkpoint_wake_rx
+                .set_non_blocking(true)
+                .with_context(|| format!("make pane {pane_id} checkpoint reader nonblocking"))?;
+            generation
+                .live_parser_checkpoint
+                .attach_wake_writer(checkpoint_wake_tx)
+                .map_err(|error| {
+                    anyhow!("attach pane {pane_id} checkpoint control channel: {error}")
+                })?;
             let banner = self.banner.read().clone();
             let weak_pane = Arc::downgrade(pane);
             let coordinator = Arc::new(PaneReaderStartCoordinator::new());
@@ -12734,6 +13659,12 @@ impl Mux {
                 thread::Builder::new()
                     .name(format!("mux-parse-pane-{pane_id}"))
                     .spawn(move || {
+                        let _checkpoint_worker = LiveParserWorkerGuard {
+                            control: Arc::clone(
+                                &parser_generation.live_parser_checkpoint,
+                            ),
+                            dead: Arc::clone(&parser_dead),
+                        };
                         if fail_parser_ready {
                             let _ = parser_ready
                                 .send(Err("injected pane parser readiness failure".to_string()));
@@ -12751,6 +13682,7 @@ impl Mux {
                                     parser_generation,
                                     &parser_dead,
                                     rx,
+                                    checkpoint_wake_rx,
                                 );
                                 let _ = parser_done_tx.send(());
                             }
@@ -12762,6 +13694,7 @@ impl Mux {
             };
             let parser_thread = parser_spawn_result.map_err(|err| {
                 dead.store(true, Ordering::Release);
+                generation.live_parser_checkpoint.mark_dead();
                 let _ = coordinator.cancel();
                 anyhow!("failed to spawn pane parser thread for pane {pane_id}: {err}")
             })?;
@@ -18542,15 +19475,23 @@ mod tests {
     use crate::pane::{ForEachPaneLogicalLine, LogicalLine, WithPaneLines};
     use crate::renderable::{RenderableDimensions, StableCursorPosition};
     use crate::tab::{DomainFloatingPaneReconcileReceipt, DomainFloatingPaneState};
+    use crate::guardian_output_journal::{
+        GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
+    };
     use frankenterm_term::color::ColorPalette;
-    use frankenterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
+    use frankenterm_term::{
+        KeyCode, KeyModifiers, MouseEvent, StableRowIndex, Terminal, TerminalConfiguration,
+        TerminalSize,
+    };
     use parking_lot::{MappedMutexGuard, MutexGuard};
     use proptest::prelude::*;
     use rangeset::RangeSet;
+    use std::fs::File;
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
     use termwiz::surface::{Line, SequenceNo};
+    use tempfile::tempdir;
 
     fn global_test_lock() -> StdMutexGuard<'static, ()> {
         crate::MUX_TEST_LOCK
@@ -18817,6 +19758,27 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct LiveCheckpointTestConfig;
+
+    impl TerminalConfiguration for LiveCheckpointTestConfig {}
+
+    struct CheckpointPaneState {
+        durable_pane_id: [u8; 16],
+        terminal: Mutex<Terminal>,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    fn live_checkpoint_test_terminal() -> Terminal {
+        Terminal::new(
+            test_size(),
+            Arc::new(LiveCheckpointTestConfig),
+            "FrankenTerm",
+            "live-parser-checkpoint-test",
+            Box::new(Vec::<u8>::new()),
+        )
+    }
+
     struct KillCountingPane {
         id: PaneId,
         domain_id: DomainId,
@@ -18835,6 +19797,7 @@ mod tests {
         mux_registration: Arc<PaneRegistrationSlot>,
         fail_reader: bool,
         search_pending: bool,
+        checkpoint: Option<CheckpointPaneState>,
     }
 
     impl KillCountingPane {
@@ -18867,6 +19830,7 @@ mod tests {
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader,
                 search_pending: false,
+                checkpoint: None,
             });
             (pane, kills)
         }
@@ -18895,6 +19859,7 @@ mod tests {
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
+                checkpoint: None,
             });
             (pane, kills)
         }
@@ -18922,6 +19887,7 @@ mod tests {
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: true,
+                checkpoint: None,
             });
             (pane, kills)
         }
@@ -18950,6 +19916,7 @@ mod tests {
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
+                checkpoint: None,
             });
             (pane, kills)
         }
@@ -18978,6 +19945,7 @@ mod tests {
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
+                checkpoint: None,
             });
             (pane, kills)
         }
@@ -19006,6 +19974,7 @@ mod tests {
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
+                checkpoint: None,
             });
             (pane, kills)
         }
@@ -19033,6 +20002,7 @@ mod tests {
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
+                checkpoint: None,
             });
             (pane, focus_events)
         }
@@ -19061,8 +20031,40 @@ mod tests {
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
+                checkpoint: None,
             });
             (pane, kills, pane_id_calls)
+        }
+
+        fn new_live_checkpoint(
+            id: PaneId,
+            durable_pane_id: [u8; 16],
+            hook: Option<Box<dyn FnOnce() + Send>>,
+        ) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                domain_id: 1,
+                size: Mutex::new(test_size()),
+                kills: Arc::new(AtomicUsize::new(0)),
+                actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
+                writes: Mutex::new(Vec::new()),
+                reader: Mutex::new(None),
+                on_reader: Mutex::new(None),
+                on_actions: Mutex::new(None),
+                on_kill: Mutex::new(None),
+                on_domain_id: Mutex::new(None),
+                focus_events: Arc::new(Mutex::new(Vec::new())),
+                pane_id_calls: None,
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
+                fail_reader: false,
+                search_pending: false,
+                checkpoint: Some(CheckpointPaneState {
+                    durable_pane_id,
+                    terminal: Mutex::new(live_checkpoint_test_terminal()),
+                    hook: Mutex::new(hook),
+                }),
+            })
         }
     }
 
@@ -19073,6 +20075,12 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
             }
             self.id
+        }
+
+        fn durable_pane_id(&self) -> Option<[u8; 16]> {
+            self.checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.durable_pane_id)
         }
 
         fn mux_registration_slot(&self) -> &Arc<PaneRegistrationSlot> {
@@ -19197,6 +20205,32 @@ mod tests {
                 on_actions();
             }
             self.actions.fetch_add(actions.len(), Ordering::SeqCst);
+            if let Some(checkpoint) = self.checkpoint.as_ref() {
+                checkpoint.terminal.lock().perform_actions(actions);
+            }
+        }
+
+        fn capture_live_parser_checkpoint(
+            &self,
+            _authority: crate::guardian_checkpoint::LiveParserCaptureAuthority,
+            pending_actions: &mut Vec<Action>,
+            ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
+            limits: TerminalCheckpointLimits,
+        ) -> Result<
+            frankenterm_term::RecoveryTerminalCheckpointV2,
+            crate::guardian_checkpoint::LiveParserPaneCaptureError,
+        > {
+            let checkpoint = self.checkpoint.as_ref().ok_or(
+                crate::guardian_checkpoint::LiveParserPaneCaptureError::Unsupported,
+            )?;
+            if let Some(hook) = checkpoint.hook.lock().take() {
+                hook();
+            }
+            let mut terminal = checkpoint.terminal.lock();
+            terminal.perform_actions(std::mem::take(pending_actions));
+            terminal
+                .capture_recovery_checkpoint_at_external_parser_ground(ground, limits)
+                .map_err(crate::guardian_checkpoint::LiveParserPaneCaptureError::Terminal)
         }
 
         fn is_dead(&self) -> bool {
@@ -19238,6 +20272,688 @@ mod tests {
         fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<url::Url> {
             None
         }
+    }
+
+    fn live_checkpoint_receipts(
+        durable_pane_id: uuid::Uuid,
+        payloads: &[&[u8]],
+    ) -> (
+        GuardianOutputSegmentIdentity,
+        Vec<GuardianOutputAppendReceipt>,
+    ) {
+        assert!(!payloads.is_empty());
+        let segment = GuardianOutputSegmentIdentity::new(
+            durable_pane_id,
+            uuid::Uuid::new_v4(),
+            1,
+            None,
+        )
+        .expect("valid live checkpoint segment");
+        let receipts = live_checkpoint_receipts_for_segment(segment, payloads);
+        (segment, receipts)
+    }
+
+    fn live_checkpoint_receipts_for_segment(
+        segment: GuardianOutputSegmentIdentity,
+        payloads: &[&[u8]],
+    ) -> Vec<GuardianOutputAppendReceipt> {
+        assert!(!payloads.is_empty());
+        let directory = tempdir().expect("create live checkpoint journal directory");
+        let file = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("live-output.segment"))
+            .expect("create live checkpoint journal");
+        let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32])
+            .expect("valid live checkpoint cipher");
+        let mut journal = GuardianOutputJournal::open(
+            file,
+            segment,
+            cipher,
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("open live checkpoint journal");
+        let directory_file = File::open(directory.path()).expect("open journal parent");
+        journal
+            .sync_parent_directory_and_activate(&directory_file)
+            .expect("activate live checkpoint journal");
+        payloads
+            .iter()
+            .map(|payload| {
+                journal
+                    .append_and_sync(*payload)
+                    .expect("append live checkpoint output")
+            })
+            .collect()
+    }
+
+    struct LiveParserTestHarness {
+        mux: Arc<Mux>,
+        pane: Arc<dyn Pane>,
+        registration: PaneRegistrationHandle,
+        generation: Arc<PaneRegistrationGeneration>,
+        writer: Arc<StdMutex<Option<FileDescriptor>>>,
+        parser_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LiveParserTestHarness {
+        fn new(
+            pane_id: PaneId,
+            durable_pane_id: uuid::Uuid,
+            hook: Option<Box<dyn FnOnce() + Send>>,
+        ) -> Self {
+            let mux = Arc::new(Mux::new(None));
+            let pane = KillCountingPane::new_live_checkpoint(
+                pane_id,
+                *durable_pane_id.as_bytes(),
+                hook,
+            );
+            mux.add_pane(&pane)
+                .expect("register live checkpoint test pane");
+            let registration = pane
+                .mux_registration_slot()
+                .load()
+                .expect("test pane registration handle");
+            let generation = registration.live_parser_test_generation();
+            let (mut data_writer, data_reader) =
+                allocate_socketpair().expect("allocate test parser data socket");
+            data_writer
+                .set_non_blocking(true)
+                .expect("make test parser writer nonblocking");
+            let (mut wake_writer, mut wake_reader) =
+                allocate_socketpair().expect("allocate test parser control socket");
+            wake_writer
+                .set_non_blocking(true)
+                .expect("make test checkpoint wake writer nonblocking");
+            wake_reader
+                .set_non_blocking(true)
+                .expect("make test checkpoint wake reader nonblocking");
+            generation
+                .live_parser_checkpoint
+                .attach_wake_writer(wake_writer)
+                .expect("attach test checkpoint control");
+            let parser_generation = Arc::clone(&generation);
+            let parser_pane = Arc::downgrade(&pane);
+            let parser_dead = Arc::clone(&generation.reader_dead);
+            let parser_thread = std::thread::spawn(move || {
+                let _worker = LiveParserWorkerGuard {
+                    control: Arc::clone(&parser_generation.live_parser_checkpoint),
+                    dead: Arc::clone(&parser_dead),
+                };
+                parse_buffered_data(
+                    parser_pane,
+                    parser_generation,
+                    &parser_dead,
+                    data_reader,
+                    wake_reader,
+                );
+            });
+            Self {
+                mux,
+                pane,
+                registration,
+                generation,
+                writer: Arc::new(StdMutex::new(Some(data_writer))),
+                parser_thread: Some(parser_thread),
+            }
+        }
+
+        fn authorize(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            receipt: GuardianOutputAppendReceipt,
+            payload: &[u8],
+        ) -> u64 {
+            self.registration
+                .authorize_guardian_output_delivery(
+                    segment,
+                    receipt,
+                    Arc::<[u8]>::from(payload.to_vec()),
+                )
+                .expect("authorize exact guardian output")
+        }
+
+        fn write(&self, payload: &[u8]) -> std::io::Result<()> {
+            let mut writer = self.writer.lock().unwrap_or_else(|error| error.into_inner());
+            self.generation
+                .live_parser_checkpoint
+                .write_delivered_bytes(
+                    writer.as_mut().expect("test parser writer remains live"),
+                    payload,
+                )
+        }
+
+        fn capture(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            receipt: GuardianOutputAppendReceipt,
+            timeout: Duration,
+        ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
+            self.registration.capture_live_parser_checkpoint(
+                segment,
+                receipt,
+                TerminalCheckpointLimits::default(),
+                timeout,
+            )
+        }
+
+        fn wait_until_parsed(&self, target: u64) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let parsed = self
+                    .generation
+                    .live_parser_checkpoint
+                    .state
+                    .lock()
+                    .parsed_bytes;
+                if parsed == target {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "parser did not reach exact test watermark {target}; observed {parsed}"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    impl Drop for LiveParserTestHarness {
+        fn drop(&mut self) {
+            self.writer
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(parser_thread) = self.parser_thread.take() {
+                let _ = parser_thread.join();
+            }
+            self.mux.remove_pane(self.pane.pane_id());
+        }
+    }
+
+    #[test]
+    fn live_parser_checkpoint_rejects_split_csi_osc_and_utf8_without_forcing_ground() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"\x1b[38;5", b";42m"),
+            (b"\x1b]0;split-title", b"\x07"),
+            (&[0xf0, 0x9f], &[0x92, 0xa9]),
+        ];
+        for (case, (prefix, suffix)) in cases.iter().copied().enumerate() {
+            let durable_pane_id = uuid::Uuid::new_v4();
+            let (segment, receipts) =
+                live_checkpoint_receipts(durable_pane_id, &[prefix, suffix]);
+            let harness = LiveParserTestHarness::new(600 + case, durable_pane_id, None);
+
+            let first_target = harness.authorize(segment, receipts[0], prefix);
+            harness.write(prefix).expect("deliver split prefix");
+            harness.wait_until_parsed(first_target);
+            assert!(matches!(
+                harness.capture(segment, receipts[0], Duration::from_secs(2)),
+                Err(LiveParserCheckpointError::ParserNotRecoveryGround)
+            ));
+
+            let completed_target = harness.authorize(segment, receipts[1], suffix);
+            harness.write(suffix).expect("deliver split suffix");
+            harness.wait_until_parsed(completed_target);
+            let ack = harness
+                .capture(segment, receipts[1], Duration::from_secs(2))
+                .expect("completed escape sequence reaches exact ground");
+            assert_eq!(ack.parser_stream_bytes(), completed_target);
+            assert_eq!(
+                ack.journal_cumulative_plaintext_bytes(),
+                receipts[1].cumulative_plaintext_bytes()
+            );
+            assert_eq!(ack.output_record_digest(), receipts[1].record_digest());
+            assert_ne!(ack.boundary_digest(), [0; 32]);
+        }
+    }
+
+    #[test]
+    fn idle_checkpoint_wake_never_enters_the_terminal_byte_stream() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payload = b"idle-parser-ground";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[payload]);
+        let harness = LiveParserTestHarness::new(610, durable_pane_id, None);
+        let target = harness.authorize(segment, receipts[0], payload);
+        harness.write(payload).expect("deliver idle fixture");
+        harness.wait_until_parsed(target);
+
+        let ack = harness
+            .capture(segment, receipts[0], Duration::from_secs(2))
+            .expect("control fd wakes an idle parser");
+        assert_eq!(ack.parser_stream_bytes(), u64::try_from(payload.len()).unwrap());
+        assert_eq!(
+            harness
+                .generation
+                .live_parser_checkpoint
+                .state
+                .lock()
+                .parsed_bytes,
+            target,
+            "control bytes must not increment the parser stream watermark"
+        );
+    }
+
+    #[test]
+    fn guardian_delivery_rejects_same_length_payload_splice_and_tracks_rollover_globally() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let first_payload = b"segment-one";
+        let (first_segment, first_receipts) =
+            live_checkpoint_receipts(durable_pane_id, &[first_payload]);
+        let harness = LiveParserTestHarness::new(617, durable_pane_id, None);
+        let mut mutation = first_payload.to_vec();
+        mutation[0] ^= 1;
+        assert!(matches!(
+            harness.registration.authorize_guardian_output_delivery(
+                first_segment,
+                first_receipts[0],
+                Arc::<[u8]>::from(mutation),
+            ),
+            Err(LiveParserCheckpointError::GuardianDeliveryIdentityMismatch)
+        ));
+
+        let first_target = harness.authorize(first_segment, first_receipts[0], first_payload);
+        harness.write(first_payload).expect("deliver first segment");
+        harness.wait_until_parsed(first_target);
+        let first_ack = harness
+            .capture(first_segment, first_receipts[0], Duration::from_secs(2))
+            .expect("capture first segment endpoint");
+        assert_eq!(first_ack.parser_stream_bytes(), first_payload.len() as u64);
+
+        let successor = GuardianOutputSegmentIdentity::new(
+            durable_pane_id,
+            uuid::Uuid::new_v4(),
+            2,
+            Some(first_receipts[0].into_predecessor()),
+        )
+        .expect("valid successor segment");
+        let second_payload = b"two";
+        let second_receipts =
+            live_checkpoint_receipts_for_segment(successor, &[second_payload]);
+        let second_target = harness.authorize(successor, second_receipts[0], second_payload);
+        assert_eq!(
+            second_target,
+            (first_payload.len() + second_payload.len()) as u64,
+            "parser-incarnation watermark remains global across journal segment rollover"
+        );
+        harness.write(second_payload).expect("deliver successor segment");
+        harness.wait_until_parsed(second_target);
+        let second_ack = harness
+            .capture(successor, second_receipts[0], Duration::from_secs(2))
+            .expect("capture successor endpoint");
+        assert_eq!(second_ack.parser_stream_bytes(), second_target);
+        assert_eq!(
+            second_ack.journal_cumulative_plaintext_bytes(),
+            u64::try_from(first_payload.len() + second_payload.len()).unwrap(),
+            "journal watermark remains pane-lifetime cumulative across rollover"
+        );
+    }
+
+    #[test]
+    fn authorized_receipt_cannot_publish_distinct_same_length_socket_bytes() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payload = b"receipt-bound-A";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[payload]);
+        let harness = LiveParserTestHarness::new(618, durable_pane_id, None);
+        harness.authorize(segment, receipts[0], payload);
+        let mut mutation = payload.to_vec();
+        *mutation.last_mut().expect("fixture is nonempty") ^= 1;
+
+        assert!(harness.write(&mutation).is_err());
+        let state = harness.generation.live_parser_checkpoint.state.lock();
+        assert_eq!(state.delivered_bytes, 0);
+        assert_eq!(state.parsed_bytes, 0);
+        assert!(state.poison.is_some());
+        drop(state);
+        assert!(matches!(
+            harness.capture(segment, receipts[0], Duration::from_millis(50)),
+            Err(LiveParserCheckpointError::Poisoned(_))
+        ));
+    }
+
+    #[test]
+    fn delivery_reservation_unwind_poison_clears_both_flags_and_wakes_waiters() {
+        let wire_identity = *uuid::Uuid::new_v4().as_bytes();
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        {
+            let mut state = control.state.lock();
+            state.delivery_call_in_flight = true;
+            state.socket_write_in_flight = true;
+        }
+        let waiter_control = Arc::clone(&control);
+        let waiter = std::thread::spawn(move || {
+            waiter_control
+                .begin_delivery_reservation(b"waiter")
+                .map(drop)
+        });
+
+        let unwind_control = Arc::clone(&control);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _delivery = LiveParserDeliveryReservation {
+                control: unwind_control.as_ref(),
+                active: true,
+            };
+            let _socket = LiveParserSocketWriteReservation {
+                control: unwind_control.as_ref(),
+                active: true,
+            };
+            panic!("injected delivery reservation unwind");
+        }));
+        assert!(panic.is_err());
+        assert!(waiter
+            .join()
+            .expect("delivery waiter does not panic")
+            .is_err());
+        let state = control.state.lock();
+        assert!(!state.delivery_call_in_flight);
+        assert!(!state.socket_write_in_flight);
+        assert!(state.poison.is_some());
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn nonblocking_backpressure_commits_before_parser_accounting_without_deadlock() {
+        let wire_identity = *uuid::Uuid::new_v4().as_bytes();
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        let (mut writer, mut reader) =
+            allocate_socketpair().expect("allocate backpressure parser socket");
+        writer
+            .set_non_blocking(true)
+            .expect("make backpressure writer nonblocking");
+        #[cfg(unix)]
+        {
+            let _ = set_socket_buffer(&mut writer, SO_SNDBUF, 1024);
+            let _ = set_socket_buffer(&mut reader, SO_RCVBUF, 1024);
+        }
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let expected = payload.len();
+        let parser_control = Arc::clone(&control);
+        let parser = std::thread::spawn(move || {
+            let mut observed = 0;
+            let mut chunk = [0_u8; 257];
+            while observed < expected {
+                match reader.read(&mut chunk) {
+                    Ok(0) => panic!("backpressure parser socket closed early"),
+                    Ok(size) => {
+                        parser_control
+                            .record_parsed_bytes(size)
+                            .expect("commit exact parser accounting after socket write");
+                        observed += size;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("backpressure parser read failed: {error}"),
+                }
+            }
+            observed
+        });
+
+        control
+            .write_delivered_bytes(&mut writer, &payload)
+            .expect("deliver payload through forced socket backpressure");
+        assert_eq!(
+            parser.join().expect("backpressure parser does not panic"),
+            expected
+        );
+        let state = control.state.lock();
+        let expected = u64::try_from(expected).unwrap();
+        assert_eq!(state.delivered_bytes, expected);
+        assert_eq!(state.parsed_bytes, expected);
+        assert!(!state.delivery_call_in_flight);
+        assert!(!state.socket_write_in_flight);
+        assert!(state.poison.is_none());
+    }
+
+    #[test]
+    fn live_parser_checkpoint_fences_post_target_bytes_and_rejects_a_second_waiter() {
+        let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_capture_tx, release_capture_rx) = std::sync::mpsc::sync_channel(1);
+        let hook = Box::new(move || {
+            capture_entered_tx.send(()).expect("report capture entry");
+            release_capture_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release blocked checkpoint callback");
+        });
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payload = b"exact-fenced-frame";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[payload]);
+        let harness = LiveParserTestHarness::new(611, durable_pane_id, Some(hook));
+        let target = harness.authorize(segment, receipts[0], payload);
+        harness.write(payload).expect("deliver exact fenced frame");
+        harness.wait_until_parsed(target);
+
+        let registration = harness.registration.clone();
+        let receipt = receipts[0];
+        let capture_thread = std::thread::spawn(move || {
+            registration.capture_live_parser_checkpoint(
+                segment,
+                receipt,
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(5),
+            )
+        });
+        capture_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("checkpoint callback reaches blocked hook");
+        assert!(matches!(
+            harness.capture(segment, receipts[0], Duration::from_millis(50)),
+            Err(LiveParserCheckpointError::CheckpointBusy)
+        ));
+
+        let writer = Arc::clone(&harness.writer);
+        let control = Arc::clone(&harness.generation.live_parser_checkpoint);
+        let (writer_started_tx, writer_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::sync_channel(1);
+        let post_target_writer = std::thread::spawn(move || {
+            writer_started_tx.send(()).expect("report writer start");
+            let result = {
+                let mut writer = writer.lock().unwrap_or_else(|error| error.into_inner());
+                control.write_delivered_bytes(
+                    writer.as_mut().expect("parser writer remains live"),
+                    b"post-target",
+                )
+            };
+            writer_done_tx.send(result).expect("report writer result");
+        });
+        writer_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("post-target writer starts");
+        assert!(matches!(
+            writer_done_rx.recv_timeout(Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_capture_tx.send(()).expect("release capture");
+        let ack = capture_thread
+            .join()
+            .expect("capture thread does not panic")
+            .expect("exact capture succeeds");
+        assert_eq!(ack.parser_stream_bytes(), target);
+        assert!(writer_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("post-target writer finishes after gate reopens")
+            .is_err());
+        post_target_writer
+            .join()
+            .expect("post-target writer does not panic");
+    }
+
+    #[test]
+    fn synchronized_output_hold_is_rejected_before_watchdog_reset() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payload = b"\x1b[?2026hheld-frame";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[payload]);
+        let harness = LiveParserTestHarness::new(612, durable_pane_id, None);
+        let target = harness.authorize(segment, receipts[0], payload);
+        harness.write(payload).expect("deliver BSU fixture");
+        harness.wait_until_parsed(target);
+        assert!(matches!(
+            harness.capture(segment, receipts[0], Duration::from_secs(2)),
+            Err(LiveParserCheckpointError::SynchronizedOutputHold)
+        ));
+        assert_eq!(
+            harness
+                .generation
+                .live_parser_checkpoint
+                .state
+                .lock()
+                .parsed_bytes,
+            target
+        );
+    }
+
+    #[test]
+    fn stale_generation_after_capture_is_rejected_under_parser_side_lease() {
+        let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_capture_tx, release_capture_rx) = std::sync::mpsc::sync_channel(1);
+        let hook = Box::new(move || {
+            capture_entered_tx.send(()).expect("report capture entry");
+            release_capture_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release stale capture");
+        });
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payload = b"stale-generation";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[payload]);
+        let harness = LiveParserTestHarness::new(613, durable_pane_id, Some(hook));
+        let target = harness.authorize(segment, receipts[0], payload);
+        harness.write(payload).expect("deliver stale fixture");
+        harness.wait_until_parsed(target);
+        let registration = harness.registration.clone();
+        let receipt = receipts[0];
+        let capture_thread = std::thread::spawn(move || {
+            registration.capture_live_parser_checkpoint(
+                segment,
+                receipt,
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(5),
+            )
+        });
+        capture_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture callback starts");
+        harness.mux.remove_pane(harness.pane.pane_id());
+        release_capture_tx.send(()).expect("release stale capture");
+        assert!(matches!(
+            capture_thread.join().expect("capture thread does not panic"),
+            Err(LiveParserCheckpointError::StaleRegistration)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_timeout_and_callback_panic_clear_the_pending_gate() {
+        let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_capture_tx, release_capture_rx) = std::sync::mpsc::sync_channel(1);
+        let hook = Box::new(move || {
+            capture_entered_tx.send(()).expect("report capture entry");
+            release_capture_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release timeout capture");
+        });
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payload = b"bounded-timeout";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[payload]);
+        let harness = LiveParserTestHarness::new(614, durable_pane_id, Some(hook));
+        let target = harness.authorize(segment, receipts[0], payload);
+        harness.write(payload).expect("deliver timeout fixture");
+        harness.wait_until_parsed(target);
+        let registration = harness.registration.clone();
+        let receipt = receipts[0];
+        let timeout_thread = std::thread::spawn(move || {
+            registration.capture_live_parser_checkpoint(
+                segment,
+                receipt,
+                TerminalCheckpointLimits::default(),
+                Duration::from_millis(25),
+            )
+        });
+        capture_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timeout callback starts");
+        assert!(matches!(
+            timeout_thread.join().expect("timeout thread does not panic"),
+            Err(LiveParserCheckpointError::Timeout)
+        ));
+        release_capture_tx.send(()).expect("release timed out capture");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness
+            .generation
+            .live_parser_checkpoint
+            .state
+            .lock()
+            .pending
+            .is_some()
+        {
+            assert!(Instant::now() < deadline, "timed-out capture gate stayed pending");
+            std::thread::yield_now();
+        }
+
+        let panic_pane_id = uuid::Uuid::new_v4();
+        let panic_payload = b"callback-panic";
+        let (panic_segment, panic_receipts) =
+            live_checkpoint_receipts(panic_pane_id, &[panic_payload]);
+        let panic_harness = LiveParserTestHarness::new(
+            615,
+            panic_pane_id,
+            Some(Box::new(|| panic!("injected content-free checkpoint panic"))),
+        );
+        let panic_target =
+            panic_harness.authorize(panic_segment, panic_receipts[0], panic_payload);
+        panic_harness
+            .write(panic_payload)
+            .expect("deliver panic fixture");
+        panic_harness.wait_until_parsed(panic_target);
+        assert!(matches!(
+            panic_harness.capture(panic_segment, panic_receipts[0], Duration::from_secs(2)),
+            Err(LiveParserCheckpointError::Poisoned(_))
+        ));
+        assert!(panic_harness
+            .generation
+            .live_parser_checkpoint
+            .state
+            .lock()
+            .pending
+            .is_none());
+    }
+
+    #[test]
+    fn parser_hup_before_authorized_target_returns_incomplete_boundary() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payload = b"never-delivered";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[payload]);
+        let harness = LiveParserTestHarness::new(616, durable_pane_id, None);
+        harness.authorize(segment, receipts[0], payload);
+        let registration = harness.registration.clone();
+        let receipt = receipts[0];
+        let capture_thread = std::thread::spawn(move || {
+            registration.capture_live_parser_checkpoint(
+                segment,
+                receipt,
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(5),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness
+            .generation
+            .live_parser_checkpoint
+            .state
+            .lock()
+            .pending
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "checkpoint request was not registered");
+            std::thread::yield_now();
+        }
+        harness
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        assert!(matches!(
+            capture_thread.join().expect("capture thread does not panic"),
+            Err(LiveParserCheckpointError::IncompleteBoundary { .. })
+        ));
     }
 
     struct GuardedMutationTestDomain {

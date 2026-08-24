@@ -558,7 +558,7 @@ impl RenderableInner {
         // default is now 20ms -- low enough to activate on ~25ms remote links;
         // explicit per-domain values are respected). `None` disables predictive
         // echo entirely. [3c, review F7]
-        match self.client.local_echo_threshold_ms {
+        match self.client.local_echo_threshold_ms() {
             Some(thresh) => self.last_input_rtt >= thresh,
             None => false,
         }
@@ -3165,7 +3165,7 @@ impl RenderableState {
                 }
             };
 
-            if inner.client.overlay_lag_indicator
+            if inner.client.overlay_lag_indicator()
                 && idx == inner.dimensions.physical_top
                 && inner.is_tardy()
             {

@@ -89,6 +89,41 @@ fn reserve_client_main_thread(
     }
 }
 
+fn reserve_client_main_thread_until_admitted(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+) -> anyhow::Result<MainThreadSpawnReservation> {
+    let mut retry_delay = Duration::from_millis(10);
+    let mut attempts = 0_u64;
+    loop {
+        match try_reserve_main_thread(service_class, estimated_bytes) {
+            MainThreadReservationOutcome::Reserved(reservation) => return Ok(reservation),
+            rejected @ (MainThreadReservationOutcome::RetryableFull(_)
+            | MainThreadReservationOutcome::RetiredGeneration(_)
+            | MainThreadReservationOutcome::Coalesced(_)
+            | MainThreadReservationOutcome::SchedulerUnavailable) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts % 100 == 0 {
+                    log::warn!(
+                        "main-thread scheduler temporarily rejected mandatory {operation}; retrying exact retained authority (attempt {attempts}): {rejected:?}"
+                    );
+                }
+                thread::sleep(retry_delay);
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(Duration::from_secs(1));
+            }
+            rejected @ (MainThreadReservationOutcome::InvalidSize(_)
+            | MainThreadReservationOutcome::AuthorityExhausted(_)) => {
+                return Err(anyhow!(
+                    "main-thread scheduler terminally rejected mandatory {operation} before task construction: {rejected:?}"
+                ));
+            }
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 #[error("Timeout")]
 struct Timeout;
@@ -2599,6 +2634,7 @@ pub struct Client {
     incarnation: Arc<ClientIncarnation>,
     connection_generation: Arc<AtomicU64>,
     rpc_transport: Arc<RpcTransportState>,
+    domain_reconnect_authorized: Arc<AtomicBool>,
     pub client_id: ClientId,
     client_domain_config: ClientDomainConfig,
     pub is_reconnectable: bool,
@@ -8127,6 +8163,8 @@ impl Client {
         let incarnation = Arc::new(ClientIncarnation);
         let connection_generation = Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION));
         let rpc_transport = Arc::new(RpcTransportState::new());
+        let domain_reconnect_authorized =
+            Arc::new(AtomicBool::new(local_domain_id.is_none()));
         let initial_dispatch_authority = ClientDispatchAuthority::new(
             local_domain_id,
             mux_owner,
@@ -8135,6 +8173,7 @@ impl Client {
             Arc::clone(&rpc_transport),
         );
         let mut reconnect_dispatch_authority = initial_dispatch_authority.clone();
+        let reconnect_authorization = Arc::clone(&domain_reconnect_authorized);
 
         if let Err(err) = thread::Builder::new()
             .name("client-reconnect".to_string())
@@ -8200,6 +8239,14 @@ impl Client {
                         // can still observe its generation as current after
                         // the reconnect thread has closed.
                         log::error!("{terminal}; won't try to reconnect");
+                        break;
+                    }
+                    if local_domain_id.is_some()
+                        && !reconnect_authorization.load(AtomicOrdering::Acquire)
+                    {
+                        log::error!(
+                            "initial client attachment ended before reconnect authority was published; closing this incarnation without dialing a successor"
+                        );
                         break;
                     }
                     // A session that survived long enough is a genuine
@@ -8432,7 +8479,7 @@ impl Client {
                     .close_rpc_transport(&receiver, "mux client reconnect loop terminated");
                 match reconnect_dispatch_authority.resolve_current() {
                     Ok(Some(dispatch)) => {
-                        match reserve_client_main_thread(
+                        match reserve_client_main_thread_until_admitted(
                             MainThreadServiceClass::Topology,
                             CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES,
                             "final client detach",
@@ -8494,6 +8541,7 @@ impl Client {
             incarnation,
             connection_generation,
             rpc_transport,
+            domain_reconnect_authorized,
             is_reconnectable,
             is_local,
             client_id,
@@ -8503,6 +8551,16 @@ impl Client {
 
     pub fn into_client_domain_config(self) -> ClientDomainConfig {
         self.client_domain_config
+    }
+
+    pub(crate) fn authorize_domain_reconnect(&self) {
+        self.domain_reconnect_authorized
+            .store(true, AtomicOrdering::Release);
+    }
+
+    pub(crate) fn revoke_domain_reconnect(&self) {
+        self.domain_reconnect_authorized
+            .store(false, AtomicOrdering::Release);
     }
 
     pub async fn verify_version_compat(
@@ -9723,6 +9781,7 @@ mod tests {
                 incarnation: Arc::new(ClientIncarnation),
                 connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
                 rpc_transport,
+                domain_reconnect_authorized: Arc::new(AtomicBool::new(true)),
                 client_id: ClientId::new(),
                 client_domain_config: ClientDomainConfig::Unix(UnixDomain::default()),
                 is_reconnectable: false,
@@ -9741,6 +9800,7 @@ mod tests {
                 incarnation: Arc::new(ClientIncarnation),
                 connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
                 rpc_transport: Arc::new(RpcTransportState::new()),
+                domain_reconnect_authorized: Arc::new(AtomicBool::new(true)),
                 client_id: ClientId::new(),
                 client_domain_config: ClientDomainConfig::Unix(UnixDomain::default()),
                 is_reconnectable: false,
@@ -9857,6 +9917,7 @@ mod tests {
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             rpc_transport: Arc::new(RpcTransportState::new()),
+            domain_reconnect_authorized: Arc::new(AtomicBool::new(true)),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable: false,
@@ -12094,6 +12155,7 @@ mod tests {
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             rpc_transport: Arc::clone(&rpc_transport),
+            domain_reconnect_authorized: Arc::new(AtomicBool::new(true)),
             client_id: ClientId::new(),
             client_domain_config: ClientDomainConfig::Unix(UnixDomain::default()),
             is_reconnectable: false,
@@ -15287,6 +15349,7 @@ mod tests {
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             rpc_transport: Arc::new(RpcTransportState::new()),
+            domain_reconnect_authorized: Arc::new(AtomicBool::new(true)),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,
@@ -15441,6 +15504,7 @@ mod tests {
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             rpc_transport: Arc::new(RpcTransportState::new()),
+            domain_reconnect_authorized: Arc::new(AtomicBool::new(true)),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,
@@ -15825,6 +15889,7 @@ mod tests {
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             rpc_transport: Arc::new(RpcTransportState::new()),
+            domain_reconnect_authorized: Arc::new(AtomicBool::new(true)),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,

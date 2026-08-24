@@ -4,6 +4,7 @@ use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::UnicodeVersion;
 use frankenterm_surface::line::MonospaceKpCostModel;
 use frankenterm_surface::{Line, SequenceNo};
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use crate::StableRowIndex;

@@ -158,7 +158,6 @@ pub(crate) enum ScreenCheckpointCaptureError {
     InvalidLineGeometry,
     UnsupportedGraphicsState,
     ColdScrollbackMetadataInconsistent,
-    ColdScrollbackRowMissing(StableRowIndex),
     ColdScrollbackSnapshot(ScrollbackSpillError),
     ColdScrollbackNotRecoveryGrade,
 }
@@ -1316,8 +1315,7 @@ impl Screen {
                 }
             } else {
                 (resident_oldest, None, 0, Vec::new())
-            }
-        };
+            };
 
         let total_lines = cold_lines
             .len()
@@ -4727,10 +4725,7 @@ mod tests {
                 .revision()
                 .checked_add(1)
                 .ok_or(crate::config::ScrollbackSpillError::RevisionExhausted)?;
-            let mut replacement = Vec::new();
-            replacement
-                .try_reserve_exact(prefix.row_count())
-                .map_err(|_| crate::config::ScrollbackSpillError::StorageUnavailable)?;
+            let mut replacement = BTreeMap::new();
             if let Some(oldest) = prefix.oldest_stable_row() {
                 for (offset, line) in prefix.rows().enumerate() {
                     let offset = StableRowIndex::try_from(offset).map_err(|_| {
@@ -4741,11 +4736,10 @@ mod tests {
                             "stable_row_range",
                         ),
                     )?;
-                    replacement.push((stable_row, line.clone()));
+                    replacement.insert(stable_row, line.clone());
                 }
             }
-            rows.clear();
-            rows.extend(replacement);
+            *rows = replacement;
             self.revision.store(next_revision, Ordering::Relaxed);
             Ok(crate::config::ScrollbackReplaceCommit::new(
                 crate::config::ScrollbackSnapshotGeneration::new([0; 16], next_revision),

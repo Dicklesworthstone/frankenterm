@@ -428,6 +428,15 @@ pub struct LocalDomain {
     pty_system: Mutex<Box<dyn PtySystem + Send>>,
     id: DomainId,
     name: String,
+    configuration: LocalDomainConfiguration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LocalDomainConfiguration {
+    Runtime,
+    Wsl(WslDomain),
+    Exec(ExecDomain),
+    Serial(SerialDomain),
 }
 
 impl LocalDomain {
@@ -452,20 +461,41 @@ impl LocalDomain {
     }
 
     pub fn with_pty_system(name: &str, pty_system: Box<dyn PtySystem + Send>) -> Self {
+        Self::with_pty_system_and_configuration(
+            name.to_string(),
+            pty_system,
+            LocalDomainConfiguration::Runtime,
+        )
+    }
+
+    fn with_pty_system_and_configuration(
+        name: String,
+        pty_system: Box<dyn PtySystem + Send>,
+        configuration: LocalDomainConfiguration,
+    ) -> Self {
         let id = alloc_domain_id();
         Self {
             pty_system: Mutex::new(pty_system),
             id,
-            name: name.to_string(),
+            name,
+            configuration,
         }
     }
 
     pub fn new_wsl(wsl: WslDomain) -> Result<Self, Error> {
-        Self::new(&wsl.name)
+        Ok(Self::with_pty_system_and_configuration(
+            wsl.name.clone(),
+            native_pty_system(),
+            LocalDomainConfiguration::Wsl(wsl),
+        ))
     }
 
     pub fn new_exec_domain(exec_domain: ExecDomain) -> anyhow::Result<Self> {
-        Self::new(&exec_domain.name)
+        Ok(Self::with_pty_system_and_configuration(
+            exec_domain.name.clone(),
+            native_pty_system(),
+            LocalDomainConfiguration::Exec(exec_domain),
+        ))
     }
 
     pub fn new_serial_domain(serial_domain: SerialDomain) -> anyhow::Result<Self> {
@@ -478,7 +508,43 @@ impl LocalDomain {
             serial.set_baud_rate(baud_u32);
         }
         let pty_system = Box::new(serial);
-        Ok(Self::with_pty_system(&serial_domain.name, pty_system))
+        Ok(Self::with_pty_system_and_configuration(
+            serial_domain.name.clone(),
+            pty_system,
+            LocalDomainConfiguration::Serial(serial_domain),
+        ))
+    }
+
+    /// Whether this exact domain generation was constructed from a reloadable
+    /// configuration entry rather than created by the mux at runtime.
+    ///
+    /// The distinction is intentionally retained on the domain itself so a
+    /// configuration sweep cannot retire the built-in local domain or another
+    /// runtime-created `LocalDomain` merely because its concrete Rust type and
+    /// name happen to match a configured entry.
+    pub fn is_configuration_owned(&self) -> bool {
+        !matches!(&self.configuration, LocalDomainConfiguration::Runtime)
+    }
+
+    pub fn matches_wsl_configuration(&self, expected: &WslDomain) -> bool {
+        matches!(
+            &self.configuration,
+            LocalDomainConfiguration::Wsl(current) if current == expected
+        )
+    }
+
+    pub fn matches_exec_configuration(&self, expected: &ExecDomain) -> bool {
+        matches!(
+            &self.configuration,
+            LocalDomainConfiguration::Exec(current) if current == expected
+        )
+    }
+
+    pub fn matches_serial_configuration(&self, expected: &SerialDomain) -> bool {
+        matches!(
+            &self.configuration,
+            LocalDomainConfiguration::Serial(current) if current == expected
+        )
     }
 
     fn wslenv_entry_name(entry: &str) -> &str {

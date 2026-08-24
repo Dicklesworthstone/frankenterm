@@ -10,13 +10,20 @@
 use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
 };
+use crate::pane::Pane;
+use crate::{
+    LiveParserCheckpointControl, LiveParserCheckpointError, PaneRegistrationGeneration,
+    PaneRegistrationOperationLease,
+};
 use frankenterm_term::{
     RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID, RecoveryTerminalCheckpointError,
     RecoveryTerminalCheckpointV2,
 };
 use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
+use std::sync::{Arc, Weak};
 use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;
+use termwiz::escape::{parser::RecoveryGroundBoundary, Action};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -39,7 +46,8 @@ pub struct GuardianCheckpointBoundary {
     segment_id: Uuid,
     output_sequence: u64,
     output_record_digest: [u8; 32],
-    journal_segment_plaintext_bytes: u64,
+    output_committed_log_bytes: u64,
+    journal_cumulative_plaintext_bytes: u64,
     parser_stream_bytes: u64,
     replay_identity_digest: [u8; 32],
     rows: u32,
@@ -76,7 +84,8 @@ impl GuardianCheckpointBoundary {
             segment_id: output.segment_id(),
             output_sequence: output.sequence(),
             output_record_digest: output.record_digest(),
-            journal_segment_plaintext_bytes: output.cumulative_plaintext_bytes(),
+            output_committed_log_bytes: output.committed_log_bytes(),
+            journal_cumulative_plaintext_bytes: output.cumulative_plaintext_bytes(),
             parser_stream_bytes: terminal_checkpoint.parser_stream_bytes(),
             replay_identity_digest: current_replay_identity_digest(),
             rows,
@@ -112,7 +121,10 @@ impl GuardianCheckpointBoundary {
         if self.output_sequence == 0 {
             return Err(GuardianCheckpointBoundaryError::ZeroOutputSequence);
         }
-        if self.journal_segment_plaintext_bytes == 0 {
+        if self.output_committed_log_bytes == 0 {
+            return Err(GuardianCheckpointBoundaryError::ZeroOutputCommittedLogBytes);
+        }
+        if self.journal_cumulative_plaintext_bytes == 0 {
             return Err(GuardianCheckpointBoundaryError::ZeroJournalPlaintextWatermark);
         }
         if self.rows == 0 || self.cols == 0 {
@@ -136,7 +148,8 @@ impl GuardianCheckpointBoundary {
         if self.segment_id != verified_segment.segment_id()
             || self.output_sequence != verified_output.sequence()
             || self.output_record_digest != verified_output.record_digest()
-            || self.journal_segment_plaintext_bytes
+            || self.output_committed_log_bytes != verified_output.committed_log_bytes()
+            || self.journal_cumulative_plaintext_bytes
                 != verified_output.cumulative_plaintext_bytes()
         {
             return Err(GuardianCheckpointBoundaryError::VerifiedOutputIdentityMismatch);
@@ -177,11 +190,16 @@ impl GuardianCheckpointBoundary {
         self.output_record_digest
     }
 
-    /// Authenticated plaintext endpoint within `segment_id`. This is not the
-    /// parser-global watermark: segment rollover resets this counter.
     #[must_use]
-    pub const fn journal_segment_plaintext_bytes(&self) -> u64 {
-        self.journal_segment_plaintext_bytes
+    pub const fn output_committed_log_bytes(&self) -> u64 {
+        self.output_committed_log_bytes
+    }
+
+    /// Authenticated pane-lifetime plaintext endpoint carried through segment
+    /// rollover. This remains distinct from the parser-incarnation watermark.
+    #[must_use]
+    pub const fn journal_cumulative_plaintext_bytes(&self) -> u64 {
+        self.journal_cumulative_plaintext_bytes
     }
 
     /// Cumulative bytes consumed by the one live parser incarnation.
@@ -226,8 +244,12 @@ impl std::fmt::Debug for GuardianCheckpointBoundary {
             .field("output_sequence", &self.output_sequence)
             .field("output_record_digest", &"[REDACTED]")
             .field(
-                "journal_segment_plaintext_bytes",
-                &self.journal_segment_plaintext_bytes,
+                "output_committed_log_bytes",
+                &self.output_committed_log_bytes,
+            )
+            .field(
+                "journal_cumulative_plaintext_bytes",
+                &self.journal_cumulative_plaintext_bytes,
             )
             .field("parser_stream_bytes", &self.parser_stream_bytes)
             .field("replay_identity_digest", &"[REDACTED]")
@@ -246,8 +268,13 @@ pub struct LiveParserCaptureAuthority {
 }
 
 impl LiveParserCaptureAuthority {
-    pub(crate) const fn issue() -> Self {
+    const fn issue() -> Self {
         Self { _private: () }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn issue_for_test() -> Self {
+        Self::issue()
     }
 }
 
@@ -257,6 +284,95 @@ pub enum LiveParserPaneCaptureError {
     Unsupported,
     #[error("terminal model checkpoint capture failed: {0}")]
     Terminal(#[source] RecoveryTerminalCheckpointError),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum LiveParserCaptureAndBindError {
+    #[error("live parser checkpoint registration identity changed before model capture")]
+    RegistrationIdentityMismatch,
+    #[error("pane terminal checkpoint callback failed")]
+    Pane(#[source] LiveParserPaneCaptureError),
+    #[error("pane checkpoint did not consume the exact parser action boundary")]
+    PendingActionsRemain,
+    #[error("live parser checkpoint identity binding failed")]
+    Boundary(#[source] GuardianCheckpointBoundaryError),
+}
+
+/// Opaque authority minted only by the exact pending checkpoint state
+/// transition. Callers cannot supply or replace any Ack identity component.
+pub(crate) struct LiveParserCaptureRequest {
+    request_id: u64,
+    target: u64,
+    durable_pane_id: Uuid,
+    segment: GuardianOutputSegmentIdentity,
+    output: GuardianOutputAppendReceipt,
+    limits: frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits,
+    registration_wire_identity: [u8; 16],
+    expected_pane: Weak<dyn Pane>,
+    expected_generation: Weak<PaneRegistrationGeneration>,
+}
+
+impl LiveParserCaptureRequest {
+    pub(super) const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub(super) const fn target(&self) -> u64 {
+        self.target
+    }
+
+    pub(super) const fn durable_pane_id(&self) -> Uuid {
+        self.durable_pane_id
+    }
+}
+
+impl LiveParserCheckpointControl {
+    /// Atomically transition the one exact pending request into capture and
+    /// mint its non-constructible binding authority. Identity fields are read
+    /// only from registration-owned state; none are caller-provided here.
+    pub(super) fn begin_capture(
+        &self,
+        target: u64,
+    ) -> Result<Option<LiveParserCaptureRequest>, LiveParserCheckpointError> {
+        let mut state = self.state.lock();
+        let Some(pending) = state.pending.as_ref() else {
+            return Ok(None);
+        };
+        if pending.cancelled {
+            state.pending.take();
+            drop(state);
+            self.delivery_gate.notify_all();
+            return Ok(None);
+        }
+        if pending.target != target
+            || state.delivered_bytes != target
+            || state.parsed_bytes != target
+            || state.delivery_call_in_flight
+            || state.socket_write_in_flight
+        {
+            return Err(LiveParserCheckpointError::ParserWatermarkMismatch);
+        }
+        if pending.capturing {
+            return Ok(None);
+        }
+        let request = LiveParserCaptureRequest {
+            request_id: pending.request_id,
+            target,
+            durable_pane_id: pending.durable_pane_id,
+            segment: pending.segment,
+            output: pending.output,
+            limits: pending.limits,
+            registration_wire_identity: state.registration_wire_identity,
+            expected_pane: pending.expected_pane.clone(),
+            expected_generation: pending.expected_generation.clone(),
+        };
+        state
+            .pending
+            .as_mut()
+            .expect("pending checkpoint was just validated")
+            .capturing = true;
+        Ok(Some(request))
+    }
 }
 
 /// The only crate-internal publication authority for a checkpoint captured
@@ -269,8 +385,12 @@ pub(crate) struct LiveParserCheckpointAck {
     terminal_checkpoint: RecoveryTerminalCheckpointV2,
 }
 
+#[allow(
+    dead_code,
+    reason = "artifact getters are the prepared guardian protocol publication seam"
+)]
 impl LiveParserCheckpointAck {
-    pub(crate) fn capture(
+    fn capture(
         registration_wire_identity: [u8; 16],
         durable_pane_id: Uuid,
         segment: GuardianOutputSegmentIdentity,
@@ -319,8 +439,12 @@ impl LiveParserCheckpointAck {
         self.boundary.output_record_digest()
     }
 
-    pub(crate) const fn journal_segment_plaintext_bytes(&self) -> u64 {
-        self.boundary.journal_segment_plaintext_bytes()
+    pub(crate) const fn output_committed_log_bytes(&self) -> u64 {
+        self.boundary.output_committed_log_bytes()
+    }
+
+    pub(crate) const fn journal_cumulative_plaintext_bytes(&self) -> u64 {
+        self.boundary.journal_cumulative_plaintext_bytes()
     }
 
     pub(crate) const fn parser_stream_bytes(&self) -> u64 {
@@ -358,12 +482,65 @@ impl std::fmt::Debug for LiveParserCheckpointAck {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LiveParserCheckpointAck")
-            .field("registration_wire_identity", &self.registration_wire_identity)
+            .field("registration_wire_identity", &"[REDACTED]")
             .field("boundary", &self.boundary)
             .field("boundary_digest", &"[REDACTED]")
-            .field("terminal_checkpoint", &self.terminal_checkpoint)
+            .field("terminal_checkpoint", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Perform the only admissible live-parser model capture and ack construction
+/// seam. The typed ground witness remains borrowed through action application,
+/// model serialization, watermark comparison, and identity binding.
+pub(crate) fn capture_and_bind_live_parser_checkpoint(
+    pane: &Arc<dyn Pane>,
+    capture_operation: &PaneRegistrationOperationLease,
+    request: &LiveParserCaptureRequest,
+    pending_actions: &mut Vec<Action>,
+    ground: RecoveryGroundBoundary<'_>,
+) -> Result<LiveParserCheckpointAck, LiveParserCaptureAndBindError> {
+    let expected_pane = request
+        .expected_pane
+        .upgrade()
+        .ok_or(LiveParserCaptureAndBindError::RegistrationIdentityMismatch)?;
+    let expected_generation = request
+        .expected_generation
+        .upgrade()
+        .ok_or(LiveParserCaptureAndBindError::RegistrationIdentityMismatch)?;
+    let observed_durable_pane_id = pane.durable_pane_id().map(Uuid::from_bytes);
+    if !Arc::ptr_eq(&expected_pane, pane)
+        || !Arc::ptr_eq(&expected_generation, &capture_operation.generation)
+        || expected_generation.wire_identity != request.registration_wire_identity
+        || observed_durable_pane_id != Some(request.durable_pane_id)
+    {
+        return Err(LiveParserCaptureAndBindError::RegistrationIdentityMismatch);
+    }
+    if ground.stream_bytes() != request.target() {
+        return Err(LiveParserCaptureAndBindError::Boundary(
+            GuardianCheckpointBoundaryError::ParserWatermarkMismatch,
+        ));
+    }
+    let terminal_checkpoint = pane
+        .capture_live_parser_checkpoint(
+            LiveParserCaptureAuthority::issue(),
+            pending_actions,
+            ground,
+            request.limits,
+        )
+        .map_err(LiveParserCaptureAndBindError::Pane)?;
+    if !pending_actions.is_empty() || terminal_checkpoint.parser_stream_bytes() != request.target {
+        return Err(LiveParserCaptureAndBindError::PendingActionsRemain);
+    }
+    LiveParserCheckpointAck::capture(
+        request.registration_wire_identity,
+        request.durable_pane_id,
+        request.segment,
+        request.output,
+        request.target,
+        terminal_checkpoint,
+    )
+    .map_err(LiveParserCaptureAndBindError::Boundary)
 }
 
 fn live_parser_boundary_digest(
@@ -378,7 +555,8 @@ fn live_parser_boundary_digest(
     hasher.update(boundary.segment_id().as_bytes());
     hasher.update(boundary.output_sequence().to_le_bytes());
     hasher.update(boundary.output_record_digest());
-    hasher.update(boundary.journal_segment_plaintext_bytes().to_le_bytes());
+    hasher.update(boundary.output_committed_log_bytes().to_le_bytes());
+    hasher.update(boundary.journal_cumulative_plaintext_bytes().to_le_bytes());
     hasher.update(boundary.parser_stream_bytes().to_le_bytes());
     hasher.update(boundary.replay_identity_digest());
     hasher.update(boundary.rows().to_le_bytes());
@@ -445,7 +623,7 @@ pub enum GuardianCheckpointBoundaryError {
     OutputSegmentMismatch,
     #[error("checkpoint output receipt precedes the verified segment")]
     OutputBeforeSegment,
-    #[error("checkpoint geometry does not fit the v1 format")]
+    #[error("checkpoint geometry does not fit the v2 format")]
     GeometryOutOfRange,
     #[error("checkpoint geometry must have nonzero rows and columns")]
     ZeroGeometry,
@@ -457,6 +635,8 @@ pub enum GuardianCheckpointBoundaryError {
     NilSegmentIdentity,
     #[error("guardian checkpoint output sequence must be nonzero")]
     ZeroOutputSequence,
+    #[error("guardian checkpoint output committed-log endpoint must be nonzero")]
+    ZeroOutputCommittedLogBytes,
     #[error("guardian checkpoint journal plaintext watermark must be nonzero")]
     ZeroJournalPlaintextWatermark,
     #[error("live parser checkpoint registration wire identity must be nonnil")]
@@ -467,7 +647,7 @@ pub enum GuardianCheckpointBoundaryError {
     ReplayIdentityMismatch,
     #[error("guardian checkpoint terminal payload must be nonempty")]
     EmptyTerminalPayload,
-    #[error("guardian checkpoint terminal payload length does not fit the v1 format")]
+    #[error("guardian checkpoint terminal payload length does not fit the v2 format")]
     TerminalPayloadLengthOutOfRange,
     #[error("guardian checkpoint does not match the verified output record")]
     VerifiedOutputIdentityMismatch,

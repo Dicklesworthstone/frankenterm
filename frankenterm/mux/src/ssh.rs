@@ -263,6 +263,16 @@ impl RemoteSshDomain {
         })
     }
 
+    /// Compare the complete configuration captured by this exact raw-SSH
+    /// generation with a desired reload entry.
+    ///
+    /// Raw SSH retains transport and spawn policy in `dom`; matching only the
+    /// public name would silently keep stale addresses, credentials, backend
+    /// selection, commands, or timeouts after a configuration reload.
+    pub fn matches_configuration(&self, expected: &SshDomain) -> bool {
+        &self.dom == expected
+    }
+
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
         ssh_domain_to_ssh_config(&self.dom)
     }

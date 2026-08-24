@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// Configures an instance of a multiplexer that can be communicated
 /// with via a unix domain socket
-#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+#[derive(Debug, Clone, Eq, PartialEq, FromDynamic, ToDynamic)]
 pub struct UnixDomain {
     /// The name of this specific domain.  Must be unique amongst
     /// all types of domain in the configuration file.

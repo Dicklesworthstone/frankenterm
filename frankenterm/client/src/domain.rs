@@ -3,7 +3,7 @@ use crate::client::{
     RpcGenerationScope,
 };
 use crate::pane::{ClientPane, ReliableInputQueue};
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail, ensure};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
@@ -31,7 +31,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use wezterm_term::TerminalSize;
 
@@ -183,8 +183,7 @@ pub struct ClientInner {
     pub client: Client,
     pub local_domain_id: DomainId,
     owner_client_id: Option<Arc<ClientId>>,
-    pub local_echo_threshold_ms: Option<u64>,
-    pub overlay_lag_indicator: bool,
+    runtime_policy: Arc<ClientDomainPolicy>,
     remote_to_local_window: Mutex<ExactIdMappings<WindowId, WindowId>>,
     remote_to_local_tab: Mutex<ExactIdMappings<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
@@ -1172,7 +1171,7 @@ impl ClientInner {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientDomainConfig {
     Unix(UnixDomain),
     Tls(TlsDomainClient),
@@ -1225,6 +1224,34 @@ impl ClientDomainConfig {
             ClientDomainConfig::Ssh(ssh) => ssh.connect_automatically,
         }
     }
+
+    pub fn transport_configuration_matches(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.clear_runtime_policy_fields();
+        right.clear_runtime_policy_fields();
+        left == right
+    }
+
+    fn clear_runtime_policy_fields(&mut self) {
+        match self {
+            Self::Unix(unix) => {
+                unix.connect_automatically = false;
+                unix.local_echo_threshold_ms = None;
+                unix.overlay_lag_indicator = false;
+            }
+            Self::Tls(tls) => {
+                tls.connect_automatically = false;
+                tls.local_echo_threshold_ms = None;
+                tls.overlay_lag_indicator = false;
+            }
+            Self::Ssh(ssh) => {
+                ssh.connect_automatically = false;
+                ssh.local_echo_threshold_ms = None;
+                ssh.overlay_lag_indicator = false;
+            }
+        }
+    }
 }
 
 impl ClientInner {
@@ -1235,12 +1262,29 @@ impl ClientInner {
         local_echo_threshold_ms: Option<u64>,
         overlay_lag_indicator: bool,
     ) -> Self {
+        Self::new_with_runtime_policy(
+            local_domain_id,
+            client,
+            owner_client_id,
+            Arc::new(ClientDomainPolicy::new(
+                false,
+                local_echo_threshold_ms,
+                overlay_lag_indicator,
+            )),
+        )
+    }
+
+    fn new_with_runtime_policy(
+        local_domain_id: DomainId,
+        client: Client,
+        owner_client_id: Option<Arc<ClientId>>,
+        runtime_policy: Arc<ClientDomainPolicy>,
+    ) -> Self {
         Self {
             client,
             local_domain_id,
             owner_client_id,
-            local_echo_threshold_ms,
-            overlay_lag_indicator,
+            runtime_policy,
             remote_to_local_window: Mutex::new(ExactIdMappings::default()),
             remote_to_local_tab: Mutex::new(ExactIdMappings::default()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
@@ -1249,6 +1293,14 @@ impl ClientInner {
             reliable_input_queue: ReliableInputQueue::new(),
             detached: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn local_echo_threshold_ms(&self) -> Option<u64> {
+        self.runtime_policy.local_echo_threshold_ms()
+    }
+
+    pub(crate) fn overlay_lag_indicator(&self) -> bool {
+        self.runtime_policy.overlay_lag_indicator()
     }
 
     pub(crate) fn begin_remote_metadata_application(
@@ -1297,12 +1349,14 @@ impl ClientInner {
     }
 
     pub(crate) fn mark_detached(&self) {
+        self.client.revoke_domain_reconnect();
         self.reliable_input_queue.detach_domain(&self.detached);
     }
 }
 
 pub struct ClientDomain {
     config: ClientDomainConfig,
+    policy: Arc<ClientDomainPolicy>,
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
     initial_attachment_pending: AtomicBool,
@@ -1310,6 +1364,68 @@ pub struct ClientDomain {
     local_domain_id: DomainId,
     mux_owner: Weak<Mux>,
     mux_subscriber_id: Option<usize>,
+}
+
+struct ClientDomainPolicy {
+    connect_automatically: AtomicBool,
+    local_echo_threshold_ms: AtomicU64,
+    local_echo_threshold_enabled: AtomicBool,
+    overlay_lag_indicator: AtomicBool,
+}
+
+impl ClientDomainPolicy {
+    fn new(
+        connect_automatically: bool,
+        local_echo_threshold_ms: Option<u64>,
+        overlay_lag_indicator: bool,
+    ) -> Self {
+        Self {
+            connect_automatically: AtomicBool::new(connect_automatically),
+            local_echo_threshold_ms: AtomicU64::new(local_echo_threshold_ms.unwrap_or(0)),
+            local_echo_threshold_enabled: AtomicBool::new(local_echo_threshold_ms.is_some()),
+            overlay_lag_indicator: AtomicBool::new(overlay_lag_indicator),
+        }
+    }
+
+    fn from_config(config: &ClientDomainConfig) -> Self {
+        Self::new(
+            config.connect_automatically(),
+            config.local_echo_threshold_ms(),
+            config.overlay_lag_indicator(),
+        )
+    }
+
+    fn update_from_config(&self, config: &ClientDomainConfig) {
+        match config.local_echo_threshold_ms() {
+            Some(threshold) => {
+                self.local_echo_threshold_ms
+                    .store(threshold, Ordering::Release);
+                self.local_echo_threshold_enabled
+                    .store(true, Ordering::Release);
+            }
+            None => self
+                .local_echo_threshold_enabled
+                .store(false, Ordering::Release),
+        }
+        self.overlay_lag_indicator
+            .store(config.overlay_lag_indicator(), Ordering::Release);
+        self.connect_automatically
+            .store(config.connect_automatically(), Ordering::Release);
+    }
+
+    fn connect_automatically(&self) -> bool {
+        self.connect_automatically.load(Ordering::Acquire)
+    }
+
+    fn local_echo_threshold_ms(&self) -> Option<u64> {
+        self.local_echo_threshold_enabled
+            .load(Ordering::Acquire)
+            .then(|| self.local_echo_threshold_ms.load(Ordering::Acquire))
+    }
+
+    fn overlay_lag_indicator(&self) -> bool {
+        self.overlay_lag_indicator.load(Ordering::Acquire)
+    }
 }
 
 struct InitialAttachmentClaim<'a> {
@@ -1932,12 +2048,14 @@ impl ClientDomain {
     pub fn new(config: ClientDomainConfig, mux_owner: &Arc<Mux>) -> anyhow::Result<Self> {
         let local_domain_id = alloc_domain_id();
         let label = config.label();
+        let policy = Arc::new(ClientDomainPolicy::from_config(&config));
         let owner = Arc::downgrade(mux_owner);
         let mux_subscriber_id = mux_owner
             .subscribe(move |notif| mux_notify_client_domain(&owner, local_domain_id, notif))
             .context("allocate client-domain mux subscription")?;
         Ok(Self {
             config,
+            policy,
             label,
             inner: Mutex::new(None),
             initial_attachment_pending: AtomicBool::new(false),
@@ -1990,7 +2108,15 @@ impl ClientDomain {
     }
 
     pub fn connect_automatically(&self) -> bool {
-        self.config.connect_automatically()
+        self.policy.connect_automatically()
+    }
+
+    pub fn reconcile_configuration(&self, expected: &ClientDomainConfig) -> bool {
+        if !self.config.transport_configuration_matches(expected) {
+            return false;
+        }
+        self.policy.update_from_config(expected);
+        true
     }
 
     pub fn perform_detach(&self) {
@@ -3461,14 +3587,11 @@ impl ClientDomain {
                  attachment preparation"
             );
         }
-        let threshold = domain.config.local_echo_threshold_ms();
-        let overlay_lag_indicator = domain.config.overlay_lag_indicator();
-        let inner = Arc::new(ClientInner::new(
+        let inner = Arc::new(ClientInner::new_with_runtime_policy(
             domain_id,
             client,
             owner_client_id,
-            threshold,
-            overlay_lag_indicator,
+            Arc::clone(&domain.policy),
         ));
 
         // Move the non-cloneable exact-domain lease into the rollback guard
@@ -3585,7 +3708,12 @@ impl ClientDomain {
                 .client
                 .publish_rpc_transport_ready(&rpc, readiness_guard)
                 .await
-                .context("publishing initial mux RPC readiness")
+                .context("publishing initial mux RPC readiness")?;
+            // Only coherent topology plus committed readiness authorizes this
+            // client incarnation's internal reconnect loop. Before this cut,
+            // the GUI desired-state supervisor is the sole retry owner.
+            inner.client.authorize_domain_reconnect();
+            Ok(())
         }
         .await;
         bootstrap_result?;
@@ -3794,11 +3922,21 @@ impl Domain for ClientDomain {
     ) -> anyhow::Result<()> {
         self.ensure_mux_owner(mux)?;
         if self.state() == DomainState::Attached {
-            if let Some(inner) = self.inner() {
-                let rpc = inner.client.rpc_scope();
-                let _ = Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id)
-                    .await?;
-            }
+            let inner = self.inner().ok_or_else(|| {
+                anyhow!("client attachment retired while coalescing an attach request")
+            })?;
+            let rpc = inner.client.rpc_scope();
+            ensure!(
+                Self::sync_remote_topology(
+                    Arc::clone(mux),
+                    self,
+                    inner,
+                    &rpc,
+                    window_id,
+                )
+                .await?,
+                "client attachment retired while coalescing an attach request"
+            );
             return Ok(());
         }
         // Claim after the attached topology-sync fast path, but before creating
@@ -3934,6 +4072,7 @@ mod tests {
         });
         let domain = ClientDomain {
             label: config.label(),
+            policy: Arc::new(ClientDomainPolicy::from_config(&config)),
             config,
             inner: Mutex::new(None),
             initial_attachment_pending: AtomicBool::new(false),
@@ -3958,6 +4097,56 @@ mod tests {
         domain
             .claim_initial_attachment()
             .expect("dropping the first transaction must release retry admission");
+    }
+
+    #[test]
+    fn policy_reconciliation_updates_the_live_attachment_policy_in_place() {
+        let domain_id = 91_021;
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "live-policy-reload-test".to_string(),
+            connect_automatically: false,
+            local_echo_threshold_ms: Some(15),
+            overlay_lag_indicator: false,
+            ..UnixDomain::default()
+        });
+        let policy = Arc::new(ClientDomainPolicy::from_config(&config));
+        let inner = Arc::new(ClientInner::new_with_runtime_policy(
+            domain_id,
+            Client::new_test_client(Some(domain_id), config.clone()),
+            None,
+            Arc::clone(&policy),
+        ));
+        let domain = ClientDomain {
+            label: config.label(),
+            config: config.clone(),
+            policy,
+            inner: Mutex::new(Some(Arc::clone(&inner))),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id: domain_id,
+            mux_owner: Weak::new(),
+            mux_subscriber_id: None,
+        };
+
+        let mut enabled = config.clone();
+        let ClientDomainConfig::Unix(enabled) = &mut enabled else {
+            unreachable!("test config is unix")
+        };
+        enabled.connect_automatically = true;
+        enabled.local_echo_threshold_ms = Some(75);
+        enabled.overlay_lag_indicator = true;
+        assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(
+            enabled.clone(),
+        )));
+        assert!(domain.connect_automatically());
+        assert_eq!(inner.local_echo_threshold_ms(), Some(75));
+        assert!(inner.overlay_lag_indicator());
+
+        enabled.local_echo_threshold_ms = None;
+        enabled.overlay_lag_indicator = false;
+        assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(enabled)));
+        assert_eq!(inner.local_echo_threshold_ms(), None);
+        assert!(!inner.overlay_lag_indicator());
     }
 
     #[test]
@@ -4287,6 +4476,7 @@ mod tests {
         });
         let domain = Arc::new(ClientDomain {
             label: config.label(),
+            policy: Arc::new(ClientDomainPolicy::from_config(&config)),
             config,
             inner: Mutex::new(Some(Arc::clone(inner))),
             initial_attachment_pending: AtomicBool::new(false),
@@ -4319,6 +4509,7 @@ mod tests {
             let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
             let domain = Arc::new(ClientDomain {
                 label: config.label(),
+                policy: Arc::new(ClientDomainPolicy::from_config(&config)),
                 config,
                 inner: Mutex::new(Some(Arc::clone(&inner))),
                 initial_attachment_pending: AtomicBool::new(false),
@@ -4378,6 +4569,7 @@ mod tests {
             });
             let successor: Arc<dyn Domain> = Arc::new(ClientDomain {
                 label: successor_config.label(),
+                policy: Arc::new(ClientDomainPolicy::from_config(&successor_config)),
                 config: successor_config,
                 inner: Mutex::new(Some(successor_inner)),
                 initial_attachment_pending: AtomicBool::new(false),

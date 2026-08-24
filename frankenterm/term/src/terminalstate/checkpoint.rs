@@ -5,6 +5,7 @@
 //! guardian binds encoded bytes to `GuardianCheckpointBoundary` after capture.
 
 use super::*;
+use crate::color::{ColorAttribute, SrgbaTuple};
 use frankenterm_escape_parser::csi::KittyKeyboardFlags;
 use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
@@ -3282,6 +3283,7 @@ impl TerminalCheckpointV2 {
     }
 
     /// Capture every supported semantic field or reject unsupported graphics state.
+    #[cfg(test)]
     pub(crate) fn capture(terminal: &TerminalState) -> Result<Self, TerminalCheckpointError> {
         Self::capture_with_limits(terminal, TerminalCheckpointLimits::default())
     }
@@ -4295,7 +4297,6 @@ pub enum TerminalCheckpointError {
         reason: &'static str,
     },
     ColdScrollbackMetadataInconsistent,
-    ColdScrollbackRowMissing(StableRowIndex),
     ColdScrollbackSnapshot(crate::config::ScrollbackSpillError),
     ColdScrollbackNotRecoveryGrade,
     InvalidCurrentDirectory,
@@ -4337,9 +4338,6 @@ impl From<crate::screen::ScreenCheckpointCaptureError> for TerminalCheckpointErr
             }
             crate::screen::ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent => {
                 Self::ColdScrollbackMetadataInconsistent
-            }
-            crate::screen::ScreenCheckpointCaptureError::ColdScrollbackRowMissing(row) => {
-                Self::ColdScrollbackRowMissing(row)
             }
             crate::screen::ScreenCheckpointCaptureError::ColdScrollbackSnapshot(error) => {
                 Self::ColdScrollbackSnapshot(error)
@@ -4384,10 +4382,6 @@ impl std::fmt::Display for TerminalCheckpointError {
             }
             Self::ColdScrollbackMetadataInconsistent => formatter.write_str(
                 "terminal checkpoint cold scrollback metadata changed or is inconsistent",
-            ),
-            Self::ColdScrollbackRowMissing(row) => write!(
-                formatter,
-                "terminal checkpoint cold scrollback row {row} could not be hydrated"
             ),
             Self::ColdScrollbackSnapshot(error) => {
                 write!(formatter, "terminal checkpoint cold scrollback snapshot failed: {error}")

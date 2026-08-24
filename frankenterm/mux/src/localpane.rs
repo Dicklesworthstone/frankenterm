@@ -4418,6 +4418,33 @@ mod disruptor_ring_keep_gate {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct TestChild;
+
+    impl ChildKiller for TestChild {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl Child for TestChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(Some(ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
     fn test_terminal(size: TerminalSize) -> Terminal {
         Terminal::new(
             size,
@@ -4484,6 +4511,55 @@ mod disruptor_ring_keep_gate {
             terminal.lock().cursor_pos().x,
             1,
             "staged output must be applied before resize observes terminal state"
+        );
+    }
+
+    #[test]
+    fn checkpoint_lock_drains_disruptor_before_pending_actions_and_model_capture() {
+        let size = term_size(10, 1);
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut staged = Vec::new();
+        parser.parse(b"a", |action| action.append_to(&mut staged));
+        let mut pending = Vec::new();
+        parser.parse(b"b", |action| action.append_to(&mut pending));
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("two printable bytes end at parser ground");
+
+        let pane = LocalPane::new(
+            1,
+            test_terminal(size),
+            Box::new(TestChild),
+            Box::new(TestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            *uuid::Uuid::new_v4().as_bytes(),
+            "checkpoint-disruptor-test".to_string(),
+        );
+        pane.perform_actions(staged);
+        assert!(
+            !pane.action_ring.is_empty(),
+            "fixture must stage its first parser batch in the disruptor"
+        );
+        let checkpoint = pane
+            .capture_live_parser_checkpoint(
+                LiveParserCaptureAuthority::issue_for_test(),
+                &mut pending,
+                ground,
+                TerminalCheckpointLimits::default(),
+            )
+            .expect("capture model through the production LocalPane lock path");
+
+        assert!(
+            pane.action_ring.is_empty(),
+            "checkpoint left disruptor actions staged"
+        );
+        assert!(pending.is_empty(), "checkpoint left parser actions unapplied");
+        assert_eq!(checkpoint.parser_stream_bytes(), 2);
+        assert_eq!(
+            pane.terminal.lock().cursor_pos().x,
+            2,
+            "ring action must precede pending action in captured model"
         );
     }
 
