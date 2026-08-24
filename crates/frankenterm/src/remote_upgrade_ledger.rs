@@ -403,29 +403,79 @@ pub(crate) struct DurableEffectPermit {
     claim_sha256: String,
     authorization_sequence: u32,
     attempt: u8,
+    authorization: RemoteUpgradeRecord,
     artifact_transaction_id: String,
     kind: DurableEffectKind,
     allow_existing_artifact: bool,
 }
 
 impl DurableEffectPermit {
-    pub(crate) fn consume_publication(self) -> anyhow::Result<String> {
-        self.validate(DurableEffectKind::PublishImmutableGeneration)?;
+    pub(crate) fn consume_publication(
+        self,
+        ledger: &RemoteUpgradeLedger<'_>,
+    ) -> anyhow::Result<String> {
+        self.validate_latest_authorization(
+            ledger,
+            DurableEffectKind::PublishImmutableGeneration,
+        )?;
         Ok(self.artifact_transaction_id)
     }
 
-    pub(crate) fn consume_selector(self) -> anyhow::Result<(String, bool)> {
-        self.validate(DurableEffectKind::SwitchCurrentSelector)?;
+    pub(crate) fn consume_selector(
+        self,
+        ledger: &RemoteUpgradeLedger<'_>,
+    ) -> anyhow::Result<(String, bool)> {
+        self.validate_latest_authorization(ledger, DurableEffectKind::SwitchCurrentSelector)?;
         Ok((self.transaction_id, self.allow_existing_artifact))
+    }
+
+    fn validate_latest_authorization(
+        &self,
+        ledger: &RemoteUpgradeLedger<'_>,
+        expected_kind: DurableEffectKind,
+    ) -> anyhow::Result<()> {
+        self.validate(expected_kind)?;
+        anyhow::ensure!(
+            self.transaction_id == ledger.claim.transaction_id
+                && self.claim_sha256 == ledger.claim_sha256
+                && self.authorization.claim == ledger.claim,
+            "durable effect permit belongs to a different remote upgrade ledger claim"
+        );
+        let scan = ledger.scan_revalidated_authority()?;
+        anyhow::ensure!(
+            scan.latest.as_ref() == Some(&self.authorization),
+            "durable effect permit authorization is no longer the latest committed authority"
+        );
+        let expected_artifact_transaction_id = durable_effect_artifact_transaction_id(
+            &self.transaction_id,
+            &self.claim_sha256,
+            self.authorization_sequence,
+            self.attempt,
+            expected_kind,
+        );
+        anyhow::ensure!(
+            self.artifact_transaction_id == expected_artifact_transaction_id,
+            "durable effect permit artifact identity is not bound to its authorization"
+        );
+        Ok(())
     }
 
     fn validate(&self, expected_kind: DurableEffectKind) -> anyhow::Result<()> {
         validate_transaction_id(&self.transaction_id)?;
+        let expected_state = match expected_kind {
+            DurableEffectKind::PublishImmutableGeneration => RemoteUpgradeState::Prepared,
+            DurableEffectKind::SwitchCurrentSelector => RemoteUpgradeState::Activating,
+        };
         anyhow::ensure!(
             self.kind == expected_kind
                 && is_lowercase_sha256(&self.claim_sha256)
                 && (1..=MAX_COMMITTED_RECORDS).contains(&self.authorization_sequence)
                 && (1..=MAX_ATTEMPTS).contains(&self.attempt)
+                && self.authorization.transaction_id == self.transaction_id
+                && self.authorization.claim_sha256 == self.claim_sha256
+                && self.authorization.sequence == self.authorization_sequence
+                && self.authorization.attempt == self.attempt
+                && self.authorization.state == expected_state
                 && self.artifact_transaction_id.len() == 32
                 && self
                     .artifact_transaction_id
@@ -843,24 +893,20 @@ impl<'root> RemoteUpgradeLedger<'root> {
         kind: DurableEffectKind,
         allow_existing_artifact: bool,
     ) -> DurableEffectPermit {
-        let kind_label = match kind {
-            DurableEffectKind::PublishImmutableGeneration => "publish",
-            DurableEffectKind::SwitchCurrentSelector => "selector",
-        };
-        let material = format!(
-            "{}\0{}\0{}\0{}\0{kind_label}",
-            self.claim.transaction_id,
-            self.claim_sha256,
+        let artifact_transaction_id = durable_effect_artifact_transaction_id(
+            &self.claim.transaction_id,
+            &self.claim_sha256,
             record.sequence,
             record.attempt,
+            kind,
         );
-        let digest = domain_hash(EFFECT_ID_HASH_DOMAIN, material.as_bytes());
         DurableEffectPermit {
             transaction_id: self.claim.transaction_id.clone(),
             claim_sha256: self.claim_sha256.clone(),
             authorization_sequence: record.sequence,
             attempt: record.attempt,
-            artifact_transaction_id: digest[..32].to_string(),
+            authorization: record.clone(),
+            artifact_transaction_id,
             kind,
             allow_existing_artifact,
         }
@@ -984,6 +1030,24 @@ impl<'root> RemoteUpgradeLedger<'root> {
         self.revalidate_authority()?;
         Ok(record)
     }
+}
+
+fn durable_effect_artifact_transaction_id(
+    transaction_id: &str,
+    claim_sha256: &str,
+    authorization_sequence: u32,
+    attempt: u8,
+    kind: DurableEffectKind,
+) -> String {
+    let kind_label = match kind {
+        DurableEffectKind::PublishImmutableGeneration => "publish",
+        DurableEffectKind::SwitchCurrentSelector => "selector",
+    };
+    let material = format!(
+        "{transaction_id}\0{claim_sha256}\0{authorization_sequence}\0{attempt}\0{kind_label}"
+    );
+    let digest = domain_hash(EFFECT_ID_HASH_DOMAIN, material.as_bytes());
+    digest[..32].to_string()
 }
 
 fn preflight_append_capacity(

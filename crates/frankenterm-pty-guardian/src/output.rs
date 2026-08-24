@@ -1294,6 +1294,375 @@ impl GuardianCheckpointStageStore {
     }
 }
 
+struct CheckpointStageDirectoryLock<'a> {
+    directory: &'a File,
+    locked: bool,
+}
+
+impl<'a> CheckpointStageDirectoryLock<'a> {
+    fn exclusive(directory: &'a File) -> Result<Self, GuardianCheckpointStageStoreError> {
+        checkpoint_stage_lock_directory(directory).map_err(|error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-directory-lock", error)
+        })?;
+        Ok(Self {
+            directory,
+            locked: true,
+        })
+    }
+
+    fn unlock(&mut self) -> std::io::Result<()> {
+        if self.locked {
+            checkpoint_stage_unlock_directory(self.directory)?;
+            self.locked = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CheckpointStageDirectoryLock<'_> {
+    fn drop(&mut self) {
+        if self.locked {
+            let _ = checkpoint_stage_unlock_directory(self.directory);
+            self.locked = false;
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn checkpoint_stage_lock_directory(directory: &File) -> std::io::Result<()> {
+    rustix::fs::flock(directory, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn checkpoint_stage_unlock_directory(directory: &File) -> std::io::Result<()> {
+    rustix::fs::flock(directory, rustix::fs::FlockOperation::Unlock)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn checkpoint_stage_lock_directory(_directory: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "safe guardian checkpoint locking is unsupported on this Unix target",
+    ))
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn checkpoint_stage_unlock_directory(_directory: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "safe guardian checkpoint unlocking is unsupported on this Unix target",
+    ))
+}
+
+fn checkpoint_stage_name_max(directory: &File) -> Result<usize, GuardianOutputError> {
+    let observed = fpathconf(directory, PathconfVar::NAME_MAX)
+        .map_err(|error| {
+            GuardianOutputError::io("checkpoint-directory-name-max", std::io::Error::from(error))
+        })?
+        .ok_or(GuardianOutputError::FilesystemAuthority(
+            "guardian checkpoint directory has no finite name bound",
+        ))?;
+    usize::try_from(observed).map_err(|_| GuardianOutputError::FilesystemAuthority(
+        "guardian checkpoint directory name bound is invalid",
+    ))
+}
+
+fn checkpoint_stage_longest_name_bytes() -> usize {
+    let scope = CheckpointStagePathScope::Pane {
+        pane_id: Uuid::from_u128(u128::MAX),
+        generation: u64::MAX,
+    };
+    format!(
+        "{}.publication-{}.chunk-{:010}{CHECKPOINT_STAGE_FILE_SUFFIX}",
+        scope.base_name(Uuid::from_u128(u128::MAX)),
+        Uuid::from_u128(u128::MAX),
+        GUARDIAN_MAX_CHECKPOINT_CHUNKS - 1,
+    )
+    .len()
+}
+
+fn checkpoint_candidate_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    key: CheckpointStageUploadKey,
+) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
+    checkpoint_stage_path(inner, format!("{}.candidate{CHECKPOINT_STAGE_FILE_SUFFIX}", key.base_name()))
+}
+
+fn checkpoint_chunk_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    key: CheckpointStageUploadKey,
+    publication_id: Uuid,
+    index: u32,
+) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
+    checkpoint_stage_path(
+        inner,
+        format!(
+            "{}.publication-{publication_id}.chunk-{index:010}{CHECKPOINT_STAGE_FILE_SUFFIX}",
+            key.base_name(),
+        ),
+    )
+}
+
+fn checkpoint_seal_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    key: CheckpointStageUploadKey,
+    publication_id: Uuid,
+) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
+    checkpoint_stage_path(
+        inner,
+        format!(
+            "{}.publication-{publication_id}.seal{CHECKPOINT_STAGE_FILE_SUFFIX}",
+            key.base_name(),
+        ),
+    )
+}
+
+fn checkpoint_stage_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    name: String,
+) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
+    if name.len() > inner.name_max || !name.as_bytes().is_ascii() {
+        return Err(GuardianCheckpointStageStoreError::NameLimit);
+    }
+    Ok(inner.directory_path.join(name))
+}
+
+fn checkpoint_stage_census(
+    inner: &GuardianCheckpointStageStoreInner,
+) -> Result<CheckpointStageCensus, GuardianCheckpointStageStoreError> {
+    inner
+        .persistence
+        .validate(&inner.directory)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    let mut entries = Vec::new();
+    let mut uploads = BTreeSet::new();
+    let mut total_bytes = 0_u64;
+    for name in read_directory_names(&inner.directory)? {
+        let raw = name.as_bytes();
+        if !raw.starts_with(CHECKPOINT_STAGE_FILE_PREFIX) {
+            continue;
+        }
+        if raw.len() > inner.name_max {
+            return Err(GuardianCheckpointStageStoreError::NameLimit);
+        }
+        let (key, role) = checkpoint_parse_stage_name(raw)?;
+        let path = inner.directory_path.join(&name);
+        let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+        let metadata = file.metadata().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-census-metadata", error)
+        })?;
+        validate_private_file_metadata(&metadata, None)?;
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        if entries.len() >= inner.policy.max_stage_files
+            || total_bytes > inner.policy.max_stage_bytes
+        {
+            return Err(GuardianCheckpointStageStoreError::Capacity);
+        }
+        entries
+            .try_reserve(1)
+            .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+        entries.push(CheckpointStageCensusEntry {
+            key,
+            role,
+            path,
+            bytes: metadata.len(),
+        });
+        uploads.insert(key);
+        if uploads.len() > inner.policy.max_retained_uploads {
+            return Err(GuardianCheckpointStageStoreError::Capacity);
+        }
+    }
+    inner
+        .persistence
+        .validate(&inner.directory)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    Ok(CheckpointStageCensus {
+        total_files: entries.len(),
+        entries,
+        uploads,
+        total_bytes,
+    })
+}
+
+fn checkpoint_parse_stage_name(
+    raw: &[u8],
+) -> Result<(CheckpointStageUploadKey, CheckpointStageFileRole), GuardianCheckpointStageStoreError> {
+    if !raw.is_ascii() {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let name = std::str::from_utf8(raw)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    let (scope, after_scope) = if let Some(rest) = name.strip_prefix("checkpoint-pane-") {
+        let (pane, rest) = checkpoint_take_uuid(rest)?;
+        let rest = rest
+            .strip_prefix(".generation-")
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        let generation_text = rest
+            .get(..20)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        let generation = generation_text
+            .parse::<u64>()
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+        if generation == 0 || format!("{generation:020}") != generation_text {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        let rest = rest
+            .get(20..)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        (
+            CheckpointStagePathScope::Pane {
+                pane_id: pane,
+                generation,
+            },
+            rest,
+        )
+    } else if let Some(rest) = name.strip_prefix("checkpoint-genesis-") {
+        let (spawn_effect_id, rest) = checkpoint_take_uuid(rest)?;
+        (
+            CheckpointStagePathScope::Genesis { spawn_effect_id },
+            rest,
+        )
+    } else {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    };
+    let after_upload = after_scope
+        .strip_prefix(".upload-")
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let (upload_id, role_text) = checkpoint_take_uuid(after_upload)?;
+    let role = if role_text == format!(".candidate{CHECKPOINT_STAGE_FILE_SUFFIX}") {
+        CheckpointStageFileRole::Candidate
+    } else if let Some(rest) = role_text.strip_prefix(".publication-") {
+        let (publication_id, rest) = checkpoint_take_uuid(rest)?;
+        if rest == format!(".seal{CHECKPOINT_STAGE_FILE_SUFFIX}") {
+            CheckpointStageFileRole::Seal { publication_id }
+        } else {
+            let index_text = rest
+                .strip_prefix(".chunk-")
+                .and_then(|rest| rest.strip_suffix(CHECKPOINT_STAGE_FILE_SUFFIX))
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            if index_text.len() != 10 {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            let index = index_text
+                .parse::<u32>()
+                .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+            if index >= GUARDIAN_MAX_CHECKPOINT_CHUNKS
+                || format!("{index:010}") != index_text
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            CheckpointStageFileRole::Chunk {
+                publication_id,
+                index,
+            }
+        }
+    } else {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    };
+    Ok((
+        CheckpointStageUploadKey {
+            scope,
+            upload_id,
+        },
+        role,
+    ))
+}
+
+fn checkpoint_take_uuid(
+    value: &str,
+) -> Result<(Uuid, &str), GuardianCheckpointStageStoreError> {
+    let encoded = value
+        .get(..36)
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let identity = Uuid::parse_str(encoded)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    if identity.is_nil() || identity.to_string() != encoded {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok((identity, &value[36..]))
+}
+
+fn checkpoint_stage_require_capacity(
+    inner: &GuardianCheckpointStageStoreInner,
+    census: &CheckpointStageCensus,
+    key: CheckpointStageUploadKey,
+    added_files: usize,
+    added_bytes: u64,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let retained_uploads = census
+        .uploads
+        .len()
+        .checked_add(usize::from(!census.uploads.contains(&key)))
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let total_files = census
+        .total_files
+        .checked_add(added_files)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let total_bytes = census
+        .total_bytes
+        .checked_add(added_bytes)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let upload_files = census
+        .entries
+        .iter()
+        .filter(|entry| entry.key == key)
+        .count()
+        .checked_add(added_files)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let upload_bytes = census
+        .entries
+        .iter()
+        .filter(|entry| entry.key == key)
+        .try_fold(0_u64, |bytes, entry| bytes.checked_add(entry.bytes))
+        .and_then(|bytes| bytes.checked_add(added_bytes))
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    if retained_uploads > inner.policy.max_retained_uploads
+        || total_files > inner.policy.max_stage_files
+        || total_bytes > inner.policy.max_stage_bytes
+        || upload_files > CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD
+        || upload_bytes > CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD
+    {
+        return Err(GuardianCheckpointStageStoreError::Capacity);
+    }
+    Ok(())
+}
+
 /// Descriptor-pinned encrypted input WAL owned by the live-input worker while
 /// one transaction is in flight.
 pub(crate) struct GuardianPaneInputJournal {
