@@ -14327,6 +14327,461 @@ mod tests {
     }
 
     #[test]
+    fn replay_selector_phase_matrix_prevents_checkpoint_skips_and_snapshot_retargeting() {
+        let guardian = id(97);
+        let mux = id(98);
+        let pane = id(99);
+        let generation = 9;
+        let snapshot_id = id(100);
+        let snapshot_digest = [0x43; 32];
+        let terminal = terminal_checkpoint();
+        let canonical = terminal.canonical_payload();
+        let descriptor = record_checkpoint_descriptor(pane, generation, canonical);
+        let requested_checkpoint =
+            GuardianCheckpointIdentityDigest::from_bytes([0xa1; 32]).unwrap();
+
+        let checkpoint_page = |offset: usize| {
+            let chunk_len = 1_024_usize.min(canonical.len() - offset);
+            let end = offset + chunk_len;
+            let (phase, checkpoint_offset) = if end < canonical.len() {
+                (
+                    GuardianReplayPhaseV1::Checkpoint,
+                    u64::try_from(end).unwrap(),
+                )
+            } else {
+                (GuardianReplayPhaseV1::Output, 0)
+            };
+            let next = GuardianReplayCursorV1::new(
+                snapshot_id,
+                snapshot_digest,
+                phase,
+                1,
+                checkpoint_offset,
+                8,
+                [0x55; 32],
+                1,
+                4_096,
+                4,
+            )
+            .unwrap();
+            GuardianReplayPageDelivery::new(
+                pane,
+                generation,
+                snapshot_id,
+                snapshot_digest,
+                [0; 32],
+                0,
+                Some(next),
+                GuardianReplayPageBodyDelivery::CheckpointChunk(
+                    GuardianCheckpointChunkDelivery::new(
+                        descriptor,
+                        u64::try_from(offset).unwrap(),
+                        Zeroizing::new(canonical[offset..end].to_vec()),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap()
+        };
+        let complete_page = |
+            snapshot: Uuid,
+            incoming_cursor_digest: [u8; 32],
+            page_index: u32,
+            checkpoint_id: GuardianCheckpointIdentityDigest,
+        | {
+            GuardianReplayPageDelivery::new(
+                pane,
+                generation,
+                snapshot,
+                snapshot_digest,
+                incoming_cursor_digest,
+                page_index,
+                None,
+                GuardianReplayPageBodyDelivery::Complete {
+                    checkpoint_id,
+                    through_sequence: 7,
+                    terminal_record_digest: [0x55; 32],
+                    cumulative_plaintext_bytes: 512,
+                },
+            )
+            .unwrap()
+        };
+        let compacted_page = |
+            snapshot: Uuid,
+            incoming_cursor_digest: [u8; 32],
+            page_index: u32,
+        | {
+            GuardianReplayPageDelivery::new(
+                pane,
+                generation,
+                snapshot,
+                snapshot_digest,
+                incoming_cursor_digest,
+                page_index,
+                None,
+                GuardianReplayPageBodyDelivery::Compacted {
+                    requested_checkpoint,
+                    replacement: descriptor,
+                    retained_first_sequence: 8,
+                    compaction_generation: 2,
+                },
+            )
+            .unwrap()
+        };
+        let gap_page = || {
+            GuardianReplayPageDelivery::new(
+                pane,
+                generation,
+                snapshot_id,
+                snapshot_digest,
+                [0; 32],
+                0,
+                None,
+                GuardianReplayPageBodyDelivery::Gap {
+                    requested_sequence: 8,
+                    oldest_retained_sequence: 9,
+                    verified_through_sequence: 7,
+                    reason: GuardianReplayGapReasonV1::Retention,
+                },
+            )
+            .unwrap()
+        };
+
+        let exact_payload = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id: descriptor.checkpoint_id(),
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 4,
+            wait_millis: 0,
+        }
+        .encode()
+        .unwrap();
+        let exact_envelope = request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(101),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &exact_payload,
+        );
+        let exact = authenticate(&exact_envelope);
+        let exact_response =
+            GuardianResponseEnvelope::replay_page(&exact, checkpoint_page(0)).unwrap();
+        let exact_frame = encode_guardian_response(&secret(), &exact_response).unwrap();
+        let exact_delivery = decode_guardian_response(&secret(), &exact_frame)
+            .unwrap()
+            .correlate(&exact_envelope.header)
+            .unwrap()
+            .into_replay_page(&exact)
+            .unwrap();
+        let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) =
+            exact_delivery.into_body()
+        else {
+            panic!("exact checkpoint replay must begin with checkpoint bytes");
+        };
+        let expected_chunk = canonical[..chunk.byte_len()].to_vec();
+        let mut delivered_chunk = Vec::new();
+        let (_, offset, delivered_bytes) = chunk
+            .write_all_bounded(&mut delivered_chunk, 4_096)
+            .unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(usize::try_from(delivered_bytes).unwrap(), expected_chunk.len());
+        assert_eq!(delivered_chunk, expected_chunk);
+
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(&exact, checkpoint_page(1)),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "the first Exact page cannot begin mid-checkpoint");
+        assert!(GuardianResponseEnvelope::replay_page(&exact, gap_page()).is_ok());
+
+        let requested_exact_payload = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id: requested_checkpoint,
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 4,
+            wait_millis: 0,
+        }
+        .encode()
+        .unwrap();
+        let requested_exact = authenticate(&request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(102),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &requested_exact_payload,
+        ));
+        assert!(GuardianResponseEnvelope::replay_page(
+            &requested_exact,
+            compacted_page(snapshot_id, [0; 32], 0),
+        )
+        .is_ok());
+
+        let latest_payload = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: 4_096,
+            max_records: 4,
+            wait_millis: 0,
+        }
+        .encode()
+        .unwrap();
+        let latest = authenticate(&request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(103),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &latest_payload,
+        ));
+        assert!(GuardianResponseEnvelope::replay_page(&latest, checkpoint_page(0)).is_ok());
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &latest,
+                complete_page(snapshot_id, [0; 32], 0, descriptor.checkpoint_id()),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "Latest cannot silently skip the required checkpoint bytes");
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &latest,
+                compacted_page(snapshot_id, [0; 32], 0),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "Latest has no requested checkpoint that a Compacted outcome could identify");
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &exact,
+                complete_page(snapshot_id, [0; 32], 0, descriptor.checkpoint_id()),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "Exact cannot silently skip the required checkpoint bytes");
+
+        let resume_payload = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id: descriptor.checkpoint_id(),
+                next_sequence: 8,
+                previous_record_digest: [0x55; 32],
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 4,
+            wait_millis: 0,
+        }
+        .encode()
+        .unwrap();
+        let resume = authenticate(&request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(104),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &resume_payload,
+        ));
+        assert!(GuardianResponseEnvelope::replay_page(
+            &resume,
+            complete_page(snapshot_id, [0; 32], 0, descriptor.checkpoint_id()),
+        )
+        .is_ok());
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &resume,
+                complete_page(snapshot_id, [0; 32], 0, requested_checkpoint),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "Resume Complete must name the exact checkpoint already held by the consumer");
+
+        let checkpoint_cursor = GuardianReplayCursorV1::new(
+            snapshot_id,
+            snapshot_digest,
+            GuardianReplayPhaseV1::Checkpoint,
+            1,
+            1_024,
+            8,
+            [0x55; 32],
+            1,
+            4_096,
+            4,
+        )
+        .unwrap();
+        let checkpoint_continue_payload = GuardianReplayRequestV1::Continue {
+            cursor: checkpoint_cursor,
+        }
+        .encode()
+        .unwrap();
+        let checkpoint_continue = authenticate(&request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(105),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &checkpoint_continue_payload,
+        ));
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &checkpoint_continue,
+                complete_page(
+                    snapshot_id,
+                    checkpoint_cursor.digest(),
+                    1,
+                    descriptor.checkpoint_id(),
+                ),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "checkpoint-phase continuation cannot complete before the remaining checkpoint bytes");
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &checkpoint_continue,
+                compacted_page(snapshot_id, checkpoint_cursor.digest(), 1),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "an already pinned snapshot cannot change recovery base mid-stream");
+
+        let expired = GuardianReplayPageDelivery::new(
+            pane,
+            generation,
+            snapshot_id,
+            snapshot_digest,
+            checkpoint_cursor.digest(),
+            1,
+            None,
+            GuardianReplayPageBodyDelivery::SnapshotExpired { snapshot_id },
+        )
+        .unwrap();
+        assert!(GuardianResponseEnvelope::replay_page(&checkpoint_continue, expired).is_ok());
+
+        let other_snapshot = id(106);
+        let retargeted = GuardianReplayPageDelivery::new(
+            pane,
+            generation,
+            other_snapshot,
+            snapshot_digest,
+            checkpoint_cursor.digest(),
+            1,
+            None,
+            GuardianReplayPageBodyDelivery::SnapshotExpired {
+                snapshot_id: other_snapshot,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(&checkpoint_continue, retargeted),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "a continuation cannot be retargeted to another snapshot");
+
+        let output_cursor = GuardianReplayCursorV1::new(
+            snapshot_id,
+            snapshot_digest,
+            GuardianReplayPhaseV1::Output,
+            1,
+            0,
+            8,
+            [0x55; 32],
+            1,
+            4_096,
+            4,
+        )
+        .unwrap();
+        let output_continue_payload = GuardianReplayRequestV1::Continue {
+            cursor: output_cursor,
+        }
+        .encode()
+        .unwrap();
+        let output_continue = authenticate(&request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(107),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &output_continue_payload,
+        ));
+        assert!(GuardianResponseEnvelope::replay_page(
+            &output_continue,
+            complete_page(
+                snapshot_id,
+                output_cursor.digest(),
+                1,
+                descriptor.checkpoint_id(),
+            ),
+        )
+        .is_ok());
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(
+                &output_continue,
+                compacted_page(snapshot_id, output_cursor.digest(), 1),
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ));
+
+        let mut noncanonical_gap = gap_page().into_payload().unwrap();
+        noncanonical_gap[REPLAY_PAGE_HEADER_BYTES + REPLAY_GAP_BYTES - 1] = 1;
+        let repaired_page_digest = compute_replay_page_digest(&noncanonical_gap).unwrap();
+        noncanonical_gap[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
+            .copy_from_slice(&repaired_page_digest);
+        assert!(matches!(
+            GuardianReplayPageDelivery::decode(noncanonical_gap),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ));
+
+        let mut false_compaction_boundary =
+            compacted_page(snapshot_id, [0; 32], 0).into_payload().unwrap();
+        let retained_sequence_offset =
+            REPLAY_PAGE_HEADER_BYTES + 32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES;
+        false_compaction_boundary[retained_sequence_offset..retained_sequence_offset + 8]
+            .copy_from_slice(&9_u64.to_be_bytes());
+        let repaired_page_digest =
+            compute_replay_page_digest(&false_compaction_boundary).unwrap();
+        false_compaction_boundary[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
+            .copy_from_slice(&repaired_page_digest);
+        assert!(matches!(
+            GuardianReplayPageDelivery::decode(false_compaction_boundary),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ), "Compacted cannot misstate the replacement checkpoint's suffix boundary");
+
+        let mut invalid_expired_snapshot = GuardianReplayPageDelivery::new(
+            pane,
+            generation,
+            snapshot_id,
+            snapshot_digest,
+            checkpoint_cursor.digest(),
+            1,
+            None,
+            GuardianReplayPageBodyDelivery::SnapshotExpired { snapshot_id },
+        )
+        .unwrap()
+        .into_payload()
+        .unwrap();
+        invalid_expired_snapshot[REPLAY_PAGE_HEADER_BYTES..REPLAY_PAGE_HEADER_BYTES + 16]
+            .fill(0);
+        let repaired_page_digest =
+            compute_replay_page_digest(&invalid_expired_snapshot).unwrap();
+        invalid_expired_snapshot[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
+            .copy_from_slice(&repaired_page_digest);
+        assert!(matches!(
+            GuardianReplayPageDelivery::decode(invalid_expired_snapshot),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ));
+    }
+
+    #[test]
     fn plaintext_bearing_protocol_owners_are_nonclone_and_zeroizing_by_contract() {
         let source = include_str!("guardian_protocol.rs");
         assert!(source.contains("#[derive(PartialEq)]\npub struct GuardianSpawnPayload"));

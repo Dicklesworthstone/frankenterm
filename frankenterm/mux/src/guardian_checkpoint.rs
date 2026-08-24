@@ -1731,17 +1731,46 @@ mod tests {
             origin.journal_cumulative_plaintext_bytes(),
             Some(capture.journal_cumulative_plaintext_bytes())
         );
+        let mut expected_boundary = Sha256::new();
+        expected_boundary.update(OUTPUT_BOUNDARY_IDENTITY_DIGEST_DOMAIN);
+        expected_boundary.update(GUARDIAN_CHECKPOINT_BOUNDARY_VERSION.to_le_bytes());
+        expected_boundary.update(capture.durable_pane_id().as_bytes());
+        expected_boundary.update(capture.segment_id().as_bytes());
+        expected_boundary.update(capture.output_sequence().to_le_bytes());
+        expected_boundary.update(capture.output_record_digest());
+        expected_boundary.update(capture.output_committed_log_bytes().to_le_bytes());
+        expected_boundary.update(
+            capture
+                .journal_cumulative_plaintext_bytes()
+                .to_le_bytes(),
+        );
+        let expected_boundary: [u8; 32] = expected_boundary.finalize().into();
         assert_eq!(
             descriptor
                 .recompute_boundary_identity_digest()
                 .expect("recompute record boundary"),
-            capture.output_boundary_identity_digest()
+            expected_boundary
         );
+        let mut expected_checkpoint = Sha256::new();
+        expected_checkpoint.update(CHECKPOINT_ARTIFACT_IDENTITY_DIGEST_DOMAIN);
+        expected_checkpoint.update(expected_boundary);
+        expected_checkpoint.update(capture.parser_stream_bytes().to_le_bytes());
+        expected_checkpoint.update(descriptor.replay_identity_digest());
+        expected_checkpoint.update(descriptor.rows().to_le_bytes());
+        expected_checkpoint.update(descriptor.cols().to_le_bytes());
+        expected_checkpoint.update(descriptor.terminal_payload_bytes().to_le_bytes());
+        expected_checkpoint.update(descriptor.terminal_payload_digest());
+        let expected_checkpoint: [u8; 32] = expected_checkpoint.finalize().into();
         assert_eq!(
             descriptor
                 .recompute_checkpoint_identity_digest()
                 .expect("recompute record artifact"),
-            capture.checkpoint_artifact_identity_digest()
+            expected_checkpoint
+        );
+        assert_eq!(capture.output_boundary_identity_digest(), expected_boundary);
+        assert_eq!(
+            capture.checkpoint_artifact_identity_digest(),
+            expected_checkpoint
         );
         descriptor
             .validate_record_authority(segment, output)
@@ -2085,11 +2114,31 @@ mod tests {
     fn descriptor_rejects_unsupported_replay_identity() {
         let (mut descriptor, _, _, capture) = record_descriptor();
         descriptor.replay_identity_digest[0] ^= 1;
+        let boundary_identity = descriptor
+            .recompute_boundary_identity_digest()
+            .expect("unsupported replay identity does not alter boundary structure");
+        let checkpoint_identity = descriptor
+            .recompute_checkpoint_identity_digest()
+            .expect("unsupported replay identity remains content-addressable");
 
         assert_eq!(
             descriptor.validate_canonical_payload(
                 capture.terminal_checkpoint().canonical_payload(),
                 TerminalCheckpointLimits::default(),
+            ),
+            Err(GuardianCheckpointBoundaryError::ReplayIdentityMismatch)
+        );
+        assert_eq!(
+            GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+                boundary_identity,
+                checkpoint_identity,
+                descriptor.origin(),
+                descriptor.parser_stream_bytes(),
+                descriptor.replay_identity_digest(),
+                descriptor.rows(),
+                descriptor.cols(),
+                descriptor.terminal_payload_bytes(),
+                descriptor.terminal_payload_digest(),
             ),
             Err(GuardianCheckpointBoundaryError::ReplayIdentityMismatch)
         );
