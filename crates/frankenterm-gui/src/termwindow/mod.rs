@@ -7103,7 +7103,6 @@ impl TermWindow {
                     .mux_or_err("detach domain")?
                     .resolve_spawn_tab_domain(Some(pane.pane_id()), domain)?;
                 let domain_name = domain.domain_name().to_string();
-                crate::cancel_auto_connect_supervisor();
                 match promise::spawn::try_reserve_main_thread(
                     promise::spawn::MainThreadServiceClass::Topology,
                     8 * 1024,
@@ -7112,24 +7111,36 @@ impl TermWindow {
                         reservation
                             .spawn_local(async move {
                                 let result = async {
+                                    let _lifecycle =
+                                        mux_lua::reserve_domain_lifecycle(domain_name.clone())
+                                            .context(
+                                                "reserving ordered manual domain detachment lifecycle",
+                                            )?
+                                            .enter()
+                                            .await
+                                            .context(
+                                                "entering ordered manual domain detachment lifecycle",
+                                            )?;
                                     let persisted_name = domain_name.clone();
                                     promise::spawn::spawn_into_new_thread(move || {
                                         domain_reconnect_manifest::set_intent(
                                             &persisted_name,
                                             DomainAttachmentIntent::Detached,
                                         )
-                                        .map(|_| ())
                                         .map_err(anyhow::Error::new)
                                     })
-                                    .await?;
+                                    .await
+                                    .map(crate::publish_domain_reconnect_manifest_snapshot)?;
+                                    crate::cancel_auto_connect_supervisor();
                                     // Keep the exact admitted domain generation
                                     // resolved by the operator action alive across
                                     // persistence. A config reload may publish a
                                     // replacement with the same name while the
                                     // worker fsyncs; name-based re-resolution here
                                     // would detach that successor instead.
-                                    domain.detach()?;
-                                    Result::<(), anyhow::Error>::Ok(())
+                                    let detach_result = domain.detach();
+                                    crate::schedule_auto_connect_domains();
+                                    detach_result
                                 }
                                 .await;
                                 if let Err(error) = result {
@@ -7145,7 +7156,6 @@ impl TermWindow {
                                     log::error!("{message}");
                                     persistent_toast_notification("Domain detach failed", &message);
                                 }
-                                crate::schedule_auto_connect_domains();
                             })
                             .detach();
                     }
@@ -7164,7 +7174,6 @@ impl TermWindow {
                         );
                         log::error!("{message}");
                         persistent_toast_notification("Domain detach failed", &message);
-                        crate::schedule_auto_connect_domains();
                     }
                 }
             }
@@ -7181,26 +7190,58 @@ impl TermWindow {
                         reservation
                             .spawn_local(async move {
                                 let result = async {
-                                    let mux = Mux::try_get().ok_or_else(|| {
-                                        anyhow!("cannot attach domain without an active mux")
-                                    })?;
-                                    let domain = mux.get_domain_by_name(&domain_name).ok_or_else(
-                                        || anyhow!("{} is not a valid domain name", domain_name),
-                                    )?;
-                                    crate::spawn::attach_domain_to_window_or_spawn_recovery(
+                                    let mux = Mux::try_get()
+                                        .ok_or_else(|| {
+                                            anyhow!(
+                                                "cannot attach domain without an active mux"
+                                            )
+                                        })
+                                        .map_err(|error| (error, false))?;
+                                    let domain = mux
+                                        .get_domain_by_name(&domain_name)
+                                        .ok_or_else(|| {
+                                            anyhow!(
+                                                "{} is not a valid domain name",
+                                                domain_name
+                                            )
+                                        })
+                                        .map_err(|error| (error, false))?;
+                                    match crate::spawn::attach_domain_to_window_or_spawn_recovery(
                                         &domain, window, None, None, dpi,
                                     )
-                                    .await?;
-
-                                    Result::<(), anyhow::Error>::Ok(())
+                                    .await
+                                    {
+                                        Ok(_) => Ok(()),
+                                        Err(failure) => {
+                                            let retry_applicable =
+                                                failure.establishes_domain_retry();
+                                            Err((failure.into_error(), retry_applicable))
+                                        }
+                                    }
                                 }
                                 .await;
 
-                                if let Err(err) = result {
+                                if let Err((err, retry_applicable)) = result {
+                                    // The attach helper durably records an
+                                    // Attached intent before dialing. Refresh
+                                    // the supervisor only after this manual
+                                    // attempt has relinquished the client's
+                                    // single-flight attachment claim, so the
+                                    // remembered domain is actually added to
+                                    // the retry frontier without racing a
+                                    // second transport against this attempt.
+                                    let recovery = if retry_applicable
+                                        && crate::schedule_auto_connect_domain(&domain_name)
+                                            .establishes_retry_handoff()
+                                    {
+                                        crate::DomainConnectionRecovery::AutomaticRetry
+                                    } else {
+                                        crate::DomainConnectionRecovery::ExistingWindow
+                                    };
                                     let message = crate::domain_connection_failure_message(
                                         &domain_name,
                                         &err,
-                                        crate::DomainConnectionRecovery::ExistingWindow,
+                                        recovery,
                                     );
                                     frankenterm_gui::gui_debug_log::record(
                                         log::Level::Error,

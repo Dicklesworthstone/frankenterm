@@ -45,7 +45,9 @@ mod tab;
 mod window;
 
 pub use domain::MuxDomain;
-pub use domain::{DomainIntent, install_domain_intent_recorder};
+pub use domain::{
+    DomainLifecycleEvent, install_domain_lifecycle_recorder, reserve_domain_lifecycle,
+};
 pub use pane::MuxPane;
 pub use tab::MuxTab;
 pub use window::MuxWindow;

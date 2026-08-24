@@ -3,7 +3,7 @@ use crate::client::{
     RpcGenerationScope,
 };
 use crate::pane::{ClientPane, ReliableInputQueue};
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail, ensure};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
@@ -1172,7 +1172,7 @@ impl ClientInner {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientDomainConfig {
     Unix(UnixDomain),
     Tls(TlsDomainClient),
@@ -1223,6 +1223,34 @@ impl ClientDomainConfig {
             ClientDomainConfig::Unix(unix) => unix.connect_automatically,
             ClientDomainConfig::Tls(tls) => tls.connect_automatically,
             ClientDomainConfig::Ssh(ssh) => ssh.connect_automatically,
+        }
+    }
+
+    pub fn transport_configuration_matches(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.clear_runtime_policy_fields();
+        right.clear_runtime_policy_fields();
+        left == right
+    }
+
+    fn clear_runtime_policy_fields(&mut self) {
+        match self {
+            Self::Unix(unix) => {
+                unix.connect_automatically = false;
+                unix.local_echo_threshold_ms = None;
+                unix.overlay_lag_indicator = false;
+            }
+            Self::Tls(tls) => {
+                tls.connect_automatically = false;
+                tls.local_echo_threshold_ms = None;
+                tls.overlay_lag_indicator = false;
+            }
+            Self::Ssh(ssh) => {
+                ssh.connect_automatically = false;
+                ssh.local_echo_threshold_ms = None;
+                ssh.overlay_lag_indicator = false;
+            }
         }
     }
 }
@@ -1297,12 +1325,14 @@ impl ClientInner {
     }
 
     pub(crate) fn mark_detached(&self) {
+        self.client.revoke_domain_reconnect();
         self.reliable_input_queue.detach_domain(&self.detached);
     }
 }
 
 pub struct ClientDomain {
     config: ClientDomainConfig,
+    policy: parking_lot::RwLock<ClientDomainPolicy>,
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
     initial_attachment_pending: AtomicBool,
@@ -1310,6 +1340,23 @@ pub struct ClientDomain {
     local_domain_id: DomainId,
     mux_owner: Weak<Mux>,
     mux_subscriber_id: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientDomainPolicy {
+    connect_automatically: bool,
+    local_echo_threshold_ms: Option<u64>,
+    overlay_lag_indicator: bool,
+}
+
+impl ClientDomainPolicy {
+    fn from_config(config: &ClientDomainConfig) -> Self {
+        Self {
+            connect_automatically: config.connect_automatically(),
+            local_echo_threshold_ms: config.local_echo_threshold_ms(),
+            overlay_lag_indicator: config.overlay_lag_indicator(),
+        }
+    }
 }
 
 struct InitialAttachmentClaim<'a> {
@@ -1932,12 +1979,14 @@ impl ClientDomain {
     pub fn new(config: ClientDomainConfig, mux_owner: &Arc<Mux>) -> anyhow::Result<Self> {
         let local_domain_id = alloc_domain_id();
         let label = config.label();
+        let policy = ClientDomainPolicy::from_config(&config);
         let owner = Arc::downgrade(mux_owner);
         let mux_subscriber_id = mux_owner
             .subscribe(move |notif| mux_notify_client_domain(&owner, local_domain_id, notif))
             .context("allocate client-domain mux subscription")?;
         Ok(Self {
             config,
+            policy: parking_lot::RwLock::new(policy),
             label,
             inner: Mutex::new(None),
             initial_attachment_pending: AtomicBool::new(false),
@@ -1990,7 +2039,15 @@ impl ClientDomain {
     }
 
     pub fn connect_automatically(&self) -> bool {
-        self.config.connect_automatically()
+        self.policy.read().connect_automatically
+    }
+
+    pub fn reconcile_configuration(&self, expected: &ClientDomainConfig) -> bool {
+        if !self.config.transport_configuration_matches(expected) {
+            return false;
+        }
+        *self.policy.write() = ClientDomainPolicy::from_config(expected);
+        true
     }
 
     pub fn perform_detach(&self) {
@@ -3461,8 +3518,9 @@ impl ClientDomain {
                  attachment preparation"
             );
         }
-        let threshold = domain.config.local_echo_threshold_ms();
-        let overlay_lag_indicator = domain.config.overlay_lag_indicator();
+        let policy = *domain.policy.read();
+        let threshold = policy.local_echo_threshold_ms;
+        let overlay_lag_indicator = policy.overlay_lag_indicator;
         let inner = Arc::new(ClientInner::new(
             domain_id,
             client,
@@ -3585,7 +3643,12 @@ impl ClientDomain {
                 .client
                 .publish_rpc_transport_ready(&rpc, readiness_guard)
                 .await
-                .context("publishing initial mux RPC readiness")
+                .context("publishing initial mux RPC readiness")?;
+            // Only coherent topology plus committed readiness authorizes this
+            // client incarnation's internal reconnect loop. Before this cut,
+            // the GUI desired-state supervisor is the sole retry owner.
+            inner.client.authorize_domain_reconnect();
+            Ok(())
         }
         .await;
         bootstrap_result?;
@@ -3794,11 +3857,21 @@ impl Domain for ClientDomain {
     ) -> anyhow::Result<()> {
         self.ensure_mux_owner(mux)?;
         if self.state() == DomainState::Attached {
-            if let Some(inner) = self.inner() {
-                let rpc = inner.client.rpc_scope();
-                let _ = Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id)
-                    .await?;
-            }
+            let inner = self.inner().ok_or_else(|| {
+                anyhow!("client attachment retired while coalescing an attach request")
+            })?;
+            let rpc = inner.client.rpc_scope();
+            ensure!(
+                Self::sync_remote_topology(
+                    Arc::clone(mux),
+                    self,
+                    inner,
+                    &rpc,
+                    window_id,
+                )
+                .await?,
+                "client attachment retired while coalescing an attach request"
+            );
             return Ok(());
         }
         // Claim after the attached topology-sync fast path, but before creating
@@ -3934,6 +4007,7 @@ mod tests {
         });
         let domain = ClientDomain {
             label: config.label(),
+            policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
             config,
             inner: Mutex::new(None),
             initial_attachment_pending: AtomicBool::new(false),
@@ -4287,6 +4361,7 @@ mod tests {
         });
         let domain = Arc::new(ClientDomain {
             label: config.label(),
+            policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
             config,
             inner: Mutex::new(Some(Arc::clone(inner))),
             initial_attachment_pending: AtomicBool::new(false),
@@ -4319,6 +4394,7 @@ mod tests {
             let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
             let domain = Arc::new(ClientDomain {
                 label: config.label(),
+                policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
                 config,
                 inner: Mutex::new(Some(Arc::clone(&inner))),
                 initial_attachment_pending: AtomicBool::new(false),
@@ -4378,6 +4454,9 @@ mod tests {
             });
             let successor: Arc<dyn Domain> = Arc::new(ClientDomain {
                 label: successor_config.label(),
+                policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(
+                    &successor_config,
+                )),
                 config: successor_config,
                 inner: Mutex::new(Some(successor_inner)),
                 initial_attachment_pending: AtomicBool::new(false),

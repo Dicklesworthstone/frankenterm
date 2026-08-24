@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 config.workspace = true
+futures.workspace = true
 libc.workspace = true
 log.workspace = true
 luahelper.workspace = true

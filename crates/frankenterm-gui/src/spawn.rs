@@ -19,62 +19,152 @@ pub enum SpawnWhere {
     FloatingPane(FloatingPaneRect),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DomainAttachmentReceipt {
+    remembered_manifest_generation: Option<u64>,
+    attachment_committed: bool,
+}
+
+impl DomainAttachmentReceipt {
+    #[must_use]
+    pub const fn remembered_attachment(self) -> bool {
+        self.remembered_manifest_generation.is_some()
+    }
+
+    #[must_use]
+    pub const fn attachment_committed(self) -> bool {
+        self.attachment_committed
+    }
+}
+
+pub struct DomainAttachmentFailure {
+    error: anyhow::Error,
+    receipt: DomainAttachmentReceipt,
+    stage: DomainAttachmentFailureStage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DomainAttachmentFailureStage {
+    Preparation,
+    IntentPersistence,
+    Attach,
+    PostAttachSpawn,
+}
+
+impl DomainAttachmentFailure {
+    #[must_use]
+    pub const fn remembered_attachment(&self) -> bool {
+        self.receipt.remembered_attachment()
+    }
+
+    #[must_use]
+    pub const fn establishes_domain_retry(&self) -> bool {
+        matches!(self.stage, DomainAttachmentFailureStage::Attach)
+            && !self.receipt.attachment_committed()
+    }
+
+    #[must_use]
+    pub fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
 pub async fn attach_domain_to_window_or_spawn_recovery(
     domain: &DomainOperationGuard,
     window_id: MuxWindowId,
     command: Option<CommandBuilder>,
     command_dir: Option<String>,
     dpi: u32,
-) -> anyhow::Result<()> {
-    let mux = Mux::try_get().context("mux singleton is not available")?;
-    let domain_id = domain.domain_id();
-    let domain_name = domain.domain_name().to_string();
-    let owner_client_id = mux.active_identity();
+) -> Result<DomainAttachmentReceipt, DomainAttachmentFailure> {
+    let mut receipt = DomainAttachmentReceipt::default();
+    let mut stage = DomainAttachmentFailureStage::Preparation;
+    let result = async {
+        let mux = Mux::try_get().context("mux singleton is not available")?;
+        let domain_id = domain.domain_id();
+        let domain_name = domain.domain_name().to_string();
+        let owner_client_id = mux.active_identity();
+        let _lifecycle = mux_lua::reserve_domain_lifecycle(domain_name.clone())
+            .context("reserving ordered domain attachment lifecycle")?
+            .enter()
+            .await
+            .context("entering ordered domain attachment lifecycle")?;
 
-    if domain.downcast_ref::<frankenterm_client::domain::ClientDomain>().is_some() {
-        let persisted_domain_name = domain_name.clone();
-        promise::spawn::spawn_into_new_thread(move || {
-            frankenterm_gui::domain_reconnect_manifest::set_intent(
-                &persisted_domain_name,
-                frankenterm_gui::domain_reconnect_manifest::DomainAttachmentIntent::Attached,
+        if domain
+            .downcast_ref::<frankenterm_client::domain::ClientDomain>()
+            .is_some()
+        {
+            stage = DomainAttachmentFailureStage::IntentPersistence;
+            let persisted_domain_name = domain_name.clone();
+            let manifest = promise::spawn::spawn_into_new_thread(move || {
+                frankenterm_gui::domain_reconnect_manifest::set_intent(
+                    &persisted_domain_name,
+                    frankenterm_gui::domain_reconnect_manifest::DomainAttachmentIntent::Attached,
+                )
+                .map_err(anyhow::Error::new)
+            })
+            .await
+            .context("persisting domain attachment intent before attach")?;
+            crate::publish_domain_reconnect_manifest_snapshot(manifest.clone());
+            receipt.remembered_manifest_generation = Some(manifest.generation());
+        }
+
+        stage = DomainAttachmentFailureStage::Attach;
+        domain
+            .attach(&mux, owner_client_id, Some(window_id))
+            .await
+            .with_context(|| format!("attaching domain `{domain_name}` to window {window_id}"))?;
+        receipt.attachment_committed = true;
+
+        if mux.window_has_panes_in_domain(window_id, domain_id) {
+            return Ok(());
+        }
+
+        stage = DomainAttachmentFailureStage::PostAttachSpawn;
+        let config = config::configuration();
+        config.update_ulimit()?;
+        let _tab = domain
+            .spawn(
+                &mux,
+                config.initial_size(
+                    dpi,
+                    Some(crate::cell_pixel_dims(&config, f64::from(dpi))?),
+                ),
+                command,
+                command_dir,
+                window_id,
             )
-            .map(|_| ())
-            .map_err(anyhow::Error::new)
-        })
-        .await
-        .context("persisting domain attachment intent before attach")?;
+            .await
+            .with_context(|| {
+                format!("spawning recovery tab for domain `{domain_name}` in window {window_id}")
+            })?;
+
+        ensure!(
+            mux.window_has_panes_in_domain(window_id, domain_id),
+            "domain `{domain_name}` attach/spawn completed, but window {window_id} still has no panes in that domain"
+        );
+
+        Ok(())
+    }
+    .await;
+
+    if receipt.remembered_attachment() {
+        // The remembered-domain set is a supervisor input snapshot. Refresh
+        // it after releasing the lifecycle guard even when the immediate
+        // operation failed: a successful manual attach must remain supervised
+        // if its internal reconnect budget is later exhausted, while an exact
+        // attach-stage failure still receives a typed handoff check at its
+        // caller.
+        crate::schedule_auto_connect_domains();
     }
 
-    domain
-        .attach(&mux, owner_client_id, Some(window_id))
-        .await
-        .with_context(|| format!("attaching domain `{domain_name}` to window {window_id}"))?;
-
-    if mux.window_has_panes_in_domain(window_id, domain_id) {
-        return Ok(());
+    match result {
+        Ok(()) => Ok(receipt),
+        Err(error) => Err(DomainAttachmentFailure {
+            error,
+            receipt,
+            stage,
+        }),
     }
-
-    let config = config::configuration();
-    config.update_ulimit()?;
-    let _tab = domain
-        .spawn(
-            &mux,
-            config.initial_size(dpi, Some(crate::cell_pixel_dims(&config, f64::from(dpi))?)),
-            command,
-            command_dir,
-            window_id,
-        )
-        .await
-        .with_context(|| {
-            format!("spawning recovery tab for domain `{domain_name}` in window {window_id}")
-        })?;
-
-    ensure!(
-        mux.window_has_panes_in_domain(window_id, domain_id),
-        "domain `{domain_name}` attach/spawn completed, but window {window_id} still has no panes in that domain"
-    );
-
-    Ok(())
 }
 
 pub fn spawn_command_impl(
@@ -267,4 +357,42 @@ pub async fn spawn_command_internal(
     drop(activity);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn planted_failure(
+        stage: DomainAttachmentFailureStage,
+        attachment_committed: bool,
+    ) -> DomainAttachmentFailure {
+        DomainAttachmentFailure {
+            error: anyhow::anyhow!("planted attachment failure"),
+            receipt: DomainAttachmentReceipt {
+                remembered_manifest_generation: Some(7),
+                attachment_committed,
+            },
+            stage,
+        }
+    }
+
+    #[test]
+    fn only_uncommitted_attach_stage_failure_establishes_domain_retry() {
+        assert!(
+            planted_failure(DomainAttachmentFailureStage::Attach, false)
+                .establishes_domain_retry()
+        );
+        for (stage, committed) in [
+            (DomainAttachmentFailureStage::Preparation, false),
+            (DomainAttachmentFailureStage::IntentPersistence, false),
+            (DomainAttachmentFailureStage::Attach, true),
+            (DomainAttachmentFailureStage::PostAttachSpawn, true),
+        ] {
+            assert!(
+                !planted_failure(stage, committed).establishes_domain_retry(),
+                "stage {stage:?} committed={committed} must not promise domain recovery"
+            );
+        }
+    }
 }
