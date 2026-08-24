@@ -19,7 +19,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-pub const GUARDIAN_PROTOCOL_VERSION: u16 = 3;
+pub const GUARDIAN_PROTOCOL_VERSION: u16 = 4;
 pub const GUARDIAN_AUTH_TOKEN_BYTES: usize = 32;
 pub const GUARDIAN_MAC_BYTES: usize = 32;
 pub const GUARDIAN_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -31,6 +31,17 @@ pub const GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT: usize = 64;
 pub const GUARDIAN_MAX_CENSUS_ENTRIES: u16 = 256;
 pub const GUARDIAN_MAX_CENSUS_BYTES: u32 = 256 * 1024;
 pub const GUARDIAN_MAX_CENSUS_SNAPSHOTS: usize = 8;
+/// Maximum plaintext carried by one checkpoint upload chunk or replay page.
+///
+/// This leaves ample space beneath the authenticated 512-KiB payload ceiling
+/// for fixed metadata and the maximum 32 output-record descriptors.
+pub const GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES: u32 = 256 * 1024;
+pub const GUARDIAN_MAX_REPLAY_RECORDS: u16 = 32;
+pub const GUARDIAN_MAX_REPLAY_WAIT_MILLIS: u16 = 1_000;
+pub const GUARDIAN_MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+pub const GUARDIAN_MAX_CHECKPOINT_CHUNKS: u32 = 1_024;
+pub const GUARDIAN_MAX_REPLAY_SNAPSHOTS_PER_CONNECTION: usize = 8;
+pub const GUARDIAN_MAX_REPLAY_SNAPSHOTS_PER_SERVICE: usize = 64;
 pub const GUARDIAN_CENSUS_PAGE_HEADER_BYTES: u32 = 34;
 pub const GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES: u32 = 87;
 pub const GUARDIAN_MIN_CENSUS_PAGE_BYTES: u32 =
@@ -58,6 +69,12 @@ const SIGNAL_PAYLOAD_MAGIC: [u8; 4] = *b"GSG1";
 const INPUT_EFFECT_QUERY_PAYLOAD_MAGIC: [u8; 4] = *b"GIQ1";
 const CHECKPOINT_INTENT_PAYLOAD_MAGIC: [u8; 4] = *b"GCP1";
 const CHECKPOINT_RECEIPT_PAYLOAD_MAGIC: [u8; 4] = *b"GCR1";
+const CHECKPOINT_STAGE_PAYLOAD_MAGIC: [u8; 4] = *b"GCS1";
+const CHECKPOINT_STAGE_REPLY_MAGIC: [u8; 4] = *b"GSR1";
+const REPLAY_REQUEST_PAYLOAD_MAGIC: [u8; 4] = *b"GRQ1";
+const REPLAY_PAGE_PAYLOAD_MAGIC: [u8; 4] = *b"GRP1";
+const REPLAY_ACK_PAYLOAD_MAGIC: [u8; 4] = *b"GRA1";
+const REPLAY_ACK_REPLY_MAGIC: [u8; 4] = *b"GAR1";
 const REJECTION_PAYLOAD_MAGIC: [u8; 4] = *b"GRE1";
 const SPAWN_PAYLOAD_FIXED_BYTES: usize = 16;
 const RESIZE_PAYLOAD_BYTES: usize = 12;
@@ -66,6 +83,29 @@ const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 48;
 const INPUT_RECEIPT_PAYLOAD_BYTES: usize = 53;
 const INPUT_EFFECT_REPLY_PAYLOAD_BYTES: usize = 21;
 const REJECTION_PAYLOAD_BYTES: usize = 6;
+const CHECKPOINT_STAGE_SCOPE_BYTES: usize = 32;
+const CHECKPOINT_STAGE_COMMON_BYTES: usize = 136;
+const CHECKPOINT_STAGE_CHUNK_FIXED_BYTES: usize = CHECKPOINT_STAGE_COMMON_BYTES + 48;
+const CHECKPOINT_STAGE_REPLY_BYTES: usize = 100;
+const REPLAY_CURSOR_BYTES: usize = 160;
+const REPLAY_OPEN_REQUEST_BYTES: usize = 92;
+const REPLAY_CONTINUE_REQUEST_BYTES: usize = 8 + REPLAY_CURSOR_BYTES;
+const REPLAY_ACK_BYTES: usize = 164;
+const REPLAY_ACK_REPLY_BYTES: usize = 132;
+const REPLAY_PAGE_HEADER_BYTES: usize = 316;
+const REPLAY_PAGE_DIGEST_OFFSET: usize = 120;
+const REPLAY_PAGE_DIGEST_END: usize = REPLAY_PAGE_DIGEST_OFFSET + 32;
+const REPLAY_CHECKPOINT_DESCRIPTOR_BYTES: usize = 224;
+const REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES: usize = REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 44;
+const REPLAY_OUTPUT_RECORD_FIXED_BYTES: usize = 168;
+const REPLAY_COMPLETE_BYTES: usize = 80;
+const REPLAY_GAP_BYTES: usize = 32;
+const REPLAY_COMPACTED_BYTES: usize = 32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 16;
+const REPLAY_SNAPSHOT_EXPIRED_BYTES: usize = 16;
+const CHECKPOINT_STAGE_WIRE_VERSION: u16 = 1;
+const REPLAY_WIRE_VERSION: u16 = 1;
+const REPLAY_CURSOR_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-cursor.v1";
+const REPLAY_PAGE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-page.v1";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -135,6 +175,11 @@ pub enum GuardianOperation {
     /// transport; the pane protocol state machine deliberately cannot apply
     /// this effect.
     GuardedStop = 14,
+    /// Content-addressed, bounded checkpoint upload staging. This never
+    /// consumes a PTY mutation sequence; `Checkpoint` performs publication.
+    CheckpointStage = 15,
+    /// Cumulative acknowledgement for one deterministic replay page.
+    ReplayAck = 16,
 }
 
 impl GuardianOperation {
@@ -154,6 +199,8 @@ impl GuardianOperation {
             12 => Ok(Self::RetireLease),
             13 => Ok(Self::Hello),
             14 => Ok(Self::GuardedStop),
+            15 => Ok(Self::CheckpointStage),
+            16 => Ok(Self::ReplayAck),
             other => Err(GuardianProtocolError::UnknownOperation(other)),
         }
     }
@@ -196,6 +243,7 @@ impl GuardianOperation {
                 | Self::Close
                 | Self::Checkpoint
                 | Self::Replay
+                | Self::ReplayAck
                 | Self::QueryInputEffect
                 | Self::RetireLease
         )
@@ -1197,6 +1245,639 @@ impl GuardianCheckpointReceipt {
             && self.sequence == identity.sequence
             && self.effect_id == identity.effect_id
             && self.intent == identity.intent
+    }
+}
+
+/// Scope of an immutable checkpoint upload. A live pane upload is fenced by
+/// its exact lease generation. A genesis upload is instead bound to the spawn
+/// effect that must adopt it before a child can emit output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianCheckpointScopeV1 {
+    Pane { pane_id: Uuid, generation: u64 },
+    Genesis { spawn_effect_id: Uuid },
+}
+
+impl GuardianCheckpointScopeV1 {
+    fn validate(self) -> Result<(), GuardianProtocolError> {
+        match self {
+            Self::Pane {
+                pane_id,
+                generation,
+            } if !pane_id.is_nil() && generation > 0 => Ok(()),
+            Self::Genesis { spawn_effect_id } if !spawn_effect_id.is_nil() => Ok(()),
+            _ => Err(GuardianProtocolError::InvalidOperationPayload),
+        }
+    }
+
+    fn encode_into(self, payload: &mut Vec<u8>) {
+        match self {
+            Self::Pane {
+                pane_id,
+                generation,
+            } => {
+                payload.push(1);
+                payload.extend_from_slice(&[0; 7]);
+                push_uuid(payload, pane_id);
+                payload.extend_from_slice(&generation.to_be_bytes());
+            }
+            Self::Genesis { spawn_effect_id } => {
+                payload.push(2);
+                payload.extend_from_slice(&[0; 7]);
+                push_uuid(payload, spawn_effect_id);
+                payload.extend_from_slice(&0_u64.to_be_bytes());
+            }
+        }
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != CHECKPOINT_STAGE_SCOPE_BYTES
+            || payload.get(1..8) != Some([0; 7].as_slice())
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let identity = read_required_uuid(payload, 8)?;
+        let generation = read_u64(payload, 24)?;
+        let scope = match payload[0] {
+            1 if generation > 0 => Self::Pane {
+                pane_id: identity,
+                generation,
+            },
+            2 if generation == 0 => Self::Genesis {
+                spawn_effect_id: identity,
+            },
+            _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    fn matches_header(self, header: &GuardianRequestHeader) -> bool {
+        match self {
+            Self::Pane {
+                pane_id,
+                generation,
+            } => {
+                header.pane_id == Some(pane_id)
+                    && header.effect_id.is_none()
+                    && header.lease_generation == generation
+                    && header.lease_sequence == 0
+            }
+            Self::Genesis { spawn_effect_id } => {
+                header.pane_id.is_none()
+                    && header.effect_id == Some(spawn_effect_id)
+                    && header.lease_generation == 0
+                    && header.lease_sequence == 0
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianCheckpointStageKindV1 {
+    Begin,
+    Chunk,
+    Seal,
+}
+
+enum GuardianCheckpointStageBodyV1 {
+    Begin,
+    Chunk {
+        index: u32,
+        offset: u64,
+        chunk_digest: [u8; 32],
+        bytes: Zeroizing<Vec<u8>>,
+    },
+    Seal,
+}
+
+/// Canonical, self-describing upload operation. Every chunk repeats the
+/// immutable upload descriptor, so an exact retry can be reconciled without
+/// consulting unauthenticated or partially written state.
+pub struct GuardianCheckpointStageRequestV1 {
+    scope: GuardianCheckpointScopeV1,
+    upload_id: Uuid,
+    checkpoint_id: GuardianCheckpointIdentityDigest,
+    boundary_id: GuardianOutputBoundaryIdentityDigest,
+    total_bytes: u64,
+    chunk_bytes: u32,
+    total_chunks: u32,
+    body: GuardianCheckpointStageBodyV1,
+}
+
+impl std::fmt::Debug for GuardianCheckpointStageRequestV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointStageRequestV1")
+            .field("scope", &self.scope)
+            .field("upload_id", &self.upload_id)
+            .field("kind", &self.kind())
+            .field("total_bytes", &self.total_bytes)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("total_chunks", &self.total_chunks)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianCheckpointStageRequestV1 {
+    pub fn begin(
+        scope: GuardianCheckpointScopeV1,
+        upload_id: Uuid,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary_id: GuardianOutputBoundaryIdentityDigest,
+        total_bytes: u64,
+        chunk_bytes: u32,
+    ) -> Result<Self, GuardianProtocolError> {
+        Self::new(
+            scope,
+            upload_id,
+            checkpoint_id,
+            boundary_id,
+            total_bytes,
+            chunk_bytes,
+            GuardianCheckpointStageBodyV1::Begin,
+        )
+    }
+
+    pub fn chunk(
+        scope: GuardianCheckpointScopeV1,
+        upload_id: Uuid,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary_id: GuardianOutputBoundaryIdentityDigest,
+        total_bytes: u64,
+        chunk_bytes: u32,
+        index: u32,
+        bytes: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, GuardianProtocolError> {
+        let offset = u64::from(index)
+            .checked_mul(u64::from(chunk_bytes))
+            .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+        let chunk_digest = Sha256::digest(bytes.as_slice()).into();
+        Self::new(
+            scope,
+            upload_id,
+            checkpoint_id,
+            boundary_id,
+            total_bytes,
+            chunk_bytes,
+            GuardianCheckpointStageBodyV1::Chunk {
+                index,
+                offset,
+                chunk_digest,
+                bytes,
+            },
+        )
+    }
+
+    pub fn seal(
+        scope: GuardianCheckpointScopeV1,
+        upload_id: Uuid,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary_id: GuardianOutputBoundaryIdentityDigest,
+        total_bytes: u64,
+        chunk_bytes: u32,
+    ) -> Result<Self, GuardianProtocolError> {
+        Self::new(
+            scope,
+            upload_id,
+            checkpoint_id,
+            boundary_id,
+            total_bytes,
+            chunk_bytes,
+            GuardianCheckpointStageBodyV1::Seal,
+        )
+    }
+
+    fn new(
+        scope: GuardianCheckpointScopeV1,
+        upload_id: Uuid,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary_id: GuardianOutputBoundaryIdentityDigest,
+        total_bytes: u64,
+        chunk_bytes: u32,
+        body: GuardianCheckpointStageBodyV1,
+    ) -> Result<Self, GuardianProtocolError> {
+        let total_chunks = checkpoint_total_chunks(total_bytes, chunk_bytes)?;
+        let request = Self {
+            scope,
+            upload_id,
+            checkpoint_id,
+            boundary_id,
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+            body,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> GuardianCheckpointScopeV1 {
+        self.scope
+    }
+
+    #[must_use]
+    pub const fn upload_id(&self) -> Uuid {
+        self.upload_id
+    }
+
+    #[must_use]
+    pub const fn checkpoint_id(&self) -> GuardianCheckpointIdentityDigest {
+        self.checkpoint_id
+    }
+
+    #[must_use]
+    pub const fn boundary_id(&self) -> GuardianOutputBoundaryIdentityDigest {
+        self.boundary_id
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    #[must_use]
+    pub const fn chunk_bytes(&self) -> u32 {
+        self.chunk_bytes
+    }
+
+    #[must_use]
+    pub const fn total_chunks(&self) -> u32 {
+        self.total_chunks
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> GuardianCheckpointStageKindV1 {
+        match self.body {
+            GuardianCheckpointStageBodyV1::Begin => GuardianCheckpointStageKindV1::Begin,
+            GuardianCheckpointStageBodyV1::Chunk { .. } => GuardianCheckpointStageKindV1::Chunk,
+            GuardianCheckpointStageBodyV1::Seal => GuardianCheckpointStageKindV1::Seal,
+        }
+    }
+
+    #[must_use]
+    pub const fn chunk_position(&self) -> Option<(u32, u64, [u8; 32])> {
+        match &self.body {
+            GuardianCheckpointStageBodyV1::Chunk {
+                index,
+                offset,
+                chunk_digest,
+                ..
+            } => Some((*index, *offset, *chunk_digest)),
+            GuardianCheckpointStageBodyV1::Begin | GuardianCheckpointStageBodyV1::Seal => None,
+        }
+    }
+
+    pub fn into_chunk_bytes(self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+        match self.body {
+            GuardianCheckpointStageBodyV1::Chunk { bytes, .. } => Ok(bytes),
+            GuardianCheckpointStageBodyV1::Begin | GuardianCheckpointStageBodyV1::Seal => {
+                Err(GuardianProtocolError::InvalidOperationPayload)
+            }
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, GuardianProtocolError> {
+        self.validate()?;
+        let extra = match &self.body {
+            GuardianCheckpointStageBodyV1::Chunk { bytes, .. } => bytes.len(),
+            GuardianCheckpointStageBodyV1::Begin | GuardianCheckpointStageBodyV1::Seal => 0,
+        };
+        let fixed = if matches!(&self.body, GuardianCheckpointStageBodyV1::Chunk { .. }) {
+            CHECKPOINT_STAGE_CHUNK_FIXED_BYTES
+        } else {
+            CHECKPOINT_STAGE_COMMON_BYTES
+        };
+        let capacity = fixed
+            .checked_add(extra)
+            .ok_or(GuardianProtocolError::PayloadTooLarge)?;
+        if capacity > GUARDIAN_MAX_PAYLOAD_BYTES {
+            return Err(GuardianProtocolError::PayloadTooLarge);
+        }
+        let mut payload = Vec::with_capacity(capacity);
+        payload.extend_from_slice(&CHECKPOINT_STAGE_PAYLOAD_MAGIC);
+        payload.extend_from_slice(&CHECKPOINT_STAGE_WIRE_VERSION.to_be_bytes());
+        payload.push(match self.body {
+            GuardianCheckpointStageBodyV1::Begin => 1,
+            GuardianCheckpointStageBodyV1::Chunk { .. } => 2,
+            GuardianCheckpointStageBodyV1::Seal => 3,
+        });
+        payload.push(0);
+        self.scope.encode_into(&mut payload);
+        push_uuid(&mut payload, self.upload_id);
+        payload.extend_from_slice(&self.checkpoint_id.0);
+        payload.extend_from_slice(&self.boundary_id.0);
+        payload.extend_from_slice(&self.total_bytes.to_be_bytes());
+        payload.extend_from_slice(&self.chunk_bytes.to_be_bytes());
+        payload.extend_from_slice(&self.total_chunks.to_be_bytes());
+        if let GuardianCheckpointStageBodyV1::Chunk {
+            index,
+            offset,
+            chunk_digest,
+            bytes,
+        } = &self.body
+        {
+            payload.extend_from_slice(&index.to_be_bytes());
+            payload.extend_from_slice(&offset.to_be_bytes());
+            payload.extend_from_slice(chunk_digest);
+            payload.extend_from_slice(
+                &u32::try_from(bytes.len())
+                    .map_err(|_| GuardianProtocolError::PayloadTooLarge)?
+                    .to_be_bytes(),
+            );
+            payload.extend_from_slice(bytes.as_slice());
+        }
+        if payload.len() != capacity {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-stage-encoded-size",
+            ));
+        }
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() < CHECKPOINT_STAGE_COMMON_BYTES
+            || payload.len() > GUARDIAN_MAX_PAYLOAD_BYTES
+            || payload.get(..4) != Some(CHECKPOINT_STAGE_PAYLOAD_MAGIC.as_slice())
+            || read_u16(payload, 4)? != CHECKPOINT_STAGE_WIRE_VERSION
+            || payload[7] != 0
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let scope = GuardianCheckpointScopeV1::decode(
+            payload
+                .get(8..40)
+                .ok_or(GuardianProtocolError::InvalidOperationPayload)?,
+        )?;
+        let upload_id = read_required_uuid(payload, 40)?;
+        let mut checkpoint_id = [0; 32];
+        checkpoint_id.copy_from_slice(&payload[56..88]);
+        let mut boundary_id = [0; 32];
+        boundary_id.copy_from_slice(&payload[88..120]);
+        let total_bytes = read_u64(payload, 120)?;
+        let chunk_bytes = read_u32(payload, 128)?;
+        let total_chunks = read_u32(payload, 132)?;
+        if checkpoint_total_chunks(total_bytes, chunk_bytes)? != total_chunks {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let body = match payload[6] {
+            1 if payload.len() == CHECKPOINT_STAGE_COMMON_BYTES => {
+                GuardianCheckpointStageBodyV1::Begin
+            }
+            2 if payload.len() >= CHECKPOINT_STAGE_CHUNK_FIXED_BYTES => {
+                let index = read_u32(payload, 136)?;
+                let offset = read_u64(payload, 140)?;
+                let mut chunk_digest = [0; 32];
+                chunk_digest.copy_from_slice(&payload[148..180]);
+                let encoded_len = usize::try_from(read_u32(payload, 180)?)
+                    .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+                let expected = CHECKPOINT_STAGE_CHUNK_FIXED_BYTES
+                    .checked_add(encoded_len)
+                    .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+                if payload.len() != expected {
+                    return Err(GuardianProtocolError::InvalidOperationPayload);
+                }
+                let bytes = Zeroizing::new(payload[CHECKPOINT_STAGE_CHUNK_FIXED_BYTES..].to_vec());
+                GuardianCheckpointStageBodyV1::Chunk {
+                    index,
+                    offset,
+                    chunk_digest,
+                    bytes,
+                }
+            }
+            3 if payload.len() == CHECKPOINT_STAGE_COMMON_BYTES => {
+                GuardianCheckpointStageBodyV1::Seal
+            }
+            _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+        };
+        let request = Self {
+            scope,
+            upload_id,
+            checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
+                .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
+            boundary_id: GuardianOutputBoundaryIdentityDigest::from_bytes(boundary_id)
+                .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
+            total_bytes,
+            chunk_bytes,
+            total_chunks,
+            body,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<(), GuardianProtocolError> {
+        self.scope.validate()?;
+        require_nonzero(self.upload_id, "checkpoint upload")?;
+        if checkpoint_total_chunks(self.total_bytes, self.chunk_bytes)? != self.total_chunks {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        if let GuardianCheckpointStageBodyV1::Chunk {
+            index,
+            offset,
+            chunk_digest,
+            bytes,
+        } = &self.body
+        {
+            if *index >= self.total_chunks
+                || *offset != u64::from(*index) * u64::from(self.chunk_bytes)
+                || bytes.is_empty()
+                || bytes.len()
+                    > usize::try_from(GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES)
+                        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?
+            {
+                return Err(GuardianProtocolError::InvalidOperationPayload);
+            }
+            let remaining = self
+                .total_bytes
+                .checked_sub(*offset)
+                .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+            let expected = remaining.min(u64::from(self.chunk_bytes));
+            if u64::try_from(bytes.len()).ok() != Some(expected)
+                || <[u8; 32]>::from(Sha256::digest(bytes.as_slice())) != *chunk_digest
+            {
+                return Err(GuardianProtocolError::InvalidOperationPayload);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_header(&self, header: &GuardianRequestHeader) -> Result<(), GuardianProtocolError> {
+        if self.scope.matches_header(header) {
+            Ok(())
+        } else {
+            Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::CheckpointStage,
+            })
+        }
+    }
+}
+
+fn checkpoint_total_chunks(total_bytes: u64, chunk_bytes: u32) -> Result<u32, GuardianProtocolError> {
+    if total_bytes == 0
+        || total_bytes > GUARDIAN_MAX_CHECKPOINT_BYTES
+        || chunk_bytes == 0
+        || chunk_bytes > GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES
+    {
+        return Err(GuardianProtocolError::InvalidOperationPayload);
+    }
+    let chunks = total_bytes
+        .checked_add(u64::from(chunk_bytes) - 1)
+        .ok_or(GuardianProtocolError::InvalidOperationPayload)?
+        / u64::from(chunk_bytes);
+    let chunks = u32::try_from(chunks).map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+    if chunks == 0 || chunks > GUARDIAN_MAX_CHECKPOINT_CHUNKS {
+        return Err(GuardianProtocolError::InvalidOperationPayload);
+    }
+    Ok(chunks)
+}
+
+/// Metadata-only result of an idempotent checkpoint staging request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianCheckpointStageReplyV1 {
+    Ready {
+        upload_id: Uuid,
+        next_index: u32,
+        committed_bytes: u64,
+    },
+    Progress {
+        upload_id: Uuid,
+        next_index: u32,
+        committed_bytes: u64,
+    },
+    Sealed {
+        upload_id: Uuid,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary_id: GuardianOutputBoundaryIdentityDigest,
+        total_bytes: u64,
+    },
+}
+
+impl GuardianCheckpointStageReplyV1 {
+    fn encode(self) -> Result<[u8; CHECKPOINT_STAGE_REPLY_BYTES], GuardianProtocolError> {
+        self.validate()?;
+        let mut payload = [0; CHECKPOINT_STAGE_REPLY_BYTES];
+        payload[..4].copy_from_slice(&CHECKPOINT_STAGE_REPLY_MAGIC);
+        payload[4..6].copy_from_slice(&CHECKPOINT_STAGE_WIRE_VERSION.to_be_bytes());
+        match self {
+            Self::Ready {
+                upload_id,
+                next_index,
+                committed_bytes,
+            }
+            | Self::Progress {
+                upload_id,
+                next_index,
+                committed_bytes,
+            } => {
+                payload[6] = if matches!(self, Self::Ready { .. }) { 1 } else { 2 };
+                payload[8..24].copy_from_slice(upload_id.as_bytes());
+                payload[24..28].copy_from_slice(&next_index.to_be_bytes());
+                payload[28..36].copy_from_slice(&committed_bytes.to_be_bytes());
+            }
+            Self::Sealed {
+                upload_id,
+                checkpoint_id,
+                boundary_id,
+                total_bytes,
+            } => {
+                payload[6] = 3;
+                payload[8..24].copy_from_slice(upload_id.as_bytes());
+                payload[28..36].copy_from_slice(&total_bytes.to_be_bytes());
+                payload[36..68].copy_from_slice(&checkpoint_id.0);
+                payload[68..100].copy_from_slice(&boundary_id.0);
+            }
+        }
+        Ok(payload)
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != CHECKPOINT_STAGE_REPLY_BYTES
+            || payload.get(..4) != Some(CHECKPOINT_STAGE_REPLY_MAGIC.as_slice())
+            || read_u16(payload, 4)? != CHECKPOINT_STAGE_WIRE_VERSION
+            || payload[7] != 0
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let upload_id = read_required_uuid(payload, 8)?;
+        let next_index = read_u32(payload, 24)?;
+        let committed_bytes = read_u64(payload, 28)?;
+        let reply = match payload[6] {
+            1 | 2 if payload[36..].iter().all(|byte| *byte == 0) => {
+                if payload[6] == 1 {
+                    Self::Ready {
+                        upload_id,
+                        next_index,
+                        committed_bytes,
+                    }
+                } else {
+                    Self::Progress {
+                        upload_id,
+                        next_index,
+                        committed_bytes,
+                    }
+                }
+            }
+            3 if next_index == 0 => {
+                let mut checkpoint_id = [0; 32];
+                checkpoint_id.copy_from_slice(&payload[36..68]);
+                let mut boundary_id = [0; 32];
+                boundary_id.copy_from_slice(&payload[68..100]);
+                Self::Sealed {
+                    upload_id,
+                    checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
+                        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                    boundary_id: GuardianOutputBoundaryIdentityDigest::from_bytes(boundary_id)
+                        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                    total_bytes: committed_bytes,
+                }
+            }
+            _ => return Err(GuardianProtocolError::InvalidReplyPayload),
+        };
+        reply.validate()?;
+        Ok(reply)
+    }
+
+    fn validate(self) -> Result<(), GuardianProtocolError> {
+        let valid = match self {
+            Self::Ready {
+                upload_id,
+                next_index,
+                committed_bytes,
+            }
+            | Self::Progress {
+                upload_id,
+                next_index,
+                committed_bytes,
+            } => {
+                !upload_id.is_nil()
+                    && next_index <= GUARDIAN_MAX_CHECKPOINT_CHUNKS
+                    && committed_bytes <= GUARDIAN_MAX_CHECKPOINT_BYTES
+            }
+            Self::Sealed {
+                upload_id,
+                total_bytes,
+                ..
+            } => {
+                !upload_id.is_nil()
+                    && total_bytes > 0
+                    && total_bytes <= GUARDIAN_MAX_CHECKPOINT_BYTES
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        }
+    }
+
+    #[must_use]
+    pub const fn upload_id(self) -> Uuid {
+        match self {
+            Self::Ready { upload_id, .. }
+            | Self::Progress { upload_id, .. }
+            | Self::Sealed { upload_id, .. } => upload_id,
+        }
     }
 }
 

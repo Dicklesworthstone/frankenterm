@@ -371,10 +371,15 @@ impl LiveParserCheckpointControl {
     }
 }
 
-/// The only crate-internal publication authority for a checkpoint captured
-/// from the reader-owned live parser. All fields are private so callers cannot
-/// splice a terminal payload, journal receipt, or registration generation.
-pub(crate) struct LiveParserCheckpointAck {
+/// Non-constructible publication authority for a checkpoint captured from the
+/// reader-owned live parser.
+///
+/// All fields remain private so consumers cannot splice a terminal payload,
+/// journal receipt, or registration generation. The registration wire identity
+/// and [`Self::boundary_digest`] authenticate this live capture transaction;
+/// they are ephemeral registration evidence, not a stable durable-checkpoint
+/// identity and must not be persisted as one.
+pub struct LiveParserCheckpointAck {
     registration_wire_identity: [u8; 16],
     boundary: GuardianCheckpointBoundary,
     boundary_digest: [u8; 32],
@@ -415,59 +420,63 @@ impl LiveParserCheckpointAck {
         })
     }
 
-    pub(crate) const fn registration_wire_identity(&self) -> [u8; 16] {
+    pub const fn registration_wire_identity(&self) -> [u8; 16] {
         self.registration_wire_identity
     }
 
-    pub(crate) const fn durable_pane_id(&self) -> Uuid {
+    pub const fn durable_pane_id(&self) -> Uuid {
         self.boundary.durable_pane_id()
     }
 
-    pub(crate) const fn segment_id(&self) -> Uuid {
+    pub const fn segment_id(&self) -> Uuid {
         self.boundary.segment_id()
     }
 
-    pub(crate) const fn output_sequence(&self) -> u64 {
+    pub const fn output_sequence(&self) -> u64 {
         self.boundary.output_sequence()
     }
 
-    pub(crate) const fn output_record_digest(&self) -> [u8; 32] {
+    pub const fn output_record_digest(&self) -> [u8; 32] {
         self.boundary.output_record_digest()
     }
 
-    pub(crate) const fn output_committed_log_bytes(&self) -> u64 {
+    pub const fn output_committed_log_bytes(&self) -> u64 {
         self.boundary.output_committed_log_bytes()
     }
 
-    pub(crate) const fn journal_cumulative_plaintext_bytes(&self) -> u64 {
+    pub const fn journal_cumulative_plaintext_bytes(&self) -> u64 {
         self.boundary.journal_cumulative_plaintext_bytes()
     }
 
-    pub(crate) const fn parser_stream_bytes(&self) -> u64 {
+    pub const fn parser_stream_bytes(&self) -> u64 {
         self.boundary.parser_stream_bytes()
     }
 
-    pub(crate) const fn terminal_payload_bytes(&self) -> u64 {
+    pub const fn terminal_payload_bytes(&self) -> u64 {
         self.boundary.terminal_payload_bytes()
     }
 
-    pub(crate) const fn terminal_payload_digest(&self) -> [u8; 32] {
+    pub const fn terminal_payload_digest(&self) -> [u8; 32] {
         self.boundary.terminal_payload_digest()
     }
 
-    pub(crate) const fn boundary_digest(&self) -> [u8; 32] {
+    /// Digest binding this boundary to the current registration wire identity.
+    ///
+    /// This value changes across registration incarnations and therefore must
+    /// not be used as the identity of a serialized durable checkpoint.
+    pub const fn boundary_digest(&self) -> [u8; 32] {
         self.boundary_digest
     }
 
-    pub(crate) const fn boundary(&self) -> &GuardianCheckpointBoundary {
+    pub const fn boundary(&self) -> &GuardianCheckpointBoundary {
         &self.boundary
     }
 
-    pub(crate) const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV2 {
+    pub const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV2 {
         &self.terminal_checkpoint
     }
 
-    pub(crate) fn into_parts(
+    pub fn into_parts(
         self,
     ) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV2) {
         (self.boundary, self.terminal_checkpoint)

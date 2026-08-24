@@ -2112,7 +2112,6 @@ struct LiveParserAuthorizedDelivery {
 }
 
 impl LiveParserGuardianCursor {
-    #[cfg(test)]
     fn matches_receipt(
         self,
         segment: GuardianOutputSegmentIdentity,
@@ -2154,7 +2153,6 @@ struct LiveParserCheckpointState {
     guardian_mode: bool,
     guardian_cursor: Option<LiveParserGuardianCursor>,
     authorized_delivery: Option<LiveParserAuthorizedDelivery>,
-    #[cfg(test)]
     next_request_id: u64,
     pending: Option<PendingLiveParserCheckpoint>,
 }
@@ -2174,7 +2172,6 @@ impl LiveParserCheckpointState {
             guardian_mode: false,
             guardian_cursor: None,
             authorized_delivery: None,
-            #[cfg(test)]
             next_request_id: 1,
             pending: None,
         }
@@ -2807,7 +2804,6 @@ impl LiveParserCheckpointControl {
         Ok(parser_global_endpoint)
     }
 
-    #[cfg(test)]
     fn register_checkpoint(
         &self,
         pane: &Arc<dyn Pane>,
@@ -2899,7 +2895,6 @@ impl LiveParserCheckpointControl {
         Ok((request_id, receiver))
     }
 
-    #[cfg(test)]
     fn cancel_checkpoint(&self, request_id: u64) {
         {
             let mut state = self.state.lock();
@@ -4311,9 +4306,10 @@ mod pane_registration_handle {
         /// Freeze this exact live parser registration at the authenticated
         /// receipt already registered by `authorize_guardian_output_delivery`.
         /// The operation lease spans registration, bounded wait, capture, and
-        /// final registry revalidation.
-        #[cfg(test)]
-        pub(crate) fn capture_live_parser_checkpoint(
+        /// final registry revalidation. The returned acknowledgement is
+        /// non-constructible outside this crate and binds the terminal model to
+        /// the exact journal receipt observed by this registration.
+        pub fn capture_live_parser_checkpoint(
             &self,
             segment: GuardianOutputSegmentIdentity,
             output: GuardianOutputAppendReceipt,
