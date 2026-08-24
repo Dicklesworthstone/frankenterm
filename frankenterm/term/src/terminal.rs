@@ -489,8 +489,7 @@ impl InertTerminal {
                 }
                 let retained_bytes = actions
                     .capacity()
-                    .checked_mul(std::mem::size_of::<Action>())
-                    .unwrap_or(usize::MAX);
+                    .saturating_mul(std::mem::size_of::<Action>());
                 if retained_bytes > max_action_batch_bytes {
                     action_memory_limit_exceeded = Some(retained_bytes);
                     return;

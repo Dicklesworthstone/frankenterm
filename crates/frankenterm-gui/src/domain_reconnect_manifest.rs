@@ -6,8 +6,12 @@
 //! record overrides the configured auto-connect bit until the operator makes
 //! the opposite choice.
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
-use cap_std::fs::{Dir as CapDir, File as CapFile, Metadata as CapMetadata};
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::fs::{
+    Dir as CapDir, DirBuilder as CapDirBuilder, File as CapFile, Metadata as CapMetadata,
+};
+#[cfg(unix)]
+use cap_std::fs::DirBuilderExt as _;
 use cap_std::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt as _};
 #[cfg(unix)]
 use cap_std::fs::{MetadataExt as CapUnixMetadataExt, PermissionsExt as _};
@@ -85,10 +89,22 @@ pub enum DomainReconnectManifestError {
     Invalid { reason: &'static str },
     #[error("domain reconnect manifest has two different states at generation {generation}")]
     AmbiguousGeneration { generation: u64 },
+    #[error(
+        "domain reconnect manifest rolled back to generation {observed} below the retained generation {retained}"
+    )]
+    AuthorityRollback { observed: u64, retained: u64 },
+    #[error(
+        "domain reconnect manifest differs from the retained authority at generation {generation}"
+    )]
+    AuthorityDivergence { generation: u64 },
     #[error("domain reconnect manifest has no authoritative two-replica quorum")]
     NoQuorum,
     #[error("domain reconnect manifest legacy authority is ambiguous")]
     LegacyAmbiguous,
+    #[error("domain reconnect manifest namespaces both contain authority evidence")]
+    NamespaceDivergence,
+    #[error("domain reconnect manifest namespace changed while selecting authority")]
+    NamespaceChanged,
     #[error("domain reconnect manifest generation namespace is exhausted")]
     GenerationExhausted,
     #[error("domain reconnect manifest private-file contract failed: {reason}")]
@@ -178,6 +194,18 @@ enum SlotRead {
     Invalid(DomainReconnectManifestError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamespaceSlotEvidence {
+    None,
+    Present,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductionNamespace {
+    LegacyRoot,
+    PrivateLeaf,
+}
+
 #[must_use]
 pub fn fingerprint_domain_name(domain_name: &str) -> [u8; 32] {
     let mut digest = Sha256::new();
@@ -204,6 +232,108 @@ fn private_manifest_directory(data_directory: &Path) -> PathBuf {
     data_directory.join(PRIVATE_AUTHORITY_DIRECTORY)
 }
 
+fn open_existing_directory_nofollow(
+    directory: &Path,
+) -> Result<CapDir, DomainReconnectManifestError> {
+    let Some(name) = directory.file_name() else {
+        return CapDir::open_ambient_dir(directory, cap_std::ambient_authority()).map_err(
+            |error| DomainReconnectManifestError::io("open manifest directory", error),
+        );
+    };
+    let parent_path = directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = CapDir::open_ambient_dir(parent_path, cap_std::ambient_authority())
+        .map_err(|error| DomainReconnectManifestError::io("open parent directory", error))?;
+    parent
+        .open_dir_nofollow(name)
+        .map_err(|error| DomainReconnectManifestError::io("open manifest directory", error))
+}
+
+fn probe_namespace_slot_evidence(
+    directory: &Path,
+) -> Result<NamespaceSlotEvidence, DomainReconnectManifestError> {
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(NamespaceSlotEvidence::None);
+        }
+        Err(error) => {
+            return Err(DomainReconnectManifestError::io(
+                "inspect namespace directory",
+                error,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DomainReconnectManifestError::UnsafeFile {
+            reason: "namespace path is not a direct directory",
+        });
+    }
+
+    let pinned = open_existing_directory_nofollow(directory)?;
+    validate_pinned_directory_identity(directory, &pinned)?;
+    for name in SLOT_NAMES {
+        match pinned.symlink_metadata(name) {
+            Ok(_) => return Ok(NamespaceSlotEvidence::Present),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DomainReconnectManifestError::io(
+                    "inspect namespace authority slot",
+                    error,
+                ));
+            }
+        }
+    }
+    validate_pinned_directory_identity(directory, &pinned)?;
+    Ok(NamespaceSlotEvidence::None)
+}
+
+fn select_production_namespace(
+    legacy_root: NamespaceSlotEvidence,
+    private_leaf: NamespaceSlotEvidence,
+) -> Result<ProductionNamespace, DomainReconnectManifestError> {
+    match (legacy_root, private_leaf) {
+        (NamespaceSlotEvidence::Present, NamespaceSlotEvidence::Present) => {
+            Err(DomainReconnectManifestError::NamespaceDivergence)
+        }
+        (NamespaceSlotEvidence::Present, NamespaceSlotEvidence::None) => {
+            Ok(ProductionNamespace::LegacyRoot)
+        }
+        (NamespaceSlotEvidence::None, _) => Ok(ProductionNamespace::PrivateLeaf),
+    }
+}
+
+fn legacy_root_can_hold_selection_lease(
+    data_directory: &Path,
+) -> Result<bool, DomainReconnectManifestError> {
+    let metadata = match std::fs::symlink_metadata(data_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(DomainReconnectManifestError::io(
+                "inspect legacy namespace directory",
+                error,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DomainReconnectManifestError::UnsafeFile {
+            reason: "legacy namespace path is not a direct directory",
+        });
+    }
+    #[cfg(unix)]
+    {
+        Ok(metadata.permissions().mode() & 0o7777 == 0o700
+            && metadata.uid() == rustix::process::geteuid().as_raw())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 fn private_open_options() -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
@@ -216,20 +346,77 @@ fn private_open_options() -> std::fs::OpenOptions {
     options
 }
 
-fn open_manifest_directory(directory: &Path) -> Result<CapDir, DomainReconnectManifestError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
+fn open_or_create_directory_tree_durably(
+    directory: &Path,
+) -> Result<CapDir, DomainReconnectManifestError> {
+    let exists = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(DomainReconnectManifestError::UnsafeFile {
+                    reason: "manifest directory is not a direct directory",
+                });
+            }
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(DomainReconnectManifestError::io(
+                "inspect manifest directory",
+                error,
+            ));
+        }
+    };
 
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder
-            .create(directory)
-            .map_err(|error| DomainReconnectManifestError::io("create directory", error))?;
+    let Some(name) = directory.file_name() else {
+        if !exists {
+            return Err(DomainReconnectManifestError::UnsafeFile {
+                reason: "manifest directory has no terminal name",
+            });
+        }
+        return CapDir::open_ambient_dir(directory, cap_std::ambient_authority()).map_err(
+            |error| DomainReconnectManifestError::io("open manifest directory", error),
+        );
+    };
+    let parent_path = directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = if exists {
+        CapDir::open_ambient_dir(parent_path, cap_std::ambient_authority())
+            .map_err(|error| DomainReconnectManifestError::io("open parent directory", error))?
+    } else {
+        open_or_create_directory_tree_durably(parent_path)?
+    };
+
+    if !exists {
+        let mut builder = CapDirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match parent.create_dir_with(name, &builder) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(DomainReconnectManifestError::io(
+                    "create manifest directory",
+                    error,
+                ));
+            }
+        }
     }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(directory)
-        .map_err(|error| DomainReconnectManifestError::io("create directory", error))?;
+    let pinned = parent
+        .open_dir_nofollow(name)
+        .map_err(|error| DomainReconnectManifestError::io("open manifest directory", error))?;
+
+    // The child cannot be called durable until the directory entry that names it
+    // is itself synchronized. This is required on the existing-directory path
+    // too: the winning creator may have reached mkdir and then crashed before
+    // making the shared entry durable.
+    sync_directory(&parent)?;
+    Ok(pinned)
+}
+
+fn open_manifest_directory(directory: &Path) -> Result<CapDir, DomainReconnectManifestError> {
+    let pinned = open_or_create_directory_tree_durably(directory)?;
     let metadata = std::fs::symlink_metadata(directory)
         .map_err(|error| DomainReconnectManifestError::io("inspect directory", error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -245,8 +432,6 @@ fn open_manifest_directory(directory: &Path) -> Result<CapDir, DomainReconnectMa
             return Err(DomainReconnectManifestError::DirectoryNotPrivate);
         }
     }
-    let pinned = CapDir::open_ambient_dir(directory, cap_std::ambient_authority())
-        .map_err(|error| DomainReconnectManifestError::io("open manifest directory", error))?;
     validate_pinned_directory(directory, &pinned)?;
     Ok(pinned)
 }
@@ -321,6 +506,15 @@ fn validate_pinned_directory(
     path: &Path,
     directory: &CapDir,
 ) -> Result<(), DomainReconnectManifestError> {
+    let pinned_metadata = validate_pinned_directory_identity(path, directory)?;
+    validate_private_file_owner(&pinned_metadata)?;
+    Ok(())
+}
+
+fn validate_pinned_directory_identity(
+    path: &Path,
+    directory: &CapDir,
+) -> Result<CapMetadata, DomainReconnectManifestError> {
     let named = std::fs::symlink_metadata(path)
         .map_err(|error| DomainReconnectManifestError::io("reinspect manifest directory", error))?;
     if named.file_type().is_symlink() || !named.is_dir() {
@@ -328,14 +522,7 @@ fn validate_pinned_directory(
             operation: "directory revalidation",
         });
     }
-    #[cfg(unix)]
-    if named.permissions().mode() & 0o7777 != 0o700
-        || named.uid() != rustix::process::geteuid().as_raw()
-    {
-        return Err(DomainReconnectManifestError::DirectoryNotPrivate);
-    }
-    let reopened = CapDir::open_ambient_dir(path, cap_std::ambient_authority())
-        .map_err(|error| DomainReconnectManifestError::io("reopen manifest directory", error))?;
+    let reopened = open_existing_directory_nofollow(path)?;
     let pinned_metadata = directory
         .dir_metadata()
         .map_err(|error| DomainReconnectManifestError::io("inspect pinned directory", error))?;
@@ -350,8 +537,7 @@ fn validate_pinned_directory(
             operation: "directory revalidation",
         });
     }
-    validate_private_file_owner(&pinned_metadata)?;
-    Ok(())
+    Ok(pinned_metadata)
 }
 
 fn validate_private_file_owner(
@@ -983,7 +1169,129 @@ fn migrate_legacy_authority(
     verify_fully_replicated(directory, &selection.manifest)
 }
 
-fn load_locked(directory: &CapDir) -> Result<LoadedManifest, DomainReconnectManifestError> {
+fn validate_retained_authority(
+    manifest: &DomainReconnectManifest,
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<(), DomainReconnectManifestError> {
+    let Some(retained) = retained else {
+        return Ok(());
+    };
+    if manifest.generation < retained.generation {
+        return Err(DomainReconnectManifestError::AuthorityRollback {
+            observed: manifest.generation,
+            retained: retained.generation,
+        });
+    }
+    if manifest.generation == retained.generation && manifest != retained {
+        return Err(DomainReconnectManifestError::AuthorityDivergence {
+            generation: manifest.generation,
+        });
+    }
+    Ok(())
+}
+
+fn validate_locked_authority_without_repair(
+    directory: &CapDir,
+) -> Result<(), DomainReconnectManifestError> {
+    let slots = [
+        read_slot(directory, OsStr::new(SLOT_NAMES[0]))?,
+        read_slot(directory, OsStr::new(SLOT_NAMES[1]))?,
+        read_slot(directory, OsStr::new(SLOT_NAMES[2]))?,
+    ];
+    if select_v2_authority(&slots)?.is_some() {
+        return Ok(());
+    }
+    match select_legacy_authority(slots)? {
+        LegacyAuthority::Published(_) => Ok(()),
+        LegacyAuthority::Pristine => Err(DomainReconnectManifestError::NamespaceChanged),
+    }
+}
+
+struct ProductionManifestLease {
+    // Field order makes the inner authority lease drop before the outer legacy
+    // selection guard. Acquisition is always legacy root, then private leaf.
+    authority: ManifestLease,
+    legacy_root_guard: Option<ManifestLease>,
+    data_directory: PathBuf,
+    private_directory: PathBuf,
+    selected: ProductionNamespace,
+}
+
+impl ProductionManifestLease {
+    fn acquire(data_directory: &Path) -> Result<Self, DomainReconnectManifestError> {
+        let private_directory = private_manifest_directory(data_directory);
+        let initial_legacy = probe_namespace_slot_evidence(data_directory)?;
+        let initial_private = probe_namespace_slot_evidence(&private_directory)?;
+        let selected = select_production_namespace(initial_legacy, initial_private)?;
+
+        match selected {
+            ProductionNamespace::LegacyRoot => {
+                let authority = ManifestLease::acquire(data_directory, true)?;
+                let locked_legacy = probe_namespace_slot_evidence(data_directory)?;
+                let locked_private = probe_namespace_slot_evidence(&private_directory)?;
+                if select_production_namespace(locked_legacy, locked_private)? != selected {
+                    return Err(DomainReconnectManifestError::NamespaceChanged);
+                }
+                // Detect corrupt, unsafe, or ambiguous legacy authority before
+                // creating or touching anything in the private namespace.
+                validate_locked_authority_without_repair(&authority.directory)?;
+                Ok(Self {
+                    authority,
+                    legacy_root_guard: None,
+                    data_directory: data_directory.to_path_buf(),
+                    private_directory,
+                    selected,
+                })
+            }
+            ProductionNamespace::PrivateLeaf => {
+                // A private legacy root is the cross-version selection lock.
+                // A broader legacy DATA_DIR cannot be used by the schema-v1
+                // writer because that writer enforces the same 0700 contract;
+                // it therefore remains unmodified while we create the private
+                // leaf. This preserves the global root -> private lock order.
+                let legacy_root_guard = if legacy_root_can_hold_selection_lease(data_directory)? {
+                    Some(ManifestLease::acquire(data_directory, true)?)
+                } else {
+                    None
+                };
+                let authority = ManifestLease::acquire(&private_directory, true)?;
+                let locked_legacy = probe_namespace_slot_evidence(data_directory)?;
+                let locked_private = probe_namespace_slot_evidence(&private_directory)?;
+                if select_production_namespace(locked_legacy, locked_private)? != selected
+                    || (initial_private == NamespaceSlotEvidence::Present
+                        && locked_private != NamespaceSlotEvidence::Present)
+                {
+                    return Err(DomainReconnectManifestError::NamespaceChanged);
+                }
+                Ok(Self {
+                    authority,
+                    legacy_root_guard,
+                    data_directory: data_directory.to_path_buf(),
+                    private_directory,
+                    selected,
+                })
+            }
+        }
+    }
+
+    fn validate(&self) -> Result<(), DomainReconnectManifestError> {
+        if let Some(legacy_root_guard) = &self.legacy_root_guard {
+            legacy_root_guard.validate()?;
+        }
+        self.authority.validate()?;
+        let legacy = probe_namespace_slot_evidence(&self.data_directory)?;
+        let private = probe_namespace_slot_evidence(&self.private_directory)?;
+        if select_production_namespace(legacy, private)? != self.selected {
+            return Err(DomainReconnectManifestError::NamespaceChanged);
+        }
+        Ok(())
+    }
+}
+
+fn load_locked(
+    directory: &CapDir,
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<LoadedManifest, DomainReconnectManifestError> {
     let slots = [
         read_slot(directory, OsStr::new(SLOT_NAMES[0]))?,
         read_slot(directory, OsStr::new(SLOT_NAMES[1]))?,
@@ -991,6 +1299,11 @@ fn load_locked(directory: &CapDir) -> Result<LoadedManifest, DomainReconnectMani
     ];
     match select_v2_authority(&slots)? {
         Some(V2Authority::Quorum(manifest)) => {
+            // Reject rollback or same-generation replacement before repairing
+            // any replica. This preserves a surviving retained-generation
+            // slot for diagnosis/recovery instead of overwriting it from a
+            // stale two-replica quorum.
+            validate_retained_authority(&manifest, retained)?;
             repair_from_v2_quorum(directory, &slots, &manifest)?;
             Ok(LoadedManifest { manifest })
         }
@@ -998,6 +1311,7 @@ fn load_locked(directory: &CapDir) -> Result<LoadedManifest, DomainReconnectMani
             manifest,
             legacy_anchor,
         }) => {
+            validate_retained_authority(&manifest, retained)?;
             complete_cross_schema_migration(
                 directory,
                 &slots,
@@ -1007,10 +1321,13 @@ fn load_locked(directory: &CapDir) -> Result<LoadedManifest, DomainReconnectMani
             Ok(LoadedManifest { manifest })
         }
         None => match select_legacy_authority(slots)? {
-            LegacyAuthority::Pristine => Ok(LoadedManifest {
-                manifest: DomainReconnectManifest::default(),
-            }),
+            LegacyAuthority::Pristine => {
+                let manifest = DomainReconnectManifest::default();
+                validate_retained_authority(&manifest, retained)?;
+                Ok(LoadedManifest { manifest })
+            }
             LegacyAuthority::Published(selection) => {
+                validate_retained_authority(&selection.manifest, retained)?;
                 migrate_legacy_authority(directory, &selection)?;
                 Ok(LoadedManifest {
                     manifest: selection.manifest,
@@ -1023,14 +1340,40 @@ fn load_locked(directory: &CapDir) -> Result<LoadedManifest, DomainReconnectMani
 pub fn load_from(
     directory: &Path,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    load_fenced_from(directory, None)
+}
+
+fn load_fenced_from(
+    directory: &Path,
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
     let lease = ManifestLease::acquire(directory, true)?;
-    let loaded = load_locked(&lease.directory)?;
+    let loaded = load_locked(&lease.directory, retained)?;
+    lease.validate()?;
+    Ok(loaded.manifest)
+}
+
+fn load_production_from(
+    data_directory: &Path,
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    let lease = ProductionManifestLease::acquire(data_directory)?;
+    let loaded = load_locked(&lease.authority.directory, retained)?;
     lease.validate()?;
     Ok(loaded.manifest)
 }
 
 pub fn load() -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
-    load_from(&private_manifest_directory(config::DATA_DIR.as_path()))
+    load_production_from(config::DATA_DIR.as_path(), None)
+}
+
+/// Load and repair only authority at or beyond the exact in-process retained
+/// manifest. Lower or same-generation-divergent evidence is rejected before
+/// any on-disk replica is changed.
+pub fn load_fenced(
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    load_production_from(config::DATA_DIR.as_path(), retained)
 }
 
 fn write_slot(
@@ -1123,12 +1466,31 @@ pub fn set_intent_at(
     domain_name: &str,
     intent: DomainAttachmentIntent,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    set_intent_fenced_at(directory, domain_name, intent, None)
+}
+
+fn set_intent_fenced_at(
+    directory: &Path,
+    domain_name: &str,
+    intent: DomainAttachmentIntent,
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
     let lease = ManifestLease::acquire(directory, true)?;
-    let loaded = load_locked(&lease.directory)?;
+    let next = set_intent_locked(&lease.directory, domain_name, intent, retained)?;
+    lease.validate()?;
+    Ok(next)
+}
+
+fn set_intent_locked(
+    directory: &CapDir,
+    domain_name: &str,
+    intent: DomainAttachmentIntent,
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    let loaded = load_locked(directory, retained)?;
     let fingerprint = fingerprint_domain_name(domain_name);
     let mut next = loaded.manifest;
     if next.intents.get(&fingerprint).copied() == Some(intent) {
-        lease.validate()?;
         return Ok(next);
     }
     if !next.intents.contains_key(&fingerprint) && next.intents.len() == MAX_DOMAIN_INTENTS {
@@ -1142,9 +1504,20 @@ pub fn set_intent_at(
         .ok_or(DomainReconnectManifestError::GenerationExhausted)?;
     next.intents.insert(fingerprint, intent);
     for name in SLOT_NAMES {
-        write_slot(&lease.directory, OsStr::new(name), &next)?;
+        write_slot(directory, OsStr::new(name), &next)?;
     }
-    verify_fully_replicated(&lease.directory, &next)?;
+    verify_fully_replicated(directory, &next)?;
+    Ok(next)
+}
+
+fn set_intent_production_at(
+    data_directory: &Path,
+    domain_name: &str,
+    intent: DomainAttachmentIntent,
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    let lease = ProductionManifestLease::acquire(data_directory)?;
+    let next = set_intent_locked(&lease.authority.directory, domain_name, intent, retained)?;
     lease.validate()?;
     Ok(next)
 }
@@ -1153,10 +1526,22 @@ pub fn set_intent(
     domain_name: &str,
     intent: DomainAttachmentIntent,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
-    set_intent_at(
-        &private_manifest_directory(config::DATA_DIR.as_path()),
+    set_intent_production_at(config::DATA_DIR.as_path(), domain_name, intent, None)
+}
+
+/// Persist intent only when the selected quorum is at or beyond the exact
+/// retained in-process authority. The fence is checked while holding the OS
+/// lease and before repair or generation advancement.
+pub fn set_intent_fenced(
+    domain_name: &str,
+    intent: DomainAttachmentIntent,
+    retained: Option<&DomainReconnectManifest>,
+) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    set_intent_production_at(
+        config::DATA_DIR.as_path(),
         domain_name,
         intent,
+        retained,
     )
 }
 
@@ -1173,6 +1558,270 @@ mod tests {
         assert_eq!(
             private_manifest_directory(data_directory),
             data_directory.join(PRIVATE_AUTHORITY_DIRECTORY)
+        );
+    }
+
+    fn namespace_slot_bytes(directory: &Path) -> [Option<Vec<u8>>; 3] {
+        manifest_paths(directory).map(|path| match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::NotFound,
+                    "namespace slot snapshot must be readable or absent"
+                );
+                None
+            }
+        })
+    }
+
+    fn assert_slots_omit_name(directory: &Path, domain_name: &str) {
+        for bytes in namespace_slot_bytes(directory).into_iter().flatten() {
+            assert!(!bytes
+                .windows(domain_name.len())
+                .any(|window| window == domain_name.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn production_v1_root_survives_upgrade_and_explicit_update_stays_in_root() {
+        let data_directory = tempfile::tempdir().expect("temporary production data root");
+        let legacy_name = "private-legacy-trj-domain";
+        let added_name = "private-added-csd-domain";
+        let legacy = attached_manifest(legacy_name);
+        write_fixture(
+            data_directory.path(),
+            0,
+            &legacy,
+            LEGACY_SCHEMA_VERSION,
+        );
+
+        let migrated = load_production_from(data_directory.path(), None)
+            .expect("load and migrate root schema-v1 authority");
+        assert_eq!(migrated, legacy);
+        assert_fully_replicated_v2(data_directory.path(), &legacy);
+        assert!(!private_manifest_directory(data_directory.path()).exists());
+
+        let updated = set_intent_production_at(
+            data_directory.path(),
+            added_name,
+            DomainAttachmentIntent::Detached,
+            Some(&migrated),
+        )
+        .expect("update the selected root authority");
+        assert_eq!(updated.generation(), 2);
+        assert_eq!(
+            updated.intent_for_name(legacy_name),
+            Some(DomainAttachmentIntent::Attached)
+        );
+        assert_eq!(
+            updated.intent_for_name(added_name),
+            Some(DomainAttachmentIntent::Detached)
+        );
+        assert_fully_replicated_v2(data_directory.path(), &updated);
+        assert!(!private_manifest_directory(data_directory.path()).exists());
+        assert_slots_omit_name(data_directory.path(), legacy_name);
+        assert_slots_omit_name(data_directory.path(), added_name);
+    }
+
+    #[test]
+    fn production_fresh_state_uses_only_the_private_leaf() {
+        let data_directory = tempfile::tempdir().expect("temporary production data root");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            data_directory.path(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("model an existing non-private application data root");
+        let private_directory = private_manifest_directory(data_directory.path());
+        let domain_name = "private-fresh-trj-domain";
+
+        let persisted = set_intent_production_at(
+            data_directory.path(),
+            domain_name,
+            DomainAttachmentIntent::Attached,
+            None,
+        )
+        .expect("persist fresh production authority");
+        assert_eq!(persisted.generation(), 1);
+        assert_eq!(
+            namespace_slot_bytes(data_directory.path()),
+            [None, None, None]
+        );
+        assert_fully_replicated_v2(&private_directory, &persisted);
+        assert_eq!(
+            load_production_from(data_directory.path(), Some(&persisted))
+                .expect("reload private-only production authority"),
+            persisted
+        );
+        let updated = set_intent_production_at(
+            data_directory.path(),
+            domain_name,
+            DomainAttachmentIntent::Detached,
+            Some(&persisted),
+        )
+        .expect("update private-only production authority");
+        assert_eq!(updated.generation(), 2);
+        assert_eq!(
+            updated.intent_for_name(domain_name),
+            Some(DomainAttachmentIntent::Detached)
+        );
+        assert_eq!(
+            namespace_slot_bytes(data_directory.path()),
+            [None, None, None]
+        );
+        assert_fully_replicated_v2(&private_directory, &updated);
+        assert_slots_omit_name(&private_directory, domain_name);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::symlink_metadata(data_directory.path())
+                .expect("inspect application data root")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn production_corrupt_root_never_defaults_to_a_fresh_private_authority() {
+        let data_directory = tempfile::tempdir().expect("temporary production data root");
+        write_corrupt_fixture(data_directory.path(), 0);
+        let before = namespace_slot_bytes(data_directory.path());
+
+        assert!(matches!(
+            set_intent_production_at(
+                data_directory.path(),
+                "private-corrupt-root-domain",
+                DomainAttachmentIntent::Attached,
+                None,
+            ),
+            Err(DomainReconnectManifestError::Invalid {
+                reason: "manifest is truncated"
+            })
+        ));
+        assert_eq!(namespace_slot_bytes(data_directory.path()), before);
+        assert!(!private_manifest_directory(data_directory.path()).exists());
+    }
+
+    #[test]
+    fn production_dual_namespace_evidence_fails_before_any_mutation() {
+        let data_directory = tempfile::tempdir().expect("temporary production data root");
+        let root_manifest = attached_manifest("private-root-trj-domain");
+        write_fixture(
+            data_directory.path(),
+            0,
+            &root_manifest,
+            LEGACY_SCHEMA_VERSION,
+        );
+        let private_directory = private_manifest_directory(data_directory.path());
+        let private_manifest = set_intent_at(
+            &private_directory,
+            "private-leaf-csd-domain",
+            DomainAttachmentIntent::Detached,
+        )
+        .expect("seed private namespace evidence");
+        let root_before = namespace_slot_bytes(data_directory.path());
+        let private_before = namespace_slot_bytes(&private_directory);
+        assert!(!lock_path(data_directory.path()).exists());
+
+        let error = set_intent_production_at(
+            data_directory.path(),
+            "private-third-domain",
+            DomainAttachmentIntent::Attached,
+            None,
+        )
+        .expect_err("dual namespace evidence must fail closed");
+        assert!(matches!(
+            &error,
+            DomainReconnectManifestError::NamespaceDivergence
+        ));
+        assert_eq!(namespace_slot_bytes(data_directory.path()), root_before);
+        assert_eq!(namespace_slot_bytes(&private_directory), private_before);
+        assert!(!lock_path(data_directory.path()).exists());
+        assert_eq!(
+            load_from(&private_directory).expect("private evidence remains readable"),
+            private_manifest
+        );
+        let error_text = error.to_string();
+        for secret in [
+            "private-root-trj-domain",
+            "private-leaf-csd-domain",
+            "private-third-domain",
+        ] {
+            assert!(!error_text.contains(secret));
+            assert_slots_omit_name(data_directory.path(), secret);
+            assert_slots_omit_name(&private_directory, secret);
+        }
+    }
+
+    #[test]
+    fn authority_leaf_syncs_parent_on_creation_and_existing_fast_path() {
+        let source = include_str!("domain_reconnect_manifest.rs");
+        let helper = source
+            .split_once("fn open_or_create_directory_tree_durably(")
+            .expect("durable directory helper must exist")
+            .1
+            .split_once("fn open_manifest_directory(")
+            .expect("durable helper must end before the manifest opener")
+            .0;
+        let create = helper
+            .find("parent.create_dir_with(name, &builder)")
+            .expect("helper must create the child through its pinned parent");
+        let creation_branch_end = helper
+            .find("\n    let pinned = parent")
+            .expect("child creation branch must end before the common publication path");
+        let nofollow_open = helper
+            .find(".open_dir_nofollow(name)")
+            .expect("helper must pin the created child without following a symlink");
+        let parent_sync = helper
+            .find("sync_directory(&parent)?")
+            .expect("helper must synchronize the parent entry");
+        let success = helper
+            .find("Ok(pinned)")
+            .expect("helper must return the pinned child only after publication");
+
+        assert!(create < nofollow_open);
+        assert!(creation_branch_end <= nofollow_open);
+        assert!(nofollow_open < parent_sync);
+        assert!(parent_sync < success);
+        assert_eq!(helper.matches("sync_directory(&parent)?").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_leaf_does_not_require_or_rewrite_legacy_parent_mode() {
+        let root = tempfile::tempdir().expect("temporary legacy data root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("model an older broadly readable data root");
+        let authority = private_manifest_directory(root.path());
+
+        let persisted = set_intent_at(
+            &authority,
+            "trj",
+            DomainAttachmentIntent::Attached,
+        )
+        .expect("persist inside dedicated private leaf");
+        assert_eq!(
+            load_from(&authority).expect("reload private-leaf authority"),
+            persisted
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&authority)
+                .expect("inspect private leaf")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(root.path())
+                .expect("inspect legacy data root")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
         );
     }
 
@@ -1386,6 +2035,105 @@ mod tests {
                 )),
             }
         }
+    }
+
+    #[test]
+    fn retained_floor_rejects_rollback_before_repair_or_write() {
+        let temp = tempfile::tempdir().expect("temporary rollback-fence directory");
+        let retained = manifest_with_intent("trj", DomainAttachmentIntent::Detached, 10);
+        let rolled_back = manifest_with_intent("trj", DomainAttachmentIntent::Attached, 8);
+        write_fixture(temp.path(), 0, &rolled_back, SCHEMA_VERSION);
+        write_fixture(temp.path(), 1, &rolled_back, SCHEMA_VERSION);
+        write_fixture(temp.path(), 2, &retained, SCHEMA_VERSION);
+        let before = manifest_paths(temp.path()).map(|path| {
+            std::fs::read(path).expect("read exact pre-fence replica bytes")
+        });
+
+        assert!(matches!(
+            load_fenced_from(temp.path(), Some(&retained)),
+            Err(DomainReconnectManifestError::AuthorityRollback {
+                observed: 8,
+                retained: 10,
+            })
+        ));
+        assert_eq!(
+            manifest_paths(temp.path()).map(|path| {
+                std::fs::read(path).expect("read exact post-load replica bytes")
+            }),
+            before,
+            "a rejected load must not repair over surviving high-water evidence"
+        );
+
+        assert!(matches!(
+            set_intent_fenced_at(
+                temp.path(),
+                "csd",
+                DomainAttachmentIntent::Attached,
+                Some(&retained),
+            ),
+            Err(DomainReconnectManifestError::AuthorityRollback {
+                observed: 8,
+                retained: 10,
+            })
+        ));
+        assert_eq!(
+            manifest_paths(temp.path()).map(|path| {
+                std::fs::read(path).expect("read exact post-write replica bytes")
+            }),
+            before,
+            "a rejected write must not repair or advance a rolled-back quorum"
+        );
+    }
+
+    #[test]
+    fn retained_floor_rejects_equal_generation_aba_without_mutation() {
+        let temp = tempfile::tempdir().expect("temporary ABA-fence directory");
+        let retained = manifest_with_intent("trj", DomainAttachmentIntent::Detached, 10);
+        let replacement = manifest_with_intent("trj", DomainAttachmentIntent::Attached, 10);
+        write_fixture(temp.path(), 0, &replacement, SCHEMA_VERSION);
+        write_fixture(temp.path(), 1, &replacement, SCHEMA_VERSION);
+        write_fixture(temp.path(), 2, &retained, SCHEMA_VERSION);
+        let before = manifest_paths(temp.path()).map(|path| {
+            std::fs::read(path).expect("read exact pre-ABA replica bytes")
+        });
+
+        assert!(matches!(
+            load_fenced_from(temp.path(), Some(&retained)),
+            Err(DomainReconnectManifestError::AuthorityDivergence { generation: 10 })
+        ));
+        assert!(matches!(
+            set_intent_fenced_at(
+                temp.path(),
+                "csd",
+                DomainAttachmentIntent::Attached,
+                Some(&retained),
+            ),
+            Err(DomainReconnectManifestError::AuthorityDivergence { generation: 10 })
+        ));
+        assert_eq!(
+            manifest_paths(temp.path()).map(|path| {
+                std::fs::read(path).expect("read exact post-ABA replica bytes")
+            }),
+            before,
+            "same-generation replacement must be rejected before repair or write"
+        );
+    }
+
+    #[test]
+    fn retained_floor_accepts_and_repairs_a_strictly_newer_quorum() {
+        let temp = tempfile::tempdir().expect("temporary forward-fence directory");
+        let retained = manifest_with_intent("trj", DomainAttachmentIntent::Detached, 10);
+        let advanced = manifest_with_intent("csd", DomainAttachmentIntent::Attached, 11);
+        write_fixture(temp.path(), 0, &advanced, SCHEMA_VERSION);
+        write_fixture(temp.path(), 1, &advanced, SCHEMA_VERSION);
+        write_fixture(temp.path(), 2, &retained, SCHEMA_VERSION);
+
+        assert_eq!(
+            load_fenced_from(temp.path(), Some(&retained))
+                .expect("strictly newer quorum should advance authority"),
+            advanced
+        );
+        assert_fully_replicated_v2(temp.path(), &advanced);
     }
 
     #[test]

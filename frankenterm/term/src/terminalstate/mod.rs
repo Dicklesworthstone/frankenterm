@@ -713,6 +713,7 @@ impl TerminalState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_prebuilt_screen(
         size: TerminalSize,
         config: Arc<dyn TerminalConfiguration>,

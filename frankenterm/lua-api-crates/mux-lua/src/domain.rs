@@ -1,7 +1,7 @@
 use super::*;
 use mlua::UserDataRef;
 use mux::domain::{DomainId, DomainState};
-use mux::DomainOperationGuard;
+use mux::{DomainOperationGuard, PreparedDomainSpawn};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -9,7 +9,8 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DomainLifecycleEvent {
-    /// Persist attachment authority before attempting a transport.
+    /// Persist best-effort attachment authority after starting the explicit
+    /// transport, including after an attach failure that should be retried.
     Attached,
     /// Persist detachment authority before mutating the live domain.
     Detached,
@@ -28,6 +29,100 @@ pub type DomainLifecycleRecorder = Arc<
 >;
 
 static DOMAIN_LIFECYCLE_RECORDER: OnceLock<DomainLifecycleRecorder> = OnceLock::new();
+
+struct InstalledDomainSpawnLifecycle;
+
+impl mux::DomainSpawnLifecycleLease for DomainLifecycleGuard {}
+
+impl mux::DomainSpawnLifecycle for InstalledDomainSpawnLifecycle {
+    fn prepare<'a>(
+        &'a self,
+        mux: Arc<Mux>,
+        domain: PreparedDomainSpawn,
+        owner_client_id: Option<Arc<mux::client::ClientId>>,
+        window_id: Option<mux::window::WindowId>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PreparedDomainSpawn>> + 'a>> {
+        Box::pin(async move {
+            crate::run_anyhow_on_main_thread_to_completion(
+                promise::spawn::MainThreadServiceClass::Topology,
+                "prepare implicit domain spawn",
+                || async move {
+                    let domain_name = domain.domain_name().to_string();
+                    let lifecycle = reserve_domain_lifecycle(domain_name.clone())?
+                        .enter()
+                        .await?;
+
+                    // The lifecycle lane is the authority for the final state
+                    // check. An explicit detach cannot interleave between this
+                    // check, transport attach, reconnect-intent publication,
+                    // and the caller's subsequent pane spawn while it holds
+                    // the lease.
+                    let attach_attempted = domain.state() == DomainState::Detached;
+                    if !attach_attempted {
+                        return domain.with_lifecycle(Box::new(lifecycle));
+                    }
+
+                    if let Err(attach_error) =
+                        domain.attach(&mux, owner_client_id, window_id).await
+                    {
+                        let remember_result = record_domain_lifecycle(
+                            domain_name.clone(),
+                            DomainLifecycleEvent::Attached,
+                            &lifecycle,
+                        )
+                        .await;
+                        let retry_result = record_domain_lifecycle(
+                            domain_name,
+                            DomainLifecycleEvent::AttachFailed,
+                            &lifecycle,
+                        )
+                        .await;
+                        return match (remember_result, retry_result) {
+                            (Ok(()), Ok(())) => Err(attach_error),
+                            (Err(remember_error), Ok(())) => Err(anyhow::anyhow!(
+                                "{attach_error:#}; reconnect intent could not be remembered: {remember_error:#}"
+                            )),
+                            (Ok(()), Err(retry_error)) => Err(anyhow::anyhow!(
+                                "{attach_error:#}; automatic retry could not be scheduled: {retry_error:#}"
+                            )),
+                            (Err(remember_error), Err(retry_error)) => Err(anyhow::anyhow!(
+                                "{attach_error:#}; reconnect intent could not be remembered: {remember_error:#}; automatic retry could not be scheduled: {retry_error:#}"
+                            )),
+                        };
+                    }
+
+                    // A successful explicit spawn is not gated on optional
+                    // disk I/O. The recorder receives its own worker hold and
+                    // runs detached; that hold keeps this lifecycle ticket
+                    // active even if the pane spawn or its caller is cancelled.
+                    if let Err(error) = schedule_domain_lifecycle_record(
+                        domain_name.clone(),
+                        DomainLifecycleEvent::Attached,
+                        &lifecycle,
+                    ) {
+                        log::error!(
+                            "implicit domain attach succeeded, but detached reconnect intent persistence could not be scheduled; using the inline fallback: {error:#}"
+                        );
+                        if let Err(fallback_error) = record_domain_lifecycle(
+                            domain_name,
+                            DomainLifecycleEvent::Attached,
+                            &lifecycle,
+                        )
+                        .await
+                        {
+                            log::error!(
+                                "implicit domain attach succeeded, but inline reconnect intent persistence also failed: {fallback_error:#}"
+                            );
+                        }
+                    }
+
+                    domain.with_lifecycle(Box::new(lifecycle))
+                },
+            )
+            .await
+        })
+    }
+}
 
 struct DomainLifecycleLane {
     next_ticket: u64,
@@ -238,8 +333,12 @@ pub fn reserve_domain_lifecycle(
 /// Non-GUI consumers intentionally leave this unset and retain the original
 /// in-memory attach/detach behavior. The first installed recorder remains the
 /// authority for the process lifetime so a config reload cannot replace it.
-pub fn install_domain_lifecycle_recorder(recorder: DomainLifecycleRecorder) {
+pub fn install_domain_lifecycle_recorder(
+    mux: &Arc<Mux>,
+    recorder: DomainLifecycleRecorder,
+) {
     let _ = DOMAIN_LIFECYCLE_RECORDER.set(recorder);
+    mux.install_domain_spawn_lifecycle(Arc::new(InstalledDomainSpawnLifecycle));
 }
 
 async fn record_domain_lifecycle(
@@ -250,6 +349,43 @@ async fn record_domain_lifecycle(
     if let Some(recorder) = DOMAIN_LIFECYCLE_RECORDER.get() {
         recorder(domain_name, event, lifecycle.worker_hold()).await?;
     }
+    Ok(())
+}
+
+fn schedule_domain_lifecycle_record(
+    domain_name: String,
+    event: DomainLifecycleEvent,
+    lifecycle: &DomainLifecycleGuard,
+) -> anyhow::Result<()> {
+    let Some(recorder) = DOMAIN_LIFECYCLE_RECORDER.get() else {
+        return Ok(());
+    };
+    let future = recorder(domain_name, event, lifecycle.worker_hold());
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        16 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!(
+            "main-thread scheduler rejected detached domain lifecycle persistence before task construction: {rejected:?}"
+        ),
+    };
+    let spawned = reservation.spawn(async move {
+        if let Err(error) = future.await {
+            log::error!("detached domain lifecycle persistence failed: {error:#}");
+        }
+    });
+    if spawned
+        .initial_enqueue_receipt()
+        .snapshot_after_enqueue
+        .retired
+    {
+        drop(spawned);
+        anyhow::bail!(
+            "main-thread scheduler retired detached domain lifecycle persistence before its initial poll"
+        );
+    }
+    spawned.detach();
     Ok(())
 }
 
@@ -291,11 +427,11 @@ impl UserData for MuxDomain {
         // boxes a non-Send `dyn Future`, and for remote `ClientDomain`s drives
         // network RPCs), but mlua 0.11's `add_async_method` requires a `Send`
         // future. So spawn the `!Send` work onto the main-thread queue via
-        // `promise::spawn::spawn` (which uses `spawn_local`, lifting the `Send`
-        // bound on the future) and await the resulting `Task` handle, which IS
-        // `Send`. The event loop drives the spawned future to completion while
-        // we yield here; no `block_on`, so no dispatch-guard trip, and only the
-        // `Send` `Task` is live across the await, satisfying mlua.
+        // a locally admitted main-thread task and await its handle. The
+        // completion wrapper detaches that already-admitted task if Lua cancels
+        // its waiter, so transport rollback/timeout, Attached persistence, and
+        // retry handoff still run to one terminal outcome. The event loop drives
+        // the task while we yield here; no `block_on`, so no dispatch-guard trip.
         methods.add_async_method(
             "attach",
             |_, this, window: Option<UserDataRef<MuxWindow>>| async move {
@@ -304,7 +440,7 @@ impl UserData for MuxDomain {
                 let domain_name = domain.domain_name().to_string();
                 let window_id = window.map(|w| w.0);
                 let owner_client_id = mux.active_identity();
-                crate::run_on_main_thread(
+                crate::run_on_main_thread_to_completion(
                     promise::spawn::MainThreadServiceClass::Topology,
                     "attach domain",
                     || async move {
@@ -358,7 +494,7 @@ impl UserData for MuxDomain {
             let mux = get_mux()?;
             let domain = this.resolve(&mux)?;
             let domain_name = domain.domain_name().to_string();
-            crate::run_on_main_thread(
+            crate::run_on_main_thread_to_completion(
                 promise::spawn::MainThreadServiceClass::Topology,
                 "detach domain",
                 || async move {
@@ -592,11 +728,21 @@ mod tests {
             transport < attached_intent,
             "best-effort remembrance must not gate the explicit Lua transport"
         );
-        assert_eq!(attach.matches("crate::run_on_main_thread(").count(), 1);
-        assert_eq!(detach.matches("crate::run_on_main_thread(").count(), 1);
+        assert_eq!(
+            attach
+                .matches("crate::run_on_main_thread_to_completion(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            detach
+                .matches("crate::run_on_main_thread_to_completion(")
+                .count(),
+            1
+        );
         for transaction in [attach, detach] {
             let admission = transaction
-                .find("crate::run_on_main_thread(")
+                .find("crate::run_on_main_thread_to_completion(")
                 .expect("transaction has scheduler admission");
             let lifecycle = transaction
                 .find("reserve_domain_lifecycle")
@@ -609,5 +755,84 @@ mod tests {
                 "scheduler admission and lifecycle ordering must precede persistence"
             );
         }
+
+        let library = include_str!("lib.rs");
+        let completion_wrapper = library
+            .split_once("struct DetachOnCallerDropTask")
+            .expect("cancellation-resistant main-thread task wrapper remains present")
+            .1
+            .split_once("pub(crate) async fn run_on_main_thread<")
+            .expect("task wrapper remains independently bounded")
+            .0;
+        assert!(completion_wrapper.contains("task.detach();"));
+        let completion_admission = library
+            .split_once("fn admit_main_thread_completion_task<")
+            .expect("cancellation-resistant admission helper remains present")
+            .1
+            .split_once("pub(crate) async fn run_on_main_thread<")
+            .expect("admission helper remains independently bounded")
+            .0;
+        assert!(completion_admission.contains("initial_enqueue_receipt()"));
+        assert!(completion_admission.contains("DetachOnCallerDropTask"));
+        let completion_runner = library
+            .split_once("pub(crate) async fn run_on_main_thread_to_completion<")
+            .expect("cancellation-resistant lifecycle runner remains present")
+            .1;
+        assert!(completion_runner.contains("admit_main_thread_completion_task("));
+    }
+
+    #[test]
+    fn implicit_spawn_attach_is_centralized_ordered_and_cancellation_safe() {
+        let source = include_str!("domain.rs");
+        let handler = source
+            .split_once("impl mux::DomainSpawnLifecycle for InstalledDomainSpawnLifecycle")
+            .expect("installed implicit-spawn lifecycle remains present")
+            .1
+            .split_once("struct DomainLifecycleLane")
+            .expect("implicit-spawn lifecycle remains independently bounded")
+            .0;
+        let completion = handler
+            .find("run_anyhow_on_main_thread_to_completion(")
+            .expect("implicit attach must detach its admitted completion worker");
+        let lifecycle = handler
+            .find("reserve_domain_lifecycle(domain_name.clone())")
+            .expect("implicit attach must acquire exact per-domain ordering");
+        let final_state = handler
+            .find("let attach_attempted = domain.state() == DomainState::Detached")
+            .expect("detached state must be checked under lifecycle authority");
+        let transport = handler
+            .find("domain.attach(&mux, owner_client_id, window_id).await")
+            .expect("detached spawn must perform its transport attach");
+        let detached_persistence = handler
+            .find("schedule_domain_lifecycle_record(")
+            .expect("successful transport must schedule best-effort persistence");
+        let retained = handler
+            .rfind("domain.with_lifecycle(Box::new(lifecycle))")
+            .expect("spawn must retain lifecycle authority after preparation");
+        assert!(
+            completion < lifecycle
+                && lifecycle < final_state
+                && final_state < transport
+                && transport < detached_persistence
+                && detached_persistence < retained
+        );
+
+        let mux_source = include_str!("../../../mux/src/lib.rs");
+        assert_eq!(
+            mux_source.matches("prepare_domain_for_spawn(").count(),
+            5,
+            "the helper definition and all four implicit attach sites must remain wired"
+        );
+        assert!(mux_source.contains("domain_spawn_lifecycle: OnceLock"));
+        assert!(mux_source.contains("lifecycle.prepare(Arc::clone(self), prepared"));
+
+        let install = source
+            .split_once("pub fn install_domain_lifecycle_recorder(")
+            .expect("GUI recorder installation remains present")
+            .1
+            .split_once("async fn record_domain_lifecycle(")
+            .expect("GUI recorder installation remains bounded")
+            .0;
+        assert!(install.contains("mux.install_domain_spawn_lifecycle"));
     }
 }

@@ -60,6 +60,7 @@ const LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE: usize = 16 * 1024 * 1024;
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V1: &str = "frankenterm.live-scrollback-manifest.v1";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2: &str = "frankenterm.live-scrollback-manifest.v2";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3: &str = "frankenterm.live-scrollback-manifest.v3";
+const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4: &str = "frankenterm.live-scrollback-manifest.v4";
 const LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES: u64 = 1024 * 1024 * 1024;
 const LIVE_SCROLLBACK_MAX_SEQUENCE_JOURNAL_BYTES: u64 = 1024 * 1024;
 const LIVE_SCROLLBACK_REPLACEMENT_LEDGER_DOMAIN: &[u8] =
@@ -68,8 +69,12 @@ const LIVE_SCROLLBACK_CLEAR_EPOCH_DOMAIN: &[u8] =
     b"frankenterm.live-scrollback-clear-epoch.v1\0";
 const LIVE_SCROLLBACK_LOGICAL_LEDGER_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.live-scrollback-logical-ledger.v3\0";
+const LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN: &[u8] =
+    b"frankenterm.live-scrollback-incremental-chain.v4\0";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1: &str =
     "frankenterm.live-scrollback-append-wal.v1";
+const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2: &str =
+    "frankenterm.live-scrollback-append-wal.v2";
 const LIVE_SCROLLBACK_APPEND_WAL_NAME: &str = ".append-wal.v1.json";
 const LIVE_SCROLLBACK_APPEND_WAL_STAGE_NAME: &str = ".append-wal.v1.installing";
 const LIVE_SCROLLBACK_APPEND_WAL_RECORD_DIGEST_DOMAIN: &[u8] =
@@ -79,6 +84,10 @@ const LIVE_SCROLLBACK_APPEND_WAL_TARGET_DIGEST_DOMAIN: &[u8] =
 const LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const LIVE_SCROLLBACK_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const LIVE_SCROLLBACK_MUTATION_LOCK_NAME: &str = ".mutation-lock.v3";
+
+#[cfg(test)]
+static LIVE_SCROLLBACK_AUTHORITY_RECORD_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
     config
@@ -392,6 +401,10 @@ struct LiveScrollbackSpillState {
     clear_manifest_published: bool,
     clear_pending_physical_reclamation: bool,
     transaction_quarantined: bool,
+    /// Private, scan-minted authority for the exact retained interval. The
+    /// type has no public constructor: ordinary mutations may only derive a
+    /// successor from an already verified predecessor.
+    verified_ledger: Option<VerifiedLedgerState>,
 }
 
 impl std::fmt::Debug for LiveScrollbackSpillState {
@@ -414,6 +427,7 @@ impl std::fmt::Debug for LiveScrollbackSpillState {
                 &self.clear_pending_physical_reclamation,
             )
             .field("transaction_quarantined", &self.transaction_quarantined)
+            .field("verified_ledger", &self.verified_ledger)
             .finish()
     }
 }
@@ -431,6 +445,7 @@ impl LiveScrollbackSpillState {
             clear_manifest_published: false,
             clear_pending_physical_reclamation: false,
             transaction_quarantined: false,
+            verified_ledger: None,
         }
     }
 
@@ -490,6 +505,13 @@ struct LiveScrollbackManifestV1 {
     committed_sequence_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     logical_ledger_sha256: Option<String>,
+    /// Schema v4 authenticates an incrementally maintainable retained-range
+    /// chain. `anchor` is the commitment immediately before `oldest_seq` and
+    /// `tail` is the commitment after the final retained record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_anchor_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_tail_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     guardian_manifest_authentication: Option<String>,
     manifest_sha256: String,
@@ -517,7 +539,18 @@ struct LiveScrollbackAppendWalV1 {
     target_retained_record_bytes: u64,
     encrypted_record_bytes: u64,
     encrypted_record_sha256: String,
-    target_record_set_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_record_set_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    predecessor_chain_anchor_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    predecessor_chain_tail_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_chain_anchor_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_chain_tail_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evicted_record_count: Option<u64>,
     encrypted_record: String,
     guardian_authentication: Option<String>,
     wal_sha256: String,
@@ -553,10 +586,272 @@ impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
             .field("encrypted_record_bytes", &self.encrypted_record_bytes)
             .field("encrypted_record_sha256", &"[REDACTED]")
             .field("target_record_set_sha256", &"[REDACTED]")
+            .field("predecessor_chain_anchor_sha256", &"[REDACTED]")
+            .field("predecessor_chain_tail_sha256", &"[REDACTED]")
+            .field("target_chain_anchor_sha256", &"[REDACTED]")
+            .field("target_chain_tail_sha256", &"[REDACTED]")
+            .field("evicted_record_count", &self.evicted_record_count)
             .field("encrypted_record", &"[REDACTED]")
             .field("guardian_authentication", &"[REDACTED]")
             .field("wal_sha256", &"[REDACTED]")
             .finish()
+    }
+}
+
+/// In-memory proof that one exact retained interval was authenticated by a
+/// complete cold scan. Fields are private and the only constructors below
+/// either scan every retained record or derive a successor from an existing
+/// verified value. This is deliberately not serializable: the signed v4
+/// manifest remains the durable authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VerifiedLedgerState {
+    ledger_pane_id: u64,
+    oldest_sequence: Option<u64>,
+    next_sequence: u64,
+    record_count: u64,
+    retained_record_bytes: u64,
+    chain_anchor: [u8; 32],
+    chain_tail: [u8; 32],
+}
+
+impl std::fmt::Debug for VerifiedLedgerState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedLedgerState")
+            .field("ledger_pane_id", &self.ledger_pane_id)
+            .field("oldest_sequence", &self.oldest_sequence)
+            .field("next_sequence", &self.next_sequence)
+            .field("record_count", &self.record_count)
+            .field("retained_record_bytes", &self.retained_record_bytes)
+            .field("chain_anchor", &"[REDACTED]")
+            .field("chain_tail", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn live_scrollback_manifest_is_authenticated(manifest: &LiveScrollbackManifestV1) -> bool {
+    matches!(
+        manifest.schema.as_str(),
+        LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 | LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
+    )
+}
+
+fn live_scrollback_incremental_chain_next(
+    predecessor: [u8; 32],
+    ledger_pane_id: u64,
+    sequence: u64,
+    record: &str,
+) -> anyhow::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN);
+    hasher.update(predecessor);
+    hasher.update(ledger_pane_id.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    hasher.update(
+        u64::try_from(record.len())
+            .map_err(|_| anyhow::anyhow!("incremental-chain record length exceeds u64"))?
+            .to_le_bytes(),
+    );
+    hasher.update(record.as_bytes());
+    Ok(hasher.finalize().into())
+}
+
+fn live_scrollback_authority_record_at(
+    store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ledger_pane_id: u64,
+    sequence: u64,
+) -> anyhow::Result<String> {
+    #[cfg(test)]
+    LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    store
+        .line_at(ledger_pane_id, sequence)?
+        .ok_or_else(|| anyhow::anyhow!("authenticated ledger is missing sequence {sequence}"))
+}
+
+impl VerifiedLedgerState {
+    fn empty(ledger_pane_id: u64) -> Self {
+        Self {
+            ledger_pane_id,
+            oldest_sequence: None,
+            next_sequence: 0,
+            record_count: 0,
+            retained_record_bytes: 0,
+            chain_anchor: [0; 32],
+            chain_tail: [0; 32],
+        }
+    }
+
+    fn scan_store(
+        ledger_pane_id: u64,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        chain_anchor: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        let oldest_sequence = store.oldest_seq(ledger_pane_id);
+        let next_sequence = store.next_seq(ledger_pane_id)?;
+        let record_count = u64::try_from(store.line_count(ledger_pane_id))
+            .map_err(|_| anyhow::anyhow!("authenticated ledger row count exceeds u64"))?;
+        match (oldest_sequence, record_count) {
+            (None, 0) => anyhow::ensure!(
+                next_sequence == 0,
+                "empty authenticated ledger has a nonzero next sequence"
+            ),
+            (Some(oldest), count) if count != 0 => anyhow::ensure!(
+                oldest.checked_add(count) == Some(next_sequence),
+                "authenticated ledger sequence interval is not contiguous"
+            ),
+            _ => anyhow::bail!("authenticated ledger oldest-sequence identity is inconsistent"),
+        }
+
+        let mut chain_tail = chain_anchor;
+        let mut retained_record_bytes = 0_u64;
+        if let Some(oldest) = oldest_sequence {
+            for offset in 0..record_count {
+                let sequence = oldest
+                    .checked_add(offset)
+                    .ok_or_else(|| anyhow::anyhow!("authenticated ledger sequence overflows"))?;
+                let record =
+                    live_scrollback_authority_record_at(store, ledger_pane_id, sequence)?;
+                retained_record_bytes = retained_record_bytes
+                    .checked_add(u64::try_from(record.len())?)
+                    .and_then(|bytes| bytes.checked_add(1))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("authenticated ledger retained bytes overflow")
+                    })?;
+                chain_tail = live_scrollback_incremental_chain_next(
+                    chain_tail,
+                    ledger_pane_id,
+                    sequence,
+                    &record,
+                )?;
+            }
+        }
+        anyhow::ensure!(
+            retained_record_bytes == store.retained_record_bytes(ledger_pane_id),
+            "authenticated ledger retained-byte accounting mismatch"
+        );
+        Ok(Self {
+            ledger_pane_id,
+            oldest_sequence,
+            next_sequence,
+            record_count,
+            retained_record_bytes,
+            chain_anchor,
+            chain_tail,
+        })
+    }
+
+    fn from_records(ledger_pane_id: u64, records: &[String]) -> anyhow::Result<Self> {
+        let mut state = Self::empty(ledger_pane_id);
+        for (offset, record) in records.iter().enumerate() {
+            let sequence = u64::try_from(offset)
+                .map_err(|_| anyhow::anyhow!("replacement ledger sequence exceeds u64"))?;
+            state.chain_tail = live_scrollback_incremental_chain_next(
+                state.chain_tail,
+                ledger_pane_id,
+                sequence,
+                record,
+            )?;
+            state.retained_record_bytes = state
+                .retained_record_bytes
+                .checked_add(u64::try_from(record.len())?)
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or_else(|| anyhow::anyhow!("replacement ledger retained bytes overflow"))?;
+            state.record_count = state
+                .record_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("replacement ledger row count overflows"))?;
+            state.next_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("replacement ledger sequence overflows"))?;
+        }
+        state.oldest_sequence = (!records.is_empty()).then_some(0);
+        Ok(state)
+    }
+
+    fn project_append(
+        self,
+        desired_sequence: u64,
+        record: &str,
+        max_retained_rows: usize,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ) -> anyhow::Result<(Self, u64)> {
+        anyhow::ensure!(
+            self.next_sequence == desired_sequence
+                && self.ledger_pane_id != u64::MAX
+                && max_retained_rows != 0,
+            "incremental append predecessor authority is inconsistent"
+        );
+        let max_retained_rows = u64::try_from(max_retained_rows)?;
+        let target_next_sequence = desired_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("incremental append sequence is exhausted"))?;
+        let target_record_count = self
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("incremental append row count overflows"))?
+            .min(max_retained_rows);
+        let target_oldest_sequence = target_next_sequence
+            .checked_sub(target_record_count)
+            .ok_or_else(|| anyhow::anyhow!("incremental append range underflows"))?;
+        let previous_oldest = self.oldest_sequence.unwrap_or(desired_sequence);
+        anyhow::ensure!(
+            self.record_count != 0 || self.oldest_sequence.is_none(),
+            "incremental append empty predecessor has an oldest sequence"
+        );
+        let evicted_record_count = target_oldest_sequence
+            .checked_sub(previous_oldest)
+            .ok_or_else(|| anyhow::anyhow!("incremental append retention moves backwards"))?;
+
+        let mut chain_anchor = self.chain_anchor;
+        let mut retained_record_bytes = self
+            .retained_record_bytes
+            .checked_add(u64::try_from(record.len())?)
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("incremental append retained bytes overflow"))?;
+        for offset in 0..evicted_record_count {
+            let sequence = previous_oldest
+                .checked_add(offset)
+                .ok_or_else(|| anyhow::anyhow!("incremental eviction sequence overflows"))?;
+            let evicted =
+                live_scrollback_authority_record_at(store, self.ledger_pane_id, sequence)?;
+            chain_anchor = live_scrollback_incremental_chain_next(
+                chain_anchor,
+                self.ledger_pane_id,
+                sequence,
+                &evicted,
+            )?;
+            retained_record_bytes = retained_record_bytes
+                .checked_sub(u64::try_from(evicted.len())?.saturating_add(1))
+                .ok_or_else(|| anyhow::anyhow!("incremental eviction byte count underflows"))?;
+        }
+        let chain_tail = live_scrollback_incremental_chain_next(
+            self.chain_tail,
+            self.ledger_pane_id,
+            desired_sequence,
+            record,
+        )?;
+        Ok((
+            Self {
+                ledger_pane_id: self.ledger_pane_id,
+                oldest_sequence: Some(target_oldest_sequence),
+                next_sequence: target_next_sequence,
+                record_count: target_record_count,
+                retained_record_bytes,
+                chain_anchor,
+                chain_tail,
+            },
+            evicted_record_count,
+        ))
+    }
+
+    fn matches_store_facts(
+        self,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ) -> anyhow::Result<bool> {
+        Ok(store.oldest_seq(self.ledger_pane_id) == self.oldest_sequence
+            && store.next_seq(self.ledger_pane_id)? == self.next_sequence
+            && u64::try_from(store.line_count(self.ledger_pane_id))? == self.record_count
+            && store.retained_record_bytes(self.ledger_pane_id) == self.retained_record_bytes)
     }
 }
 
@@ -571,7 +866,9 @@ fn live_scrollback_manifest_generation(
             );
             Ok(None)
         }
-        LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2 | LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 => {
+        LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2
+        | LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3
+        | LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4 => {
             let encoded_epoch = manifest
                 .content_epoch
                 .as_deref()

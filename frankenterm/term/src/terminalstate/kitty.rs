@@ -89,8 +89,10 @@ impl KittyImageState {
         max_transmission_bytes: usize,
         max_image_id: u32,
     ) -> Self {
-        let mut state = Self::default();
-        state.image_budget_bytes = image_budget_bytes;
+        let mut state = Self {
+            image_budget_bytes,
+            ..Self::default()
+        };
         state.set_max_transmission_bytes(max_transmission_bytes);
         state.restore_quiescent_checkpoint_high_water(max_image_id);
         state

@@ -9,7 +9,7 @@
 
 use crate::redactor::{BytesRedactionEvidence, RedactionResult, StreamingRedactor};
 use crate::scrollback_mmap_format::{
-    HEADER_SIZE, RECORD_HEADER_SIZE, RecordHeader, RecordKind, ScrollbackHeader,
+    HEADER_SIZE, HeaderFlags, RECORD_HEADER_SIZE, RecordHeader, RecordKind, ScrollbackHeader,
 };
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
@@ -27,6 +27,75 @@ pub const HARD_MAX_LINEAR_RECORD_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CAP_BYTES: u64 = HARD_MAX_LINEAR_RECORD_FILE_BYTES - HEADER_SIZE as u64;
 const DEFAULT_SYNC_EVERY_APPENDS: u64 = 64;
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+
+// Fresh files use an authenticated v2 ring profile inside the existing
+// 256-byte envelope. Keeping the outer `FormatVersion::V1` value lets the
+// bounded orphan census decode immutable identity/telemetry without teaching
+// that scanner how to replay records; the dedicated reader below requires this
+// flag and validates the v2 state slots and record digests before returning
+// bytes.
+const V2_RING_FLAG: u16 = 0x8000;
+const V2_STATE_SLOT_MAGIC: [u8; 4] = *b"FTS2";
+const V2_STATE_SLOT_VERSION: u16 = 2;
+const V2_STATE_SLOT_SIZE: usize = 64;
+const V2_STATE_SLOT_COUNT: usize = 2;
+const V2_STATE_SLOTS_OFFSET: usize = 88;
+const V2_STATE_CHECKSUM_OFFSET: usize = 48;
+const V2_STATE_CHECKSUM_BYTES: usize = 16;
+const V2_RECORD_MAGIC: [u8; 4] = *b"FTR2";
+const V2_RECORD_HEADER_SIZE: usize = 64;
+const V2_RECORD_DIGEST_OFFSET: usize = 32;
+const V2_RECORD_DIGEST_BYTES: usize = 32;
+const V2_STATE_HASH_DOMAIN: &[u8] = b"frankenterm.scrollback.v2.state\0";
+const V2_RECORD_HASH_DOMAIN: &[u8] = b"frankenterm.scrollback.v2.record\0";
+
+const _: () = assert!(
+    V2_STATE_SLOTS_OFFSET + V2_STATE_SLOT_SIZE * V2_STATE_SLOT_COUNT <= HEADER_SIZE
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2RingState {
+    slot_epoch: u64,
+    head: u32,
+    tail: u32,
+    wrap_at: u32,
+    generation: u64,
+    next_sequence: u64,
+    record_count: u32,
+}
+
+impl V2RingState {
+    fn fresh(capacity_bytes: u64) -> Result<Self, MmapScrollbackError> {
+        Ok(Self {
+            slot_epoch: 1,
+            head: 0,
+            tail: 0,
+            wrap_at: u32::try_from(capacity_bytes).map_err(|_| {
+                MmapScrollbackError::CapTooLarge {
+                    maximum: u64::from(u32::MAX),
+                    actual: capacity_bytes,
+                }
+            })?,
+            generation: 0,
+            next_sequence: 0,
+            record_count: 0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2RecordMeta {
+    total_len: u32,
+    generation: u64,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+struct OpenedWriterFile {
+    file: File,
+    identity: LinearRecordSourceIdentity,
+    created: bool,
+}
 
 /// Caller-owned resource envelope for decoding a legacy mmap scrollback file.
 ///

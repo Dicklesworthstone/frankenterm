@@ -36,12 +36,12 @@ use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env::{self, current_dir};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
@@ -125,10 +125,26 @@ static MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE:
     Mutex<AdmissionRetryCoordinatorState> = Mutex::new(AdmissionRetryCoordinatorState::Idle);
 static DOMAIN_RECONNECT_MANIFEST_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static DOMAIN_RECONNECT_MANIFEST_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED: AtomicBool = AtomicBool::new(false);
 static DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Exact content identity at the highest accepted generation. This survives
+/// active-snapshot invalidation so a rolled-back history cannot reuse the same
+/// numeric generation with different intents (an ABA replacement).
+static DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_SNAPSHOT: std::sync::RwLock<
+    Option<domain_reconnect_manifest::DomainReconnectManifest>,
+> = std::sync::RwLock::new(None);
 static DOMAIN_RECONNECT_MANIFEST_SNAPSHOT: std::sync::RwLock<
     Option<domain_reconnect_manifest::DomainReconnectManifest>,
 > = std::sync::RwLock::new(None);
+static DOMAIN_RECONNECT_MANIFEST_OPERATION_LANE: LazyLock<
+    Mutex<DomainReconnectManifestOperationLane>,
+> = LazyLock::new(|| {
+    Mutex::new(DomainReconnectManifestOperationLane {
+        next_ticket: 1,
+        active_ticket: None,
+        waiters: VecDeque::new(),
+    })
+});
 thread_local! {
     /// One process-local owner for the retry task. Replacing this handle drops
     /// and cancels the old future immediately, releasing both its exact domain
@@ -1303,51 +1319,225 @@ where
     failures
 }
 
+struct DomainReconnectManifestOperationLane {
+    next_ticket: u64,
+    active_ticket: Option<u64>,
+    waiters: VecDeque<DomainReconnectManifestOperationWaiter>,
+}
+
+struct DomainReconnectManifestOperationWaiter {
+    ticket: u64,
+    ready: futures::channel::oneshot::Sender<()>,
+}
+
+#[must_use = "a manifest operation reservation must be entered or dropped"]
+struct DomainReconnectManifestOperationReservation {
+    ticket: u64,
+    ready: Option<futures::channel::oneshot::Receiver<()>>,
+    release_required: bool,
+}
+
+#[must_use = "the manifest operation guard must span disk evidence and in-memory reconciliation"]
+struct DomainReconnectManifestOperationGuard {
+    ticket: u64,
+    release_required: bool,
+}
+
+fn finish_domain_reconnect_manifest_operation(ticket: u64, release_required: &mut bool) {
+    if !std::mem::take(release_required) {
+        return;
+    }
+
+    let mut released_ticket = ticket;
+    loop {
+        let next_waiter = {
+            let mut lane = DOMAIN_RECONNECT_MANIFEST_OPERATION_LANE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if lane.active_ticket == Some(released_ticket) {
+                lane.active_ticket = None;
+                let next = lane.waiters.pop_front();
+                if let Some(next) = &next {
+                    lane.active_ticket = Some(next.ticket);
+                }
+                next
+            } else if let Some(position) = lane
+                .waiters
+                .iter()
+                .position(|waiter| waiter.ticket == released_ticket)
+            {
+                lane.waiters.remove(position);
+                None
+            } else {
+                return;
+            }
+        };
+
+        let Some(next_waiter) = next_waiter else {
+            return;
+        };
+        released_ticket = next_waiter.ticket;
+        if next_waiter.ready.send(()).is_ok() {
+            return;
+        }
+    }
+}
+
+fn reserve_domain_reconnect_manifest_operation(
+) -> anyhow::Result<DomainReconnectManifestOperationReservation> {
+    let (ready_sender, ready) = futures::channel::oneshot::channel();
+    let mut lane = DOMAIN_RECONNECT_MANIFEST_OPERATION_LANE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let ticket = lane.next_ticket;
+    lane.next_ticket = lane.next_ticket.checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!("domain reconnect manifest operation ticket namespace exhausted")
+    })?;
+    let ready_sender = if lane.active_ticket.is_none() {
+        lane.active_ticket = Some(ticket);
+        Some(ready_sender)
+    } else {
+        lane.waiters
+            .push_back(DomainReconnectManifestOperationWaiter {
+                ticket,
+                ready: ready_sender,
+            });
+        None
+    };
+    drop(lane);
+    if let Some(ready_sender) = ready_sender
+        && ready_sender.send(()).is_err()
+    {
+        let mut release_required = true;
+        finish_domain_reconnect_manifest_operation(ticket, &mut release_required);
+        anyhow::bail!("initial domain reconnect manifest operation admission was cancelled");
+    }
+    Ok(DomainReconnectManifestOperationReservation {
+        ticket,
+        ready: Some(ready),
+        release_required: true,
+    })
+}
+
+impl DomainReconnectManifestOperationReservation {
+    async fn enter(mut self) -> anyhow::Result<DomainReconnectManifestOperationGuard> {
+        let ready = self.ready.take().ok_or_else(|| {
+            anyhow::anyhow!("domain reconnect manifest operation readiness receiver is absent")
+        })?;
+        ready.await.map_err(|_| {
+            anyhow::anyhow!("domain reconnect manifest operation authority was lost before entry")
+        })?;
+        let guard = DomainReconnectManifestOperationGuard {
+            ticket: self.ticket,
+            release_required: self.release_required,
+        };
+        self.release_required = false;
+        Ok(guard)
+    }
+}
+
+impl Drop for DomainReconnectManifestOperationReservation {
+    fn drop(&mut self) {
+        finish_domain_reconnect_manifest_operation(self.ticket, &mut self.release_required);
+    }
+}
+
+impl Drop for DomainReconnectManifestOperationGuard {
+    fn drop(&mut self) {
+        finish_domain_reconnect_manifest_operation(self.ticket, &mut self.release_required);
+    }
+}
+
 fn publish_domain_reconnect_manifest_snapshot(
     manifest: domain_reconnect_manifest::DomainReconnectManifest,
+    _operation: &DomainReconnectManifestOperationGuard,
 ) {
     let generation = manifest.generation();
     let mut ambiguous_generation = None;
-    let mut retired_supervisor = None;
+    let mut rollback_generation = None;
     let mut snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut high_water_snapshot = DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_SNAPSHOT
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let initialized = DOMAIN_RECONNECT_MANIFEST_INITIALIZED.load(Ordering::Acquire);
     let high_water = DOMAIN_RECONNECT_MANIFEST_HIGH_WATER.load(Ordering::Acquire);
     if !initialized || generation > high_water {
         DOMAIN_RECONNECT_MANIFEST_HIGH_WATER.store(generation, Ordering::Release);
+        DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED.store(false, Ordering::Release);
+        *high_water_snapshot = Some(manifest.clone());
         *snapshot = Some(manifest);
         mint_domain_reconnect_manifest_authority_epoch();
     } else if generation == high_water {
-        match snapshot.as_ref() {
-            Some(current) if current == &manifest => {
-                // A distinct worker has just re-proven this durable state.
-                // Advance the publication epoch even though its manifest
-                // generation is idempotent so an older failed worker cannot
-                // invalidate the newer proof.
-                mint_domain_reconnect_manifest_authority_epoch();
-            }
-            Some(_) => {
-                *snapshot = None;
-                ambiguous_generation = Some(generation);
-                mint_domain_reconnect_manifest_authority_epoch();
-                retired_supervisor = Some(fence_and_take_auto_connect_supervisor(
-                    "divergent remembered-domain authority",
-                ));
-            }
-            None => {
-                // A same-or-older completion cannot repair an authority state
-                // already fenced at this generation. Only a later durable
-                // generation may make automatic connection eligible again.
+        if DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED.load(Ordering::Acquire) {
+            *snapshot = None;
+            ambiguous_generation = Some(generation);
+            mint_domain_reconnect_manifest_authority_epoch();
+        } else {
+            match high_water_snapshot.as_ref() {
+                Some(retained) if retained == &manifest => {
+                    // A distinct worker has just re-proven this durable state.
+                    // Advance the publication epoch even though its manifest
+                    // generation is idempotent so an older failed worker cannot
+                    // invalidate the newer proof.
+                    *snapshot = Some(manifest);
+                    mint_domain_reconnect_manifest_authority_epoch();
+                }
+                Some(_) => {
+                    *snapshot = None;
+                    ambiguous_generation = Some(generation);
+                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED
+                        .store(true, Ordering::Release);
+                    mint_domain_reconnect_manifest_authority_epoch();
+                }
+                None => {
+                    // Initialization may have failed before this process
+                    // accepted any content identity. The first valid quorum,
+                    // including a pristine generation-zero quorum, establishes
+                    // the retained identity. Once present, this branch is never
+                    // used to recover from invalidation or rollback.
+                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER
+                        .store(generation, Ordering::Release);
+                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED
+                        .store(false, Ordering::Release);
+                    *high_water_snapshot = Some(manifest.clone());
+                    *snapshot = Some(manifest);
+                    mint_domain_reconnect_manifest_authority_epoch();
+                }
             }
         }
+    } else {
+        // The operation guard makes this a fresh serialized disk observation,
+        // not an older worker completion. Falling below the in-process durable
+        // high-water therefore proves rollback, loss, or replacement damage and
+        // must revoke every supervisor derived from the older snapshot.
+        *snapshot = None;
+        rollback_generation = Some((generation, high_water));
+        mint_domain_reconnect_manifest_authority_epoch();
     }
+    let retired_supervisor = fence_and_take_auto_connect_supervisor(
+        "a new remembered-domain authority epoch",
+    );
     DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
+    drop(high_water_snapshot);
     drop(snapshot);
-    drop(retired_supervisor.flatten());
+    drop(retired_supervisor);
     if let Some(generation) = ambiguous_generation {
         let message = format!(
             "remembered domain attachment authority produced divergent state at generation {generation}; automatic domain connection is paused until a later durable generation"
+        );
+        frankenterm_gui::gui_debug_log::record(
+            log::Level::Error,
+            "frankenterm_gui::auto_connect",
+            message.clone(),
+        );
+        log::error!("{message}");
+        persistent_toast_notification("Remembered domain connections unavailable", &message);
+    }
+    if let Some((observed, high_water)) = rollback_generation {
+        let message = format!(
+            "remembered domain attachment authority rolled back from generation {high_water} to freshly observed generation {observed}; automatic domain connection is paused until durable authority advances or the exact high-water quorum is restored"
         );
         frankenterm_gui::gui_debug_log::record(
             log::Level::Error,
@@ -1367,11 +1557,23 @@ fn domain_reconnect_manifest_snapshot(
         .clone()
 }
 
+fn domain_reconnect_manifest_high_water_snapshot(
+) -> Option<domain_reconnect_manifest::DomainReconnectManifest> {
+    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_SNAPSHOT
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Revoke all in-memory automatic-reconnect authority after persistence can no
 /// longer prove an exact durable manifest. The high-water generation remains
-/// fenced so an older delayed completion cannot republish stale intent; only a
-/// later generation can repair the snapshot.
-pub(crate) fn invalidate_domain_reconnect_manifest_snapshot() {
+/// fenced, together with its exact content identity. The global operation
+/// guard prevents an older delayed completion from republishing stale intent;
+/// an equal-generation quorum can restore the active snapshot only when its
+/// full content equals that retained identity.
+fn invalidate_domain_reconnect_manifest_snapshot(
+    _operation: &DomainReconnectManifestOperationGuard,
+) {
     let mut snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1385,27 +1587,27 @@ pub(crate) fn invalidate_domain_reconnect_manifest_snapshot() {
     drop(retired_supervisor);
 }
 
-/// Revoke stale in-memory authority after a worker failure without erasing a
-/// later lifecycle operation that completed while this worker was in flight.
-fn invalidate_domain_reconnect_manifest_snapshot_unless_newer_than(
-    baseline_authority_epoch: u64,
+fn mark_domain_reconnect_manifest_generation_conflicted(
+    generation: u64,
+    operation: &DomainReconnectManifestOperationGuard,
 ) {
-    let mut snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
-        > baseline_authority_epoch
+    if DOMAIN_RECONNECT_MANIFEST_HIGH_WATER.load(Ordering::Acquire) == generation
+        && domain_reconnect_manifest_high_water_snapshot().is_some()
     {
-        return;
+        DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED.store(true, Ordering::Release);
     }
-    *snapshot = None;
-    mint_domain_reconnect_manifest_authority_epoch();
-    DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
-    let retired_supervisor = fence_and_take_auto_connect_supervisor(
-        "failed remembered-domain persistence worker",
-    );
-    drop(snapshot);
-    drop(retired_supervisor);
+    invalidate_domain_reconnect_manifest_snapshot(operation);
+}
+
+fn domain_reconnect_manifest_conflict_generation(
+    error: &domain_reconnect_manifest::DomainReconnectManifestError,
+) -> Option<u64> {
+    match error {
+        domain_reconnect_manifest::DomainReconnectManifestError::AuthorityDivergence {
+            generation,
+        } => Some(*generation),
+        _ => None,
+    }
 }
 
 fn current_domain_reconnect_manifest_for_intent(
@@ -1425,7 +1627,10 @@ enum DomainReconnectIntentPersistenceOutcome {
         manifest: domain_reconnect_manifest::DomainReconnectManifest,
         error: anyhow::Error,
     },
-    AuthorityUnavailable(anyhow::Error),
+    AuthorityUnavailable {
+        error: anyhow::Error,
+        conflict_generation: Option<u64>,
+    },
 }
 
 /// Persist one explicit attachment intent and reconcile any ambiguous late
@@ -1438,105 +1643,267 @@ pub(crate) async fn persist_domain_reconnect_intent(
     intent: DomainAttachmentIntent,
     lifecycle_worker_hold: mux_lua::DomainLifecycleWorkerHold,
 ) -> anyhow::Result<domain_reconnect_manifest::DomainReconnectManifest> {
-    let authority_baseline =
-        DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire);
+    let operation = reserve_domain_reconnect_manifest_operation()?;
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        32 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => {
+            return Err(anyhow::anyhow!(
+                "main-thread scheduler rejected cancellation-safe attachment-intent persistence before worker construction: {rejected:?}"
+            ));
+        }
+    };
+    let (completion_sender, completion_receiver) = futures::channel::oneshot::channel();
+    let persistence = reservation.spawn_local(async move {
+        let result = complete_domain_reconnect_intent_persistence(
+            domain_name,
+            intent,
+            lifecycle_worker_hold,
+            operation,
+        )
+        .await;
+        let _ = completion_sender.send(result);
+    });
+    if persistence
+        .initial_enqueue_receipt()
+        .snapshot_after_enqueue
+        .retired
+    {
+        drop(persistence);
+        return Err(anyhow::anyhow!(
+            "main-thread scheduler retired cancellation-safe attachment-intent persistence before its initial poll"
+        ));
+    }
+    persistence.detach();
+    completion_receiver.await.map_err(|_| {
+        anyhow::anyhow!(
+            "cancellation-safe attachment-intent persistence terminated without a reconciled result"
+        )
+    })?
+}
+
+async fn complete_domain_reconnect_intent_persistence(
+    domain_name: String,
+    intent: DomainAttachmentIntent,
+    lifecycle_worker_hold: mux_lua::DomainLifecycleWorkerHold,
+    operation: DomainReconnectManifestOperationReservation,
+) -> anyhow::Result<domain_reconnect_manifest::DomainReconnectManifest> {
+    let operation = operation.enter().await?;
     let worker_domain_name = domain_name.clone();
+    let retained_authority = domain_reconnect_manifest_high_water_snapshot();
     let outcome = promise::spawn::spawn_into_new_thread(move || {
-        let outcome = match domain_reconnect_manifest::set_intent(&worker_domain_name, intent) {
+        let outcome = match domain_reconnect_manifest::set_intent_fenced(
+            &worker_domain_name,
+            intent,
+            retained_authority.as_ref(),
+        ) {
             Ok(manifest) => DomainReconnectIntentPersistenceOutcome::Committed(manifest),
-            Err(write_error) => match domain_reconnect_manifest::load() {
-                Ok(manifest)
-                    if manifest.intent_for_name(&worker_domain_name) == Some(intent) =>
-                {
-                    DomainReconnectIntentPersistenceOutcome::Committed(manifest)
-                }
-                Ok(manifest) => {
-                    DomainReconnectIntentPersistenceOutcome::ReconciledWithoutRequestedIntent {
-                        manifest,
-                        error: anyhow::anyhow!(
-                            "attachment-intent publication failed and the reconciled durable quorum retained its prior intent: {write_error}"
-                        ),
+            Err(write_error) => {
+                let write_conflict_generation =
+                    domain_reconnect_manifest_conflict_generation(&write_error);
+                match domain_reconnect_manifest::load_fenced(retained_authority.as_ref()) {
+                    Ok(manifest)
+                        if write_conflict_generation
+                            .is_some_and(|generation| manifest.generation() <= generation) =>
+                    {
+                        DomainReconnectIntentPersistenceOutcome::AuthorityUnavailable {
+                            conflict_generation: write_conflict_generation,
+                            error: anyhow::anyhow!(
+                                "attachment-intent publication observed same-generation authority divergence ({write_error}); a later reload did not prove a strictly newer generation"
+                            ),
+                        }
+                    }
+                    Ok(manifest)
+                        if manifest.intent_for_name(&worker_domain_name) == Some(intent) =>
+                    {
+                        DomainReconnectIntentPersistenceOutcome::Committed(manifest)
+                    }
+                    Ok(manifest) => {
+                        DomainReconnectIntentPersistenceOutcome::ReconciledWithoutRequestedIntent {
+                            manifest,
+                            error: anyhow::anyhow!(
+                                "attachment-intent publication failed and the reconciled durable quorum retained its prior intent: {write_error}"
+                            ),
+                        }
+                    }
+                    Err(load_error) => {
+                        DomainReconnectIntentPersistenceOutcome::AuthorityUnavailable {
+                            conflict_generation: write_conflict_generation.or_else(|| {
+                                domain_reconnect_manifest_conflict_generation(&load_error)
+                            }),
+                            error: anyhow::anyhow!(
+                                "attachment-intent publication failed ({write_error}); durable authority reconciliation also failed ({load_error})"
+                            ),
+                        }
                     }
                 }
-                Err(load_error) => DomainReconnectIntentPersistenceOutcome::AuthorityUnavailable(
-                    anyhow::anyhow!(
-                        "attachment-intent publication failed ({write_error}); durable authority reconciliation also failed ({load_error})"
-                    ),
-                ),
-            },
+            }
         };
-        Ok((outcome, lifecycle_worker_hold))
+        Ok(outcome)
     })
     .await;
-    let (outcome, _lifecycle_worker_hold) = match outcome {
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
-            invalidate_domain_reconnect_manifest_snapshot_unless_newer_than(authority_baseline);
+            invalidate_domain_reconnect_manifest_snapshot(&operation);
             return Err(error.context(
                 "attachment-intent persistence worker failed before authority reconciliation",
             ));
         }
     };
 
-    match outcome {
+    let (result, authority_reconciled) = match outcome {
         DomainReconnectIntentPersistenceOutcome::Committed(manifest) => {
             let minimum_generation = manifest.generation();
-            publish_domain_reconnect_manifest_snapshot(manifest.clone());
-            current_domain_reconnect_manifest_for_intent(
-                &domain_name,
-                intent,
-                minimum_generation,
-            )
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "attachment-intent publication was superseded or rejected by newer in-memory authority"
+            publish_domain_reconnect_manifest_snapshot(manifest.clone(), &operation);
+            (
+                current_domain_reconnect_manifest_for_intent(
+                    &domain_name,
+                    intent,
+                    minimum_generation,
                 )
-            })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "attachment-intent publication was superseded or rejected by newer in-memory authority"
+                    )
+                }),
+                true,
+            )
         }
         DomainReconnectIntentPersistenceOutcome::ReconciledWithoutRequestedIntent {
             manifest,
             error,
         } => {
             let minimum_generation = manifest.generation();
-            publish_domain_reconnect_manifest_snapshot(manifest);
-            current_domain_reconnect_manifest_for_intent(
-                &domain_name,
-                intent,
-                minimum_generation,
+            publish_domain_reconnect_manifest_snapshot(manifest, &operation);
+            (
+                current_domain_reconnect_manifest_for_intent(
+                    &domain_name,
+                    intent,
+                    minimum_generation,
+                )
+                .ok_or(error),
+                true,
             )
-            .ok_or(error)
         }
-        DomainReconnectIntentPersistenceOutcome::AuthorityUnavailable(error) => {
-            invalidate_domain_reconnect_manifest_snapshot_unless_newer_than(authority_baseline);
-            Err(error)
+        DomainReconnectIntentPersistenceOutcome::AuthorityUnavailable {
+            error,
+            conflict_generation,
+        } => {
+            if let Some(generation) = conflict_generation {
+                mark_domain_reconnect_manifest_generation_conflicted(generation, &operation);
+            } else {
+                invalidate_domain_reconnect_manifest_snapshot(&operation);
+            }
+            (Err(error), false)
         }
+    };
+    if authority_reconciled {
+        schedule_auto_connect_domains();
     }
+    drop(lifecycle_worker_hold);
+    result
 }
 
 async fn initialize_domain_reconnect_manifest_snapshot() {
     if DOMAIN_RECONNECT_MANIFEST_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
-    match promise::spawn::spawn_into_new_thread(|| {
-        domain_reconnect_manifest::load().map_err(anyhow::Error::from)
+    let operation = match reserve_domain_reconnect_manifest_operation() {
+        Ok(operation) => operation,
+        Err(error) => {
+            report_domain_reconnect_manifest_initialization_failure(&error);
+            return;
+        }
+    };
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        32 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => {
+            drop(operation);
+            report_domain_reconnect_manifest_initialization_failure(&anyhow::anyhow!(
+                "main-thread scheduler rejected cancellation-safe manifest initialization before worker construction: {rejected:?}"
+            ));
+            return;
+        }
+    };
+    let (completion_sender, completion_receiver) = futures::channel::oneshot::channel();
+    let initialization = reservation.spawn_local(async move {
+        let result = complete_domain_reconnect_manifest_initialization(operation).await;
+        let _ = completion_sender.send(result);
+    });
+    if initialization
+        .initial_enqueue_receipt()
+        .snapshot_after_enqueue
+        .retired
+    {
+        drop(initialization);
+        report_domain_reconnect_manifest_initialization_failure(&anyhow::anyhow!(
+            "main-thread scheduler retired cancellation-safe manifest initialization before its initial poll"
+        ));
+        return;
+    }
+    initialization.detach();
+    match completion_receiver.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => report_domain_reconnect_manifest_initialization_failure(&error),
+        Err(_) => {
+            AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
+            cancel_auto_connect_supervisor();
+            report_domain_reconnect_manifest_initialization_failure(&anyhow::anyhow!(
+                "cancellation-safe manifest initialization terminated without reconciling authority"
+            ));
+        }
+    }
+}
+
+async fn complete_domain_reconnect_manifest_initialization(
+    operation: DomainReconnectManifestOperationReservation,
+) -> anyhow::Result<()> {
+    let operation = operation.enter().await?;
+    if DOMAIN_RECONNECT_MANIFEST_INITIALIZED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let retained_authority = domain_reconnect_manifest_high_water_snapshot();
+    match promise::spawn::spawn_into_new_thread(move || {
+        domain_reconnect_manifest::load_fenced(retained_authority.as_ref())
+            .map_err(anyhow::Error::from)
     })
     .await
     {
-        Ok(manifest) => publish_domain_reconnect_manifest_snapshot(manifest),
+        Ok(manifest) => publish_domain_reconnect_manifest_snapshot(manifest, &operation),
         Err(error) => {
-            invalidate_domain_reconnect_manifest_snapshot();
-            let message = format!(
-                "remembered domain attachment authority could not be loaded on the persistence worker; automatic domain connection is paused until the next durable lifecycle event repairs authority: {error}"
-            );
-            frankenterm_gui::gui_debug_log::record(
-                log::Level::Error,
-                "frankenterm_gui::auto_connect",
-                message.clone(),
-            );
-            log::error!("{message}");
-            persistent_toast_notification("Remembered domain connections unavailable", &message);
+            if let Some(generation) = error
+                .downcast_ref::<domain_reconnect_manifest::DomainReconnectManifestError>()
+                .and_then(domain_reconnect_manifest_conflict_generation)
+            {
+                mark_domain_reconnect_manifest_generation_conflicted(generation, &operation);
+            } else {
+                invalidate_domain_reconnect_manifest_snapshot(&operation);
+            }
+            return Err(error.context(
+                "remembered domain attachment authority could not be loaded on the persistence worker"
+            ));
         }
     }
+    Ok(())
+}
+
+fn report_domain_reconnect_manifest_initialization_failure(error: &anyhow::Error) {
+    let message = format!(
+        "remembered domain attachment authority could not be initialized; automatic domain connection is paused until the next durable lifecycle event repairs authority: {error}"
+    );
+    frankenterm_gui::gui_debug_log::record(
+        log::Level::Error,
+        "frankenterm_gui::auto_connect",
+        message.clone(),
+    );
+    log::error!("{message}");
+    persistent_toast_notification("Remembered domain connections unavailable", &message);
 }
 
 /// Persist an operator-authorized attached intent without turning the optional
@@ -1579,25 +1946,25 @@ pub(crate) async fn remember_attached_domain_best_effort(
 
 fn auto_connect_domain_configs(
     config: &ConfigHandle,
-) -> Option<(u64, Vec<ClientDomainConfig>)> {
+) -> (u64, Option<Vec<ClientDomainConfig>>) {
     let (authority_epoch, manifest) = {
         let snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let manifest = snapshot.as_ref()?.clone();
+        let manifest = snapshot.clone();
         let authority_epoch =
             DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire);
         (authority_epoch, manifest)
     };
-    Some((
-        authority_epoch,
+    let desired_domains = manifest.map(|manifest| {
         frankenterm_mux_server_impl::configured_client_domains(config)
             .into_iter()
             .filter(|domain| {
                 manifest.should_connect(domain.name(), domain.connect_automatically())
             })
-            .collect(),
-    ))
+            .collect()
+    });
+    (authority_epoch, desired_domains)
 }
 
 fn auto_connect_generation_is_current(
@@ -2057,6 +2424,24 @@ fn cancel_auto_connect_supervisor() {
     drop(previous);
 }
 
+fn cancel_auto_connect_supervisor_if_manifest_authority_epoch(
+    expected_authority_epoch: u64,
+    context: &str,
+) -> bool {
+    let manifest_authority = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
+        != expected_authority_epoch
+    {
+        return false;
+    }
+    let previous = fence_and_take_auto_connect_supervisor(context);
+    drop(manifest_authority);
+    drop(previous);
+    true
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AutoConnectScheduleOutcome {
     Scheduled,
@@ -2074,7 +2459,7 @@ impl AutoConnectScheduleOutcome {
     const fn establishes_retry_handoff(self) -> bool {
         matches!(
             self,
-            Self::Scheduled | Self::AdmissionRetryPending | Self::StartupNotReady
+            Self::Scheduled | Self::AdmissionRetryPending
         )
     }
 }
@@ -2145,19 +2530,24 @@ fn start_auto_connect_admission_retry() -> bool {
     }
 }
 
-fn desired_auto_connect_domains_for_retry(config: &ConfigHandle) -> Vec<ClientDomainConfig> {
-    auto_connect_domain_configs(config).unwrap_or_default()
+fn desired_auto_connect_domains_for_retry(
+    config: &ConfigHandle,
+) -> (u64, Option<Vec<ClientDomainConfig>>) {
+    auto_connect_domain_configs(config)
 }
 
 fn try_admit_auto_connect_supervisor(
     mux: Arc<Mux>,
     request_generation: u64,
+    authority_epoch: u64,
     desired_domains: Arc<Vec<ClientDomainConfig>>,
 ) -> AutoConnectSupervisorAdmission {
     use promise::spawn::MainThreadReservationOutcome;
 
     if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
         != request_generation
+        || DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
+            != authority_epoch
         || MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) != 0
     {
         return AutoConnectSupervisorAdmission::Superseded;
@@ -2180,14 +2570,22 @@ fn try_admit_auto_connect_supervisor(
     };
     if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
         != request_generation
+        || DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
+            != authority_epoch
         || MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) != 0
     {
         drop(reservation);
         return AutoConnectSupervisorAdmission::Superseded;
     }
     let spawned = reservation.handoff_to_main_thread_local(move |reservation| {
+        let manifest_authority = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
             != request_generation
+            || DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
+                != authority_epoch
+            || manifest_authority.is_none()
             || MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) != 0
             || !AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
             || !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &mux))
@@ -2216,13 +2614,13 @@ fn try_admit_auto_connect_supervisor(
                 desired_domains,
             ))
             .into_task();
-        AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| {
-            let replaced = slot.borrow_mut().replace(task);
-            // The successor owns the same exact admission that carried the
-            // cross-thread bootstrap. Only now is it safe to cancel the prior
-            // main-thread-local supervisor.
-            drop(replaced);
-        });
+        let replaced = AUTO_CONNECT_SUPERVISOR_TASK
+            .with(|slot| slot.borrow_mut().replace(task));
+        drop(manifest_authority);
+        // The successor owns the same exact admission that carried the
+        // cross-thread bootstrap. Only now is it safe to cancel the prior
+        // main-thread-local supervisor.
+        drop(replaced);
     });
     if spawned
         .initial_enqueue_receipt()
@@ -2237,6 +2635,8 @@ fn try_admit_auto_connect_supervisor(
     spawned.detach();
     if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
         == request_generation
+        && DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
+            == authority_epoch
         && MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) == 0
     {
         AutoConnectSupervisorAdmission::Scheduled
@@ -2296,8 +2696,14 @@ fn retry_auto_connect_admission() {
                 .min(std::time::Duration::from_secs(1));
             continue;
         };
-        let desired_domains =
-            desired_auto_connect_domains_for_retry(&config::configuration());
+        let (authority_epoch, Some(desired_domains)) =
+            desired_auto_connect_domains_for_retry(&config::configuration())
+        else {
+            if completion.finish(request_generation) {
+                continue;
+            }
+            return;
+        };
         if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
             != request_generation
         {
@@ -2314,6 +2720,7 @@ fn retry_auto_connect_admission() {
         match try_admit_auto_connect_supervisor(
             mux,
             request_generation,
+            authority_epoch,
             Arc::new(desired_domains),
         ) {
             AutoConnectSupervisorAdmission::Scheduled => {
@@ -2424,28 +2831,39 @@ fn schedule_auto_connect_domains_requiring(
         return AutoConnectScheduleOutcome::MissingMux;
     };
     let config = config::configuration();
-    let desired_domains = match auto_connect_domain_configs(&config) {
-        Some(desired_domains) => desired_domains,
-        None => {
-            // Once remembered authority has existed, damage cannot distinguish
-            // a stale Attached record from a newer explicit Detached record.
-            // Pause automatic connection globally rather than broadening back
-            // to configuration and reconnecting against an operator's choice.
-            // Explicit operator-requested attach remains available.
-            let message = "remembered domain attachment authority is unavailable; automatic domain connection is paused until authority is durably repaired".to_string();
-            frankenterm_gui::gui_debug_log::record(
-                log::Level::Error,
-                "frankenterm_gui::auto_connect",
-                message.clone(),
-            );
-            log::error!("{message}");
-            persistent_toast_notification("Remembered domain connections unavailable", &message);
-            Vec::new()
-        }
+    let (authority_epoch, desired_domains) = auto_connect_domain_configs(&config);
+    let Some(desired_domains) = desired_domains else {
+        // Once remembered authority has existed, damage cannot distinguish
+        // a stale Attached record from a newer explicit Detached record.
+        // Pause automatic connection globally rather than broadening back
+        // to configuration and reconnecting against an operator's choice.
+        // Explicit operator-requested attach remains available.
+        let message = "remembered domain attachment authority is unavailable; automatic domain connection is paused until authority is durably repaired".to_string();
+        frankenterm_gui::gui_debug_log::record(
+            log::Level::Error,
+            "frankenterm_gui::auto_connect",
+            message.clone(),
+        );
+        log::error!("{message}");
+        persistent_toast_notification("Remembered domain connections unavailable", &message);
+        return if cancel_auto_connect_supervisor_if_manifest_authority_epoch(
+            authority_epoch,
+            "unavailable remembered-domain scheduling authority",
+        ) {
+            AutoConnectScheduleOutcome::NoEligibleDomains
+        } else {
+            AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain
+        };
     };
     if desired_domains.is_empty() {
-        cancel_auto_connect_supervisor();
-        return AutoConnectScheduleOutcome::NoEligibleDomains;
+        return if cancel_auto_connect_supervisor_if_manifest_authority_epoch(
+            authority_epoch,
+            "an empty remembered-domain retry frontier",
+        ) {
+            AutoConnectScheduleOutcome::NoEligibleDomains
+        } else {
+            AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain
+        };
     }
     let pending = desired_domains
         .iter()
@@ -2461,6 +2879,7 @@ fn schedule_auto_connect_domains_requiring(
     match try_admit_auto_connect_supervisor(
         mux,
         request_generation,
+        authority_epoch,
         Arc::new(desired_domains),
     ) {
         AutoConnectSupervisorAdmission::Scheduled => {
@@ -2710,7 +3129,6 @@ async fn async_run_terminal_gui(
         (spawn, None) => spawn,
     };
     let mux = Mux::try_get().context("mux singleton is not available")?;
-    initialize_domain_reconnect_manifest_snapshot().await;
 
     let domain = if let Some(name) = &opts.domain {
         let domain = mux
@@ -2830,6 +3248,10 @@ async fn async_run_terminal_gui(
                         false,
                     )
                     .await?;
+                    // The directly requested transport and its recovery shell
+                    // are already visible. Only now may a blocking manifest
+                    // bootstrap delay unrelated automatic connections.
+                    initialize_domain_reconnect_manifest_snapshot().await;
                     return Ok(TerminalGuiStartupOutcome {
                         retry_domain: retry_requested
                             .then(|| domain.domain_name().to_string()),
@@ -2845,6 +3267,11 @@ async fn async_run_terminal_gui(
         }
     }
     spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await?;
+    // Explicit startup must never wait on the remembered-domain filesystem
+    // lease before it has begun its requested transport and published a usable
+    // pane. Generic automatic connection still waits for this exact authority
+    // before the outer startup transaction enables its supervisor.
+    initialize_domain_reconnect_manifest_snapshot().await;
     Ok(TerminalGuiStartupOutcome::default())
 }
 
@@ -3251,7 +3678,13 @@ fn initialize_window_state_persistence() {
         );
     }
 
-    mux_lua::install_domain_lifecycle_recorder(Arc::new(
+    let Some(mux) = Mux::try_get() else {
+        log::error!(
+            "domain reconnect lifecycle could not be installed because the mux singleton is absent"
+        );
+        return;
+    };
+    mux_lua::install_domain_lifecycle_recorder(&mux, Arc::new(
         |domain_name, event, lifecycle_worker_hold| {
             Box::pin(async move {
                 if domain_name == "local" {
@@ -3743,6 +4176,14 @@ mod tests {
             remember > attach,
             "optional manifest I/O must not gate the explicit transport"
         );
+        let initialize = startup[attach..]
+            .find("initialize_domain_reconnect_manifest_snapshot().await")
+            .map(|offset| attach + offset)
+            .expect("remembered-domain authority must initialize after explicit startup");
+        assert!(
+            initialize > attach,
+            "blocking manifest bootstrap must not gate the explicit startup transport"
+        );
         assert!(
             !startup[..attach].contains(
                 ".context(\"persisting explicitly requested domain attachment intent\")"
@@ -3762,14 +4203,32 @@ mod tests {
             .expect("reconciled intent helper remains independently bounded")
             .0;
         assert!(persistence.contains("domain_reconnect_manifest::set_intent"));
-        assert!(persistence.contains("domain_reconnect_manifest::load()"));
+        assert!(persistence.contains("domain_reconnect_manifest::load_fenced("));
+        assert!(persistence.contains("domain_reconnect_manifest::set_intent_fenced("));
+        assert!(persistence.contains("retained_authority.as_ref()"));
+        assert!(persistence.contains("write_conflict_generation"));
+        assert!(persistence.contains("manifest.generation() <= generation"));
+        assert!(persistence.contains("did not prove a strictly newer generation"));
         assert!(persistence.contains("intent_for_name(&worker_domain_name) == Some(intent)"));
-        assert!(persistence.contains("publish_domain_reconnect_manifest_snapshot(manifest)"));
-        assert!(persistence.contains(
-            "invalidate_domain_reconnect_manifest_snapshot_unless_newer_than(authority_baseline)"
-        ));
+        assert!(persistence.contains("reserve_domain_reconnect_manifest_operation()?"));
+        assert!(persistence.contains("let operation = operation.enter().await?"));
+        assert!(persistence.contains("publish_domain_reconnect_manifest_snapshot(manifest"));
+        assert!(persistence.contains("invalidate_domain_reconnect_manifest_snapshot(&operation)"));
+        assert!(!persistence.contains("authority_baseline"));
         assert!(persistence.contains("lifecycle_worker_hold"));
         assert!(persistence.contains("current_domain_reconnect_manifest_for_intent("));
+        assert!(persistence.contains("reservation.spawn_local(async move"));
+        assert!(persistence.contains("persistence.detach()"));
+        let schedule = persistence
+            .find("schedule_auto_connect_domains();")
+            .expect("detached completion must rebuild the accepted authority plan");
+        let release = persistence
+            .find("drop(lifecycle_worker_hold);")
+            .expect("detached completion must release its lifecycle hold");
+        assert!(
+            schedule < release,
+            "authority publication and supervisor reconciliation must precede lifecycle release"
+        );
 
         let termwindow = include_str!("termwindow/mod.rs");
         let persistence = termwindow
@@ -3786,10 +4245,83 @@ mod tests {
     }
 
     #[test]
+    fn manifest_operation_ticket_spans_disk_evidence_through_reconciliation() {
+        let source = include_str!("main.rs");
+        let completion = source
+            .split_once("async fn complete_domain_reconnect_intent_persistence(")
+            .expect("manifest persistence completion remains present")
+            .1
+            .split_once("\nasync fn initialize_domain_reconnect_manifest_snapshot(")
+            .expect("manifest persistence completion remains bounded")
+            .0;
+        let enter = completion
+            .find("let operation = operation.enter().await?")
+            .expect("completion must enter the global operation ticket");
+        let disk = completion
+            .find("domain_reconnect_manifest::set_intent")
+            .expect("completion must acquire disk evidence");
+        let publish = completion
+            .find("publish_domain_reconnect_manifest_snapshot")
+            .expect("completion must publish reconciled authority");
+        let schedule = completion
+            .find("schedule_auto_connect_domains();")
+            .expect("completion must rebuild supervision");
+        assert!(enter < disk && disk < publish && publish < schedule);
+
+        let initialization = source
+            .split_once("async fn initialize_domain_reconnect_manifest_snapshot(")
+            .expect("manifest initialization remains present")
+            .1
+            .split_once("\nasync fn remember_attached_domain_best_effort(")
+            .expect("manifest initialization remains bounded")
+            .0;
+        assert!(initialization.contains("reserve_domain_reconnect_manifest_operation()"));
+        assert!(initialization.contains("initialization.detach()"));
+        assert!(initialization.contains("let operation = operation.enter().await?"));
+
+        let publication = source
+            .split_once("fn publish_domain_reconnect_manifest_snapshot(")
+            .expect("manifest publication remains present")
+            .1
+            .split_once("\nfn domain_reconnect_manifest_snapshot(")
+            .expect("manifest publication remains bounded")
+            .0;
+        let empty_snapshot = publication
+            .find("None => {")
+            .expect("equal-generation invalidated snapshot branch remains present");
+        assert!(publication[empty_snapshot..].contains("*snapshot = Some(manifest);"));
+        assert!(publication.contains("high_water_snapshot.as_ref()"));
+        assert!(publication.contains("HIGH_WATER_CONFLICTED"));
+        assert!(publication.contains("Some(retained) if retained == &manifest"));
+        assert!(publication.contains(".store(true, Ordering::Release)"));
+        assert!(publication.contains("rollback_generation = Some((generation, high_water));"));
+        assert!(publication.contains("*snapshot = None;"));
+        assert!(!publication.contains("generation < high_water {\n        return"));
+
+        let disk = include_str!("domain_reconnect_manifest.rs");
+        let fenced_load = disk
+            .split_once("fn load_locked(")
+            .expect("fenced disk load remains present")
+            .1
+            .split_once("pub fn load_from(")
+            .expect("fenced disk load remains bounded")
+            .0;
+        let validate = fenced_load
+            .find("validate_retained_authority(&manifest, retained)?")
+            .expect("retained authority must be checked before repair");
+        let repair = fenced_load
+            .find("repair_from_v2_quorum(directory, &slots, &manifest)?")
+            .expect("quorum repair remains present");
+        assert!(validate < repair);
+        assert!(persistence.contains("mark_domain_reconnect_manifest_generation_conflicted"));
+    }
+
+    #[test]
     fn unavailable_remembered_authority_never_falls_back_to_configured_auto_connect() {
         let source = include_str!("main.rs");
         assert!(!source.contains("configured_auto_connect_domain_configs"));
-        assert!(source.contains("auto_connect_domain_configs(config).unwrap_or_default()"));
+        assert!(source.contains("auto_connect_domain_configs(config)"));
+        assert!(!source.contains("auto_connect_domain_configs(config).unwrap_or_default()"));
         assert!(source.contains(
             "automatic domain connection is paused until authority is durably repaired"
         ));
@@ -3818,9 +4350,9 @@ mod tests {
         assert!(
             AutoConnectScheduleOutcome::AdmissionRetryPending.establishes_retry_handoff()
         );
-        assert!(AutoConnectScheduleOutcome::StartupNotReady.establishes_retry_handoff());
         for outcome in [
             AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain,
+            AutoConnectScheduleOutcome::StartupNotReady,
             AutoConnectScheduleOutcome::Disabled,
             AutoConnectScheduleOutcome::MissingMux,
             AutoConnectScheduleOutcome::NoEligibleDomains,

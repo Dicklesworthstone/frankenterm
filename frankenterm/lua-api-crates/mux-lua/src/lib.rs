@@ -14,7 +14,76 @@ use mux::window::{Window, WindowId};
 use mux::Mux;
 use portable_pty::CommandBuilder;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+
+struct DetachOnCallerDropTask<R> {
+    task: Option<promise::spawn::Task<R>>,
+}
+
+impl<R> Unpin for DetachOnCallerDropTask<R> {}
+
+impl<R> Future for DetachOnCallerDropTask<R> {
+    type Output = R;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let poll = Pin::new(
+            this.task
+                .as_mut()
+                .expect("main-thread completion task was polled after completion"),
+        )
+        .poll(context);
+        if poll.is_ready() {
+            this.task.take();
+        }
+        poll
+    }
+}
+
+impl<R> Drop for DetachOnCallerDropTask<R> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.detach();
+        }
+    }
+}
+
+fn admit_main_thread_completion_task<MAKE, FUT, OUTPUT>(
+    service_class: promise::spawn::MainThreadServiceClass,
+    operation: &'static str,
+    make_future: MAKE,
+) -> Result<DetachOnCallerDropTask<OUTPUT>, String>
+where
+    MAKE: FnOnce() -> FUT,
+    FUT: std::future::Future<Output = OUTPUT> + 'static,
+    OUTPUT: 'static,
+{
+    let reservation = match promise::spawn::try_reserve_main_thread(service_class, 8 * 1024) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => {
+            return Err(format!(
+                "main-thread scheduler rejected operation {operation} before task construction: {rejected:?}"
+            ));
+        }
+    };
+    let spawned = reservation.spawn_local(make_future());
+    if spawned
+        .initial_enqueue_receipt()
+        .snapshot_after_enqueue
+        .retired
+    {
+        drop(spawned);
+        return Err(format!(
+            "main-thread scheduler retired operation {operation} before its initial poll"
+        ));
+    }
+    Ok(DetachOnCallerDropTask {
+        task: Some(spawned.into_task()),
+    })
+}
 
 pub(crate) async fn run_on_main_thread<MAKE, FUT, OUTPUT>(
     service_class: promise::spawn::MainThreadServiceClass,
@@ -34,7 +103,61 @@ where
             )));
         }
     };
-    Ok(reservation.spawn_local(make_future()).into_task().await)
+    let spawned = reservation.spawn_local(make_future());
+    if spawned
+        .initial_enqueue_receipt()
+        .snapshot_after_enqueue
+        .retired
+    {
+        drop(spawned);
+        return Err(mlua::Error::external(format!(
+            "main-thread scheduler retired mux Lua operation {operation} before its initial poll"
+        )));
+    }
+    Ok(spawned.into_task().await)
+}
+
+/// Run an admitted main-thread transaction to completion even when the Lua
+/// future awaiting its result is cancelled.
+///
+/// This is reserved for lifecycle mutations whose request has already crossed
+/// its admission boundary. Once an attach or detach starts, dropping the Lua
+/// callback must not cancel the transport/persistence sequence and strand its
+/// durable reconnect intent between states.
+pub(crate) async fn run_on_main_thread_to_completion<MAKE, FUT, OUTPUT>(
+    service_class: promise::spawn::MainThreadServiceClass,
+    operation: &'static str,
+    make_future: MAKE,
+) -> mlua::Result<OUTPUT>
+where
+    MAKE: FnOnce() -> FUT,
+    FUT: std::future::Future<Output = OUTPUT> + 'static,
+    OUTPUT: 'static,
+{
+    Ok(admit_main_thread_completion_task(service_class, operation, make_future)
+        .map_err(mlua::Error::external)?
+        .await)
+}
+
+/// Run one owned mux transaction to completion after main-thread admission.
+///
+/// Unlike the Lua-facing wrapper, this preserves `anyhow` errors for the
+/// mux-owned implicit-domain lifecycle hook. Dropping the waiter detaches the
+/// admitted task, so transport cleanup and reconnect-intent handoff still
+/// reach a terminal outcome.
+pub(crate) async fn run_anyhow_on_main_thread_to_completion<MAKE, FUT, OUTPUT>(
+    service_class: promise::spawn::MainThreadServiceClass,
+    operation: &'static str,
+    make_future: MAKE,
+) -> anyhow::Result<OUTPUT>
+where
+    MAKE: FnOnce() -> FUT,
+    FUT: std::future::Future<Output = anyhow::Result<OUTPUT>> + 'static,
+    OUTPUT: 'static,
+{
+    admit_main_thread_completion_task(service_class, operation, make_future)
+        .map_err(anyhow::Error::msg)?
+        .await
 }
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::TerminalSize;
