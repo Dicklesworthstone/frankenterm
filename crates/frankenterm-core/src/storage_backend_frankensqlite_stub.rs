@@ -55,7 +55,7 @@ use std::path::Path;
 
 use crate::storage_backend_trait::{
     BackendError, BackendTransactionState, OpenConfig, StorageBackend, StorageBackendFactory,
-    ToSqlValue, TransactionGuard,
+    StorageTransaction, ToSqlValue,
 };
 
 /// Stable diagnostic hint for every stubbed operation. Carries

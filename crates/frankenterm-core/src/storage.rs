@@ -21102,6 +21102,9 @@ const fn storage_backend_error_class(error: &BackendError) -> &'static str {
         BackendError::Connect(_) => "connect",
         BackendError::Query(_) => "query",
         BackendError::TxPoisoned => "transaction_poisoned",
+        BackendError::TransactionBusy => "transaction_busy",
+        BackendError::TransactionBoundaryLost => "transaction_boundary_lost",
+        BackendError::TransactionCallbackInvokedMoreThanOnce => "transaction_callback_reused",
         BackendError::Schema(_) => "schema",
         BackendError::Other(_) => "other",
     }
@@ -32112,6 +32115,15 @@ fn storage_backend_error_class_is_finite_and_content_free() {
         (BackendError::Connect(sensitive.to_string()), "connect"),
         (BackendError::Query(sensitive.to_string()), "query"),
         (BackendError::TxPoisoned, "transaction_poisoned"),
+        (BackendError::TransactionBusy, "transaction_busy"),
+        (
+            BackendError::TransactionBoundaryLost,
+            "transaction_boundary_lost",
+        ),
+        (
+            BackendError::TransactionCallbackInvokedMoreThanOnce,
+            "transaction_callback_reused",
+        ),
         (BackendError::Schema(sensitive.to_string()), "schema"),
         (BackendError::Other(sensitive.to_string()), "other"),
     ];
