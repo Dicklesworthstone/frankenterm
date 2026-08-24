@@ -820,8 +820,11 @@ impl VerifiedLedgerState {
                 sequence,
                 &evicted,
             )?;
+            let evicted_bytes = u64::try_from(evicted.len())?
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("incremental eviction bytes overflow"))?;
             retained_record_bytes = retained_record_bytes
-                .checked_sub(u64::try_from(evicted.len())?.saturating_add(1))
+                .checked_sub(evicted_bytes)
                 .ok_or_else(|| anyhow::anyhow!("incremental eviction byte count underflows"))?;
         }
         let chain_tail = live_scrollback_incremental_chain_next(
@@ -1516,7 +1519,7 @@ pub struct LiveScrollbackDurablePane {
     pub error: Option<String>,
 }
 
-/// Authenticated identity of one complete v3 scrollback ledger publication.
+/// Authenticated identity of one complete v3/v4 scrollback ledger publication.
 ///
 /// Content-bearing identities and digests remain absent from `Debug`; explicit
 /// accessors are intended for recovery/checkpoint protocol binding.
@@ -1999,6 +2002,21 @@ impl LiveScrollbackSpillSink {
                     == Some(wal.target_next_sequence),
             "append WAL target sequence interval is inconsistent"
         );
+        if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 {
+            let evicted = wal
+                .evicted_record_count
+                .ok_or_else(|| anyhow::anyhow!("v2 append WAL eviction count is missing"))?;
+            anyhow::ensure!(
+                evicted <= wal.appended_sequence
+                    && wal.target_oldest_sequence
+                        == wal
+                            .appended_sequence
+                            .checked_add(1)
+                            .and_then(|next| next.checked_sub(wal.target_record_count))
+                            .ok_or_else(|| anyhow::anyhow!("v2 append WAL target underflows"))?,
+                "v2 append WAL eviction accounting is inconsistent"
+            );
+        }
         let stable_offset = wezterm_term::StableRowIndex::try_from(wal.appended_sequence)
             .map_err(|_| anyhow::anyhow!("append WAL sequence exceeds stable-row range"))?;
         let appended_stable_row = wal
@@ -2341,7 +2359,7 @@ impl LiveScrollbackSpillSink {
         max_retained_rows: usize,
         encrypted_record: &str,
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
-    ) -> anyhow::Result<LiveScrollbackAppendWalV1> {
+    ) -> anyhow::Result<(LiveScrollbackAppendWalV1, VerifiedLedgerState)> {
         anyhow::ensure!(
             predecessor_manifest.publication_state == "complete"
                 && live_scrollback_manifest_is_authenticated(predecessor_manifest)
@@ -2459,7 +2477,7 @@ impl LiveScrollbackSpillSink {
         );
         Self::validate_append_wal_identity(&wal, self.durable_pane_id)?;
         wal.wal_sha256 = Self::append_wal_checksum(&wal)?;
-        Ok(wal)
+        Ok((wal, target_authority))
     }
 
     fn persist_authenticated_append_wal(
@@ -2503,12 +2521,22 @@ impl LiveScrollbackSpillSink {
                     .lock_store("replace consumed append WAL target")
                     .map_err(anyhow::Error::new)?;
                 Self::verify_append_wal_target_store(&active, &store)?;
-                Self::verify_logical_ledger_digest_from_store(
-                    &manifest,
-                    active.ledger_pane_id,
-                    &store,
-                )
-                .context("bind consumed append WAL before bounded-slot replacement")?;
+                if active.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 {
+                    let authority = Self::v2_append_wal_target_authority(&active)?;
+                    anyhow::ensure!(
+                        authority.matches_store_facts(&store)?
+                            && expected_live_scrollback_v4_chain(&manifest)?
+                                == (authority.chain_anchor, authority.chain_tail),
+                        "consumed v2 append WAL disagrees with its published v4 authority"
+                    );
+                } else {
+                    Self::verify_logical_ledger_digest_from_store(
+                        &manifest,
+                        active.ledger_pane_id,
+                        &store,
+                    )
+                    .context("bind consumed append WAL before bounded-slot replacement")?;
+                }
             }
 
             let mut bytes = serde_json::to_vec_pretty(wal)?;
@@ -2854,7 +2882,7 @@ impl LiveScrollbackSpillSink {
             .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
         anyhow::ensure!(
             Self::authenticate_manifest(manifest, &keyring)?,
-            "replacement manifest is not authenticated v3"
+            "replacement manifest is not an authenticated generation"
         );
         drop(keyring);
         {
@@ -2884,7 +2912,7 @@ impl LiveScrollbackSpillSink {
                 wezterm_term::config::ScrollbackSnapshotGeneration::new(content_epoch, revision)
             },
         );
-        Ok(manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3
+        Ok(manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
             && manifest.publication_state == "complete"
             && manifest_generation == Some(proposed_state.snapshot_generation())
             && live_scrollback_manifest_predecessor(manifest)? == expected_generation
@@ -2973,7 +3001,7 @@ impl LiveScrollbackSpillSink {
             anyhow::ensure!(
                 !require_exact_semantic
                     || fidelity == DecodedScrollbackRecordFidelity::ExactSemantic,
-                "authenticated v3 scrollback ledger contains a legacy/non-exact row"
+            "authenticated scrollback ledger contains a legacy/non-exact row"
             );
         }
         Ok(())
@@ -3399,7 +3427,7 @@ impl LiveScrollbackSpillSink {
                 {
                     let authoritative_state_is_intact = match persisted_manifest.as_ref() {
                         Some(manifest)
-                            if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 =>
+                            if live_scrollback_manifest_is_authenticated(manifest) =>
                         {
                             Self::verify_logical_ledger_digest_from_store(
                                 manifest,
@@ -4267,6 +4295,7 @@ impl LiveScrollbackSpillSink {
         let revision = state.revision;
         let authenticated_manifest = state.authenticated_manifest;
         let predecessor_generation = state.predecessor_generation;
+        let verified_ledger = state.verified_ledger;
         drop(state);
         let ledger_pane_id = self.active_ledger_pane_id();
 
@@ -4303,12 +4332,28 @@ impl LiveScrollbackSpillSink {
         if !authenticated_manifest && ledger_pane_id != 0 {
             anyhow::bail!("legacy scrollback manifest cannot name a versioned ledger");
         }
+        let incremental_authority = if authenticated_manifest {
+            let authority = verified_ledger.ok_or_else(|| {
+                anyhow::anyhow!("authenticated manifest has no scan-minted ledger authority")
+            })?;
+            anyhow::ensure!(
+                authority.ledger_pane_id == ledger_pane_id
+                    && authority.oldest_sequence == oldest_seq
+                    && authority.next_sequence == next_seq
+                    && authority.record_count == retained_rows
+                    && authority.retained_record_bytes == retained_record_bytes,
+                "incremental authority disagrees with manifest ledger facts"
+            );
+            Some(authority)
+        } else {
+            None
+        };
         let predecessor_content_epoch = predecessor_generation
             .map(|generation| hex::encode(generation.content_epoch()));
         let predecessor_revision = predecessor_generation.map(|generation| generation.revision());
         let mut manifest = LiveScrollbackManifestV1 {
             schema: if authenticated_manifest {
-                LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3
+                LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
             } else {
                 LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2
             }
@@ -4353,32 +4398,16 @@ impl LiveScrollbackSpillSink {
             committed_sequence_bytes: authenticated_manifest
                 .then_some(committed_sequence_bytes),
             logical_ledger_sha256: None,
+            chain_anchor_sha256: incremental_authority
+                .map(|authority| hex::encode(authority.chain_anchor)),
+            chain_tail_sha256: incremental_authority
+                .map(|authority| hex::encode(authority.chain_tail)),
             guardian_manifest_authentication: None,
             manifest_sha256: String::new(),
         };
 
         if authenticated_manifest {
-            let logical_ledger_digest = if publication_state == "cleared" {
-                live_scrollback_logical_ledger_digest_from_records(
-                    &manifest,
-                    ledger_pane_id,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    &[],
-                )?
-            } else {
-                let store = self
-                    .lock_store("persist_manifest logical ledger digest")
-                    .map_err(anyhow::Error::new)?;
-                let digest =
-                    Self::logical_ledger_digest_from_store(&manifest, ledger_pane_id, &store)?;
-                drop(store);
-                digest
-            };
-            manifest.logical_ledger_sha256 = Some(hex::encode(logical_ledger_digest));
+            expected_live_scrollback_v4_chain(&manifest)?;
             let canonical = Self::manifest_authentication_bytes(&manifest)?;
             let mut keyring = self
                 .lock_keyring("persist_manifest authentication")
@@ -4460,13 +4489,13 @@ impl LiveScrollbackSpillSink {
                         == Self::manifest_authentication_bytes(&manifest)?,
                     "deterministic scrollback manifest stage belongs to a different transaction"
                 );
-                if staged.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 {
+                if live_scrollback_manifest_is_authenticated(&staged) {
                     let keyring = self
                         .lock_keyring("persist_manifest staged authentication")
                         .map_err(anyhow::Error::new)?;
                     anyhow::ensure!(
                         Self::authenticate_manifest(&staged, &keyring)?,
-                        "deterministic v3 scrollback manifest stage did not authenticate"
+                        "deterministic authenticated scrollback manifest stage did not authenticate"
                     );
                 }
                 // The existing stage may carry a different randomized AEAD
@@ -4516,19 +4545,22 @@ impl LiveScrollbackSpillSink {
                 .map_err(anyhow::Error::new)?;
             anyhow::ensure!(
                 Self::authenticate_manifest(&published_manifest, &keyring)?,
-                "published v3 scrollback manifest lost guardian authority"
+                "published v4 scrollback manifest lost guardian authority"
             );
             drop(keyring);
             if publication_state != "cleared" {
                 let store = self
                     .lock_store("persist_manifest published logical ledger")
                     .map_err(anyhow::Error::new)?;
-                Self::verify_logical_ledger_digest_from_store(
-                    &published_manifest,
-                    ledger_pane_id,
-                    &store,
-                )
-                .context("reverify logical ledger after manifest publication")?;
+                let authority = incremental_authority.ok_or_else(|| {
+                    anyhow::anyhow!("published v4 manifest lost incremental authority")
+                })?;
+                anyhow::ensure!(
+                    authority.matches_store_facts(&store)?
+                        && expected_live_scrollback_v4_chain(&published_manifest)?
+                            == (authority.chain_anchor, authority.chain_tail),
+                    "published v4 manifest disagrees with incremental ledger authority"
+                );
             }
         }
         Ok(())
@@ -4733,12 +4765,28 @@ impl LiveScrollbackSpillSink {
             return Err(ScrollbackSpillError::StorageUnavailable);
         }
         let store = self.lock_store("pre-mutation logical ledger")?;
-        let digest_verified = Self::verify_logical_ledger_digest_from_store(
-            &manifest,
-            ledger_pane_id,
-            &store,
-        )
-        .is_ok();
+        let digest_verified = if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4 {
+            state.verified_ledger.is_some_and(|authority| {
+                let chain = expected_live_scrollback_v4_chain(&manifest).ok();
+                let manifest_facts_match = authority.ledger_pane_id == ledger_pane_id
+                    && authority.oldest_sequence == manifest.oldest_seq
+                    && authority.next_sequence == manifest.next_seq
+                    && authority.record_count == manifest.retained_rows
+                    && Some(authority.retained_record_bytes) == manifest.retained_record_bytes
+                    && chain == Some((authority.chain_anchor, authority.chain_tail));
+                if manifest.publication_state == "cleared" {
+                    manifest_facts_match && authority == VerifiedLedgerState::empty(ledger_pane_id)
+                } else {
+                    manifest_facts_match
+                        && authority.matches_store_facts(&store).unwrap_or(false)
+                        && manifest.committed_log_bytes == Some(store.file_bytes(ledger_pane_id))
+                        && manifest.committed_sequence_bytes
+                            == store.sequence_file_bytes(ledger_pane_id).ok()
+                }
+            })
+        } else {
+            Self::verify_logical_ledger_digest_from_store(&manifest, ledger_pane_id, &store).is_ok()
+        };
         if !digest_verified {
             if !(allow_prepared_content_ahead && manifest.publication_state == "prepared") {
                 return Err(ScrollbackSpillError::StorageUnavailable);
@@ -5503,14 +5551,32 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             };
             record
         };
-        let append_wal = if manifest_prepare_required {
-            None
+        let (append_wal, target_authority) = if manifest_prepare_required {
+            let target = {
+                let Ok(store) = self.lock_store("store_scrollback_line prepare first authority")
+                else {
+                    return false;
+                };
+                let Some(predecessor) = previous_state.verified_ledger else {
+                    return false;
+                };
+                match predecessor.project_append(
+                    desired_seq,
+                    &record,
+                    max_retained_rows,
+                    &store,
+                ) {
+                    Ok((target, 0)) => target,
+                    _ => return false,
+                }
+            };
+            (None, target)
         } else {
             let predecessor_manifest = match Self::read_manifest(&self.manifest_path) {
                 Ok(Some(manifest)) => manifest,
                 _ => return false,
             };
-            let wal = {
+            let (wal, target) = {
                 let Ok(store) = self.lock_store("store_scrollback_line prepare append WAL") else {
                     return false;
                 };
@@ -5525,7 +5591,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                     &record,
                     &store,
                 ) {
-                    Ok(wal) => wal,
+                    Ok(prepared) => prepared,
                     Err(_) => return false,
                 }
             };
@@ -5539,7 +5605,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                 }
                 return false;
             }
-            Some(wal)
+            (Some(wal), target)
         };
         let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state") else {
             return false;
@@ -5592,6 +5658,10 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             if let Some(wal) = append_wal.as_ref() {
                 Self::verify_append_wal_target_store(wal, &store)?;
             }
+            anyhow::ensure!(
+                target_authority.matches_store_facts(&store)?,
+                "incremental append receipt disagrees with synchronized store facts"
+            );
             Ok(())
         })();
         if content_result.is_err() {
@@ -5608,6 +5678,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return false;
         };
         state.max_retained_rows = max_retained_rows;
+        state.verified_ledger = Some(target_authority);
         drop(state);
 
         match self.persist_manifest("complete") {
@@ -6433,7 +6504,7 @@ fn validate_live_scrollback_manifest_identity(
         "live scrollback manifest next sequence is inconsistent at {}",
         manifest_path.display()
     );
-    if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3
+    if live_scrollback_manifest_is_authenticated(manifest)
         && manifest.publication_state != "cleared"
     {
         let newest = manifest.newest_stable_row_exclusive.ok_or_else(|| {
@@ -6528,7 +6599,7 @@ fn validate_live_scrollback_content_file(
     Ok(())
 }
 
-/// Read and authenticate the exact v3 generation/pointer identity without
+/// Read and authenticate the exact v3/v4 generation/pointer identity without
 /// opening the selected ledger for mutation.
 pub fn read_live_scrollback_committed_ledger_identity(
     base_dir: &std::path::Path,
@@ -6549,13 +6620,13 @@ pub fn read_live_scrollback_committed_ledger_identity(
         &manifest_path,
     )?;
     anyhow::ensure!(
-        manifest_before.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3
+        live_scrollback_manifest_is_authenticated(&manifest_before)
             && manifest_before.publication_state == "complete"
             && LiveScrollbackSpillSink::authenticate_manifest_for_read(
                 base_dir,
                 &manifest_before,
             )?,
-        "scrollback ledger identity requires one authenticated complete v3 manifest"
+        "scrollback ledger identity requires one authenticated complete manifest"
     );
     let ledger_pane_id = LiveScrollbackSpillSink::manifest_ledger_pane_id(&manifest_before)?;
     validate_live_scrollback_content_file(
@@ -6631,7 +6702,7 @@ pub fn read_live_scrollback_committed_ledger_identity(
             manifest_after
                 .guardian_manifest_authentication
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("v3 manifest authentication is missing"))?,
+                .ok_or_else(|| anyhow::anyhow!("manifest authentication is missing"))?,
         )?;
     let mut durable_pane_bytes = [0; 16];
     hex::decode_to_slice(durable_pane_id, &mut durable_pane_bytes)
@@ -7018,7 +7089,7 @@ pub fn export_live_scrollback_transcript(
         .ok_or_else(|| anyhow::anyhow!("scrollback export provenance accounting underflow"))?;
     anyhow::ensure!(
         !authenticated_manifest || legacy_non_recovery_grade_records == 0,
-        "authenticated v3 scrollback ledger contains legacy/non-exact rows"
+        "authenticated scrollback ledger contains legacy/non-exact rows"
     );
     let contains_exact_records = exact_semantic_records != 0;
     let keyring = if contains_exact_records {
@@ -7610,7 +7681,7 @@ mod tests {
         let store = sink
             .lock_store("prepare test append WAL target")
             .expect("lock test append WAL store");
-        let wal = sink
+        let (wal, target_authority) = sink
             .prepare_authenticated_append_wal(
                 &predecessor_manifest,
                 previous_state,
@@ -7623,6 +7694,7 @@ mod tests {
                 &store,
             )
             .expect("prepare authenticated test append WAL");
+        proposed_state.verified_ledger = Some(target_authority);
         (wal, proposed_state)
     }
 
@@ -9036,24 +9108,23 @@ mod tests {
             live_scrollback_append_wal_record_digest(&tampered.encrypted_record)
                 .expect("digest mutated encrypted record"),
         );
-        let store = sink
-            .lock_store("recompute tampered append WAL target")
-            .expect("lock tampered append WAL store");
-        let (target_digest, target_bytes) = live_scrollback_append_wal_target_digest(
-            &tampered,
-            |sequence| {
-                if sequence == tampered.appended_sequence {
-                    Ok(tampered.encrypted_record.clone())
-                } else {
-                    store
-                        .line_at(tampered.ledger_pane_id, sequence)?
-                        .ok_or_else(|| anyhow::anyhow!("tampered WAL predecessor row is missing"))
-                }
-            },
+        let predecessor_tail = decode_live_scrollback_canonical_digest(
+            tampered
+                .predecessor_chain_tail_sha256
+                .as_deref()
+                .expect("v2 WAL predecessor tail exists"),
+            "test predecessor tail",
         )
-        .expect("recompute attacker-controlled target digest");
-        tampered.target_record_set_sha256 = hex::encode(target_digest);
-        tampered.target_retained_record_bytes = target_bytes;
+        .expect("decode v2 WAL predecessor tail");
+        tampered.target_chain_tail_sha256 = Some(hex::encode(
+            live_scrollback_incremental_chain_next(
+                predecessor_tail,
+                tampered.ledger_pane_id,
+                tampered.appended_sequence,
+                &tampered.encrypted_record,
+            )
+            .expect("recompute attacker-controlled target tail"),
+        ));
         tampered.wal_sha256 = LiveScrollbackSpillSink::append_wal_checksum(&tampered)
             .expect("recompute attacker-controlled public WAL checksum");
         LiveScrollbackSpillSink::validate_append_wal_identity(
@@ -9964,7 +10035,7 @@ mod tests {
         let manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
             .expect("read authenticated cleared manifest")
             .expect("authenticated cleared manifest exists");
-        assert_eq!(manifest.schema, LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3);
+        assert_eq!(manifest.schema, LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
         assert!(manifest.content_epoch.is_some());
         assert_eq!(manifest.revision, Some(0));
         assert_eq!(manifest.initial_stable_row, None);
@@ -9972,7 +10043,9 @@ mod tests {
         assert_eq!(manifest.oldest_seq, None);
         assert_eq!(manifest.retained_rows, 0);
         assert_eq!(manifest.next_seq, 0);
-        assert!(manifest.logical_ledger_sha256.is_some());
+        assert!(manifest.logical_ledger_sha256.is_none());
+        assert_eq!(manifest.chain_anchor_sha256, manifest.chain_tail_sha256);
+        assert!(manifest.chain_anchor_sha256.is_some());
         assert!(manifest.guardian_manifest_authentication.is_some());
     }
 

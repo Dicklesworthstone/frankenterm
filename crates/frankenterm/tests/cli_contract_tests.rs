@@ -4067,6 +4067,72 @@ fn session_list_orphans_scan_rejection_returns_structured_exit_2() {
     assert!(output.stderr.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn session_orphan_file_limit_opt_in_admits_valid_nondefault_capacity() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let scrollback_dir = data_home.join("ft").join("scrollback");
+    std::fs::create_dir_all(&scrollback_dir).expect("create recovery directory");
+    std::fs::set_permissions(&scrollback_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("harden recovery directory");
+    let pane_uuid = "6c".repeat(32);
+    let path = scrollback_dir.join(format!("{pane_uuid}.bin"));
+    let physical_bytes = 70 * 1024 * 1024u64;
+    let header = ScrollbackHeader {
+        version: FormatVersion::V1,
+        flags: HeaderFlags::empty(),
+        capacity_bytes: physical_bytes
+            - frankenterm_core::scrollback_mmap_format::HEADER_SIZE as u64,
+        write_cursor_bytes: 0,
+        pane_uuid: [0x6c; 32],
+        created_at_epoch_ms: 1_700_000_000_000,
+        last_msync_at_epoch_ms: 1_700_000_000_123,
+        redactions_applied: 0,
+        total_bytes_written: 0,
+    };
+    let mut file = std::fs::File::create(&path).expect("create large sparse scrollback file");
+    file.write_all(&header.encode())
+        .expect("write large scrollback header");
+    file.set_len(physical_bytes)
+        .expect("size sparse scrollback file");
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .expect("harden sparse scrollback file");
+    drop(file);
+
+    let default_output = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args(["session", "list-orphans", "--format", "json"])
+        .output()
+        .expect("default bounded list should execute");
+    assert!(default_output.status.success());
+    let default_payload: serde_json::Value = serde_json::from_slice(&default_output.stdout)
+        .expect("default list stdout should be JSON");
+    assert_eq!(default_payload["orphans"][0]["state"], "unsafe");
+    assert_eq!(default_payload["orphans"][0]["unsafe_reason"], "oversized");
+
+    let opted_in = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args([
+            "session",
+            "list-orphans",
+            "--max-file-bytes",
+            "83886080",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("opted-in bounded list should execute");
+    assert!(
+        opted_in.status.success(),
+        "opted-in list failed: {}",
+        String::from_utf8_lossy(&opted_in.stderr)
+    );
+    let opted_in_payload: serde_json::Value =
+        serde_json::from_slice(&opted_in.stdout).expect("opted-in stdout should be JSON");
+    assert_eq!(opted_in_payload["orphans"][0]["state"], "orphaned");
+}
+
 #[test]
 fn session_recover_existing_output_returns_structured_exit_2_without_overwrite() {
     let (dir, ws) = setup_workspace();

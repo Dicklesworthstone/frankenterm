@@ -86,6 +86,7 @@ impl V2RingState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct V2RecordMeta {
     total_len: u32,
+    payload_len: u32,
     generation: u64,
     sequence: u64,
 }
@@ -864,7 +865,7 @@ impl MmapScrollback {
                 continue;
             }
 
-            let ring_full = state.record_count > 0 && used_bytes == capacity;
+            let ring_full = state.record_count > 0 && state.tail == state.head;
             if !ring_full && tail + total_len <= capacity {
                 break;
             }
@@ -970,6 +971,507 @@ impl Drop for MmapScrollback {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.lock_file);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoadedV2State {
+    state: V2RingState,
+    slot_index: usize,
+    used_bytes: u64,
+}
+
+#[derive(Debug)]
+struct DecodedV2Records {
+    records: Vec<(RecordKind, Vec<u8>)>,
+    payload_bytes: u64,
+    used_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum V2SlotObservation {
+    Empty,
+    Valid(V2RingState),
+    Invalid,
+}
+
+fn encode_v2_base_header(mut header: ScrollbackHeader) -> [u8; HEADER_SIZE] {
+    // v2 replay authority lives exclusively in the authenticated dual slots.
+    // Keep the v1 cursor zero on disk so a reader that ignores the v2 flag can
+    // never mis-present a wrapped physical prefix as an ordered export.
+    header.write_cursor_bytes = 0;
+    header.encode()
+}
+
+fn encode_v2_state_slot(
+    base_header: &[u8; HEADER_SIZE],
+    state: V2RingState,
+) -> [u8; V2_STATE_SLOT_SIZE] {
+    let mut slot = [0u8; V2_STATE_SLOT_SIZE];
+    slot[0..4].copy_from_slice(&V2_STATE_SLOT_MAGIC);
+    slot[4..6].copy_from_slice(&V2_STATE_SLOT_VERSION.to_le_bytes());
+    slot[6..8].copy_from_slice(&0u16.to_le_bytes());
+    slot[8..16].copy_from_slice(&state.slot_epoch.to_le_bytes());
+    slot[16..20].copy_from_slice(&state.head.to_le_bytes());
+    slot[20..24].copy_from_slice(&state.tail.to_le_bytes());
+    slot[24..28].copy_from_slice(&state.wrap_at.to_le_bytes());
+    slot[28..32].copy_from_slice(&state.record_count.to_le_bytes());
+    slot[32..40].copy_from_slice(&state.generation.to_le_bytes());
+    slot[40..48].copy_from_slice(&state.next_sequence.to_le_bytes());
+    let checksum = v2_state_checksum(base_header, &slot[..V2_STATE_CHECKSUM_OFFSET]);
+    slot[V2_STATE_CHECKSUM_OFFSET
+        ..V2_STATE_CHECKSUM_OFFSET + V2_STATE_CHECKSUM_BYTES]
+        .copy_from_slice(&checksum);
+    slot
+}
+
+fn v2_state_checksum(
+    base_header: &[u8; HEADER_SIZE],
+    state_prefix: &[u8],
+) -> [u8; V2_STATE_CHECKSUM_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(V2_STATE_HASH_DOMAIN);
+    // Capacity, pane identity, creation time, outer version, and flags are
+    // immutable for the lifetime of a v2 leaf. Mutable telemetry starts at 64.
+    hasher.update(&base_header[..64]);
+    hasher.update(state_prefix);
+    let digest = hasher.finalize();
+    let mut checksum = [0u8; V2_STATE_CHECKSUM_BYTES];
+    checksum.copy_from_slice(&digest[..V2_STATE_CHECKSUM_BYTES]);
+    checksum
+}
+
+fn observe_v2_state_slot(
+    base_header: &[u8; HEADER_SIZE],
+    slot_index: usize,
+) -> V2SlotObservation {
+    let offset = V2_STATE_SLOTS_OFFSET + slot_index * V2_STATE_SLOT_SIZE;
+    let slot = &base_header[offset..offset + V2_STATE_SLOT_SIZE];
+    if slot.iter().all(|byte| *byte == 0) {
+        return V2SlotObservation::Empty;
+    }
+    if slot[..4] != V2_STATE_SLOT_MAGIC
+        || u16::from_le_bytes([slot[4], slot[5]]) != V2_STATE_SLOT_VERSION
+        || u16::from_le_bytes([slot[6], slot[7]]) != 0
+    {
+        return V2SlotObservation::Invalid;
+    }
+    let expected = v2_state_checksum(base_header, &slot[..V2_STATE_CHECKSUM_OFFSET]);
+    if slot[V2_STATE_CHECKSUM_OFFSET
+        ..V2_STATE_CHECKSUM_OFFSET + V2_STATE_CHECKSUM_BYTES]
+        != expected
+    {
+        return V2SlotObservation::Invalid;
+    }
+    V2SlotObservation::Valid(V2RingState {
+        slot_epoch: u64::from_le_bytes(slot[8..16].try_into().unwrap()),
+        head: u32::from_le_bytes(slot[16..20].try_into().unwrap()),
+        tail: u32::from_le_bytes(slot[20..24].try_into().unwrap()),
+        wrap_at: u32::from_le_bytes(slot[24..28].try_into().unwrap()),
+        record_count: u32::from_le_bytes(slot[28..32].try_into().unwrap()),
+        generation: u64::from_le_bytes(slot[32..40].try_into().unwrap()),
+        next_sequence: u64::from_le_bytes(slot[40..48].try_into().unwrap()),
+    })
+}
+
+fn v2_slot_candidates(
+    header_bytes: &[u8; HEADER_SIZE],
+) -> (Vec<(V2RingState, usize)>, bool) {
+    let mut candidates = Vec::with_capacity(V2_STATE_SLOT_COUNT);
+    let mut saw_invalid = false;
+    for slot_index in 0..V2_STATE_SLOT_COUNT {
+        match observe_v2_state_slot(header_bytes, slot_index) {
+            V2SlotObservation::Empty => {}
+            V2SlotObservation::Valid(state) => candidates.push((state, slot_index)),
+            V2SlotObservation::Invalid => saw_invalid = true,
+        }
+    }
+    candidates.sort_by(|left, right| right.0.slot_epoch.cmp(&left.0.slot_epoch));
+    (candidates, saw_invalid)
+}
+
+fn encode_v2_record_header(
+    pane_uuid: [u8; 32],
+    record_kind: RecordKind,
+    payload_len: u32,
+    generation: u64,
+    sequence: u64,
+    payload: &[u8],
+) -> [u8; V2_RECORD_HEADER_SIZE] {
+    let mut header = [0u8; V2_RECORD_HEADER_SIZE];
+    header[0..4].copy_from_slice(&V2_RECORD_MAGIC);
+    header[4..8].copy_from_slice(&payload_len.to_le_bytes());
+    header[8] = record_kind.as_u8();
+    header[16..24].copy_from_slice(&generation.to_le_bytes());
+    header[24..32].copy_from_slice(&sequence.to_le_bytes());
+    let digest = v2_record_digest(
+        pane_uuid,
+        record_kind,
+        payload_len,
+        generation,
+        sequence,
+        payload,
+    );
+    header[V2_RECORD_DIGEST_OFFSET..V2_RECORD_DIGEST_OFFSET + V2_RECORD_DIGEST_BYTES]
+        .copy_from_slice(&digest);
+    header
+}
+
+fn v2_record_digest(
+    pane_uuid: [u8; 32],
+    record_kind: RecordKind,
+    payload_len: u32,
+    generation: u64,
+    sequence: u64,
+    payload: &[u8],
+) -> [u8; V2_RECORD_DIGEST_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(V2_RECORD_HASH_DOMAIN);
+    hasher.update(pane_uuid);
+    hasher.update([record_kind.as_u8()]);
+    hasher.update(payload_len.to_le_bytes());
+    hasher.update(generation.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+fn read_v2_record_verified(
+    file: &mut File,
+    path: &Path,
+    header: ScrollbackHeader,
+    body_offset: u64,
+    capacity_bytes: u64,
+    max_payload_bytes: u64,
+) -> Result<(RecordKind, Vec<u8>, V2RecordMeta), MmapScrollbackError> {
+    if body_offset
+        .checked_add(V2_RECORD_HEADER_SIZE as u64)
+        .is_none_or(|end| end > capacity_bytes)
+    {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 record header crosses the ring boundary",
+        });
+    }
+    let mut bytes = [0u8; V2_RECORD_HEADER_SIZE];
+    file.seek(SeekFrom::Start(HEADER_SIZE as u64 + body_offset))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .map_err(|source| MmapScrollbackError::ReadRecord {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes[..4] != V2_RECORD_MAGIC || bytes[9..16].iter().any(|byte| *byte != 0) {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 record marker or reserved bytes are invalid",
+        });
+    }
+    let payload_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if u64::from(payload_len) > max_payload_bytes {
+        return Err(MmapScrollbackError::ReadLimitExceeded {
+            path: path.to_path_buf(),
+            limit_name: "payload_bytes",
+            limit: max_payload_bytes,
+            observed: u64::from(payload_len),
+        });
+    }
+    let total_len = (V2_RECORD_HEADER_SIZE as u64)
+        .checked_add(u64::from(payload_len))
+        .ok_or_else(|| MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 record length overflow",
+        })?;
+    if body_offset
+        .checked_add(total_len)
+        .is_none_or(|end| end > capacity_bytes)
+    {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 record payload crosses the ring boundary",
+        });
+    }
+    let record_kind = RecordKind::from_u8(bytes[8]).ok_or_else(|| {
+        MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 record kind is unknown",
+        }
+    })?;
+    let generation = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let sequence = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    let mut payload = vec![0u8; payload_len as usize];
+    file.read_exact(&mut payload)
+        .map_err(|source| MmapScrollbackError::ReadRecord {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let expected = v2_record_digest(
+        header.pane_uuid,
+        record_kind,
+        payload_len,
+        generation,
+        sequence,
+        &payload,
+    );
+    if bytes[V2_RECORD_DIGEST_OFFSET..V2_RECORD_DIGEST_OFFSET + V2_RECORD_DIGEST_BYTES]
+        != expected
+    {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 record digest mismatch",
+        });
+    }
+    Ok((
+        record_kind,
+        payload,
+        V2RecordMeta {
+            total_len: u32::try_from(total_len).map_err(|_| {
+                MmapScrollbackError::V2Integrity {
+                    path: path.to_path_buf(),
+                    reason: "v2 record length does not fit its format",
+                }
+            })?,
+            payload_len,
+            generation,
+            sequence,
+        },
+    ))
+}
+
+fn read_v2_record_meta_verified(
+    file: &mut File,
+    path: &Path,
+    header: ScrollbackHeader,
+    body_offset: u64,
+    capacity_bytes: u64,
+) -> Result<V2RecordMeta, MmapScrollbackError> {
+    read_v2_record_verified(
+        file,
+        path,
+        header,
+        body_offset,
+        capacity_bytes,
+        capacity_bytes,
+    )
+    .map(|(_, _, meta)| meta)
+}
+
+fn validate_v2_state_shape(
+    path: &Path,
+    state: V2RingState,
+    capacity_bytes: u64,
+) -> Result<(), MmapScrollbackError> {
+    let capacity = u32::try_from(capacity_bytes).map_err(|_| {
+        MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 capacity does not fit ring offsets",
+        }
+    })?;
+    if state.head >= capacity || state.tail >= capacity || state.wrap_at > capacity {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 state offset lies outside the ring",
+        });
+    }
+    if state.record_count == 0 {
+        if state.head != state.tail || state.wrap_at != capacity {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "empty v2 state has inconsistent head, tail, or wrap boundary",
+            });
+        }
+        return Ok(());
+    }
+    if u64::from(state.record_count) > state.next_sequence {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 retained count exceeds the next sequence",
+        });
+    }
+    if state.tail < state.head {
+        if state.wrap_at < state.head || state.wrap_at > capacity {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "wrapped v2 state has an invalid wrap boundary",
+            });
+        }
+    } else if state.tail > state.head && state.wrap_at != capacity {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "linear v2 state unexpectedly retains a wrap boundary",
+        });
+    } else if state.tail == state.head && state.wrap_at < state.head {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "full v2 state has an invalid wrap boundary",
+        });
+    }
+    Ok(())
+}
+
+fn decode_v2_records_for_state(
+    file: &mut File,
+    path: &Path,
+    header: ScrollbackHeader,
+    state: V2RingState,
+    limits: LinearRecordReadLimits,
+    collect_records: bool,
+) -> Result<DecodedV2Records, MmapScrollbackError> {
+    validate_v2_state_shape(path, state, header.capacity_bytes)?;
+    if state.record_count as usize > limits.max_records {
+        return Err(MmapScrollbackError::ReadLimitExceeded {
+            path: path.to_path_buf(),
+            limit_name: "records",
+            limit: limits.max_records as u64,
+            observed: u64::from(state.record_count),
+        });
+    }
+    let mut cursor = u64::from(state.head);
+    let mut records = if collect_records {
+        Vec::with_capacity(state.record_count as usize)
+    } else {
+        Vec::new()
+    };
+    let mut payload_bytes = 0u64;
+    let mut used_bytes = 0u64;
+    let mut wrapped = false;
+    let first_sequence = state
+        .next_sequence
+        .checked_sub(u64::from(state.record_count))
+        .ok_or_else(|| MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 sequence/count accounting underflow",
+        })?;
+    let mut previous_generation = None;
+
+    for record_index in 0..state.record_count {
+        if cursor == u64::from(state.wrap_at) && cursor != 0 {
+            if wrapped {
+                return Err(MmapScrollbackError::V2Integrity {
+                    path: path.to_path_buf(),
+                    reason: "v2 retained interval wraps more than once",
+                });
+            }
+            cursor = 0;
+            wrapped = true;
+        }
+        let remaining_payload = limits.max_payload_bytes.saturating_sub(payload_bytes);
+        let (kind, payload, meta) = read_v2_record_verified(
+            file,
+            path,
+            header,
+            cursor,
+            header.capacity_bytes,
+            remaining_payload,
+        )?;
+        let expected_sequence = first_sequence + u64::from(record_index);
+        if meta.sequence != expected_sequence || meta.generation > state.generation {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 record sequence or generation is inconsistent with state",
+            });
+        }
+        if previous_generation.is_some_and(|previous| meta.generation < previous) {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 record generations are not monotone",
+            });
+        }
+        previous_generation = Some(meta.generation);
+        payload_bytes = payload_bytes
+            .checked_add(u64::from(meta.payload_len))
+            .ok_or_else(|| MmapScrollbackError::ReadLimitExceeded {
+                path: path.to_path_buf(),
+                limit_name: "payload_bytes",
+                limit: limits.max_payload_bytes,
+                observed: u64::MAX,
+            })?;
+        used_bytes = used_bytes
+            .checked_add(u64::from(meta.total_len))
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 used-byte accounting overflow",
+            })?;
+        if used_bytes > header.capacity_bytes {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 retained records exceed ring capacity",
+            });
+        }
+        if collect_records {
+            records.push((kind, payload));
+        }
+        cursor += u64::from(meta.total_len);
+        if cursor == u64::from(state.wrap_at) || cursor == header.capacity_bytes {
+            if cursor == u64::from(state.wrap_at) && state.wrap_at != 0
+                || cursor == header.capacity_bytes
+            {
+                if record_index + 1 < state.record_count && wrapped {
+                    return Err(MmapScrollbackError::V2Integrity {
+                        path: path.to_path_buf(),
+                        reason: "v2 retained interval wraps more than once",
+                    });
+                }
+                cursor = 0;
+                wrapped = true;
+            }
+        }
+    }
+    if cursor != u64::from(state.tail) {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 retained records do not terminate at the published tail",
+        });
+    }
+    Ok(DecodedV2Records {
+        records,
+        payload_bytes,
+        used_bytes,
+    })
+}
+
+fn load_v2_writer_state(
+    file: &mut File,
+    path: &Path,
+    header_bytes: &[u8; HEADER_SIZE],
+    header: ScrollbackHeader,
+    capacity_bytes: u64,
+) -> Result<LoadedV2State, MmapScrollbackError> {
+    if header.write_cursor_bytes != 0 || header.flags.bits() != V2_RING_FLAG {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 outer header fields are not canonical",
+        });
+    }
+    let (candidates, saw_invalid) = v2_slot_candidates(header_bytes);
+    if saw_invalid || candidates.is_empty() {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 state slot is missing, torn, or corrupt",
+        });
+    }
+    if candidates.len() == 2 && candidates[0].0.slot_epoch == candidates[1].0.slot_epoch {
+        return Err(MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "v2 state slots have an ambiguous epoch",
+        });
+    }
+    let (state, slot_index) = candidates[0];
+    let decoded = decode_v2_records_for_state(
+        file,
+        path,
+        header,
+        state,
+        LinearRecordReadLimits {
+            max_file_bytes: HEADER_SIZE as u64 + capacity_bytes,
+            max_records: HARD_MAX_LINEAR_RECORDS,
+            max_payload_bytes: HARD_MAX_LINEAR_RECORD_PAYLOAD_BYTES,
+        },
+        false,
+    )?;
+    Ok(LoadedV2State {
+        state,
+        slot_index,
+        used_bytes: decoded.used_bytes,
+    })
 }
 
 /// Decode the linear committed prefix of a legacy mmap scrollback file.
@@ -1176,6 +1678,80 @@ fn read_linear_records_from_file(
             source,
         })?;
     let header = ScrollbackHeader::decode(&header_bytes)?;
+    if header.flags.bits() & V2_RING_FLAG != 0 {
+        if header.flags.bits() != V2_RING_FLAG || header.write_cursor_bytes != 0 {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 outer header fields are not canonical",
+            });
+        }
+        let expected_file_len = (HEADER_SIZE as u64)
+            .checked_add(header.capacity_bytes)
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 physical length overflow",
+            })?;
+        if file_len != expected_file_len {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 physical length does not match its declared capacity",
+            });
+        }
+        let (candidates, saw_invalid_slot) = v2_slot_candidates(&header_bytes);
+        if candidates.is_empty() {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 has no authenticated state slot",
+            });
+        }
+        if candidates.len() == 2 && candidates[0].0.slot_epoch == candidates[1].0.slot_epoch {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 state slots have an ambiguous epoch",
+            });
+        }
+
+        let mut rejected_newer_state = saw_invalid_slot;
+        let mut rejected_tail = None;
+        let mut last_error = None;
+        for (state, _) in candidates {
+            match decode_v2_records_for_state(file, path, header, state, limits, true) {
+                Ok(decoded) => {
+                    let mut decoded_header = header;
+                    decoded_header.write_cursor_bytes = u64::from(state.tail);
+                    let completeness = if rejected_newer_state {
+                        LinearRecordCompleteness::Incomplete {
+                            decoded_cursor_bytes: u64::from(state.tail),
+                            declared_cursor_bytes: rejected_tail
+                                .unwrap_or(header.capacity_bytes),
+                            reason: LinearRecordTerminalReason::V2NewerStateInvalid,
+                        }
+                    } else {
+                        LinearRecordCompleteness::Complete
+                    };
+                    return Ok(LinearRecordSnapshot {
+                        header: decoded_header,
+                        records: decoded.records,
+                        payload_bytes: decoded.payload_bytes,
+                        source_identity,
+                        completeness,
+                    });
+                }
+                Err(error @ MmapScrollbackError::ReadLimitExceeded { .. }) => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    rejected_newer_state = true;
+                    rejected_tail = Some(u64::from(state.tail));
+                    last_error = Some(error);
+                }
+            }
+        }
+        return Err(last_error.unwrap_or_else(|| MmapScrollbackError::V2Integrity {
+            path: path.to_path_buf(),
+            reason: "no v2 state slot references a valid retained interval",
+        }));
+    }
     // The header's write_cursor/capacity are themselves on-disk values that may
     // be corrupt or stale — this recovery path exists precisely because a crash
     // can leave a header whose cursor was bumped before the payload flushed. So
@@ -1278,7 +1854,14 @@ fn read_linear_records_from_file(
         cursor = payload_end;
     }
 
-    let completeness = if cursor == header.write_cursor_bytes {
+    let legacy_wrapped = header.total_bytes_written > header.write_cursor_bytes;
+    let completeness = if legacy_wrapped {
+        LinearRecordCompleteness::Incomplete {
+            decoded_cursor_bytes: cursor,
+            declared_cursor_bytes: header.write_cursor_bytes,
+            reason: LinearRecordTerminalReason::LegacyWrappedOrderUnknown,
+        }
+    } else if cursor == header.write_cursor_bytes {
         LinearRecordCompleteness::Complete
     } else {
         LinearRecordCompleteness::Incomplete {

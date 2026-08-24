@@ -75083,9 +75083,9 @@ async fn handle_session_command(
             let scrollback_dir = default_scrollback_recovery_dir();
             let candidates = scan_session_orphans_for_cli(&scrollback_dir, limits)
                 .unwrap_or_else(|error| {
-                    exit_session_export_error(
+                    exit_session_export_format_error(
                         "session.orphan_scan_failed",
-                        &format!("{error:#}"),
+                        format_args!("{error:#}"),
                         output_format,
                     )
                 });
@@ -75171,9 +75171,9 @@ async fn handle_session_command(
             }
 
             let snapshot = candidate.read_records(limits).unwrap_or_else(|error| {
-                exit_session_export_error(
+                exit_session_export_format_error(
                     "session.orphan_read_failed",
-                    &format!(
+                    format_args!(
                         "failed to read bounded scrollback mmap records from {} under the retained recovery lease: {error}",
                         candidate.path.display()
                     ),
@@ -75187,9 +75187,9 @@ async fn handle_session_command(
                     limits,
                 )
                 .unwrap_or_else(|error| {
-                    exit_session_export_error(
+                    exit_session_export_format_error(
                         "session.orphan_plan_failed",
-                        &format!(
+                        format_args!(
                             "failed to build a bounded scrollback replay plan for {}: {error}",
                             candidate.path.display()
                         ),
@@ -75242,9 +75242,9 @@ async fn handle_session_command(
                 );
             }
             write_new_private_artifact(&output_path, &transcript).unwrap_or_else(|error| {
-                exit_session_export_error(
+                exit_session_export_format_error(
                     "session.orphan_artifact_write_failed",
-                    &format!("failed to write the private recovery artifact: {error:#}"),
+                    format_args!("failed to write the private recovery artifact: {error:#}"),
                     output_format,
                 )
             });
@@ -75342,9 +75342,9 @@ async fn handle_session_command(
                 );
             }
             let receipt = candidate.discard().unwrap_or_else(|error| {
-                exit_session_export_error(
+                exit_session_export_format_error(
                     "session.orphan_discard_failed",
-                    &format!(
+                    format_args!(
                         "failed to discard the identity-bound scrollback orphan: {error}"
                     ),
                     output_format,
@@ -77558,8 +77558,12 @@ fn find_session_orphan_candidate(
     if !is_valid_scrollback_pane_uuid(pane_uuid) {
         return Err(SessionOrphanLookupError {
             error_code: "session.orphan_invalid_id",
-            message: format!(
-                "invalid pane_uuid '{pane_uuid}' (expected 64 lowercase hex characters)"
+            message: bounded_format_diagnostic(
+                format_args!(
+                    "invalid pane_uuid '{pane_uuid}' (expected 64 lowercase hex characters)"
+                ),
+                1_024,
+                4_096,
             ),
         });
     }
@@ -77567,7 +77571,7 @@ fn find_session_orphan_candidate(
     let candidates = scan_session_orphans_for_cli(scrollback_dir, limits).map_err(|error| {
         SessionOrphanLookupError {
             error_code: "session.orphan_scan_failed",
-            message: format!("{error:#}"),
+            message: bounded_display_diagnostic("", &error, 1_024, 4_096),
         }
     })?;
     candidates
@@ -77575,9 +77579,13 @@ fn find_session_orphan_candidate(
         .find(|candidate| session_orphan_candidate_uuid(candidate).as_deref() == Some(pane_uuid))
         .ok_or_else(|| SessionOrphanLookupError {
             error_code: "session.orphan_not_found",
-            message: format!(
-                "scrollback orphan {pane_uuid} not found in {}",
-                scrollback_dir.display()
+            message: bounded_format_diagnostic(
+                format_args!(
+                    "scrollback orphan {pane_uuid} not found in {}",
+                    scrollback_dir.display()
+                ),
+                1_024,
+                4_096,
             ),
         })
 }
@@ -77635,6 +77643,15 @@ fn exit_session_orphan_error(
 
 fn exit_session_durable_error(message: &str, format: SnapshotSessionOutputFormat) -> ! {
     exit_session_export_error("session.durable_export_failed", message, format)
+}
+
+fn exit_session_export_format_error(
+    error_code: &'static str,
+    message: std::fmt::Arguments<'_>,
+    format: SnapshotSessionOutputFormat,
+) -> ! {
+    let message = bounded_format_diagnostic(message, 1_024, 4_096);
+    exit_session_export_error(error_code, &message, format)
 }
 
 fn exit_session_export_error(
@@ -93657,7 +93674,7 @@ recorder_backend = "rusqlite"
 
     #[test]
     fn session_orphan_operational_failures_remain_bounded_json_and_toon() {
-        let raw_secret = format!("{} {}", "x".repeat(8_192), "sk-secret-value-1234567890");
+        let raw_secret = format!("AKIAIOSFODNN7EXAMPLE {}", "x".repeat(8_192));
         for error_code in [
             "session.orphan_scan_failed",
             "session.orphan_artifact_write_failed",
@@ -93671,7 +93688,8 @@ recorder_backend = "rusqlite"
                 let (message, rendered) =
                     format_session_export_error(error_code, &raw_secret, format);
                 assert!(message.len() <= 4_096);
-                assert!(!message.contains("sk-secret-value"));
+                assert!(!message.contains("AKIAIOSFODNN7EXAMPLE"));
+                assert!(message.contains("[REDACTED]"));
                 let rendered = rendered.expect("structured error rendering");
                 let payload: serde_json::Value = match format {
                     SnapshotSessionOutputFormat::Json => {
@@ -93691,7 +93709,7 @@ recorder_backend = "rusqlite"
                 assert_eq!(payload["ok"], false);
                 assert_eq!(payload["error_code"], error_code);
                 assert!(!payload["error"].as_str().unwrap_or_default().is_empty());
-                assert!(!rendered.contains("sk-secret-value"));
+                assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"));
             }
         }
     }
