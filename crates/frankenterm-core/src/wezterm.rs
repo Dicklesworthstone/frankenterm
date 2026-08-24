@@ -1126,6 +1126,7 @@ const MAX_CLI_BULK_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
 /// an 8 KiB byte prefix. Enforce that exact byte budget during capture.
 const MAX_CLI_ERROR_OUTPUT_BYTES: usize = 8 * 1024;
 
+#[cfg(any(test, all(feature = "vendored", unix)))]
 fn append_mux_text_line_bounded(out: &mut String, line: &str, cap: usize) -> Result<()> {
     let next_len = out
         .len()

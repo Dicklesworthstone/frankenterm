@@ -127,8 +127,8 @@ pub enum MmapStoreError {
         "pane sequence journal capacity {limit} bytes would be exceeded: attempted {attempted} bytes"
     )]
     PaneSequenceJournalFull { limit: u64, attempted: u64 },
-    #[error("unable to allocate a unique versioned pane ledger identity")]
-    VersionedPaneIdentityExhausted,
+    #[error("deterministic versioned pane ledger identity collides with different content")]
+    VersionedPaneIdentityCollision,
     #[error("staged pane ledger failed exact reopen verification")]
     StagedPaneVerificationFailed,
 }
@@ -143,28 +143,12 @@ const PANE_LOG_HEADER_PREFIX: &[u8] = b"\0FTMMAP1:";
 const PANE_BASE_SEQ_JOURNAL_PREFIX: &str = "FTSEQ1:";
 const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const PANE_BASE_SEQ_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
-const VERSIONED_PANE_ID_ATTEMPTS: usize = 128;
 #[cfg(not(test))]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 =
     PANE_BASE_SEQ_JOURNAL_MAX_BYTES / 4 * 3;
 #[cfg(test)]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = 512;
 const GF_PRIM: u32 = 0x11d;
-
-fn next_versioned_pane_id() -> PaneId {
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            let bytes = duration.as_nanos().to_le_bytes();
-            u64::from_le_bytes(bytes[..8].try_into().expect("fixed timestamp slice"))
-        });
-    let process = u64::from(std::process::id());
-    let candidate = timestamp.rotate_left(17) ^ process.rotate_left(41) ^ sequence;
-    candidate | (1_u64 << 63)
-}
 
 /// An immutable, bounded view of one pane log at a stable filesystem identity.
 ///
@@ -177,7 +161,9 @@ pub struct MmapPaneReadSnapshot {
     pub oldest_seq: Option<u64>,
     pub next_seq: u64,
     pub records: Vec<String>,
+    pub retained_record_bytes: u64,
     pub committed_bytes: u64,
+    pub sequence_bytes: u64,
     pub physical_bytes: u64,
     pub trailing_uncommitted_bytes: u64,
 }
@@ -193,6 +179,7 @@ pub struct MmapStagedPaneLedger {
     record_count: usize,
     record_bytes: u64,
     committed_bytes: u64,
+    reused_existing: bool,
 }
 
 impl MmapStagedPaneLedger {
@@ -215,6 +202,11 @@ impl MmapStagedPaneLedger {
     pub const fn committed_bytes(self) -> u64 {
         self.committed_bytes
     }
+
+    #[must_use]
+    pub const fn reused_existing(self) -> bool {
+        self.reused_existing
+    }
 }
 
 impl std::fmt::Debug for MmapStagedPaneLedger {
@@ -225,6 +217,7 @@ impl std::fmt::Debug for MmapStagedPaneLedger {
             .field("record_count", &self.record_count)
             .field("record_bytes", &self.record_bytes)
             .field("committed_bytes", &self.committed_bytes)
+            .field("reused_existing", &self.reused_existing)
             .finish()
     }
 }
@@ -1535,6 +1528,12 @@ impl PaneFile {
             .saturating_add(self.file_len.saturating_sub(first.0))
     }
 
+    fn retained_record_bytes(&self) -> u64 {
+        self.line_offsets
+            .first()
+            .map_or(0, |first| self.file_len.saturating_sub(first.0))
+    }
+
     fn oldest_seq(&self) -> Option<u64> {
         (!self.line_offsets.is_empty()).then_some(self.base_seq)
     }
@@ -2033,6 +2032,15 @@ pub fn read_pane_snapshot(
         records.push(String::from_utf8(bytes)?);
     }
 
+    let retained_record_bytes = record_bytes
+        .checked_add(
+            u64::try_from(records.len())
+                .map_err(|_| MmapStoreError::NumericOverflow("record_delimiters"))?,
+        )
+        .ok_or(MmapStoreError::NumericOverflow("retained_record_bytes"))?;
+    let sequence_bytes = journal_guard
+        .as_ref()
+        .map_or(0, |(_journal, metadata)| metadata.len());
     let handle_metadata_after = file.metadata()?;
     if PaneFile::metadata_changed(&handle_metadata_before, &handle_metadata_after)? {
         return Err(MmapStoreError::InvalidPaneLogHeader(
@@ -2070,7 +2078,9 @@ pub fn read_pane_snapshot(
         oldest_seq: (!records.is_empty()).then_some(base_seq),
         next_seq,
         records,
+        retained_record_bytes,
         committed_bytes,
+        sequence_bytes,
         physical_bytes: handle_metadata_after.len(),
         trailing_uncommitted_bytes: handle_metadata_after.len().saturating_sub(committed_bytes),
     })
@@ -2121,8 +2131,14 @@ impl MmapScrollbackStore {
     /// Every record and both ledger files are synchronized before return. The
     /// caller must publish its authenticated pointer manifest separately; a
     /// failure here never modifies any previously published pane ledger.
+    /// `pane_id` is a caller-derived deterministic transaction identity. If
+    /// its exact bounded slot already exists, this method returns it without
+    /// rewriting bytes and marks the receipt as reused; before publication,
+    /// the caller must authenticate and semantically compare those opaque
+    /// records against its transaction input.
     pub fn stage_versioned_pane_replacement(
         &mut self,
+        pane_id: PaneId,
         records: &[String],
         max_records: usize,
         max_record_bytes: u64,
@@ -2155,19 +2171,52 @@ impl MmapScrollbackStore {
             });
         }
 
-        let mut selected = None;
-        for _ in 0..VERSIONED_PANE_ID_ATTEMPTS {
-            let pane_id = next_versioned_pane_id();
-            if pane_id == 0 || self.panes.contains_key(&pane_id) {
-                continue;
-            }
-            if let Some(pane) = PaneFile::create_versioned(&self.base_dir, pane_id)? {
-                selected = Some((pane_id, pane));
-                break;
-            }
+        if pane_id == 0 {
+            return Err(MmapStoreError::VersionedPaneIdentityCollision);
         }
-        let (pane_id, mut pane) =
-            selected.ok_or(MmapStoreError::VersionedPaneIdentityExhausted)?;
+        let log_path = self.base_dir.join(format!("{pane_id}.log"));
+        let sequence_path = PaneFile::base_seq_path(&log_path);
+        let path_is_regular = |path: &Path| -> Result<bool, MmapStoreError> {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+                Ok(_) => Err(MmapStoreError::VersionedPaneIdentityCollision),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        };
+        let log_exists = path_is_regular(&log_path)?;
+        let sequence_exists = path_is_regular(&sequence_path)?;
+        if log_exists != sequence_exists {
+            return Err(MmapStoreError::VersionedPaneIdentityCollision);
+        }
+        if log_exists {
+            let pane = PaneFile::open(&self.base_dir, pane_id)?;
+            if pane.base_seq != 0
+                || pane.data_start != 0
+                || pane.trailing_partial
+                || pane.line_offsets.len() != records.len()
+                || pane.file_len != committed_byte_limit_observation
+                || pane.base_seq_file.metadata()?.len() != 0
+            {
+                return Err(MmapStoreError::VersionedPaneIdentityCollision);
+            }
+            let staged = MmapStagedPaneLedger {
+                pane_id,
+                record_count: records.len(),
+                record_bytes,
+                committed_bytes: pane.file_len,
+                reused_existing: true,
+            };
+            self.panes.insert(pane_id, pane);
+            return Ok(staged);
+        }
+
+        let Some(mut pane) = PaneFile::create_versioned(&self.base_dir, pane_id)? else {
+            // A concurrent creator may have finished the same deterministic
+            // transaction. The next retry reopens and validates that bounded
+            // slot; never allocate a second random ledger for one transaction.
+            return Err(MmapStoreError::VersionedPaneIdentityCollision);
+        };
         for record in records {
             pane.append_line(record)?;
         }
@@ -2185,6 +2234,7 @@ impl MmapScrollbackStore {
             record_count: records.len(),
             record_bytes,
             committed_bytes,
+            reused_existing: false,
         };
         self.verify_staged_pane_ledger(staged, records)?;
         Ok(staged)
@@ -2522,6 +2572,20 @@ impl MmapScrollbackStore {
         self.panes
             .get(&pane_id)
             .map(PaneFile::retained_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Exact newline-delimited bytes occupied by currently reachable records.
+    /// This excludes an in-band sequence header and any logically pruned
+    /// prefix that remains pending physical compaction.
+    #[must_use]
+    pub fn retained_record_bytes(&self, pane_id: PaneId) -> u64 {
+        if self.fallback_panes.contains(&pane_id) {
+            return 0;
+        }
+        self.panes
+            .get(&pane_id)
+            .map(PaneFile::retained_record_bytes)
             .unwrap_or(0)
     }
 
@@ -3306,6 +3370,102 @@ mod tests {
     }
 
     #[test]
+    fn versioned_replacement_stage_is_exact_durable_and_preserves_published_ledger() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_line(0, "published-predecessor").unwrap();
+        let predecessor_log = std::fs::read(dir.path().join("0.log")).unwrap();
+        let predecessor_sequence = std::fs::read(dir.path().join("0.seq")).unwrap();
+        let replacement_id = (1_u64 << 63) | 77;
+        let records = vec!["sealed-row-one".to_string(), "sealed-row-two".to_string()];
+
+        let staged = store
+            .stage_versioned_pane_replacement(replacement_id, &records, 2, 1024)
+            .expect("stage exact replacement ledger");
+        assert_eq!(staged.pane_id(), replacement_id);
+        assert_eq!(staged.record_count(), 2);
+        assert_eq!(staged.record_bytes(), 28);
+        assert_eq!(staged.committed_bytes(), 30);
+        assert!(!staged.reused_existing());
+        assert_eq!(
+            std::fs::read(dir.path().join("0.log")).unwrap(),
+            predecessor_log
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("0.seq")).unwrap(),
+            predecessor_sequence
+        );
+        store
+            .verify_staged_pane_ledger(staged, &records)
+            .expect("reopen and verify staged ledger");
+    }
+
+    #[test]
+    fn deterministic_replacement_retry_reuses_one_bounded_ledger_slot() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let replacement_id = (1_u64 << 63) | 78;
+        let records = vec!["opaque-record-a".to_string(), "opaque-record-b".to_string()];
+        let first = store
+            .stage_versioned_pane_replacement(replacement_id, &records, 2, 1024)
+            .expect("stage first transaction attempt");
+        assert!(!first.reused_existing());
+        let log_before = std::fs::read(dir.path().join(format!("{replacement_id}.log"))).unwrap();
+        let second = store
+            .stage_versioned_pane_replacement(replacement_id, &records, 2, 1024)
+            .expect("reuse deterministic transaction attempt");
+        assert!(second.reused_existing());
+        assert_eq!(first.committed_bytes(), second.committed_bytes());
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("{replacement_id}.log"))).unwrap(),
+            log_before
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&replacement_id.to_string())
+                })
+                .count(),
+            2,
+            "one deterministic transaction owns exactly one .log/.seq pair"
+        );
+    }
+
+    #[test]
+    fn empty_versioned_replacement_has_zero_committed_bytes_and_bounds_include_delimiters() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let empty = store
+            .stage_versioned_pane_replacement((1_u64 << 63) | 79, &[], 0, 0)
+            .expect("stage atomic empty replacement");
+        assert_eq!(empty.record_count(), 0);
+        assert_eq!(empty.record_bytes(), 0);
+        assert_eq!(empty.committed_bytes(), 0);
+
+        let error = store
+            .stage_versioned_pane_replacement(
+                (1_u64 << 63) | 80,
+                &["four".to_string()],
+                1,
+                4,
+            )
+            .expect_err("record delimiter participates in committed-byte bound");
+        assert!(matches!(
+            error,
+            MmapStoreError::PaneSnapshotLimitExceeded {
+                limit_name: "committed_bytes",
+                limit: 4,
+                observed: 5,
+            }
+        ));
+    }
+
+    #[test]
     fn file_store_unknown_pane_tail_errors() {
         let dir = temp_dir();
         let store = file_only_store(dir.path());
@@ -3905,7 +4065,9 @@ mod tests {
         assert_eq!(snapshot.oldest_seq, Some(0));
         assert_eq!(snapshot.next_seq, 2);
         assert_eq!(snapshot.records, vec!["zero", "one"]);
+        assert_eq!(snapshot.retained_record_bytes, 9);
         assert_eq!(snapshot.committed_bytes, 9);
+        assert_eq!(snapshot.sequence_bytes, 0);
         assert_eq!(snapshot.physical_bytes, 13);
         assert_eq!(snapshot.trailing_uncommitted_bytes, 4);
         assert!(
@@ -3940,6 +4102,9 @@ mod tests {
         assert_eq!(snapshot.oldest_seq, Some(2));
         assert_eq!(snapshot.next_seq, 3);
         assert_eq!(snapshot.records, vec!["two"]);
+        assert_eq!(snapshot.retained_record_bytes, 4);
+        assert_eq!(snapshot.committed_bytes, 13);
+        assert_eq!(snapshot.sequence_bytes, 9);
 
         let error = read_pane_snapshot(dir.path(), 9, 2, 1024, 1024)
             .expect_err("physical record scan limit must fail closed before allocation grows");

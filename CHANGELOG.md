@@ -56,7 +56,12 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   durable diagnostic instead of appearing to do nothing or copying an
   unbounded error into a toast. Fleet-wide auto-connect outages retain one
   diagnostic per failed domain but coalesce the interactive notification, so a
-  large failure set cannot create a persistent-toast storm.
+  large failure set cannot create a persistent-toast storm. Each desired
+  domain now owns its own health discovery, failure count, retry deadline, and
+  capped backoff, so a long-backoff `trj` cannot delay a newly detached `csd`.
+  The reconnect manifest is loaded once on a persistence worker and thereafter
+  updated in memory by durable lifecycle events rather than reread on every
+  health pass.
 - Remembers explicit remote-domain attachment intent across GUI restarts in a
   bounded, checksummed two-slot manifest. Domain aliases are persisted only as
   domain-separated SHA-256 fingerprints; the authority directory is mode 0700,
@@ -66,7 +71,22 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   suppresses the built-in supervisor, and an absent record continues to follow configuration. Manual,
   command-palette, and Lua attach/detach paths durably publish intent before
   mutating the mux, while a torn inactive slot falls back to the last verified
-  generation. Corrupt optional state fails visibly and leaves only explicit
+  generation. Failed command-palette and Lua attaches release their exact
+  single-flight transport claim before rebuilding supervision with the newly
+  remembered domain, and Lua detach fences the retired retry generation before
+  mutating the live domain. A failed explicit open reports automatic retry only
+  after durable intent and an enabled startup handoff, while live command-palette
+  and Lua failures require that exact attachment to enter the scheduled retry
+  frontier. Attach, detach, auto-connect, startup, and config-reload actions are
+  ticket-ordered per exact domain name across persistence, mux mutation, and
+  retry handoff; cancellation advances the queue without allowing a later
+  same-name action to overtake an active predecessor. A successful remembered
+  attach also refreshes the long-lived supervisor plan, so later exhaustion of
+  the transport's internal reconnect budget cannot silently drop it. Config
+  reload reconciles every independent domain/default while exact old
+  generations drain, retries same-name client-to-raw transitions, and fences
+  stale or scheduler-rejected reload generations. Corrupt optional state fails
+  visibly and leaves only explicit
   `connect_automatically = true` configuration eligible for automatic dialing.
 - Keeps attached remote-domain reconnect supervision alive indefinitely by
   default with capped backoff and one reused connection window. The finite
@@ -194,7 +214,11 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   discovery and transcript export of the continuous format. Export refuses
   symlink, privacy, checksum, identity, sequence, replacement-race, and resource
   violations; excludes uncommitted torn tails; reapplies redaction; never opens
-  source content for write; and never sends bytes into a live PTY.
+  source content for write; and never sends bytes into a live PTY. Its result
+  separately accounts for authenticated exact-semantic rows encrypted without
+  semantic-destroying pre-persistence redaction, unauthenticated legacy
+  redact-before-encode framing, and raw legacy rows with unknown redaction
+  provenance, rather than promoting every legacy byte to a proven privacy claim.
 - Introduces the guardian raw-output journal substrate with mandatory
   XChaCha20-Poly1305 encryption, pane- and segment-bound record digests, strict
   byte/record admission caps, synchronized append receipts, poisoned recovery
@@ -215,20 +239,37 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   An exact activation retry after acknowledgement loss reopens and synchronizes
   the immutable record, referenced key, and full contiguous inventory before
   accepting the already-published generation; partial or conflicting records
-  remain terminal failures.
+  remain terminal failures. Current v3 files use a keyed, authenticated
+  176-byte header; a complete legacy 160-byte v1 header is recognized as an
+  unsupported preserved artifact, never misclassified as a torn v3 file or
+  shifted or rewritten in place. Any future legacy recovery must emit a fresh
+  v3 successor or a separately verified serialized artifact. V3 cold-scrollback
+  manifests also authenticate a canonical logical-ledger SHA-256 over the
+  generation, predecessor, pane/ledger identity, exact sequence/byte facts,
+  and every ordered length-delimited record. Publication and export recompute
+  that digest, while a private cross-process mutation lease plus on-disk
+  generation/digest comparison prevents stale-writer replacement.
   This is storage/format substrate only; it is not yet wired to a live guardian
   PTY reader and does not claim mux-crash process continuity.
 - Adds the guardian input-effect journal substrate. It synchronizes an encrypted
   exact intent and a conservative `AcceptedNotDurable` marker before a PTY write
-  may become observable, then permits only a proven `Durable` or
-  `KnownNotApplied` refinement. Fixed-size records encrypt the mux, generation,
-  sequence, effect, payload-fingerprint, and input-length identity under a
-  separate AEAD domain; raw keystrokes are never stored. Record and effect
+  may become observable, then permits only `DurableFull`, an exact nonzero
+  `DurablePrefix { applied_bytes }`, or `KnownNotApplied` as a terminal
+  refinement. Total input length and applied-prefix count are authenticated, so
+  a partial write can never be promoted to full durability or replayed from byte
+  zero. Only a newly synchronized Accepted transition yields the opaque
+  one-attempt PTY-write permit; an exact, alias, or stale retry returns the
+  current reconciled disposition without fresh write authority. Fixed-size
+  records encrypt the mux, generation, sequence, effect, payload-fingerprint,
+  and input-length identity under a separate AEAD domain; raw keystrokes are
+  never stored. Record and effect
   limits bound recovery memory and disk growth, digest chaining detects
   reordering, exact per-phase receipts reconcile acknowledgement loss, and
   complete corruption, torn tails, external writes, and ambiguous I/O fail
   closed without truncating evidence. This remains a descriptor-level storage
   primitive until the guardian PTY runtime and takeover recovery path are wired.
+  Its v2 format fails closed on fieldless v1 `Durable`, because old bytes cannot
+  prove whether the entire input or only a prefix became observable.
 - Adds an explicit escape-parser recovery-ground authority and versioned parser
   checkpoint identity. The authority rejects partial CSI, OSC, DCS, Sixel,
   termcap, UTF-8, and tmux-control state even when the underlying VT transition
@@ -236,17 +277,22 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   parser only to the exact processed raw-output sequence at which this stricter
   predicate was true; older output offsets paired with newer screen state are
   forbidden because suffix replay would duplicate terminal effects. This is a
-  checkpoint substrate only; live guardian capture remains pending. The first
-  capability-free terminal projection now covers both screen buffers and saved
+  checkpoint substrate only; production guardian publication remains pending.
+  The current v2 capability-free terminal projection covers both screen buffers and saved
   cursors plus the complete performer, mode, margin, keyboard, mouse, palette,
   metadata, Unicode-width, bidi, focus, geometry, and sequence state. It sorts
-  terminal maps for canonical encoding and rejects out-of-band graphics until
-  their bounded v1 representation exists. OSC-8 hyperlink serialization also
+  terminal maps, deduplicated custom-width tables, and hyperlinks for canonical
+  encoding, carries authenticated exact cold-scrollback rows, and rejects
+  out-of-band graphics until their bounded representation exists. OSC-8 hyperlink serialization also
   now sorts its internal parameter map, closing a pre-existing path where
   identical styled lines could produce different checkpoint/render digests.
-  Strict decode bounds, restore validation, atomic publication, and live
-  guardian integration remain pending.
-- Freezes the guardian v1 authenticated request/response envelopes and pure
+  Strict structural and semantic decode bounds, canonical re-encoding,
+  off-topology inert restore, suffix-replay resource bounds, configuration
+  fencing, and staged scrollback activation now fail closed. A live mux parser
+  barrier can capture the model only at the exact durable receipt watermark and
+  retains its own pane-generation lease through serialization; this remains
+  source substrate until the guardian runtime durably publishes and reattaches it.
+- Freezes the guardian v3 authenticated request/response envelopes and pure
   fencing state machine: bounded HMAC-before-decode framing, exact response
   correlation, a token-authenticated payload-free `Hello` bootstrap that is
   the sole nil guardian-incarnation scope and returns the current nonzero

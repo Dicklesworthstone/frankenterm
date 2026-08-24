@@ -198,7 +198,25 @@ mux mutation begins, so an unreachable domain can still retain the operator's
 desired state. A Lua script that later calls `domain:attach()` is itself an
 explicit attach and changes a remembered detached state back to attached; a
 periodic user-authored Lua watchdog therefore remains authoritative over its
-own actions.
+own actions. If a command-palette or Lua attach cannot reach the mux, the failed
+attempt releases its single-flight transport claim before FrankenTerm rebuilds
+the supervisor with that exact remembered domain in its retry frontier. A Lua
+detach fences the old supervisor generation immediately after the detached
+intent is durable, so a stale retry cannot undo the operator's choice. All
+attach, detach, startup, retry, and configuration-reload actions for the same
+domain alias are ticket-ordered through persistence, mux mutation, and retry
+handoff; cancelling a queued action cannot let its successor overtake the
+currently active action. Different domains remain independent, with separate
+health discovery and backoff, so an unavailable domain cannot starve a newly
+detached peer. A successful explicit attach refreshes the remembered supervisor
+plan as well as the live connection, preserving automatic recovery if the
+connection's internal retry budget is later exhausted.
+
+Hot configuration reload retires an old exact client-domain generation before
+publishing its replacement, but continues adding unrelated domains and a safe
+default while that guard drains. It retries the newest configuration until the
+same-name fence clears, including a client-to-raw domain transition; a stale
+reload generation cannot overwrite a newer one.
 
 The preference is stored under FrankenTerm's mode-0700 private data directory
 in two alternating, mode-0600 checksummed files. It stores only

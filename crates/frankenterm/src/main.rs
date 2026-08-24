@@ -74877,14 +74877,15 @@ async fn handle_session_command(
                 "physical_log_bytes": export.physical_log_bytes,
                 "trailing_uncommitted_bytes": export.trailing_uncommitted_bytes,
                 "exact_semantic_records": export.exact_semantic_records,
-                "legacy_redacted_records": export.legacy_redacted_records,
-                "redaction_applied_before_persistence_to_all_records": export.redaction_applied_before_persistence,
-                "redaction_applied_before_persistence_to_any_record": export.redaction_applied_before_persistence_to_any_record,
+                "legacy_non_recovery_grade_records": export.legacy_non_recovery_grade_records,
+                "pre_persistence_redaction_not_applied_records": export.pre_persistence_redaction_not_applied_records,
+                "legacy_redaction_attested_but_unauthenticated_records": export.legacy_redaction_attested_but_unauthenticated_records,
+                "raw_legacy_redaction_unknown_records": export.raw_legacy_redaction_unknown_records,
                 "output_path": &display_output_path,
                 "transcript_bytes": artifact.bytes,
                 "transcript_sha256": &artifact.sha256,
                 "durability": artifact.durability,
-                "redaction_applied": true,
+                "redaction_applied_during_export": export.redaction_applied_during_export,
                 "source_content_mutated": export.source_content_mutated,
                 "live_pty_mutated": false,
                 "executable_restore_image": false,
@@ -74896,8 +74897,22 @@ async fn handle_session_command(
                 println!("  Output:          {display_output_path}");
                 println!("  Rows:            {}", export.retained_rows);
                 println!(
-                    "  Fidelity:        {} exact semantic, {} legacy redacted",
-                    export.exact_semantic_records, export.legacy_redacted_records
+                    "  Fidelity:        {} exact semantic, {} legacy/non-recovery-grade",
+                    export.exact_semantic_records, export.legacy_non_recovery_grade_records
+                );
+                println!(
+                    "  Persistence redaction: {} exact encrypted/unredacted, {} legacy attested/unauthenticated, {} raw legacy unknown",
+                    export.pre_persistence_redaction_not_applied_records,
+                    export.legacy_redaction_attested_but_unauthenticated_records,
+                    export.raw_legacy_redaction_unknown_records
+                );
+                println!(
+                    "  Export redaction: {}",
+                    if export.redaction_applied_during_export {
+                        "applied"
+                    } else {
+                        "not applied"
+                    }
                 );
                 println!("  Bytes:           {}", artifact.bytes);
                 println!("  SHA-256:         {}", artifact.sha256);

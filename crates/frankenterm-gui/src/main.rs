@@ -17,14 +17,16 @@ use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
-use frankenterm_client::domain::ClientDomain;
+use frankenterm_client::domain::{ClientDomain, ClientDomainConfig};
 use frankenterm_core::macos_backend_select::{
     BackendOverride, BackendSelectionInputs, BackendSelectionResult, MacosArch, MacosVersion,
     select_macos_backend,
 };
 use frankenterm_font::FontConfiguration;
 use frankenterm_font::shaper::PresentationWidth;
-use frankenterm_mux_server_impl::update_mux_domains;
+use frankenterm_mux_server_impl::{
+    MuxDomainUpdateOutcome, reconcile_mux_domains, update_mux_domains,
+};
 use frankenterm_toast_notification::*;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
@@ -33,7 +35,7 @@ use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env::{self, current_dir};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -105,6 +107,15 @@ use frankenterm_gui::{
 static AUTO_CONNECT_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUTO_CONNECT_STARTUP_READY: AtomicBool = AtomicBool::new(false);
 static AUTO_CONNECT_SUPERVISOR_GENERATION: AtomicU64 = AtomicU64::new(0);
+static AUTO_CONNECT_ADMISSION_RETRY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static AUTO_CONNECT_ADMISSION_RETRY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_ACTIVE: AtomicBool =
+    AtomicBool::new(false);
+static DOMAIN_RECONNECT_MANIFEST_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static DOMAIN_RECONNECT_MANIFEST_SNAPSHOT: std::sync::RwLock<
+    Option<domain_reconnect_manifest::DomainReconnectManifest>,
+> = std::sync::RwLock::new(None);
 thread_local! {
     /// One process-local owner for the retry task. Replacing this handle drops
     /// and cancels the old future immediately, releasing both its exact domain
@@ -393,7 +404,7 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     let should_publish = false;
     let result = async_run_terminal_gui(cmd, start_command, should_publish).await;
     drop(domain_guard);
-    result
+    result.map(|_| ())
 }
 
 fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -460,7 +471,7 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
     let should_publish = false;
     let result = async_run_terminal_gui(cmd, start_command, should_publish).await;
     drop(domain_guard);
-    result
+    result.map(|_| ())
 }
 
 fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Result<()> {
@@ -500,60 +511,273 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
 
 fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
     config::subscribe_to_config_reload(move || {
-        match promise::spawn::try_reserve_main_thread(
-            promise::spawn::MainThreadServiceClass::Topology,
-            4 * 1024,
-        ) {
-            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-                reservation
-                    .spawn(async move {
-                        // Fence the retired retry generation before changing
-                        // the domain registry. Otherwise it can acquire and
-                        // attach an old same-name registration while the
-                        // replacement topology is being published.
-                        cancel_auto_connect_supervisor();
-                        if let Err(err) = update_mux_domains(&config::configuration()) {
-                            let message = bounded_gui_failure_message(
-                                "Failed to update mux domains after configuration reload",
-                                &err,
-                            );
-                            frankenterm_gui::gui_debug_log::record(
-                                log::Level::Error,
-                                "frankenterm_gui::domain_config_reload",
-                                message.clone(),
-                            );
-                            log::error!("{message}");
-                            persistent_toast_notification(
-                                "Domain configuration reload failed",
-                                &message,
-                            );
-                            if AUTO_CONNECT_ENABLED.load(Ordering::Acquire) {
-                                // Rebuild supervision from whichever registry
-                                // state survived the failed update; leaving the
-                                // old task cancelled forever would convert a
-                                // transient reload failure into permanent loss
-                                // of reconnect service.
-                                schedule_auto_connect_domains();
-                            }
-                        } else if AUTO_CONNECT_ENABLED.load(Ordering::Acquire) {
-                            schedule_auto_connect_domains();
-                        }
-                    })
-                    .detach();
+        // Config subscribers execute while the configuration mutex is held.
+        // Never call `config::configuration()` here: the admitted task reads
+        // the latest handle only after notification releases that mutex.
+        let generation = match mint_mux_domain_config_reconciliation_generation() {
+            Some(generation) => generation,
+            None => {
+                metrics::counter!(
+                    "gui.domain_config_reload_admission",
+                    "outcome" => "generation_exhausted"
+                )
+                .increment(1);
+                log::error!(
+                    "mux-domain configuration reconciliation generation exhausted; refusing an ambiguous reload"
+                );
+                return true;
             }
-            rejected => {
+        };
+        match try_admit_mux_domain_config_reconciliation(generation) {
+            MuxDomainConfigAdmission::Started => {}
+            MuxDomainConfigAdmission::Retryable(rejection) => {
+                metrics::counter!(
+                    "gui.domain_config_reload_admission",
+                    "outcome" => "retrying"
+                )
+                .increment(1);
+                log::warn!(
+                    "main-thread scheduler temporarily rejected mux-domain config reload; a single coordinator will retry the newest generation: {rejection}"
+                );
+                start_mux_domain_config_admission_retry();
+            }
+            MuxDomainConfigAdmission::Terminal(rejection) => {
                 metrics::counter!(
                     "gui.domain_config_reload_admission",
                     "outcome" => "terminal_rejection"
                 )
                 .increment(1);
                 log::error!(
-                    "main-thread scheduler rejected mux-domain config reload before task construction: {rejected:?}"
+                    "main-thread scheduler terminally rejected mux-domain config reload before task construction: {rejection}"
                 );
             }
         }
         true
     })
+}
+
+fn mint_mux_domain_config_reconciliation_generation() -> Option<u64> {
+    MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .and_then(|previous| previous.checked_add(1))
+}
+
+enum MuxDomainConfigAdmission {
+    Started,
+    Retryable(String),
+    Terminal(String),
+}
+
+fn try_admit_mux_domain_config_reconciliation(
+    generation: u64,
+) -> MuxDomainConfigAdmission {
+    use promise::spawn::MainThreadReservationOutcome;
+
+    match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        16 * 1024,
+    ) {
+        MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation
+                .spawn(reconcile_mux_domain_config_until_converged(generation))
+                .detach();
+            MuxDomainConfigAdmission::Started
+        }
+        rejected @ (MainThreadReservationOutcome::RetryableFull(_)
+        | MainThreadReservationOutcome::RetiredGeneration(_)
+        | MainThreadReservationOutcome::Coalesced(_)
+        | MainThreadReservationOutcome::SchedulerUnavailable) => {
+            MuxDomainConfigAdmission::Retryable(format!("{rejected:?}"))
+        }
+        rejected @ (MainThreadReservationOutcome::InvalidSize(_)
+        | MainThreadReservationOutcome::AuthorityExhausted(_)) => {
+            MuxDomainConfigAdmission::Terminal(format!("{rejected:?}"))
+        }
+    }
+}
+
+fn start_mux_domain_config_admission_retry() {
+    if MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("ft-domain-config-admission".to_string())
+        .spawn(retry_mux_domain_config_admission)
+    {
+        MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_ACTIVE
+            .store(false, Ordering::Release);
+        log::error!(
+            "failed to start mux-domain config admission retry coordinator: {error}"
+        );
+    }
+}
+
+fn retry_mux_domain_config_admission() {
+    let mut delay = std::time::Duration::from_millis(10);
+    let mut attempts = 0_u64;
+    loop {
+        let generation = MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire);
+        match try_admit_mux_domain_config_reconciliation(generation) {
+            MuxDomainConfigAdmission::Started => {
+                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
+                    != generation
+                {
+                    continue;
+                }
+                MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_ACTIVE
+                    .store(false, Ordering::Release);
+                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
+                    != generation
+                    && MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_ACTIVE
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    continue;
+                }
+                return;
+            }
+            MuxDomainConfigAdmission::Retryable(rejection) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts % 100 == 0 {
+                    log::warn!(
+                        "mux-domain config reconciliation is waiting for main-thread admission (attempt {attempts}): {rejection}"
+                    );
+                }
+                std::thread::sleep(delay);
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(1));
+            }
+            MuxDomainConfigAdmission::Terminal(rejection) => {
+                MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_ACTIVE
+                    .store(false, Ordering::Release);
+                log::error!(
+                    "mux-domain config reconciliation admission became terminal: {rejection}"
+                );
+                return;
+            }
+        }
+    }
+}
+
+async fn reconcile_mux_domain_config_until_converged(
+    generation: u64,
+) {
+    if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let config = config::configuration();
+    // Fence the retired retry generation before changing the domain registry.
+    // Otherwise it can acquire and attach an old same-name registration while
+    // the replacement topology is being published.
+    cancel_auto_connect_supervisor();
+    let mut retirement_round = 0_u64;
+    let mut retry_delay = std::time::Duration::from_millis(25);
+    const MAX_RECONCILIATION_DELAY: std::time::Duration =
+        std::time::Duration::from_secs(1);
+    let mut lifecycle_names = frankenterm_mux_server_impl::configured_client_domains(&config)
+        .into_iter()
+        .map(|domain| domain.name().to_string())
+        .collect::<Vec<_>>();
+    if let Some(mux) = Mux::try_get() {
+        lifecycle_names.extend(mux.iter_domains().into_iter().filter_map(|domain| {
+            domain
+                .downcast_ref::<ClientDomain>()
+                .map(|_| domain.domain_name().to_string())
+        }));
+    }
+    lifecycle_names.sort();
+    lifecycle_names.dedup();
+
+    loop {
+        if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != generation {
+            return;
+        }
+        let mut lifecycle_guards = Vec::with_capacity(lifecycle_names.len());
+        for domain_name in &lifecycle_names {
+            let reservation = match mux_lua::reserve_domain_lifecycle(domain_name.clone()) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    report_mux_domain_config_reload_failure(&error);
+                    return;
+                }
+            };
+            match reservation.enter().await {
+                Ok(guard) => lifecycle_guards.push(guard),
+                Err(error) => {
+                    report_mux_domain_config_reload_failure(&error);
+                    return;
+                }
+            }
+            if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != generation {
+                return;
+            }
+        }
+        let reconciliation = reconcile_mux_domains(&config);
+        drop(lifecycle_guards);
+        match reconciliation {
+            Ok(MuxDomainUpdateOutcome::Converged) => {
+                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
+                    == generation
+                    && AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
+                {
+                    schedule_auto_connect_domains();
+                }
+                return;
+            }
+            Ok(MuxDomainUpdateOutcome::PendingRetirements { domain_names }) => {
+                let Some(next_round) = retirement_round.checked_add(1) else {
+                    let error = anyhow!(
+                        "mux-domain configuration reconciliation retry counter exhausted for {domain_names:?}"
+                    );
+                    report_mux_domain_config_reload_failure(&error);
+                    return;
+                };
+                retirement_round = next_round;
+                if retirement_round == 1 || retirement_round % 100 == 0 {
+                    log::info!(
+                        "mux-domain configuration reload is waiting for exact domain retirements before replacement: {domain_names:?}"
+                    );
+                }
+                promise::spawn::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(MAX_RECONCILIATION_DELAY);
+            }
+            Err(error) => {
+                report_mux_domain_config_reload_failure(&error);
+                if AUTO_CONNECT_ENABLED.load(Ordering::Acquire) {
+                    // Rebuild supervision from whichever registry state
+                    // survived the failed update; leaving the old task
+                    // cancelled forever would convert one bad reload into
+                    // permanent loss of reconnect service.
+                    schedule_auto_connect_domains();
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn report_mux_domain_config_reload_failure(error: &anyhow::Error) {
+    let message = bounded_gui_failure_message(
+        "Failed to update mux domains after configuration reload",
+        error,
+    );
+    frankenterm_gui::gui_debug_log::record(
+        log::Level::Error,
+        "frankenterm_gui::domain_config_reload",
+        message.clone(),
+    );
+    log::error!("{message}");
+    persistent_toast_notification("Domain configuration reload failed", &message);
 }
 
 fn have_panes_in_domain_and_ws(
@@ -576,6 +800,8 @@ async fn populate_local_recovery_window_after_remote_failure(
     failed_domain: &DomainOperationGuard,
     window_id: mux::window::WindowId,
     error: &anyhow::Error,
+    remembered_attachment: bool,
+    domain_retry_applicable: bool,
 ) -> anyhow::Result<()> {
     let client = failed_domain
         .downcast_ref::<ClientDomain>()
@@ -585,7 +811,9 @@ async fn populate_local_recovery_window_after_remote_failure(
         error,
         configured_remote_recovery(
             client.connect_automatically(),
+            remembered_attachment,
             AUTO_CONNECT_ENABLED.load(Ordering::Acquire),
+            domain_retry_applicable,
         ),
     );
     frankenterm_gui::gui_debug_log::record(
@@ -609,6 +837,7 @@ async fn populate_local_recovery_window_after_remote_failure(
         dpi as u32,
     )
     .await
+    .map_err(crate::spawn::DomainAttachmentFailure::into_error)
     .context("spawning local recovery shell after remote attach failure")?;
     trigger_and_log_gui_attached(MuxDomain(recovery_domain.domain_id())).await;
     Ok(())
@@ -619,6 +848,8 @@ async fn preserve_or_populate_window_after_remote_failure(
     failed_domain: &DomainOperationGuard,
     window_id: mux::window::WindowId,
     error: &anyhow::Error,
+    remembered_attachment: bool,
+    domain_retry_applicable: bool,
 ) -> anyhow::Result<()> {
     if mux.window_has_panes_in_domain(window_id, failed_domain.domain_id()) {
         let message = domain_connection_failure_message(
@@ -641,6 +872,8 @@ async fn preserve_or_populate_window_after_remote_failure(
             failed_domain,
             window_id,
             error,
+            remembered_attachment,
+            domain_retry_applicable,
         )
         .await
     }
@@ -680,14 +913,22 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 
     let config = config::configuration();
     let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
-    if let Err(error) = crate::spawn::attach_domain_to_window_or_spawn_recovery(
+    if let Err(failure) = crate::spawn::attach_domain_to_window_or_spawn_recovery(
         &domain, window_id, cmd, None, dpi as u32,
     )
     .await
     {
+        let remembered_attachment = failure.remembered_attachment();
+        let domain_retry_applicable = failure.establishes_domain_retry();
+        let error = failure.into_error();
         if domain.downcast_ref::<ClientDomain>().is_some() {
             preserve_or_populate_window_after_remote_failure(
-                &mux, &domain, window_id, &error,
+                &mux,
+                &domain,
+                window_id,
+                &error,
+                remembered_attachment,
+                domain_retry_applicable,
             )
             .await?;
             return Ok(());
@@ -726,53 +967,155 @@ where
     failures
 }
 
-fn configured_auto_connect_domain_names(mux: &Arc<Mux>) -> Vec<String> {
-    mux.iter_domains()
+fn publish_domain_reconnect_manifest_snapshot(
+    manifest: domain_reconnect_manifest::DomainReconnectManifest,
+) {
+    let mut snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if snapshot
+        .as_ref()
+        .is_none_or(|current| manifest.generation() >= current.generation())
+    {
+        *snapshot = Some(manifest);
+    }
+    DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
+}
+
+fn domain_reconnect_manifest_snapshot(
+) -> Option<domain_reconnect_manifest::DomainReconnectManifest> {
+    DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+async fn initialize_domain_reconnect_manifest_snapshot() {
+    if DOMAIN_RECONNECT_MANIFEST_INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
+    match promise::spawn::spawn_into_new_thread(domain_reconnect_manifest::load).await {
+        Ok(manifest) => publish_domain_reconnect_manifest_snapshot(manifest),
+        Err(error) => {
+            DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
+            let message = format!(
+                "remembered domain attachment intent could not be loaded on the persistence worker and will be ignored until the next durable lifecycle event: {error}"
+            );
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Error,
+                "frankenterm_gui::auto_connect",
+                message.clone(),
+            );
+            log::error!("{message}");
+            persistent_toast_notification("Remembered domain connections unavailable", &message);
+        }
+    }
+}
+
+fn configured_auto_connect_domain_configs(config: &ConfigHandle) -> Vec<ClientDomainConfig> {
+    frankenterm_mux_server_impl::configured_client_domains(config)
         .into_iter()
-        .filter_map(|domain| {
-            domain
-                .downcast_ref::<ClientDomain>()
-                .filter(|client| client.connect_automatically())
-                .map(|_| domain.domain_name().to_string())
-        })
+        .filter(ClientDomainConfig::connect_automatically)
         .collect()
 }
 
-fn auto_connect_domain_names(
-    mux: &Arc<Mux>,
-) -> Result<Vec<String>, domain_reconnect_manifest::DomainReconnectManifestError> {
-    let manifest = domain_reconnect_manifest::load()?;
-    Ok(mux
-        .iter_domains()
-        .into_iter()
-        .filter_map(|domain| {
-            domain.downcast_ref::<ClientDomain>().and_then(|client| {
-                manifest
-                    .should_connect(domain.domain_name(), client.connect_automatically())
-                    .then(|| domain.domain_name().to_string())
+fn auto_connect_domain_configs(config: &ConfigHandle) -> Option<Vec<ClientDomainConfig>> {
+    let manifest = domain_reconnect_manifest_snapshot()?;
+    Some(
+        frankenterm_mux_server_impl::configured_client_domains(config)
+            .into_iter()
+            .filter(|domain| {
+                manifest.should_connect(domain.name(), domain.connect_automatically())
             })
-        })
-        .collect())
+            .collect(),
+    )
+}
+
+fn auto_connect_generation_is_current(
+    mux: &Arc<Mux>,
+    generation: u64,
+    request_generation: u64,
+) -> bool {
+    AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
+        && AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire) == generation
+        && AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
+            == request_generation
+        && Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, mux))
 }
 
 async fn attempt_auto_connect_round(
     mux: &Arc<Mux>,
+    generation: u64,
+    request_generation: u64,
+    desired_domains: &Arc<Vec<ClientDomainConfig>>,
     domain_names: Vec<String>,
 ) -> Vec<(String, anyhow::Error)> {
     attempt_independent_auto_connects(domain_names, {
         let mux = Arc::clone(mux);
+        let desired_domains = Arc::clone(desired_domains);
         move |domain_name| {
             let mux = Arc::clone(&mux);
+            let expected = desired_domains
+                .iter()
+                .find(|candidate| candidate.name() == domain_name)
+                .cloned();
             async move {
+                anyhow::ensure!(
+                    auto_connect_generation_is_current(
+                        &mux,
+                        generation,
+                        request_generation,
+                    ),
+                    "automatic domain retry generation retired before registry reconciliation"
+                );
+                let _lifecycle = mux_lua::reserve_domain_lifecycle(domain_name.clone())
+                    .context("reserving ordered automatic domain lifecycle")?
+                    .enter()
+                    .await
+                    .context("entering ordered automatic domain lifecycle")?;
+                anyhow::ensure!(
+                    auto_connect_generation_is_current(
+                        &mux,
+                        generation,
+                        request_generation,
+                    ),
+                    "automatic domain retry generation retired while awaiting lifecycle authority"
+                );
+                let expected = expected.with_context(|| {
+                    format!(
+                        "automatic domain retry plan no longer contains {domain_name:?}"
+                    )
+                })?;
+                match frankenterm_mux_server_impl::reconcile_client_domain_config(
+                    &mux, &expected,
+                )? {
+                    frankenterm_mux_server_impl::ConfiguredClientDomainReconcileOutcome::Current
+                    | frankenterm_mux_server_impl::ConfiguredClientDomainReconcileOutcome::Registered => {}
+                    frankenterm_mux_server_impl::ConfiguredClientDomainReconcileOutcome::PendingRetirement => {
+                        anyhow::bail!(
+                            "domain {domain_name:?} is awaiting exact-generation retirement before reconnect"
+                        );
+                    }
+                    frankenterm_mux_server_impl::ConfiguredClientDomainReconcileOutcome::NotConfigured => unreachable!(
+                        "a directly supplied retry-plan configuration cannot be absent"
+                    ),
+                }
                 let Some(domain) = mux.get_domain_by_name(&domain_name) else {
-                    // A config reload retired this name. The newer supervisor
-                    // generation owns whatever replaced it, so this attempt is
-                    // complete rather than retryable.
-                    return Ok(());
+                    anyhow::bail!(
+                        "configured domain {domain_name:?} disappeared after registry reconciliation"
+                    );
                 };
                 if domain.downcast_ref::<ClientDomain>().is_none() {
                     return Ok(());
                 }
+                anyhow::ensure!(
+                    auto_connect_generation_is_current(
+                        &mux,
+                        generation,
+                        request_generation,
+                    ),
+                    "automatic domain retry generation retired before transport attach"
+                );
                 let owner_client_id = mux.active_identity();
                 domain.attach(&mux, owner_client_id, None).await
             }
@@ -791,9 +1134,14 @@ enum DomainConnectionRecovery {
 
 fn configured_remote_recovery(
     connect_automatically: bool,
+    remembered_attachment: bool,
     supervisor_enabled: bool,
+    domain_retry_applicable: bool,
 ) -> DomainConnectionRecovery {
-    if connect_automatically && supervisor_enabled {
+    if domain_retry_applicable
+        && (connect_automatically || remembered_attachment)
+        && supervisor_enabled
+    {
         DomainConnectionRecovery::AutomaticRetry
     } else {
         DomainConnectionRecovery::LocalRecoveryShell
@@ -880,44 +1228,131 @@ fn domain_connection_failure_message(
     format!("connection to domain `{safe_domain}` failed; {recovery}: {safe_error}")
 }
 
+fn domain_requires_auto_connect_reconciliation(mux: &Arc<Mux>, domain_name: &str) -> bool {
+    mux.get_domain_by_name(domain_name)
+        .and_then(|domain| {
+            domain
+                .downcast_ref::<ClientDomain>()
+                .map(|client| client.state())
+        })
+        != Some(mux::domain::DomainState::Attached)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AutoConnectRetryState {
+    failure_count: u64,
+    next_attempt: std::time::Instant,
+}
+
+fn refresh_auto_connect_retry_frontier(
+    retries: &mut BTreeMap<String, AutoConnectRetryState>,
+    desired_names: &[String],
+    now: std::time::Instant,
+    mut requires_reconciliation: impl FnMut(&str) -> bool,
+) {
+    retries.retain(|domain_name, _| {
+        desired_names.iter().any(|candidate| candidate == domain_name)
+            && requires_reconciliation(domain_name)
+    });
+    for domain_name in desired_names {
+        if requires_reconciliation(domain_name) {
+            retries
+                .entry(domain_name.clone())
+                .or_insert(AutoConnectRetryState {
+                    failure_count: 0,
+                    next_attempt: now,
+                });
+        }
+    }
+}
+
+fn due_auto_connect_domains(
+    retries: &BTreeMap<String, AutoConnectRetryState>,
+    now: std::time::Instant,
+) -> Vec<String> {
+    retries
+        .iter()
+        .filter_map(|(domain_name, state)| {
+            (state.next_attempt <= now).then(|| domain_name.clone())
+        })
+        .collect()
+}
+
 async fn supervise_auto_connect_domains(
     mux: Arc<Mux>,
     generation: u64,
-    mut pending: Vec<String>,
+    request_generation: u64,
+    desired_domains: Arc<Vec<ClientDomainConfig>>,
 ) {
-    let mut round = 0_u64;
-    let mut retry_delay = std::time::Duration::from_secs(1);
+    let desired_names = desired_domains
+        .iter()
+        .map(|domain| domain.name().to_string())
+        .collect::<Vec<_>>();
+    let mut retries = BTreeMap::<String, AutoConnectRetryState>::new();
     const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+    const HEALTH_RECONCILIATION_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(1);
 
-    while !pending.is_empty()
-        && AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
-        && AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire) == generation
-    {
-        let Some(next_round) = round.checked_add(1) else {
-            let message = "automatic domain connection retry counter exhausted; refusing to wrap retry identity";
-            frankenterm_gui::gui_debug_log::record(
-                log::Level::Error,
-                "frankenterm_gui::auto_connect",
-                message,
-            );
-            log::error!("{message}");
-            persistent_toast_notification("Domain auto-connect unavailable", message);
-            return;
-        };
-        round = next_round;
-        let failures = attempt_auto_connect_round(&mux, pending).await;
-        if AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire) != generation {
-            return;
-        }
-        if failures.is_empty() {
-            return;
+    while auto_connect_generation_is_current(&mux, generation, request_generation) {
+        let now = std::time::Instant::now();
+        refresh_auto_connect_retry_frontier(&mut retries, &desired_names, now, |domain_name| {
+            domain_requires_auto_connect_reconciliation(&mux, domain_name)
+        });
+
+        let due = due_auto_connect_domains(&retries, now);
+        if due.is_empty() {
+            let until_next_attempt = retries
+                .values()
+                .map(|state| state.next_attempt.saturating_duration_since(now))
+                .min()
+                .unwrap_or(HEALTH_RECONCILIATION_INTERVAL);
+            promise::spawn::sleep(until_next_attempt.min(HEALTH_RECONCILIATION_INTERVAL)).await;
+            continue;
         }
 
-        pending = Vec::with_capacity(failures.len());
+        let failures = attempt_auto_connect_round(
+            &mux,
+            generation,
+            request_generation,
+            &desired_domains,
+            due.clone(),
+        )
+        .await;
+        if !auto_connect_generation_is_current(&mux, generation, request_generation) {
+            return;
+        }
+
+        let mut failures = failures.into_iter().collect::<BTreeMap<_, _>>();
         let mut first_round_toast = None;
-        for (domain_name, error) in failures {
-            pending.push(domain_name.clone());
-            if round == 1 || round % 20 == 0 {
+        for domain_name in due {
+            let Some(error) = failures.remove(&domain_name) else {
+                retries.remove(&domain_name);
+                continue;
+            };
+            let Some(state) = retries.get_mut(&domain_name) else {
+                continue;
+            };
+            let Some(failure_count) = state.failure_count.checked_add(1) else {
+                let message = format!(
+                    "automatic domain connection retry counter exhausted for {domain_name:?}; refusing to wrap retry identity"
+                );
+                frankenterm_gui::gui_debug_log::record(
+                    log::Level::Error,
+                    "frankenterm_gui::auto_connect",
+                    message.clone(),
+                );
+                log::error!("{message}");
+                persistent_toast_notification("Domain auto-connect unavailable", &message);
+                return;
+            };
+            state.failure_count = failure_count;
+            let shift = u32::try_from(failure_count.saturating_sub(1).min(5)).unwrap_or(5);
+            let retry_ceiling = std::time::Duration::from_secs(1_u64 << shift)
+                .min(MAX_RETRY_DELAY);
+            state.next_attempt = std::time::Instant::now()
+                + auto_connect_retry_delay(retry_ceiling, generation, failure_count);
+
+            if failure_count == 1 || failure_count % 20 == 0 {
                 // Auto-connect is independent per exact configured domain. A
                 // single unavailable or mixed-version remote used to abort the
                 // loop and surrounding GUI startup, so later domains were not
@@ -935,7 +1370,7 @@ async fn supervise_auto_connect_domains(
                     message.clone(),
                 );
                 log::error!("{message}");
-                if round == 1 && first_round_toast.is_none() {
+                if failure_count == 1 && first_round_toast.is_none() {
                     first_round_toast = Some(message);
                 }
             }
@@ -943,14 +1378,6 @@ async fn supervise_auto_connect_domains(
         if let Some(message) = first_round_toast {
             persistent_toast_notification("Domain auto-connect failures", &message);
         }
-
-        promise::spawn::sleep(auto_connect_retry_delay(
-            retry_delay,
-            generation,
-            round,
-        ))
-        .await;
-        retry_delay = retry_delay.saturating_mul(2).min(MAX_RETRY_DELAY);
     }
 }
 
@@ -987,24 +1414,357 @@ fn auto_connect_retry_delay_with_process_id(
     std::time::Duration::from_millis(ceiling_ms.saturating_sub(jitter))
 }
 
+fn mint_auto_connect_supervisor_generation() -> Option<u64> {
+    match AUTO_CONNECT_SUPERVISOR_GENERATION.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |current| current.checked_add(1),
+    ) {
+        Ok(previous) => Some(previous + 1),
+        Err(_) => {
+            // No distinct successor epoch can be represented. Disabling the
+            // controller is the only remaining fence that makes every old
+            // generation fail `auto_connect_generation_is_current`.
+            AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
+            None
+        }
+    }
+}
+
 fn cancel_auto_connect_supervisor() {
+    if mint_auto_connect_admission_retry_generation().is_none() {
+        AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
+        let message = "automatic domain admission request generation exhausted while fencing a cancelled supervisor; automatic connection is disabled for this process";
+        frankenterm_gui::gui_debug_log::record(
+            log::Level::Error,
+            "frankenterm_gui::auto_connect",
+            message,
+        );
+        log::error!("{message}");
+        persistent_toast_notification("Domain auto-connect unavailable", message);
+    }
     let previous = AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take());
+    if mint_auto_connect_supervisor_generation().is_none() {
+        let message = "automatic domain connection generation exhausted while fencing a cancelled supervisor; automatic connection is disabled for this process";
+        frankenterm_gui::gui_debug_log::record(
+            log::Level::Error,
+            "frankenterm_gui::auto_connect",
+            message,
+        );
+        log::error!("{message}");
+        persistent_toast_notification("Domain auto-connect unavailable", message);
+    }
     // Drop only after releasing the RefCell borrow. Cancellation may dispose
-    // future-owned domain guards and scheduler permits synchronously.
+    // future-owned domain guards and scheduler permits synchronously. The
+    // generation fence above is already visible before any destructor runs.
     drop(previous);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoConnectScheduleOutcome {
+    Scheduled,
+    ScheduledWithoutRequiredDomain,
+    AdmissionRetryPending,
+    Disabled,
+    StartupNotReady,
+    MissingMux,
+    NoEligibleDomains,
+    GenerationExhausted,
+    AdmissionRejected,
+}
+
+impl AutoConnectScheduleOutcome {
+    const fn establishes_retry_handoff(self) -> bool {
+        matches!(
+            self,
+            Self::Scheduled | Self::AdmissionRetryPending | Self::StartupNotReady
+        )
+    }
+}
+
+enum AutoConnectSupervisorAdmission {
+    Scheduled,
+    Superseded,
+    Retryable(String),
+    Terminal(String),
+}
+
+fn retry_frontier_includes(
+    pending: &[String],
+    required_domain: Option<&str>,
+) -> bool {
+    required_domain.is_none_or(|required| {
+        pending.iter().any(|candidate| candidate == required)
+    })
 }
 
 const fn auto_connect_supervisor_may_schedule(enabled: bool, startup_ready: bool) -> bool {
     enabled && startup_ready
 }
 
-fn schedule_auto_connect_domains() {
-    if !auto_connect_supervisor_may_schedule(
-        AUTO_CONNECT_ENABLED.load(Ordering::Acquire),
-        AUTO_CONNECT_STARTUP_READY.load(Ordering::Acquire),
+const fn auto_connect_retry_admission_outcome(
+    includes_required_domain: bool,
+) -> AutoConnectScheduleOutcome {
+    if includes_required_domain {
+        AutoConnectScheduleOutcome::AdmissionRetryPending
+    } else {
+        AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain
+    }
+}
+
+fn mint_auto_connect_admission_retry_generation() -> Option<u64> {
+    AUTO_CONNECT_ADMISSION_RETRY_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .and_then(|previous| previous.checked_add(1))
+}
+
+fn finish_auto_connect_admission_retry(observed_generation: u64) -> bool {
+    AUTO_CONNECT_ADMISSION_RETRY_ACTIVE.store(false, Ordering::Release);
+    AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire) != observed_generation
+        && AUTO_CONNECT_ADMISSION_RETRY_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
+fn start_auto_connect_admission_retry() -> bool {
+    if AUTO_CONNECT_ADMISSION_RETRY_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return true;
+    }
+    match std::thread::Builder::new()
+        .name("ft-domain-auto-admission".to_string())
+        .spawn(retry_auto_connect_admission)
+    {
+        Ok(_) => true,
+        Err(error) => {
+            AUTO_CONNECT_ADMISSION_RETRY_ACTIVE.store(false, Ordering::Release);
+            log::error!(
+                "failed to start automatic domain admission retry coordinator: {error}"
+            );
+            false
+        }
+    }
+}
+
+fn desired_auto_connect_domains_for_retry(config: &ConfigHandle) -> Vec<ClientDomainConfig> {
+    auto_connect_domain_configs(config)
+        .unwrap_or_else(|| configured_auto_connect_domain_configs(config))
+}
+
+fn try_admit_auto_connect_supervisor(
+    mux: Arc<Mux>,
+    request_generation: u64,
+    desired_domains: Arc<Vec<ClientDomainConfig>>,
+) -> AutoConnectSupervisorAdmission {
+    use promise::spawn::MainThreadReservationOutcome;
+
+    if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
+        != request_generation
+    {
+        return AutoConnectSupervisorAdmission::Superseded;
+    }
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Background,
+        32 * 1024,
     ) {
+        MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected @ (MainThreadReservationOutcome::RetryableFull(_)
+        | MainThreadReservationOutcome::RetiredGeneration(_)
+        | MainThreadReservationOutcome::Coalesced(_)
+        | MainThreadReservationOutcome::SchedulerUnavailable) => {
+            return AutoConnectSupervisorAdmission::Retryable(format!("{rejected:?}"));
+        }
+        rejected @ (MainThreadReservationOutcome::InvalidSize(_)
+        | MainThreadReservationOutcome::AuthorityExhausted(_)) => {
+            return AutoConnectSupervisorAdmission::Terminal(format!("{rejected:?}"));
+        }
+    };
+    if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
+        != request_generation
+    {
+        drop(reservation);
+        return AutoConnectSupervisorAdmission::Superseded;
+    }
+    let spawned = reservation.handoff_to_main_thread_local(move |reservation| {
+        if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
+            != request_generation
+            || !AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
+            || !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &mux))
+        {
+            return;
+        }
+        let Some(generation) = mint_auto_connect_supervisor_generation() else {
+            let message = "automatic domain connection generation exhausted during main-thread installation; automatic connection is disabled";
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Error,
+                "frankenterm_gui::auto_connect",
+                message,
+            );
+            log::error!("{message}");
+            persistent_toast_notification("Domain auto-connect unavailable", message);
+            return;
+        };
+        if !auto_connect_generation_is_current(&mux, generation, request_generation) {
+            return;
+        }
+        let task = reservation
+            .spawn_local(supervise_auto_connect_domains(
+                mux,
+                generation,
+                request_generation,
+                desired_domains,
+            ))
+            .into_task();
+        AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| {
+            let replaced = slot.borrow_mut().replace(task);
+            // The successor owns the same exact admission that carried the
+            // cross-thread bootstrap. Only now is it safe to cancel the prior
+            // main-thread-local supervisor.
+            drop(replaced);
+        });
+    });
+    if spawned
+        .initial_enqueue_receipt()
+        .snapshot_after_enqueue
+        .retired
+    {
+        drop(spawned);
+        return AutoConnectSupervisorAdmission::Retryable(
+            "scheduler generation retired during local-supervisor handoff".to_string(),
+        );
+    }
+    spawned.detach();
+    AutoConnectSupervisorAdmission::Scheduled
+}
+
+fn retry_auto_connect_admission() {
+    let mut delay = std::time::Duration::from_millis(10);
+    let mut attempts = 0_u64;
+    loop {
+        let request_generation =
+            AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
+        if !auto_connect_supervisor_may_schedule(
+            AUTO_CONNECT_ENABLED.load(Ordering::Acquire),
+            AUTO_CONNECT_STARTUP_READY.load(Ordering::Acquire),
+        ) {
+            if finish_auto_connect_admission_retry(request_generation) {
+                continue;
+            }
+            return;
+        }
+        let Some(mux) = Mux::try_get() else {
+            attempts = attempts.saturating_add(1);
+            if attempts == 1 || attempts % 100 == 0 {
+                log::warn!(
+                    "automatic domain admission is waiting for the mux singleton (attempt {attempts})"
+                );
+            }
+            std::thread::sleep(delay);
+            delay = delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_secs(1));
+            continue;
+        };
+        let desired_domains =
+            desired_auto_connect_domains_for_retry(&config::configuration());
+        if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
+            != request_generation
+        {
+            delay = std::time::Duration::from_millis(10);
+            attempts = 0;
+            continue;
+        }
+        if desired_domains.is_empty() {
+            if finish_auto_connect_admission_retry(request_generation) {
+                continue;
+            }
+            return;
+        }
+        match try_admit_auto_connect_supervisor(
+            mux,
+            request_generation,
+            Arc::new(desired_domains),
+        ) {
+            AutoConnectSupervisorAdmission::Scheduled => {
+                if finish_auto_connect_admission_retry(request_generation) {
+                    delay = std::time::Duration::from_millis(10);
+                    attempts = 0;
+                    continue;
+                }
+                return;
+            }
+            AutoConnectSupervisorAdmission::Superseded => {
+                delay = std::time::Duration::from_millis(10);
+                attempts = 0;
+            }
+            AutoConnectSupervisorAdmission::Retryable(rejection) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts % 100 == 0 {
+                    log::warn!(
+                        "automatic domain connection is waiting for main-thread admission (attempt {attempts}): {rejection}"
+                    );
+                }
+                std::thread::sleep(delay);
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(1));
+            }
+            AutoConnectSupervisorAdmission::Terminal(rejection) => {
+                log::error!(
+                    "automatic domain connection admission became terminal: {rejection}"
+                );
+                if finish_auto_connect_admission_retry(request_generation) {
+                    delay = std::time::Duration::from_millis(10);
+                    attempts = 0;
+                    continue;
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn schedule_auto_connect_domains() {
+    let _ = schedule_auto_connect_domains_requiring(None);
+}
+
+fn schedule_auto_connect_domain(
+    required_domain: &str,
+) -> AutoConnectScheduleOutcome {
+    schedule_auto_connect_domains_requiring(Some(required_domain))
+}
+
+fn schedule_auto_connect_domains_requiring(
+    required_domain: Option<&str>,
+) -> AutoConnectScheduleOutcome {
+    let Some(request_generation) = mint_auto_connect_admission_retry_generation() else {
+        AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
+        let previous = AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take());
+        drop(previous);
+        let message = "automatic domain admission request generation exhausted; automatic connection is disabled rather than accepting ambiguous retry authority";
+        frankenterm_gui::gui_debug_log::record(
+            log::Level::Error,
+            "frankenterm_gui::auto_connect",
+            message,
+        );
+        log::error!("{message}");
+        persistent_toast_notification("Domain auto-connect unavailable", message);
+        return AutoConnectScheduleOutcome::GenerationExhausted;
+    };
+    let enabled = AUTO_CONNECT_ENABLED.load(Ordering::Acquire);
+    let startup_ready = AUTO_CONNECT_STARTUP_READY.load(Ordering::Acquire);
+    if !auto_connect_supervisor_may_schedule(enabled, startup_ready) {
         cancel_auto_connect_supervisor();
-        return;
+        return if enabled {
+            AutoConnectScheduleOutcome::StartupNotReady
+        } else {
+            AutoConnectScheduleOutcome::Disabled
+        };
     }
     let Some(mux) = Mux::try_get() else {
         log::error!("cannot schedule domain auto-connect without the mux singleton");
@@ -1012,18 +1772,17 @@ fn schedule_auto_connect_domains() {
         // not leave that retired topology retrying merely because the process
         // singleton disappeared before this replacement attempt.
         cancel_auto_connect_supervisor();
-        return;
+        return AutoConnectScheduleOutcome::MissingMux;
     };
-    let pending = match auto_connect_domain_names(&mux) {
-        Ok(pending) => pending,
-        Err(error) => {
+    let config = config::configuration();
+    let desired_domains = match auto_connect_domain_configs(&config) {
+        Some(desired_domains) => desired_domains,
+        None => {
             // A damaged optional preference must never become connection
             // authority. Explicit configuration remains usable, while the
             // privacy-safe error tells the operator that remembered intent
             // was ignored rather than silently widening it.
-            let message = format!(
-                "remembered domain attachment intent is unavailable and was ignored; only explicit connect_automatically configuration will be used: {error}"
-            );
+            let message = "remembered domain attachment intent is unavailable and was ignored; only explicit connect_automatically configuration will be used".to_string();
             frankenterm_gui::gui_debug_log::record(
                 log::Level::Error,
                 "frankenterm_gui::auto_connect",
@@ -1031,50 +1790,62 @@ fn schedule_auto_connect_domains() {
             );
             log::error!("{message}");
             persistent_toast_notification("Remembered domain connections unavailable", &message);
-            configured_auto_connect_domain_names(&mux)
+            configured_auto_connect_domain_configs(&config)
         }
     };
-    if pending.is_empty() {
+    if desired_domains.is_empty() {
         cancel_auto_connect_supervisor();
-        return;
+        return AutoConnectScheduleOutcome::NoEligibleDomains;
     }
-    match promise::spawn::try_reserve_main_thread(
-        promise::spawn::MainThreadServiceClass::Background,
-        32 * 1024,
+    let pending = desired_domains
+        .iter()
+        .map(|domain| domain.name().to_string())
+        .collect::<Vec<_>>();
+    let includes_required_domain = retry_frontier_includes(&pending, required_domain);
+    match try_admit_auto_connect_supervisor(
+        mux,
+        request_generation,
+        Arc::new(desired_domains),
     ) {
-        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-            let generation = match AUTO_CONNECT_SUPERVISOR_GENERATION.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |current| current.checked_add(1),
-            ) {
-                Ok(previous) => previous + 1,
-                Err(_) => {
-                    let message = "automatic domain connection generation exhausted; preserving the current supervisor rather than reviving an ambiguous retired generation";
-                    frankenterm_gui::gui_debug_log::record(
-                        log::Level::Error,
-                        "frankenterm_gui::auto_connect",
-                        message,
-                    );
-                    log::error!("{message}");
-                    persistent_toast_notification("Domain auto-connect unavailable", message);
-                    return;
-                }
-            };
-            let task = reservation
-                .spawn_local(supervise_auto_connect_domains(mux, generation, pending))
-                .into_task();
-            AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| {
-                let replaced = slot.borrow_mut().replace(task);
-                // Replacement is intentional: the successor already owns a
-                // fresh generation and scheduler permit, so only now is it
-                // safe to cancel the prior supervisor.
-                drop(replaced);
-            });
+        AutoConnectSupervisorAdmission::Scheduled => {
+            if includes_required_domain {
+                AutoConnectScheduleOutcome::Scheduled
+            } else {
+                AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain
+            }
         }
-        rejected => {
+        AutoConnectSupervisorAdmission::Superseded => {
+            AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain
+        }
+        AutoConnectSupervisorAdmission::Retryable(rejected) => {
+            if start_auto_connect_admission_retry() {
+                let message = format!(
+                    "main-thread scheduler temporarily rejected automatic domain connections before task construction: {rejected}; a single bounded coordinator will retain and retry the newest request"
+                );
+                frankenterm_gui::gui_debug_log::record(
+                    log::Level::Warn,
+                    "frankenterm_gui::auto_connect",
+                    message.clone(),
+                );
+                log::warn!("{message}");
+                auto_connect_retry_admission_outcome(includes_required_domain)
+            } else {
+                let message = format!(
+                    "main-thread scheduler rejected automatic domain connections and the admission retry coordinator could not start: {rejected}"
+                );
+                frankenterm_gui::gui_debug_log::record(
+                    log::Level::Error,
+                    "frankenterm_gui::auto_connect",
+                    message.clone(),
+                );
+                log::error!("{message}");
+                persistent_toast_notification("Domain auto-connect unavailable", &message);
+                AutoConnectScheduleOutcome::AdmissionRejected
+            }
+        }
+        AutoConnectSupervisorAdmission::Terminal(rejected) => {
             let message = format!(
-                "main-thread scheduler rejected automatic domain connections before task construction: {rejected:?}; GUI startup will continue, any existing supervisor remains active, and a config reload or manual domain open can retry"
+                "main-thread scheduler terminally rejected automatic domain connections before task construction: {rejected}"
             );
             frankenterm_gui::gui_debug_log::record(
                 log::Level::Error,
@@ -1083,8 +1854,49 @@ fn schedule_auto_connect_domains() {
             );
             log::error!("{message}");
             persistent_toast_notification("Domain auto-connect unavailable", &message);
+            AutoConnectScheduleOutcome::AdmissionRejected
         }
     }
+}
+
+fn report_startup_domain_retry_handoff(
+    domain_name: &str,
+    outcome: AutoConnectScheduleOutcome,
+) {
+    use frankenterm_core::output::sanitize_redact_truncate_bounded;
+    use frankenterm_core::policy::Redactor;
+
+    let redactor = Redactor::new();
+    let safe_domain = sanitize_redact_truncate_bounded(domain_name, 96, 256, |text| {
+        redactor.redact(text)
+    });
+    let (level, title, message) = if outcome.establishes_retry_handoff() {
+        (
+            log::Level::Info,
+            "Domain automatic retry scheduled",
+            format!(
+                "GUI startup completed; domain `{safe_domain}` was admitted to the exact automatic-retry frontier"
+            ),
+        )
+    } else {
+        (
+            log::Level::Error,
+            "Domain automatic retry unavailable",
+            format!(
+                "GUI startup completed, but domain `{safe_domain}` was not admitted to automatic retry ({outcome:?}); retry it manually"
+            ),
+        )
+    };
+    frankenterm_gui::gui_debug_log::record(
+        level,
+        "frankenterm_gui::startup_domain_retry",
+        message.clone(),
+    );
+    match level {
+        log::Level::Error => log::error!("{message}"),
+        _ => log::info!("{message}"),
+    }
+    persistent_toast_notification(title, &message);
 }
 
 async fn trigger_gui_startup(
@@ -1185,11 +1997,16 @@ fn cell_pixel_dims(config: &ConfigHandle, dpi: f64) -> anyhow::Result<(usize, us
     ))
 }
 
+#[derive(Debug, Default)]
+struct TerminalGuiStartupOutcome {
+    retry_domain: Option<String>,
+}
+
 async fn async_run_terminal_gui(
     cmd: Option<CommandBuilder>,
     opts: StartCommand,
     should_publish: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TerminalGuiStartupOutcome> {
     let pid = std::process::id();
     let unix_socket_path = config::RUNTIME_DIR.join(format!("frankenterm-gui-sock-{}", pid));
     #[allow(unused_unsafe)]
@@ -1222,6 +2039,7 @@ async fn async_run_terminal_gui(
         (spawn, None) => spawn,
     };
     let mux = Mux::try_get().context("mux singleton is not available")?;
+    initialize_domain_reconnect_manifest_snapshot().await;
 
     let domain = if let Some(name) = &opts.domain {
         let domain = mux
@@ -1249,7 +2067,16 @@ async fn async_run_terminal_gui(
                 *builder
             };
 
+            let mut remembered_attachment = false;
+            let mut attachment_attempt_started = false;
+            let mut attachment_committed = false;
             let remote_open_result = async {
+                let _lifecycle =
+                    mux_lua::reserve_domain_lifecycle(domain.domain_name().to_string())
+                        .context("reserving ordered startup domain lifecycle")?
+                        .enter()
+                        .await
+                        .context("entering ordered startup domain lifecycle")?;
                 if domain.downcast_ref::<ClientDomain>().is_some() {
                     let persisted_domain_name = domain.domain_name().to_string();
                     promise::spawn::spawn_into_new_thread(move || {
@@ -1257,16 +2084,19 @@ async fn async_run_terminal_gui(
                             &persisted_domain_name,
                             DomainAttachmentIntent::Attached,
                         )
-                        .map(|_| ())
                         .map_err(anyhow::Error::new)
                     })
                     .await
-                    .context("persisting explicitly requested domain attachment intent")?;
+                    .context("persisting explicitly requested domain attachment intent")
+                    .map(publish_domain_reconnect_manifest_snapshot)?;
+                    remembered_attachment = true;
                 }
                 let owner_client_id = mux.active_identity();
+                attachment_attempt_started = true;
                 domain
                     .attach(&mux, owner_client_id, Some(window_id))
                     .await?;
+                attachment_committed = true;
                 let config = config::configuration();
                 let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
                 let tab = domain
@@ -1292,18 +2122,38 @@ async fn async_run_terminal_gui(
 
             if let Err(error) = remote_open_result {
                 if domain.downcast_ref::<ClientDomain>().is_some() {
+                    let domain_retry_applicable =
+                        attachment_attempt_started && !attachment_committed;
+                    let retry_requested = domain_retry_applicable
+                        && (domain
+                            .downcast_ref::<ClientDomain>()
+                            .is_some_and(ClientDomain::connect_automatically)
+                            || remembered_attachment)
+                        && AUTO_CONNECT_ENABLED.load(Ordering::Acquire);
                     // An explicitly requested remote domain must not leave an
                     // inert empty window or terminate the whole GUI when its
                     // mux is temporarily unavailable or still on an older
                     // codec. Populate the already-published window with a
                     // local recovery shell; the independent auto-connect
-                    // supervisor keeps retrying configured auto domains and
-                    // will publish their recovered topology after success.
+                    // supervisor keeps retrying domains authorized by explicit
+                    // remembered intent or configuration and will publish their
+                    // recovered topology after success.
                     preserve_or_populate_window_after_remote_failure(
-                        &mux, domain, window_id, &error,
+                        &mux,
+                        domain,
+                        window_id,
+                        &error,
+                        remembered_attachment,
+                        // The exact retry handoff occurs only after the outer
+                        // startup transaction publishes StartupReady. Do not
+                        // promise it in this earlier recovery diagnostic.
+                        false,
                     )
                     .await?;
-                    return Ok(());
+                    return Ok(TerminalGuiStartupOutcome {
+                        retry_domain: retry_requested
+                            .then(|| domain.domain_name().to_string()),
+                    });
                 }
                 return Err(anyhow!(domain_connection_failure_message(
                     domain.domain_name(),
@@ -1314,7 +2164,8 @@ async fn async_run_terminal_gui(
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
-    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await
+    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await?;
+    Ok(TerminalGuiStartupOutcome::default())
 }
 
 #[derive(Debug)]
@@ -1689,9 +2540,14 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     startup_reservation
         .spawn_local(async move {
             match async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
-                Ok(()) => {
+                Ok(outcome) => {
                     AUTO_CONNECT_STARTUP_READY.store(true, Ordering::Release);
-                    schedule_auto_connect_domains();
+                    if let Some(domain_name) = outcome.retry_domain {
+                        let schedule = schedule_auto_connect_domain(&domain_name);
+                        report_startup_domain_retry_handoff(&domain_name, schedule);
+                    } else {
+                        schedule_auto_connect_domains();
+                    }
                 }
                 Err(err) => terminate_with_error(err),
             }
@@ -1715,21 +2571,54 @@ fn initialize_window_state_persistence() {
         );
     }
 
-    mux_lua::install_domain_intent_recorder(Arc::new(|domain_name, intent| {
+    mux_lua::install_domain_lifecycle_recorder(Arc::new(|domain_name, event| {
         Box::pin(async move {
             if domain_name == "local" {
                 return Ok(());
             }
-            let intent = match intent {
-                mux_lua::DomainIntent::Attached => DomainAttachmentIntent::Attached,
-                mux_lua::DomainIntent::Detached => DomainAttachmentIntent::Detached,
-            };
-            promise::spawn::spawn_into_new_thread(move || {
-                domain_reconnect_manifest::set_intent(&domain_name, intent)
-                    .map(|_| ())
-                    .map_err(anyhow::Error::new)
-            })
-            .await
+            match event {
+                mux_lua::DomainLifecycleEvent::Attached => {
+                    let manifest = promise::spawn::spawn_into_new_thread(move || {
+                        domain_reconnect_manifest::set_intent(
+                            &domain_name,
+                            DomainAttachmentIntent::Attached,
+                        )
+                        .map_err(anyhow::Error::new)
+                    })
+                    .await?;
+                    publish_domain_reconnect_manifest_snapshot(manifest);
+                    schedule_auto_connect_domains();
+                    Ok(())
+                }
+                mux_lua::DomainLifecycleEvent::Detached => {
+                    promise::spawn::spawn_into_new_thread(move || {
+                        domain_reconnect_manifest::set_intent(
+                            &domain_name,
+                            DomainAttachmentIntent::Detached,
+                        )
+                        .map_err(anyhow::Error::new)
+                    })
+                    .await
+                    .map(publish_domain_reconnect_manifest_snapshot)
+                }
+                mux_lua::DomainLifecycleEvent::AttachFailed => {
+                    let outcome = schedule_auto_connect_domain(&domain_name);
+                    anyhow::ensure!(
+                        outcome.establishes_retry_handoff(),
+                        "the exact failed domain was not admitted to automatic retry ({outcome:?})"
+                    );
+                    Ok(())
+                }
+                mux_lua::DomainLifecycleEvent::DetachedPersisted => {
+                    // Detachment authority is already durable. Fence the old
+                    // snapshot before rebuilding it so no retired retry task
+                    // can race the subsequent live detach and reconnect the
+                    // domain against the operator's explicit choice.
+                    cancel_auto_connect_supervisor();
+                    schedule_auto_connect_domains();
+                    Ok(())
+                }
+            }
         })
     }));
 }
@@ -2013,6 +2902,36 @@ mod tests {
     }
 
     #[test]
+    fn failed_domain_backoff_does_not_starve_newly_detached_peer() {
+        let now = std::time::Instant::now();
+        let desired = vec!["trj".to_string(), "csd".to_string()];
+        let mut retries = BTreeMap::new();
+        refresh_auto_connect_retry_frontier(&mut retries, &desired, now, |name| name == "trj");
+        let trj = retries.get_mut("trj").expect("trj enters retry state");
+        trj.failure_count = 5;
+        trj.next_attempt = now + std::time::Duration::from_secs(30);
+
+        let peer_detached_at = now + std::time::Duration::from_secs(1);
+        refresh_auto_connect_retry_frontier(
+            &mut retries,
+            &desired,
+            peer_detached_at,
+            |_name| true,
+        );
+
+        assert_eq!(
+            due_auto_connect_domains(&retries, peer_detached_at),
+            vec!["csd".to_string()],
+            "a newly detached peer must be admitted immediately instead of waiting behind trj's backoff"
+        );
+        assert_eq!(
+            retries.get("trj").map(|state| state.failure_count),
+            Some(5),
+            "health discovery must preserve the failing domain's independent backoff"
+        );
+    }
+
+    #[test]
     fn auto_connect_retry_jitter_is_deterministic_bounded_and_nonzero() {
         let ceiling = std::time::Duration::from_secs(30);
         let first = auto_connect_retry_delay_with_process_id(ceiling, 7, 11, 101);
@@ -2085,16 +3004,91 @@ mod tests {
     #[test]
     fn disabled_auto_connect_never_promises_an_automatic_retry() {
         assert_eq!(
-            configured_remote_recovery(true, false),
+            configured_remote_recovery(true, false, false, true),
             DomainConnectionRecovery::LocalRecoveryShell
         );
         assert_eq!(
-            configured_remote_recovery(true, true),
+            configured_remote_recovery(false, true, false, true),
+            DomainConnectionRecovery::LocalRecoveryShell
+        );
+        assert_eq!(
+            configured_remote_recovery(true, false, true, true),
             DomainConnectionRecovery::AutomaticRetry
+        );
+        assert_eq!(
+            configured_remote_recovery(false, true, true, true),
+            DomainConnectionRecovery::AutomaticRetry
+        );
+        assert_eq!(
+            configured_remote_recovery(true, true, true, false),
+            DomainConnectionRecovery::LocalRecoveryShell,
+            "a post-attach spawn failure must not promise a domain retry"
         );
         assert!(!auto_connect_supervisor_may_schedule(true, false));
         assert!(!auto_connect_supervisor_may_schedule(false, true));
         assert!(auto_connect_supervisor_may_schedule(true, true));
+    }
+
+    #[test]
+    fn retry_promise_requires_the_exact_domain_in_the_scheduled_frontier() {
+        let pending = vec!["trj".to_string(), "csd".to_string()];
+        assert!(retry_frontier_includes(&pending, None));
+        assert!(retry_frontier_includes(&pending, Some("trj")));
+        assert!(retry_frontier_includes(&pending, Some("csd")));
+        assert!(!retry_frontier_includes(&pending, Some("TRJ")));
+        assert!(!retry_frontier_includes(&pending, Some("missing")));
+
+        assert_eq!(
+            auto_connect_retry_admission_outcome(true),
+            AutoConnectScheduleOutcome::AdmissionRetryPending
+        );
+        assert_eq!(
+            auto_connect_retry_admission_outcome(false),
+            AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain,
+            "scheduler retry must not promise a domain absent from its exact frontier"
+        );
+
+        assert!(AutoConnectScheduleOutcome::Scheduled.establishes_retry_handoff());
+        assert!(
+            AutoConnectScheduleOutcome::AdmissionRetryPending.establishes_retry_handoff()
+        );
+        assert!(AutoConnectScheduleOutcome::StartupNotReady.establishes_retry_handoff());
+        for outcome in [
+            AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain,
+            AutoConnectScheduleOutcome::Disabled,
+            AutoConnectScheduleOutcome::MissingMux,
+            AutoConnectScheduleOutcome::NoEligibleDomains,
+            AutoConnectScheduleOutcome::GenerationExhausted,
+            AutoConnectScheduleOutcome::AdmissionRejected,
+        ] {
+            assert!(
+                !outcome.establishes_retry_handoff(),
+                "unexpected retry promise: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_fences_generation_even_without_a_retained_task_handle() {
+        let request_before =
+            AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
+        let before = AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire);
+        cancel_auto_connect_supervisor();
+        let request_after =
+            AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
+        let after = AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire);
+        assert_eq!(
+            request_after,
+            request_before
+                .checked_add(1)
+                .expect("test request generation must not exhaust"),
+            "cancellation must invalidate every captured admission plan"
+        );
+        assert_eq!(
+            after,
+            before.checked_add(1).expect("test generation must not exhaust"),
+            "cancellation must invalidate an old epoch even when its task already completed"
+        );
     }
 
     type GuardedStartupFuture = std::pin::Pin<
