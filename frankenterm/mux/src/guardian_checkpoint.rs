@@ -1166,12 +1166,13 @@ impl std::fmt::Debug for GuardianCheckpointStageSealIntentV1 {
 /// One exact, canonical final-manifest operation.
 ///
 /// This capability is neither `Clone` nor `Copy`; all fields are private, and
-/// the only production issuance path consumes a validated capture/Genesis
-/// authority. Canonical manifest bytes and their identities remain zeroizing
-/// and have no accessor. A future guardian-runtime attestation constructor can
-/// issue this same private representation after checking its MAC-authenticated
-/// Seal request and live mux/pane incarnation, without introducing any raw
-/// request-field constructor here.
+/// its issuance machinery consumes both a validated capture/Genesis authority
+/// and an independently validated Phase-A assembly witness. Canonical manifest
+/// bytes and their identities remain zeroizing and have no accessor. A future
+/// guardian-runtime attestation constructor can issue the opaque prerequisite
+/// authorities after checking its MAC-authenticated Seal request, live mux/pane
+/// incarnation, and journal assembly, without introducing a raw request-field
+/// constructor here.
 #[must_use = "a validated checkpoint manifest operation must be consumed"]
 pub struct GuardianCheckpointValidatedManifestOperationV1 {
     binding: GuardianCheckpointStageBindingV1,
@@ -1250,6 +1251,12 @@ impl GuardianCheckpointValidatedManifestOperationV1 {
             return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
         }
         let manifest_digest = checkpoint_seal_manifest_identity(&self.canonical_manifest)?;
+        if !checkpoint_stage_digests_match(
+            &manifest_digest,
+            &self.expected_manifest_digest,
+        ) {
+            return Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch);
+        }
         let (manifest_bytes, plaintext_digest) =
             checkpoint_stage_plaintext_identity(&self.canonical_manifest)?;
         if manifest_bytes != self.context.plaintext_bytes
@@ -1259,12 +1266,6 @@ impl GuardianCheckpointValidatedManifestOperationV1 {
             )
         {
             return Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch);
-        }
-        if !checkpoint_stage_digests_match(
-            &manifest_digest,
-            &self.expected_manifest_digest,
-        ) {
-            return Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch);
         }
         let operation_digest = checkpoint_seal_operation_identity(&self.context, &manifest_digest);
         if !checkpoint_stage_digests_match(
@@ -1300,7 +1301,7 @@ impl std::fmt::Debug for GuardianCheckpointValidatedManifestOperationV1 {
 /// the retry/time budget. A process restart deliberately loses this in-memory
 /// authority and remains fail-closed until the future authenticated
 /// runtime/journal remint seam reconstructs the exact operation.
-#[must_use = "a checkpoint manifest retry capability must be consumed or discarded"]
+#[must_use = "a checkpoint manifest retry capability must be retained or explicitly discarded"]
 pub struct GuardianCheckpointManifestRetryCapabilityV1 {
     operation: GuardianCheckpointValidatedManifestOperationV1,
 }
@@ -1310,7 +1311,6 @@ impl GuardianCheckpointManifestRetryCapabilityV1 {
     pub const fn context(&self) -> GuardianCheckpointStageRecordContextV1 {
         self.operation.context
     }
-
 }
 
 impl std::fmt::Debug for GuardianCheckpointManifestRetryCapabilityV1 {
@@ -1322,7 +1322,8 @@ impl std::fmt::Debug for GuardianCheckpointManifestRetryCapabilityV1 {
     }
 }
 
-/// Exactly one primary Seal operation and one same-operation retry.
+/// Exactly one primary Seal operation and one reusable same-operation retry
+/// authority.
 #[must_use = "checkpoint manifest capabilities must be consumed"]
 pub struct GuardianCheckpointManifestSealCapabilitiesV1 {
     primary: GuardianCheckpointValidatedManifestOperationV1,
@@ -4796,6 +4797,10 @@ mod tests {
         descriptor_substitution.canonical_manifest[56] ^= 1;
         assert!(descriptor_substitution.validate().is_err());
 
+        let mut capture_generation_substitution = fresh_operation();
+        capture_generation_substitution.canonical_manifest[120] ^= 1;
+        assert!(capture_generation_substitution.validate().is_err());
+
         let mut candidate_digest_substitution = fresh_operation();
         candidate_digest_substitution.canonical_manifest[request_bytes] ^= 1;
         assert!(matches!(
@@ -4807,6 +4812,17 @@ mod tests {
         chunk_set_digest_substitution.canonical_manifest[request_bytes + 32] ^= 1;
         assert!(matches!(
             chunk_set_digest_substitution.validate(),
+            Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch)
+        ));
+
+        let mut component_order_substitution = fresh_operation();
+        for offset in 0..32 {
+            component_order_substitution
+                .canonical_manifest
+                .swap(request_bytes + offset, request_bytes + 32 + offset);
+        }
+        assert!(matches!(
+            component_order_substitution.validate(),
             Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch)
         ));
 
@@ -4992,7 +5008,7 @@ mod tests {
         let header = record.fixed_header();
         assert_eq!(&header[FORMER_CLEAR_DIGEST_OFFSET..], &[0; 32]);
         let aad = checkpoint_stage_record_aad(cipher.key_id(), &context);
-        let expected_domain = b"frankenterm.guardian-checkpoint-phase-a-record.v2\0";
+        let expected_domain = b"frankenterm.guardian-checkpoint-phase-a-record.v3\0";
         assert_eq!(&aad[..expected_domain.len()], expected_domain);
         assert_eq!(
             &aad[expected_domain.len()..expected_domain.len() + 4],

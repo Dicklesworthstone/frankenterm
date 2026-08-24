@@ -13,7 +13,7 @@ publish = false
 
 [features]
 bench-scalar-vte-scan = []
-use_serde = ["termwiz/use_serde", "frankenterm-cell/use_serde", "frankenterm-escape-parser/use_serde", "frankenterm-surface/use_serde"]
+use_serde = ["termwiz/use_serde", "frankenterm-cell/use_serde", "frankenterm-escape-parser/use_serde", "frankenterm-surface/use_serde", "dep:zeroize"]
 
 [dependencies]
 anyhow.workspace = true
@@ -36,6 +36,7 @@ serde_json.workspace = true
 terminfo.workspace = true
 unicode-normalization.workspace = true
 url.workspace = true
+zeroize = { workspace = true, optional = true }
 frankenterm-bidi.workspace = true
 frankenterm-dynamic = {workspace = true, features=["std"]}
 frankenterm-cell = {workspace = true, features=["std", "use_image"]}

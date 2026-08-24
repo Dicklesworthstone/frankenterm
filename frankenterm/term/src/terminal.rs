@@ -4,6 +4,8 @@ use frankenterm_escape_parser::parser::{Parser, RecoveryGroundBoundary};
 #[cfg(feature = "use_serde")]
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "use_serde")]
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Versioned identity for terminal-model semantics used by guardian suffix
 /// replay. Bump this whenever Performer, width, eviction, reset, or checkpoint
@@ -130,8 +132,9 @@ pub struct Terminal {
 /// was recovery-ground.  The fields are deliberately private so a guardian
 /// cannot pair state bytes with an unrelated parser instance.
 #[cfg(feature = "use_serde")]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct RecoveryTerminalCheckpointV2 {
-    canonical_payload: Vec<u8>,
+    canonical_payload: Zeroizing<Vec<u8>>,
     rows: usize,
     cols: usize,
     parser_stream_bytes: u64,
@@ -163,9 +166,11 @@ impl RecoveryTerminalCheckpointV2 {
         self.parser_stream_bytes
     }
 
+    /// Consume the checkpoint while keeping its plaintext payload under an
+    /// automatic wipe-on-drop guard.
     #[must_use]
-    pub fn into_canonical_payload(self) -> Vec<u8> {
-        self.canonical_payload
+    pub fn into_canonical_payload(mut self) -> Zeroizing<Vec<u8>> {
+        std::mem::take(&mut self.canonical_payload)
     }
 }
 
@@ -751,9 +756,11 @@ impl Terminal {
                 limits,
             )
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
-        let canonical_payload = checkpoint
-            .to_canonical_json(limits)
-            .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
+        let canonical_payload = Zeroizing::new(
+            checkpoint
+                .to_canonical_json(limits)
+                .map_err(RecoveryTerminalCheckpointError::Checkpoint)?,
+        );
         let size = self.state.get_size();
         Ok(RecoveryTerminalCheckpointV2 {
             canonical_payload,
@@ -997,6 +1004,24 @@ mod tests {
             )
             .expect("capture owned-parser checkpoint");
         assert_eq!(checkpoint.parser_stream_bytes(), 7);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn recovery_checkpoint_plaintext_remains_wipe_guarded_when_consumed() {
+        fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        fn require_zeroizing_payload(_: &Zeroizing<Vec<u8>>) {}
+
+        require_zeroize_on_drop::<RecoveryTerminalCheckpointV2>();
+        let checkpoint = make_prop_term(4, 8)
+            .capture_recovery_checkpoint(
+                crate::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+            )
+            .expect("capture wipe-guarded checkpoint");
+        let expected = Zeroizing::new(checkpoint.canonical_payload().to_vec());
+        let payload = checkpoint.into_canonical_payload();
+        require_zeroizing_payload(&payload);
+        assert_eq!(payload.as_slice(), expected.as_slice());
     }
 
     #[cfg(feature = "use_serde")]

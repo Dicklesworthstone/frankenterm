@@ -12,6 +12,7 @@
 use crate::transport::provision_guardian_token_in_pinned_parent;
 use mio::Waker;
 use mux::guardian_checkpoint::{
+    GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES, GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES,
     GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
     GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES, GuardianCheckpointArtifactDescriptorV1,
     GuardianCheckpointBoundaryError, GuardianCheckpointCipher, GuardianCheckpointCipherError,
@@ -148,6 +149,10 @@ impl GuardianCheckpointStagePolicy {
         if self.max_retained_uploads == 0
             || protocol_files_per_upload != CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD
             || protocol_bytes_per_upload != CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD
+            || u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES).ok()
+                != Some(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
+            || u32::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES).ok()
+                != Some(GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)
             || self.max_retained_uploads > CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
             || self.max_stage_files < minimum_files
             || self.max_stage_files > CHECKPOINT_STAGE_MAX_FILES
@@ -224,6 +229,8 @@ pub(crate) enum GuardianCheckpointStageStoreError {
     CandidateAbsent,
     #[error("guardian checkpoint staging origin authority does not match its scope")]
     OriginAuthorityMismatch,
+    #[error("guardian checkpoint staging publication authority is unavailable")]
+    PublicationAuthorityUnavailable,
 }
 
 impl GuardianCheckpointStageStoreError {
@@ -410,7 +417,6 @@ struct CheckpointStageUploadInspection {
     publication_id: Uuid,
     next_index: u32,
     committed_bytes: u64,
-    seal_context: Option<GuardianCheckpointStageRecordContextV1>,
     candidate_digest: [u8; 32],
     chunk_set_digest: [u8; 32],
 }
@@ -1178,7 +1184,7 @@ impl GuardianCheckpointStageStore {
                 )?;
                 return checkpoint_chunk_progress(&shape, index);
             }
-            if index != inspection.next_index || inspection.seal_context.is_some() {
+            if index != inspection.next_index {
                 return Err(GuardianCheckpointStageStoreError::OutOfOrder);
             }
             let record_bytes = checkpoint_record_bytes_for_plaintext(bytes.len())?;
@@ -1241,7 +1247,7 @@ impl GuardianCheckpointStageStore {
         }
         let shape = CheckpointStageRequestShape::from_request(request)?;
         self.with_exclusive_directory(|inner| {
-            let mut census = checkpoint_stage_census(inner)?;
+            let census = checkpoint_stage_census(inner)?;
             let inspection = checkpoint_inspect_upload(inner, &census, &shape)?
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if inspection.next_index != shape.total_chunks
@@ -1256,7 +1262,7 @@ impl GuardianCheckpointStageStore {
                 inspection.publication_id,
             )?;
             request.validate_staged_plaintext(payload.as_slice())?;
-            let manifest_authority = match origin_authority {
+            let _manifest_authority = match origin_authority {
                 GuardianCheckpointOriginAuthority::Record {
                     journal,
                     manifest_authority,
@@ -1276,69 +1282,17 @@ impl GuardianCheckpointStageStore {
                     return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
                 }
             };
-            let manifest = checkpoint_seal_manifest(
+            let _manifest = checkpoint_seal_manifest(
                 &shape,
                 inspection.candidate_digest,
                 inspection.chunk_set_digest,
             )?;
-            if let Some(observed_context) = inspection.seal_context {
-                let intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
-                    &shape.binding,
-                    manifest_authority,
-                    shape.upload_id,
-                    inspection.publication_id,
-                    manifest,
-                )?;
-                if !checkpoint_context_public_identity_matches(
-                    &observed_context,
-                    &intent.context(),
-                ) {
-                    return Err(GuardianCheckpointStageStoreError::Poisoned);
-                }
-                return Ok(checkpoint_sealed_reply(&shape));
-            }
-            let record_bytes = checkpoint_record_bytes_for_plaintext(manifest.len())?;
-            checkpoint_stage_require_capacity(
-                inner,
-                &census,
-                shape.key(),
-                1,
-                record_bytes,
-            )?;
-            let path = checkpoint_seal_path(
-                inner,
-                shape.key(),
-                inspection.publication_id,
-            )?;
-            let created = checkpoint_create_record_new(inner, &path)?;
-            let intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
-                &shape.binding,
-                manifest_authority,
-                shape.upload_id,
-                inspection.publication_id,
-                manifest,
-            )?;
-            let expected_context = intent.context();
-            match created {
-                CheckpointStageCreateOutcome::Created(file) => {
-                    let record = inner.cipher.seal(intent)?;
-                    checkpoint_write_created_record(inner, &path, file, &record)?;
-                }
-                CheckpointStageCreateOutcome::Existing => drop(intent),
-            }
-            census = checkpoint_stage_census(inner)?;
-            let sealed = checkpoint_inspect_upload(inner, &census, &shape)?
-                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
-            let Some(observed_context) = sealed.seal_context else {
-                return Err(GuardianCheckpointStageStoreError::Poisoned);
-            };
-            if !checkpoint_context_public_identity_matches(
-                &observed_context,
-                &expected_context,
-            ) {
-                return Err(GuardianCheckpointStageStoreError::Poisoned);
-            }
-            Ok(checkpoint_sealed_reply(&shape))
+            // The filesystem inspection above derives the exact assembly
+            // evidence needed by the v3 cipher, but raw request fields and
+            // digests cannot mint its nonconstructible witness. Until the
+            // authenticated runtime/journal boundary issues that witness,
+            // final publication and adoption remain deliberately unavailable.
+            Err(GuardianCheckpointStageStoreError::PublicationAuthorityUnavailable)
         })
     }
 
@@ -2065,23 +2019,6 @@ fn checkpoint_context_public_identity_matches(
         && observed.plaintext_bytes() == expected.plaintext_bytes()
 }
 
-fn checkpoint_shared_context_identity_matches(
-    observed: &GuardianCheckpointStageRecordContextV1,
-    candidate: &GuardianCheckpointStageRecordContextV1,
-) -> bool {
-    observed.scope() == candidate.scope()
-        && observed.upload_id() == candidate.upload_id()
-        && checkpoint_bytes_match(
-            &observed.boundary_identity_digest(),
-            &candidate.boundary_identity_digest(),
-        )
-        && checkpoint_bytes_match(
-            &observed.checkpoint_identity_digest(),
-            &candidate.checkpoint_identity_digest(),
-        )
-        && observed.publication_id() == candidate.publication_id()
-}
-
 fn checkpoint_inspect_upload(
     inner: &GuardianCheckpointStageStoreInner,
     census: &CheckpointStageCensus,
@@ -2120,6 +2057,13 @@ fn checkpoint_inspect_upload(
             Err(GuardianCheckpointStageStoreError::Poisoned)
         };
     };
+    if seal.is_some() {
+        // V3 Seal records can be authenticated only with the exact primary or
+        // retry operation capability. Production cannot mint the independent
+        // assembled-stage witness yet, so no Seal can be adopted here and the
+        // deterministic upload stays quarantined for a fresh upload identity.
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
     let begin_payload = Zeroizing::new(shape.begin_payload()?);
     let (candidate_context, candidate_plaintext) = checkpoint_open_record(
         inner,
@@ -2202,49 +2146,10 @@ fn checkpoint_inspect_upload(
     let next_index = u32::try_from(chunks.len())
         .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
     let chunk_set_digest: [u8; 32] = chunk_set.finalize().into();
-    let seal_context = if let Some(seal) = seal {
-        let publication = match seal.role {
-            CheckpointStageFileRole::Seal { publication_id } => publication_id,
-            CheckpointStageFileRole::Candidate | CheckpointStageFileRole::Chunk { .. } => {
-                return Err(GuardianCheckpointStageStoreError::Poisoned);
-            }
-        };
-        if publication != publication_id
-            || next_index != shape.total_chunks
-            || committed_bytes != shape.total_bytes
-        {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
-        let (seal_context, seal_plaintext) = checkpoint_open_record(
-            inner,
-            seal,
-            u32::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES)
-                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
-        )?;
-        let expected_manifest =
-            checkpoint_seal_manifest(shape, candidate_digest, chunk_set_digest)?;
-        if seal_context.kind() != GuardianCheckpointStageRecordKindV1::SealManifest
-            || seal_context.chunk_position().is_some()
-            || seal_context.plaintext_bytes()
-                != u32::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES)
-                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
-            || !checkpoint_shared_context_identity_matches(&seal_context, &candidate_context)
-            || !checkpoint_bytes_match(
-                seal_plaintext.as_slice(),
-                expected_manifest.as_slice(),
-            )
-        {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
-        Some(seal_context)
-    } else {
-        None
-    };
     Ok(Some(CheckpointStageUploadInspection {
         publication_id,
         next_index,
         committed_bytes,
-        seal_context,
         candidate_digest,
         chunk_set_digest,
     }))
