@@ -276,7 +276,7 @@ impl GuardianRequestHeader {
 #[derive(Clone, Eq, PartialEq)]
 pub struct GuardianRequestEnvelope {
     pub header: GuardianRequestHeader,
-    pub payload: Vec<u8>,
+    payload: Vec<u8>,
 }
 
 impl std::fmt::Debug for GuardianRequestEnvelope {
@@ -293,6 +293,17 @@ impl GuardianRequestEnvelope {
     #[must_use]
     pub fn new(header: GuardianRequestHeader, payload: Vec<u8>) -> Self {
         Self { header, payload }
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Wipe the owned payload immediately while retaining its authenticated
+    /// header for content-free correlation and diagnostics.
+    pub fn zeroize_payload(&mut self) {
+        self.payload.zeroize();
     }
 }
 
@@ -1178,7 +1189,7 @@ impl GuardianCheckpointReceipt {
 }
 
 struct GuardianBoundedPayloadBuffer {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
     max_bytes: usize,
     exceeded: bool,
 }
@@ -1186,14 +1197,14 @@ struct GuardianBoundedPayloadBuffer {
 impl GuardianBoundedPayloadBuffer {
     const fn new(max_bytes: usize) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Zeroizing::new(Vec::new()),
             max_bytes,
             exceeded: false,
         }
     }
 
-    fn into_inner(self) -> Vec<u8> {
-        self.bytes
+    fn into_inner(mut self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(std::mem::take(&mut *self.bytes))
     }
 }
 
