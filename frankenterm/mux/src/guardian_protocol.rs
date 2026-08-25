@@ -8095,6 +8095,164 @@ impl GuardianProtocolState {
         self.incarnation
     }
 
+    /// Install one authenticated Spawn fence recovered from durable broker
+    /// state before the service accepts traffic.
+    ///
+    /// Exact replay is idempotent. Reuse of any request, effect, or pane
+    /// identity with different authenticated Spawn bytes fails closed. This
+    /// method installs no pane and grants no spawn authority; it only makes a
+    /// fresh in-memory protocol state remember that the legacy Spawn callback
+    /// is permanently unavailable for the broker-managed identity.
+    pub fn install_durable_spawn_fence(
+        &mut self,
+        candidate: GuardianDurableSpawnFenceV1,
+    ) -> Result<GuardianDurableSpawnFenceInstallV1, GuardianProtocolError> {
+        if let Some(existing) = self
+            .durable_spawn_fences_by_request
+            .get(&candidate.origin_request_id)
+        {
+            let effect_request = self
+                .durable_spawn_fence_effects
+                .get(&existing.spawn_effect_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-request-effect-index",
+                ))?;
+            let pane_request = self
+                .durable_spawn_fence_panes
+                .get(&existing.durable_pane_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-request-pane-index",
+                ))?;
+            if *effect_request != existing.origin_request_id
+                || *pane_request != existing.origin_request_id
+            {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-request-index-identity",
+                ));
+            }
+            return if *existing == candidate {
+                Ok(GuardianDurableSpawnFenceInstallV1::AlreadyPresent)
+            } else {
+                Err(GuardianProtocolError::RequestIdentityConflict)
+            };
+        }
+        if self.requests.contains_key(&candidate.origin_request_id)
+            || self
+                .protected_spawn_requests
+                .contains(&candidate.origin_request_id)
+        {
+            return Err(GuardianProtocolError::RequestIdentityConflict);
+        }
+        if let Some(existing) = self
+            .genesis_reservations_by_request
+            .get(&candidate.origin_request_id)
+        {
+            if GuardianDurableSpawnFenceV1::from_genesis_record(existing) != candidate {
+                return Err(GuardianProtocolError::RequestIdentityConflict);
+            }
+        }
+
+        if let Some(request_id) = self
+            .durable_spawn_fence_effects
+            .get(&candidate.spawn_effect_id)
+        {
+            let existing = self
+                .durable_spawn_fences_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-effect-request-index",
+                ))?;
+            return Err(if *existing == candidate {
+                GuardianProtocolError::GenesisReservationAlreadyIssued
+            } else {
+                GuardianProtocolError::EffectIdentityConflict
+            });
+        }
+        if self.effects.contains_key(&candidate.spawn_effect_id)
+            || self
+                .protected_spawn_effects
+                .contains(&candidate.spawn_effect_id)
+        {
+            return Err(GuardianProtocolError::EffectIdentityConflict);
+        }
+        if let Some(request_id) = self
+            .genesis_reservation_effects
+            .get(&candidate.spawn_effect_id)
+        {
+            let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
+                    "genesis-effect-durable-spawn-index",
+                ),
+            )?;
+            if GuardianDurableSpawnFenceV1::from_genesis_record(existing) != candidate {
+                return Err(GuardianProtocolError::EffectIdentityConflict);
+            }
+        }
+
+        if let Some(request_id) = self
+            .durable_spawn_fence_panes
+            .get(&candidate.durable_pane_id)
+        {
+            let existing = self
+                .durable_spawn_fences_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-pane-request-index",
+                ))?;
+            return Err(if *existing == candidate {
+                GuardianProtocolError::GenesisReservationAlreadyIssued
+            } else {
+                GuardianProtocolError::PaneAlreadyExists(candidate.durable_pane_id)
+            });
+        }
+        if self.panes.contains_key(&candidate.durable_pane_id) {
+            return Err(GuardianProtocolError::PaneAlreadyExists(
+                candidate.durable_pane_id,
+            ));
+        }
+        if let Some(request_id) = self
+            .genesis_reservation_panes
+            .get(&candidate.durable_pane_id)
+        {
+            let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
+                    "genesis-pane-durable-spawn-index",
+                ),
+            )?;
+            if GuardianDurableSpawnFenceV1::from_genesis_record(existing) != candidate {
+                return Err(GuardianProtocolError::PaneAlreadyExists(
+                    candidate.durable_pane_id,
+                ));
+            }
+        }
+
+        if self.durable_spawn_fences_by_request.len() >= GUARDIAN_MAX_PANES {
+            return Err(GuardianProtocolError::CapacityExhausted);
+        }
+        self.durable_spawn_fences_by_request
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.durable_spawn_fence_effects
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.durable_spawn_fence_panes
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        let prior_request = self
+            .durable_spawn_fences_by_request
+            .insert(candidate.origin_request_id, candidate);
+        let prior_effect = self
+            .durable_spawn_fence_effects
+            .insert(candidate.spawn_effect_id, candidate.origin_request_id);
+        let prior_pane = self
+            .durable_spawn_fence_panes
+            .insert(candidate.durable_pane_id, candidate.origin_request_id);
+        debug_assert!(prior_request.is_none());
+        debug_assert!(prior_effect.is_none());
+        debug_assert!(prior_pane.is_none());
+        Ok(GuardianDurableSpawnFenceInstallV1::Installed)
+    }
+
     /// Bind one authenticated, build-bearing `Hello` to this guardian state.
     ///
     /// The mux incarnation and build identity are decoded exclusively from
@@ -8289,6 +8447,50 @@ impl GuardianProtocolState {
         &self,
         candidate: &GuardianGenesisReservationRecordV1,
     ) -> Result<(), GuardianProtocolError> {
+        let durable_candidate = GuardianDurableSpawnFenceV1::from_genesis_record(candidate);
+        if let Some(existing) = self
+            .durable_spawn_fences_by_request
+            .get(&candidate.origin_request_id)
+        {
+            return Err(if *existing == durable_candidate {
+                GuardianProtocolError::GenesisReservationAlreadyIssued
+            } else {
+                GuardianProtocolError::RequestIdentityConflict
+            });
+        }
+        if let Some(request_id) = self
+            .durable_spawn_fence_effects
+            .get(&candidate.spawn_effect_id)
+        {
+            let existing = self
+                .durable_spawn_fences_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-effect-genesis-index",
+                ))?;
+            return Err(if *existing == durable_candidate {
+                GuardianProtocolError::GenesisReservationAlreadyIssued
+            } else {
+                GuardianProtocolError::EffectIdentityConflict
+            });
+        }
+        if let Some(request_id) = self
+            .durable_spawn_fence_panes
+            .get(&candidate.durable_pane_id)
+        {
+            let existing = self
+                .durable_spawn_fences_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-pane-genesis-index",
+                ))?;
+            return Err(if *existing == durable_candidate {
+                GuardianProtocolError::GenesisReservationAlreadyIssued
+            } else {
+                GuardianProtocolError::PaneAlreadyExists(candidate.durable_pane_id)
+            });
+        }
+
         if let Some(existing) = self
             .genesis_reservations_by_request
             .get(&candidate.origin_request_id)
@@ -8351,6 +8553,7 @@ impl GuardianProtocolState {
             .panes
             .len()
             .checked_add(self.genesis_reservation_panes.len())
+            .and_then(|count| count.checked_add(self.durable_spawn_fence_panes.len()))
             .ok_or(GuardianProtocolError::CapacityExhausted)?;
         if reserved_panes >= GUARDIAN_MAX_PANES {
             return Err(GuardianProtocolError::CapacityExhausted);
@@ -8365,6 +8568,58 @@ impl GuardianProtocolState {
         if request.header.operation != GuardianOperation::Spawn {
             return Ok(());
         }
+        let effect_id =
+            request
+                .header
+                .effect_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::Spawn,
+                })?;
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::Spawn,
+                })?;
+
+        if let Some(existing) = self
+            .durable_spawn_fences_by_request
+            .get(&request.header.request_id)
+        {
+            return Err(if existing.matches_authenticated_spawn(request) {
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            } else {
+                GuardianProtocolError::RequestIdentityConflict
+            });
+        }
+        if let Some(request_id) = self.durable_spawn_fence_effects.get(&effect_id) {
+            let existing = self
+                .durable_spawn_fences_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-effect-spawn-fence",
+                ))?;
+            return Err(if existing.matches_authenticated_spawn(request) {
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            } else {
+                GuardianProtocolError::EffectIdentityConflict
+            });
+        }
+        if let Some(request_id) = self.durable_spawn_fence_panes.get(&pane_id) {
+            let existing = self
+                .durable_spawn_fences_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "durable-spawn-pane-spawn-fence",
+                ))?;
+            return Err(if existing.matches_authenticated_spawn(request) {
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            } else {
+                GuardianProtocolError::PaneAlreadyExists(pane_id)
+            });
+        }
+
         if let Some(existing) = self
             .genesis_reservations_by_request
             .get(&request.header.request_id)
@@ -8375,13 +8630,6 @@ impl GuardianProtocolState {
                 GuardianProtocolError::RequestIdentityConflict
             });
         }
-        let effect_id =
-            request
-                .header
-                .effect_id
-                .ok_or(GuardianProtocolError::InvalidOperationScope {
-                    operation: GuardianOperation::Spawn,
-                })?;
         if let Some(request_id) = self.genesis_reservation_effects.get(&effect_id) {
             let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
                 GuardianProtocolError::StateInvariantViolation("genesis-effect-spawn-fence"),
@@ -8392,13 +8640,6 @@ impl GuardianProtocolState {
                 GuardianProtocolError::EffectIdentityConflict
             });
         }
-        let pane_id =
-            request
-                .header
-                .pane_id
-                .ok_or(GuardianProtocolError::InvalidOperationScope {
-                    operation: GuardianOperation::Spawn,
-                })?;
         if let Some(request_id) = self.genesis_reservation_panes.get(&pane_id) {
             let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
                 GuardianProtocolError::StateInvariantViolation("genesis-pane-spawn-fence"),
