@@ -7848,6 +7848,12 @@ struct SshReadinessOperationMetrics {
     reactor_unavailable: metrics::Counter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshIoDirection {
+    Read,
+    Write,
+}
+
 impl SshReadinessOperationMetrics {
     fn new(operation: &'static str) -> Self {
         Self {
@@ -8021,39 +8027,37 @@ impl SshStream {
     }
 
     fn register_interest_for_read(&self, task_cx: &TaskContext<'_>) -> std::io::Result<()> {
-        self.register_interest(
-            &self.stdout,
-            &self.read_registration,
-            Interest::READABLE,
-            "read",
-            &self.readiness_metrics.read,
-            &self.read_poll_fallback,
-            task_cx,
-        )
+        self.register_interest(SshIoDirection::Read, task_cx)
     }
 
     fn register_interest_for_write(&self, task_cx: &TaskContext<'_>) -> std::io::Result<()> {
-        self.register_interest(
-            &self.stdin,
-            &self.write_registration,
-            Interest::WRITABLE,
-            "write",
-            &self.readiness_metrics.write,
-            &self.write_poll_fallback,
-            task_cx,
-        )
+        self.register_interest(SshIoDirection::Write, task_cx)
     }
 
     fn register_interest(
         &self,
-        desc: &FileDescriptor,
-        registration: &Mutex<Option<IoRegistration>>,
-        interest: Interest,
-        operation: &'static str,
-        readiness_metrics: &SshReadinessOperationMetrics,
-        _poll_fallback: &SshPollFallback,
+        direction: SshIoDirection,
         task_cx: &TaskContext<'_>,
     ) -> std::io::Result<()> {
+        let (desc, registration, interest, operation, readiness_metrics, _poll_fallback) =
+            match direction {
+                SshIoDirection::Read => (
+                    &self.stdout,
+                    &self.read_registration,
+                    Interest::READABLE,
+                    "read",
+                    &self.readiness_metrics.read,
+                    &self.read_poll_fallback,
+                ),
+                SshIoDirection::Write => (
+                    &self.stdin,
+                    &self.write_registration,
+                    Interest::WRITABLE,
+                    "write",
+                    &self.readiness_metrics.write,
+                    &self.write_poll_fallback,
+                ),
+            };
         let Some(current) = Cx::current() else {
             readiness_metrics.missing_cx.increment(1);
             return Err(SshReadinessAuthorityError::MissingContext { operation }.into_io_error());
