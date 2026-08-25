@@ -2308,6 +2308,7 @@ fn checkpoint_bytes_match(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+#[cfg(test)]
 fn checkpoint_zeroizing_sha256_digest(bytes: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut digest = Zeroizing::new([0_u8; 32]);
     // Finalize directly into the zeroizing owner rather than producing a raw
@@ -2335,9 +2336,9 @@ pub(crate) enum GuardianPaneInputTransactionError {
     JournalBeforeWrite,
     AuthorityBeforeWrite,
     OutcomeIndeterminate,
-    AcceptedJournalUnavailable(GuardianReply),
+    AcceptedJournalUnavailable,
     AcceptedAuthorityUnavailable,
-    AcceptedProtocolUnavailable(GuardianReply),
+    AcceptedProtocolUnavailable,
 }
 
 pub(crate) enum GuardianPaneInputCompletionError {
@@ -2407,26 +2408,22 @@ impl GuardianPaneInputJournal {
                 Err(GuardianPaneInputTransactionError::OutcomeIndeterminate)
             }
             Err(GuardianInputTransactionError::AcceptedJournalUnavailable {
-                accepted_reply,
+                accepted_reply: _,
                 error: _,
             }) => {
                 self.validate_path_authority().map_err(|_| {
                     GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
                 })?;
-                Err(GuardianPaneInputTransactionError::AcceptedJournalUnavailable(
-                    accepted_reply,
-                ))
+                Err(GuardianPaneInputTransactionError::AcceptedJournalUnavailable)
             }
             Err(GuardianInputTransactionError::AcceptedProtocolUnavailable {
-                accepted_reply,
+                accepted_reply: _,
                 error: _,
             }) => {
                 self.validate_path_authority().map_err(|_| {
                     GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
                 })?;
-                Err(GuardianPaneInputTransactionError::AcceptedProtocolUnavailable(
-                    accepted_reply,
-                ))
+                Err(GuardianPaneInputTransactionError::AcceptedProtocolUnavailable)
             }
         }
     }

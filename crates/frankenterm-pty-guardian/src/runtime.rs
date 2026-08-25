@@ -457,9 +457,9 @@ fn execute_input_job(job: &mut InputJob) -> InputJobExecution {
         },
         Err(
             GuardianPaneInputTransactionError::OutcomeIndeterminate
-            | GuardianPaneInputTransactionError::AcceptedJournalUnavailable(_)
+            | GuardianPaneInputTransactionError::AcceptedJournalUnavailable
             | GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
-            | GuardianPaneInputTransactionError::AcceptedProtocolUnavailable(_),
+            | GuardianPaneInputTransactionError::AcceptedProtocolUnavailable,
         ) => InputJobExecution {
             response: None,
             disposition: None,

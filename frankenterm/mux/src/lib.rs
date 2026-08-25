@@ -21076,7 +21076,9 @@ mod tests {
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "parser did not reach exact test watermark {target}; observed {parsed}"
+                    "parser did not reach exact test watermark {}; observed {}",
+                    target,
+                    parsed
                 );
                 std::thread::yield_now();
             }

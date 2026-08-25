@@ -10487,7 +10487,7 @@ mod tests {
             });
             let intended_reply = match first {
                 Err(GuardianEffectTransactionError::OutcomeIndeterminate(reply)) => reply,
-                other => panic!("expected indeterminate transaction, got {other:?}"),
+                other => panic!("expected indeterminate transaction, got {:?}", other),
             };
             assert_eq!(invocations.get(), 1);
             assert_eq!(
@@ -12785,7 +12785,7 @@ mod tests {
                 let _outcome = permit.write_once(&mut writer, authenticated_input.payload());
                 panic!("terminal capacity exhaustion must not yield write authority");
             }
-            other => panic!("unexpected capacity-negative outcome: {other:?}"),
+            other => panic!("unexpected capacity-negative outcome: {:?}", other),
         }
         assert_eq!(writer.calls, 0);
         assert_eq!(journal.record_count(), 0);

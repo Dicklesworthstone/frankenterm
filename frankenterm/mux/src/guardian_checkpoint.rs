@@ -2888,11 +2888,6 @@ impl LiveParserCaptureAuthority {
     const fn issue() -> Self {
         Self { _private: () }
     }
-
-    #[cfg(test)]
-    pub(crate) const fn issue_for_test() -> Self {
-        Self::issue()
-    }
 }
 
 #[derive(Debug, Error)]
@@ -3388,8 +3383,13 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs::File;
     use std::sync::Arc;
+    use syn::ext::IdentExt as _;
     use syn::visit::{self, Visit};
     use tempfile::tempdir;
+
+    fn canonical_ident(ident: &syn::Ident) -> String {
+        ident.unraw().to_string()
+    }
 
     const AUTHORITY_CRITICAL_TYPES: &[&str] = &[
         "GuardianCheckpointGenesisSpawnPermitV1",
@@ -3573,13 +3573,13 @@ mod tests {
             path.path
                 .segments
                 .last()
-                .map(|segment| segment.ident.to_string())
+                .map(|segment| canonical_ident(&segment.ident))
         }
 
         fn path_name(path: &syn::Path) -> Option<String> {
             path.segments
                 .last()
-                .map(|segment| segment.ident.to_string())
+                .map(|segment| canonical_ident(&segment.ident))
         }
 
         fn cfg_test(attributes: &[syn::Attribute]) -> bool {
@@ -3653,7 +3653,7 @@ mod tests {
                         let name = if segment.ident == "Self" {
                             self.owner.unwrap_or("Self").to_owned()
                         } else {
-                            segment.ident.to_string()
+                            canonical_ident(&segment.ident)
                         };
                         if AuthoritySurfaceAstInventory::protected(&name) {
                             self.names.insert(name);
@@ -3715,7 +3715,7 @@ mod tests {
             impl<'ast> Visit<'ast> for TypeNameVisitor {
                 fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
                     if let Some(name) = path.path.segments.last() {
-                        self.names.insert(name.ident.to_string());
+                        self.names.insert(canonical_ident(&name.ident));
                     }
                     visit::visit_type_path(self, path);
                 }
@@ -3775,7 +3775,7 @@ mod tests {
                         .filter(|owner| Self::protected(owner))
                         .cloned()
                 } else {
-                    let name = segment.ident.to_string();
+                    let name = canonical_ident(&segment.ident);
                     Self::protected(&name).then_some(name)
                 }
             });
@@ -3848,7 +3848,7 @@ mod tests {
         }
 
         fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
-            let target = item.ident.to_string();
+            let target = canonical_ident(&item.ident);
             if Self::protected(&target) {
                 for derived in Self::derive_names(&item.attrs) {
                     self.derives.push(format!("{target}:{derived}"));
@@ -3887,7 +3887,7 @@ mod tests {
         }
 
         fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
-            let owner = item.ident.to_string();
+            let owner = canonical_ident(&item.ident);
             for variant in &item.variants {
                 for field in &variant.fields {
                     for protected in Self::protected_names_in_type(&field.ty, Some(&owner)) {
@@ -3902,7 +3902,7 @@ mod tests {
         }
 
         fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
-            let owner = item.ident.to_string();
+            let owner = canonical_ident(&item.ident);
             for field in &item.fields.named {
                 for protected in Self::protected_names_in_type(&field.ty, Some(&owner)) {
                     self.external_storage_sites.push(format!(
@@ -3918,7 +3918,7 @@ mod tests {
         }
 
         fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
-            self.traits.push(item.ident.to_string());
+            self.traits.push(canonical_ident(&item.ident));
             visit::visit_item_trait(self, item);
         }
 
@@ -3994,7 +3994,9 @@ mod tests {
                 &function.vis,
                 cfg_test,
             );
-            let previous_function = self.current_function.replace(function.sig.ident.to_string());
+            let previous_function = self
+                .current_function
+                .replace(canonical_ident(&function.sig.ident));
             if !cfg_test {
                 visit::visit_impl_item_fn(self, function);
             }
@@ -4015,7 +4017,9 @@ mod tests {
                 &function.vis,
                 cfg_test,
             );
-            let previous_function = self.current_function.replace(function.sig.ident.to_string());
+            let previous_function = self
+                .current_function
+                .replace(canonical_ident(&function.sig.ident));
             if !cfg_test {
                 visit::visit_item_fn(self, function);
             }
@@ -4238,7 +4242,7 @@ mod tests {
         fn path_label(path: &syn::Path) -> String {
             path.segments
                 .iter()
-                .map(|segment| segment.ident.to_string())
+                .map(|segment| canonical_ident(&segment.ident))
                 .collect::<Vec<_>>()
                 .join("::")
         }
@@ -4250,7 +4254,7 @@ mod tests {
             path.path
                 .segments
                 .last()
-                .map(|segment| segment.ident.to_string())
+                .map(|segment| canonical_ident(&segment.ident))
         }
 
         fn parse_meta_list(list: &syn::MetaList) -> Option<Vec<syn::Meta>> {
@@ -4333,7 +4337,7 @@ mod tests {
                         let name = if segment.ident == "Self" {
                             self.owner.unwrap_or("Self").to_owned()
                         } else {
-                            segment.ident.to_string()
+                            canonical_ident(&segment.ident)
                         };
                         if ProtocolDeliveryAstInventory::protected(&name) {
                             self.names.insert(name);
@@ -4404,7 +4408,7 @@ mod tests {
             {
                 self.methods.push(surface.clone());
             }
-            if Self::duplicate_like(&signature.ident.to_string()) {
+            if Self::duplicate_like(&canonical_ident(&signature.ident)) {
                 self.clone_like_factories.push(surface);
             }
             for returned in Self::return_names(&signature.output, owner) {
@@ -4441,7 +4445,7 @@ mod tests {
                         .filter(|owner| Self::protected(owner))
                         .cloned()
                 } else {
-                    let name = segment.ident.to_string();
+                    let name = canonical_ident(&segment.ident);
                     Self::protected(&name).then_some(name)
                 }
             })
@@ -4450,13 +4454,13 @@ mod tests {
         fn use_tree_mentions_protected(tree: &syn::UseTree) -> bool {
             match tree {
                 syn::UseTree::Path(path) => {
-                    Self::protected(&path.ident.to_string())
+                    Self::protected(&canonical_ident(&path.ident))
                         || Self::use_tree_mentions_protected(&path.tree)
                 }
-                syn::UseTree::Name(name) => Self::protected(&name.ident.to_string()),
+                syn::UseTree::Name(name) => Self::protected(&canonical_ident(&name.ident)),
                 syn::UseTree::Rename(rename) => {
-                    Self::protected(&rename.ident.to_string())
-                        || Self::protected(&rename.rename.to_string())
+                    Self::protected(&canonical_ident(&rename.ident))
+                        || Self::protected(&canonical_ident(&rename.rename))
                 }
                 syn::UseTree::Group(group) => {
                     group.items.iter().any(Self::use_tree_mentions_protected)
@@ -4609,7 +4613,7 @@ mod tests {
             if Self::cfg_test_only(&item.attrs) {
                 return;
             }
-            let owner = item.ident.to_string();
+            let owner = canonical_ident(&item.ident);
             if Self::protected(&owner) {
                 self.structs.push(ProtocolDeliveryStructSurface {
                     name: owner.clone(),
@@ -4659,7 +4663,7 @@ mod tests {
             if Self::cfg_test_only(&item.attrs) {
                 return;
             }
-            let owner = item.ident.to_string();
+            let owner = canonical_ident(&item.ident);
             if owner == "GuardianCheckpointStageBodyV1" {
                 self.stage_bodies.push(item.clone());
             }
@@ -4706,7 +4710,7 @@ mod tests {
             if Self::cfg_test_only(&item.attrs) {
                 return;
             }
-            let owner = item.ident.to_string();
+            let owner = canonical_ident(&item.ident);
             for field in &item.fields.named {
                 if Self::cfg_test_only(&field.attrs) {
                     continue;
@@ -4764,12 +4768,12 @@ mod tests {
             }
             let owner = self.current_impl_owner.clone();
             self.record_signature(owner.as_deref(), &function.sig, &function.vis);
-            let function_name = function.sig.ident.to_string();
+            let function_name = canonical_ident(&function.sig.ident);
             if matches!(
                 (owner.as_deref(), function_name.as_str()),
                 (
                     Some("GuardianCheckpointStageChunkDeliveryV1"),
-                    "into_bytes"
+                    "into_validated_parts"
                 ) | (Some("GuardianCheckpointStageRequestV1"), "into_chunk")
                     | (Some("GuardianCheckpointStageRequestV1"), "encode")
                     | (
@@ -4794,7 +4798,9 @@ mod tests {
                     &function.attrs,
                 );
             }
-            let previous_function = self.current_function.replace(function.sig.ident.to_string());
+            let previous_function = self
+                .current_function
+                .replace(canonical_ident(&function.sig.ident));
             visit::visit_impl_item_fn(self, function);
             self.current_function = previous_function;
         }
@@ -4804,7 +4810,9 @@ mod tests {
                 return;
             }
             self.record_signature(None, &function.sig, &function.vis);
-            let previous_function = self.current_function.replace(function.sig.ident.to_string());
+            let previous_function = self
+                .current_function
+                .replace(canonical_ident(&function.sig.ident));
             visit::visit_item_fn(self, function);
             self.current_function = previous_function;
         }
@@ -5205,19 +5213,7 @@ mod tests {
                 "GuardianCheckpointStageChunkDeliveryV1",
                 "pub",
                 false,
-                "fn chunk_digest(&self) -> &[u8; 32]",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointStageChunkDeliveryV1",
-                "pub",
-                false,
-                "fn bytes(&self) -> &[u8]",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointStageChunkDeliveryV1",
-                "pub",
-                false,
-                "fn into_bytes(mut self) -> Zeroizing<Vec<u8>>",
+                "fn into_validated_parts(mut self) -> Result<((u32, u64), Zeroizing<Vec<u8>>), GuardianProtocolError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointStageRequestV1",
@@ -5420,8 +5416,18 @@ mod tests {
             expected_protocol_ownership_method(
                 "GuardianCheckpointStageChunkDeliveryV1",
                 r#"
-                    pub fn into_bytes(mut self) -> Zeroizing<Vec<u8>> {
-                        std::mem::take(&mut self.bytes)
+                    pub fn into_validated_parts(
+                        mut self,
+                    ) -> Result<((u32, u64), Zeroizing<Vec<u8>>), GuardianProtocolError> {
+                        let observed_digest = zeroizing_sha256_digest(self.bytes.as_slice());
+                        if !checkpoint_chunk_digest_matches(
+                            observed_digest.as_slice(),
+                            self.chunk_digest.as_slice(),
+                        ) {
+                            return Err(GuardianProtocolError::InvalidOperationPayload);
+                        }
+                        let position = (self.index, self.offset);
+                        Ok((position, std::mem::take(&mut self.bytes)))
                     }
                 "#,
             ),
@@ -7708,7 +7714,6 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1::validate:private:production",
             "GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
             "LiveParserCaptureAuthority::issue:private:production",
-            "LiveParserCaptureAuthority::issue_for_test:pub(crate):test",
             "LiveParserCheckpointAck::boundary:pub:production",
             "LiveParserCheckpointAck::boundary_digest:pub:production",
             "LiveParserCheckpointAck::capture:private:production",
@@ -7878,12 +7883,6 @@ mod tests {
                 "private",
                 false,
                 "const fn issue() -> Self",
-            ),
-            expected_authority_method(
-                "LiveParserCaptureAuthority",
-                "pub(crate)",
-                true,
-                "const fn issue_for_test() -> Self",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
@@ -8212,7 +8211,6 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue:private:production",
-            "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue_for_test:pub(crate):test",
             "LiveParserCheckpointAck@<free>::capture_and_bind_live_parser_checkpoint:pub(crate):production",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture:private:production",
         ]
