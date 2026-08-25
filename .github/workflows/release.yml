@@ -138,7 +138,17 @@ jobs:
             echo "release tag $RELEASE_TAG does not match workspace version $VERSION" >&2
             exit 1
           fi
-          FEATURE_CONTRACT="workspace-default-members-default-features-v1"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              FEATURE_CONTRACT="application-family-gui-ft-mux-server-default-features-v1"
+              ;;
+            *windows*)
+              FEATURE_CONTRACT="cli-ft-windows-curated-features-v1"
+              ;;
+            *)
+              FEATURE_CONTRACT="process-family-ft-mux-server-default-features-v1"
+              ;;
+          esac
           BUILD_ID="$(bash scripts/atomic-component-manifest.sh derive-build-id \
             --source-revision "$SOURCE_REVISION" \
             --version "$VERSION" \

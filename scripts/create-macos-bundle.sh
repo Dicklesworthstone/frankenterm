@@ -30,7 +30,7 @@ SKIP_BUILD=false
 OUTPUT_DIR="$PROJECT_ROOT"
 TARGET_TRIPLE="${FT_ATOMIC_BUILD_TARGET:-}"
 BUILD_PROFILE="release-interactive"
-FEATURE_CONTRACT="workspace-default-members-default-features-v1"
+FEATURE_CONTRACT="application-family-gui-ft-mux-server-default-features-v1"
 BROWSER_RUNTIME_ROOT=""
 BROWSER_RUNTIME_MANIFEST=""
 

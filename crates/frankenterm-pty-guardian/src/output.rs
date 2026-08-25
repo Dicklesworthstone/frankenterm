@@ -556,11 +556,13 @@ struct CheckpointCatalogMetadata {
 /// mux-issued reservation identity inside this nonduplicable value lets the
 /// runtime consume the same authority when it finally opens the PTY.
 #[must_use = "Genesis admission authority must be consumed by the Spawn runtime"]
+#[allow(dead_code)] // Consumed by the immediately following runtime-wiring tranche.
 pub(crate) struct GuardianPublishedGenesisAdmissionPermitV1 {
     reservation_identity: GuardianGenesisReservationIdentityV1,
     catalog_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
 }
 
+#[allow(dead_code)] // Kept narrow until the runtime consumes this new authority.
 impl GuardianPublishedGenesisAdmissionPermitV1 {
     pub(crate) const fn reservation_identity(&self) -> &GuardianGenesisReservationIdentityV1 {
         &self.reservation_identity

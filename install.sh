@@ -958,7 +958,7 @@ build_from_source() {
   local workspace_version=""
   local build_target=""
   local build_profile="release-interactive"
-  local feature_contract="workspace-default-members-default-features-v1"
+  local feature_contract="process-family-ft-mux-server-default-features-v1"
   local build_id=""
   source_revision=$(git -C "$TMP/src" rev-parse HEAD 2>/dev/null) || {
     err "Cannot resolve the exact source revision for the cloned release tag."

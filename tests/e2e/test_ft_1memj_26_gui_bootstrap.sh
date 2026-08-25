@@ -19,7 +19,7 @@ TEST_ATOMIC_BUILD_ID="$(bash "${ROOT_DIR}/scripts/atomic-component-manifest.sh" 
   --version "${WORKSPACE_VERSION}" \
   --target "${BUNDLE_TARGET}" \
   --profile release-interactive \
-  --feature-contract workspace-default-members-default-features-v1)"
+  --feature-contract application-family-gui-ft-mux-server-default-features-v1)"
 
 mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
 

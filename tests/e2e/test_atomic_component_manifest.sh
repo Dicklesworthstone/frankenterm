@@ -13,7 +13,7 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ft-atomic-manifest-matrix.XXXXXX")"
 VERSION="0.13.0"
 TARGET="aarch64-apple-darwin"
 PROFILE="release"
-FEATURE_CONTRACT="workspace-default-members-default-features-v1"
+FEATURE_CONTRACT="fixture-default-features-v1"
 SOURCE_A="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 SOURCE_B="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 

@@ -101879,6 +101879,10 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             .expect("source-build function end");
         let source_build = &installer[source_build_start..source_build_end];
         assert!(source_build.contains("scripts/atomic-component-manifest.sh"));
+        assert!(
+            source_build
+                .contains("feature_contract=\"process-family-ft-mux-server-default-features-v1\"")
+        );
         assert!(source_build.contains("${VERSION#v}"));
         assert!(source_build.contains("rustc -vV"));
         assert!(source_build.contains("derive-build-id"));
