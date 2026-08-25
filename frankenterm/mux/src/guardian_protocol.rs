@@ -1519,6 +1519,9 @@ pub struct GuardianCheckpointStageChunkDeliveryV1 {
     _nonduplicable: GuardianCheckpointChunkNonDuplicable,
 }
 
+static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);
+static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: ZeroizeOnDrop);
+
 impl std::fmt::Debug for GuardianCheckpointStageChunkDeliveryV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1579,6 +1582,8 @@ pub struct GuardianCheckpointStageRequestV1 {
     total_chunks: u32,
     body: GuardianCheckpointStageBodyV1,
 }
+
+static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);
 
 impl std::fmt::Debug for GuardianCheckpointStageRequestV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3741,6 +3746,9 @@ pub struct GuardianCheckpointChunkDelivery {
     bytes: Zeroizing<Vec<u8>>,
     _nonduplicable: GuardianCheckpointChunkNonDuplicable,
 }
+
+static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);
+static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: ZeroizeOnDrop);
 
 impl std::fmt::Debug for GuardianCheckpointChunkDelivery {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

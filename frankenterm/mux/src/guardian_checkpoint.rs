@@ -1590,7 +1590,6 @@ impl GuardianCheckpointManifestSealCapabilitiesV1 {
         Ok(Self { primary, retry })
     }
 
-    #[must_use]
     pub fn into_primary_and_retry(
         self,
     ) -> (
