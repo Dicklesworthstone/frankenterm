@@ -624,7 +624,7 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
 
 fn mint_mux_domain_config_reconciliation_generation() -> Option<u64> {
     MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .ok()
@@ -2352,7 +2352,7 @@ fn auto_connect_retry_delay_with_process_id(
 }
 
 fn mint_auto_connect_supervisor_generation() -> Option<u64> {
-    match AUTO_CONNECT_SUPERVISOR_GENERATION.fetch_update(
+    match AUTO_CONNECT_SUPERVISOR_GENERATION.try_update(
         Ordering::AcqRel,
         Ordering::Acquire,
         |current| current.checked_add(1),
@@ -2370,7 +2370,7 @@ fn mint_auto_connect_supervisor_generation() -> Option<u64> {
 
 fn mint_domain_reconnect_manifest_authority_epoch() {
     if DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .is_err()
@@ -2496,7 +2496,7 @@ const fn auto_connect_retry_admission_outcome(
 
 fn mint_auto_connect_admission_retry_generation() -> Option<u64> {
     AUTO_CONNECT_ADMISSION_RETRY_GENERATION
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .ok()
@@ -4313,7 +4313,7 @@ mod tests {
             .find("repair_from_v2_quorum(directory, &slots, &manifest)?")
             .expect("quorum repair remains present");
         assert!(validate < repair);
-        assert!(persistence.contains("mark_domain_reconnect_manifest_generation_conflicted"));
+        assert!(completion.contains("mark_domain_reconnect_manifest_generation_conflicted"));
     }
 
     #[test]

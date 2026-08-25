@@ -7322,7 +7322,7 @@ mod tests {
             pane,
             segment,
             first,
-            terminal_checkpoint(),
+            record_terminal_checkpoint(),
         );
         let exact_descriptor =
             GuardianCheckpointArtifactDescriptorV1::from_live_capture(&exact_capture)
@@ -9339,7 +9339,7 @@ mod tests {
                 .expect("target record pane"),
             segment,
             output,
-            terminal_checkpoint(),
+            record_terminal_checkpoint(),
         );
         let target_begin = record_begin_request(&binding, &target_capture, upload_id);
         let (target_candidate_identity, target_chunk_set_identity) =
@@ -9370,7 +9370,7 @@ mod tests {
                 pane_id,
                 segment,
                 output,
-                terminal_checkpoint(),
+                record_terminal_checkpoint(),
             );
             let capabilities = default_record_manifest_capabilities(
                 &binding,
