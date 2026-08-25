@@ -108604,6 +108604,24 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
     }
 
     #[test]
+    fn default_build_enables_agent_detection_contract() {
+        #[cfg(feature = "agent-detection")]
+        {
+            assert!(
+                frankenterm_core::agent_correlator::filesystem_detection_available(),
+                "agent-detection feature must enable filesystem detection in ft binary"
+            );
+        }
+        #[cfg(not(feature = "agent-detection"))]
+        {
+            assert!(
+                !frankenterm_core::agent_correlator::filesystem_detection_available(),
+                "absence of agent-detection feature must report detection unavailable"
+            );
+        }
+    }
+
+    #[test]
     fn project_scope_agent_config_write_is_idempotent() {
         let root = unique_temp_dir("agent_config_project");
         let workspace_root = root.join("workspace");

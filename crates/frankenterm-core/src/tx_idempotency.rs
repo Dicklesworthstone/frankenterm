@@ -8782,6 +8782,7 @@ mod tests {
             .transition_phase("exec-1", TxPhase::Preparing)
             .unwrap();
         let key_1 = make_key("test-plan", &plan.steps[0].id);
+        let key_2 = make_key("test-plan", &plan.steps[1].id);
         record_durable_outcome(
             &mut store,
             "exec-1",
@@ -8790,6 +8791,15 @@ mod tests {
             StepRisk::Low,
             "agent",
             1000,
+        );
+        record_durable_outcome(
+            &mut store,
+            "exec-1",
+            key_2,
+            StepOutcome::Success { result: None },
+            StepRisk::Low,
+            "agent",
+            1001,
         );
         drop(store);
 
@@ -8852,10 +8862,13 @@ mod tests {
         drop(store);
 
         let corrupt_file = spool_path.join("exec-corrupt.json");
-        std::fs::write(&corrupt_file, b"{\"execution_id\": \"exec-corrupt\", broken").unwrap();
+        std::fs::write(
+            &corrupt_file,
+            b"{\"execution_id\": \"exec-corrupt\", broken",
+        )
+        .unwrap();
 
-        let open_err =
-            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap_err();
+        let open_err = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap_err();
         assert!(matches!(open_err, IdempotencyError::LedgerPersist { .. }));
 
         let _ = std::fs::remove_dir_all(&ft_dir);

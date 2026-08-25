@@ -4525,3 +4525,25 @@ fn contract_json_mode_always_parseable() {
         }
     }
 }
+
+// =============================================================================
+// Feature Contract: Agent detection feature availability
+// =============================================================================
+
+#[test]
+fn contract_agent_detection_feature_matches_cfg() {
+    #[cfg(feature = "agent-detection")]
+    {
+        assert!(
+            frankenterm_core::agent_correlator::filesystem_detection_available(),
+            "default build with agent-detection enabled must report filesystem detection available"
+        );
+    }
+    #[cfg(not(feature = "agent-detection"))]
+    {
+        assert!(
+            !frankenterm_core::agent_correlator::filesystem_detection_available(),
+            "trimmed build without agent-detection must report filesystem detection unavailable"
+        );
+    }
+}
