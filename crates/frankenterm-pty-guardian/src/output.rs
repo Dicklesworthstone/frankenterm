@@ -642,21 +642,47 @@ impl FileIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    owner: u32,
+}
+
+impl DirectoryIdentity {
+    fn capture(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            owner: metadata.uid(),
+        }
+    }
+
+    fn matches(self, metadata: &Metadata) -> bool {
+        self.device == metadata.dev()
+            && self.inode == metadata.ino()
+            && self.mode == metadata.mode()
+            && self.owner == metadata.uid()
+    }
+}
+
 #[derive(Debug)]
 struct PersistentOutputAuthority {
     parent_path: PathBuf,
-    parent_identity: FileIdentity,
+    parent_identity: DirectoryIdentity,
     directory_path: PathBuf,
-    directory_identity: FileIdentity,
+    directory_identity: DirectoryIdentity,
     key_path: PathBuf,
     key_identity: FileIdentity,
 }
 
 impl PersistentOutputAuthority {
     fn validate(&self, directory: &File) -> Result<(), OutputCommitError> {
-        validate_path_identity(&self.parent_path, self.parent_identity)
+        validate_directory_path_identity(&self.parent_path, self.parent_identity)
             .map_err(|_| OutputCommitError::PersistenceAuthority)?;
-        validate_path_identity(&self.directory_path, self.directory_identity)
+        validate_directory_path_identity(&self.directory_path, self.directory_identity)
             .map_err(|_| OutputCommitError::PersistenceAuthority)?;
         let directory_metadata = directory
             .metadata()
@@ -5342,7 +5368,10 @@ fn create_private_file_new_at(
 
 fn open_output_directory(
     token_path: &Path,
-) -> Result<(File, PathBuf, FileIdentity, FileIdentity), GuardianOutputError> {
+) -> Result<
+    (File, PathBuf, DirectoryIdentity, DirectoryIdentity),
+    GuardianOutputError,
+> {
     validate_normalized_absolute_file_path(token_path)?;
     let parent = token_path
         .parent()
@@ -5413,8 +5442,8 @@ fn open_output_directory(
     Ok((
         directory,
         directory_path,
-        FileIdentity::capture(&parent_after, None),
-        FileIdentity::capture(&opened_directory, None),
+        DirectoryIdentity::capture(&parent_after),
+        DirectoryIdentity::capture(&opened_directory),
     ))
 }
 
@@ -5825,13 +5854,22 @@ fn require_same_directory_identity(
     right: &Metadata,
     site: &'static str,
 ) -> Result<(), GuardianOutputError> {
-    let identity = FileIdentity::capture(left, None);
-    if identity.device != right.dev()
-        || identity.inode != right.ino()
-        || identity.mode != right.mode()
-        || identity.owner != right.uid()
-    {
+    if !DirectoryIdentity::capture(left).matches(right) {
         return Err(GuardianOutputError::FilesystemAuthority(site));
+    }
+    Ok(())
+}
+
+fn validate_directory_path_identity(
+    path: &Path,
+    identity: DirectoryIdentity,
+) -> Result<(), GuardianOutputError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| GuardianOutputError::io("output-directory-authority-revalidation", error))?;
+    if !identity.matches(&metadata) {
+        return Err(GuardianOutputError::FilesystemAuthority(
+            "guardian output directory identity changed",
+        ));
     }
     Ok(())
 }
