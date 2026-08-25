@@ -6184,6 +6184,13 @@ fn checkpoint_catalog_encode_candidate(
     encoded.extend_from_slice(metadata.adoption_mux_incarnation.as_bytes());
     encoded.extend_from_slice(metadata.adoption_effect_id.as_bytes());
     encoded.extend_from_slice(&metadata.adoption_sequence.to_le_bytes());
+    encoded.extend_from_slice(metadata.genesis_durable_pane_id.as_bytes());
+    encoded.extend_from_slice(metadata.genesis_origin_request_id.as_bytes());
+    encoded.extend_from_slice(&metadata.genesis_spawn_payload_bytes.to_le_bytes());
+    encoded.extend_from_slice(&metadata.genesis_spawn_payload_digest);
+    encoded.extend_from_slice(&metadata.genesis_process_family_build_identity_digest);
+    encoded.extend_from_slice(&metadata.genesis_pixel_width.to_le_bytes());
+    encoded.extend_from_slice(&metadata.genesis_pixel_height.to_le_bytes());
     if let Some(predecessor) = metadata.predecessor {
         encoded.extend_from_slice(&predecessor.generation.to_le_bytes());
         encoded.extend_from_slice(predecessor.candidate_id.as_bytes());
@@ -6193,7 +6200,7 @@ fn checkpoint_catalog_encode_candidate(
     } else {
         encoded.extend_from_slice(&[0; 120]);
     }
-    encoded.extend_from_slice(&[0; 8]);
+    encoded.extend_from_slice(&[0; 12]);
     if encoded.len() != CHECKPOINT_CATALOG_HEADER_BYTES {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
@@ -6265,12 +6272,19 @@ fn checkpoint_catalog_decode_candidate(
     let adoption_mux_incarnation = decoder.uuid()?;
     let adoption_effect_id = decoder.uuid()?;
     let adoption_sequence = decoder.u64()?;
+    let genesis_durable_pane_id = decoder.uuid()?;
+    let genesis_origin_request_id = decoder.uuid()?;
+    let genesis_spawn_payload_bytes = decoder.u64()?;
+    let genesis_spawn_payload_digest = decoder.take::<32>()?;
+    let genesis_process_family_build_identity_digest = decoder.take::<32>()?;
+    let genesis_pixel_width = u16::from_le_bytes(decoder.take::<2>()?);
+    let genesis_pixel_height = u16::from_le_bytes(decoder.take::<2>()?);
     let predecessor_generation = decoder.u64()?;
     let predecessor_candidate_id = decoder.uuid()?;
     let predecessor_checksum = decoder.take::<32>()?;
     let predecessor_checkpoint_id = decoder.take::<32>()?;
     let predecessor_boundary_id = decoder.take::<32>()?;
-    if decoder.take::<8>()? != [0; 8]
+    if decoder.take::<12>()? != [0; 12]
         || decoder.offset != CHECKPOINT_CATALOG_HEADER_BYTES
         || CHECKPOINT_CATALOG_HEADER_BYTES.checked_add(record_bytes) != Some(checksum_offset)
     {
@@ -6315,6 +6329,13 @@ fn checkpoint_catalog_decode_candidate(
         adoption_mux_incarnation,
         adoption_effect_id,
         adoption_sequence,
+        genesis_durable_pane_id,
+        genesis_origin_request_id,
+        genesis_spawn_payload_bytes,
+        genesis_spawn_payload_digest,
+        genesis_process_family_build_identity_digest,
+        genesis_pixel_width,
+        genesis_pixel_height,
     };
     checkpoint_catalog_validate_metadata(&metadata)?;
     let expected_records = chunk_count
@@ -6485,7 +6506,6 @@ fn checkpoint_catalog_decode_marker(
         || terminal_payload_digest == [0; 32]
         || adoption_mux_incarnation.is_nil()
         || adoption_effect_id.is_nil()
-        || adoption_sequence == 0
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
@@ -6504,6 +6524,18 @@ fn checkpoint_catalog_decode_marker(
         }
         _ => return Err(GuardianCheckpointStageStoreError::Poisoned),
     };
+    let scope_binding_valid = match identity.scope {
+        CheckpointCatalogScope::Pane { .. } => adoption_sequence > 0,
+        CheckpointCatalogScope::Genesis { spawn_effect_id } => {
+            identity.generation == 1
+                && predecessor_generation.is_none()
+                && adoption_effect_id == spawn_effect_id
+                && adoption_sequence == 0
+        }
+    };
+    if !scope_binding_valid {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
     Ok(CheckpointCatalogMarker {
         identity,
         predecessor_generation,
@@ -7046,6 +7078,13 @@ fn checkpoint_catalog_candidate_from_sealed_stage(
             adoption_mux_incarnation: permit.mux_incarnation(),
             adoption_effect_id: permit.effect_id(),
             adoption_sequence: permit.sequence(),
+            genesis_durable_pane_id: Uuid::nil(),
+            genesis_origin_request_id: Uuid::nil(),
+            genesis_spawn_payload_bytes: 0,
+            genesis_spawn_payload_digest: [0; 32],
+            genesis_process_family_build_identity_digest: [0; 32],
+            genesis_pixel_width: 0,
+            genesis_pixel_height: 0,
         },
         records,
         checksum: [0; OUTPUT_MANIFEST_CHECKSUM_BYTES],
@@ -7715,6 +7754,13 @@ mod tests {
                 adoption_mux_incarnation: Uuid::from_u128(0x300),
                 adoption_effect_id: Uuid::from_u128(u128::from(identity_byte) + 0x400),
                 adoption_sequence: generation,
+                genesis_durable_pane_id: Uuid::nil(),
+                genesis_origin_request_id: Uuid::nil(),
+                genesis_spawn_payload_bytes: 0,
+                genesis_spawn_payload_digest: [0; 32],
+                genesis_process_family_build_identity_digest: [0; 32],
+                genesis_pixel_width: 0,
+                genesis_pixel_height: 0,
             },
             candidate_checksum,
             candidate_path: PathBuf::from(format!("candidate-{identity_byte}")),

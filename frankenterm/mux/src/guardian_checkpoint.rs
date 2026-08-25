@@ -4229,6 +4229,7 @@ mod tests {
     }
 
     const AUTHORITY_CRITICAL_TYPES: &[&str] = &[
+        "GuardianGenesisReservationIdentityV1",
         "GuardianCheckpointGenesisSpawnPermitV1",
         "GuardianCheckpointDurableCompletionReceiptV1",
         "GuardianCheckpointCandidateIdentityV1",
@@ -8436,6 +8437,264 @@ mod tests {
         cipher
             .retry_open_manifest(&retry, &reconstructed)
             .expect("adopt only the exact canonical final manifest");
+    }
+
+    #[derive(Clone)]
+    struct GenesisReservationFixture {
+        mux_incarnation: Uuid,
+        spawn_effect_id: Uuid,
+        durable_pane_id: Uuid,
+        origin_request_id: Uuid,
+        spawn_payload_bytes: u64,
+        spawn_payload_digest: [u8; 32],
+        process_family_build_identity_digest: [u8; 32],
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+        checkpoint_identity_digest: [u8; 32],
+        boundary_identity_digest: [u8; 32],
+        upload_id: Uuid,
+    }
+
+    impl GenesisReservationFixture {
+        fn exact() -> Self {
+            Self {
+                mux_incarnation: Uuid::from_u128(0x10),
+                spawn_effect_id: Uuid::from_u128(0x20),
+                durable_pane_id: Uuid::from_u128(0x30),
+                origin_request_id: Uuid::from_u128(0x40),
+                spawn_payload_bytes: 4_096,
+                spawn_payload_digest: [0x51; 32],
+                process_family_build_identity_digest: [0x62; 32],
+                rows: 24,
+                cols: 80,
+                pixel_width: 1_920,
+                pixel_height: 1_080,
+                checkpoint_identity_digest: [0x73; 32],
+                boundary_identity_digest: [0x84; 32],
+                upload_id: Uuid::from_u128(0x50),
+            }
+        }
+
+        fn identity(
+            &self,
+        ) -> Result<GuardianGenesisReservationIdentityV1, GuardianCheckpointBoundaryError> {
+            GuardianGenesisReservationIdentityV1::from_authenticated_spawn(
+                self.mux_incarnation,
+                self.spawn_effect_id,
+                self.durable_pane_id,
+                self.origin_request_id,
+                self.spawn_payload_bytes,
+                self.spawn_payload_digest,
+                self.process_family_build_identity_digest,
+                self.rows,
+                self.cols,
+                self.pixel_width,
+                self.pixel_height,
+                self.checkpoint_identity_digest,
+                self.boundary_identity_digest,
+                self.upload_id,
+            )
+        }
+    }
+
+    #[test]
+    fn genesis_reservation_identity_is_complete_validated_and_mutation_sensitive() {
+        let fixture = GenesisReservationFixture::exact();
+        let identity = fixture
+            .identity()
+            .expect("construct exact Genesis reservation");
+        assert_eq!(identity.mux_incarnation(), fixture.mux_incarnation);
+        assert_eq!(identity.spawn_effect_id(), fixture.spawn_effect_id);
+        assert_eq!(identity.durable_pane_id(), fixture.durable_pane_id);
+        assert_eq!(identity.origin_request_id(), fixture.origin_request_id);
+        assert_eq!(identity.spawn_payload_bytes(), fixture.spawn_payload_bytes);
+        assert_eq!(
+            identity.spawn_payload_digest(),
+            fixture.spawn_payload_digest
+        );
+        assert_eq!(
+            identity.process_family_build_identity_digest(),
+            fixture.process_family_build_identity_digest
+        );
+        assert_eq!(identity.rows(), fixture.rows);
+        assert_eq!(identity.cols(), fixture.cols);
+        assert_eq!(identity.pixel_width(), fixture.pixel_width);
+        assert_eq!(identity.pixel_height(), fixture.pixel_height);
+        assert_eq!(
+            identity.checkpoint_identity_digest(),
+            fixture.checkpoint_identity_digest
+        );
+        assert_eq!(
+            identity.boundary_identity_digest(),
+            fixture.boundary_identity_digest
+        );
+        assert_eq!(identity.upload_id(), fixture.upload_id);
+        assert_eq!(
+            std::mem::size_of::<GuardianGenesisReservationIdentityV1>(),
+            224
+        );
+
+        macro_rules! assert_bound_mutation {
+            ($field:ident, $value:expr) => {{
+                let mut changed = fixture.clone();
+                changed.$field = $value;
+                assert_ne!(
+                    fixture.identity().expect("reconstruct exact reservation"),
+                    changed
+                        .identity()
+                        .expect("construct valid mutated reservation"),
+                    "Genesis reservation field was not identity-bearing: {}",
+                    stringify!($field)
+                );
+            }};
+        }
+        assert_bound_mutation!(mux_incarnation, Uuid::from_u128(0x11));
+        assert_bound_mutation!(spawn_effect_id, Uuid::from_u128(0x21));
+        assert_bound_mutation!(durable_pane_id, Uuid::from_u128(0x31));
+        assert_bound_mutation!(origin_request_id, Uuid::from_u128(0x41));
+        assert_bound_mutation!(spawn_payload_bytes, 4_097);
+        assert_bound_mutation!(spawn_payload_digest, [0x52; 32]);
+        assert_bound_mutation!(process_family_build_identity_digest, [0x63; 32]);
+        assert_bound_mutation!(rows, 25);
+        assert_bound_mutation!(cols, 81);
+        assert_bound_mutation!(pixel_width, 1_921);
+        assert_bound_mutation!(pixel_height, 1_081);
+        assert_bound_mutation!(checkpoint_identity_digest, [0x74; 32]);
+        assert_bound_mutation!(boundary_identity_digest, [0x85; 32]);
+        assert_bound_mutation!(upload_id, Uuid::from_u128(0x51));
+
+        for (label, invalid, expected) in [
+            {
+                let mut invalid = fixture.clone();
+                invalid.mux_incarnation = Uuid::nil();
+                (
+                    "mux_incarnation",
+                    invalid,
+                    GuardianCheckpointBoundaryError::NilGenesisMuxIncarnation,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.spawn_effect_id = Uuid::nil();
+                (
+                    "spawn_effect_id",
+                    invalid,
+                    GuardianCheckpointBoundaryError::NilGenesisEffectIdentity,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.durable_pane_id = Uuid::nil();
+                (
+                    "durable_pane_id",
+                    invalid,
+                    GuardianCheckpointBoundaryError::NilGenesisPaneIdentity,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.origin_request_id = Uuid::nil();
+                (
+                    "origin_request_id",
+                    invalid,
+                    GuardianCheckpointBoundaryError::NilGenesisRequestIdentity,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.spawn_payload_bytes = 0;
+                (
+                    "spawn_payload_bytes",
+                    invalid,
+                    GuardianCheckpointBoundaryError::EmptyGenesisSpawnPayload,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.spawn_payload_digest = [0; 32];
+                (
+                    "spawn_payload_digest",
+                    invalid,
+                    GuardianCheckpointBoundaryError::ZeroGenesisSpawnPayloadDigest,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.process_family_build_identity_digest = [0; 32];
+                (
+                    "process_family_build_identity_digest",
+                    invalid,
+                    GuardianCheckpointBoundaryError::ZeroGenesisProcessFamilyBuildIdentityDigest,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.rows = 0;
+                (
+                    "rows",
+                    invalid,
+                    GuardianCheckpointBoundaryError::ZeroGeometry,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.cols = 0;
+                (
+                    "cols",
+                    invalid,
+                    GuardianCheckpointBoundaryError::ZeroGeometry,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.checkpoint_identity_digest = [0; 32];
+                (
+                    "checkpoint_identity_digest",
+                    invalid,
+                    GuardianCheckpointBoundaryError::ZeroGenesisCheckpointIdentityDigest,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.boundary_identity_digest = [0; 32];
+                (
+                    "boundary_identity_digest",
+                    invalid,
+                    GuardianCheckpointBoundaryError::ZeroGenesisBoundaryIdentityDigest,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.upload_id = Uuid::nil();
+                (
+                    "upload_id",
+                    invalid,
+                    GuardianCheckpointBoundaryError::NilGenesisUploadIdentity,
+                )
+            },
+        ] {
+            assert_eq!(invalid.identity(), Err(expected), "invalid field: {label}");
+        }
+
+        let mut zero_pixel_geometry = fixture.clone();
+        zero_pixel_geometry.pixel_width = 0;
+        zero_pixel_geometry.pixel_height = 0;
+        zero_pixel_geometry
+            .identity()
+            .expect("zero pixel dimensions remain valid PTY geometry");
+
+        let debug = format!("{identity:?}");
+        assert_eq!(debug.matches("[REDACTED]").count(), 4);
+        assert!(!debug.contains(&format!("{:?}", fixture.spawn_payload_digest)));
+
+        let permit = GuardianCheckpointGenesisSpawnPermitV1::issue(
+            fixture.identity().expect("construct permit reservation"),
+        )
+        .expect("issue exact test permit");
+        assert_eq!(permit.reservation_identity(), &identity);
+        assert_eq!(permit.into_reservation_identity(), identity);
     }
 
     #[test]
