@@ -459,12 +459,140 @@ PY
 
 ensure_exact_staged_file() {
   local source="$1" target="$2" mode="$3"
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    [ -f "$target" ] && [ ! -L "$target" ] && cmp "$source" "$target" >/dev/null 2>&1 || return 1
-    chmod "$mode" "$target" || return 1
-  else
-    install -m "$mode" "$source" "$target" || return 1
-  fi
+  python3 - "$source" "$target" "$mode" <<'PY'
+import os, stat, sys
+
+source_path, target_path, requested_mode = sys.argv[1:]
+final_mode = int(requested_mode, 8)
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+if not nofollow or not directory:
+    raise SystemExit("descriptor-relative nofollow staging is unavailable")
+
+source_fd = os.open(source_path, os.O_RDONLY | nofollow | cloexec)
+parent_path, target_name = os.path.split(os.path.abspath(target_path))
+if not target_name or target_name in (".", "..") or "/" in target_name:
+    raise SystemExit("staged target is not one canonical child")
+parent_fd = os.open(parent_path, os.O_RDONLY | directory | nofollow | cloexec)
+target_fd = -1
+try:
+    source_before = os.fstat(source_fd)
+    parent_before = os.fstat(parent_fd)
+    if (not stat.S_ISREG(source_before.st_mode) or source_before.st_nlink != 1 or
+            source_before.st_size > 16 * 1024 * 1024 * 1024):
+        raise SystemExit("staged source is not one bounded single-link regular file")
+    if (not stat.S_ISDIR(parent_before.st_mode) or parent_before.st_uid != os.geteuid() or
+            stat.S_IMODE(parent_before.st_mode) not in (0o700, 0o555)):
+        raise SystemExit("staged target parent is not one owner-controlled directory")
+
+    try:
+        target_fd = os.open(
+            target_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    except FileExistsError:
+        target_fd = os.open(target_name, os.O_RDONLY | nofollow | cloexec, dir_fd=parent_fd)
+
+    target_before = os.fstat(target_fd)
+    named_before = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    target_mode = stat.S_IMODE(target_before.st_mode)
+    if (not stat.S_ISREG(target_before.st_mode) or target_before.st_uid != os.geteuid() or
+            target_before.st_nlink != 1 or target_before.st_dev != named_before.st_dev or
+            target_before.st_ino != named_before.st_ino or target_before.st_size > source_before.st_size or
+            target_mode not in (0o600, final_mode)):
+        raise SystemExit("retained staged file is not one safe resumable regular file")
+
+    remaining = target_before.st_size
+    while remaining:
+        width = min(1024 * 1024, remaining)
+        source_chunk = os.read(source_fd, width)
+        target_chunk = os.read(target_fd, width)
+        if len(source_chunk) != width or target_chunk != source_chunk:
+            raise SystemExit("retained staged file is not an exact source prefix")
+        remaining -= width
+    source_after_prefix = os.fstat(source_fd)
+    target_after_prefix = os.fstat(target_fd)
+    if ((source_before.st_dev, source_before.st_ino, source_before.st_size,
+         source_before.st_mtime_ns, source_before.st_ctime_ns) !=
+        (source_after_prefix.st_dev, source_after_prefix.st_ino, source_after_prefix.st_size,
+         source_after_prefix.st_mtime_ns, source_after_prefix.st_ctime_ns) or
+        (target_before.st_dev, target_before.st_ino, target_before.st_size,
+         target_before.st_mtime_ns, target_before.st_ctime_ns) !=
+        (target_after_prefix.st_dev, target_after_prefix.st_ino, target_after_prefix.st_size,
+         target_after_prefix.st_mtime_ns, target_after_prefix.st_ctime_ns)):
+        raise SystemExit("staged source or target changed during prefix validation")
+
+    if target_before.st_size < source_before.st_size:
+        os.fchmod(target_fd, 0o600)
+        os.fsync(target_fd)
+        os.close(target_fd)
+        target_fd = os.open(target_name, os.O_RDWR | nofollow | cloexec, dir_fd=parent_fd)
+        reopened = os.fstat(target_fd)
+        if (reopened.st_dev, reopened.st_ino, reopened.st_size) != (
+                target_before.st_dev, target_before.st_ino, target_before.st_size):
+            raise SystemExit("staged target changed while reopening for prefix completion")
+        os.lseek(source_fd, target_before.st_size, os.SEEK_SET)
+        os.lseek(target_fd, target_before.st_size, os.SEEK_SET)
+        remaining = source_before.st_size - target_before.st_size
+        while remaining:
+            chunk = os.read(source_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit("staged source truncated during prefix completion")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_fd, view)
+                if written <= 0:
+                    raise SystemExit("staged target write made no progress")
+                view = view[written:]
+            remaining -= len(chunk)
+        os.fsync(target_fd)
+
+    target_before_final_read = os.fstat(target_fd)
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    os.lseek(target_fd, 0, os.SEEK_SET)
+    remaining = source_before.st_size
+    while remaining:
+        width = min(1024 * 1024, remaining)
+        source_chunk = os.read(source_fd, width)
+        target_chunk = os.read(target_fd, width)
+        if len(source_chunk) != width or target_chunk != source_chunk:
+            raise SystemExit("completed staged file differs from its pinned source")
+        remaining -= width
+    if os.read(target_fd, 1):
+        raise SystemExit("completed staged file has an unexpected suffix")
+    source_final = os.fstat(source_fd)
+    target_final = os.fstat(target_fd)
+    named_final = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    if ((source_before.st_dev, source_before.st_ino, source_before.st_size,
+         source_before.st_mtime_ns, source_before.st_ctime_ns) !=
+        (source_final.st_dev, source_final.st_ino, source_final.st_size,
+         source_final.st_mtime_ns, source_final.st_ctime_ns) or
+        (target_before_final_read.st_dev, target_before_final_read.st_ino,
+         target_before_final_read.st_size, target_before_final_read.st_mtime_ns,
+         target_before_final_read.st_ctime_ns) !=
+        (target_final.st_dev, target_final.st_ino, target_final.st_size,
+         target_final.st_mtime_ns, target_final.st_ctime_ns) or
+        target_final.st_dev != named_final.st_dev or target_final.st_ino != named_final.st_ino or
+        target_final.st_size != source_before.st_size or target_final.st_nlink != 1):
+        raise SystemExit("staged file identity changed during exact completion")
+    os.fchmod(target_fd, final_mode)
+    os.fsync(target_fd)
+    sealed = os.fstat(target_fd)
+    named_sealed = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    if (sealed.st_dev, sealed.st_ino, sealed.st_size, stat.S_IMODE(sealed.st_mode)) != (
+            named_sealed.st_dev, named_sealed.st_ino, source_before.st_size, final_mode):
+        raise SystemExit("staged file seal did not survive exact readback")
+    os.fsync(parent_fd)
+finally:
+    if target_fd >= 0:
+        os.close(target_fd)
+    os.close(parent_fd)
+    os.close(source_fd)
+PY
 }
 
 validate_installer_stage_inventory() {
