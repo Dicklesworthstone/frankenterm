@@ -9019,26 +9019,27 @@ pub fn encode_guardian_request(
     }
 
     let mut frame = GuardianWireFrame::with_capacity(total_len)?;
-    push_u32(frame.bytes_mut(), u32::try_from(frame_len).map_err(|_| GuardianProtocolError::FrameTooLarge)?);
-    frame.extend_from_slice(&FRAME_MAGIC);
-    frame.extend_from_slice(&request.header.protocol_version.to_be_bytes());
-    frame.push(request.header.operation as u8);
-    frame.push(0);
-    push_uuid(frame.bytes_mut(), request.header.guardian_incarnation);
-    push_uuid(frame.bytes_mut(), request.header.mux_incarnation);
-    push_uuid(frame.bytes_mut(), request.header.request_id);
-    frame.extend_from_slice(&request.header.payload_sha256);
-    push_optional_uuid(frame.bytes_mut(), request.header.pane_id);
-    frame.extend_from_slice(&request.header.lease_generation.to_be_bytes());
-    frame.extend_from_slice(&request.header.lease_sequence.to_be_bytes());
-    push_optional_uuid(frame.bytes_mut(), request.header.effect_id);
+    let bytes = frame.bytes_mut();
+    push_u32(bytes, u32::try_from(frame_len).map_err(|_| GuardianProtocolError::FrameTooLarge)?);
+    bytes.extend_from_slice(&FRAME_MAGIC);
+    bytes.extend_from_slice(&request.header.protocol_version.to_be_bytes());
+    bytes.push(request.header.operation as u8);
+    bytes.push(0);
+    push_uuid(bytes, request.header.guardian_incarnation);
+    push_uuid(bytes, request.header.mux_incarnation);
+    push_uuid(bytes, request.header.request_id);
+    bytes.extend_from_slice(&request.header.payload_sha256);
+    push_optional_uuid(bytes, request.header.pane_id);
+    bytes.extend_from_slice(&request.header.lease_generation.to_be_bytes());
+    bytes.extend_from_slice(&request.header.lease_sequence.to_be_bytes());
+    push_optional_uuid(bytes, request.header.effect_id);
     push_u32(
-        frame.bytes_mut(),
+        bytes,
         u32::try_from(payload_len).map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
     );
-    frame.extend_from_slice(&request.payload);
+    bytes.extend_from_slice(&request.payload);
     let tag = Zeroizing::new(secret.mac(&frame)?);
-    frame.extend_from_slice(&tag);
+    frame.bytes_mut().extend_from_slice(&tag);
     debug_assert_eq!(frame.len(), total_len);
     Ok(frame)
 }
@@ -9142,30 +9143,31 @@ pub fn encode_guardian_response(
 
     let header = &response.header;
     let mut frame = GuardianWireFrame::with_capacity(total_len)?;
+    let bytes = frame.bytes_mut();
     push_u32(
-        frame.bytes_mut(),
+        bytes,
         u32::try_from(frame_len).map_err(|_| GuardianProtocolError::FrameTooLarge)?,
     );
-    frame.extend_from_slice(&RESPONSE_FRAME_MAGIC);
-    frame.extend_from_slice(&header.protocol_version.to_be_bytes());
-    frame.push(header.operation as u8);
-    frame.push(header.status as u8);
-    push_uuid(frame.bytes_mut(), header.guardian_incarnation);
-    push_uuid(frame.bytes_mut(), header.mux_incarnation);
-    push_uuid(frame.bytes_mut(), header.request_id);
-    frame.extend_from_slice(&header.request_payload_sha256);
-    frame.extend_from_slice(&header.payload_sha256);
-    push_optional_uuid(frame.bytes_mut(), header.pane_id);
-    frame.extend_from_slice(&header.lease_generation.to_be_bytes());
-    frame.extend_from_slice(&header.lease_sequence.to_be_bytes());
-    push_optional_uuid(frame.bytes_mut(), header.effect_id);
+    bytes.extend_from_slice(&RESPONSE_FRAME_MAGIC);
+    bytes.extend_from_slice(&header.protocol_version.to_be_bytes());
+    bytes.push(header.operation as u8);
+    bytes.push(header.status as u8);
+    push_uuid(bytes, header.guardian_incarnation);
+    push_uuid(bytes, header.mux_incarnation);
+    push_uuid(bytes, header.request_id);
+    bytes.extend_from_slice(&header.request_payload_sha256);
+    bytes.extend_from_slice(&header.payload_sha256);
+    push_optional_uuid(bytes, header.pane_id);
+    bytes.extend_from_slice(&header.lease_generation.to_be_bytes());
+    bytes.extend_from_slice(&header.lease_sequence.to_be_bytes());
+    push_optional_uuid(bytes, header.effect_id);
     push_u32(
-        frame.bytes_mut(),
+        bytes,
         u32::try_from(payload_len).map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
     );
-    frame.extend_from_slice(&response.payload);
+    bytes.extend_from_slice(&response.payload);
     let tag = Zeroizing::new(secret.mac(&frame)?);
-    frame.extend_from_slice(&tag);
+    frame.bytes_mut().extend_from_slice(&tag);
     debug_assert_eq!(frame.len(), total_len);
     Ok(frame)
 }

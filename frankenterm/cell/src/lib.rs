@@ -1301,7 +1301,8 @@ pub struct Cell {
 impl core::fmt::Debug for Cell {
     fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
         fmt.debug_struct("Cell")
-            .field("text", &self.str())
+            .field("text_bytes", &self.str().len())
+            .field("text", &"[REDACTED]")
             .field("width", &self.width())
             .field("attrs", &self.attrs)
             .finish()

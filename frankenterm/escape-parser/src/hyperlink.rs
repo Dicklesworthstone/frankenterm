@@ -101,8 +101,17 @@ fn decode_percent_escapes(input: &[u8]) -> Result<Zeroizing<String>> {
 /// `Hyperlink` deliberately retains ordinary `String` fields for its public
 /// API and wire shape.  This private type closes the interval between decoding
 /// a string and successfully installing it in a Drop-hardened `Hyperlink`.
-#[derive(Debug)]
 struct GuardedString(Zeroizing<String>);
+
+impl core::fmt::Debug for GuardedString {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("GuardedString")
+            .field("bytes", &self.0.len())
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
 
 impl GuardedString {
     fn new(text: String) -> Self {
@@ -183,13 +192,25 @@ struct GuardedHyperlink {
     implicit: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, ToDynamic)]
+#[derive(PartialEq, Eq, ToDynamic)]
 pub struct Hyperlink {
     params: HashMap<String, String>,
     uri: String,
     /// If the link was produced by an implicit or matching rule,
     /// this field will be set to true.
     implicit: bool,
+}
+
+impl core::fmt::Debug for Hyperlink {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Hyperlink")
+            .field("param_count", &self.params.len())
+            .field("uri_bytes", &self.uri.len())
+            .field("implicit", &self.implicit)
+            .field("semantic_text", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[cfg(feature = "use_serde")]
