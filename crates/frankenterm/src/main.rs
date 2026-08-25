@@ -101732,6 +101732,7 @@ log_level = "debug"
         let dir = tempfile::tempdir().expect("create component fixture directory");
         let ft_path = dir.path().join("ft");
         let mux_path = dir.path().join("frankenterm-mux-server");
+        let guardian_path = dir.path().join("frankenterm-pty-guardian");
         let build_id = "a".repeat(64);
         write_atomic_component_fixture(&ft_path, &build_id, "ft", "x86_64-unknown-linux-gnu");
         write_atomic_component_fixture(
@@ -101740,11 +101741,19 @@ log_level = "debug"
             "frankenterm-mux-server",
             "x86_64-unknown-linux-gnu",
         );
-        let family = validate_local_process_family(&ft_path, &mux_path).unwrap();
+        write_atomic_component_fixture(
+            &guardian_path,
+            &build_id,
+            "frankenterm-pty-guardian",
+            "x86_64-unknown-linux-gnu",
+        );
+        let family = validate_local_process_family(&ft_path, &mux_path, &guardian_path).unwrap();
         let byte_receipt = ProcessFamilyByteReceipt::from(&family);
         assert_eq!(&family.ft.identity, &family.mux_server.identity);
+        assert_eq!(&family.ft.identity, &family.guardian.identity);
         assert_eq!(family.ft.sha256.len(), 64);
         assert_eq!(family.mux_server.sha256.len(), 64);
+        assert_eq!(family.guardian.sha256.len(), 64);
         assert_eq!(
             family.ft.byte_len,
             std::fs::metadata(&ft_path).unwrap().len()
@@ -101893,6 +101902,10 @@ log_level = "debug"
                 publish_command.matches(&family.mux_server.sha256).count() >= 2,
                 "mux bytes must be verified both before execution and immediately before publication"
             );
+            assert!(
+                publish_command.matches(&family.guardian.sha256).count() >= 2,
+                "guardian bytes must be verified both before execution and immediately before publication"
+            );
             assert!(publish_command.contains("--version >/dev/null"));
             assert!(
                 local_process_family_publish_command("not-a-suffix", &byte_receipt, false).is_err(),
@@ -101901,8 +101914,12 @@ log_level = "debug"
 
             let remote_mux_stage = remote_bin
                 .join("frankenterm-mux-server.installing-0123456789abcdef0123456789abcdef");
+            let remote_guardian_stage = remote_bin
+                .join("frankenterm-pty-guardian.installing-0123456789abcdef0123456789abcdef");
             std::fs::copy(&mux_path, &remote_mux_stage)
                 .expect("stage exact mux component fixture bytes");
+            std::fs::copy(&guardian_path, &remote_guardian_stage)
+                .expect("stage exact guardian component fixture bytes");
             let rejected_publication = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&publish_command)
@@ -101916,6 +101933,7 @@ log_level = "debug"
             assert!(rejected_publication.stdout.is_empty());
             assert!(!remote_bin.join("ft").exists());
             assert!(!remote_bin.join("frankenterm-mux-server").exists());
+            assert!(!remote_bin.join("frankenterm-pty-guardian").exists());
 
             std::fs::copy(&ft_path, &remote_stage)
                 .expect("restore exact ft stage for compensating publication");
@@ -101946,6 +101964,12 @@ log_level = "debug"
                 )),
                 family.mux_server.sha256
             );
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(
+                    std::fs::read(remote_bin.join("frankenterm-pty-guardian")).unwrap()
+                )),
+                family.guardian.sha256
+            );
 
             let pending_publish = local_process_family_publish_command(
                 "fedcba9876543210fedcba9876543210",
@@ -101956,15 +101980,21 @@ log_level = "debug"
             assert!(pending_publish.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"));
             assert!(pending_publish.matches(&family.ft.sha256).count() >= 2);
             assert!(pending_publish.matches(&family.mux_server.sha256).count() >= 2);
+            assert!(pending_publish.matches(&family.guardian.sha256).count() >= 2);
             let pending_suffix = "fedcba9876543210fedcba9876543210";
             let pending_ft_stage = remote_bin.join(format!("ft.installing-{pending_suffix}"));
             let pending_mux_stage = remote_bin.join(format!(
                 "frankenterm-mux-server.installing-{pending_suffix}"
             ));
+            let pending_guardian_stage = remote_bin.join(format!(
+                "frankenterm-pty-guardian.installing-{pending_suffix}"
+            ));
             std::fs::copy(&ft_path, &pending_ft_stage)
                 .expect("stage ft fixture for pending no-clobber test");
             std::fs::copy(&mux_path, &pending_mux_stage)
                 .expect("stage mux fixture for pending no-clobber test");
+            std::fs::copy(&guardian_path, &pending_guardian_stage)
+                .expect("stage guardian fixture for pending no-clobber test");
             std::os::unix::fs::symlink(
                 remote_bin.join("missing-pending-target"),
                 remote_bin.join(format!("ft.pending-{pending_suffix}")),
@@ -101982,6 +102012,7 @@ log_level = "debug"
             );
             assert!(pending_ft_stage.is_file());
             assert!(pending_mux_stage.is_file());
+            assert!(pending_guardian_stage.is_file());
             assert!(
                 !remote_bin
                     .join(format!("frankenterm-mux-server.pending-{pending_suffix}"))
@@ -101998,6 +102029,11 @@ log_level = "debug"
                 .expect("stage verified release ft fixture");
             std::fs::copy(&mux_path, release_dir.join("frankenterm-mux-server"))
                 .expect("stage verified release mux fixture");
+            std::fs::copy(
+                &guardian_path,
+                release_dir.join("frankenterm-pty-guardian"),
+            )
+            .expect("stage verified release guardian fixture");
             let release_stage_command =
                 remote_release_stage_command("v0.15.2", release_suffix, &byte_receipt)
                     .expect("render verified release byte-binding transaction");
@@ -102014,7 +102050,7 @@ log_level = "debug"
             );
             assert_eq!(
                 String::from_utf8_lossy(&release_staging.stdout),
-                format!("FT_RELEASE_COMPONENT_STAGE_V1=v0.15.2:{release_suffix}\n")
+                format!("FT_RELEASE_COMPONENT_STAGE_V2=v0.15.2:{release_suffix}\n")
             );
             assert_eq!(
                 hex::encode(sha2::Sha256::digest(
@@ -102031,6 +102067,15 @@ log_level = "debug"
                     .unwrap()
                 )),
                 family.mux_server.sha256
+            );
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(
+                    std::fs::read(remote_bin.join(format!(
+                        "frankenterm-pty-guardian.installing-{release_suffix}"
+                    )))
+                    .unwrap()
+                )),
+                family.guardian.sha256
             );
 
             let symlink_suffix = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -102060,7 +102105,7 @@ log_level = "debug"
             "frankenterm-mux-server",
             "x86_64-unknown-linux-gnu",
         );
-        assert!(validate_local_process_family(&ft_path, &mux_path).is_err());
+        assert!(validate_local_process_family(&ft_path, &mux_path, &guardian_path).is_err());
     }
 
     #[test]
@@ -102068,13 +102113,13 @@ log_level = "debug"
         let dir = tempfile::tempdir().expect("create component fixture directory");
         let path = dir.path().join("component");
         assert!(
-            read_local_component_snapshot(Path::new("../component"), "ft")
+            read_local_component_snapshot(Path::new("../component"), AtomicComponentRole::Ft)
                 .expect_err("parent traversal must fail before opening a component")
                 .to_string()
                 .contains("parent component")
         );
         write_atomic_component_fixture(&path, "unsealed", "ft", "x86_64-unknown-linux-gnu");
-        assert!(read_local_component_snapshot(&path, "ft").is_err());
+        assert!(read_local_component_snapshot(&path, AtomicComponentRole::Ft).is_err());
 
         write_atomic_component_fixture(
             &path,
@@ -102082,14 +102127,14 @@ log_level = "debug"
             "frankenterm-mux-server",
             "x86_64-unknown-linux-gnu",
         );
-        assert!(read_local_component_snapshot(&path, "ft").is_err());
+        assert!(read_local_component_snapshot(&path, AtomicComponentRole::Ft).is_err());
 
         #[cfg(unix)]
         {
             let symlink_path = dir.path().join("component-symlink");
             std::os::unix::fs::symlink(&path, &symlink_path)
                 .expect("create planted local component symlink");
-            let error = read_local_component_snapshot(&symlink_path, "ft")
+            let error = read_local_component_snapshot(&symlink_path, AtomicComponentRole::Ft)
                 .expect_err("local component symlinks must fail before staging");
             assert!(
                 error.to_string().contains("without following symlinks"),
@@ -102123,7 +102168,8 @@ log_level = "debug"
         assert!(command.contains("test \"$(stat -c %a -- \"$destination\")\" = 700"));
         assert!(command.contains("install-v0.15.2-0123456789abcdef0123456789abcdef-$$"));
         assert!(command.contains("mkdir \"$destination\""));
-        assert!(command.contains("FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2"));
+        assert!(command.contains("FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2"));
+        assert!(command.contains("$destination/frankenterm-pty-guardian"));
         assert!(command.contains("stat -c %s"));
         assert!(command.contains("sha256sum"));
     }
@@ -102156,7 +102202,8 @@ test -n "$destination"
 mkdir -p "$destination"
 printf '#!/bin/sh\nexit 0\n' > "$destination/ft"
 printf '#!/bin/sh\nexit 0\n' > "$destination/frankenterm-mux-server"
-chmod 0755 "$destination/ft" "$destination/frankenterm-mux-server"
+printf '#!/bin/sh\nexit 0\n' > "$destination/frankenterm-pty-guardian"
+chmod 0755 "$destination/ft" "$destination/frankenterm-mux-server" "$destination/frankenterm-pty-guardian"
 "#,
         )
         .expect("write fake release installer");
@@ -102238,7 +102285,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
     }
 
     #[test]
-    fn top_level_installer_launch_probes_both_staged_components_before_backup() {
+    fn top_level_installer_launch_probes_all_three_staged_components_before_backup() {
         let installer = include_str!("../../../install.sh");
         assert!(installer.contains("Refusing process-family source paths that are symlinks"));
         assert!(
@@ -102246,8 +102293,10 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         );
         assert!(installer.contains("[ -L \"$ft_target\" ]"));
         assert!(installer.contains("[ -L \"$mux_target\" ]"));
+        assert!(installer.contains("[ -L \"$guardian_target\" ]"));
         assert!(installer.contains("[ -L \"$ft_backup_candidate\" ]"));
         assert!(installer.contains("[ -L \"$mux_backup_candidate\" ]"));
+        assert!(installer.contains("[ -L \"$guardian_backup_candidate\" ]"));
         assert!(installer.contains("restore_preserved_component()"));
         assert!(
             installer
@@ -102258,17 +102307,22 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         ));
         assert!(!installer.contains("mv \"$ft_backup\" \"$ft_target\" || true"));
         assert!(!installer.contains("mv \"$mux_backup\" \"$mux_target\" || true"));
+        assert!(!installer.contains("mv \"$guardian_backup\" \"$guardian_target\" || true"));
         let ft_probe = installer
             .find("if ! \"$ft_stage\" --version")
             .expect("staged ft launch probe");
         let mux_probe = installer
             .find("if ! \"$mux_stage\" --version")
             .expect("staged mux launch probe");
+        let guardian_probe = installer
+            .find("if ! \"$guardian_stage\" --version")
+            .expect("staged guardian launch probe");
         let first_backup = installer
             .find("if [ -e \"$ft_target\" ]")
             .expect("installed ft backup boundary");
         assert!(ft_probe < first_backup);
         assert!(mux_probe < first_backup);
+        assert!(guardian_probe < first_backup);
 
         let lock_acquired = installer
             .find("if mkdir \"$LOCK_DIR\"")
@@ -102281,6 +102335,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(installer.contains("command -v awk >/dev/null 2>&1 || return 1"));
         assert!(installer.contains("sed 's/:ft:/:ROLE:/' | sort -u"));
         assert!(installer.contains("sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u"));
+        assert!(installer.contains("sed 's/:frankenterm-pty-guardian:/:ROLE:/' | sort -u"));
 
         let source_build_start = installer
             .find("build_from_source() {")
@@ -102293,7 +102348,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(source_build.contains("scripts/atomic-component-manifest.sh"));
         assert!(
             source_build
-                .contains("feature_contract=\"process-family-ft-mux-server-default-features-v1\"")
+                .contains("feature_contract=\"process-family-ft-mux-server-pty-guardian-default-features-v1\"")
         );
         assert!(source_build.contains("${VERSION#v}"));
         assert!(source_build.contains("rustc -vV"));
@@ -102307,7 +102362,15 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(source_build.contains(
             "--entry executable:mux-server:frankenterm-mux-server:frankenterm-mux-server"
         ));
-        assert!(!source_build.contains("install_process_family \"$bin\" \"$mux_bin\""));
+        assert!(source_build.contains(
+            "--entry executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian"
+        ));
+        assert!(source_build.contains(
+            "-p frankenterm-pty-guardian --bin frankenterm-pty-guardian"
+        ));
+        assert!(!source_build.contains(
+            "install_process_family \"$bin\" \"$mux_bin\""
+        ));
         let identity_derivation = source_build
             .find("derive-build-id")
             .expect("canonical build identity derivation");
@@ -102321,7 +102384,9 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             .find("bash \"$atomic_tool\" verify")
             .expect("source-family manifest verification");
         let family_install = source_build
-            .find("install_process_family \"$proof_root/ft\"")
+            .find(
+                "install_process_family \\\n+    \"$proof_root/ft\" \\\n+    \"$proof_root/frankenterm-mux-server\" \\\n+    \"$proof_root/frankenterm-pty-guardian\"",
+            )
             .expect("verified process-family installation");
         assert!(identity_derivation < cargo_build);
         assert!(cargo_build < manifest_generation);
@@ -102348,6 +102413,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         let dir = tempfile::tempdir().expect("create installed process-family fixture");
         let ft_path = dir.path().join("ft");
         let mux_path = dir.path().join("frankenterm-mux-server");
+        let guardian_path = dir.path().join("frankenterm-pty-guardian");
         let build_id = "a".repeat(64);
         write_atomic_component_fixture(&ft_path, &build_id, "ft", "x86_64-unknown-linux-gnu");
         write_atomic_component_fixture(
@@ -102356,7 +102422,13 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             "frankenterm-mux-server",
             "x86_64-unknown-linux-gnu",
         );
-        for path in [&ft_path, &mux_path] {
+        write_atomic_component_fixture(
+            &guardian_path,
+            &build_id,
+            "frankenterm-pty-guardian",
+            "x86_64-unknown-linux-gnu",
+        );
+        for path in [&ft_path, &mux_path, &guardian_path] {
             let mut permissions = std::fs::metadata(path)
                 .expect("read component fixture metadata")
                 .permissions();
@@ -102381,6 +102453,20 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         check(true);
 
         write_atomic_component_fixture(
+            &guardian_path,
+            &"b".repeat(64),
+            "frankenterm-pty-guardian",
+            "x86_64-unknown-linux-gnu",
+        );
+        check(false);
+        write_atomic_component_fixture(
+            &guardian_path,
+            &build_id,
+            "frankenterm-pty-guardian",
+            "x86_64-unknown-linux-gnu",
+        );
+
+        write_atomic_component_fixture(
             &mux_path,
             &"b".repeat(64),
             "frankenterm-mux-server",
@@ -102388,7 +102474,11 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         );
         check(false);
 
-        for (path, component) in [(&ft_path, "ft"), (&mux_path, "frankenterm-mux-server")] {
+        for (path, component) in [
+            (&ft_path, "ft"),
+            (&mux_path, "frankenterm-mux-server"),
+            (&guardian_path, "frankenterm-pty-guardian"),
+        ] {
             write_atomic_component_fixture(path, &build_id, component, "x86_64-unknown-linux-gnu");
             let stale = std::fs::read_to_string(path)
                 .expect("read stale-version fixture")
@@ -102397,7 +102487,11 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         }
         check(false);
 
-        for (path, component) in [(&ft_path, "ft"), (&mux_path, "frankenterm-mux-server")] {
+        for (path, component) in [
+            (&ft_path, "ft"),
+            (&mux_path, "frankenterm-mux-server"),
+            (&guardian_path, "frankenterm-pty-guardian"),
+        ] {
             write_atomic_component_fixture(path, &build_id, component, "x86_64-unknown-linux-gnu");
             let debug = std::fs::read_to_string(path)
                 .expect("read non-shipping-profile fixture")
@@ -102413,6 +102507,12 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             "frankenterm-mux-server",
             "aarch64-unknown-linux-gnu",
         );
+        write_atomic_component_fixture(
+            &guardian_path,
+            &build_id,
+            "frankenterm-pty-guardian",
+            "aarch64-unknown-linux-gnu",
+        );
         check(true);
 
         write_atomic_component_fixture(&ft_path, &build_id, "ft", "x86_64-unknown-linux-gnu");
@@ -102422,14 +102522,20 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             "frankenterm-mux-server",
             "x86_64-unknown-linux-gnu",
         );
+        write_atomic_component_fixture(
+            &guardian_path,
+            &build_id,
+            "frankenterm-pty-guardian",
+            "x86_64-unknown-linux-gnu",
+        );
         std::fs::OpenOptions::new()
             .append(true)
-            .open(&mux_path)
+            .open(&guardian_path)
             .and_then(|mut file| {
                 use std::io::Write as _;
                 writeln!(
                     file,
-                    "# FT_ATOMIC_COMPONENT_IDENTITY_V1:{}:frankenterm-mux-server:x86_64-unknown-linux-gnu:release-interactive:0.15.2;",
+                    "# FT_ATOMIC_COMPONENT_IDENTITY_V1:{}:frankenterm-pty-guardian:x86_64-unknown-linux-gnu:release-interactive:0.15.2;",
                     "c".repeat(64)
                 )
             })
