@@ -43,7 +43,8 @@ use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
 use mux::guardian_protocol::{
-    GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1, GuardianSpawnPayload,
+    GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1,
+    GuardianDurableSpawnFenceV1, GuardianSpawnPayload,
 };
 #[cfg(test)]
 use portable_pty::ExitStatus;
@@ -184,6 +185,22 @@ impl BrokerSpawnWalIdentityV1 {
     pub const fn binding_digest(self) -> [u8; 32] {
         self.binding_digest
     }
+
+    /// Project the exact authenticated Spawn fields needed to fence the
+    /// legacy callback in a freshly reconstructed guardian protocol state.
+    pub fn durable_protocol_fence(
+        self,
+    ) -> Result<GuardianDurableSpawnFenceV1, BrokerSpawnWalError> {
+        GuardianDurableSpawnFenceV1::new(
+            self.mux_incarnation,
+            self.spawn_effect_id,
+            self.durable_pane_id,
+            self.origin_request_id,
+            self.spawn_payload_bytes,
+            self.spawn_payload_digest,
+        )
+        .map_err(|_| BrokerSpawnWalError::InvalidIdentity)
+    }
 }
 
 /// Durable phase of one broker-managed Spawn effect.
@@ -294,6 +311,17 @@ impl BrokerSpawnWalStatusV1 {
     #[must_use]
     pub const fn spawn_outcome_is_indeterminate(self) -> bool {
         matches!(self.phase, Some(BrokerSpawnWalPhaseV1::Attempted))
+    }
+
+    /// Return the durable global Spawn fence only after at least one lifecycle
+    /// record exists. Authenticated file headers alone are setup state and must
+    /// not suppress an otherwise unattempted Spawn.
+    pub fn durable_protocol_fence(
+        self,
+    ) -> Result<Option<GuardianDurableSpawnFenceV1>, BrokerSpawnWalError> {
+        self.phase
+            .map(|_| self.identity.durable_protocol_fence())
+            .transpose()
     }
 }
 
