@@ -8,6 +8,9 @@
 //! A fresh mux first uses the authenticated `Hello` operation to learn the current guardian
 //! incarnation; nil incarnation scope is otherwise forbidden.
 
+use frankenterm_build_identity::{
+    AtomicBuildIdentity, SealedAtomicBuildIdentity, UNSEALED_BUILD_ID,
+};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{
     terminalstate::checkpoint::TerminalCheckpointLimits, RecoveryTerminalCheckpointV2,
@@ -23,7 +26,8 @@ use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::guardian_checkpoint::{
-    GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointOriginV1, LiveParserCheckpointAck,
+    GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointGenesisSpawnPermitV1,
+    GuardianCheckpointOriginV1, GuardianGenesisReservationIdentityV1, LiveParserCheckpointAck,
 };
 
 pub const GUARDIAN_PROTOCOL_VERSION: u16 = 4;
@@ -72,6 +76,7 @@ const RESPONSE_FRAME_MIN_BYTES: usize =
 const RESPONSE_PAYLOAD_LENGTH_OFFSET: usize =
     FRAME_LENGTH_BYTES + RESPONSE_FRAME_HEADER_BYTES - std::mem::size_of::<u32>();
 const SPAWN_PAYLOAD_MAGIC: [u8; 4] = *b"GSP1";
+const HELLO_BUILD_IDENTITY_PAYLOAD_MAGIC: [u8; 4] = *b"GHB1";
 const RESIZE_PAYLOAD_MAGIC: [u8; 4] = *b"GRS1";
 const SIGNAL_PAYLOAD_MAGIC: [u8; 4] = *b"GSG1";
 const INPUT_EFFECT_QUERY_PAYLOAD_MAGIC: [u8; 4] = *b"GIQ2";
@@ -85,6 +90,7 @@ const REPLAY_ACK_PAYLOAD_MAGIC: [u8; 4] = *b"GRA1";
 const REPLAY_ACK_REPLY_MAGIC: [u8; 4] = *b"GAR1";
 const REJECTION_PAYLOAD_MAGIC: [u8; 4] = *b"GRE1";
 const SPAWN_PAYLOAD_FIXED_BYTES: usize = 16;
+const HELLO_BUILD_IDENTITY_PAYLOAD_BYTES: usize = 40;
 const RESIZE_PAYLOAD_BYTES: usize = 12;
 const SIGNAL_PAYLOAD_BYTES: usize = 5;
 const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 64;

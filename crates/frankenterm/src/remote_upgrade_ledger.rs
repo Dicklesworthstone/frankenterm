@@ -32,11 +32,11 @@ const MAX_RECORD_ARTIFACTS: usize = 32 * 16;
 const MAX_TRANSACTION_ENTRIES: usize = 1 + MAX_RECORD_ARTIFACTS + 32;
 const MAX_RECEIPT_BYTES: usize = 4 * 1024;
 const MAX_COMPONENT_BYTES: u64 = 128 * 1024 * 1024;
-const CLAIM_SCHEMA: &str = "frankenterm.remote-upgrade-claim.v1";
-const RECORD_SCHEMA: &str = "frankenterm.remote-upgrade-record.v1";
-const CLAIM_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.claim.v1";
-const RECORD_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.record.v1";
-const EFFECT_ID_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.effect-id.v1";
+const CLAIM_SCHEMA: &str = "frankenterm.remote-upgrade-claim.v2";
+const RECORD_SCHEMA: &str = "frankenterm.remote-upgrade-record.v2";
+const CLAIM_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.claim.v2";
+const RECORD_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.record.v2";
+const EFFECT_ID_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.effect-id.v2";
 const TRANSACTIONS_DIRECTORY: &str = "upgrade-transactions";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -50,6 +50,8 @@ pub(crate) struct RemoteUpgradeClaim {
     ft_bytes: u64,
     mux_server_sha256: String,
     mux_server_bytes: u64,
+    guardian_sha256: String,
+    guardian_bytes: u64,
 }
 
 impl RemoteUpgradeClaim {
@@ -61,16 +63,20 @@ impl RemoteUpgradeClaim {
         ft_bytes: u64,
         mux_server_sha256: &str,
         mux_server_bytes: u64,
+        guardian_sha256: &str,
+        guardian_bytes: u64,
     ) -> anyhow::Result<Self> {
         let claim = Self {
             schema: CLAIM_SCHEMA.to_string(),
             transaction_id: transaction_id.to_string(),
-            operation: "publish_process_family_generation".to_string(),
+            operation: "publish_process_family_triplet_generation".to_string(),
             generation_id: generation_id.to_string(),
             ft_sha256: ft_sha256.to_string(),
             ft_bytes,
             mux_server_sha256: mux_server_sha256.to_string(),
             mux_server_bytes,
+            guardian_sha256: guardian_sha256.to_string(),
+            guardian_bytes,
         };
         claim.validate()?;
         Ok(claim)
@@ -91,18 +97,20 @@ impl RemoteUpgradeClaim {
         );
         validate_transaction_id(&self.transaction_id)?;
         anyhow::ensure!(
-            self.operation == "publish_process_family_generation",
+            self.operation == "publish_process_family_triplet_generation",
             "upgrade claim operation is unsupported"
         );
         anyhow::ensure!(
             is_lowercase_sha256(&self.generation_id)
                 && is_lowercase_sha256(&self.ft_sha256)
-                && is_lowercase_sha256(&self.mux_server_sha256),
+                && is_lowercase_sha256(&self.mux_server_sha256)
+                && is_lowercase_sha256(&self.guardian_sha256),
             "upgrade claim contains a non-canonical digest"
         );
         anyhow::ensure!(
             (1..=MAX_COMPONENT_BYTES).contains(&self.ft_bytes)
-                && (1..=MAX_COMPONENT_BYTES).contains(&self.mux_server_bytes),
+                && (1..=MAX_COMPONENT_BYTES).contains(&self.mux_server_bytes)
+                && (1..=MAX_COMPONENT_BYTES).contains(&self.guardian_bytes),
             "upgrade claim contains a process-family component outside its byte bound"
         );
         Ok(())
@@ -361,27 +369,27 @@ impl RemoteUpgradeRecord {
         validate_receipt(&self.receipt)?;
         let expected_receipt = match self.state {
             RemoteUpgradeState::Prepared => format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:prepared:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:prepared:{}\n",
                 self.transaction_id, self.generation_id
             ),
             RemoteUpgradeState::PendingLiveOwner => format!(
-                "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
                 self.generation_id
             ),
             RemoteUpgradeState::Activating => format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:activating:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:activating:{}\n",
                 self.transaction_id, self.generation_id
             ),
             RemoteUpgradeState::Committed => format!(
-                "FT_REMOTE_GENERATION_PUBLICATION_V1={}:current:generations/{}\n",
+                "FT_REMOTE_GENERATION_PUBLICATION_V2={}:current:generations/{}\n",
                 self.generation_id, self.generation_id
             ),
             RemoteUpgradeState::RolledBack => format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:rolled_back:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:rolled_back:{}\n",
                 self.transaction_id, self.generation_id
             ),
             RemoteUpgradeState::Indeterminate => format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:indeterminate:{}\n",
                 self.transaction_id, self.generation_id
             ),
         };
@@ -683,7 +691,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
         );
         let attempt = self.take_next_attempt()?;
         let receipt = format!(
-            "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:prepared:{}\n",
+            "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:prepared:{}\n",
             self.claim.transaction_id, self.claim.generation_id
         );
         let record = self.append_committed_record(
@@ -738,7 +746,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
         );
         let attempt = authorization.attempt;
         let receipt = format!(
-            "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:activating:{}\n",
+            "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:activating:{}\n",
             self.claim.transaction_id, self.claim.generation_id
         );
         let record = self.append_committed_record(
@@ -766,7 +774,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
         );
         let attempt = self.take_next_attempt()?;
         let receipt = format!(
-            "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:activating:{}\n",
+            "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:activating:{}\n",
             self.claim.transaction_id, self.claim.generation_id
         );
         let record = self.append_committed_record(
@@ -794,7 +802,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
         );
         let attempt = self.take_next_attempt()?;
         let receipt = format!(
-            "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:activating:{}\n",
+            "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:activating:{}\n",
             self.claim.transaction_id, self.claim.generation_id
         );
         let record = self.append_committed_record(
@@ -863,7 +871,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
         let before = authorization.selector_before.clone();
         let attempt = authorization.attempt;
         let receipt = format!(
-            "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:rolled_back:{}\n",
+            "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:rolled_back:{}\n",
             self.claim.transaction_id, self.claim.generation_id
         );
         self.append_committed_record(
@@ -1682,6 +1690,8 @@ mod tests {
             101,
             &"c".repeat(64),
             202,
+            &"d".repeat(64),
+            303,
         )
         .expect("create canonical upgrade claim")
     }
@@ -1701,7 +1711,7 @@ mod tests {
     ) -> (RemoteUpgradeRecord, Vec<u8>, String) {
         let authorization = ledger.latest().expect("Prepared authorization");
         let receipt = format!(
-            "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+            "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
             ledger.claim.generation_id
         );
         let record = RemoteUpgradeRecord {
@@ -1749,7 +1759,7 @@ mod tests {
             .commit_pending_live_owner(
                 SelectorAuthority::Missing,
                 format!(
-                    "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                    "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
                     ledger.claim.generation_id
                 ),
             )
@@ -1769,7 +1779,7 @@ mod tests {
         let (fixture, root, effective_uid) = root_fixture();
         let upgrade_claim = claim('a');
         let expected_receipt = format!(
-            "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+            "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
             "a".repeat(64)
         );
         let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim.clone())
@@ -1984,7 +1994,7 @@ mod tests {
                     SelectorAuthority::Missing,
                     SelectorAuthority::Missing,
                     format!(
-                        "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:indeterminate:{}\n",
+                        "FT_REMOTE_UPGRADE_TRANSACTION_V2={TRANSACTION_ID}:indeterminate:{}\n",
                         "a".repeat(64)
                     ),
                 )
@@ -2049,7 +2059,7 @@ mod tests {
                 .commit_current(
                     selector_after,
                     format!(
-                        "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:generations/{generation_id}\n"
+                    "FT_REMOTE_GENERATION_PUBLICATION_V2={generation_id}:current:generations/{generation_id}\n"
                     ),
                 )
                 .expect("advance transaction to Committed");
@@ -2082,7 +2092,7 @@ mod tests {
                 SelectorAuthority::Missing,
                 SelectorAuthority::Missing,
                 format!(
-                    "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:indeterminate:{}\n",
+                    "FT_REMOTE_UPGRADE_TRANSACTION_V2={TRANSACTION_ID}:indeterminate:{}\n",
                     "a".repeat(64)
                 ),
             )
@@ -2125,7 +2135,7 @@ mod tests {
         assert_eq!(
             rolled_back.receipt(),
             format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:rolled_back:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={TRANSACTION_ID}:rolled_back:{}\n",
                 "a".repeat(64)
             )
         );
@@ -2144,7 +2154,7 @@ mod tests {
                 SelectorAuthority::Missing,
                 SelectorAuthority::Missing,
                 format!(
-                    "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:indeterminate:{}\n",
+                    "FT_REMOTE_UPGRADE_TRANSACTION_V2={TRANSACTION_ID}:indeterminate:{}\n",
                     "a".repeat(64)
                 ),
             )
@@ -2266,7 +2276,7 @@ mod tests {
             selector_before: authorization.selector_before.clone(),
             selector_after: changed,
             receipt: format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:rolled_back:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={TRANSACTION_ID}:rolled_back:{}\n",
                 ledger.claim.generation_id
             ),
         };
@@ -2315,7 +2325,7 @@ mod tests {
             selector_before: wrong_authority.clone(),
             selector_after: wrong_authority,
             receipt: format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:rolled_back:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={TRANSACTION_ID}:rolled_back:{}\n",
                 ledger.claim.generation_id
             ),
         };
@@ -2427,7 +2437,7 @@ mod tests {
             selector_before: authorization.selector_before.clone(),
             selector_after: authorization.selector_before.clone(),
             receipt: format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:indeterminate:{}\n",
                 ledger.claim.transaction_id, ledger.claim.generation_id
             ),
         };
@@ -2451,7 +2461,7 @@ mod tests {
         let names_before = transaction_names(&ledger);
         let (_, _, intended_digest) = pending_outcome_record(&ledger);
         let intended_receipt = format!(
-            "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+            "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
             ledger.claim.generation_id
         );
 
@@ -2528,7 +2538,7 @@ mod tests {
             .commit_pending_live_owner(
                 SelectorAuthority::Missing,
                 format!(
-                    "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                    "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
                     "a".repeat(64)
                 ),
             )

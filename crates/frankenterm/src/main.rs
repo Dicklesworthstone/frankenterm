@@ -80758,7 +80758,7 @@ fn read_remote_generation_manifest(
         .map_err(|error| anyhow::anyhow!("generation manifest is not valid JSON: {error}"))?;
     manifest.validate()?;
     verify_exact_pretty_json_encoding(&manifest, &bytes, REMOTE_GENERATION_MANIFEST_MAX_BYTES)
-        .context("generation manifest does not use the one canonical v2 encoding")?;
+        .context("generation manifest does not use the one canonical v3 encoding")?;
     Ok(manifest)
 }
 
@@ -80768,7 +80768,7 @@ fn write_remote_generation_component(
     source_path: &Path,
     source_snapshot: &LocalComponentSnapshot,
     component: &RemoteGenerationComponentManifest,
-    expected_component: &str,
+    expected_role: AtomicComponentRole,
     effective_uid: u32,
     stage_device: u64,
 ) -> anyhow::Result<()> {
@@ -80849,7 +80849,7 @@ fn write_remote_generation_component(
     })?;
     verify_remote_generation_file(stage, component, effective_uid, stage_device)?;
     let source_after =
-        read_remote_generation_source_snapshot(source_path, expected_component, effective_uid)?;
+        read_remote_generation_source_snapshot(source_path, expected_role, effective_uid)?;
     anyhow::ensure!(
         source_after == *source_snapshot,
         "generation source {} changed identity or hash during publication",
@@ -81031,12 +81031,13 @@ fn verify_remote_generation_directory(
     let expected_names = BTreeSet::from([
         REMOTE_GENERATION_LIFETIME_LEASE_FILE.to_string(),
         REMOTE_GENERATION_FT_FILE.to_string(),
+        REMOTE_GENERATION_GUARDIAN_FILE.to_string(),
         REMOTE_GENERATION_MANIFEST_FILE.to_string(),
         REMOTE_GENERATION_MUX_FILE.to_string(),
     ]);
     anyhow::ensure!(
         remote_generation_directory_inventory(&directory)? == expected_names,
-        "immutable generation directory does not contain exactly lifetime lease, ft, mux, and manifest"
+        "immutable generation directory does not contain exactly lifetime lease, ft, mux, guardian, and manifest"
     );
     let manifest = read_remote_generation_manifest(&directory, effective_uid, generations_device)?;
     if require_content_derived_name {
@@ -81055,6 +81056,12 @@ fn verify_remote_generation_directory(
     verify_remote_generation_file(
         &directory,
         &manifest.mux_server,
+        effective_uid,
+        generations_device,
+    )?;
+    verify_remote_generation_file(
+        &directory,
+        &manifest.guardian,
         effective_uid,
         generations_device,
     )?;
@@ -81853,21 +81860,31 @@ fn publish_remote_process_family_generation(
 
     let ft = read_remote_generation_source_snapshot(
         request.ft_source,
-        REMOTE_GENERATION_FT_FILE,
+        AtomicComponentRole::Ft,
         effective_uid,
     )?;
     let mux_server = read_remote_generation_source_snapshot(
         request.mux_server_source,
-        REMOTE_GENERATION_MUX_FILE,
+        AtomicComponentRole::FrankenTermMuxServer,
         effective_uid,
     )?;
-    let family = ValidatedLocalProcessFamily { ft, mux_server };
+    let guardian = read_remote_generation_source_snapshot(
+        request.guardian_source,
+        AtomicComponentRole::FrankenTermPtyGuardian,
+        effective_uid,
+    )?;
+    let family = ValidatedLocalProcessFamily {
+        ft,
+        mux_server,
+        guardian,
+    };
     anyhow::ensure!(
         ProcessFamilyByteReceipt::from(&family) == request.expected,
         "remote generation sources do not match the caller's exact length and hash receipt"
     );
     anyhow::ensure!(
-        family.ft.identity == family.mux_server.identity,
+        family.ft.identity == family.mux_server.identity
+            && family.ft.identity == family.guardian.identity,
         "remote generation sources do not share one sealed build identity"
     );
     let manifest = RemoteGenerationManifest::from_process_family(&family)?;
@@ -81882,6 +81899,8 @@ fn publish_remote_process_family_generation(
         request.expected.ft.byte_len,
         &request.expected.mux_server.sha256,
         request.expected.mux_server.byte_len,
+        &request.expected.guardian.sha256,
+        request.expected.guardian.byte_len,
     )?;
     let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(&root, effective_uid, claim)?;
 
@@ -82137,7 +82156,7 @@ fn publish_remote_process_family_generation(
             request.ft_source,
             &family.ft,
             &manifest.ft,
-            REMOTE_GENERATION_FT_FILE,
+            AtomicComponentRole::Ft,
             effective_uid,
             stage_device,
         )?;
@@ -82146,7 +82165,16 @@ fn publish_remote_process_family_generation(
             request.mux_server_source,
             &family.mux_server,
             &manifest.mux_server,
-            REMOTE_GENERATION_MUX_FILE,
+            AtomicComponentRole::FrankenTermMuxServer,
+            effective_uid,
+            stage_device,
+        )?;
+        write_remote_generation_component(
+            &stage,
+            request.guardian_source,
+            &family.guardian,
+            &manifest.guardian,
+            AtomicComponentRole::FrankenTermPtyGuardian,
             effective_uid,
             stage_device,
         )?;
