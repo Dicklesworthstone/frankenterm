@@ -13,7 +13,7 @@ use mux::guardian_protocol::{
     GuardianOperation, GuardianProtocolError, GuardianReply, GuardianRequestEnvelope,
     GuardianRequestHeader, GuardianRejectionCode, GuardianResponseEnvelope,
     GuardianResponseStatus, GuardianSecret, GuardianResizePayload, GuardianSignal,
-    GuardianSpawnPayload, InputEffectState, GUARDIAN_AUTH_TOKEN_BYTES,
+    GuardianSpawnPayload, GuardianWireFrame, InputEffectState, GUARDIAN_AUTH_TOKEN_BYTES,
     GUARDIAN_MAX_CENSUS_BYTES, GUARDIAN_MAX_CENSUS_ENTRIES, GUARDIAN_MAX_FRAME_BYTES,
     GUARDIAN_MAX_PANES, decode_guardian_request, decode_guardian_response,
     encode_guardian_request, encode_guardian_response,
@@ -199,8 +199,8 @@ struct ReadyEvent {
 struct Connection {
     stream: UnixStream,
     generation: u64,
-    read_buf: Zeroizing<Vec<u8>>,
-    write_buf: Zeroizing<Vec<u8>>,
+    read_state: GuardianReadState,
+    write_buf: Option<GuardianWireFrame>,
     write_offset: usize,
     mux_incarnation: Option<Uuid>,
     close_after_write: bool,
@@ -209,13 +209,33 @@ struct Connection {
     accepted_at: Instant,
 }
 
+enum GuardianReadState {
+    Prefix {
+        bytes: [u8; 4],
+        filled: usize,
+    },
+    Frame {
+        bytes: Zeroizing<Vec<u8>>,
+        filled: usize,
+    },
+}
+
+impl GuardianReadState {
+    const fn prefix() -> Self {
+        Self::Prefix {
+            bytes: [0; 4],
+            filled: 0,
+        }
+    }
+}
+
 impl Connection {
     fn new(stream: UnixStream, generation: u64) -> Self {
         Self {
             stream,
             generation,
-            read_buf: Zeroizing::new(Vec::new()),
-            write_buf: Zeroizing::new(Vec::new()),
+            read_state: GuardianReadState::prefix(),
+            write_buf: None,
             write_offset: 0,
             mux_incarnation: None,
             close_after_write: false,
@@ -928,10 +948,10 @@ impl GuardianService {
             return;
         }
         let mut keep = !event.closed;
-        if keep && event.readable && connection.write_buf.is_empty() {
+        if keep && event.readable && connection.write_buf.is_none() {
             keep = self.read_connection_frame(event.token, &mut connection);
         }
-        if keep && event.writable && !connection.write_buf.is_empty() {
+        if keep && event.writable && connection.write_buf.is_some() {
             keep = self.write_connection_frame(event.token, &mut connection);
         }
 
@@ -944,74 +964,95 @@ impl GuardianService {
 
     fn read_connection_frame(&mut self, token: Token, connection: &mut Connection) -> bool {
         loop {
-            let mut chunk = Zeroizing::new([0_u8; 8192]);
-            match connection.stream.read(&mut chunk[..]) {
-                Ok(0) => return false,
-                Ok(count) => {
-                    let Some(next_len) = connection.read_buf.len().checked_add(count) else {
-                        return false;
-                    };
-                    if next_len > GUARDIAN_MAX_FRAME_BYTES
-                        || connection.read_buf.try_reserve(count).is_err()
-                    {
-                        return false;
-                    }
-                    connection.read_buf.extend_from_slice(&chunk[..count]);
-                    let Some(frame_len) = complete_frame_len(&connection.read_buf) else {
-                        continue;
-                    };
-                    if frame_len > GUARDIAN_MAX_FRAME_BYTES
-                        || connection.read_buf.len() > frame_len
-                    {
-                        return false;
-                    }
-                    if connection.read_buf.len() == frame_len {
-                        let frame = std::mem::replace(
-                            &mut connection.read_buf,
-                            Zeroizing::new(Vec::new()),
-                        );
-                        return match self.process_frame(token, connection, &frame) {
-                            FrameProcessing::Response(response) => {
-                                connection.write_buf =
-                                    match encode_guardian_response(&self.secret, &response) {
-                                        Ok(frame) => Zeroizing::new(frame),
-                                        Err(_) => return false,
-                                    };
-                                connection.write_offset = 0;
-                                self.poll
-                                    .registry()
-                                    .reregister(
-                                        &mut connection.stream,
-                                        token,
-                                        Interest::WRITABLE,
-                                    )
-                                    .is_ok()
+            let completed_frame = match &mut connection.read_state {
+                GuardianReadState::Prefix { bytes, filled } => {
+                    match connection.stream.read(&mut bytes[*filled..]) {
+                        Ok(0) => return false,
+                        Ok(count) => {
+                            *filled += count;
+                            if *filled != bytes.len() {
+                                continue;
                             }
-                            FrameProcessing::PendingInput => self
-                                .poll
-                                .registry()
-                                .reregister(
-                                    &mut connection.stream,
-                                    token,
-                                    Interest::READABLE,
-                                )
-                                .is_ok(),
-                            FrameProcessing::Close => false,
-                        };
+                            let body_len = match usize::try_from(u32::from_be_bytes(*bytes)) {
+                                Ok(body_len) => body_len,
+                                Err(_) => return false,
+                            };
+                            let Some(total_len) = body_len.checked_add(bytes.len()) else {
+                                return false;
+                            };
+                            if total_len > GUARDIAN_MAX_FRAME_BYTES {
+                                return false;
+                            }
+                            let mut frame = Zeroizing::new(Vec::new());
+                            if frame.try_reserve_exact(total_len).is_err() {
+                                return false;
+                            }
+                            frame.resize(total_len, 0);
+                            frame[..bytes.len()].copy_from_slice(bytes);
+                            connection.read_state = GuardianReadState::Frame {
+                                bytes: frame,
+                                filled: bytes.len(),
+                            };
+                            continue;
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
+                        Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return false,
                     }
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => return false,
-            }
+                GuardianReadState::Frame { bytes, filled } => {
+                    match connection.stream.read(&mut bytes[*filled..]) {
+                        Ok(0) => return false,
+                        Ok(count) => {
+                            *filled += count;
+                            if *filled != bytes.len() {
+                                continue;
+                            }
+                            let GuardianReadState::Frame { bytes, .. } = std::mem::replace(
+                                &mut connection.read_state,
+                                GuardianReadState::prefix(),
+                            ) else {
+                                unreachable!("completed guardian frame state changed");
+                            };
+                            bytes
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
+                        Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return false,
+                    }
+                }
+            };
+            return match self.process_frame(token, connection, &completed_frame) {
+                FrameProcessing::Response(response) => {
+                    connection.write_buf =
+                        match encode_guardian_response(&self.secret, &response) {
+                            Ok(frame) => Some(frame),
+                            Err(_) => return false,
+                        };
+                    connection.write_offset = 0;
+                    self.poll
+                        .registry()
+                        .reregister(&mut connection.stream, token, Interest::WRITABLE)
+                        .is_ok()
+                }
+                FrameProcessing::PendingInput => self
+                    .poll
+                    .registry()
+                    .reregister(&mut connection.stream, token, Interest::READABLE)
+                    .is_ok(),
+                FrameProcessing::Close => false,
+            };
         }
     }
 
     fn write_connection_frame(&mut self, token: Token, connection: &mut Connection) -> bool {
-        while connection.write_offset < connection.write_buf.len() {
+        let Some(write_buf) = connection.write_buf.as_ref() else {
+            return false;
+        };
+        while connection.write_offset < write_buf.len() {
             match connection
                 .stream
-                .write(&connection.write_buf[connection.write_offset..])
+                .write(&write_buf[connection.write_offset..])
             {
                 Ok(0) => return false,
                 Ok(count) => connection.write_offset += count,
@@ -1028,7 +1069,7 @@ impl GuardianService {
                 Err(_) => return false,
             }
         }
-        connection.write_buf.zeroize();
+        let _completed_frame = connection.write_buf.take();
         connection.write_offset = 0;
         if let Some(authority) = connection.guarded_stop_response.take() {
             if !self.lifecycle.response_flushed(authority) {
@@ -1216,7 +1257,7 @@ impl GuardianService {
                 self.finish_connection(token, connection);
                 continue;
             };
-            connection.write_buf = Zeroizing::new(frame);
+            connection.write_buf = Some(frame);
             connection.write_offset = 0;
             if self
                 .poll
@@ -1430,15 +1471,15 @@ impl Drop for OwnedClientRequest {
 
 /// Encoded request bytes that remain wipe-on-drop across every socket error.
 struct OwnedEncodedFrame {
-    frame: Zeroizing<Vec<u8>>,
+    frame: GuardianWireFrame,
     #[cfg(test)]
     wipe_probe: Option<Arc<ClientRequestWipeProbe>>,
 }
 
 impl OwnedEncodedFrame {
-    fn new(frame: Vec<u8>) -> Self {
+    fn new(frame: GuardianWireFrame) -> Self {
         Self {
-            frame: Zeroizing::new(frame),
+            frame,
             #[cfg(test)]
             wipe_probe: None,
         }
@@ -1450,11 +1491,11 @@ impl OwnedEncodedFrame {
     }
 
     fn as_slice(&self) -> &[u8] {
-        &self.frame
+        self.frame.as_slice()
     }
 
     fn zeroize_after_write(&mut self) {
-        self.frame.as_mut_slice().zeroize();
+        self.frame.zeroize_bytes();
         #[cfg(test)]
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe.encoded_frame_wipe.store(
@@ -1467,7 +1508,7 @@ impl OwnedEncodedFrame {
 
 impl Drop for OwnedEncodedFrame {
     fn drop(&mut self) {
-        self.frame.as_mut_slice().zeroize();
+        self.frame.zeroize_bytes();
         #[cfg(test)]
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe.encoded_frame_drop_wipe.store(

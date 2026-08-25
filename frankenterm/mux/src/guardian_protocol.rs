@@ -1441,6 +1441,84 @@ struct GuardianCheckpointChunkNonDuplicable;
 // tests remained green.
 static_assertions::assert_not_impl_any!(GuardianCheckpointChunkNonDuplicable: Clone, Copy);
 
+/// Authenticated guardian wire bytes owned by one wipe-on-drop capability.
+///
+/// Encoding allocates this owner before any header or payload plaintext is
+/// written. The type intentionally has no `Clone`, `ToOwned`, or raw-`Vec`
+/// extraction surface; socket code borrows it until the write completes.
+pub struct GuardianWireFrame {
+    bytes: Zeroizing<Vec<u8>>,
+    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+}
+
+impl GuardianWireFrame {
+    fn with_capacity(capacity: usize) -> Result<Self, GuardianProtocolError> {
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| GuardianProtocolError::FrameTooLarge)?;
+        Ok(Self {
+            bytes,
+            _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+        })
+    }
+
+    fn bytes_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
+    pub fn zeroize_bytes(&mut self) {
+        self.bytes.as_mut_slice().zeroize();
+    }
+}
+
+impl std::ops::Deref for GuardianWireFrame {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for GuardianWireFrame {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.bytes.as_mut_slice()
+    }
+}
+
+impl AsRef<[u8]> for GuardianWireFrame {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for GuardianWireFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianWireFrame")
+            .field("frame_bytes", &self.bytes.len())
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl PartialEq for GuardianWireFrame {
+    fn eq(&self, other: &Self) -> bool {
+        checkpoint_chunk_digest_matches(self.as_slice(), other.as_slice())
+    }
+}
+
+impl Eq for GuardianWireFrame {}
+impl ZeroizeOnDrop for GuardianWireFrame {}
+
+static_assertions::assert_not_impl_any!(GuardianWireFrame: Clone, Copy);
+static_assertions::assert_impl_all!(GuardianWireFrame: ZeroizeOnDrop);
+
 /// Wipe-on-drop ownership for a digest derived from replay plaintext.
 ///
 /// The digest is intentionally non-cloneable even though its bytes have a
@@ -8871,7 +8949,7 @@ impl GuardianProtocolState {
 pub fn encode_guardian_request(
     secret: &GuardianSecret,
     request: &GuardianRequestEnvelope,
-) -> Result<Vec<u8>, GuardianProtocolError> {
+) -> Result<GuardianWireFrame, GuardianProtocolError> {
     validate_request_envelope(request)?;
     let payload_len = request.payload.len();
     let frame_len = REQUEST_FRAME_HEADER_BYTES
@@ -8885,26 +8963,26 @@ pub fn encode_guardian_request(
         return Err(GuardianProtocolError::FrameTooLarge);
     }
 
-    let mut frame = Vec::with_capacity(total_len);
-    push_u32(&mut frame, u32::try_from(frame_len).map_err(|_| GuardianProtocolError::FrameTooLarge)?);
+    let mut frame = GuardianWireFrame::with_capacity(total_len)?;
+    push_u32(frame.bytes_mut(), u32::try_from(frame_len).map_err(|_| GuardianProtocolError::FrameTooLarge)?);
     frame.extend_from_slice(&FRAME_MAGIC);
     frame.extend_from_slice(&request.header.protocol_version.to_be_bytes());
     frame.push(request.header.operation as u8);
     frame.push(0);
-    push_uuid(&mut frame, request.header.guardian_incarnation);
-    push_uuid(&mut frame, request.header.mux_incarnation);
-    push_uuid(&mut frame, request.header.request_id);
+    push_uuid(frame.bytes_mut(), request.header.guardian_incarnation);
+    push_uuid(frame.bytes_mut(), request.header.mux_incarnation);
+    push_uuid(frame.bytes_mut(), request.header.request_id);
     frame.extend_from_slice(&request.header.payload_sha256);
-    push_optional_uuid(&mut frame, request.header.pane_id);
+    push_optional_uuid(frame.bytes_mut(), request.header.pane_id);
     frame.extend_from_slice(&request.header.lease_generation.to_be_bytes());
     frame.extend_from_slice(&request.header.lease_sequence.to_be_bytes());
-    push_optional_uuid(&mut frame, request.header.effect_id);
+    push_optional_uuid(frame.bytes_mut(), request.header.effect_id);
     push_u32(
-        &mut frame,
+        frame.bytes_mut(),
         u32::try_from(payload_len).map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
     );
     frame.extend_from_slice(&request.payload);
-    let tag = secret.mac(&frame)?;
+    let tag = Zeroizing::new(secret.mac(&frame)?);
     frame.extend_from_slice(&tag);
     debug_assert_eq!(frame.len(), total_len);
     Ok(frame)
@@ -8993,7 +9071,7 @@ pub fn decode_guardian_request(
 pub fn encode_guardian_response(
     secret: &GuardianSecret,
     response: &GuardianResponseEnvelope,
-) -> Result<Vec<u8>, GuardianProtocolError> {
+) -> Result<GuardianWireFrame, GuardianProtocolError> {
     validate_response_envelope(response)?;
     let payload_len = response.payload.len();
     let frame_len = RESPONSE_FRAME_HEADER_BYTES
@@ -9008,30 +9086,30 @@ pub fn encode_guardian_response(
     }
 
     let header = &response.header;
-    let mut frame = Vec::with_capacity(total_len);
+    let mut frame = GuardianWireFrame::with_capacity(total_len)?;
     push_u32(
-        &mut frame,
+        frame.bytes_mut(),
         u32::try_from(frame_len).map_err(|_| GuardianProtocolError::FrameTooLarge)?,
     );
     frame.extend_from_slice(&RESPONSE_FRAME_MAGIC);
     frame.extend_from_slice(&header.protocol_version.to_be_bytes());
     frame.push(header.operation as u8);
     frame.push(header.status as u8);
-    push_uuid(&mut frame, header.guardian_incarnation);
-    push_uuid(&mut frame, header.mux_incarnation);
-    push_uuid(&mut frame, header.request_id);
+    push_uuid(frame.bytes_mut(), header.guardian_incarnation);
+    push_uuid(frame.bytes_mut(), header.mux_incarnation);
+    push_uuid(frame.bytes_mut(), header.request_id);
     frame.extend_from_slice(&header.request_payload_sha256);
     frame.extend_from_slice(&header.payload_sha256);
-    push_optional_uuid(&mut frame, header.pane_id);
+    push_optional_uuid(frame.bytes_mut(), header.pane_id);
     frame.extend_from_slice(&header.lease_generation.to_be_bytes());
     frame.extend_from_slice(&header.lease_sequence.to_be_bytes());
-    push_optional_uuid(&mut frame, header.effect_id);
+    push_optional_uuid(frame.bytes_mut(), header.effect_id);
     push_u32(
-        &mut frame,
+        frame.bytes_mut(),
         u32::try_from(payload_len).map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
     );
     frame.extend_from_slice(&response.payload);
-    let tag = secret.mac(&frame)?;
+    let tag = Zeroizing::new(secret.mac(&frame)?);
     frame.extend_from_slice(&tag);
     debug_assert_eq!(frame.len(), total_len);
     Ok(frame)
