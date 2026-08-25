@@ -103676,9 +103676,8 @@ log_level = "debug"
                 )
             })
             .expect("append an identical second component marker");
-        let duplicate_identical =
-            read_local_component_snapshot(&path, AtomicComponentRole::Ft)
-                .expect_err("an identical second component marker must fail closed");
+        let duplicate_identical = read_local_component_snapshot(&path, AtomicComponentRole::Ft)
+            .expect_err("an identical second component marker must fail closed");
         assert!(
             duplicate_identical
                 .to_string()
@@ -103697,9 +103696,8 @@ log_level = "debug"
                 )
             })
             .expect("append a conflicting second component marker");
-        let duplicate_conflicting =
-            read_local_component_snapshot(&path, AtomicComponentRole::Ft)
-                .expect_err("a conflicting second component marker must fail closed");
+        let duplicate_conflicting = read_local_component_snapshot(&path, AtomicComponentRole::Ft)
+            .expect_err("a conflicting second component marker must fail closed");
         assert!(
             duplicate_conflicting
                 .to_string()
@@ -105200,11 +105198,8 @@ esac
         let verifier = repository.join("scripts/atomic-component-manifest.sh");
         let packaged_verifier = package.join("verify-components.sh");
         std::fs::copy(&verifier, &packaged_verifier).expect("copy verifier into package");
-        std::fs::set_permissions(
-            &packaged_verifier,
-            std::fs::Permissions::from_mode(0o555),
-        )
-        .expect("make packaged verifier executable");
+        std::fs::set_permissions(&packaged_verifier, std::fs::Permissions::from_mode(0o555))
+            .expect("make packaged verifier executable");
         let manifest = fixture.path().join("manifest.json");
         let rejected = std::process::Command::new("bash")
             .arg(&verifier)
