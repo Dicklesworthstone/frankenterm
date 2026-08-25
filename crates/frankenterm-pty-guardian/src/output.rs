@@ -85,15 +85,16 @@ const CHECKPOINT_STAGE_FILE_PREFIX: &[u8] = b"checkpoint-";
 const CHECKPOINT_STAGE_FILE_SUFFIX: &str = ".ftgcp";
 const CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES: usize = 336;
 const CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES: usize = 400;
+const CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES: usize = 352;
 const CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES: u64 = 296;
-const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize = 1_026;
-const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = 268_739_888;
+const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize = 1_027;
+const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = 268_740_536;
 // Phase A has no deletion or ACK-backed reclamation. Keep this deliberately
 // finite; whole-fleet activation remains disabled until the catalog layer can
 // retain one proven generation per pane without exhausting this quarantine.
 const CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS: usize = 8;
-const CHECKPOINT_STAGE_MAX_FILES: usize = 8_208;
-const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_919_104;
+const CHECKPOINT_STAGE_MAX_FILES: usize = 8_216;
+const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_924_288;
 
 #[derive(Clone, Copy, Debug)]
 struct GuardianCheckpointStagePolicy {
@@ -114,7 +115,7 @@ impl GuardianCheckpointStagePolicy {
     fn validate(self) -> Result<Self, GuardianOutputError> {
         let protocol_files_per_upload = usize::try_from(GUARDIAN_MAX_CHECKPOINT_CHUNKS)
             .ok()
-            .and_then(|chunks| chunks.checked_add(2))
+            .and_then(|chunks| chunks.checked_add(3))
             .ok_or(GuardianOutputError::Allocation)?;
         let protocol_bytes_per_upload = u64::from(GUARDIAN_MAX_CHECKPOINT_CHUNKS)
             .checked_mul(CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)
@@ -129,6 +130,13 @@ impl GuardianCheckpointStagePolicy {
             .and_then(|bytes| {
                 bytes.checked_add(
                     u64::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES)
+                        .ok()?
+                        .checked_add(CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
                         .ok()?
                         .checked_add(CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)?,
                 )
@@ -149,6 +157,8 @@ impl GuardianCheckpointStagePolicy {
                 != Some(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
             || u32::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES).ok()
                 != Some(GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)
+            || CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES
+                != CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES + 16
             || self.max_retained_uploads > CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
             || self.max_stage_files < minimum_files
             || self.max_stage_files > CHECKPOINT_STAGE_MAX_FILES
@@ -318,6 +328,7 @@ enum CheckpointStageFileRole {
     Candidate,
     Chunk { publication_id: Uuid, index: u32 },
     Seal { publication_id: Uuid },
+    Ack { publication_id: Uuid },
 }
 
 #[derive(Debug)]
@@ -401,6 +412,7 @@ struct CheckpointStageUploadInspection {
     next_index: u32,
     committed_bytes: u64,
     seal_present: bool,
+    ack_present: bool,
     candidate_identity: GuardianCheckpointCandidateIdentityV1,
     ordered_chunk_set_identity: Option<GuardianCheckpointOrderedChunkSetIdentityV1>,
 }
@@ -1655,6 +1667,20 @@ fn checkpoint_seal_path(
     )
 }
 
+fn checkpoint_ack_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    key: CheckpointStageUploadKey,
+    publication_id: Uuid,
+) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
+    checkpoint_stage_path(
+        inner,
+        format!(
+            "{}.publication-{publication_id}.ack{CHECKPOINT_STAGE_FILE_SUFFIX}",
+            key.base_name(),
+        ),
+    )
+}
+
 fn checkpoint_stage_path(
     inner: &GuardianCheckpointStageStoreInner,
     name: String,
@@ -1782,6 +1808,8 @@ fn checkpoint_parse_stage_name(
         let (publication_id, rest) = checkpoint_take_uuid(rest)?;
         if rest == ".seal.ftgcp" {
             CheckpointStageFileRole::Seal { publication_id }
+        } else if rest == ".ack.ftgcp" {
+            CheckpointStageFileRole::Ack { publication_id }
         } else {
             let index_text = rest
                 .strip_prefix(".chunk-")
@@ -2174,6 +2202,11 @@ fn checkpoint_validate_context_path(
                 && context.publication_id() == publication_id
                 && context.chunk_position().is_none()
         }
+        CheckpointStageFileRole::Ack { publication_id } => {
+            context.kind() == GuardianCheckpointStageRecordKindV1::Finalizer
+                && context.publication_id() == publication_id
+                && context.chunk_position().is_none()
+        }
     };
     if matches {
         Ok(())
@@ -2211,6 +2244,7 @@ fn checkpoint_inspect_upload(
     let mut candidate = None;
     let mut chunks = BTreeMap::new();
     let mut seal = None;
+    let mut ack = None;
     for entry in census
         .entries
         .iter()
@@ -2232,16 +2266,25 @@ fn checkpoint_inspect_upload(
                     return Err(GuardianCheckpointStageStoreError::Poisoned);
                 }
             }
+            CheckpointStageFileRole::Ack { .. } => {
+                if ack.replace(entry).is_some() {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+            }
         }
     }
     let Some(candidate) = candidate else {
-        return if chunks.is_empty() && seal.is_none() {
+        return if chunks.is_empty() && seal.is_none() && ack.is_none() {
             Ok(None)
         } else {
             Err(GuardianCheckpointStageStoreError::Poisoned)
         };
     };
     let seal_present = seal.is_some();
+    let ack_present = ack.is_some();
+    if ack_present && !seal_present {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
     if seal_present && matches!(seal_inspection, CheckpointStageSealInspection::Reject) {
         // V3 Seal records can be authenticated only with the exact primary or
         // retry operation capability. Production cannot mint the independent
@@ -2286,7 +2329,9 @@ fn checkpoint_inspect_upload(
         }
         let publication = match entry.role {
             CheckpointStageFileRole::Chunk { publication_id, .. } => publication_id,
-            CheckpointStageFileRole::Candidate | CheckpointStageFileRole::Seal { .. } => {
+            CheckpointStageFileRole::Candidate
+            | CheckpointStageFileRole::Seal { .. }
+            | CheckpointStageFileRole::Ack { .. } => {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
         };
@@ -2338,6 +2383,7 @@ fn checkpoint_inspect_upload(
         next_index,
         committed_bytes,
         seal_present,
+        ack_present,
         candidate_identity,
         ordered_chunk_set_identity,
     }))
