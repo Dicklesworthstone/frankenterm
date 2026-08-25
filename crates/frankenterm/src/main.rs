@@ -101869,6 +101869,48 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(installer.contains("command -v awk >/dev/null 2>&1 || return 1"));
         assert!(installer.contains("sed 's/:ft:/:ROLE:/' | sort -u"));
         assert!(installer.contains("sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u"));
+
+        let source_build_start = installer
+            .find("build_from_source() {")
+            .expect("source-build function start");
+        let source_build_end = installer[source_build_start..]
+            .find("\n}\n\n# ───────────────────────────────────────────────────────────────────────────\n# Usage + arg parsing")
+            .map(|relative| source_build_start + relative)
+            .expect("source-build function end");
+        let source_build = &installer[source_build_start..source_build_end];
+        assert!(source_build.contains("scripts/atomic-component-manifest.sh"));
+        assert!(source_build.contains("${VERSION#v}"));
+        assert!(source_build.contains("rustc -vV"));
+        assert!(source_build.contains("derive-build-id"));
+        assert!(source_build.contains("FT_ATOMIC_BUILD_IDENTITY=\"$build_id\""));
+        assert!(source_build.contains("FT_ATOMIC_BUILD_PROFILE=\"$build_profile\""));
+        assert!(source_build.contains(
+            "cargo build --locked --profile \"$build_profile\" --target \"$build_target\""
+        ));
+        assert!(source_build.contains("--entry executable:cli:ft:ft"));
+        assert!(source_build.contains(
+            "--entry executable:mux-server:frankenterm-mux-server:frankenterm-mux-server"
+        ));
+        assert!(!source_build.contains("install_process_family \"$bin\" \"$mux_bin\""));
+        let identity_derivation = source_build
+            .find("derive-build-id")
+            .expect("canonical build identity derivation");
+        let cargo_build = source_build
+            .find("cargo build --locked")
+            .expect("sealed process-family Cargo build");
+        let manifest_generation = source_build
+            .find("bash \"$atomic_tool\" generate")
+            .expect("source-family manifest generation");
+        let manifest_verification = source_build
+            .find("bash \"$atomic_tool\" verify")
+            .expect("source-family manifest verification");
+        let family_install = source_build
+            .find("install_process_family \"$proof_root/ft\"")
+            .expect("verified process-family installation");
+        assert!(identity_derivation < cargo_build);
+        assert!(cargo_build < manifest_generation);
+        assert!(manifest_generation < manifest_verification);
+        assert!(manifest_verification < family_install);
     }
 
     #[cfg(unix)]
