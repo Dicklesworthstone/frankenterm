@@ -4392,6 +4392,7 @@ version = "0.15.1"
 dependencies = [
  "anyhow",
  "clap",
+ "frankenterm-sigpipe",
  "getrandom 0.4.3",
  "libc",
  "mio",
