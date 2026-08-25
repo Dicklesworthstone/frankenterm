@@ -8030,6 +8030,21 @@ mod tests {
             ),
         ];
         sort_authority_methods(&mut expected_method_surfaces);
+        if inventory.method_surfaces != expected_method_surfaces {
+            for unexpected in inventory
+                .method_surfaces
+                .iter()
+                .filter(|surface| !expected_method_surfaces.contains(surface))
+            {
+                eprintln!("unexpected authority method surface: {unexpected:#?}");
+            }
+            for missing in expected_method_surfaces
+                .iter()
+                .filter(|surface| !inventory.method_surfaces.contains(surface))
+            {
+                eprintln!("missing authority method surface: {missing:#?}");
+            }
+        }
         assert_eq!(inventory.method_surfaces, expected_method_surfaces);
 
         inventory.cipher_methods.sort();
