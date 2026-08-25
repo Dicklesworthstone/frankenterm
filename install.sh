@@ -657,7 +657,17 @@ def sync_dir(fd, depth=0):
     global entries
     if depth > 128:
         raise SystemExit("installer tree exceeds depth bound")
-    for name in sorted(os.listdir(fd)):
+    names = []
+    name_bytes = 0
+    with os.scandir(fd) as iterator:
+        for entry in iterator:
+            encoded = entry.name.encode("utf-8", "surrogateescape")
+            name_bytes += len(encoded)
+            if entries + len(names) + 1 > 1_000_000 or name_bytes > 64 * 1024 * 1024:
+                raise SystemExit("installer tree exceeds bounded enumeration budget")
+            names.append(entry.name)
+    names.sort(key=lambda value: value.encode("utf-8", "surrogateescape"))
+    for name in names:
         entries += 1
         if entries > 1_000_000:
             raise SystemExit("installer tree exceeds entry bound")
@@ -1449,22 +1459,49 @@ should_install_app() {
 }
 
 install_macos_app() {
-  local app_url dest tmp_app_tar extracted_app target_app staged_app backup_app
+  local app_url dest tmp_app_tar extraction_root extracted_app app_manifest
+  local target_app staged_app app_metadata standalone_metadata app_manifest_id app_id
+  local app_build app_source app_version app_target app_profile app_features
+  local family_manifest_id family_build family_source family_version family_target family_profile family_features
+  local stage_id target_id txid operation retained_manifest manifest_store manifest_stage
   app_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${APP_ASSET}"
 
-  # Destination: explicit --app-dest, else /Applications when writable, else
-  # ~/Applications (no sudo). ~/Applications is a first-class macOS app dir.
+  [ -n "$ACTIVE_PROCESS_FAMILY_MANIFEST" ] && [ -n "$ACTIVE_PROCESS_FAMILY_VERIFIER" ] && \
+    [ -n "$ACTIVE_ATOMIC_TRANSITION_HELPER" ] || {
+      warn "No externally authenticated installed process-family authority is available; skipping GUI app"
+      return 0
+    }
+
+  # Atomic rename authority is descriptor-pinned and refuses group/world
+  # writable parents. Prefer /Applications only when this process owns that
+  # exact private directory; otherwise use the user's first-class app folder.
   dest="$APP_DEST"
   if [ -z "$dest" ]; then
-    if [ -w "/Applications" ]; then
-      dest="/Applications"
-    else
+    dest="/Applications"
+    if ! python3 - "$dest" <<'PY' >/dev/null 2>&1
+import os, stat, sys
+s = os.lstat(sys.argv[1])
+raise SystemExit(0 if stat.S_ISDIR(s.st_mode) and not stat.S_ISLNK(s.st_mode)
+                 and s.st_uid == os.geteuid() and not (s.st_mode & 0o022) else 1)
+PY
+    then
       dest="$HOME/Applications"
-      info "/Applications not writable; installing app to $dest"
+      info "Using private atomic app destination $dest"
     fi
   fi
   if ! mkdir -p "$dest" 2>/dev/null; then
     warn "Could not create app destination $dest; skipping GUI app install"
+    return 0
+  fi
+  if ! python3 - "$dest" <<'PY'
+import os, stat, sys
+s = os.lstat(sys.argv[1])
+if (not stat.S_ISDIR(s.st_mode) or stat.S_ISLNK(s.st_mode) or
+        s.st_uid != os.geteuid() or s.st_mode & 0o022):
+    raise SystemExit("app destination is not one private owner-controlled directory")
+PY
+  then
+    warn "App destination cannot provide descriptor-pinned atomic authority: $dest"
     return 0
   fi
 
@@ -1474,50 +1511,140 @@ install_macos_app() {
       curl -fsSL --max-time 300 --retry 3 --retry-delay 2 --retry-connrefused \
       ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$app_url" -o "$tmp_app_tar"; then
     warn "FrankenTerm.app asset not found at $app_url; skipping GUI app install"
-    warn "(The ft CLI install above is unaffected.)"
     return 0
   fi
 
-  # Checksum: fail CLOSED, same posture as the ft CLI. The .app is executable
-  # code going into /Applications, so we never install it unverified. A missing
-  # sidecar or a mismatch skips the GUI app (the ft CLI install is unaffected)
-  # rather than aborting the whole installer; --no-verify is the explicit
-  # escape hatch. The release workflow always publishes the sidecar.
+  # The detached manifest and verifier are meaningful only when rooted in the
+  # release archive checksum. --no-verify therefore disables app publication;
+  # it never silently downgrades the app-family binding proof.
   if [ "$NO_CHECKSUM" -eq 1 ]; then
-    warn "App checksum verification skipped (--no-verify)"
-  else
-    local app_sum=""
-    if curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "${app_url}.sha256" -o "$TMP/app.sha256" 2>/dev/null; then
-      app_sum=$(awk '{print $1}' "$TMP/app.sha256")
-    fi
-    if [ -n "$app_sum" ]; then
-      verify_checksum "$tmp_app_tar" "$app_sum" || { err "FrankenTerm.app checksum failed; skipping GUI app install"; return 0; }
-    else
-      warn "Could not fetch the FrankenTerm.app checksum; skipping GUI app install"
-      warn "(Pass --no-verify to install the app without checksum verification.)"
-      return 0
-    fi
+    warn "Skipping FrankenTerm.app because --no-verify removes its external trust root"
+    return 0
+  fi
+  local app_sum=""
+  if curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+      "${app_url}.sha256" -o "$TMP/app.sha256" 2>/dev/null; then
+    app_sum=$(awk '{print $1}' "$TMP/app.sha256")
+  fi
+  if [ -z "$app_sum" ] || ! verify_checksum "$tmp_app_tar" "$app_sum"; then
+    warn "FrankenTerm.app checksum is absent or invalid; skipping GUI app install"
+    return 0
   fi
 
-  info "Extracting FrankenTerm.app"
-  if ! tar -xf "$tmp_app_tar" -C "$TMP"; then
-    warn "Failed to extract $APP_ASSET; skipping GUI app install"
+  # Validate the complete archive namespace before extracting into a new
+  # private directory. No member may traverse out of the two expected roots or
+  # descend through an archived symlink; hard links and special files are
+  # forbidden. This makes the outer checksum an authority over exact bytes,
+  # not permission to let tar interpret an attacker-controlled namespace.
+  extraction_root="$TMP/app-package"
+  mkdir -m 0700 "$extraction_root" || return 0
+  if ! python3 - "$tmp_app_tar" "$extraction_root" <<'PY'
+import os, posixpath, stat, sys, tarfile
+
+archive_path, root = sys.argv[1:]
+with tarfile.open(archive_path, "r:xz") as archive:
+    members = archive.getmembers()
+    if not members or len(members) > 1_000_000:
+        raise SystemExit("app archive has an invalid bounded inventory")
+    names, symlinks = set(), set()
+    name_bytes = total_bytes = 0
+    detached = 0
+    for member in members:
+        name = member.name
+        normalized = posixpath.normpath(name)
+        name_bytes += len(name.encode("utf-8", "surrogateescape"))
+        if (name != normalized or name.startswith("/") or normalized in ("", ".", "..") or
+                normalized.startswith("../") or name_bytes > 64 * 1024 * 1024 or name in names):
+            raise SystemExit("app archive contains an unsafe or duplicate member name")
+        names.add(name)
+        if name == "FrankenTerm.app.component-manifest.json":
+            detached += 1
+            if not member.isfile():
+                raise SystemExit("detached app manifest is not one regular file")
+        elif name != "FrankenTerm.app" and not name.startswith("FrankenTerm.app/"):
+            raise SystemExit("app archive contains an unexpected top-level member")
+        if member.isfile():
+            total_bytes += member.size
+            if total_bytes > 16 * 1024 * 1024 * 1024:
+                raise SystemExit("app archive exceeds its decompressed byte bound")
+        elif member.isdir():
+            pass
+        elif member.issym():
+            if posixpath.isabs(member.linkname):
+                raise SystemExit("app archive contains an absolute symlink")
+            target = posixpath.normpath(posixpath.join(posixpath.dirname(name), member.linkname))
+            if target != "FrankenTerm.app" and not target.startswith("FrankenTerm.app/"):
+                raise SystemExit("app archive symlink escapes the app bundle")
+            symlinks.add(name)
+        else:
+            raise SystemExit("app archive contains a hard link or special file")
+    if detached != 1:
+        raise SystemExit("app archive must contain one detached component manifest")
+    for name in names:
+        parent = posixpath.dirname(name)
+        while parent not in ("", "."):
+            if parent in symlinks:
+                raise SystemExit("app archive member descends through an archived symlink")
+            parent = posixpath.dirname(parent)
+    archive.extractall(root, members=members)
+PY
+  then
+    warn "FrankenTerm.app archive namespace failed validation; skipping GUI app install"
     return 0
   fi
-  extracted_app="$TMP/FrankenTerm.app"
-  if [ ! -d "$extracted_app" ]; then
-    extracted_app=$(find "$TMP" -maxdepth 3 -type d -name "FrankenTerm.app" 2>/dev/null | head -n 1)
-  fi
-  if [ -z "$extracted_app" ] || [ ! -d "$extracted_app" ]; then
-    warn "FrankenTerm.app not found in $APP_ASSET; skipping GUI app install"
-    return 0
+  extracted_app="$extraction_root/FrankenTerm.app"
+  app_manifest="$extraction_root/FrankenTerm.app.component-manifest.json"
+  [ -d "$extracted_app" ] && [ ! -L "$extracted_app" ] && \
+    [ -f "$app_manifest" ] && [ ! -L "$app_manifest" ] || return 0
+
+  # The verifier authority comes from the independently checksummed standalone
+  # package. It re-hashes the complete app tree, including the app's shipped
+  # verifier, and then the two detached manifests must bind one exact release.
+  bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+    --root "$extracted_app" --manifest "$app_manifest" >/dev/null || {
+      warn "Detached app component verification failed; skipping GUI app install"
+      return 0
+    }
+  app_metadata=$(process_family_manifest_metadata "$app_manifest" app) || return 0
+  standalone_metadata=$(process_family_manifest_metadata "$ACTIVE_PROCESS_FAMILY_MANIFEST" triplet) || return 0
+  IFS=$'\t' read -r app_manifest_id app_build app_source app_version app_target app_profile app_features <<<"$app_metadata"
+  IFS=$'\t' read -r _family_manifest_id family_build family_source family_version family_target family_profile family_features <<<"$standalone_metadata"
+  [ "$app_build" = "$family_build" ] && [ "$app_source" = "$family_source" ] && \
+    [ "$app_version" = "$family_version" ] && [ "$app_target" = "$family_target" ] && \
+    [ "$app_profile" = "$family_profile" ] && [ "$app_features" = "$family_features" ] && \
+    [ "$app_features" = application-family-gui-ft-mux-server-pty-guardian-default-features-v1 ] || {
+      warn "FrankenTerm.app identity does not match the installed standalone process family"
+      return 0
+    }
+  app_id="${app_manifest_id#sha256:}"
+  [[ "$app_id" =~ ^[0-9a-f]{64}$ ]] || return 0
+
+  manifest_store="$dest/.frankenterm-app-manifests"
+  mkdir -p "$manifest_store" || return 0
+  chmod 0700 "$manifest_store" || return 0
+  retained_manifest="$manifest_store/$app_id.json"
+  if [ -e "$retained_manifest" ] || [ -L "$retained_manifest" ]; then
+    [ -f "$retained_manifest" ] && [ ! -L "$retained_manifest" ] && \
+      cmp "$app_manifest" "$retained_manifest" >/dev/null 2>&1 || return 0
+  else
+    manifest_stage="$manifest_store/.manifest-$app_id.installing"
+    ensure_exact_staged_file "$app_manifest" "$manifest_stage" 0444 || return 0
+    fsync_installer_tree "$manifest_store" || return 0
+    stage_id=$(atomic_path_content_id "$ACTIVE_ATOMIC_TRANSITION_HELPER" \
+      "$manifest_store" "$(basename "$manifest_stage")") || return 0
+    txid=$(atomic_transition_txid "app-manifest:$dest:$app_id") || return 0
+    atomic_path_transition "$ACTIVE_ATOMIC_TRANSITION_HELPER" "$manifest_store" \
+      "$(basename "$manifest_stage")" "$app_id.json" "$txid" "$stage_id" missing \
+      publish-noreplace || return 0
   fi
 
   target_app="$dest/FrankenTerm.app"
-  staged_app="${target_app}.installing-$$"
-  backup_app=""
-  if [ -e "$staged_app" ] || [ -L "$staged_app" ]; then
-    warn "Refusing to reuse existing app staging path $staged_app"
+  staged_app="$dest/.FrankenTerm.app.installing-$app_id"
+  if [ -d "$target_app" ] && [ ! -L "$target_app" ] && \
+      bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+        --root "$target_app" --manifest "$retained_manifest" >/dev/null 2>&1; then
+    APP_INSTALLED_PATH="$target_app"
+    ok "FrankenTerm.app already matches atomic app generation $app_id"
     return 0
   fi
   if { [ -e "$target_app" ] || [ -L "$target_app" ]; } && \
@@ -1525,41 +1652,68 @@ install_macos_app() {
     warn "Refusing to replace non-directory or symlink app target at $target_app"
     return 0
   fi
-  # Copy to a sibling staging path before changing the live bundle. This keeps
-  # updates recoverable and avoids deleting a working app before the new bundle
-  # has been copied successfully.
-  if command -v ditto >/dev/null 2>&1; then
-    if ! ditto "$extracted_app" "$staged_app"; then
-      warn "Failed to stage FrankenTerm.app at $staged_app; leaving the current app unchanged"
+  if [ -e "$staged_app" ] || [ -L "$staged_app" ]; then
+    if ! { [ -d "$staged_app" ] && [ ! -L "$staged_app" ] && \
+        bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+          --root "$staged_app" --manifest "$retained_manifest" >/dev/null 2>&1; }; then
+      warn "Retained app stage is not the exact requested app generation"
       return 0
     fi
   else
-    if ! cp -R "$extracted_app" "$staged_app"; then
-      warn "Failed to stage FrankenTerm.app at $staged_app; leaving the current app unchanged"
-      return 0
+    if command -v ditto >/dev/null 2>&1; then
+      ditto "$extracted_app" "$staged_app" || return 0
+    else
+      cp -R "$extracted_app" "$staged_app" || return 0
     fi
+  fi
+  bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+    --root "$staged_app" --manifest "$retained_manifest" >/dev/null || return 0
+  python3 - "$staged_app" <<'PY'
+import os, stat, sys
+root = sys.argv[1]
+for current, directories, files in os.walk(root, topdown=False, followlinks=False):
+    for name in files:
+        path = os.path.join(current, name)
+        observed = os.lstat(path)
+        if stat.S_ISLNK(observed.st_mode):
+            continue
+        if not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid():
+            raise SystemExit("app stage contains an unsafe file")
+        os.chmod(path, 0o555 if observed.st_mode & 0o111 else 0o444, follow_symlinks=False)
+    for name in directories:
+        path = os.path.join(current, name)
+        observed = os.lstat(path)
+        if stat.S_ISLNK(observed.st_mode):
+            continue
+        if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid():
+            raise SystemExit("app stage contains an unsafe directory")
+        os.chmod(path, 0o555, follow_symlinks=False)
+os.chmod(root, 0o555, follow_symlinks=False)
+PY
+  fsync_installer_tree "$staged_app" || return 0
+  bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+    --root "$staged_app" --manifest "$retained_manifest" >/dev/null || return 0
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --verify --deep --strict "$staged_app" >/dev/null 2>&1 || return 0
   fi
 
-  if [ -e "$target_app" ] || [ -L "$target_app" ]; then
-    backup_app="${target_app}.previous-$(date +%Y%m%d%H%M%S)-$$"
-    if [ -e "$backup_app" ] || [ -L "$backup_app" ]; then
-      warn "Refusing to overwrite existing app backup at $backup_app"
-      return 0
-    fi
-    if ! move_no_clobber "$target_app" "$backup_app"; then
-      warn "Could not preserve existing $target_app; staged app remains at $staged_app"
-      return 0
-    fi
+  stage_id=$(atomic_path_content_id "$ACTIVE_ATOMIC_TRANSITION_HELPER" \
+    "$dest" "$(basename "$staged_app")") || return 0
+  txid=$(atomic_transition_txid "app-publish:$dest:$app_id") || return 0
+  if [ -e "$target_app" ]; then
+    target_id=$(atomic_path_content_id "$ACTIVE_ATOMIC_TRANSITION_HELPER" "$dest" FrankenTerm.app) || return 0
+    operation=exchange
+  else
+    target_id=missing
+    operation=publish-noreplace
   fi
-  if ! move_no_clobber "$staged_app" "$target_app"; then
-    warn "Could not publish staged FrankenTerm.app at $target_app"
-    if [ -n "$backup_app" ] && [ ! -e "$target_app" ] && [ ! -L "$target_app" ]; then
-      if ! move_no_clobber "$backup_app" "$target_app"; then
-        err "App rollback was incomplete; preserved bundle requires operator recovery at $backup_app"
-      fi
-    fi
-    return 0
-  fi
+  installer_failpoint before-app-selector-switch
+  atomic_path_transition "$ACTIVE_ATOMIC_TRANSITION_HELPER" "$dest" \
+    "$(basename "$staged_app")" FrankenTerm.app "$txid" "$stage_id" "$target_id" \
+    "$operation" || return 0
+  installer_failpoint after-app-selector-switch
+  bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+    --root "$target_app" --manifest "$retained_manifest" >/dev/null || return 0
 
   # A terminal/curl-placed bundle isn't Gatekeeper-quarantined, but strip the
   # attribute defensively so a proxy/CDN that tagged the download can't force a
@@ -1581,9 +1735,9 @@ install_macos_app() {
     killall Dock >/dev/null 2>&1 || true
   fi
 
-  ok "Installed FrankenTerm.app → $target_app"
-  if [ -n "$backup_app" ]; then
-    info "Previous FrankenTerm.app preserved at $backup_app"
+  ok "Installed atomic FrankenTerm.app generation $app_id → $target_app"
+  if [ "$operation" = exchange ]; then
+    info "Previous FrankenTerm.app preserved at $staged_app"
   fi
   APP_INSTALLED_PATH="$target_app"
 }

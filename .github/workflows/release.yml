@@ -438,12 +438,64 @@ jobs:
               --browser-runtime-root dist-browser/runtime-component \
               --browser-runtime-manifest dist-browser/runtime-component-manifest.json \
               --output dist-app
+          STANDALONE_STAGING="target/atomic-release-staging/${{ matrix.asset }}"
+          STANDALONE_MANIFEST="$STANDALONE_STAGING/${{ matrix.asset }}.component-manifest.json"
+          APP_MANIFEST="dist-app/FrankenTerm.app.component-manifest.json"
+          bash "$STANDALONE_STAGING/verify-components.sh" verify \
+            --root dist-app/FrankenTerm.app \
+            --manifest "$APP_MANIFEST"
+          python3 - "$STANDALONE_MANIFEST" "$APP_MANIFEST" <<'PY'
+          import json, sys
+
+          standalone_path, app_path = sys.argv[1:]
+          with open(standalone_path, "rb") as handle:
+              standalone = json.load(handle)
+          with open(app_path, "rb") as handle:
+              app = json.load(handle)
+          identity_keys = (
+              "build_id", "source_revision", "version", "target", "profile", "feature_contract",
+          )
+          if tuple(app["identity"].get(key) for key in identity_keys) != tuple(
+              standalone["identity"].get(key) for key in identity_keys
+          ):
+              raise SystemExit("macOS app and standalone triplet identities differ")
+          standalone_roles = {
+              (record.get("role"), record.get("component"), record.get("path"))
+              for record in standalone.get("files", []) if record.get("kind") == "executable"
+          }
+          app_roles = {
+              (record.get("role"), record.get("component"), record.get("path"))
+              for record in app.get("files", []) if record.get("kind") == "executable"
+          }
+          if standalone_roles != {
+              ("cli", "ft", "ft"),
+              ("mux-server", "frankenterm-mux-server", "frankenterm-mux-server"),
+              ("pty-guardian", "frankenterm-pty-guardian", "frankenterm-pty-guardian"),
+          }:
+              raise SystemExit("standalone archive is not the exact process-family triplet")
+          if app_roles != {
+              ("gui", "frankenterm-gui", "Contents/MacOS/frankenterm-gui"),
+              ("cli", "ft", "Contents/MacOS/ft"),
+              ("mux-server", "frankenterm-mux-server", "Contents/MacOS/frankenterm-mux-server"),
+              ("pty-guardian", "frankenterm-pty-guardian", "Contents/MacOS/frankenterm-pty-guardian"),
+          }:
+              raise SystemExit("app archive is not the exact four-role application family")
+          PY
           cd dist-app
           # COPYFILE_DISABLE stops bsdtar from emitting ._* AppleDouble sidecars.
           COPYFILE_DISABLE=1 tar -cJf \
             "../dist/FrankenTerm-darwin-arm64.app.tar.xz" \
             FrankenTerm.app FrankenTerm.app.component-manifest.json
           cd ../dist
+          app_archive_entries="$(tar -tJf FrankenTerm-darwin-arm64.app.tar.xz)"
+          grep -Fxq FrankenTerm.app <<<"$app_archive_entries"
+          grep -Fxq FrankenTerm.app.component-manifest.json <<<"$app_archive_entries"
+          APP_PROBE="$RUNNER_TEMP/frankenterm-release-app-install"
+          mkdir "$APP_PROBE"
+          tar -xJf FrankenTerm-darwin-arm64.app.tar.xz -C "$APP_PROBE"
+          bash "../$STANDALONE_STAGING/verify-components.sh" verify \
+            --root "$APP_PROBE/FrankenTerm.app" \
+            --manifest "$APP_PROBE/FrankenTerm.app.component-manifest.json"
           shasum -a 256 "FrankenTerm-darwin-arm64.app.tar.xz" \
             > "FrankenTerm-darwin-arm64.app.tar.xz.sha256"
 
