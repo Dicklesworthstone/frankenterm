@@ -7632,6 +7632,17 @@ mod tests {
 
         assert_protocol_delivery_surface_is_closed();
 
+        assert_eq!(GuardianCheckpointStageRecordKindV1::Finalizer as u8, 4);
+        assert_eq!(
+            GuardianCheckpointStageRecordKindV1::from_wire(4)
+                .expect("decode the frozen finalizer record discriminant"),
+            GuardianCheckpointStageRecordKindV1::Finalizer
+        );
+        assert!(matches!(
+            GuardianCheckpointStageRecordKindV1::from_wire(5),
+            Err(GuardianCheckpointCipherError::InvalidRecordKind)
+        ));
+
         assert_zeroize_on_drop::<Sha256>();
         assert!(std::mem::needs_drop::<GuardianCheckpointStageSealIntentV1>());
         assert!(std::mem::needs_drop::<
