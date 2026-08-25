@@ -67,16 +67,16 @@ const BROKER_SPAWN_HEAD_FILE_MAGIC: [u8; 8] = *b"FTBSH001";
 const BROKER_SPAWN_WAL_RECORD_MAGIC: [u8; 8] = *b"FTBSR001";
 const BROKER_SPAWN_HEAD_RECORD_MAGIC: [u8; 8] = *b"FTBHR001";
 const BROKER_SPAWN_WAL_FORMAT_VERSION: u32 = 1;
-const BROKER_SPAWN_WAL_FILE_HEADER_BYTES: usize = 192;
-const BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U32: u32 = 192;
-const BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64: u64 = 192;
+const BROKER_SPAWN_WAL_FILE_HEADER_BYTES: usize = 224;
+const BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U32: u32 = 224;
+const BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64: u64 = 224;
 const BROKER_SPAWN_WAL_RECORD_BYTES: usize = 176;
 const BROKER_SPAWN_WAL_RECORD_BYTES_U32: u32 = 176;
 const BROKER_SPAWN_WAL_RECORD_BYTES_U64: u64 = 176;
 const BROKER_SPAWN_HEAD_RECORD_BYTES: usize = 120;
 const BROKER_SPAWN_HEAD_RECORD_BYTES_U32: u32 = 120;
 const BROKER_SPAWN_HEAD_RECORD_BYTES_U64: u64 = 120;
-const BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES: usize = 160;
+const BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES: usize = 192;
 const BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES: usize = 144;
 const BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES: usize = 88;
 const BROKER_SPAWN_WAL_MAC_BYTES: usize = 32;
@@ -101,6 +101,7 @@ pub struct BrokerSpawnWalIdentityV1 {
     spawn_effect_id: Uuid,
     origin_request_id: Uuid,
     spawn_payload_bytes: u64,
+    spawn_payload_digest: [u8; 32],
     binding_digest: [u8; 32],
 }
 
@@ -121,6 +122,7 @@ impl BrokerSpawnWalIdentityV1 {
             spawn_effect_id: binding.spawn_effect_id,
             origin_request_id: binding.origin_request_id,
             spawn_payload_bytes: binding.spawn_payload_bytes,
+            spawn_payload_digest: binding.spawn_payload_digest,
             binding_digest: broker_genesis_binding_digest(binding),
         };
         identity.validate()?;
@@ -135,6 +137,7 @@ impl BrokerSpawnWalIdentityV1 {
             || self.spawn_effect_id.is_nil()
             || self.origin_request_id.is_nil()
             || self.spawn_payload_bytes == 0
+            || self.spawn_payload_digest == [0; 32]
             || self.binding_digest == [0; 32]
         {
             return Err(BrokerSpawnWalError::InvalidIdentity);
@@ -170,6 +173,11 @@ impl BrokerSpawnWalIdentityV1 {
     #[must_use]
     pub const fn spawn_payload_bytes(self) -> u64 {
         self.spawn_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn spawn_payload_digest(self) -> [u8; 32] {
+        self.spawn_payload_digest
     }
 
     #[must_use]
@@ -547,13 +555,14 @@ fn encode_broker_spawn_file_header(
     header[80..96].copy_from_slice(identity.spawn_effect_id.as_bytes());
     header[96..112].copy_from_slice(identity.origin_request_id.as_bytes());
     header[112..120].copy_from_slice(&identity.spawn_payload_bytes.to_le_bytes());
-    header[120..128].copy_from_slice(&authenticator.key_id());
-    header[128..160].copy_from_slice(&identity.binding_digest);
+    header[120..152].copy_from_slice(&identity.spawn_payload_digest);
+    header[152..160].copy_from_slice(&authenticator.key_id());
+    header[160..192].copy_from_slice(&identity.binding_digest);
     let tag = broker_spawn_wal_authenticate(
         authenticator,
         &header[..BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES],
     )?;
-    header[160..192].copy_from_slice(&tag);
+    header[192..224].copy_from_slice(&tag);
     Ok(header)
 }
 
@@ -573,7 +582,7 @@ fn validate_broker_spawn_file_header(
     if read_broker_u32(&header[12..16]) != BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U32 {
         return Err(BrokerSpawnWalError::InvalidFileHeaderLength);
     }
-    if header[120..128] != authenticator.key_id() {
+    if header[152..160] != authenticator.key_id() {
         return Err(BrokerSpawnWalError::KeyIdentityMismatch);
     }
     let observed = BrokerSpawnWalIdentityV1 {
@@ -584,7 +593,8 @@ fn validate_broker_spawn_file_header(
         spawn_effect_id: read_broker_uuid(&header[80..96]),
         origin_request_id: read_broker_uuid(&header[96..112]),
         spawn_payload_bytes: read_broker_u64(&header[112..120]),
-        binding_digest: read_broker_array_32(&header[128..160]),
+        spawn_payload_digest: read_broker_array_32(&header[120..152]),
+        binding_digest: read_broker_array_32(&header[160..192]),
     };
     observed.validate()?;
     if observed != expected {
@@ -593,9 +603,9 @@ fn validate_broker_spawn_file_header(
     broker_spawn_wal_verify(
         authenticator,
         &header[..BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES],
-        &header[160..192],
+        &header[192..224],
     )?;
-    Ok(read_broker_array_32(&header[160..192]))
+    Ok(read_broker_array_32(&header[192..224]))
 }
 
 fn encode_broker_spawn_wal_record(
@@ -1031,14 +1041,14 @@ impl BrokerSpawnJournalV1 {
             head,
             identity,
             authenticator,
-            header_mac: read_broker_array_32(&wal_header[160..192]),
-            head_header_mac: read_broker_array_32(&head_header[160..192]),
+            header_mac: read_broker_array_32(&wal_header[192..224]),
+            head_header_mac: read_broker_array_32(&head_header[192..224]),
             committed_wal_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
             committed_head_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
             wal_trailing_bytes: 0,
             head_trailing_bytes: 0,
             records,
-            terminal_head_mac: read_broker_array_32(&head_header[160..192]),
+            terminal_head_mac: read_broker_array_32(&head_header[192..224]),
             directory_entry_sync_required: true,
             recovery_append_authority_withheld: false,
             head_reconciliation_required: false,
@@ -3282,7 +3292,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::fs::OpenOptions;
-    use std::io::{Read, Seek as _, Write as _};
+    use std::io::Read;
     use std::os::fd::{AsFd, BorrowedFd};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
