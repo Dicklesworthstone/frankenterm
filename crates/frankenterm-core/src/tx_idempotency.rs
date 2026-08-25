@@ -755,6 +755,7 @@ impl TxExecutionLedger {
             last_hash: String::new(),
             next_ordinal: 0,
             key_index: HashMap::new(),
+            terminal_certificate: None,
         }
     }
 

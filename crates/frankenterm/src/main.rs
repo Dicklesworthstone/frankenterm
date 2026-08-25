@@ -17,6 +17,10 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
+use frankenterm_build_identity::{
+    AtomicComponentRole, SealedAtomicBuildIdentity,
+    parse_sealed_atomic_component_marker_details,
+};
 use frankenterm_core::attention_router::{
     AttentionRouterSourceAdapterInput, AttentionRouterSurface, AttentionRouterSurfacePayload,
     build_attention_router_surface_payload,
@@ -6132,7 +6136,7 @@ enum SetupCommands {
         #[arg(long)]
         yes: bool,
 
-        /// Install the matching ft and frankenterm-mux-server process family
+        /// Install the matching ft, mux-server, and PTY-guardian process family
         #[arg(long)]
         install_ft: bool,
 
@@ -6143,6 +6147,10 @@ enum SetupCommands {
         /// Path to a target-compatible local mux-server binary for identity-fenced SSH upload
         #[arg(long, requires = "ft_path")]
         mux_server_path: Option<PathBuf>,
+
+        /// Path to a target-compatible local PTY guardian from the same sealed build
+        #[arg(long, requires = "ft_path")]
+        guardian_path: Option<PathBuf>,
 
         /// Install both components from an immutable release tag
         #[arg(long)]
@@ -6170,6 +6178,9 @@ enum SetupCommands {
         mux_server_source: PathBuf,
 
         #[arg(long)]
+        guardian_source: PathBuf,
+
+        #[arg(long)]
         expected_ft_sha256: String,
 
         #[arg(long)]
@@ -6180,6 +6191,12 @@ enum SetupCommands {
 
         #[arg(long)]
         expected_mux_bytes: u64,
+
+        #[arg(long)]
+        expected_guardian_sha256: String,
+
+        #[arg(long)]
+        expected_guardian_bytes: u64,
 
         #[arg(long)]
         transaction_id: String,
@@ -62135,6 +62152,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         install_ft,
                         ft_path,
                         mux_server_path,
+                        guardian_path,
                         ft_version,
                         transaction_id,
                         timeout_secs,
@@ -62146,6 +62164,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             install_ft,
                             ft_path: ft_path.as_deref(),
                             mux_server_path: mux_server_path.as_deref(),
+                            guardian_path: guardian_path.as_deref(),
                             ft_version: ft_version.as_deref(),
                             transaction_id: transaction_id.as_deref(),
                             timeout_secs,
@@ -62157,10 +62176,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         root,
                         ft_source,
                         mux_server_source,
+                        guardian_source,
                         expected_ft_sha256,
                         expected_ft_bytes,
                         expected_mux_sha256,
                         expected_mux_bytes,
+                        expected_guardian_sha256,
+                        expected_guardian_bytes,
                         transaction_id,
                     } => {
                         let receipt = publish_remote_process_family_generation(
@@ -62168,6 +62190,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 root: &root,
                                 ft_source: &ft_source,
                                 mux_server_source: &mux_server_source,
+                                guardian_source: &guardian_source,
                                 expected: ProcessFamilyByteReceipt {
                                     ft: ComponentByteReceipt {
                                         sha256: expected_ft_sha256,
@@ -62176,6 +62199,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     mux_server: ComponentByteReceipt {
                                         sha256: expected_mux_sha256,
                                         byte_len: expected_mux_bytes,
+                                    },
+                                    guardian: ComponentByteReceipt {
+                                        sha256: expected_guardian_sha256,
+                                        byte_len: expected_guardian_bytes,
                                     },
                                 },
                                 transaction_id: &transaction_id,
@@ -79637,7 +79664,6 @@ struct RemoteCommandOutput {
 const REMOTE_SETUP_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const REMOTE_SETUP_MAX_STDERR_BYTES: usize = 8 * 1024 * 1024;
 const REMOTE_COMPONENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
-const ATOMIC_COMPONENT_MARKER_PREFIX: &[u8] = b"FT_ATOMIC_COMPONENT_IDENTITY_V1:";
 const ATOMIC_COMPONENT_MARKER_MAX_BYTES: usize = 512;
 
 struct RemoteSetupOptions<'a> {
@@ -79647,6 +79673,7 @@ struct RemoteSetupOptions<'a> {
     install_ft: bool,
     ft_path: Option<&'a Path>,
     mux_server_path: Option<&'a Path>,
+    guardian_path: Option<&'a Path>,
     ft_version: Option<&'a str>,
     transaction_id: Option<&'a str>,
     timeout_secs: u64,
@@ -79655,7 +79682,7 @@ struct RemoteSetupOptions<'a> {
 
 #[derive(Debug, Eq, PartialEq)]
 struct LocalComponentIdentity {
-    build_id: String,
+    build_id: SealedAtomicBuildIdentity,
     target: String,
     profile: String,
     version: String,
@@ -79673,6 +79700,7 @@ struct LocalComponentSnapshot {
 struct ValidatedLocalProcessFamily {
     ft: LocalComponentSnapshot,
     mux_server: LocalComponentSnapshot,
+    guardian: LocalComponentSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79685,6 +79713,7 @@ struct ComponentByteReceipt {
 struct ProcessFamilyByteReceipt {
     ft: ComponentByteReceipt,
     mux_server: ComponentByteReceipt,
+    guardian: ComponentByteReceipt,
 }
 
 impl From<&ValidatedLocalProcessFamily> for ProcessFamilyByteReceipt {
@@ -79698,12 +79727,20 @@ impl From<&ValidatedLocalProcessFamily> for ProcessFamilyByteReceipt {
                 sha256: family.mux_server.sha256.clone(),
                 byte_len: family.mux_server.byte_len,
             },
+            guardian: ComponentByteReceipt {
+                sha256: family.guardian.sha256.clone(),
+                byte_len: family.guardian.byte_len,
+            },
         }
     }
 }
 
 fn validate_process_family_byte_receipt(receipt: &ProcessFamilyByteReceipt) -> anyhow::Result<()> {
-    for (role, component) in [("ft", &receipt.ft), ("mux", &receipt.mux_server)] {
+    for (role, component) in [
+        ("ft", &receipt.ft),
+        ("frankenterm-mux-server", &receipt.mux_server),
+        ("frankenterm-pty-guardian", &receipt.guardian),
+    ] {
         anyhow::ensure!(
             component.byte_len > 0 && component.byte_len <= REMOTE_COMPONENT_MAX_BYTES,
             "{role} component receipt byte length is outside the supported bound"
@@ -79720,10 +79757,11 @@ fn validate_process_family_byte_receipt(receipt: &ProcessFamilyByteReceipt) -> a
     Ok(())
 }
 
-const REMOTE_GENERATION_MANIFEST_SCHEMA: &str = "frankenterm.remote-process-family-generation.v2";
+const REMOTE_GENERATION_MANIFEST_SCHEMA: &str = "frankenterm.remote-process-family-generation.v3";
 const REMOTE_GENERATION_MANIFEST_FILE: &str = "manifest.json";
 const REMOTE_GENERATION_FT_FILE: &str = "ft";
 const REMOTE_GENERATION_MUX_FILE: &str = "frankenterm-mux-server";
+const REMOTE_GENERATION_GUARDIAN_FILE: &str = "frankenterm-pty-guardian";
 const REMOTE_GENERATION_LIFETIME_LEASE_FILE: &str =
     frankenterm_mux_server_impl::generation_lifetime::MANAGED_GENERATION_LIFETIME_LEASE_FILENAME;
 const REMOTE_GENERATION_MANIFEST_MAX_BYTES: u64 = 16 * 1024;
@@ -79741,6 +79779,7 @@ struct RemoteGenerationPublishRequest<'a> {
     root: &'a Path,
     ft_source: &'a Path,
     mux_server_source: &'a Path,
+    guardian_source: &'a Path,
     expected: ProcessFamilyByteReceipt,
     transaction_id: &'a str,
     /// Private fixture-only seam for the future lifetime-lease owner.
@@ -79764,11 +79803,11 @@ impl RemoteGenerationPublicationReceipt {
     fn canonical_line(&self) -> String {
         match self.activation {
             RemoteGenerationActivation::PendingLease => format!(
-                "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
                 self.generation_id
             ),
             RemoteGenerationActivation::Current => format!(
-                "FT_REMOTE_GENERATION_PUBLICATION_V1={}:current:generations/{}\n",
+                "FT_REMOTE_GENERATION_PUBLICATION_V2={}:current:generations/{}\n",
                 self.generation_id, self.generation_id
             ),
         }
@@ -79786,7 +79825,7 @@ struct RemoteGenerationBuildIdentity {
 impl From<&LocalComponentIdentity> for RemoteGenerationBuildIdentity {
     fn from(identity: &LocalComponentIdentity) -> Self {
         Self {
-            build_id: identity.build_id.clone(),
+            build_id: identity.build_id.to_string(),
             target: identity.target.clone(),
             profile: identity.profile.clone(),
             version: identity.version.clone(),
@@ -79796,6 +79835,7 @@ impl From<&LocalComponentIdentity> for RemoteGenerationBuildIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RemoteGenerationComponentManifest {
+    role: String,
     filename: String,
     sha256: String,
     byte_len: u64,
@@ -79817,6 +79857,7 @@ struct RemoteGenerationManifest {
     codec_version: u64,
     ft: RemoteGenerationComponentManifest,
     mux_server: RemoteGenerationComponentManifest,
+    guardian: RemoteGenerationComponentManifest,
     lifetime_lease: RemoteGenerationLifetimeLeaseManifest,
 }
 
@@ -79826,18 +79867,21 @@ struct RemoteGenerationIdMaterial<'a> {
     codec_version: u64,
     ft: &'a RemoteGenerationComponentManifest,
     mux_server: &'a RemoteGenerationComponentManifest,
+    guardian: &'a RemoteGenerationComponentManifest,
     lifetime_lease: &'a RemoteGenerationLifetimeLeaseManifest,
 }
 
 impl RemoteGenerationManifest {
     fn from_process_family(family: &ValidatedLocalProcessFamily) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            family.ft.identity == family.mux_server.identity,
+            family.ft.identity == family.mux_server.identity
+                && family.ft.identity == family.guardian.identity,
             "remote generation components do not share one sealed build identity"
         );
         let codec_version = u64::try_from(codec::CODEC_VERSION)
             .map_err(|_| anyhow::anyhow!("codec version does not fit the generation manifest"))?;
         let ft = RemoteGenerationComponentManifest {
+            role: AtomicComponentRole::Ft.as_str().to_string(),
             filename: REMOTE_GENERATION_FT_FILE.to_string(),
             sha256: family.ft.sha256.clone(),
             byte_len: family.ft.byte_len,
@@ -79845,11 +79889,20 @@ impl RemoteGenerationManifest {
             build_identity: RemoteGenerationBuildIdentity::from(&family.ft.identity),
         };
         let mux_server = RemoteGenerationComponentManifest {
+            role: AtomicComponentRole::FrankenTermMuxServer.as_str().to_string(),
             filename: REMOTE_GENERATION_MUX_FILE.to_string(),
             sha256: family.mux_server.sha256.clone(),
             byte_len: family.mux_server.byte_len,
             mode: REMOTE_GENERATION_BINARY_MODE,
             build_identity: RemoteGenerationBuildIdentity::from(&family.mux_server.identity),
+        };
+        let guardian = RemoteGenerationComponentManifest {
+            role: AtomicComponentRole::FrankenTermPtyGuardian.as_str().to_string(),
+            filename: REMOTE_GENERATION_GUARDIAN_FILE.to_string(),
+            sha256: family.guardian.sha256.clone(),
+            byte_len: family.guardian.byte_len,
+            mode: REMOTE_GENERATION_BINARY_MODE,
+            build_identity: RemoteGenerationBuildIdentity::from(&family.guardian.identity),
         };
         let lifetime_lease = RemoteGenerationLifetimeLeaseManifest {
             filename: REMOTE_GENERATION_LIFETIME_LEASE_FILE.to_string(),
@@ -79862,6 +79915,7 @@ impl RemoteGenerationManifest {
             codec_version,
             ft,
             mux_server,
+            guardian,
             lifetime_lease,
         };
         manifest.generation_id = manifest.recompute_generation_id()?;
@@ -79875,6 +79929,7 @@ impl RemoteGenerationManifest {
             codec_version: self.codec_version,
             ft: &self.ft,
             mux_server: &self.mux_server,
+            guardian: &self.guardian,
             lifetime_lease: &self.lifetime_lease,
         };
         let bytes = serialize_json_bounded(
@@ -79907,12 +79962,20 @@ impl RemoteGenerationManifest {
         );
         validate_remote_generation_component(
             &self.ft,
+            AtomicComponentRole::Ft,
             REMOTE_GENERATION_FT_FILE,
             REMOTE_GENERATION_BINARY_MODE,
         )?;
         validate_remote_generation_component(
             &self.mux_server,
+            AtomicComponentRole::FrankenTermMuxServer,
             REMOTE_GENERATION_MUX_FILE,
+            REMOTE_GENERATION_BINARY_MODE,
+        )?;
+        validate_remote_generation_component(
+            &self.guardian,
+            AtomicComponentRole::FrankenTermPtyGuardian,
+            REMOTE_GENERATION_GUARDIAN_FILE,
             REMOTE_GENERATION_BINARY_MODE,
         )?;
         anyhow::ensure!(
@@ -79922,7 +79985,8 @@ impl RemoteGenerationManifest {
             "remote generation manifest has an invalid lifetime-lease authority"
         );
         anyhow::ensure!(
-            self.ft.build_identity == self.mux_server.build_identity,
+            self.ft.build_identity == self.mux_server.build_identity
+                && self.ft.build_identity == self.guardian.build_identity,
             "remote generation manifest mixes build identities"
         );
         anyhow::ensure!(
@@ -79936,12 +80000,13 @@ impl RemoteGenerationManifest {
 
 fn validate_remote_generation_component(
     component: &RemoteGenerationComponentManifest,
+    expected_role: AtomicComponentRole,
     expected_filename: &str,
     expected_mode: u32,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        component.filename == expected_filename,
-        "remote generation manifest has an unexpected component filename"
+        component.role == expected_role.as_str() && component.filename == expected_filename,
+        "remote generation manifest has an unexpected component role or filename"
     );
     anyhow::ensure!(
         component.byte_len > 0 && component.byte_len <= REMOTE_COMPONENT_MAX_BYTES,
@@ -80005,7 +80070,7 @@ fn open_local_component_nofollow(path: &Path) -> anyhow::Result<fs::File> {
 
 fn read_local_component_snapshot(
     path: &Path,
-    expected_component: &str,
+    expected_role: AtomicComponentRole,
 ) -> anyhow::Result<LocalComponentSnapshot> {
     use sha2::{Digest as _, Sha256};
 
@@ -80073,16 +80138,16 @@ fn read_local_component_snapshot(
     }
     let mut identity = None;
 
+    let marker_prefix = frankenterm_build_identity::ATOMIC_COMPONENT_MARKER_PREFIX.as_bytes();
     for marker_start in bytes
-        .windows(ATOMIC_COMPONENT_MARKER_PREFIX.len())
+        .windows(marker_prefix.len())
         .enumerate()
         .filter_map(|(offset, candidate)| {
-            (candidate == ATOMIC_COMPONENT_MARKER_PREFIX).then_some(offset)
+            (candidate == marker_prefix).then_some(offset)
         })
     {
-        let payload_start = marker_start + ATOMIC_COMPONENT_MARKER_PREFIX.len();
-        let payload = &bytes[payload_start..];
-        let marker_len = payload
+        let marker_suffix = &bytes[marker_start..];
+        let marker_len = marker_suffix
             .iter()
             .take(ATOMIC_COMPONENT_MARKER_MAX_BYTES)
             .position(|byte| *byte == b';')
@@ -80092,54 +80157,25 @@ fn read_local_component_snapshot(
                     path.display()
                 )
             })?;
-        let marker = std::str::from_utf8(&payload[..marker_len]).map_err(|error| {
+        let marker = std::str::from_utf8(&marker_suffix[..=marker_len]).map_err(|error| {
             anyhow::anyhow!(
                 "component {} contains a non-UTF-8 atomic identity marker: {error}",
                 path.display()
             )
         })?;
-        let fields: Vec<&str> = marker.split(':').collect();
-        if fields.len() != 5 {
-            anyhow::bail!(
-                "component {} contains a malformed atomic identity marker",
-                path.display()
-            );
-        }
-        let [build_id, component, target, profile, version] = fields.as_slice() else {
-            unreachable!("field count was checked above")
-        };
-        if build_id.len() != 64
-            || !build_id
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            anyhow::bail!(
-                "component {} is not from a sealed atomic release build",
-                path.display()
-            );
-        }
-        if *component != expected_component {
-            anyhow::bail!(
-                "component {} identifies itself as {component}, expected {expected_component}",
-                path.display()
-            );
-        }
-        if [*target, *profile, *version].iter().any(|value| {
-            value.is_empty()
-                || !value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
-                })
-        }) {
-            anyhow::bail!(
-                "component {} contains invalid target/profile/version identity fields",
-                path.display()
-            );
-        }
+        let marker = parse_sealed_atomic_component_marker_details(marker, expected_role).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "component {} has no valid sealed {expected_role} atomic identity: {error}",
+                    path.display()
+                )
+            },
+        )?;
         let parsed = LocalComponentIdentity {
-            build_id: (*build_id).to_string(),
-            target: (*target).to_string(),
-            profile: (*profile).to_string(),
-            version: (*version).to_string(),
+            build_id: marker.build_identity(),
+            target: marker.target().to_string(),
+            profile: marker.profile().to_string(),
+            version: marker.version().to_string(),
         };
         if let Some(existing) = identity.as_ref() {
             if existing != &parsed {
@@ -80170,17 +80206,30 @@ fn read_local_component_snapshot(
 fn validate_local_process_family(
     ft_path: &Path,
     mux_server_path: &Path,
+    guardian_path: &Path,
 ) -> anyhow::Result<ValidatedLocalProcessFamily> {
-    let ft = read_local_component_snapshot(ft_path, "ft")?;
-    let mux_server = read_local_component_snapshot(mux_server_path, "frankenterm-mux-server")?;
-    if ft.identity != mux_server.identity {
+    let ft = read_local_component_snapshot(ft_path, AtomicComponentRole::Ft)?;
+    let mux_server = read_local_component_snapshot(
+        mux_server_path,
+        AtomicComponentRole::FrankenTermMuxServer,
+    )?;
+    let guardian = read_local_component_snapshot(
+        guardian_path,
+        AtomicComponentRole::FrankenTermPtyGuardian,
+    )?;
+    if ft.identity != mux_server.identity || ft.identity != guardian.identity {
         anyhow::bail!(
-            "local ft and frankenterm-mux-server do not share one sealed build identity: ft={:?}, mux={:?}",
+            "local ft, frankenterm-mux-server, and frankenterm-pty-guardian do not share one sealed build identity: ft={:?}, mux={:?}, guardian={:?}",
             ft.identity,
-            mux_server.identity
+            mux_server.identity,
+            guardian.identity
         );
     }
-    Ok(ValidatedLocalProcessFamily { ft, mux_server })
+    Ok(ValidatedLocalProcessFamily {
+        ft,
+        mux_server,
+        guardian,
+    })
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -80202,12 +80251,12 @@ fn validate_remote_generation_transaction_id(transaction_id: &str) -> anyhow::Re
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn read_remote_generation_source_snapshot(
     path: &Path,
-    expected_component: &str,
+    expected_role: AtomicComponentRole,
     effective_uid: u32,
 ) -> anyhow::Result<LocalComponentSnapshot> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let snapshot = read_local_component_snapshot(path, expected_component)?;
+    let snapshot = read_local_component_snapshot(path, expected_role)?;
     let file = open_local_component_nofollow(path)?;
     let metadata = file.metadata().map_err(|error| {
         anyhow::anyhow!(

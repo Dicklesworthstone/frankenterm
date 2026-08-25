@@ -219,7 +219,7 @@ detect_platform() {
   # WSL warning (continue with linux platform)
   if [[ "$OS" == "linux" ]] && grep -qi microsoft /proc/version 2>/dev/null; then
     warn "WSL detected. The FrankenTerm GUI is macOS-only for now;"
-    warn "the ft CLI + frankenterm-mux-server work fine under WSL."
+    warn "the ft CLI + mux server + PTY guardian work fine under WSL."
   fi
 
   # FrankenTerm release assets are named ft-{os}-{arch}.tar.xz where:
@@ -297,8 +297,8 @@ resolve_version() {
 # Preflight
 # ───────────────────────────────────────────────────────────────────────────
 check_disk_space() {
-  # 100MB headroom. The atomic Unix archive contains both ft and the matching
-  # frankenterm-mux-server; download, extraction, staged install, and preserved
+  # 100MB headroom. The atomic Unix archive contains ft plus the matching mux
+  # server and PTY guardian; download, extraction, staged install, and preserved
   # previous binaries can coexist briefly under $TMP and $DEST.
   local min_kb=102400
   local path="$DEST"
