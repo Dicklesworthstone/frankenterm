@@ -458,8 +458,7 @@ impl GuardianCheckpointPipeline {
         completion_waker: Arc<Waker>,
     ) -> Result<Self, GuardianProtocolError> {
         let (jobs, job_receiver) = sync_channel(CHECKPOINT_WORKER_QUEUE_CAPACITY);
-        let (completion_sender, completions) =
-            sync_channel(CHECKPOINT_WORKER_QUEUE_CAPACITY);
+        let (completion_sender, completions) = sync_channel(CHECKPOINT_WORKER_QUEUE_CAPACITY);
         let worker_waker = Arc::clone(&completion_waker);
         let worker = thread::Builder::new()
             .name("ft-guardian-checkpoint".to_string())
@@ -467,9 +466,7 @@ impl GuardianCheckpointPipeline {
                 checkpoint_worker(store, job_receiver, completion_sender, worker_waker);
             })
             .map_err(|_| {
-                GuardianProtocolError::StateInvariantViolation(
-                    "guardian-checkpoint-worker-spawn",
-                )
+                GuardianProtocolError::StateInvariantViolation("guardian-checkpoint-worker-spawn")
             })?;
         Ok(Self {
             jobs: Some(jobs),
@@ -494,9 +491,7 @@ impl GuardianCheckpointPipeline {
             return GuardianRuntimeCheckpointCompletionStateInternal::Disconnected;
         };
         match completions.try_recv() {
-            Ok(completion) => {
-                GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion)
-            }
+            Ok(completion) => GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion),
             Err(TryRecvError::Empty) => GuardianRuntimeCheckpointCompletionStateInternal::Empty,
             Err(TryRecvError::Disconnected) => {
                 GuardianRuntimeCheckpointCompletionStateInternal::Disconnected
@@ -1053,10 +1048,7 @@ impl GuardianRuntime {
             request.zeroize_payload();
             return GuardianCheckpointSubmission::Respond(response);
         }
-        if self.checkpoint_pipeline_failed
-            || self.protocol.is_none()
-            || self.indeterminate_effect
-        {
+        if self.checkpoint_pipeline_failed || self.protocol.is_none() || self.indeterminate_effect {
             self.counters.checkpoint_retryable_capacity_closes = self
                 .counters
                 .checkpoint_retryable_capacity_closes
@@ -1215,9 +1207,7 @@ impl GuardianRuntime {
     /// exact transport completion. Storage ambiguity closes retryably; because
     /// final publication is still disabled, a Stage-worker panic cannot mint or
     /// invalidate live pane authority and the next exact Query remains usable.
-    pub(crate) fn try_checkpoint_completion(
-        &mut self,
-    ) -> GuardianRuntimeCheckpointCompletionState {
+    pub(crate) fn try_checkpoint_completion(&mut self) -> GuardianRuntimeCheckpointCompletionState {
         match self.checkpoint_pipeline.try_completion() {
             GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion) => {
                 debug_assert!(self.protocol.is_none());
@@ -1227,10 +1217,8 @@ impl GuardianRuntime {
                     .checkpoint_transactions_completed
                     .saturating_add(1);
                 if completion.worker_panicked {
-                    self.counters.checkpoint_worker_panics = self
-                        .counters
-                        .checkpoint_worker_panics
-                        .saturating_add(1);
+                    self.counters.checkpoint_worker_panics =
+                        self.counters.checkpoint_worker_panics.saturating_add(1);
                 }
                 self.replay_deferred_child_exits();
                 GuardianRuntimeCheckpointCompletionState::Ready(

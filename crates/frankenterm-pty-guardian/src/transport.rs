@@ -1468,6 +1468,15 @@ fn pending_input_route_matches(
         && matches!(pending_input, Some(pending) if pending == completion)
 }
 
+fn pending_checkpoint_route_matches(
+    connection_generation: u64,
+    pending_checkpoint: Option<GuardianCheckpointRoute>,
+    completion: GuardianCheckpointRoute,
+) -> bool {
+    connection_generation == completion.connection_generation
+        && matches!(pending_checkpoint, Some(pending) if pending == completion)
+}
+
 /// Blocking client used by mux integration and real-service lifetime tests.
 pub struct GuardianClient {
     stream: BlockingUnixStream,
