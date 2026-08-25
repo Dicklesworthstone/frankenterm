@@ -19,7 +19,7 @@
 //! See `wa-29k1` bead for the full design.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -6630,8 +6630,13 @@ pub const CHECKPOINT_SCROLLBACK_HARD_MAX_GAPS: usize = 262_144;
 const CHECKPOINT_SCROLLBACK_MAX_CATALOG_VERSION_BYTES: usize = 256;
 /// Maximum byte length admitted for one explicit capture-gap reason.
 const CHECKPOINT_SCROLLBACK_MAX_GAP_REASON_BYTES: usize = 16 * 1024;
-/// Maximum number of retained publication residues tried for one target name.
-const CHECKPOINT_SCROLLBACK_MAX_STAGING_ATTEMPTS: u8 = 32;
+/// One stable lock inode serializes publication within an artifact directory.
+const CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK: &str =
+    ".ft-checkpoint-scrollback-publication.lock";
+/// Publication lock acquisition is finite so a wedged peer cannot hang export.
+const CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Short polling interval for the cross-process publication lock.
+const CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// Resource contract used by production and offline artifact paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6764,6 +6769,9 @@ pub enum CheckpointScrollbackArtifactError {
     /// No-clobber publication found an existing conflicting target.
     #[error("checkpoint scrollback target already exists")]
     AlreadyExists,
+    /// Another producer retained the directory-wide publication lock too long.
+    #[error("checkpoint scrollback publication lock acquisition timed out")]
+    PublicationBusy,
 }
 
 /// Exact source columns required to recompute a v2 checkpoint witness offline.
