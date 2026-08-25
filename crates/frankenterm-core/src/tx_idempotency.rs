@@ -6519,10 +6519,7 @@ mod tests {
         let store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
             .expect("open durable store");
         let key = make_key("test-plan", &plan.steps[0].id);
-        let key_hash = key
-            .as_str()
-            .strip_prefix("txk:v2:")
-            .expect("key prefix");
+        let key_hash = key.as_str().strip_prefix("txk:v2:").expect("key prefix");
         let lock_dir = anchor.path().join(KEY_LOCK_DIR_NAME);
         let lock_path = lock_dir.join(format!("{key_hash}.lock"));
         let target_path = anchor.path().join("unrelated-target");
@@ -6542,10 +6539,7 @@ mod tests {
         let store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
             .expect("open durable store");
         let key = make_key("test-plan", &plan.steps[0].id);
-        let key_hash = key
-            .as_str()
-            .strip_prefix("txk:v2:")
-            .expect("key prefix");
+        let key_hash = key.as_str().strip_prefix("txk:v2:").expect("key prefix");
         let lock_dir = anchor.path().join(KEY_LOCK_DIR_NAME);
         let lock_path = lock_dir.join(format!("{key_hash}.lock"));
         std::fs::write(&lock_path, b"").unwrap();
