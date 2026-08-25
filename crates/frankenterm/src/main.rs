@@ -104434,7 +104434,8 @@ esac
     #[cfg(unix)]
     #[test]
     fn installer_failpoint_matrix_retries_without_partial_or_mixed_process_family() {
-        use std::os::unix::fs::{ExitStatusExt as _, PermissionsExt as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
 
         let fixture = tempfile::tempdir().expect("create installer failpoint matrix fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
@@ -104648,7 +104649,8 @@ esac
     #[cfg(unix)]
     #[test]
     fn installer_app_failpoints_and_partial_tree_retries_preserve_one_live_bundle() {
-        use std::os::unix::fs::{ExitStatusExt as _, PermissionsExt as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
 
         let fixture = tempfile::tempdir().expect("create app failpoint fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
