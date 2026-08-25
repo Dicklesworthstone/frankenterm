@@ -920,6 +920,10 @@ build_from_source() {
   info "Building ft from source — this takes 10-30+ minutes cold-cache"
   ensure_rust
   command -v git >/dev/null 2>&1 || { err "git is required for --from-source"; exit 1; }
+  command -v python3 >/dev/null 2>&1 || {
+    err "python3 is required to seal and verify a source-built process family"
+    exit 1
+  }
   # A source fallback must preserve the exact requested release identity. A
   # typo, missing tag, or transient clone failure must not silently build the
   # default branch and publish different client/server bytes under the requested
@@ -940,9 +944,62 @@ build_from_source() {
     err "Source tree does not satisfy the shipped panic-profile contract."
     exit 1
   fi
+  local atomic_tool="$TMP/src/scripts/atomic-component-manifest.sh"
+  if [ ! -f "$atomic_tool" ] || [ -L "$atomic_tool" ]; then
+    err "Atomic component manifest tool is missing or unsafe: $atomic_tool"
+    err "Refusing to build an unverifiable CLI/mux-server process family."
+    exit 1
+  fi
+
+  # Derive the same commit/build identity used by release CI.  The explicit
+  # target is important: Cargo configuration can otherwise select a different
+  # target after we have already frozen the identity that the binaries claim.
+  local source_revision=""
+  local workspace_version=""
+  local build_target=""
+  local build_profile="release-interactive"
+  local feature_contract="workspace-default-members-default-features-v1"
+  local build_id=""
+  source_revision=$(git -C "$TMP/src" rev-parse HEAD 2>/dev/null) || {
+    err "Cannot resolve the exact source revision for the cloned release tag."
+    exit 1
+  }
+  workspace_version=$(awk '
+    /^\[workspace.package\]$/ { in_workspace_package = 1; next }
+    in_workspace_package && /^version = / {
+      gsub(/^version = "/, "")
+      gsub(/".*/, "")
+      print
+      exit
+    }
+  ' "$TMP/src/Cargo.toml")
+  if [ -z "$workspace_version" ] || [ "${VERSION#v}" != "$workspace_version" ]; then
+    err "Release tag $VERSION does not match workspace version ${workspace_version:-<missing>}."
+    err "Refusing to mint a misleading source-build identity."
+    exit 1
+  fi
+  build_target=$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' | head -n 1)
+  if [[ ! "$build_target" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+    err "Cannot derive a canonical native Rust target for the source build."
+    exit 1
+  fi
+  if ! build_id=$(bash "$atomic_tool" derive-build-id \
+      --source-revision "$source_revision" \
+      --version "$workspace_version" \
+      --target "$build_target" \
+      --profile "$build_profile" \
+      --feature-contract "$feature_contract"); then
+    err "Failed to derive the canonical atomic source-build identity."
+    exit 1
+  fi
+
   # Friendly error wrapping: a bare `set -e` exit on cargo failure would
   # not give the user any actionable diagnosis.
-  if ! ( cd "$TMP/src" && cargo build --locked --profile release-interactive \
+  if ! ( cd "$TMP/src" && env \
+      CARGO_TARGET_DIR="$TMP/src/target" \
+      FT_ATOMIC_BUILD_IDENTITY="$build_id" \
+      FT_ATOMIC_BUILD_PROFILE="$build_profile" \
+      cargo build --locked --profile "$build_profile" --target "$build_target" \
       -p frankenterm --bin ft \
       -p frankenterm-mux-server --bin frankenterm-mux-server ); then
     err "Source build failed."
@@ -954,11 +1011,42 @@ build_from_source() {
     err "  - Missing or stale nightly toolchain (see rust-toolchain.toml)."
     exit 1
   fi
-  local bin="$TMP/src/target/release-interactive/ft"
-  local mux_bin="$TMP/src/target/release-interactive/frankenterm-mux-server"
+  local bin="$TMP/src/target/$build_target/$build_profile/ft"
+  local mux_bin="$TMP/src/target/$build_target/$build_profile/frankenterm-mux-server"
   [ -x "$bin" ] || { err "Build did not produce $bin"; exit 1; }
   [ -x "$mux_bin" ] || { err "Build did not produce $mux_bin"; exit 1; }
-  install_process_family "$bin" "$mux_bin"
+
+  # Verify the embedded role/build/target/profile/version markers before any
+  # live destination is mutated.  A version probe alone cannot distinguish a
+  # sealed atomic family from the ordinary `unsealed` development default.
+  local proof_root="$TMP/source-family-proof"
+  local proof_manifest="$proof_root/source-family.component-manifest.json"
+  if ! mkdir "$proof_root" \
+      || ! install -m 0755 "$bin" "$proof_root/ft" \
+      || ! install -m 0755 "$mux_bin" "$proof_root/frankenterm-mux-server"; then
+    err "Failed to stage the source-built process family for identity proof."
+    exit 1
+  fi
+  if ! bash "$atomic_tool" generate \
+      --root "$proof_root" \
+      --source-root "$TMP/src" \
+      --output "$proof_manifest" \
+      --build-id "$build_id" \
+      --source-revision "$source_revision" \
+      --version "$workspace_version" \
+      --target "$build_target" \
+      --profile "$build_profile" \
+      --feature-contract "$feature_contract" \
+      --entry executable:cli:ft:ft \
+      --entry executable:mux-server:frankenterm-mux-server:frankenterm-mux-server \
+      || ! bash "$atomic_tool" verify \
+      --root "$proof_root" \
+      --manifest "$proof_manifest"; then
+    err "Source-built ft and mux-server do not form one sealed atomic family."
+    err "Installed bytes are unchanged."
+    exit 1
+  fi
+  install_process_family "$proof_root/ft" "$proof_root/frankenterm-mux-server"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

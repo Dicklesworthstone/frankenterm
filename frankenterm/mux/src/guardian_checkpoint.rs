@@ -689,7 +689,7 @@ impl GuardianGenesisReservationIdentityV1 {
     /// authenticated connection or successor-handoff authority and the live
     /// guardian build identity from the running guardian itself. Neither build
     /// identity may be accepted from the Spawn payload.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn from_authenticated_spawn(
         mux_incarnation: Uuid,
         spawn_effect_id: Uuid,
@@ -854,10 +854,8 @@ impl PartialEq for GuardianGenesisReservationIdentityV1 {
             && self.origin_request_id == other.origin_request_id
             && self.spawn_payload_bytes == other.spawn_payload_bytes
             && self.spawn_payload_digest == other.spawn_payload_digest
-            && self.spawning_mux_build_identity_digest
-                == other.spawning_mux_build_identity_digest
-            && self.live_guardian_build_identity_digest
-                == other.live_guardian_build_identity_digest
+            && self.spawning_mux_build_identity_digest == other.spawning_mux_build_identity_digest
+            && self.live_guardian_build_identity_digest == other.live_guardian_build_identity_digest
             && self.rows == other.rows
             && self.cols == other.cols
             && self.pixel_width == other.pixel_width
@@ -951,6 +949,7 @@ impl GuardianCheckpointGenesisSpawnPermitV1 {
             1,
             [1; 32],
             [2; 32],
+            [3; 32],
             u16::try_from(terminal_checkpoint.rows()).expect("test Genesis rows must fit u16"),
             u16::try_from(terminal_checkpoint.cols()).expect("test Genesis columns must fit u16"),
             0,
@@ -1315,10 +1314,7 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
         binding: &GuardianCheckpointStageBindingV1,
         permit: GuardianCheckpointGenesisSpawnPermitV1,
         terminal_checkpoint: &RecoveryTerminalCheckpointV2,
-    ) -> Result<
-        (Self, GuardianGenesisReservationIdentityV1),
-        GuardianCheckpointBoundaryError,
-    > {
+    ) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError> {
         let reservation = permit.into_reservation_identity();
         let spawn_effect_id = reservation.spawn_effect_id();
         let authoritative_descriptor =
@@ -4147,8 +4143,10 @@ pub enum GuardianCheckpointBoundaryError {
     EmptyGenesisSpawnPayload,
     #[error("Genesis reservation canonical Spawn payload digest must be nonzero")]
     ZeroGenesisSpawnPayloadDigest,
-    #[error("Genesis reservation process-family build identity digest must be nonzero")]
-    ZeroGenesisProcessFamilyBuildIdentityDigest,
+    #[error("Genesis reservation spawning-mux build identity digest must be nonzero")]
+    ZeroGenesisSpawningMuxBuildIdentityDigest,
+    #[error("Genesis reservation live-guardian build identity digest must be nonzero")]
+    ZeroGenesisLiveGuardianBuildIdentityDigest,
     #[error("Genesis reservation checkpoint identity digest must be nonzero")]
     ZeroGenesisCheckpointIdentityDigest,
     #[error("Genesis reservation boundary identity digest must be nonzero")]
@@ -4211,7 +4209,7 @@ pub enum GuardianCheckpointBoundaryError {
 // unit-test build.
 static_assertions::const_assert_eq!(
     std::mem::size_of::<GuardianGenesisReservationIdentityV1>(),
-    224
+    256
 );
 static_assertions::assert_not_impl_any!(GuardianGenesisReservationIdentityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
 static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
@@ -8477,7 +8475,8 @@ mod tests {
         origin_request_id: Uuid,
         spawn_payload_bytes: u64,
         spawn_payload_digest: [u8; 32],
-        process_family_build_identity_digest: [u8; 32],
+        spawning_mux_build_identity_digest: [u8; 32],
+        live_guardian_build_identity_digest: [u8; 32],
         rows: u16,
         cols: u16,
         pixel_width: u16,
@@ -8496,7 +8495,8 @@ mod tests {
                 origin_request_id: Uuid::from_u128(0x40),
                 spawn_payload_bytes: 4_096,
                 spawn_payload_digest: [0x51; 32],
-                process_family_build_identity_digest: [0x62; 32],
+                spawning_mux_build_identity_digest: [0x62; 32],
+                live_guardian_build_identity_digest: [0x63; 32],
                 rows: 24,
                 cols: 80,
                 pixel_width: 1_920,
@@ -8517,7 +8517,8 @@ mod tests {
                 self.origin_request_id,
                 self.spawn_payload_bytes,
                 self.spawn_payload_digest,
-                self.process_family_build_identity_digest,
+                self.spawning_mux_build_identity_digest,
+                self.live_guardian_build_identity_digest,
                 self.rows,
                 self.cols,
                 self.pixel_width,
@@ -8545,8 +8546,12 @@ mod tests {
             fixture.spawn_payload_digest
         );
         assert_eq!(
-            identity.process_family_build_identity_digest(),
-            fixture.process_family_build_identity_digest
+            identity.spawning_mux_build_identity_digest(),
+            fixture.spawning_mux_build_identity_digest
+        );
+        assert_eq!(
+            identity.live_guardian_build_identity_digest(),
+            fixture.live_guardian_build_identity_digest
         );
         assert_eq!(identity.rows(), fixture.rows);
         assert_eq!(identity.cols(), fixture.cols);
@@ -8563,7 +8568,7 @@ mod tests {
         assert_eq!(identity.upload_id(), fixture.upload_id);
         assert_eq!(
             std::mem::size_of::<GuardianGenesisReservationIdentityV1>(),
-            224
+            256
         );
 
         macro_rules! assert_bound_mutation {
@@ -8586,7 +8591,8 @@ mod tests {
         assert_bound_mutation!(origin_request_id, Uuid::from_u128(0x41));
         assert_bound_mutation!(spawn_payload_bytes, 4_097);
         assert_bound_mutation!(spawn_payload_digest, [0x52; 32]);
-        assert_bound_mutation!(process_family_build_identity_digest, [0x63; 32]);
+        assert_bound_mutation!(spawning_mux_build_identity_digest, [0x64; 32]);
+        assert_bound_mutation!(live_guardian_build_identity_digest, [0x65; 32]);
         assert_bound_mutation!(rows, 25);
         assert_bound_mutation!(cols, 81);
         assert_bound_mutation!(pixel_width, 1_921);
@@ -8652,11 +8658,20 @@ mod tests {
             },
             {
                 let mut invalid = fixture.clone();
-                invalid.process_family_build_identity_digest = [0; 32];
+                invalid.spawning_mux_build_identity_digest = [0; 32];
                 (
-                    "process_family_build_identity_digest",
+                    "spawning_mux_build_identity_digest",
                     invalid,
-                    GuardianCheckpointBoundaryError::ZeroGenesisProcessFamilyBuildIdentityDigest,
+                    GuardianCheckpointBoundaryError::ZeroGenesisSpawningMuxBuildIdentityDigest,
+                )
+            },
+            {
+                let mut invalid = fixture.clone();
+                invalid.live_guardian_build_identity_digest = [0; 32];
+                (
+                    "live_guardian_build_identity_digest",
+                    invalid,
+                    GuardianCheckpointBoundaryError::ZeroGenesisLiveGuardianBuildIdentityDigest,
                 )
             },
             {
@@ -8716,7 +8731,7 @@ mod tests {
             .expect("zero pixel dimensions remain valid PTY geometry");
 
         let debug = format!("{identity:?}");
-        assert_eq!(debug.matches("[REDACTED]").count(), 4);
+        assert_eq!(debug.matches("[REDACTED]").count(), 5);
         assert!(!debug.contains(&format!("{:?}", fixture.spawn_payload_digest)));
 
         let permit = GuardianCheckpointGenesisSpawnPermitV1::issue(

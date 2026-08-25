@@ -18,11 +18,10 @@ use mux::guardian_checkpoint::{
     GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointBoundaryError,
     GuardianCheckpointCandidateIdentityV1, GuardianCheckpointCipher, GuardianCheckpointCipherError,
     GuardianCheckpointOrderedChunkSetBuilderV1, GuardianCheckpointOrderedChunkSetIdentityV1,
-    GuardianCheckpointStageBindingV1,
-    GuardianCheckpointStageRecordContextV1, GuardianCheckpointStageRecordKindV1,
-    GuardianCheckpointStageScopeV1, GuardianCheckpointStageSealIntentV1,
-    GuardianCheckpointValidatedManifestAuthorityV1, GuardianEncryptedCheckpointStageRecordV1,
-    GuardianGenesisReservationIdentityV1,
+    GuardianCheckpointStageBindingV1, GuardianCheckpointStageRecordContextV1,
+    GuardianCheckpointStageRecordKindV1, GuardianCheckpointStageScopeV1,
+    GuardianCheckpointStageSealIntentV1, GuardianCheckpointValidatedManifestAuthorityV1,
+    GuardianEncryptedCheckpointStageRecordV1, GuardianGenesisReservationIdentityV1,
 };
 use mux::guardian_input_journal::{
     GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
@@ -109,9 +108,9 @@ const CHECKPOINT_CATALOG_MARKER_BODY_BYTES: usize = 312;
 const CHECKPOINT_CATALOG_MARKER_BYTES: usize =
     CHECKPOINT_CATALOG_MARKER_BODY_BYTES + OUTPUT_MANIFEST_CHECKSUM_BYTES;
 const CHECKPOINT_CATALOG_CHECKSUM_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-catalog-candidate.v1\0";
+    b"frankenterm.guardian-checkpoint-catalog-candidate.v2\0";
 const CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-catalog-marker.v1\0";
+    b"frankenterm.guardian-checkpoint-catalog-marker.v2\0";
 const CHECKPOINT_CATALOG_GENESIS_CANDIDATE_ID_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-catalog-genesis-candidate-id.v1\0";
 const CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS: usize = 8;
@@ -7479,31 +7478,31 @@ fn checkpoint_catalog_publish_genesis_stage(
     }
     let candidate_file_identity = match candidate_plan {
         CheckpointCatalogGenesisCandidatePlan::Reuse(existing) => {
-        let existing_bytes = checkpoint_catalog_read_file(
-            inner,
-            &existing.path,
-            existing.file_identity,
-            CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
-        )?;
-        checkpoint_catalog_require_exact_genesis_candidate_bytes(
-            &existing_bytes,
-            &encoded_candidate,
-        )?;
-        let decoded = checkpoint_catalog_decode_candidate(&existing_bytes)?;
-        if decoded.metadata.identity != identity
-            || decoded.metadata != candidate.metadata
-            || decoded.checksum != candidate.checksum
-        {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
-        checkpoint_catalog_validate_candidate_records(inner, &decoded)?;
-        checkpoint_catalog_resync_file(
-            inner,
-            &existing.path,
-            existing.file_identity,
-            "checkpoint-catalog-genesis-candidate-retry-sync",
-        )?;
-        existing.file_identity
+            let existing_bytes = checkpoint_catalog_read_file(
+                inner,
+                &existing.path,
+                existing.file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            checkpoint_catalog_require_exact_genesis_candidate_bytes(
+                &existing_bytes,
+                &encoded_candidate,
+            )?;
+            let decoded = checkpoint_catalog_decode_candidate(&existing_bytes)?;
+            if decoded.metadata.identity != identity
+                || decoded.metadata != candidate.metadata
+                || decoded.checksum != candidate.checksum
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            checkpoint_catalog_validate_candidate_records(inner, &decoded)?;
+            checkpoint_catalog_resync_file(
+                inner,
+                &existing.path,
+                existing.file_identity,
+                "checkpoint-catalog-genesis-candidate-retry-sync",
+            )?;
+            existing.file_identity
         }
         CheckpointCatalogGenesisCandidatePlan::Create => checkpoint_catalog_create_file(
             inner,
@@ -8058,13 +8057,14 @@ mod tests {
             origin_request_id: Uuid::from_u128(0xe004),
             spawn_payload_bytes: 73,
             spawn_payload_digest: [0x51; 32],
-            process_family_build_identity_digest: [0x52; 32],
+            spawning_mux_build_identity_digest: [0x52; 32],
+            live_guardian_build_identity_digest: [0x53; 32],
             rows: 24,
             cols: 80,
             pixel_width: 640,
             pixel_height: 480,
-            checkpoint_identity_digest: [0x53; 32],
-            boundary_identity_digest: [0x54; 32],
+            checkpoint_identity_digest: [0x54; 32],
+            boundary_identity_digest: [0x55; 32],
             upload_id: Uuid::from_u128(0xe005),
         }
     }
@@ -8099,8 +8099,10 @@ mod tests {
             genesis_origin_request_id: reservation.origin_request_id,
             genesis_spawn_payload_bytes: reservation.spawn_payload_bytes,
             genesis_spawn_payload_digest: reservation.spawn_payload_digest,
-            genesis_process_family_build_identity_digest: reservation
-                .process_family_build_identity_digest,
+            genesis_spawning_mux_build_identity_digest: reservation
+                .spawning_mux_build_identity_digest,
+            genesis_live_guardian_build_identity_digest: reservation
+                .live_guardian_build_identity_digest,
             genesis_pixel_width: reservation.pixel_width,
             genesis_pixel_height: reservation.pixel_height,
         }
@@ -8183,7 +8185,10 @@ mod tests {
         changed.genesis_spawn_payload_digest[0] ^= 1;
         mutations.push(changed);
         changed = genesis;
-        changed.genesis_process_family_build_identity_digest[0] ^= 1;
+        changed.genesis_spawning_mux_build_identity_digest[0] ^= 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.genesis_live_guardian_build_identity_digest[0] ^= 1;
         mutations.push(changed);
         changed = genesis;
         changed.genesis_pixel_width += 1;
@@ -8193,10 +8198,7 @@ mod tests {
         mutations.push(changed);
         for mutation in mutations {
             assert!(
-                !checkpoint_catalog_genesis_metadata_matches_reservation(
-                    &mutation,
-                    reservation
-                ),
+                !checkpoint_catalog_genesis_metadata_matches_reservation(&mutation, reservation),
                 "every reservation field must remain catalog-bound"
             );
         }
@@ -8227,7 +8229,10 @@ mod tests {
         changed.spawn_payload_digest[0] ^= 1;
         mutations.push(changed);
         changed = reservation;
-        changed.process_family_build_identity_digest[0] ^= 1;
+        changed.spawning_mux_build_identity_digest[0] ^= 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.live_guardian_build_identity_digest[0] ^= 1;
         mutations.push(changed);
         changed = reservation;
         changed.rows += 1;
@@ -8394,10 +8399,8 @@ mod tests {
         let mut nonzero_sequence = marker;
         nonzero_sequence.adoption_sequence = 1;
         assert!(
-            checkpoint_catalog_decode_marker(&checkpoint_catalog_encode_marker(
-                &nonzero_sequence
-            ))
-            .is_err()
+            checkpoint_catalog_decode_marker(&checkpoint_catalog_encode_marker(&nonzero_sequence))
+                .is_err()
         );
         let mut wrong_spawn = marker;
         wrong_spawn.adoption_effect_id = Uuid::from_u128(0xe303);
@@ -8408,10 +8411,8 @@ mod tests {
         let mut second_generation = marker;
         second_generation.identity.generation = 2;
         assert!(
-            checkpoint_catalog_decode_marker(&checkpoint_catalog_encode_marker(
-                &second_generation
-            ))
-            .is_err()
+            checkpoint_catalog_decode_marker(&checkpoint_catalog_encode_marker(&second_generation))
+                .is_err()
         );
     }
 
@@ -8490,8 +8491,7 @@ mod tests {
         checkpoint_catalog_require_exact_genesis_candidate_bytes(b"exact", b"exact")
             .expect("exact immutable candidate bytes");
         assert!(
-            checkpoint_catalog_require_exact_genesis_candidate_bytes(b"corrupt", b"exact")
-                .is_err(),
+            checkpoint_catalog_require_exact_genesis_candidate_bytes(b"corrupt", b"exact").is_err(),
             "candidate corruption must fail closed before marker creation"
         );
 
@@ -8516,11 +8516,7 @@ mod tests {
         let duplicate = CheckpointCatalogScan {
             published: Vec::new(),
             unpublished_candidates: vec![
-                checkpoint_catalog_test_unpublished_candidate(
-                    identity,
-                    candidate_path.clone(),
-                    9,
-                ),
+                checkpoint_catalog_test_unpublished_candidate(identity, candidate_path.clone(), 9),
                 checkpoint_catalog_test_unpublished_candidate(
                     wrong_identity,
                     PathBuf::from("second-candidate"),
@@ -8632,7 +8628,8 @@ mod tests {
                 genesis_origin_request_id: Uuid::nil(),
                 genesis_spawn_payload_bytes: 0,
                 genesis_spawn_payload_digest: [0; 32],
-                genesis_process_family_build_identity_digest: [0; 32],
+                genesis_spawning_mux_build_identity_digest: [0; 32],
+                genesis_live_guardian_build_identity_digest: [0; 32],
                 genesis_pixel_width: 0,
                 genesis_pixel_height: 0,
             },
