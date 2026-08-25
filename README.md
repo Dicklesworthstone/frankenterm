@@ -1376,7 +1376,11 @@ MCP mirrors Robot Mode. See [`docs/mcp-api-spec.md`](docs/mcp-api-spec.md) for t
 
 ## Configuration
 
-Configuration lives in `ft.toml` in the current directory when present; otherwise `ft` uses the platform default config file (`~/.config/ft/ft.toml` on XDG, `~/Library/Application Support/ft/ft.toml` on macOS).
+Configuration is discovered in canonical precedence order:
+1. Explicit `--config <path>` CLI option
+2. Workspace-local configuration via `FT_WORKSPACE` (`$FT_WORKSPACE/.ft/config.toml`, `$FT_WORKSPACE/.ft/ft.toml`, or `$FT_WORKSPACE/ft.toml`)
+3. Current working directory (`./.ft/config.toml`, `./.ft/ft.toml`, or `./ft.toml`)
+4. Platform default configuration (`~/.config/ft/ft.toml` on XDG, `~/Library/Application Support/ft/ft.toml` on macOS, or `%APPDATA%\ft\ft.toml` on Windows)
 
 ```toml
 [general]
