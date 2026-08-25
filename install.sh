@@ -543,7 +543,7 @@ check_installed_version() {
   [ -f "$DEST/frankenterm-mux-server" ] && \
     [ ! -L "$DEST/frankenterm-mux-server" ] && \
     [ -x "$DEST/frankenterm-mux-server" ] || return 1
-  local ft_cur mux_cur ft_identity mux_identity expected_identity_suffix
+  local ft_cur mux_cur ft_identity mux_identity identity_profile_version
   ft_cur=$("$DEST/ft" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
   mux_cur=$("$DEST/frankenterm-mux-server" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
   [ -z "$ft_cur" ] && return 1
@@ -569,10 +569,13 @@ check_installed_version() {
   [ "$(printf '%s\n' "$mux_identity" | awk 'END { print NR }')" -eq 1 ] || return 1
   [ "$ft_identity" = "$mux_identity" ] || return 1
   # Matching stale or non-shipping markers are still not the requested release.
-  # TARGET is resolved by detect_platform before this function can run.
-  [ -n "${TARGET:-}" ] || return 1
-  expected_identity_suffix="${TARGET}:release-interactive:${stripped};"
-  [ "${ft_identity##*:ROLE:}" = "$expected_identity_suffix" ]
+  # The successful launch probes above are the native-executability authority;
+  # do not compare against the prebuilt-asset target inferred by
+  # `detect_platform`. A valid source build may use a different native triple
+  # (for example musl) while still being one exact runnable sealed family.
+  identity_profile_version="${ft_identity##*:ROLE:}"
+  identity_profile_version="${identity_profile_version#*:}"
+  [ "$identity_profile_version" = "release-interactive:${stripped};" ]
 }
 
 # ───────────────────────────────────────────────────────────────────────────

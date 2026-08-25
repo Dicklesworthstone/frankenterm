@@ -102001,7 +102001,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             "frankenterm-mux-server",
             "aarch64-unknown-linux-gnu",
         );
-        check(false);
+        check(true);
 
         write_atomic_component_fixture(&ft_path, &build_id, "ft", "x86_64-unknown-linux-gnu");
         write_atomic_component_fixture(
