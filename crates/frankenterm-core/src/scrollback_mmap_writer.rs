@@ -3488,7 +3488,9 @@ mod tests {
         let capability = open_directory_tree_nofollow(&dir).unwrap();
         let metadata = capability.dir_metadata().unwrap();
         let actual_uid = cap_std::fs::MetadataExt::uid(&metadata);
-        let foreign_uid = actual_uid.checked_add(1).unwrap_or(actual_uid - 1);
+        let foreign_uid = actual_uid
+            .checked_add(1)
+            .unwrap_or_else(|| actual_uid.saturating_sub(1));
 
         let error = validate_cap_directory_for_uid(&metadata, &dir, foreign_uid).unwrap_err();
 
@@ -3710,6 +3712,7 @@ mod tests {
         let mut writer = MmapScrollback::open(config).unwrap();
         writer.append(RecordKind::Text, b"first").unwrap();
         writer.append(RecordKind::Text, b"second").unwrap();
+        writer.flush_pending_redaction().unwrap();
         writer.sync().unwrap();
         drop(writer);
 
@@ -4477,6 +4480,7 @@ mod tests {
         let first = b"first";
         let second = b"second";
         append_test_payload(&mut writer, RecordKind::Text, first);
+        writer.sync().unwrap();
         append_test_payload(&mut writer, RecordKind::Osc, second);
         writer.sync().unwrap();
         drop(writer);
