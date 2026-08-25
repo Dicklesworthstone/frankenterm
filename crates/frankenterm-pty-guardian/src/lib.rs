@@ -20,7 +20,7 @@
 //! non-overwriting retirement design lands.
 
 #[cfg(unix)]
-mod output;
+pub(crate) mod output;
 #[cfg(unix)]
 pub mod runtime;
 #[cfg(unix)]

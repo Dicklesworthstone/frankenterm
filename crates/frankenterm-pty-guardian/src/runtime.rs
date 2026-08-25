@@ -198,7 +198,7 @@ pub(crate) struct GuardianRuntimeInputCompletion {
 }
 
 pub(crate) enum GuardianRuntimeInputCompletionState {
-    Ready(GuardianRuntimeInputCompletion),
+    Ready(Box<GuardianRuntimeInputCompletion>),
     Empty,
     Disconnected,
 }
@@ -239,7 +239,7 @@ pub(crate) struct GuardianRuntimeCheckpointCompletion {
 }
 
 pub(crate) enum GuardianRuntimeCheckpointCompletionState {
-    Ready(GuardianRuntimeCheckpointCompletion),
+    Ready(Box<GuardianRuntimeCheckpointCompletion>),
     Empty,
     Disconnected,
 }
@@ -357,8 +357,8 @@ struct InputWorkerCompletion {
 }
 
 enum InputSubmitError {
-    Saturated(InputJob),
-    Unavailable(InputJob),
+    Saturated(Box<InputJob>),
+    Unavailable(Box<InputJob>),
 }
 
 struct GuardianInputPipeline {
@@ -389,11 +389,11 @@ impl GuardianInputPipeline {
 
     fn try_submit(&self, job: InputJob) -> Result<(), InputSubmitError> {
         let Some(jobs) = self.jobs.as_ref() else {
-            return Err(InputSubmitError::Unavailable(job));
+            return Err(InputSubmitError::Unavailable(Box::new(job)));
         };
         jobs.try_send(job).map_err(|error| match error {
-            TrySendError::Full(job) => InputSubmitError::Saturated(job),
-            TrySendError::Disconnected(job) => InputSubmitError::Unavailable(job),
+            TrySendError::Full(job) => InputSubmitError::Saturated(Box::new(job)),
+            TrySendError::Disconnected(job) => InputSubmitError::Unavailable(Box::new(job)),
         })
     }
 
@@ -402,7 +402,9 @@ impl GuardianInputPipeline {
             return GuardianRuntimeInputCompletionStateInternal::Disconnected;
         };
         match completions.try_recv() {
-            Ok(completion) => GuardianRuntimeInputCompletionStateInternal::Ready(completion),
+            Ok(completion) => {
+                GuardianRuntimeInputCompletionStateInternal::Ready(Box::new(completion))
+            }
             Err(TryRecvError::Empty) => GuardianRuntimeInputCompletionStateInternal::Empty,
             Err(TryRecvError::Disconnected) => {
                 GuardianRuntimeInputCompletionStateInternal::Disconnected
@@ -422,7 +424,7 @@ impl Drop for GuardianInputPipeline {
 }
 
 enum GuardianRuntimeInputCompletionStateInternal {
-    Ready(InputWorkerCompletion),
+    Ready(Box<InputWorkerCompletion>),
     Empty,
     Disconnected,
 }
@@ -441,8 +443,8 @@ struct CheckpointWorkerCompletion {
 }
 
 enum CheckpointSubmitError {
-    Saturated(CheckpointJob),
-    Unavailable(CheckpointJob),
+    Saturated(Box<CheckpointJob>),
+    Unavailable(Box<CheckpointJob>),
 }
 
 struct GuardianCheckpointPipeline {
@@ -478,11 +480,13 @@ impl GuardianCheckpointPipeline {
 
     fn try_submit(&self, job: CheckpointJob) -> Result<(), CheckpointSubmitError> {
         let Some(jobs) = self.jobs.as_ref() else {
-            return Err(CheckpointSubmitError::Unavailable(job));
+            return Err(CheckpointSubmitError::Unavailable(Box::new(job)));
         };
         jobs.try_send(job).map_err(|error| match error {
-            TrySendError::Full(job) => CheckpointSubmitError::Saturated(job),
-            TrySendError::Disconnected(job) => CheckpointSubmitError::Unavailable(job),
+            TrySendError::Full(job) => CheckpointSubmitError::Saturated(Box::new(job)),
+            TrySendError::Disconnected(job) => {
+                CheckpointSubmitError::Unavailable(Box::new(job))
+            }
         })
     }
 
@@ -491,7 +495,9 @@ impl GuardianCheckpointPipeline {
             return GuardianRuntimeCheckpointCompletionStateInternal::Disconnected;
         };
         match completions.try_recv() {
-            Ok(completion) => GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion),
+            Ok(completion) => {
+                GuardianRuntimeCheckpointCompletionStateInternal::Ready(Box::new(completion))
+            }
             Err(TryRecvError::Empty) => GuardianRuntimeCheckpointCompletionStateInternal::Empty,
             Err(TryRecvError::Disconnected) => {
                 GuardianRuntimeCheckpointCompletionStateInternal::Disconnected
@@ -511,7 +517,7 @@ impl Drop for GuardianCheckpointPipeline {
 }
 
 enum GuardianRuntimeCheckpointCompletionStateInternal {
-    Ready(CheckpointWorkerCompletion),
+    Ready(Box<CheckpointWorkerCompletion>),
     Empty,
     Disconnected,
 }
@@ -1012,7 +1018,7 @@ impl GuardianRuntime {
                 GuardianInputSubmission::Pending
             }
             Err(InputSubmitError::Saturated(job)) => {
-                self.restore_unsent_input_job(job);
+                self.restore_unsent_input_job(*job);
                 self.counters.input_retryable_capacity_closes = self
                     .counters
                     .input_retryable_capacity_closes
@@ -1020,7 +1026,7 @@ impl GuardianRuntime {
                 GuardianInputSubmission::CloseRetryably
             }
             Err(InputSubmitError::Unavailable(job)) => {
-                self.restore_unsent_input_job(job);
+                self.restore_unsent_input_job(*job);
                 self.input_pipeline_failed = true;
                 self.counters.input_worker_disconnects =
                     self.counters.input_worker_disconnects.saturating_add(1);
@@ -1039,7 +1045,6 @@ impl GuardianRuntime {
     ) -> GuardianCheckpointSubmission {
         if request.header().operation != GuardianOperation::CheckpointStage
             || request.header().request_id != route.request_id
-            || request.header().effect_id.is_some()
         {
             let response = GuardianResponseEnvelope::rejection(
                 &request,
@@ -1078,7 +1083,7 @@ impl GuardianRuntime {
                 GuardianCheckpointSubmission::Pending
             }
             Err(CheckpointSubmitError::Saturated(job)) => {
-                self.restore_unsent_checkpoint_job(job);
+                self.restore_unsent_checkpoint_job(*job);
                 self.counters.checkpoint_retryable_capacity_closes = self
                     .counters
                     .checkpoint_retryable_capacity_closes
@@ -1086,7 +1091,7 @@ impl GuardianRuntime {
                 GuardianCheckpointSubmission::CloseRetryably
             }
             Err(CheckpointSubmitError::Unavailable(job)) => {
-                self.restore_unsent_checkpoint_job(job);
+                self.restore_unsent_checkpoint_job(*job);
                 self.checkpoint_pipeline_failed = true;
                 self.counters.checkpoint_worker_disconnects = self
                     .counters
@@ -1138,6 +1143,7 @@ impl GuardianRuntime {
     pub(crate) fn try_input_completion(&mut self) -> GuardianRuntimeInputCompletionState {
         match self.input_pipeline.try_completion() {
             GuardianRuntimeInputCompletionStateInternal::Ready(completion) => {
+                let completion = *completion;
                 debug_assert!(self.protocol.is_none());
                 self.protocol = Some(completion.protocol);
                 if !self.restore_pane_input_authority(
@@ -1148,12 +1154,12 @@ impl GuardianRuntime {
                     self.counters.protocol_transition_failures =
                         self.counters.protocol_transition_failures.saturating_add(1);
                     self.replay_deferred_child_exits();
-                    return GuardianRuntimeInputCompletionState::Ready(
+                    return GuardianRuntimeInputCompletionState::Ready(Box::new(
                         GuardianRuntimeInputCompletion {
                             route: completion.route,
                             response: None,
                         },
-                    );
+                    ));
                 }
                 self.counters.input_transactions_completed =
                     self.counters.input_transactions_completed.saturating_add(1);
@@ -1184,10 +1190,10 @@ impl GuardianRuntime {
                     | None => {}
                 }
                 self.replay_deferred_child_exits();
-                GuardianRuntimeInputCompletionState::Ready(GuardianRuntimeInputCompletion {
+                GuardianRuntimeInputCompletionState::Ready(Box::new(GuardianRuntimeInputCompletion {
                     route: completion.route,
                     response: completion.response,
-                })
+                }))
             }
             GuardianRuntimeInputCompletionStateInternal::Empty => {
                 GuardianRuntimeInputCompletionState::Empty
@@ -1210,6 +1216,7 @@ impl GuardianRuntime {
     pub(crate) fn try_checkpoint_completion(&mut self) -> GuardianRuntimeCheckpointCompletionState {
         match self.checkpoint_pipeline.try_completion() {
             GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion) => {
+                let completion = *completion;
                 debug_assert!(self.protocol.is_none());
                 self.protocol = Some(completion.protocol);
                 self.counters.checkpoint_transactions_completed = self
@@ -1221,12 +1228,12 @@ impl GuardianRuntime {
                         self.counters.checkpoint_worker_panics.saturating_add(1);
                 }
                 self.replay_deferred_child_exits();
-                GuardianRuntimeCheckpointCompletionState::Ready(
+                GuardianRuntimeCheckpointCompletionState::Ready(Box::new(
                     GuardianRuntimeCheckpointCompletion {
                         route: completion.route,
                         response: completion.response,
                     },
-                )
+                ))
             }
             GuardianRuntimeCheckpointCompletionStateInternal::Empty => {
                 GuardianRuntimeCheckpointCompletionState::Empty
@@ -2113,10 +2120,16 @@ fn register_reader(registry: &Registry, pane: &mut RuntimePane) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+    use frankenterm_term::{
+        RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
+    };
     use mio::{Poll, Waker};
     use mux::guardian_protocol::{
-        GuardianRequestEnvelope, GuardianRequestHeader, GuardianResponseEnvelope,
-        GuardianResponseStatus, GuardianSecret, decode_guardian_request, encode_guardian_request,
+        GuardianCheckpointDescriptorV1, GuardianCheckpointScopeV1,
+        GuardianCheckpointStageRequestV1, GuardianRequestEnvelope, GuardianRequestHeader,
+        GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret, decode_guardian_request,
+        encode_guardian_request,
     };
     use portable_pty::{CommandBuilder, PtySize};
     use std::io;
@@ -2195,22 +2208,60 @@ mod tests {
         )
     }
 
-    fn authenticated_checkpoint_stage_request(
+    #[derive(Debug)]
+    struct RuntimeCheckpointConfig;
+
+    impl TerminalConfiguration for RuntimeCheckpointConfig {
+        fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+            frankenterm_term::color::ColorPalette::default()
+        }
+    }
+
+    fn runtime_terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+        Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(RuntimeCheckpointConfig),
+            "FrankenTerm",
+            "guardian-runtime-test",
+            Box::new(Vec::<u8>::new()),
+        )
+        .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+        .expect("capture canonical runtime checkpoint fixture")
+    }
+
+    fn authenticated_genesis_checkpoint_stage_request(
         request_id: Uuid,
-        pane_id: Uuid,
-        payload: &[u8],
     ) -> AuthenticatedGuardianRequest {
-        let payload = payload.to_vec();
-        let request = GuardianRequestEnvelope::new(
+        let spawn_effect_id = Uuid::from_u128(182);
+        let terminal = runtime_terminal_checkpoint();
+        let descriptor =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(spawn_effect_id, &terminal)
+                .expect("canonical Genesis descriptor");
+        let payload = GuardianCheckpointStageRequestV1::begin(
+            GuardianCheckpointScopeV1::Genesis { spawn_effect_id },
+            Uuid::from_u128(183),
+            descriptor,
+            1_024,
+        )
+        .expect("canonical Genesis Stage request")
+        .into_zeroizing_payload()
+        .expect("canonical Genesis Stage request encodes");
+        let request = GuardianRequestEnvelope::from_zeroizing_payload(
             GuardianRequestHeader::new(
                 GuardianOperation::CheckpointStage,
                 Uuid::from_u128(1),
                 Uuid::from_u128(2),
                 request_id,
-                Some(pane_id),
-                1,
-                0,
                 None,
+                0,
+                0,
+                Some(spawn_effect_id),
                 &payload,
             ),
             payload,
@@ -2432,7 +2483,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             match runtime.try_input_completion() {
-                GuardianRuntimeInputCompletionState::Ready(completion) => return completion,
+                GuardianRuntimeInputCompletionState::Ready(completion) => return *completion,
                 GuardianRuntimeInputCompletionState::Empty if Instant::now() < deadline => {
                     std::thread::yield_now();
                 }
@@ -2452,7 +2503,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             match runtime.try_checkpoint_completion() {
-                GuardianRuntimeCheckpointCompletionState::Ready(completion) => return completion,
+                GuardianRuntimeCheckpointCompletionState::Ready(completion) => return *completion,
                 GuardianRuntimeCheckpointCompletionState::Empty if Instant::now() < deadline => {
                     std::thread::yield_now();
                 }
@@ -2578,15 +2629,11 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_worker_preflight_rejects_malformed_stage_and_restores_protocol_authority() {
+    fn checkpoint_worker_preflight_rejects_genesis_and_restores_protocol_authority() {
         let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
         let before = runtime.counters();
         let request_id = Uuid::from_u128(181);
-        let request = authenticated_checkpoint_stage_request(
-            request_id,
-            Uuid::from_u128(182),
-            b"not-a-canonical-stage-request",
-        );
+        let request = authenticated_genesis_checkpoint_stage_request(request_id);
         let route = GuardianCheckpointRoute::new(Token(9), 7, request_id).unwrap();
 
         assert!(matches!(
@@ -2606,7 +2653,7 @@ mod tests {
                 .expect("typed preflight rejection")
                 .header()
                 .status,
-            GuardianResponseStatus::Rejected
+            GuardianResponseStatus::Terminal
         );
         assert!(
             runtime.protocol.is_some(),

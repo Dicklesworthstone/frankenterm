@@ -2951,7 +2951,7 @@ impl GuardianOutputPipeline {
             Arc::clone(&persistence),
             GuardianCheckpointStagePolicy::production(),
         )?;
-        let max_outstanding = max_panes.min(OUTPUT_MAX_IN_FLIGHT).max(1);
+        let max_outstanding = max_panes.clamp(1, OUTPUT_MAX_IN_FLIGHT);
         let queue = Arc::new(OutputQueue::new(max_outstanding)?);
         let (completion_tx, completions) = sync_channel(max_outstanding);
         let worker_count = OUTPUT_WORKER_THREADS.min(max_outstanding);
@@ -3384,7 +3384,7 @@ fn parse_checksum_hex(encoded: &str) -> Option<[u8; OUTPUT_MANIFEST_CHECKSUM_BYT
         return None;
     }
     let mut checksum = [0; OUTPUT_MANIFEST_CHECKSUM_BYTES];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
         checksum[index] = (high << 4) | low;

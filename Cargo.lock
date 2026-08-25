@@ -4393,6 +4393,7 @@ dependencies = [
  "anyhow",
  "clap",
  "frankenterm-sigpipe",
+ "frankenterm-term",
  "getrandom 0.4.3",
  "libc",
  "mio",
