@@ -1834,33 +1834,39 @@ fn open_regular_nofollow(
     Ok(file)
 }
 
-fn read_regular_nofollow(
+fn read_regular_nofollow_bounded(
     dir: &Dir,
     relative: &Path,
     display_path: &Path,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, IdempotencyError> {
     let mut file = open_regular_nofollow(dir, relative, display_path)?;
-    read_bounded_ledger(&mut file, display_path)
+    read_bounded_ledger_with_limit(&mut file, display_path, max_bytes)
 }
 
-fn read_bounded_ledger(
+fn read_bounded_ledger_with_limit(
     reader: &mut impl Read,
     display_path: &Path,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, IdempotencyError> {
     let mut contents = Vec::new();
     reader
-        .take(MAX_DURABLE_LEDGER_BYTES + 1)
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut contents)
         .map_err(|err| IdempotencyError::LedgerPersist {
             reason: format!("read durable leaf {}: {err}", display_path.display()),
         })?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_DURABLE_LEDGER_BYTES {
-        return Err(IdempotencyError::LedgerPersist {
-            reason: format!(
-                "durable ledger {} exceeds the {} byte safety limit",
-                display_path.display(),
-                MAX_DURABLE_LEDGER_BYTES
-            ),
+    let actual = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+    if actual > max_bytes {
+        let execution_id = display_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        return Err(IdempotencyError::LedgerOversized {
+            execution_id,
+            actual,
+            maximum: max_bytes,
         });
     }
     Ok(contents)
@@ -2581,7 +2587,11 @@ impl IdempotencyStore {
                 reason: format!("inspect locked ledger {}: {err}", ledger_display.display()),
             })?;
         validate_open_regular_file(&metadata, &ledger_display)?;
-        let contents = read_bounded_ledger(&mut ledger_file, &ledger_display)?;
+        let contents = read_bounded_ledger_with_limit(
+            &mut ledger_file,
+            &ledger_display,
+            self.policy.max_ledger_bytes,
+        )?;
         let ledger = serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
             IdempotencyError::LedgerPersist {
                 reason: format!(
@@ -2783,16 +2793,35 @@ impl IdempotencyStore {
             }
         }
         candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if candidates.len() > store.policy.max_spool_files {
+            return Err(IdempotencyError::SpoolFileCountExceeded {
+                actual: candidates.len(),
+                maximum: store.policy.max_spool_files,
+            });
+        }
         let mut verified_ledgers = Vec::with_capacity(candidates.len());
+        let mut total_spool_bytes: u64 = 0;
+        let mut total_records: usize = 0;
 
         for (stem, name) in candidates {
             let display_path = spool.display(&name);
-            let contents =
-                read_regular_nofollow(&spool.dir, &name, &display_path).map_err(|error| {
-                    IdempotencyError::LedgerPersist {
-                        reason: format!("read ledger {}: {error}", display_path.display()),
-                    }
-                })?;
+            let contents = read_regular_nofollow_bounded(
+                &spool.dir,
+                &name,
+                &display_path,
+                store.policy.max_ledger_bytes,
+            )
+            .map_err(|error| IdempotencyError::LedgerPersist {
+                reason: format!("read ledger {}: {error}", display_path.display()),
+            })?;
+            let file_bytes = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+            total_spool_bytes = total_spool_bytes.saturating_add(file_bytes);
+            if total_spool_bytes > store.policy.max_spool_total_bytes {
+                return Err(IdempotencyError::SpoolByteLimitExceeded {
+                    actual: total_spool_bytes,
+                    maximum: store.policy.max_spool_total_bytes,
+                });
+            }
             let ledger = serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
                 IdempotencyError::LedgerPersist {
                     reason: format!("deserialize ledger {}: {err}", display_path.display()),
@@ -2816,6 +2845,13 @@ impl IdempotencyStore {
                         verification.first_break_at,
                         verification.missing_ordinals
                     ),
+                });
+            }
+            total_records = total_records.saturating_add(ledger.records().len());
+            if total_records > store.policy.max_spool_records {
+                return Err(IdempotencyError::SpoolRecordCountExceeded {
+                    actual: total_records,
+                    maximum: store.policy.max_spool_records,
                 });
             }
             verified_ledgers.push((stem, ledger));
@@ -3309,7 +3345,7 @@ impl IdempotencyStore {
                         spool.display_path.display()
                     ),
                 })?;
-            let mut durable_high_water_ms = 0;
+            let mut candidates: Vec<(String, PathBuf)> = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
                     reason: format!(
@@ -3327,8 +3363,35 @@ impl IdempotencyStore {
                 if !is_valid_execution_id(stem) {
                     continue;
                 }
+                candidates.push((stem.to_string(), name));
+            }
+            if candidates.len() > self.policy.max_spool_files {
+                return Err(IdempotencyError::SpoolFileCountExceeded {
+                    actual: candidates.len(),
+                    maximum: self.policy.max_spool_files,
+                });
+            }
+            candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+            let mut durable_high_water_ms = 0;
+            let mut total_spool_bytes: u64 = 0;
+            let mut total_records: usize = 0;
+            for (stem, name) in candidates {
                 let display_path = spool.display(&name);
-                let contents = read_regular_nofollow(&spool.dir, &name, &display_path)?;
+                let contents = read_regular_nofollow_bounded(
+                    &spool.dir,
+                    &name,
+                    &display_path,
+                    self.policy.max_ledger_bytes,
+                )?;
+                let file_bytes = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+                total_spool_bytes = total_spool_bytes.saturating_add(file_bytes);
+                if total_spool_bytes > self.policy.max_spool_total_bytes {
+                    return Err(IdempotencyError::SpoolByteLimitExceeded {
+                        actual: total_spool_bytes,
+                        maximum: self.policy.max_spool_total_bytes,
+                    });
+                }
                 let ledger =
                     serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
                         IdempotencyError::LedgerPersist {
@@ -3358,12 +3421,19 @@ impl IdempotencyStore {
                         ),
                     });
                 }
+                total_records = total_records.saturating_add(ledger.records().len());
+                if total_records > self.policy.max_spool_records {
+                    return Err(IdempotencyError::SpoolRecordCountExceeded {
+                        actual: total_records,
+                        maximum: self.policy.max_spool_records,
+                    });
+                }
                 for record in ledger.records() {
                     durable_high_water_ms = durable_high_water_ms.max(record.timestamp_ms);
                     if let Some(observations) = matching_records.get_mut(&record.idem_key) {
                         observations.push(DurableOutcomeObservation {
                             timestamp_ms: record.timestamp_ms,
-                            execution_id: stem.to_string(),
+                            execution_id: stem.clone(),
                             ordinal: record.ordinal,
                             outcome: record.outcome.clone(),
                         });
@@ -3431,6 +3501,14 @@ impl IdempotencyStore {
             serde_json::to_vec_pretty(ledger).map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!("serialize ledger {execution_id}: {err}"),
             })?;
+        let actual = u64::try_from(json.len()).unwrap_or(u64::MAX);
+        if actual > self.policy.max_ledger_bytes {
+            return Err(IdempotencyError::LedgerOversized {
+                execution_id: execution_id.to_string(),
+                actual,
+                maximum: self.policy.max_ledger_bytes,
+            });
+        }
         let final_name = PathBuf::from(format!("{execution_id}.json"));
         let expected_file = expected_file.ok_or_else(|| IdempotencyError::LedgerPersist {
             reason: format!(
@@ -3460,6 +3538,14 @@ impl IdempotencyStore {
             serde_json::to_vec_pretty(ledger).map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!("serialize new ledger {execution_id}: {err}"),
             })?;
+        let actual = u64::try_from(json.len()).unwrap_or(u64::MAX);
+        if actual > self.policy.max_ledger_bytes {
+            return Err(IdempotencyError::LedgerOversized {
+                execution_id: execution_id.to_string(),
+                actual,
+                maximum: self.policy.max_ledger_bytes,
+            });
+        }
         persist_ledger_bytes(
             spool,
             &PathBuf::from(format!("{execution_id}.json")),
@@ -4136,6 +4222,14 @@ pub struct IdempotencyPolicy {
     /// if verified nonterminal ledgers exceed this limit; it never evicts
     /// resumable state to manufacture capacity.
     pub max_active_ledgers: usize,
+    /// Maximum number of ledger files allowed in the durable spool (ft-u61ij).
+    pub max_spool_files: usize,
+    /// Maximum cumulative byte size allowed for all ledger files in the durable spool (ft-u61ij).
+    pub max_spool_total_bytes: u64,
+    /// Maximum number of total records allowed across the durable spool (ft-u61ij).
+    pub max_spool_records: usize,
+    /// Maximum byte size accepted for any single ledger file (ft-u61ij).
+    pub max_ledger_bytes: u64,
 }
 
 impl Default for IdempotencyPolicy {
@@ -4146,6 +4240,10 @@ impl Default for IdempotencyPolicy {
             dedup_ttl_ms: 3_600_000, // 1 hour
             require_chain_integrity: true,
             max_active_ledgers: 100,
+            max_spool_files: 10_000,
+            max_spool_total_bytes: 512 * 1024 * 1024, // 512 MB
+            max_spool_records: 1_000_000,
+            max_ledger_bytes: MAX_DURABLE_LEDGER_BYTES, // 16 MB
         }
     }
 }
@@ -4192,6 +4290,22 @@ pub enum IdempotencyError {
 
     #[error("active ledger limit exceeded: max_active_ledgers={max_active_ledgers}")]
     ActiveLedgerLimitExceeded { max_active_ledgers: usize },
+
+    #[error("spool file limit exceeded: {actual} files exceeds max {maximum}")]
+    SpoolFileCountExceeded { actual: usize, maximum: usize },
+
+    #[error("spool total byte limit exceeded: {actual} bytes exceeds max {maximum}")]
+    SpoolByteLimitExceeded { actual: u64, maximum: u64 },
+
+    #[error("spool record limit exceeded: {actual} records exceeds max {maximum}")]
+    SpoolRecordCountExceeded { actual: usize, maximum: usize },
+
+    #[error("ledger file {execution_id} is oversized: {actual} bytes exceeds max {maximum}")]
+    LedgerOversized {
+        execution_id: String,
+        actual: u64,
+        maximum: u64,
+    },
 
     #[error("durable idempotency reservation requires a spool-backed store")]
     DurableReservationRequired,
@@ -7928,11 +8042,19 @@ mod tests {
             dedup_ttl_ms: 60_000,
             require_chain_integrity: false,
             max_active_ledgers: 10,
+            max_spool_files: 50,
+            max_spool_total_bytes: 1024 * 1024,
+            max_spool_records: 500,
+            max_ledger_bytes: 64 * 1024,
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: IdempotencyPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(back.dedup_capacity, 500);
         assert!(!back.skip_completed_on_resume);
+        assert_eq!(back.max_spool_files, 50);
+        assert_eq!(back.max_spool_total_bytes, 1024 * 1024);
+        assert_eq!(back.max_spool_records, 500);
+        assert_eq!(back.max_ledger_bytes, 64 * 1024);
     }
 
     proptest! {
@@ -8574,5 +8696,168 @@ mod tests {
         let dedup = store.peek_cached_outcome(&key, store.logical_clock_ms());
         assert!(dedup.is_some());
         assert!(matches!(dedup.unwrap(), StepOutcome::Success { .. }));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn spool_file_count_limit_exceeded_on_open_and_refresh() {
+        let ft_dir = durable_test_dir("spool-file-count-limit");
+        let plan = make_plan(1);
+        let mut store = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap();
+        store.create_ledger("exec-1", &plan).unwrap();
+        store.create_ledger("exec-2", &plan).unwrap();
+        store.create_ledger("exec-3", &plan).unwrap();
+        drop(store);
+
+        let restricted_policy = IdempotencyPolicy {
+            max_spool_files: 2,
+            ..IdempotencyPolicy::default()
+        };
+        let open_err = IdempotencyStore::open(&ft_dir, restricted_policy.clone()).unwrap_err();
+        assert_eq!(
+            open_err,
+            IdempotencyError::SpoolFileCountExceeded {
+                actual: 3,
+                maximum: 2
+            }
+        );
+
+        let mut store = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap();
+        store.policy.max_spool_files = 2;
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let refresh_err = store
+            .refresh_durable_outcome_for_key(&key, 1000)
+            .unwrap_err();
+        assert_eq!(
+            refresh_err,
+            IdempotencyError::SpoolFileCountExceeded {
+                actual: 3,
+                maximum: 2
+            }
+        );
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn spool_total_bytes_limit_exceeded_on_open_and_refresh() {
+        let ft_dir = durable_test_dir("spool-bytes-limit");
+        let plan = make_plan(1);
+        let mut store = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap();
+        store.create_ledger("exec-1", &plan).unwrap();
+        store.create_ledger("exec-2", &plan).unwrap();
+        drop(store);
+
+        let restricted_policy = IdempotencyPolicy {
+            max_spool_total_bytes: 100,
+            ..IdempotencyPolicy::default()
+        };
+        let open_err = IdempotencyStore::open(&ft_dir, restricted_policy.clone()).unwrap_err();
+        assert!(matches!(
+            open_err,
+            IdempotencyError::SpoolByteLimitExceeded { maximum: 100, .. }
+        ));
+
+        let mut store = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap();
+        store.policy.max_spool_total_bytes = 100;
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let refresh_err = store
+            .refresh_durable_outcome_for_key(&key, 1000)
+            .unwrap_err();
+        assert!(matches!(
+            refresh_err,
+            IdempotencyError::SpoolByteLimitExceeded { maximum: 100, .. }
+        ));
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn spool_record_count_limit_exceeded_on_open_and_refresh() {
+        let ft_dir = durable_test_dir("spool-record-count-limit");
+        let plan = make_plan(2);
+        let mut store = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap();
+        store.create_ledger("exec-1", &plan).unwrap();
+        store
+            .transition_phase("exec-1", TxPhase::Preparing)
+            .unwrap();
+        let key_1 = make_key("test-plan", &plan.steps[0].id);
+        record_durable_outcome(
+            &mut store,
+            "exec-1",
+            key_1.clone(),
+            StepOutcome::Success { result: None },
+            StepRisk::Low,
+            "agent",
+            1000,
+        );
+        drop(store);
+
+        let restricted_policy = IdempotencyPolicy {
+            max_spool_records: 1,
+            ..IdempotencyPolicy::default()
+        };
+        let open_err = IdempotencyStore::open(&ft_dir, restricted_policy.clone()).unwrap_err();
+        assert_eq!(
+            open_err,
+            IdempotencyError::SpoolRecordCountExceeded {
+                actual: 2,
+                maximum: 1
+            }
+        );
+
+        let mut store = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap();
+        store.policy.max_spool_records = 1;
+        let refresh_err = store
+            .refresh_durable_outcome_for_key(&key_1, 2000)
+            .unwrap_err();
+        assert_eq!(
+            refresh_err,
+            IdempotencyError::SpoolRecordCountExceeded {
+                actual: 2,
+                maximum: 1
+            }
+        );
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn spool_ledger_oversized_limit_exceeded() {
+        let ft_dir = durable_test_dir("spool-ledger-oversized");
+        let restricted_policy = IdempotencyPolicy {
+            max_ledger_bytes: 100,
+            ..IdempotencyPolicy::default()
+        };
+        let mut store = IdempotencyStore::open(&ft_dir, restricted_policy).unwrap();
+        let plan = make_plan(2);
+        let err = store.create_ledger("exec-oversized", &plan).unwrap_err();
+        assert!(matches!(
+            err,
+            IdempotencyError::LedgerOversized {
+                ref execution_id,
+                actual,
+                maximum: 100
+            } if execution_id == "exec-oversized" && actual > 100
+        ));
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn corrupt_spool_fails_closed_without_oom() {
+        let ft_dir = durable_test_dir("spool-corrupt-fail-closed");
+        let store = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap();
+        let spool_path = ft_dir.join("tx_ledgers");
+        drop(store);
+
+        let corrupt_file = spool_path.join("exec-corrupt.json");
+        std::fs::write(&corrupt_file, b"{\"execution_id\": \"exec-corrupt\", broken").unwrap();
+
+        let open_err =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap_err();
+        assert!(matches!(open_err, IdempotencyError::LedgerPersist { .. }));
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
     }
 }
