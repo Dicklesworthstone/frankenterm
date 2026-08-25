@@ -6928,6 +6928,8 @@ pub struct CheckpointScrollbackCapabilities {
     pub process_state: bool,
     /// Artifact does not preserve running-process continuity.
     pub running_process_continuity: bool,
+    /// Embedded pane IDs are evidence labels, not stable live-mux identities.
+    pub stable_mux_local_pane_ids: bool,
     /// Artifact verification and import perform no live mux mutation.
     pub live_mux_mutation: bool,
 }
@@ -6942,6 +6944,7 @@ impl CheckpointScrollbackCapabilities {
         pty_descriptor_state: false,
         process_state: false,
         running_process_continuity: false,
+        stable_mux_local_pane_ids: false,
         live_mux_mutation: false,
     };
 }
@@ -8847,10 +8850,7 @@ fn validate_checkpoint_artifact_file_metadata(
 
 fn checkpoint_artifact_staging_name(leaf: &Path, artifact_sha256: &str) -> String {
     let leaf_digest = checkpoint_artifact_sha256(leaf.to_string_lossy().as_bytes());
-    format!(
-        ".ft-checkpoint-scrollback-{}-{artifact_sha256}.staging",
-        &leaf_digest[..16]
-    )
+    format!(".ft-checkpoint-scrollback-{leaf_digest}-{artifact_sha256}.staging")
 }
 
 fn acquire_checkpoint_artifact_publication_lock(
@@ -12399,6 +12399,7 @@ mod tests {
             assert!(!artifact.payload.capabilities.pty_descriptor_state);
             assert!(!artifact.payload.capabilities.process_state);
             assert!(!artifact.payload.capabilities.running_process_continuity);
+            assert!(!artifact.payload.capabilities.stable_mux_local_pane_ids);
             assert!(!artifact.payload.capabilities.live_mux_mutation);
 
             drop(db_file);

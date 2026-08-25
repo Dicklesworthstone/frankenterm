@@ -742,6 +742,7 @@ def exact_file(source_dir_fd, target_dir_fd, name, source_named):
         os.fsync(target_fd)
         budget["files"] += 1
         if fail_after and budget["files"] == fail_after:
+            os.kill(os.getppid(), signal.SIGKILL)
             os.kill(os.getpid(), signal.SIGKILL)
     finally:
         if target_fd >= 0:
