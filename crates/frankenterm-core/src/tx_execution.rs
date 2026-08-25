@@ -348,6 +348,19 @@ pub struct TxContractLockGuard {
     file: File,
 }
 
+impl std::fmt::Debug for TxContractLockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxContractLockGuard")
+            .field("key", &self.key)
+            .field("workspace_display", &self.workspace_display)
+            .field("control_display", &self.control_display)
+            .field("parent_display", &self.parent_display)
+            .field("contract_name", &self.contract_name)
+            .field("lock_name", &self.lock_name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TxContractLockGuard {
     /// Return the exact canonical contract path protected by this guard.
     ///
