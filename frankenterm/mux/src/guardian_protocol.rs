@@ -7563,6 +7563,85 @@ impl GuardianProtocolState {
         }
     }
 
+    /// Validate one authenticated checkpoint Stage request against the live
+    /// pane lease before a guardian worker is allowed to inspect persistent
+    /// staging state.
+    ///
+    /// This is deliberately read-only and returns only the decoded wire
+    /// request, never publication authority. Record-backed Stage traffic must
+    /// name the exact currently claimed pane generation and mux incarnation;
+    /// pending input durability or an indeterminate checkpoint publication
+    /// blocks it. Genesis remains unavailable until the runtime can consume a
+    /// durable pre-Spawn reservation permit rather than trusting a raw effect
+    /// UUID from the wire.
+    pub fn preflight_checkpoint_stage(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+        }
+        if request.header.operation != GuardianOperation::CheckpointStage {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            });
+        }
+        let stage = GuardianCheckpointStageRequestV1::decode(request.payload())?;
+        let GuardianCheckpointScopeV1::Pane {
+            pane_id,
+            generation,
+        } = stage.scope()
+        else {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::CheckpointStage,
+            });
+        };
+        match self.panes.get(&pane_id) {
+            Some(GuardianPaneState::LiveClaimed {
+                generation: live_generation,
+                mux_incarnation,
+                pending_input_effect: None,
+                ..
+            }) if *live_generation == generation
+                && *mux_incarnation == request.header.mux_incarnation
+                && !self.indeterminate_checkpoints_by_pane.contains_key(&pane_id) =>
+            {
+                Ok(stage)
+            }
+            Some(GuardianPaneState::LiveClaimed {
+                generation: live_generation,
+                mux_incarnation,
+                pending_input_effect: Some(_),
+                ..
+            }) if *live_generation == generation
+                && *mux_incarnation == request.header.mux_incarnation =>
+            {
+                Err(GuardianProtocolError::InputDurabilityPending)
+            }
+            Some(GuardianPaneState::LiveClaimed {
+                generation: live_generation,
+                mux_incarnation,
+                pending_input_effect: None,
+                ..
+            }) if *live_generation == generation
+                && *mux_incarnation == request.header.mux_incarnation =>
+            {
+                Err(GuardianProtocolError::CheckpointOutcomeIndeterminate)
+            }
+            Some(GuardianPaneState::LiveUnclaimed { .. })
+            | Some(GuardianPaneState::LiveClaimed { .. }) => {
+                Err(GuardianProtocolError::StaleLease)
+            }
+            Some(
+                GuardianPaneState::ExitedUnclaimed { .. }
+                | GuardianPaneState::ClosedTerminal { .. }
+                | GuardianPaneState::Quarantined { .. },
+            ) => Err(GuardianProtocolError::PaneTerminal),
+            None => Err(GuardianProtocolError::PaneNotFound(pane_id)),
+        }
+    }
+
     /// Fence, execute, and commit one effect-producing request.
     ///
     /// The callback is invoked only for a new effect identity, after authentication,
@@ -10305,6 +10384,40 @@ mod tests {
     ) -> GuardianCheckpointEffectIdentity {
         GuardianCheckpointEffectIdentity::from_authenticated_request(&authenticate(request))
             .expect("test checkpoint carries an exact authenticated publication identity")
+    }
+
+    fn pane_checkpoint_stage_request(
+        guardian: Uuid,
+        mux: Uuid,
+        request_id: Uuid,
+        pane: Uuid,
+        generation: u64,
+        upload_id: Uuid,
+        descriptor: GuardianCheckpointDescriptorV1,
+    ) -> GuardianRequestEnvelope {
+        let payload = GuardianCheckpointStageRequestV1::begin(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id: pane,
+                generation,
+            },
+            upload_id,
+            descriptor,
+            1_024,
+        )
+        .unwrap()
+        .into_zeroizing_payload()
+        .unwrap();
+        request_zeroizing(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            request_id,
+            Some(pane),
+            generation,
+            0,
+            None,
+            payload,
+        )
     }
 
     #[test]
@@ -14250,6 +14363,166 @@ mod tests {
             sequence_state.mark_exited(pane, 137),
             Err(GuardianProtocolError::PaneTerminal)
         );
+    }
+
+    #[test]
+    fn checkpoint_stage_preflight_fences_live_authority_before_storage_access() {
+        let guardian = id(160);
+        let mux = id(161);
+        let pane = id(162);
+        let generation = 1;
+        let terminal = terminal_checkpoint();
+        let descriptor =
+            record_checkpoint_descriptor(pane, generation, terminal.canonical_payload());
+        let stage = pane_checkpoint_stage_request(
+            guardian,
+            mux,
+            id(163),
+            pane,
+            generation,
+            id(164),
+            descriptor,
+        );
+
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 165, 166),
+        )
+        .unwrap();
+        let claimed_state = state.clone();
+        let decoded = state
+            .preflight_checkpoint_stage(&authenticate(&stage))
+            .unwrap();
+        assert_eq!(decoded.kind(), GuardianCheckpointStageKindV1::Begin);
+        assert_eq!(decoded.scope(), GuardianCheckpointScopeV1::Pane { pane_id: pane, generation });
+        assert_eq!(state, claimed_state, "Stage preflight must remain read-only");
+
+        let wrong_mux = pane_checkpoint_stage_request(
+            guardian,
+            id(167),
+            id(168),
+            pane,
+            generation,
+            id(164),
+            descriptor,
+        );
+        assert!(matches!(
+            state.preflight_checkpoint_stage(&authenticate(&wrong_mux)),
+            Err(GuardianProtocolError::StaleLease)
+        ));
+
+        let stale_descriptor =
+            record_checkpoint_descriptor(pane, generation + 1, terminal.canonical_payload());
+        let stale_generation = pane_checkpoint_stage_request(
+            guardian,
+            mux,
+            id(169),
+            pane,
+            generation + 1,
+            id(164),
+            stale_descriptor,
+        );
+        assert!(matches!(
+            state.preflight_checkpoint_stage(&authenticate(&stale_generation)),
+            Err(GuardianProtocolError::StaleLease)
+        ));
+
+        let missing_pane = id(170);
+        let missing_descriptor = record_checkpoint_descriptor(
+            missing_pane,
+            generation,
+            terminal.canonical_payload(),
+        );
+        let missing = pane_checkpoint_stage_request(
+            guardian,
+            mux,
+            id(171),
+            missing_pane,
+            generation,
+            id(172),
+            missing_descriptor,
+        );
+        assert!(matches!(
+            state.preflight_checkpoint_stage(&authenticate(&missing)),
+            Err(GuardianProtocolError::PaneNotFound(found)) if found == missing_pane
+        ));
+
+        let input = authenticate(&request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(173),
+            Some(pane),
+            generation,
+            1,
+            Some(id(174)),
+            b"pending",
+        ));
+        state
+            .apply_input_effect_transactionally(&input, |_| {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert!(matches!(
+            state.preflight_checkpoint_stage(&authenticate(&stage)),
+            Err(GuardianProtocolError::InputDurabilityPending)
+        ));
+
+        let mut indeterminate = claimed_state.clone();
+        let checkpoint = checkpoint_request(
+            guardian, mux, pane, generation, 1, 175, 176, 0x71, 0x72,
+        );
+        let receipt = indeterminate
+            .apply_checkpoint_transactionally(&authenticate(&checkpoint), |_| Err::<(), ()>(()))
+            .unwrap();
+        assert_eq!(
+            receipt.disposition,
+            GuardianCheckpointDisposition::OutcomeIndeterminate
+        );
+        assert!(matches!(
+            indeterminate.preflight_checkpoint_stage(&authenticate(&stage)),
+            Err(GuardianProtocolError::CheckpointOutcomeIndeterminate)
+        ));
+
+        let mut terminal_state = claimed_state.clone();
+        terminal_state.mark_exited(pane, 0).unwrap();
+        assert!(matches!(
+            terminal_state.preflight_checkpoint_stage(&authenticate(&stage)),
+            Err(GuardianProtocolError::PaneTerminal)
+        ));
+
+        let spawn_effect_id = id(5);
+        let genesis_descriptor =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(spawn_effect_id, &terminal)
+                .unwrap();
+        let genesis_payload = GuardianCheckpointStageRequestV1::begin(
+            GuardianCheckpointScopeV1::Genesis { spawn_effect_id },
+            id(177),
+            genesis_descriptor,
+            1_024,
+        )
+        .unwrap()
+        .into_zeroizing_payload()
+        .unwrap();
+        let genesis = request_zeroizing(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(178),
+            None,
+            0,
+            0,
+            Some(spawn_effect_id),
+            genesis_payload,
+        );
+        assert!(matches!(
+            claimed_state.preflight_checkpoint_stage(&authenticate(&genesis)),
+            Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::CheckpointStage
+            })
+        ));
     }
 
     #[test]
