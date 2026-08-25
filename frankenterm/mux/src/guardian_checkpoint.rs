@@ -8647,7 +8647,7 @@ mod tests {
                 "<free>",
                 "private",
                 false,
-                "fn checkpoint_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>,), GuardianCheckpointCipherError>",
+                "fn checkpoint_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>,), GuardianCheckpointCipherError,>",
             ),
             expected_authority_method(
                 "<free>",
@@ -8663,6 +8663,21 @@ mod tests {
             ),
         ]);
         sort_authority_methods(&mut expected_authority_signatures);
+        if inventory.authority_signature_surfaces != expected_authority_signatures {
+            for unexpected in inventory
+                .authority_signature_surfaces
+                .iter()
+                .filter(|surface| !expected_authority_signatures.contains(surface))
+            {
+                eprintln!("unexpected authority signature surface: {unexpected:#?}");
+            }
+            for missing in expected_authority_signatures
+                .iter()
+                .filter(|surface| !inventory.authority_signature_surfaces.contains(surface))
+            {
+                eprintln!("missing authority signature surface: {missing:#?}");
+            }
+        }
         assert_eq!(
             inventory.authority_signature_surfaces,
             expected_authority_signatures
