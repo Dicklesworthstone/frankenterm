@@ -2,8 +2,9 @@
 
 use crate::output::GuardianOutputPipeline;
 use crate::runtime::{
-    GuardianInputRoute, GuardianInputSubmission, GuardianRuntime, GuardianRuntimeConfig,
-    GuardianRuntimeCounters, GuardianRuntimeInputCompletionState,
+    GuardianCheckpointRoute, GuardianCheckpointSubmission, GuardianInputRoute,
+    GuardianInputSubmission, GuardianRuntime, GuardianRuntimeCheckpointCompletionState,
+    GuardianRuntimeConfig, GuardianRuntimeCounters, GuardianRuntimeInputCompletionState,
 };
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -205,6 +206,7 @@ struct Connection {
     close_after_write: bool,
     guarded_stop_response: Option<GuardedStopAuthority>,
     pending_input: Option<GuardianInputRoute>,
+    pending_checkpoint: Option<GuardianCheckpointRoute>,
     accepted_at: Instant,
 }
 
@@ -240,6 +242,7 @@ impl Connection {
             close_after_write: false,
             guarded_stop_response: None,
             pending_input: None,
+            pending_checkpoint: None,
             accepted_at: Instant::now(),
         }
     }
@@ -516,6 +519,7 @@ impl MuxConnectionTracker {
 enum FrameProcessing {
     Response(GuardianResponseEnvelope),
     PendingInput,
+    PendingCheckpoint,
     Close,
 }
 
@@ -870,12 +874,13 @@ impl GuardianService {
         // number of worker wake calls represented by one poll event.
         self.runtime.handle_output_completions();
         self.handle_input_completions();
+        self.handle_checkpoint_completions();
         // Authentication deadlines are the finite bound on a pre-disconnect
         // unknown identity. Resolve expired candidates before the final
         // membership recheck so they cannot add an unnecessary extra poll.
         self.expire_unauthenticated_connections();
         // Replay only after every connection event in this readiness batch and
-        // every available input-authority restoration has been observed.  In
+        // every available worker-owned protocol restoration has been observed. In
         // particular, `finish_connection` must only queue: replaying from the
         // middle of the loop above could retire a mux before a co-ready delayed
         // Hello publishes its later lifecycle-observation epoch.
@@ -939,8 +944,8 @@ impl GuardianService {
         let Some(mut connection) = take_exact_ready_connection(&mut self.connections, event) else {
             return;
         };
-        if connection.pending_input.is_some() {
-            let keep = monitor_pending_input_connection(&mut connection, event);
+        if connection.pending_input.is_some() || connection.pending_checkpoint.is_some() {
+            let keep = monitor_pending_worker_connection(&mut connection, event);
             if keep {
                 self.connections.insert(event.token, connection);
             } else {
@@ -1036,6 +1041,11 @@ impl GuardianService {
                         .is_ok()
                 }
                 FrameProcessing::PendingInput => self
+                    .poll
+                    .registry()
+                    .reregister(&mut connection.stream, token, Interest::READABLE)
+                    .is_ok(),
+                FrameProcessing::PendingCheckpoint => self
                     .poll
                     .registry()
                     .reregister(&mut connection.stream, token, Interest::READABLE)
@@ -1211,6 +1221,30 @@ impl GuardianService {
                         GuardianInputSubmission::CloseRetryably => FrameProcessing::Close,
                     };
                 }
+                if request.header().operation == GuardianOperation::CheckpointStage {
+                    let Some(route) = GuardianCheckpointRoute::new(
+                        token,
+                        connection.generation,
+                        request.header().request_id,
+                    ) else {
+                        let response = GuardianResponseEnvelope::rejection(
+                            &request,
+                            GuardianRejectionCode::InvalidRequest,
+                        );
+                        request.zeroize_payload();
+                        return FrameProcessing::Response(response);
+                    };
+                    return match self.runtime.submit_checkpoint(request, route) {
+                        GuardianCheckpointSubmission::Pending => {
+                            connection.pending_checkpoint = Some(route);
+                            FrameProcessing::PendingCheckpoint
+                        }
+                        GuardianCheckpointSubmission::Respond(response) => {
+                            FrameProcessing::Response(response)
+                        }
+                        GuardianCheckpointSubmission::CloseRetryably => FrameProcessing::Close,
+                    };
+                }
                 let response = self.runtime.dispatch(&request);
                 request.zeroize_payload();
                 match response {
@@ -1244,6 +1278,52 @@ impl GuardianService {
                 continue;
             }
             connection.pending_input = None;
+            let Some(response) = completion.response else {
+                self.finish_connection(token, connection);
+                continue;
+            };
+            let Ok(frame) = encode_guardian_response(&self.secret, &response) else {
+                self.finish_connection(token, connection);
+                continue;
+            };
+            connection.write_buf = Some(frame);
+            connection.write_offset = 0;
+            if self
+                .poll
+                .registry()
+                .reregister(&mut connection.stream, token, Interest::WRITABLE)
+                .is_ok()
+            {
+                self.connections.insert(token, connection);
+            } else {
+                self.finish_connection(token, connection);
+            }
+        }
+    }
+
+    fn handle_checkpoint_completions(&mut self) {
+        loop {
+            let completion = match self.runtime.try_checkpoint_completion() {
+                GuardianRuntimeCheckpointCompletionState::Ready(completion) => completion,
+                GuardianRuntimeCheckpointCompletionState::Empty
+                | GuardianRuntimeCheckpointCompletionState::Disconnected => break,
+            };
+            let token = completion.route.connection_token;
+            let Some(mut connection) = self.connections.remove(&token) else {
+                // The originating peer disconnected. Protocol restoration and
+                // deferred final-lease retirement already happened before this
+                // routing step; never redirect to a recycled token.
+                continue;
+            };
+            if !pending_checkpoint_route_matches(
+                connection.generation,
+                connection.pending_checkpoint,
+                completion.route,
+            ) {
+                self.connections.insert(token, connection);
+                continue;
+            }
+            connection.pending_checkpoint = None;
             let Some(response) = completion.response else {
                 self.finish_connection(token, connection);
                 continue;
@@ -1357,7 +1437,7 @@ fn take_exact_ready_connection(
     connections.remove(&event.token)
 }
 
-fn monitor_pending_input_connection(connection: &mut Connection, event: ReadyEvent) -> bool {
+fn monitor_pending_worker_connection(connection: &mut Connection, event: ReadyEvent) -> bool {
     if event.closed {
         return false;
     }
@@ -1365,9 +1445,9 @@ fn monitor_pending_input_connection(connection: &mut Connection, event: ReadyEve
         return true;
     }
     // One connection carries one request at a time. Readability while its
-    // input is pending therefore means EOF or forbidden pipelining; either way
-    // close the transport identity while the worker safely finishes the exact
-    // durable disposition.
+    // worker operation is pending therefore means EOF or forbidden pipelining;
+    // either way close the transport identity while the worker safely finishes
+    // the exact durable disposition.
     let mut probe = Zeroizing::new([0_u8; 1]);
     loop {
         match connection.stream.read(&mut probe[..]) {

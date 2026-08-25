@@ -1034,6 +1034,83 @@ impl GuardianRuntime {
         }
     }
 
+    /// Transfer the one global protocol authority and one owned authenticated
+    /// Stage request to the fixed checkpoint worker. Only Begin, Chunk, and
+    /// Query can reach storage; Seal, Ack, and Genesis remain fail-closed.
+    pub(crate) fn submit_checkpoint(
+        &mut self,
+        mut request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+    ) -> GuardianCheckpointSubmission {
+        if request.header().operation != GuardianOperation::CheckpointStage
+            || request.header().request_id != route.request_id
+            || request.header().effect_id.is_some()
+        {
+            let response = GuardianResponseEnvelope::rejection(
+                &request,
+                GuardianRejectionCode::InvalidRequest,
+            );
+            request.zeroize_payload();
+            return GuardianCheckpointSubmission::Respond(response);
+        }
+        if self.checkpoint_pipeline_failed
+            || self.protocol.is_none()
+            || self.indeterminate_effect
+        {
+            self.counters.checkpoint_retryable_capacity_closes = self
+                .counters
+                .checkpoint_retryable_capacity_closes
+                .saturating_add(1);
+            request.zeroize_payload();
+            return GuardianCheckpointSubmission::CloseRetryably;
+        }
+        let Some(protocol) = self.protocol.take() else {
+            self.counters.checkpoint_retryable_capacity_closes = self
+                .counters
+                .checkpoint_retryable_capacity_closes
+                .saturating_add(1);
+            request.zeroize_payload();
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        let job = CheckpointJob {
+            route,
+            protocol,
+            request,
+        };
+        match self.checkpoint_pipeline.try_submit(job) {
+            Ok(()) => {
+                self.counters.checkpoint_transactions_submitted = self
+                    .counters
+                    .checkpoint_transactions_submitted
+                    .saturating_add(1);
+                GuardianCheckpointSubmission::Pending
+            }
+            Err(CheckpointSubmitError::Saturated(job)) => {
+                self.restore_unsent_checkpoint_job(job);
+                self.counters.checkpoint_retryable_capacity_closes = self
+                    .counters
+                    .checkpoint_retryable_capacity_closes
+                    .saturating_add(1);
+                GuardianCheckpointSubmission::CloseRetryably
+            }
+            Err(CheckpointSubmitError::Unavailable(job)) => {
+                self.restore_unsent_checkpoint_job(job);
+                self.checkpoint_pipeline_failed = true;
+                self.counters.checkpoint_worker_disconnects = self
+                    .counters
+                    .checkpoint_worker_disconnects
+                    .saturating_add(1);
+                GuardianCheckpointSubmission::CloseRetryably
+            }
+        }
+    }
+
+    fn restore_unsent_checkpoint_job(&mut self, mut job: CheckpointJob) {
+        debug_assert!(self.protocol.is_none());
+        self.protocol = Some(job.protocol);
+        job.request.zeroize_payload();
+    }
+
     fn restore_unsent_input_job(&mut self, job: InputJob) {
         debug_assert!(self.protocol.is_none());
         self.protocol = Some(job.protocol);
@@ -1130,6 +1207,51 @@ impl GuardianRuntime {
                         self.counters.input_worker_disconnects.saturating_add(1);
                 }
                 GuardianRuntimeInputCompletionState::Disconnected
+            }
+        }
+    }
+
+    /// Restore checkpoint-worker-owned protocol authority before yielding the
+    /// exact transport completion. Storage ambiguity closes retryably; because
+    /// final publication is still disabled, a Stage-worker panic cannot mint or
+    /// invalidate live pane authority and the next exact Query remains usable.
+    pub(crate) fn try_checkpoint_completion(
+        &mut self,
+    ) -> GuardianRuntimeCheckpointCompletionState {
+        match self.checkpoint_pipeline.try_completion() {
+            GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion) => {
+                debug_assert!(self.protocol.is_none());
+                self.protocol = Some(completion.protocol);
+                self.counters.checkpoint_transactions_completed = self
+                    .counters
+                    .checkpoint_transactions_completed
+                    .saturating_add(1);
+                if completion.worker_panicked {
+                    self.counters.checkpoint_worker_panics = self
+                        .counters
+                        .checkpoint_worker_panics
+                        .saturating_add(1);
+                }
+                self.replay_deferred_child_exits();
+                GuardianRuntimeCheckpointCompletionState::Ready(
+                    GuardianRuntimeCheckpointCompletion {
+                        route: completion.route,
+                        response: completion.response,
+                    },
+                )
+            }
+            GuardianRuntimeCheckpointCompletionStateInternal::Empty => {
+                GuardianRuntimeCheckpointCompletionState::Empty
+            }
+            GuardianRuntimeCheckpointCompletionStateInternal::Disconnected => {
+                if !self.checkpoint_pipeline_failed {
+                    self.checkpoint_pipeline_failed = true;
+                    self.counters.checkpoint_worker_disconnects = self
+                        .counters
+                        .checkpoint_worker_disconnects
+                        .saturating_add(1);
+                }
+                GuardianRuntimeCheckpointCompletionState::Disconnected
             }
         }
     }
