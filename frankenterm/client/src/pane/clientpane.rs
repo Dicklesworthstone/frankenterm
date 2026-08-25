@@ -267,9 +267,7 @@ impl ReliablePaneWriteDelivery {
     fn finish_chunk(&self, failure: Option<ReliablePaneWriteFailure>) {
         let mut state = self.state.lock();
         if state.pending_chunks == 0 {
-            log::error!(
-                "reliable pane-write delivery settled a chunk without accepted ownership"
-            );
+            log::error!("reliable pane-write delivery settled a chunk without accepted ownership");
             state
                 .sticky_failure
                 .get_or_insert(ReliablePaneWriteFailure::ProtocolError);
@@ -350,10 +348,7 @@ impl QueuedReliableInput {
     }
 
     fn is_pane_write(&self) -> bool {
-        matches!(
-            &self.payload,
-            QueuedReliableInputPayload::PaneWrite { .. }
-        )
+        matches!(&self.payload, QueuedReliableInputPayload::PaneWrite { .. })
     }
 
     fn same_identity(&self, other: &Self) -> bool {
@@ -364,12 +359,8 @@ impl QueuedReliableInput {
         }
         match (&self.payload, &other.payload) {
             (
-                QueuedReliableInputPayload::Key {
-                    request: left, ..
-                },
-                QueuedReliableInputPayload::Key {
-                    request: right, ..
-                },
+                QueuedReliableInputPayload::Key { request: left, .. },
+                QueuedReliableInputPayload::Key { request: right, .. },
             ) => left == right,
             (
                 QueuedReliableInputPayload::PaneWrite {
@@ -385,9 +376,7 @@ impl QueuedReliableInput {
                     ..
                 },
             ) => {
-                left == right
-                    && left_end == right_end
-                    && Arc::ptr_eq(left_delivery, right_delivery)
+                left == right && left_end == right_end && Arc::ptr_eq(left_delivery, right_delivery)
             }
             _ => false,
         }
@@ -522,9 +511,7 @@ fn pane_write_failure_for_outcome(outcome: &'static str) -> ReliablePaneWriteFai
         }
         "outcome_indeterminate" => ReliablePaneWriteFailure::Indeterminate,
         "definitely_not_applied" => ReliablePaneWriteFailure::DefinitelyNotApplied,
-        "pane_unavailable" | "pane_registration_mismatch" => {
-            ReliablePaneWriteFailure::PaneRetired
-        }
+        "pane_unavailable" | "pane_registration_mismatch" => ReliablePaneWriteFailure::PaneRetired,
         _ => ReliablePaneWriteFailure::ProtocolError,
     }
 }
@@ -627,15 +614,8 @@ impl ReliableInputQueue {
         pane_authority: Arc<Mutex<Option<ReliablePaneInputAuthority>>>,
         request: ReliableKeyEventV1,
     ) -> anyhow::Result<()> {
-        self.enqueue_with_trace_context(
-            client,
-            registration,
-            pane_authority,
-            request,
-            None,
-            None,
-        )
-        .map(|_| ())
+        self.enqueue_with_trace_context(client, registration, pane_authority, request, None, None)
+            .map(|_| ())
     }
 
     fn enqueue_with_trace_context(
@@ -683,9 +663,8 @@ impl ReliableInputQueue {
                 );
             }
             if request.input_serial.is_empty() {
-                request.input_serial = InputSerial::try_now().ok_or_else(|| {
-                    anyhow::anyhow!("process-local input serial space exhausted")
-                })?;
+                request.input_serial = InputSerial::try_now()
+                    .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
             }
             request
                 .validate()
@@ -1011,9 +990,7 @@ impl ReliableInputQueue {
         entry: &QueuedReliableInput,
     ) -> ReliableInputAttempt {
         match &entry.payload {
-            QueuedReliableInputPayload::Key { .. } => {
-                Self::attempt_key(queue, client, entry).await
-            }
+            QueuedReliableInputPayload::Key { .. } => Self::attempt_key(queue, client, entry).await,
             QueuedReliableInputPayload::PaneWrite { .. } => {
                 Self::attempt_pane_write(queue, client, entry).await
             }
@@ -1055,34 +1032,31 @@ impl ReliableInputQueue {
             );
         };
 
-        let (wire_attempt, consumed_trace_context) =
-            match queue.claim_front_wire_attempt(
-                entry,
-                disposition,
-                connection_identity.session_incarnation,
-            ) {
-                Ok(attempt) => attempt,
-                Err(ReliableKeyClaimError::FifoAuthorityChanged) => {
-                    return ReliableInputAttempt::AbortLane("fifo_authority_changed");
-                }
-                Err(ReliableKeyClaimError::ConnectionIdentityUnavailable) => {
-                    return ReliableInputAttempt::Retry(
-                        RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
-                        "connection_identity_unavailable",
-                    );
-                }
-                Err(ReliableKeyClaimError::ServerRestartAfterAmbiguousAttempt) => {
-                    return ReliableInputAttempt::DropOne(
-                        "server_restart_after_ambiguous_attempt",
-                    );
-                }
-                Err(ReliableKeyClaimError::ReliableEffectMayHaveReached) => {
-                    return ReliableInputAttempt::Retry(
-                        RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
-                        "codec_downgrade_after_ambiguous_attempt",
-                    );
-                }
-            };
+        let (wire_attempt, consumed_trace_context) = match queue.claim_front_wire_attempt(
+            entry,
+            disposition,
+            connection_identity.session_incarnation,
+        ) {
+            Ok(attempt) => attempt,
+            Err(ReliableKeyClaimError::FifoAuthorityChanged) => {
+                return ReliableInputAttempt::AbortLane("fifo_authority_changed");
+            }
+            Err(ReliableKeyClaimError::ConnectionIdentityUnavailable) => {
+                return ReliableInputAttempt::Retry(
+                    RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
+                    "connection_identity_unavailable",
+                );
+            }
+            Err(ReliableKeyClaimError::ServerRestartAfterAmbiguousAttempt) => {
+                return ReliableInputAttempt::DropOne("server_restart_after_ambiguous_attempt");
+            }
+            Err(ReliableKeyClaimError::ReliableEffectMayHaveReached) => {
+                return ReliableInputAttempt::Retry(
+                    RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
+                    "codec_downgrade_after_ambiguous_attempt",
+                );
+            }
+        };
         #[cfg(test)]
         if let Some(barrier) = queue.after_claim_generation_barrier.lock().take() {
             barrier
@@ -1114,12 +1088,9 @@ impl ReliableInputQueue {
                     == crate::client::RpcDeliveryCertainty::DefinitelyNotSent
                 {
                     if !queue.restore_front_trace_context(entry, consumed_trace_context) {
-                        return ReliableInputAttempt::AbortLane(
-                            "trace_context_restore_conflict",
-                        );
+                        return ReliableInputAttempt::AbortLane("trace_context_restore_conflict");
                     }
-                } else if request_had_pane_authority
-                    && !queue.set_front_key_ambiguity(entry, true)
+                } else if request_had_pane_authority && !queue.set_front_key_ambiguity(entry, true)
                 {
                     return ReliableInputAttempt::AbortLane("fifo_authority_changed");
                 }
@@ -1255,36 +1226,32 @@ impl ReliableInputQueue {
                 "connection_identity_unavailable",
             );
         };
-        let (wire_attempt, consumed_trace_context) =
-            match queue.claim_front_legacy_key_attempt(
-                entry,
-                connection_identity.session_incarnation,
-            ) {
-                Ok(attempt) => attempt,
-                Err(ReliableKeyClaimError::FifoAuthorityChanged) => {
-                    return ReliableInputAttempt::AbortLane("fifo_authority_changed");
-                }
-                Err(ReliableKeyClaimError::ConnectionIdentityUnavailable) => {
-                    return ReliableInputAttempt::Retry(
-                        RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
-                        "connection_identity_unavailable",
-                    );
-                }
-                Err(ReliableKeyClaimError::ServerRestartAfterAmbiguousAttempt) => {
-                    return ReliableInputAttempt::DropOne(
-                        "server_restart_after_ambiguous_attempt",
-                    );
-                }
-                Err(ReliableKeyClaimError::ReliableEffectMayHaveReached) => {
-                    // A same-server reliable retry remains deduplicable once a
-                    // capable generation returns. The legacy dialect has no
-                    // serial ledger, so it must not consume ambiguous input.
-                    return ReliableInputAttempt::Retry(
-                        RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
-                        "codec_downgrade_after_ambiguous_attempt",
-                    );
-                }
-            };
+        let (wire_attempt, consumed_trace_context) = match queue
+            .claim_front_legacy_key_attempt(entry, connection_identity.session_incarnation)
+        {
+            Ok(attempt) => attempt,
+            Err(ReliableKeyClaimError::FifoAuthorityChanged) => {
+                return ReliableInputAttempt::AbortLane("fifo_authority_changed");
+            }
+            Err(ReliableKeyClaimError::ConnectionIdentityUnavailable) => {
+                return ReliableInputAttempt::Retry(
+                    RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
+                    "connection_identity_unavailable",
+                );
+            }
+            Err(ReliableKeyClaimError::ServerRestartAfterAmbiguousAttempt) => {
+                return ReliableInputAttempt::DropOne("server_restart_after_ambiguous_attempt");
+            }
+            Err(ReliableKeyClaimError::ReliableEffectMayHaveReached) => {
+                // A same-server reliable retry remains deduplicable once a
+                // capable generation returns. The legacy dialect has no
+                // serial ledger, so it must not consume ambiguous input.
+                return ReliableInputAttempt::Retry(
+                    RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
+                    "codec_downgrade_after_ambiguous_attempt",
+                );
+            }
+        };
         let response = match wire_attempt {
             LegacyKeyWireAttempt::KeyDown(request) => rpc.key_down(request).await,
             LegacyKeyWireAttempt::KeyUp(request) => rpc.key_up(request).await,
@@ -1300,9 +1267,7 @@ impl ReliableInputQueue {
                     == crate::client::RpcDeliveryCertainty::DefinitelyNotSent
                 {
                     if !queue.restore_front_trace_context(entry, consumed_trace_context) {
-                        return ReliableInputAttempt::AbortLane(
-                            "trace_context_restore_conflict",
-                        );
+                        return ReliableInputAttempt::AbortLane("trace_context_restore_conflict");
                     }
                     ReliableInputAttempt::Retry(
                         RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
@@ -1358,10 +1323,9 @@ impl ReliableInputQueue {
                 "connection_identity_unavailable",
             );
         };
-        let request = match queue.claim_front_pane_write_attempt(
-            entry,
-            connection_identity.session_incarnation,
-        ) {
+        let request = match queue
+            .claim_front_pane_write_attempt(entry, connection_identity.session_incarnation)
+        {
             Ok(request) => request,
             Err(ReliablePaneWriteClaimError::FifoAuthorityChanged) => {
                 return ReliableInputAttempt::AbortLane("fifo_authority_changed");
@@ -1373,9 +1337,7 @@ impl ReliableInputQueue {
                 );
             }
             Err(ReliablePaneWriteClaimError::ServerRestartAfterAmbiguousAttempt) => {
-                return ReliableInputAttempt::DropOne(
-                    "server_restart_after_ambiguous_attempt",
-                );
+                return ReliableInputAttempt::DropOne("server_restart_after_ambiguous_attempt");
             }
         };
         let request_had_pane_authority = request.pane_registration.is_some();
@@ -1433,9 +1395,7 @@ impl ReliableInputQueue {
                 return ReliableInputAttempt::DropOne("protocol_error");
             }
         };
-        if response.pane_id != expected_pane_id
-            || response.input_serial != expected_input_serial
-        {
+        if response.pane_id != expected_pane_id || response.input_serial != expected_input_serial {
             log::warn!(
                 "reliable pane-write response identity mismatch: expected pane={} serial={}, got pane={} serial={}",
                 expected_pane_id,
@@ -1467,12 +1427,12 @@ impl ReliableInputQueue {
             }
             ReliablePaneWriteOutcomeV1::Retry(retry) => {
                 let (retry_after_ns, outcome, effect_may_have_reached) = match retry {
-                    ReliablePaneWriteRetryV1::Input(
-                        ReliableKeyEventRetryV1::SchedulerFull(pressure),
-                    ) => (pressure.retry_after_ns, "scheduler_full", false),
-                    ReliablePaneWriteRetryV1::Input(
-                        ReliableKeyEventRetryV1::SchedulerRetired(pressure),
-                    ) => (pressure.retry_after_ns, "scheduler_retired", false),
+                    ReliablePaneWriteRetryV1::Input(ReliableKeyEventRetryV1::SchedulerFull(
+                        pressure,
+                    )) => (pressure.retry_after_ns, "scheduler_full", false),
+                    ReliablePaneWriteRetryV1::Input(ReliableKeyEventRetryV1::SchedulerRetired(
+                        pressure,
+                    )) => (pressure.retry_after_ns, "scheduler_retired", false),
                     ReliablePaneWriteRetryV1::Input(
                         ReliableKeyEventRetryV1::SchedulerUnavailable { retry_after_ns },
                     ) => (retry_after_ns, "scheduler_unavailable", false),
@@ -1480,9 +1440,7 @@ impl ReliableInputQueue {
                         ReliableKeyEventRetryV1::DuplicatePending { retry_after_ns },
                     ) => (retry_after_ns, "duplicate_pending", true),
                     ReliablePaneWriteRetryV1::Input(
-                        ReliableKeyEventRetryV1::ClientRegistrationTransition {
-                            retry_after_ns,
-                        },
+                        ReliableKeyEventRetryV1::ClientRegistrationTransition { retry_after_ns },
                     ) => (retry_after_ns, "client_registration_transition", false),
                     ReliablePaneWriteRetryV1::Input(
                         ReliableKeyEventRetryV1::PaneAuthorityRequired { pane_registration },
@@ -1524,9 +1482,9 @@ impl ReliableInputQueue {
                 ReliablePaneWriteRejectionV1::Input(
                     ReliableKeyEventRejectionV1::IdentityAuthorityExhausted,
                 ) => ReliableInputAttempt::AbortLane("identity_authority_exhausted"),
-                ReliablePaneWriteRejectionV1::Input(
-                    ReliableKeyEventRejectionV1::StaleSerial,
-                ) => ReliableInputAttempt::AbortLane("stale_serial"),
+                ReliablePaneWriteRejectionV1::Input(ReliableKeyEventRejectionV1::StaleSerial) => {
+                    ReliableInputAttempt::AbortLane("stale_serial")
+                }
                 ReliablePaneWriteRejectionV1::Input(
                     ReliableKeyEventRejectionV1::IdentityConflict,
                 ) => ReliableInputAttempt::AbortLane("identity_conflict"),
@@ -1573,9 +1531,7 @@ impl ReliableInputQueue {
         }
         if attempted_session.is_some_and(|attempted| attempted != current_session) {
             if *effect_may_have_reached {
-                return Err(
-                    ReliablePaneWriteClaimError::ServerRestartAfterAmbiguousAttempt,
-                );
+                return Err(ReliablePaneWriteClaimError::ServerRestartAfterAmbiguousAttempt);
             }
             *pane_authority = None;
         }
@@ -1793,10 +1749,8 @@ impl ReliableInputQueue {
         expected: &QueuedReliableInput,
         disposition: ReliableInputCodecDisposition,
         current_session: MuxSessionIncarnation,
-    ) -> Result<
-        (ReliableInputWireAttempt, Option<SampledTraceContextV1>),
-        ReliableKeyClaimError,
-    > {
+    ) -> Result<(ReliableInputWireAttempt, Option<SampledTraceContextV1>), ReliableKeyClaimError>
+    {
         if current_session.as_bytes() == [0; 16] {
             return Err(ReliableKeyClaimError::ConnectionIdentityUnavailable);
         }
@@ -1977,7 +1931,9 @@ impl ReliableInputQueue {
             .pending
             .pop_front()
             .expect("matched reliable-input front must remain present");
-        state.pending_bytes = state.pending_bytes.saturating_sub(removed.estimated_bytes());
+        state.pending_bytes = state
+            .pending_bytes
+            .saturating_sub(removed.estimated_bytes());
         drop(state);
         removed.finish_write(failure);
         metrics::counter!("mux.client.reliable_input_attempt", "outcome" => outcome).increment(1);
@@ -4263,15 +4219,13 @@ mod tests {
             Some(context),
             "authority probe must retain context for the first effect-eligible attempt"
         );
-        assert!(inner
-            .reliable_input_queue
-            .bind_front_pane_authority(
-                &expected,
-                pane_authority_binding(
-                    TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
-                    pane_registration,
-                ),
-            ));
+        assert!(inner.reliable_input_queue.bind_front_pane_authority(
+            &expected,
+            pane_authority_binding(
+                TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
+                pane_registration,
+            ),
+        ));
 
         let (first, consumed) = inner
             .reliable_input_queue
@@ -4590,8 +4544,7 @@ mod tests {
             .capture_pane_registration(&pane)
             .expect("capture reliable-key incarnation-fence registration");
         inner.reliable_input_queue.state.lock().worker_running = true;
-        let pane_registration =
-            ReliablePaneRegistrationIdentityV1::from_bytes([0x54; 16]);
+        let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x54; 16]);
         let pane_authority = test_pane_authority(pane_registration);
         inner
             .reliable_input_queue
@@ -4741,18 +4694,18 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        peer.replace_ready_generation(
-            &inner.client,
-            RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION - 1,
-        )
-        .expect("install exact legacy key generation");
+        peer.replace_ready_generation(&inner.client, RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION - 1)
+            .expect("install exact legacy key generation");
         let pane = test_client_pane(&inner, 153, 139);
         let pane_for_mux: Arc<dyn Pane> = pane.clone();
         mux.add_pane(&pane_for_mux)
             .expect("register exact-generation key-dispatch pane");
         inner.reliable_input_queue.state.lock().worker_running = true;
 
-        for kind in [ReliableKeyEventKindV1::KeyDown, ReliableKeyEventKindV1::KeyUp] {
+        for kind in [
+            ReliableKeyEventKindV1::KeyDown,
+            ReliableKeyEventKindV1::KeyUp,
+        ] {
             inner
                 .reliable_input_queue
                 .arm_after_interactive_scope_capture_generation_barrier(
@@ -4831,7 +4784,10 @@ mod tests {
             .expect("register reliable-to-legacy key pane");
         inner.reliable_input_queue.state.lock().worker_running = true;
 
-        for kind in [ReliableKeyEventKindV1::KeyDown, ReliableKeyEventKindV1::KeyUp] {
+        for kind in [
+            ReliableKeyEventKindV1::KeyDown,
+            ReliableKeyEventKindV1::KeyUp,
+        ] {
             match kind {
                 ReliableKeyEventKindV1::KeyDown => pane
                     .key_down_with_trace_context(
@@ -4876,8 +4832,13 @@ mod tests {
             assert_eq!(consumed_context, Some(sampled_reliable_key_context()));
             assert!(matches!(
                 (kind, legacy),
-                (ReliableKeyEventKindV1::KeyDown, LegacyKeyWireAttempt::KeyDown(_))
-                    | (ReliableKeyEventKindV1::KeyUp, LegacyKeyWireAttempt::KeyUp(_))
+                (
+                    ReliableKeyEventKindV1::KeyDown,
+                    LegacyKeyWireAttempt::KeyDown(_)
+                ) | (
+                    ReliableKeyEventKindV1::KeyUp,
+                    LegacyKeyWireAttempt::KeyUp(_)
+                )
             ));
             assert!(inner
                 .reliable_input_queue
@@ -4916,15 +4877,13 @@ mod tests {
         .expect("traced key enters the exact reliable lane");
         let entry = inner.reliable_input_queue.state.lock().pending[0].clone();
         let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x55; 16]);
-        assert!(inner
-            .reliable_input_queue
-            .bind_front_pane_authority(
-                &entry,
-                pane_authority_binding(
-                    TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
-                    pane_registration,
-                ),
-            ));
+        assert!(inner.reliable_input_queue.bind_front_pane_authority(
+            &entry,
+            pane_authority_binding(
+                TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
+                pane_registration,
+            ),
+        ));
         let (prior_effect_attempt, _) = inner
             .reliable_input_queue
             .claim_front_wire_attempt(
@@ -5136,11 +5095,25 @@ mod tests {
             let state = inner.reliable_input_queue.state.lock();
             assert_eq!(state.pending.len(), RELIABLE_INPUT_QUEUE_CAPACITY);
             assert_eq!(
-                state.pending.front().unwrap().key_request().unwrap().input_serial.get(),
+                state
+                    .pending
+                    .front()
+                    .unwrap()
+                    .key_request()
+                    .unwrap()
+                    .input_serial
+                    .get(),
                 1
             );
             assert_eq!(
-                state.pending.back().unwrap().key_request().unwrap().input_serial.get(),
+                state
+                    .pending
+                    .back()
+                    .unwrap()
+                    .key_request()
+                    .unwrap()
+                    .input_serial
+                    .get(),
                 u64::try_from(RELIABLE_INPUT_QUEUE_CAPACITY).unwrap()
             );
             assert_eq!(
@@ -5154,22 +5127,24 @@ mod tests {
             state.pending.front().unwrap().clone()
         };
         let remote_authority = ReliablePaneRegistrationIdentityV1::from_bytes([0x61; 16]);
-        assert!(inner
-            .reliable_input_queue
-            .bind_front_pane_authority(
-                &first,
-                pane_authority_binding(
-                    TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
-                    remote_authority,
-                ),
-            ));
-        assert_eq!(cached_pane_registration(&pane_authority), Some(remote_authority));
+        assert!(inner.reliable_input_queue.bind_front_pane_authority(
+            &first,
+            pane_authority_binding(
+                TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
+                remote_authority,
+            ),
+        ));
+        assert_eq!(
+            cached_pane_registration(&pane_authority),
+            Some(remote_authority)
+        );
         let mut state = inner.reliable_input_queue.state.lock();
         assert!(
-            state
-                .pending
-                .iter()
-                .all(|queued| queued.key_request().unwrap().pane_registration.is_none()),
+            state.pending.iter().all(|queued| queued
+                .key_request()
+                .unwrap()
+                .pane_registration
+                .is_none()),
             "authority binding must stay O(1) instead of rewriting the queued burst"
         );
         state.pending.clear();
@@ -5184,7 +5159,8 @@ mod tests {
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
         let pane: Arc<dyn Pane> = test_client_pane(&inner, 143, 129);
-        mux.add_pane(&pane).expect("register bounded pane-write pane");
+        mux.add_pane(&pane)
+            .expect("register bounded pane-write pane");
         let registration = mux
             .capture_pane_registration(&pane)
             .expect("capture bounded pane-write registration");
@@ -5264,8 +5240,7 @@ mod tests {
             .capture_pane_registration(&pane)
             .expect("capture partial-write registration");
         inner.reliable_input_queue.state.lock().worker_running = true;
-        let pane_registration =
-            ReliablePaneRegistrationIdentityV1::from_bytes([0x44; 16]);
+        let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x44; 16]);
         let pane_authority = test_pane_authority(pane_registration);
         let first_delivery = ReliablePaneWriteDelivery::new();
         let later_delivery = ReliablePaneWriteDelivery::new();
@@ -5348,8 +5323,9 @@ mod tests {
 
         let state = inner.reliable_input_queue.state.lock();
         assert_eq!(state.pending.len(), 3);
-        let QueuedReliableInputPayload::PaneWrite { request: suffix, .. } =
-            &state.pending[0].payload
+        let QueuedReliableInputPayload::PaneWrite {
+            request: suffix, ..
+        } = &state.pending[0].payload
         else {
             panic!("partial suffix must remain the FIFO front");
         };
@@ -5358,7 +5334,9 @@ mod tests {
         assert!(suffix.input_serial <= reserved_end);
         assert!(suffix.input_serial < key_serial);
         assert_eq!(
-            state.pending[1].key_request().map(|request| request.input_serial),
+            state.pending[1]
+                .key_request()
+                .map(|request| request.input_serial),
             Some(key_serial)
         );
         assert!(matches!(
@@ -5377,7 +5355,10 @@ mod tests {
             )
             .expect("an acknowledged suffix may safely re-probe a replacement server");
         assert_eq!(suffix_after_restart.data, b"cdef");
-        assert_eq!(suffix_after_restart.input_serial.get(), first_serial.get() + 2);
+        assert_eq!(
+            suffix_after_restart.input_serial.get(),
+            first_serial.get() + 2
+        );
         assert_eq!(suffix_after_restart.pane_registration, None);
         assert_eq!(*pane_authority.lock(), None);
         inner.reliable_input_queue.retire("domain_detached");
@@ -5413,9 +5394,9 @@ mod tests {
 
         let (attempt, wire) = promise::spawn::block_on(futures::future::join(
             ReliableInputQueue::attempt(&inner.reliable_input_queue, &inner, &entry),
-            peer.respond_next_reliable_pane_write(
-                ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 4 },
-            ),
+            peer.respond_next_reliable_pane_write(ReliablePaneWriteOutcomeV1::AppliedPrefix {
+                bytes: 4,
+            }),
         ));
         let wire = wire.expect("test peer receives exact pane-write request");
         assert_eq!(wire.request.data, b"abc");
@@ -5475,13 +5456,16 @@ mod tests {
         let (first_attempt, first_wire) = promise::spawn::block_on(futures::future::join(
             ReliableInputQueue::attempt(&inner.reliable_input_queue, &inner, &entry),
             peer.respond_next_reliable_pane_write(ReliablePaneWriteOutcomeV1::Retry(
-                ReliablePaneWriteRetryV1::DefinitelyNotApplied {
-                    retry_after_ns: 1,
-                },
+                ReliablePaneWriteRetryV1::DefinitelyNotApplied { retry_after_ns: 1 },
             )),
         ));
-        assert!(matches!(first_attempt, ReliableInputAttempt::Retry(_, "write_zero")));
-        let first_wire = first_wire.expect("first retry request reaches peer").request;
+        assert!(matches!(
+            first_attempt,
+            ReliableInputAttempt::Retry(_, "write_zero")
+        ));
+        let first_wire = first_wire
+            .expect("first retry request reaches peer")
+            .request;
 
         let (second_attempt, second_wire) = promise::spawn::block_on(futures::future::join(
             ReliableInputQueue::attempt(&inner.reliable_input_queue, &inner, &entry),
@@ -5495,7 +5479,9 @@ mod tests {
             second_attempt,
             ReliableInputAttempt::Retry(_, "duplicate_pending")
         ));
-        let second_wire = second_wire.expect("duplicate-pending retry reaches peer").request;
+        let second_wire = second_wire
+            .expect("duplicate-pending retry reaches peer")
+            .request;
         assert_eq!(second_wire, first_wire);
         let state = inner.reliable_input_queue.state.lock();
         let QueuedReliableInputPayload::PaneWrite {
@@ -5518,7 +5504,8 @@ mod tests {
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
         let pane: Arc<dyn Pane> = test_client_pane(&inner, 147, 133);
-        mux.add_pane(&pane).expect("register incarnation-fence pane");
+        mux.add_pane(&pane)
+            .expect("register incarnation-fence pane");
         let registration = mux
             .capture_pane_registration(&pane)
             .expect("capture incarnation-fence registration");
@@ -5592,8 +5579,7 @@ mod tests {
             .capture_pane_registration(&pane)
             .expect("capture fresh successor-reprobe registration");
         inner.reliable_input_queue.state.lock().worker_running = true;
-        let stale_registration =
-            ReliablePaneRegistrationIdentityV1::from_bytes([0x52; 16]);
+        let stale_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x52; 16]);
         let pane_authority = test_pane_authority(stale_registration);
         let delivery = ReliablePaneWriteDelivery::new();
         inner
@@ -5620,17 +5606,14 @@ mod tests {
         assert_eq!(successor_probe.data, b"successor");
         assert_eq!(cached_pane_registration(&pane_authority), None);
 
-        let successor_registration =
-            ReliablePaneRegistrationIdentityV1::from_bytes([0x53; 16]);
-        assert!(inner
-            .reliable_input_queue
-            .bind_front_pane_authority(
-                &entry,
-                pane_authority_binding(
-                    SERVER_RESTART_RENDER_CONNECTION_IDENTITY.session_incarnation,
-                    successor_registration,
-                ),
-            ));
+        let successor_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x53; 16]);
+        assert!(inner.reliable_input_queue.bind_front_pane_authority(
+            &entry,
+            pane_authority_binding(
+                SERVER_RESTART_RENDER_CONNECTION_IDENTITY.session_incarnation,
+                successor_registration,
+            ),
+        ));
         let successor_effect_attempt = inner
             .reliable_input_queue
             .claim_front_pane_write_attempt(
@@ -5657,7 +5640,8 @@ mod tests {
         let inner = test_client_inner(17);
         let pane = test_client_pane(&inner, 148, 134);
         let pane_for_mux: Arc<dyn Pane> = pane.clone();
-        mux.add_pane(&pane_for_mux).expect("register flush-test pane");
+        mux.add_pane(&pane_for_mux)
+            .expect("register flush-test pane");
         inner.reliable_input_queue.state.lock().worker_running = true;
 
         assert_eq!(
@@ -5750,9 +5734,8 @@ mod tests {
             .capture_pane_registration(&pane)
             .expect("capture terminal-stream pane registration");
         inner.reliable_input_queue.state.lock().worker_running = true;
-        let pane_authority = test_pane_authority(
-            ReliablePaneRegistrationIdentityV1::from_bytes([0x50; 16]),
-        );
+        let pane_authority =
+            test_pane_authority(ReliablePaneRegistrationIdentityV1::from_bytes([0x50; 16]));
         let delivery = ReliablePaneWriteDelivery::new();
 
         inner
@@ -5829,9 +5812,8 @@ mod tests {
             .capture_pane_registration(&pane)
             .expect("capture pane-write codec-upgrade race registration");
         inner.reliable_input_queue.state.lock().worker_running = true;
-        let pane_authority = test_pane_authority(
-            ReliablePaneRegistrationIdentityV1::from_bytes([0x51; 16]),
-        );
+        let pane_authority =
+            test_pane_authority(ReliablePaneRegistrationIdentityV1::from_bytes([0x51; 16]));
         let delivery = ReliablePaneWriteDelivery::new();
 
         peer.activate_reconnect_generation(&inner.client)
@@ -5847,11 +5829,8 @@ mod tests {
                 b"upgrade",
             )
             .expect("an unready transport may retain bounded pane bytes");
-        peer.replace_ready_generation(
-            &inner.client,
-            RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION - 1,
-        )
-        .expect("install the exact pre-v64 generation at the audit cut");
+        peer.replace_ready_generation(&inner.client, RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION - 1)
+            .expect("install the exact pre-v64 generation at the audit cut");
         let entry = inner.reliable_input_queue.state.lock().pending[0].clone();
         inner
             .reliable_input_queue
@@ -5884,9 +5863,9 @@ mod tests {
 
         let (settled, wire) = promise::spawn::block_on(futures::future::join(
             ReliableInputQueue::attempt(&inner.reliable_input_queue, &inner, &entry),
-            peer.respond_next_reliable_pane_write(
-                ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 7 },
-            ),
+            peer.respond_next_reliable_pane_write(ReliablePaneWriteOutcomeV1::AppliedPrefix {
+                bytes: 7,
+            }),
         ));
         assert!(matches!(
             settled,
@@ -5917,9 +5896,8 @@ mod tests {
             .capture_pane_registration(&pane)
             .expect("capture temporary codec-downgrade registration");
         inner.reliable_input_queue.state.lock().worker_running = true;
-        let pane_authority = test_pane_authority(
-            ReliablePaneRegistrationIdentityV1::from_bytes([0x55; 16]),
-        );
+        let pane_authority =
+            test_pane_authority(ReliablePaneRegistrationIdentityV1::from_bytes([0x55; 16]));
         let delivery = ReliablePaneWriteDelivery::new();
         inner
             .reliable_input_queue
@@ -5968,9 +5946,9 @@ mod tests {
             .expect("restore a capable exact generation");
         let (settled, wire) = promise::spawn::block_on(futures::future::join(
             ReliableInputQueue::attempt(&inner.reliable_input_queue, &inner, &entry),
-            peer.respond_next_reliable_pane_write(
-                ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 8 },
-            ),
+            peer.respond_next_reliable_pane_write(ReliablePaneWriteOutcomeV1::AppliedPrefix {
+                bytes: 8,
+            }),
         ));
         assert!(matches!(
             settled,
@@ -5995,14 +5973,12 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        peer.replace_ready_generation(
-            &inner.client,
-            RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION - 1,
-        )
-        .expect("install an explicit v63 test peer");
+        peer.replace_ready_generation(&inner.client, RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION - 1)
+            .expect("install an explicit v63 test peer");
         let pane = test_client_pane(&inner, 149, 135);
         let pane_for_mux: Arc<dyn Pane> = pane.clone();
-        mux.add_pane(&pane_for_mux).expect("register old-codec pane");
+        mux.add_pane(&pane_for_mux)
+            .expect("register old-codec pane");
         inner.reliable_input_queue.state.lock().worker_running = true;
 
         let error = std::io::Write::write(&mut *pane.writer.lock(), b"no-shim")
@@ -6186,7 +6162,10 @@ mod tests {
             .reliable_input_queue
             .retire_front_pane_authority(&first, "pane_registration_mismatch"));
         assert_eq!(*first_authority_cache.lock(), None);
-        assert_eq!(cached_pane_registration(&second_authority_cache), Some(second_authority));
+        assert_eq!(
+            cached_pane_registration(&second_authority_cache),
+            Some(second_authority)
+        );
         let state = inner.reliable_input_queue.state.lock();
         assert_eq!(state.pending.len(), 1);
         assert!(
@@ -6195,10 +6174,7 @@ mod tests {
                 .same_registration(&second.registration),
             "retiring one pane generation must preserve another pane's FIFO work"
         );
-        assert_eq!(
-            state.pending[0].key_request(),
-            second.key_request()
-        );
+        assert_eq!(state.pending[0].key_request(), second.key_request());
     }
 
     fn test_render_application_update(

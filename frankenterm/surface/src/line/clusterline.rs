@@ -785,8 +785,7 @@ mod test {
     #[cfg(feature = "use_serde")]
     #[test]
     fn serde_failure_after_text_decoding_wipes_the_guarded_text() {
-        let before = GUARDED_LINE_TEXT_WIPE_INVOCATIONS
-            .load(core::sync::atomic::Ordering::Relaxed);
+        let before = GUARDED_LINE_TEXT_WIPE_INVOCATIONS.load(core::sync::atomic::Ordering::Relaxed);
         let result = serde_json::from_str::<ClusteredLine>(
             r#"{"text":"semantic terminal text","is_double_wide":[],"clusters":"not-an-array","len":0,"last_cell_width":null}"#,
         );

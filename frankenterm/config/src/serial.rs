@@ -78,19 +78,15 @@ mod tests {
             )
         };
 
-        let maximum = SerialDomain::from_dynamic(
-            &serial_config(u64::from(u32::MAX)),
-            Default::default(),
-        )
-        .expect("the serial backend's maximum representable baud must decode");
+        let maximum =
+            SerialDomain::from_dynamic(&serial_config(u64::from(u32::MAX)), Default::default())
+                .expect("the serial backend's maximum representable baud must decode");
         let exact_backend_type: Option<u32> = maximum.baud;
         assert_eq!(exact_backend_type, Some(u32::MAX));
 
         let first_unrepresentable = u64::from(u32::MAX) + 1;
-        let rejected = SerialDomain::from_dynamic(
-            &serial_config(first_unrepresentable),
-            Default::default(),
-        );
+        let rejected =
+            SerialDomain::from_dynamic(&serial_config(first_unrepresentable), Default::default());
         assert!(
             rejected.is_err(),
             "baud {} must fail at config decode, before domain construction",

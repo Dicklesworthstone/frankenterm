@@ -60,9 +60,7 @@ pub(crate) fn validate_cell_widths(value: &Option<Vec<CellWidth>>) -> Result<(),
 }
 
 impl CellWidth {
-    pub(crate) fn compile_to_map(
-        cellwidths: Option<Vec<Self>>,
-    ) -> Option<Arc<HashMap<u32, u8>>> {
+    pub(crate) fn compile_to_map(cellwidths: Option<Vec<Self>>) -> Option<Arc<HashMap<u32, u8>>> {
         let cellwidths = cellwidths.as_ref()?;
         let expanded_entries = match validate_cell_width_slice(cellwidths) {
             Ok(expanded_entries) => expanded_entries,

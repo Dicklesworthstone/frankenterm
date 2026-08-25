@@ -134,9 +134,11 @@ where
     FUT: std::future::Future<Output = OUTPUT> + 'static,
     OUTPUT: 'static,
 {
-    Ok(admit_main_thread_completion_task(service_class, operation, make_future)
-        .map_err(mlua::Error::external)?
-        .await)
+    Ok(
+        admit_main_thread_completion_task(service_class, operation, make_future)
+            .map_err(mlua::Error::external)?
+            .await,
+    )
 }
 
 /// Run one owned mux transaction to completion after main-thread admission.
@@ -169,8 +171,8 @@ mod window;
 
 pub use domain::MuxDomain;
 pub use domain::{
-    DomainLifecycleEvent, DomainLifecycleGuard, DomainLifecycleWorkerHold,
-    install_domain_lifecycle_recorder, reserve_domain_lifecycle,
+    install_domain_lifecycle_recorder, reserve_domain_lifecycle, DomainLifecycleEvent,
+    DomainLifecycleGuard, DomainLifecycleWorkerHold,
 };
 pub use pane::MuxPane;
 pub use tab::MuxTab;

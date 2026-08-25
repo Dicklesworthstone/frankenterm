@@ -1787,12 +1787,12 @@ where
         let outcome = match (poll_outcome, drop_outcome) {
             (Ok(output), Ok(())) => Ok(output),
             (Ok(output), Err(primary)) => {
-                if let Err(secondary) = std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| {
+                if let Err(secondary) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let _worker_scope = enter_block_on_io_task_poll_scope();
                         drop(output);
-                    }),
-                ) {
+                    }))
+                {
                     // A second panic cannot replace the earlier execution
                     // failure. Quarantine its payload without invoking a
                     // potentially panicking destructor a second time.
@@ -3409,14 +3409,10 @@ mod tests {
         }
         let signal = DropSignal(dropped_by_task);
         let exec = SimpleExecutor::new();
-        let task = try_spawn_with_admission(
-            MainThreadServiceClass::Input,
-            16,
-            async move {
-                let _signal = signal;
-                std::future::pending::<()>().await;
-            },
-        );
+        let task = try_spawn_with_admission(MainThreadServiceClass::Input, 16, async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
         let MainThreadSpawnOutcome::Spawned(task) = task else {
             panic!("fresh SimpleExecutor must admit bounded test work");
         };
@@ -3437,10 +3433,7 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         let accounting_errors_before = main_thread_admission_accounting_errors();
         let exec = SimpleExecutor::new();
-        let reservation = match try_reserve_main_thread(
-            MainThreadServiceClass::Input,
-            16,
-        ) {
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Input, 16) {
             MainThreadReservationOutcome::Reserved(reservation) => reservation,
             rejected => panic!(
                 "fresh SimpleExecutor must reserve test work: {:?}",
@@ -3464,7 +3457,12 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        assert!(spawned.initial_enqueue_receipt().snapshot_after_enqueue.retired);
+        assert!(
+            spawned
+                .initial_enqueue_receipt()
+                .snapshot_after_enqueue
+                .retired
+        );
         assert!(dropped.load(Ordering::Acquire));
         drop(spawned);
         assert_eq!(binding.admission_snapshot().active_tasks, 0);
@@ -4553,8 +4551,7 @@ mod tests {
     #[cfg(feature = "async-asupersync")]
     #[test]
     fn block_on_io_reports_sender_disconnect_as_task_cancellation() {
-        let (output_tx, output_rx) =
-            std::sync::mpsc::sync_channel::<std::thread::Result<()>>(1);
+        let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<std::thread::Result<()>>(1);
         drop(output_tx);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

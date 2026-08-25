@@ -269,7 +269,8 @@ impl FileDescriptor {
                 Ok(_) => return Ok(true),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::Interrupted && interrupted_retries < 3 =>
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        && interrupted_retries < 3 =>
                 {
                     interrupted_retries += 1;
                 }

@@ -506,10 +506,7 @@ impl LocalDomain {
     }
 
     pub fn new_serial_domain(serial_domain: SerialDomain) -> anyhow::Result<Self> {
-        Self::new_serial_domain_with_configuration(
-            serial_domain,
-            LocalDomainConfiguration::Runtime,
-        )
+        Self::new_serial_domain_with_configuration(serial_domain, LocalDomainConfiguration::Runtime)
     }
 
     pub fn new_configured_serial_domain(serial_domain: SerialDomain) -> anyhow::Result<Self> {
@@ -1291,8 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_local_generation_retains_exact_spawn_configuration()
-    -> anyhow::Result<()> {
+    fn configured_local_generation_retains_exact_spawn_configuration() -> anyhow::Result<()> {
         let wsl = WslDomain {
             name: "retained-wsl".to_string(),
             distribution: Some("RetainedDistro".to_string()),

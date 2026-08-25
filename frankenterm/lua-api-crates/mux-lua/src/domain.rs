@@ -172,11 +172,7 @@ struct EnteredDomainLifecycle {
     release_required: bool,
 }
 
-fn finish_domain_lifecycle(
-    domain_name: &str,
-    ticket: u64,
-    release_required: &mut bool,
-) {
+fn finish_domain_lifecycle(domain_name: &str, ticket: u64, release_required: &mut bool) {
     if !std::mem::take(release_required) {
         return;
     }
@@ -252,21 +248,13 @@ impl DomainLifecycleReservation {
 
 impl Drop for DomainLifecycleReservation {
     fn drop(&mut self) {
-        finish_domain_lifecycle(
-            &self.domain_name,
-            self.ticket,
-            &mut self.release_required,
-        );
+        finish_domain_lifecycle(&self.domain_name, self.ticket, &mut self.release_required);
     }
 }
 
 impl Drop for EnteredDomainLifecycle {
     fn drop(&mut self) {
-        finish_domain_lifecycle(
-            &self.domain_name,
-            self.ticket,
-            &mut self.release_required,
-        );
+        finish_domain_lifecycle(&self.domain_name, self.ticket, &mut self.release_required);
     }
 }
 
@@ -281,9 +269,7 @@ impl DomainLifecycleGuard {
 }
 
 /// Reserve the next exact process-local lifecycle position for `domain_name`.
-pub fn reserve_domain_lifecycle(
-    domain_name: String,
-) -> anyhow::Result<DomainLifecycleReservation> {
+pub fn reserve_domain_lifecycle(domain_name: String) -> anyhow::Result<DomainLifecycleReservation> {
     let (ready_sender, ready) = futures::channel::oneshot::channel();
     let mut lanes = DOMAIN_LIFECYCLE_LANES
         .lock()
@@ -297,9 +283,7 @@ pub fn reserve_domain_lifecycle(
         });
     let ticket = lane.next_ticket;
     lane.next_ticket = lane.next_ticket.checked_add(1).ok_or_else(|| {
-        anyhow::anyhow!(
-            "domain lifecycle ticket namespace exhausted for {domain_name:?}"
-        )
+        anyhow::anyhow!("domain lifecycle ticket namespace exhausted for {domain_name:?}")
     })?;
     let ready_sender = if lane.active_ticket.is_none() {
         lane.active_ticket = Some(ticket);
@@ -333,10 +317,7 @@ pub fn reserve_domain_lifecycle(
 /// Non-GUI consumers intentionally leave this unset and retain the original
 /// in-memory attach/detach behavior. The first installed recorder remains the
 /// authority for the process lifetime so a config reload cannot replace it.
-pub fn install_domain_lifecycle_recorder(
-    mux: &Arc<Mux>,
-    recorder: DomainLifecycleRecorder,
-) {
+pub fn install_domain_lifecycle_recorder(mux: &Arc<Mux>, recorder: DomainLifecycleRecorder) {
     let _ = DOMAIN_LIFECYCLE_RECORDER.set(recorder);
     mux.install_domain_spawn_lifecycle(Arc::new(InstalledDomainSpawnLifecycle));
 }
@@ -586,8 +567,8 @@ mod tests {
                 .enter(),
         )
         .expect("enter first lifecycle action");
-        let second = reserve_domain_lifecycle(name.clone())
-            .expect("reserve second lifecycle action");
+        let second =
+            reserve_domain_lifecycle(name.clone()).expect("reserve second lifecycle action");
         let mut second_enter = Box::pin(second.enter());
         let waker = futures::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
@@ -605,10 +586,10 @@ mod tests {
         };
         drop(second);
 
-        let cancelled = reserve_domain_lifecycle(name.clone())
-            .expect("reserve cancellable lifecycle action");
-        let successor = reserve_domain_lifecycle(name)
-            .expect("reserve successor after cancellable action");
+        let cancelled =
+            reserve_domain_lifecycle(name.clone()).expect("reserve cancellable lifecycle action");
+        let successor =
+            reserve_domain_lifecycle(name).expect("reserve successor after cancellable action");
         drop(cancelled);
         drop(
             futures::executor::block_on(successor.enter())

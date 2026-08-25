@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use anyhow::Context as _;
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_core::attention_router::{
@@ -74853,10 +74853,7 @@ async fn handle_session_command(
                 println!("  Content bytes:    {}", receipt.content_bytes);
                 println!("  Payload SHA-256:  {}", receipt.payload_sha256);
                 println!("  Artifact SHA-256: {}", receipt.artifact_sha256);
-                println!(
-                    "  Restore image:    {}",
-                    receipt.executable_restore_image
-                );
+                println!("  Restore image:    {}", receipt.executable_restore_image);
             }
         }
 
@@ -74873,15 +74870,14 @@ async fn handle_session_command(
                     output_format,
                 );
             }
-            let scrollback_dir =
-                frankenterm_mux_server_impl::default_live_scrollback_dir();
+            let scrollback_dir = frankenterm_mux_server_impl::default_live_scrollback_dir();
             let mut panes = frankenterm_mux_server_impl::list_live_scrollback_panes(
                 &scrollback_dir,
                 max_entries,
             )
             .unwrap_or_else(|error| {
-                let error = frankenterm_core::redactor::Redactor::new()
-                    .redact(&format!("{error:#}"));
+                let error =
+                    frankenterm_core::redactor::Redactor::new().redact(&format!("{error:#}"));
                 exit_session_durable_error(&error, output_format)
             });
             let redactor = frankenterm_core::redactor::Redactor::new();
@@ -74960,8 +74956,7 @@ async fn handle_session_command(
                     output_format,
                 );
             }
-            if max_total_bytes == 0
-                || max_total_bytes > LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES
+            if max_total_bytes == 0 || max_total_bytes > LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES
             {
                 exit_session_durable_error(
                     &format!(
@@ -74980,8 +74975,7 @@ async fn handle_session_command(
                     output_format,
                 );
             }
-            let scrollback_dir =
-                frankenterm_mux_server_impl::default_live_scrollback_dir();
+            let scrollback_dir = frankenterm_mux_server_impl::default_live_scrollback_dir();
             let export = frankenterm_mux_server_impl::export_live_scrollback_transcript(
                 &scrollback_dir,
                 &pane_uuid,
@@ -74990,20 +74984,19 @@ async fn handle_session_command(
                 max_physical_bytes,
             )
             .unwrap_or_else(|error| {
-                let error = frankenterm_core::redactor::Redactor::new()
-                    .redact(&format!("{error:#}"));
+                let error =
+                    frankenterm_core::redactor::Redactor::new().redact(&format!("{error:#}"));
                 exit_session_durable_error(&error, output_format)
             });
             let redactor = frankenterm_core::redactor::Redactor::new();
             let transcript = redactor.redact(&export.transcript).into_bytes();
             let command_description = redactor.redact(&export.command_description);
             let output_path = output.unwrap_or_else(|| default_orphan_transcript_path(&pane_uuid));
-            let artifact = write_new_private_artifact(&output_path, &transcript).unwrap_or_else(
-                |error| {
+            let artifact =
+                write_new_private_artifact(&output_path, &transcript).unwrap_or_else(|error| {
                     let error = redactor.redact(&format!("{error:#}"));
                     exit_session_durable_error(&error, output_format)
-                },
-            );
+                });
             let display_source_path = redactor.redact(&export.source_path.display().to_string());
             let display_output_path = redactor.redact(&output_path.display().to_string());
             let result = serde_json::json!({
@@ -75063,8 +75056,12 @@ async fn handle_session_command(
                 );
                 println!("  Bytes:           {}", artifact.bytes);
                 println!("  SHA-256:         {}", artifact.sha256);
-                println!("  Safety:          source content was not opened for write; live PTY received no bytes");
-                println!("  Scope:           transcript export, not an executable PTY restore image");
+                println!(
+                    "  Safety:          source content was not opened for write; live PTY received no bytes"
+                );
+                println!(
+                    "  Scope:           transcript export, not an executable PTY restore image"
+                );
             }
         }
 
@@ -75081,8 +75078,8 @@ async fn handle_session_command(
                 )
             });
             let scrollback_dir = default_scrollback_recovery_dir();
-            let candidates = scan_session_orphans_for_cli(&scrollback_dir, limits)
-                .unwrap_or_else(|error| {
+            let candidates =
+                scan_session_orphans_for_cli(&scrollback_dir, limits).unwrap_or_else(|error| {
                     exit_session_export_format_error(
                         "session.orphan_scan_failed",
                         format_args!("{error:#}"),
@@ -75163,11 +75160,7 @@ async fn handle_session_command(
             ) {
                 let err = session_orphan_recoverability_error(&candidate, &pane_uuid)
                     .expect("non-orphaned candidate must not be recoverable");
-                exit_session_export_error(
-                    "session.orphan_not_recoverable",
-                    &err,
-                    output_format,
-                );
+                exit_session_export_error("session.orphan_not_recoverable", &err, output_format);
             }
 
             let snapshot = candidate.read_records(limits).unwrap_or_else(|error| {
@@ -75335,18 +75328,12 @@ async fn handle_session_command(
             let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid, limits)
                 .unwrap_or_else(|error| exit_session_orphan_error(&error, output_format));
             if let Some(err) = session_orphan_discardability_error(&candidate, &pane_uuid) {
-                exit_session_export_error(
-                    "session.orphan_not_discardable",
-                    &err,
-                    output_format,
-                );
+                exit_session_export_error("session.orphan_not_discardable", &err, output_format);
             }
             let receipt = candidate.discard().unwrap_or_else(|error| {
                 exit_session_export_format_error(
                     "session.orphan_discard_failed",
-                    format_args!(
-                        "failed to discard the identity-bound scrollback orphan: {error}"
-                    ),
+                    format_args!("failed to discard the identity-bound scrollback orphan: {error}"),
                     output_format,
                 )
             });
@@ -75773,10 +75760,7 @@ impl<'de> serde::de::Visitor<'de> for JsonStructureSeed<'_> {
     }
 }
 
-fn verify_json_structure_bounded(
-    bytes: &[u8],
-    limits: JsonStructureLimits,
-) -> anyhow::Result<()> {
+fn verify_json_structure_bounded(bytes: &[u8], limits: JsonStructureLimits) -> anyhow::Result<()> {
     let budget = JsonStructureBudget::new(limits);
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     serde::de::DeserializeSeed::deserialize(
@@ -75814,9 +75798,7 @@ fn require_mux_dump_redaction_fixed_point(
                 require_mux_dump_redaction_fixed_point(value, redactor)?;
             }
         }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_) => {}
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
     Ok(())
 }
@@ -75890,10 +75872,7 @@ fn default_ft_data_dir() -> PathBuf {
         return PathBuf::from(base).join("ft");
     }
     if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("ft");
+        return PathBuf::from(home).join(".local").join("share").join("ft");
     }
     PathBuf::from(".").join(".ft")
 }
@@ -75924,10 +75903,7 @@ fn path_contains_parent_component(path: &Path) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
-fn create_private_child_directory(
-    parent: &cap_std::fs::Dir,
-    name: &Path,
-) -> std::io::Result<()> {
+fn create_private_child_directory(parent: &cap_std::fs::Dir, name: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use cap_std::fs::DirBuilderExt as _;
@@ -76014,9 +75990,7 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir
     parent.open_dir_nofollow(Path::new(leaf))
 }
 
-fn artifact_parent_and_leaf(
-    path: &Path,
-) -> anyhow::Result<(cap_std::fs::Dir, PathBuf, PathBuf)> {
+fn artifact_parent_and_leaf(path: &Path) -> anyhow::Result<(cap_std::fs::Dir, PathBuf, PathBuf)> {
     if path_contains_parent_component(path) {
         anyhow::bail!(
             "Artifact path {} contains a parent component; use a normalized path",
@@ -76144,10 +76118,7 @@ fn require_exact_json_object_keys(
     Ok(())
 }
 
-fn write_new_private_artifact(
-    path: &Path,
-    bytes: &[u8],
-) -> anyhow::Result<PrivateArtifactReceipt> {
+fn write_new_private_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<PrivateArtifactReceipt> {
     let (parent, leaf, parent_path) = artifact_parent_and_leaf(path)?;
     let mut options = cap_std::fs::OpenOptions::new();
     options
@@ -76188,7 +76159,10 @@ fn write_new_private_artifact(
         use cap_fs_ext::OsMetadataExt as _;
 
         let path_metadata = parent.symlink_metadata(&leaf).map_err(|err| {
-            anyhow::anyhow!("Failed to revalidate artifact name {}: {err}", path.display())
+            anyhow::anyhow!(
+                "Failed to revalidate artifact name {}: {err}",
+                path.display()
+            )
         })?;
         if !path_metadata.is_file()
             || path_metadata.dev() != handle_metadata.dev()
@@ -76272,7 +76246,10 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let mut file = parent.open_with(&leaf, &options).map_err(|err| {
-        anyhow::anyhow!("Failed to open mux dump {} without following symlinks: {err}", path.display())
+        anyhow::anyhow!(
+            "Failed to open mux dump {} without following symlinks: {err}",
+            path.display()
+        )
     })?;
     let metadata = file
         .metadata()
@@ -76284,7 +76261,10 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
         use cap_fs_ext::OsMetadataExt as _;
 
         let path_metadata = parent.symlink_metadata(&leaf).map_err(|err| {
-            anyhow::anyhow!("Failed to revalidate mux dump name {}: {err}", path.display())
+            anyhow::anyhow!(
+                "Failed to revalidate mux dump name {}: {err}",
+                path.display()
+            )
         })?;
         if !path_metadata.is_file()
             || path_metadata.dev() != metadata.dev()
@@ -76334,11 +76314,11 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
             path.display()
         );
     }
-    let handle_metadata_after = file
-        .metadata()
-        .map_err(|err| anyhow::anyhow!("Failed to re-inspect mux dump {}: {err}", path.display()))?;
-    let metadata_after = DiagnosticFileSnapshot::capture_cap(&handle_metadata_after)
-        .map_err(|err| {
+    let handle_metadata_after = file.metadata().map_err(|err| {
+        anyhow::anyhow!("Failed to re-inspect mux dump {}: {err}", path.display())
+    })?;
+    let metadata_after =
+        DiagnosticFileSnapshot::capture_cap(&handle_metadata_after).map_err(|err| {
             anyhow::anyhow!("Failed to re-snapshot mux dump {}: {err}", path.display())
         })?;
     if metadata_after != metadata_before {
@@ -76403,7 +76383,11 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     if schema != "frankenterm.mux-content-dump.v1" {
         anyhow::bail!("Unsupported mux dump schema {schema:?}");
     }
-    if envelope.get("publication_state").and_then(serde_json::Value::as_str) != Some("complete") {
+    if envelope
+        .get("publication_state")
+        .and_then(serde_json::Value::as_str)
+        != Some("complete")
+    {
         anyhow::bail!("Mux dump publication state is not complete");
     }
     let payload = envelope
@@ -76441,19 +76425,28 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Mux dump payload checksum is missing"))?;
     if actual_payload_sha256 != embedded_payload_sha256 {
-        anyhow::bail!("Mux dump checksum verification failed for {}", path.display());
+        anyhow::bail!(
+            "Mux dump checksum verification failed for {}",
+            path.display()
+        );
     }
     if !is_canonical_lowercase_sha256(embedded_payload_sha256) {
         anyhow::bail!("Mux dump payload checksum is not canonical lowercase SHA-256");
     }
-    if payload.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1) {
+    if payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
         anyhow::bail!("Mux dump payload schema_version is not 1");
     }
     if payload
         .get("created_at_epoch_ms")
         .and_then(serde_json::Value::as_u64)
         .is_none()
-        || payload.pointer("/source/kind").and_then(serde_json::Value::as_str)
+        || payload
+            .pointer("/source/kind")
+            .and_then(serde_json::Value::as_str)
             != Some("live_mux")
         || !payload
             .pointer("/source/ft_version")
@@ -76490,7 +76483,9 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     let required_completeness_semantics = [
         (
             "/completeness_semantics/meaning",
-            serde_json::json!("every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing"),
+            serde_json::json!(
+                "every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing"
+            ),
         ),
         (
             "/completeness_semantics/point_in_time_content_snapshot",
@@ -76613,7 +76608,11 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             anyhow::bail!("Mux dump contains duplicate pane_id {pane_id}");
         }
         for field in ["tab_id", "window_id"] {
-            if pane.get(field).and_then(serde_json::Value::as_u64).is_none() {
+            if pane
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            {
                 anyhow::bail!("Mux dump pane {pane_id} {field} is invalid");
             }
         }
@@ -76667,7 +76666,10 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         for field in ["cursor_x", "cursor_y", "left_col"] {
             match pane.get(field) {
                 Some(serde_json::Value::Null) => {}
-                Some(value) if value.as_u64().is_some_and(|value| value <= u64::from(u32::MAX)) => {}
+                Some(value)
+                    if value
+                        .as_u64()
+                        .is_some_and(|value| value <= u64::from(u32::MAX)) => {}
                 _ => anyhow::bail!("Mux dump pane {pane_id} {field} is invalid"),
             }
         }
@@ -76677,7 +76679,11 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             _ => anyhow::bail!("Mux dump pane {pane_id} top_row is invalid"),
         }
         for field in ["is_active", "is_zoomed"] {
-            if pane.get(field).and_then(serde_json::Value::as_bool).is_none() {
+            if pane
+                .get(field)
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+            {
                 anyhow::bail!("Mux dump pane {pane_id} {field} is invalid");
             }
         }
@@ -76687,7 +76693,14 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} content is missing"))?;
         require_exact_json_object_keys(
             content,
-            &["encoding", "redaction_applied", "bytes", "lines", "sha256", "text"],
+            &[
+                "encoding",
+                "redaction_applied",
+                "bytes",
+                "lines",
+                "sha256",
+                "text",
+            ],
             "pane content",
         )?;
         if content.get("encoding").and_then(serde_json::Value::as_str) != Some("utf-8")
@@ -76788,8 +76801,10 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
                 .get("pane_id")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("Mux dump pane capture error lacks pane_id"))?;
-            if !matches!(code, "pane_text_unavailable" | "aggregate_content_limit_exceeded")
-                || !error_pane_ids.insert(pane_id)
+            if !matches!(
+                code,
+                "pane_text_unavailable" | "aggregate_content_limit_exceeded"
+            ) || !error_pane_ids.insert(pane_id)
                 || pane_ids.contains(&pane_id)
             {
                 anyhow::bail!("Mux dump contains an invalid pane capture error");
@@ -76808,12 +76823,16 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
                         .get("pane_bytes")
                         .and_then(serde_json::Value::as_u64)
                         .and_then(|value| usize::try_from(value).ok())
-                        .ok_or_else(|| anyhow::anyhow!("Mux dump limited pane byte count is invalid"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Mux dump limited pane byte count is invalid")
+                        })?;
                     let admitted_bytes = error
                         .get("admitted_bytes")
                         .and_then(serde_json::Value::as_u64)
                         .and_then(|value| usize::try_from(value).ok())
-                        .ok_or_else(|| anyhow::anyhow!("Mux dump admitted byte count is invalid"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Mux dump admitted byte count is invalid")
+                        })?;
                     if error
                         .get("max_total_bytes")
                         .and_then(serde_json::Value::as_u64)
@@ -76852,7 +76871,11 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         ("/capabilities/stable_cross_restart_pane_identity", false),
     ];
     for (pointer, expected) in required_capabilities {
-        if payload.pointer(pointer).and_then(serde_json::Value::as_bool) != Some(expected) {
+        if payload
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            != Some(expected)
+        {
             anyhow::bail!("Mux dump capability claim {pointer} does not match the v1 contract");
         }
     }
@@ -76958,8 +76981,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         ],
         "topology fence",
     )?;
-    if topology.get("kind").and_then(serde_json::Value::as_str)
-        != Some("double_list_fingerprint")
+    if topology.get("kind").and_then(serde_json::Value::as_str) != Some("double_list_fingerprint")
         || topology
             .get("fingerprint_scope")
             .and_then(serde_json::Value::as_str)
@@ -77067,7 +77089,9 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             .ok_or_else(|| anyhow::anyhow!("Mux dump topology error evidence is missing"))?;
         match code {
             "topology_changed_during_capture"
-                if error.get("initial_panes").and_then(serde_json::Value::as_u64)
+                if error
+                    .get("initial_panes")
+                    .and_then(serde_json::Value::as_u64)
                     != u64::try_from(initial_pane_count).ok()
                     || error.get("final_panes").and_then(serde_json::Value::as_u64)
                         != final_pane_count.and_then(|count| u64::try_from(count).ok())
@@ -77226,9 +77250,7 @@ fn mux_dump_topology_fingerprint_from_records(
             domain_name: std::borrow::Cow::Borrowed(
                 pane.get("domain_name")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Mux dump topology domain_name is invalid")
-                    })?,
+                    .ok_or_else(|| anyhow::anyhow!("Mux dump topology domain_name is invalid"))?,
             ),
             workspace,
             rows: u32::try_from(required_u64("rows")?)
@@ -77238,9 +77260,11 @@ fn mux_dump_topology_fingerprint_from_records(
             left_col: optional_u32("left_col")?,
             top_row: match pane.get("top_row") {
                 Some(serde_json::Value::Null) => None,
-                Some(value) => Some(value.as_i64().ok_or_else(|| {
-                    anyhow::anyhow!("Mux dump topology top_row is invalid")
-                })?),
+                Some(value) => Some(
+                    value
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("Mux dump topology top_row is invalid"))?,
+                ),
                 None => anyhow::bail!("Mux dump topology top_row is missing"),
             },
             is_active: pane
@@ -77257,9 +77281,7 @@ fn mux_dump_topology_fingerprint_from_records(
     hash_mux_dump_topology(&topology)
 }
 
-fn mux_dump_domain_identity(
-    pane: &frankenterm_core::wezterm::PaneInfo,
-) -> (String, &'static str) {
+fn mux_dump_domain_identity(pane: &frankenterm_core::wezterm::PaneInfo) -> (String, &'static str) {
     if let Some(explicit) = pane
         .domain_name
         .as_deref()
@@ -77281,9 +77303,7 @@ async fn capture_live_mux_dump(
     max_total_bytes: usize,
 ) -> anyhow::Result<serde_json::Value> {
     if max_panes == 0 || max_panes > LIVE_MUX_DUMP_MAX_PANES {
-        anyhow::bail!(
-            "--max-panes must be in 1..={LIVE_MUX_DUMP_MAX_PANES}, got {max_panes}"
-        );
+        anyhow::bail!("--max-panes must be in 1..={LIVE_MUX_DUMP_MAX_PANES}, got {max_panes}");
     }
     if max_total_bytes == 0 || max_total_bytes > LIVE_MUX_DUMP_MAX_TOTAL_BYTES {
         anyhow::bail!(
@@ -77316,14 +77336,12 @@ async fn capture_live_mux_dump(
     for pane in panes {
         let (domain_name, domain_identity_authority) = mux_dump_domain_identity(&pane);
         domains.insert(redactor.redact(&domain_name));
-        let text = match robot_get_text_on_runtime_task(wezterm.clone(), pane.pane_id, false).await {
+        let text = match robot_get_text_on_runtime_task(wezterm.clone(), pane.pane_id, false).await
+        {
             Ok(text) => redactor.redact(&text),
             Err(err) => {
-                let detail = bounded_terminal_diagnostic(
-                    &redactor.redact(&err.to_string()),
-                    240,
-                    1024,
-                );
+                let detail =
+                    bounded_terminal_diagnostic(&redactor.redact(&err.to_string()), 240, 1024);
                 errors.push(serde_json::json!({
                     "pane_id": pane.pane_id,
                     "code": "pane_text_unavailable",
@@ -77551,10 +77569,7 @@ fn find_session_orphan_candidate(
     scrollback_dir: &Path,
     pane_uuid: &str,
     limits: frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits,
-) -> Result<
-    frankenterm_core::scrollback_mmap_recovery::OrphanCandidate,
-    SessionOrphanLookupError,
-> {
+) -> Result<frankenterm_core::scrollback_mmap_recovery::OrphanCandidate, SessionOrphanLookupError> {
     if !is_valid_scrollback_pane_uuid(pane_uuid) {
         return Err(SessionOrphanLookupError {
             error_code: "session.orphan_invalid_id",
@@ -77682,9 +77697,9 @@ fn format_session_export_error(
         });
         Some(
             format_snapshot_session_structured_output(&payload, format)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| payload.to_string()),
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| payload.to_string()),
         )
     } else {
         None
@@ -79572,10 +79587,7 @@ fn remote_guardian_mux_start_probe(guardian_path: &str) -> anyhow::Result<String
     dead_code,
     reason = "source-owned unit publication is withheld until a durable startup lease exists"
 )]
-fn remote_mux_service_unit(
-    mux_path: &str,
-    guardian_path: Option<&str>,
-) -> anyhow::Result<String> {
+fn remote_mux_service_unit(mux_path: &str, guardian_path: Option<&str>) -> anyhow::Result<String> {
     let mux_path = validate_remote_mux_server_path(mux_path)?;
     let (guardian_wants, guardian_after, guardian_probe) = match guardian_path {
         Some(guardian_path) => (
@@ -79586,7 +79598,11 @@ fn remote_mux_service_unit(
                 remote_guardian_mux_start_probe(guardian_path)?
             ),
         ),
-        None => (String::new(), "After=network.target".to_string(), String::new()),
+        None => (
+            String::new(),
+            "After=network.target".to_string(),
+            String::new(),
+        ),
     };
     Ok(format!(
         r"[Unit]
@@ -79686,9 +79702,7 @@ impl From<&ValidatedLocalProcessFamily> for ProcessFamilyByteReceipt {
     }
 }
 
-fn validate_process_family_byte_receipt(
-    receipt: &ProcessFamilyByteReceipt,
-) -> anyhow::Result<()> {
+fn validate_process_family_byte_receipt(receipt: &ProcessFamilyByteReceipt) -> anyhow::Result<()> {
     for (role, component) in [("ft", &receipt.ft), ("mux", &receipt.mux_server)] {
         anyhow::ensure!(
             component.byte_len > 0 && component.byte_len <= REMOTE_COMPONENT_MAX_BYTES,
@@ -79706,8 +79720,7 @@ fn validate_process_family_byte_receipt(
     Ok(())
 }
 
-const REMOTE_GENERATION_MANIFEST_SCHEMA: &str =
-    "frankenterm.remote-process-family-generation.v2";
+const REMOTE_GENERATION_MANIFEST_SCHEMA: &str = "frankenterm.remote-process-family-generation.v2";
 const REMOTE_GENERATION_MANIFEST_FILE: &str = "manifest.json";
 const REMOTE_GENERATION_FT_FILE: &str = "ft";
 const REMOTE_GENERATION_MUX_FILE: &str = "frankenterm-mux-server";
@@ -79953,8 +79966,7 @@ fn validate_remote_generation_component(
             .all(|value| {
                 !value.is_empty()
                     && value.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric()
-                            || matches!(byte, b'.' | b'_' | b'+' | b'-')
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
                     })
             }),
         "remote generation manifest contains an invalid build identity field"
@@ -79998,9 +80010,9 @@ fn read_local_component_snapshot(
     use sha2::{Digest as _, Sha256};
 
     let file = open_local_component_nofollow(path)?;
-    let metadata = file.metadata().map_err(|error| {
-        anyhow::anyhow!("cannot inspect component {}: {error}", path.display())
-    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("cannot inspect component {}: {error}", path.display()))?;
     if !metadata.is_file() {
         anyhow::bail!("component path is not a regular file: {}", path.display());
     }
@@ -80275,9 +80287,11 @@ fn create_or_open_remote_generation_directory(
         anyhow::anyhow!("cannot open {label} directory without following links: {error}")
     })?;
     if created {
-        directory.open(".")?.set_permissions(
-            cap_std::fs::Permissions::from_mode(REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE),
-        )?;
+        directory
+            .open(".")?
+            .set_permissions(cap_std::fs::Permissions::from_mode(
+                REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
+            ))?;
         sync_capability_directory(&directory)?;
     }
     validate_remote_generation_directory(
@@ -80319,12 +80333,13 @@ fn open_remote_generation_root(
         .ok_or_else(|| anyhow::anyhow!("remote generation root has no parent"))?;
     // Existing ordinary HOME/.local/share ancestors need not be private. They
     // are still traversed descriptor-by-descriptor without following links.
-    let root_parent = ensure_private_directory_tree_nofollow(root_parent_path).map_err(|error| {
-        anyhow::anyhow!(
-            "cannot pin remote generation root parent {} without following links: {error}",
-            root_parent_path.display()
-        )
-    })?;
+    let root_parent =
+        ensure_private_directory_tree_nofollow(root_parent_path).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot pin remote generation root parent {} without following links: {error}",
+                root_parent_path.display()
+            )
+        })?;
     let root = create_or_open_remote_generation_directory(
         &root_parent,
         root_name,
@@ -80367,10 +80382,8 @@ fn revalidate_remote_generation_root(
             && pinned.ino() == current.ino()
             && pinned.uid() == effective_uid
             && current.uid() == effective_uid
-            && pinned.permissions().mode() & 0o7777
-                == REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE
-            && current.permissions().mode() & 0o7777
-                == REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
+            && pinned.permissions().mode() & 0o7777 == REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE
+            && current.permissions().mode() & 0o7777 == REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
         "remote generation root changed identity, owner, or mode during publication"
     );
     Ok(())
@@ -80461,15 +80474,13 @@ fn acquire_remote_generation_publication_lock(
             && metadata.permissions().mode() & 0o7777 == REMOTE_GENERATION_LOCK_MODE,
         "remote generation publication lock is not one private owner file with nlink=1"
     );
-    let locked = nix::fcntl::Flock::lock(
-        file.into_std(),
-        nix::fcntl::FlockArg::LockExclusiveNonblock,
-    )
-    .map_err(|(_file, error)| {
-        anyhow::anyhow!(
-            "another remote generation publisher owns the publication lock: {error}"
-        )
-    })?;
+    let locked =
+        nix::fcntl::Flock::lock(file.into_std(), nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_file, error)| {
+                anyhow::anyhow!(
+                    "another remote generation publisher owns the publication lock: {error}"
+                )
+            })?;
     let locked_metadata = locked.metadata()?;
     let named_metadata = root.symlink_metadata(lock_name)?;
     anyhow::ensure!(
@@ -80508,7 +80519,10 @@ fn validate_remote_generation_file_metadata(
         )
     })?;
     let handle_metadata = file.metadata().map_err(|error| {
-        anyhow::anyhow!("cannot inspect opened generation file {}: {error}", filename.display())
+        anyhow::anyhow!(
+            "cannot inspect opened generation file {}: {error}",
+            filename.display()
+        )
     })?;
     anyhow::ensure!(
         path_metadata.is_file()
@@ -80563,7 +80577,10 @@ fn verify_open_remote_generation_file(
         (&mut *file).take(component.byte_len.saturating_add(1)),
     )
     .map_err(|error| {
-        anyhow::anyhow!("cannot hash generation component {}: {error}", component.filename)
+        anyhow::anyhow!(
+            "cannot hash generation component {}: {error}",
+            component.filename
+        )
     })?;
     anyhow::ensure!(
         actual_len == component.byte_len && actual_sha256 == component.sha256,
@@ -80684,16 +80701,15 @@ fn read_remote_generation_manifest(
         effective_uid,
         expected_device,
     )?;
-    anyhow::ensure!(before == after, "generation manifest changed while it was read");
+    anyhow::ensure!(
+        before == after,
+        "generation manifest changed while it was read"
+    );
     let manifest: RemoteGenerationManifest = serde_json::from_slice(&bytes)
         .map_err(|error| anyhow::anyhow!("generation manifest is not valid JSON: {error}"))?;
     manifest.validate()?;
-    verify_exact_pretty_json_encoding(
-        &manifest,
-        &bytes,
-        REMOTE_GENERATION_MANIFEST_MAX_BYTES,
-    )
-    .context("generation manifest does not use the one canonical v2 encoding")?;
+    verify_exact_pretty_json_encoding(&manifest, &bytes, REMOTE_GENERATION_MANIFEST_MAX_BYTES)
+        .context("generation manifest does not use the one canonical v2 encoding")?;
     Ok(manifest)
 }
 
@@ -80737,7 +80753,10 @@ fn write_remote_generation_component(
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = source.read(&mut buffer).map_err(|error| {
-            anyhow::anyhow!("cannot read generation source {}: {error}", source_path.display())
+            anyhow::anyhow!(
+                "cannot read generation source {}: {error}",
+                source_path.display()
+            )
         })?;
         if read == 0 {
             break;
@@ -80752,7 +80771,10 @@ fn write_remote_generation_component(
         );
         hasher.update(&buffer[..read]);
         destination.write_all(&buffer[..read]).map_err(|error| {
-            anyhow::anyhow!("cannot write generation component {}: {error}", component.filename)
+            anyhow::anyhow!(
+                "cannot write generation component {}: {error}",
+                component.filename
+            )
         })?;
     }
     let copied_sha256 = hex::encode(hasher.finalize());
@@ -80771,14 +80793,14 @@ fn write_remote_generation_component(
         REMOTE_GENERATION_BINARY_MODE,
     ))?;
     destination.sync_all().map_err(|error| {
-        anyhow::anyhow!("cannot synchronize generation component {}: {error}", component.filename)
+        anyhow::anyhow!(
+            "cannot synchronize generation component {}: {error}",
+            component.filename
+        )
     })?;
     verify_remote_generation_file(stage, component, effective_uid, stage_device)?;
-    let source_after = read_remote_generation_source_snapshot(
-        source_path,
-        expected_component,
-        effective_uid,
-    )?;
+    let source_after =
+        read_remote_generation_source_snapshot(source_path, expected_component, effective_uid)?;
     anyhow::ensure!(
         source_after == *source_snapshot,
         "generation source {} changed identity or hash during publication",
@@ -80839,9 +80861,7 @@ fn open_verified_remote_generation_lifetime_lease(
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let file = directory.open_with(filename, &options).map_err(|error| {
-        anyhow::anyhow!(
-            "cannot open generation lifetime lease without following links: {error}"
-        )
+        anyhow::anyhow!("cannot open generation lifetime lease without following links: {error}")
     })?;
     validate_remote_generation_file_metadata(
         directory,
@@ -80880,9 +80900,7 @@ fn write_remote_generation_lifetime_lease(
         .follow(FollowSymlinks::No)
         .mode(lease.mode);
     let file = stage.open_with(filename, &options).map_err(|error| {
-        anyhow::anyhow!(
-            "cannot create generation lifetime lease without overwriting: {error}"
-        )
+        anyhow::anyhow!("cannot create generation lifetime lease without overwriting: {error}")
     })?;
     file.set_permissions(cap_std::fs::Permissions::from_mode(lease.mode))?;
     file.sync_all()
@@ -80897,12 +80915,8 @@ fn write_remote_generation_lifetime_lease(
         stage_device,
     )?;
     sync_capability_directory(stage)?;
-    let verified = open_verified_remote_generation_lifetime_lease(
-        stage,
-        lease,
-        effective_uid,
-        stage_device,
-    )?;
+    let verified =
+        open_verified_remote_generation_lifetime_lease(stage, lease, effective_uid, stage_device)?;
     let created = DiagnosticFileSnapshot::capture_cap(&file.metadata()?)?;
     let reopened = DiagnosticFileSnapshot::capture_cap(&verified.metadata()?)?;
     anyhow::ensure!(
@@ -80975,11 +80989,7 @@ fn verify_remote_generation_directory(
         remote_generation_directory_inventory(&directory)? == expected_names,
         "immutable generation directory does not contain exactly lifetime lease, ft, mux, and manifest"
     );
-    let manifest = read_remote_generation_manifest(
-        &directory,
-        effective_uid,
-        generations_device,
-    )?;
+    let manifest = read_remote_generation_manifest(&directory, effective_uid, generations_device)?;
     if require_content_derived_name {
         anyhow::ensure!(
             manifest.generation_id == directory_name,
@@ -80992,12 +81002,7 @@ fn verify_remote_generation_directory(
             "existing generation conflicts with the requested exact process-family identity"
         );
     }
-    verify_remote_generation_file(
-        &directory,
-        &manifest.ft,
-        effective_uid,
-        generations_device,
-    )?;
+    verify_remote_generation_file(&directory, &manifest.ft, effective_uid, generations_device)?;
     verify_remote_generation_file(
         &directory,
         &manifest.mux_server,
@@ -81052,12 +81057,7 @@ fn run_descriptor_pinned_remote_generation_mux_version(
     let executable_path = PathBuf::from("/proc/self/fd").join(inherited_number.to_string());
     let mut command = std::process::Command::new(&executable_path);
     command.arg("--version");
-    let output = run_cmd_with_timeout(
-        &mut command,
-        Duration::from_secs(10),
-        64 * 1024,
-        64 * 1024,
-    )?;
+    let output = run_cmd_with_timeout(&mut command, Duration::from_secs(10), 64 * 1024, 64 * 1024)?;
     anyhow::ensure!(
         !output.stdout.overflowed && !output.stderr.overflowed,
         "mux version probe output exceeded its bounded capture"
@@ -81168,13 +81168,7 @@ fn verify_remote_generation_selector(
             "generation selector {selector_name} does not name the expected generation"
         );
     }
-    verify_remote_generation_directory(
-        generations,
-        &generation_id,
-        true,
-        None,
-        effective_uid,
-    )?;
+    verify_remote_generation_directory(generations, &generation_id, true, None, effective_uid)?;
     let after = root.symlink_metadata(selector_path)?;
     let target_after = root.read_link(selector_path)?;
     anyhow::ensure!(
@@ -81273,13 +81267,7 @@ where
         validate_remote_generation_selector_target(&target)? == generation_id,
         "candidate selector target is not canonical"
     );
-    verify_remote_generation_directory(
-        generations,
-        generation_id,
-        true,
-        None,
-        effective_uid,
-    )?;
+    verify_remote_generation_directory(generations, generation_id, true, None, effective_uid)?;
 
     let current_before = match root.symlink_metadata("current") {
         Ok(_) => Some(verify_remote_generation_selector(
@@ -81450,7 +81438,9 @@ where
                 "current",
                 RenameFlags::RENAME_NOREPLACE,
             )
-            .map_err(|error| anyhow::anyhow!("atomic current-selector publication failed: {error}"))?;
+            .map_err(|error| {
+                anyhow::anyhow!("atomic current-selector publication failed: {error}")
+            })?;
             sync_root(root)?;
             let current_after = verify_remote_generation_selector(
                 root,
@@ -81506,8 +81496,7 @@ where
 {
     validate_remote_generation_transaction_id(transaction_id)?;
     revalidate_remote_generations_binding(root, generations, effective_uid)?;
-    sync_root(root)
-        .context("cannot re-durabilize the process-family selector namespace")?;
+    sync_root(root).context("cannot re-durabilize the process-family selector namespace")?;
     let current = verify_remote_generation_selector(
         root,
         generations,
@@ -81711,9 +81700,7 @@ where
         }
     };
     if let Err(binding_error) = revalidate_remote_generation_root(root_path, root, effective_uid)
-        .and_then(|()| {
-            revalidate_remote_generations_binding(root, generations, effective_uid)
-        })
+        .and_then(|()| revalidate_remote_generations_binding(root, generations, effective_uid))
     {
         let receipt = format!(
             "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
@@ -81837,11 +81824,8 @@ fn publish_remote_process_family_generation(
     let manifest = RemoteGenerationManifest::from_process_family(&family)?;
     let generation_id = manifest.generation_id.clone();
 
-    let selector_before = observe_remote_generation_selector_authority(
-        &root,
-        &generations,
-        effective_uid,
-    )?;
+    let selector_before =
+        observe_remote_generation_selector_authority(&root, &generations, effective_uid)?;
     let claim = remote_upgrade_ledger::RemoteUpgradeClaim::process_family_publication(
         request.transaction_id,
         &generation_id,
@@ -81850,11 +81834,7 @@ fn publish_remote_process_family_generation(
         &request.expected.mux_server.sha256,
         request.expected.mux_server.byte_len,
     )?;
-    let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(
-        &root,
-        effective_uid,
-        claim,
-    )?;
+    let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(&root, effective_uid, claim)?;
 
     if let Some(latest) = ledger.latest().cloned() {
         use remote_upgrade_ledger::RemoteUpgradeState;
@@ -82088,9 +82068,11 @@ fn publish_remote_process_family_generation(
         let stage = generations
             .open_dir_nofollow(Path::new(&stage_name))
             .map_err(|error| anyhow::anyhow!("cannot pin generation stage: {error}"))?;
-        stage.open(".")?.set_permissions(
-            cap_std::fs::Permissions::from_mode(REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE),
-        )?;
+        stage
+            .open(".")?
+            .set_permissions(cap_std::fs::Permissions::from_mode(
+                REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
+            ))?;
         let generations_device = generations.dir_metadata()?.dev();
         let stage_device = validate_remote_generation_directory(
             &generations,
@@ -82119,12 +82101,7 @@ fn publish_remote_process_family_generation(
             effective_uid,
             stage_device,
         )?;
-        run_verified_remote_generation_mux_version(
-            &stage,
-            &manifest,
-            effective_uid,
-            stage_device,
-        )?;
+        run_verified_remote_generation_mux_version(&stage, &manifest, effective_uid, stage_device)?;
         write_remote_generation_lifetime_lease(
             &stage,
             &manifest.lifetime_lease,
@@ -82133,9 +82110,11 @@ fn publish_remote_process_family_generation(
         )?;
         write_remote_generation_manifest(&stage, &manifest, effective_uid, stage_device)?;
         sync_capability_directory(&stage)?;
-        stage.open(".")?.set_permissions(
-            cap_std::fs::Permissions::from_mode(REMOTE_GENERATION_DIRECTORY_MODE),
-        )?;
+        stage
+            .open(".")?
+            .set_permissions(cap_std::fs::Permissions::from_mode(
+                REMOTE_GENERATION_DIRECTORY_MODE,
+            ))?;
         sync_capability_directory(&stage)?;
         verify_remote_generation_directory(
             &generations,
@@ -82221,8 +82200,8 @@ fn publish_remote_process_family_generation(
                 "current selector changed while the immutable generation was published; refusing an unbound activation"
             );
         }
-        let selector_permit = ledger
-            .authorize_selector_after_publication(selector_after_publication.clone())?;
+        let selector_permit =
+            ledger.authorize_selector_after_publication(selector_after_publication.clone())?;
         revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
         run_ledger_authorized_selector_effect(
             request.root,
@@ -82272,8 +82251,8 @@ fn validate_remote_release_tag(tag: &str) -> anyhow::Result<&str> {
     }
     if !tag.as_bytes()[0].is_ascii_alphanumeric()
         || !tag
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         anyhow::bail!(
             "remote release tag may contain only ASCII letters, digits, dot, underscore, and hyphen"
@@ -82329,24 +82308,19 @@ fn validate_remote_guardian_path(path: &str) -> anyhow::Result<&str> {
     Ok(path)
 }
 
-fn remote_release_installer_command(
-    tag: &str,
-    staging_suffix: &str,
-) -> anyhow::Result<String> {
+fn remote_release_installer_command(tag: &str, staging_suffix: &str) -> anyhow::Result<String> {
     let installer_revision = build_meta::GIT_HASH;
     if build_meta::GIT_DIRTY != ""
         || installer_revision.len() != 40
-        || !installer_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !installer_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
     {
         anyhow::bail!(
             "remote release installation requires a clean build with an exact 40-hex source revision"
         );
     }
-    remote_release_installer_command_at_revision(
-        tag,
-        staging_suffix,
-        installer_revision,
-    )
+    remote_release_installer_command_at_revision(tag, staging_suffix, installer_revision)
 }
 
 fn remote_release_installer_command_at_revision(
@@ -82454,9 +82428,9 @@ fn parse_remote_release_component_receipt(
         "verified release component receipt output must use an exact final LF terminator"
     );
     let mut receipts = stdout.lines().filter(|line| line.starts_with(PREFIX));
-    let line = receipts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("verified release installer returned no component receipt"))?;
+    let line = receipts.next().ok_or_else(|| {
+        anyhow::anyhow!("verified release installer returned no component receipt")
+    })?;
     anyhow::ensure!(
         receipts.next().is_none(),
         "verified release installer returned multiple component receipts"
@@ -82480,29 +82454,27 @@ fn parse_remote_release_component_receipt(
             && fields.next().is_none(),
         "verified release installer returned a malformed or wrong-tag component receipt"
     );
-    let parse_component = |role: &str,
-                           byte_len: &str,
-                           sha256: &str|
-     -> anyhow::Result<ComponentByteReceipt> {
-        let byte_len = byte_len
-            .parse::<u64>()
-            .with_context(|| format!("{role} component receipt has an invalid byte length"))?;
-        anyhow::ensure!(
-            byte_len > 0 && byte_len <= REMOTE_COMPONENT_MAX_BYTES,
-            "{role} component receipt byte length is outside the supported bound"
-        );
-        anyhow::ensure!(
-            sha256.len() == 64
-                && sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
-            "{role} component receipt has an invalid SHA-256 digest"
-        );
-        Ok(ComponentByteReceipt {
-            sha256: sha256.to_string(),
-            byte_len,
-        })
-    };
+    let parse_component =
+        |role: &str, byte_len: &str, sha256: &str| -> anyhow::Result<ComponentByteReceipt> {
+            let byte_len = byte_len
+                .parse::<u64>()
+                .with_context(|| format!("{role} component receipt has an invalid byte length"))?;
+            anyhow::ensure!(
+                byte_len > 0 && byte_len <= REMOTE_COMPONENT_MAX_BYTES,
+                "{role} component receipt byte length is outside the supported bound"
+            );
+            anyhow::ensure!(
+                sha256.len() == 64
+                    && sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "{role} component receipt has an invalid SHA-256 digest"
+            );
+            Ok(ComponentByteReceipt {
+                sha256: sha256.to_string(),
+                byte_len,
+            })
+        };
     Ok(ProcessFamilyByteReceipt {
         ft: parse_component(
             "ft",
@@ -82547,9 +82519,8 @@ fn copy_remote_component(
     );
     let ready_receipt =
         format!("FT_REMOTE_COMPONENT_UPLOAD_V1=ready:{remote_name}:{staging_suffix}\n");
-    let existing_receipt = format!(
-        "FT_REMOTE_COMPONENT_UPLOAD_V1=existing_exact:{remote_name}:{staging_suffix}\n"
-    );
+    let existing_receipt =
+        format!("FT_REMOTE_COMPONENT_UPLOAD_V1=existing_exact:{remote_name}:{staging_suffix}\n");
     let upload_required = if preflight.stdout == ready_receipt {
         true
     } else if preflight.stdout == existing_receipt {
@@ -82561,12 +82532,13 @@ fn copy_remote_component(
     };
 
     let source_file = open_local_component_nofollow(source)?;
-    let source_before = DiagnosticFileSnapshot::capture(&source_file.metadata()?).map_err(|error| {
-        anyhow::anyhow!(
-            "cannot capture component identity for {} before upload: {error}",
-            source.display()
-        )
-    })?;
+    let source_before =
+        DiagnosticFileSnapshot::capture(&source_file.metadata()?).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot capture component identity for {} before upload: {error}",
+                source.display()
+            )
+        })?;
     anyhow::ensure!(
         source_before == expected.source_identity,
         "component {} changed after process-family validation and before upload",
@@ -82614,23 +82586,21 @@ fn copy_remote_component(
             "identity-fenced component upload returned unexpected stdout"
         );
     }
-    let source_after = DiagnosticFileSnapshot::capture(&source_file.metadata()?).map_err(|error| {
-        anyhow::anyhow!(
-            "cannot recapture component identity for {} after upload: {error}",
-            source.display()
-        )
-    })?;
+    let source_after =
+        DiagnosticFileSnapshot::capture(&source_file.metadata()?).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot recapture component identity for {} after upload: {error}",
+                source.display()
+            )
+        })?;
     anyhow::ensure!(
         source_after == expected.source_identity,
         "component {} changed while its identity-fenced bytes were uploaded",
         source.display()
     );
 
-    let verify_command = remote_component_verification_command(
-        remote_name,
-        staging_suffix,
-        expected,
-    );
+    let verify_command =
+        remote_component_verification_command(remote_name, staging_suffix, expected);
     let verification = run_remote_command(host, &verify_command, timeout)?;
     anyhow::ensure!(
         verification.status.success(),
@@ -82728,8 +82698,7 @@ fn remote_generation_publication_command(
             path.starts_with("$HOME/")
                 && !path.contains("..")
                 && path.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric()
-                        || matches!(byte, b'$' | b'/' | b'.' | b'_' | b'-')
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'/' | b'.' | b'_' | b'-')
                 })
         }),
         "remote generation source is not a fixed HOME-relative shell path"
@@ -82825,9 +82794,7 @@ fn remote_release_generation_publication_command(
     let tag = validate_remote_release_tag(tag)?;
     remote_generation_publication_command(
         &format!("$HOME/.cache/frankenterm/releases/{tag}-{suffix}/ft"),
-        &format!(
-            "$HOME/.cache/frankenterm/releases/{tag}-{suffix}/frankenterm-mux-server"
-        ),
+        &format!("$HOME/.cache/frankenterm/releases/{tag}-{suffix}/frankenterm-mux-server"),
         suffix,
         process_family,
     )
@@ -82869,8 +82836,7 @@ fn parse_remote_generation_publication_receipt(
                 anyhow::anyhow!("current generation receipt has no selector target")
             })?;
             anyhow::ensure!(
-                fields.next().is_none()
-                    && target == format!("generations/{generation_id}"),
+                fields.next().is_none() && target == format!("generations/{generation_id}"),
                 "current generation receipt has a non-canonical selector target"
             );
             RemoteGenerationActivation::Current
@@ -83167,12 +83133,10 @@ fn print_remote_output(
     if trimmed.is_empty() {
         return;
     }
-    let safe = frankenterm_core::output::sanitize_redact_truncate_bounded(
-        trimmed,
-        1_024,
-        4_096,
-        |text| redactor.redact(text),
-    );
+    let safe =
+        frankenterm_core::output::sanitize_redact_truncate_bounded(trimmed, 1_024, 4_096, |text| {
+            redactor.redact(text)
+        });
     println!("  {label}: {safe}");
 }
 
@@ -83299,7 +83263,9 @@ fn remote_mux_activation_summary(
         // that process to a unit or immutable generation.
         Ok("mux owner observed; exact service and running-generation identities remain unverified")
     } else {
-        Ok("service inactive; automatic start withheld because no cross-launcher lifetime lease exists")
+        Ok(
+            "service inactive; automatic start withheld because no cross-launcher lifetime lease exists",
+        )
     }
 }
 
@@ -83743,11 +83709,8 @@ fi"#,
                     true,
                 )?;
                 let receipt = parse_remote_release_component_receipt(&installation.stdout, tag)?;
-                let publish_command = remote_release_generation_publication_command(
-                    tag,
-                    staging_suffix,
-                    &receipt,
-                )?;
+                let publish_command =
+                    remote_release_generation_publication_command(tag, staging_suffix, &receipt)?;
                 let publication = run_remote_step(
                     "Publish verified release as an immutable pending generation",
                     host,
@@ -83777,7 +83740,9 @@ fi"#,
         } else if let (Some(ft_path), Some(mux_server_path)) =
             (options.ft_path, options.mux_server_path)
         {
-            println!("• Would publish an immutable pending FrankenTerm generation via identity-fenced SSH upload; activation requires a cross-launcher lease");
+            println!(
+                "• Would publish an immutable pending FrankenTerm generation via identity-fenced SSH upload; activation requires a cross-launcher lease"
+            );
             println!("  ft: {}", ft_path.display());
             println!("  mux-server: {}", mux_server_path.display());
         } else if let Some(tag) = options.ft_version {
@@ -83945,9 +83910,10 @@ fi"#;
     if options.install_ft {
         println!("  Components: ft + frankenterm-mux-server (same release identity)");
         println!("  Activation: {activation_summary}");
-        if let (Some(transaction_id), Some(publication)) =
-            (options.transaction_id, remote_generation_publication.as_ref())
-        {
+        if let (Some(transaction_id), Some(publication)) = (
+            options.transaction_id,
+            remote_generation_publication.as_ref(),
+        ) {
             println!("  Upgrade transaction: {transaction_id}");
             println!(
                 "  Publication receipt: {}",
@@ -93802,7 +93768,7 @@ recorder_backend = "rusqlite"
             &link,
             frankenterm_core::scrollback_mmap_recovery::LegacyRecoveryLimits::DEFAULT,
         )
-            .expect_err("a dangling recovery-directory symlink must not look like no state");
+        .expect_err("a dangling recovery-directory symlink must not look like no state");
         assert!(error.to_string().contains("scan scrollback directory"));
     }
 
@@ -93830,12 +93796,11 @@ recorder_backend = "rusqlite"
                         serde_json::from_str(&rendered).expect("decode JSON operational error")
                     }
                     SnapshotSessionOutputFormat::Toon => {
-                        let decoded =
-                            toon_rust::try_decode(&rendered, None).expect("decode TOON operational error");
-                        let json = toon_rust::cli::json_stringify::json_stringify_lines(
-                            &decoded, 0,
-                        )
-                        .join("\n");
+                        let decoded = toon_rust::try_decode(&rendered, None)
+                            .expect("decode TOON operational error");
+                        let json =
+                            toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0)
+                                .join("\n");
                         serde_json::from_str(&json).expect("decode TOON error as JSON")
                     }
                     SnapshotSessionOutputFormat::Plain => unreachable!(),
@@ -93925,14 +93890,8 @@ recorder_backend = "rusqlite"
 
         assert_eq!(payload["status"], "partial");
         assert_eq!(payload["source_completeness"]["status"], "incomplete");
-        assert_eq!(
-            payload["source_completeness"]["decoded_cursor_bytes"],
-            31
-        );
-        assert_eq!(
-            payload["source_completeness"]["declared_cursor_bytes"],
-            47
-        );
+        assert_eq!(payload["source_completeness"]["decoded_cursor_bytes"], 31);
+        assert_eq!(payload["source_completeness"]["declared_cursor_bytes"], 47);
         assert_eq!(
             payload["source_completeness"]["reason"],
             "physical_record_payload_truncated"
@@ -93943,8 +93902,8 @@ recorder_backend = "rusqlite"
     fn private_artifact_write_is_verified_and_never_overwrites() {
         let dir = tempfile::tempdir().expect("artifact tempdir");
         let path = dir.path().join("private").join("mux-dump.json");
-        let receipt = write_new_private_artifact(&path, b"first\n")
-            .expect("first private artifact write");
+        let receipt =
+            write_new_private_artifact(&path, b"first\n").expect("first private artifact write");
         assert_eq!(receipt.bytes, 6);
         assert_eq!(receipt.sha256, sha256_hex(b"first\n"));
         assert_eq!(receipt.durability, "file_and_parent_directory_synced");
@@ -94013,15 +93972,16 @@ recorder_backend = "rusqlite"
         let (pinned_parent, _leaf, parent_path) =
             artifact_parent_and_leaf(&path).expect("pin original artifact parent");
         let displaced_parent = dir.path().join("displaced-private");
-        std::fs::rename(&parent_path, &displaced_parent)
-            .expect("displace pinned artifact parent");
+        std::fs::rename(&parent_path, &displaced_parent).expect("displace pinned artifact parent");
         std::fs::create_dir(&parent_path).expect("plant replacement artifact parent");
 
         let error = revalidate_artifact_parent_directory(&parent_path, &pinned_parent)
             .expect_err("replacement parent path must not retain the pinned authority");
-        assert!(error
-            .to_string()
-            .contains("parent directory changed identity"));
+        assert!(
+            error
+                .to_string()
+                .contains("parent directory changed identity")
+        );
     }
 
     #[test]
@@ -94116,8 +94076,7 @@ recorder_backend = "rusqlite"
                 .expect("fixture panes are an array"),
         )
         .expect("fingerprint canonical fixture topology");
-        payload["topology_fence"]["initial_sha256"] =
-            serde_json::json!(&topology_sha256);
+        payload["topology_fence"]["initial_sha256"] = serde_json::json!(&topology_sha256);
         payload["topology_fence"]["final_sha256"] = serde_json::json!(&topology_sha256);
         let (_, payload_sha256) = hash_json_bounded(
             &payload,
@@ -94145,8 +94104,7 @@ recorder_backend = "rusqlite"
         let secret_injection_path = dir.path().join("secret-injection-mux-dump.json");
         let mut secret_injection_payload = payload.clone();
         let planted_secret = "AKIAIOSFODNN7EXAMPLE";
-        secret_injection_payload["panes"][0]["pane"]["title"] =
-            serde_json::json!(planted_secret);
+        secret_injection_payload["panes"][0]["pane"]["title"] = serde_json::json!(planted_secret);
         let (_, secret_injection_sha256) = hash_json_bounded(
             &secret_injection_payload,
             LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
@@ -94195,9 +94153,11 @@ recorder_backend = "rusqlite"
             .expect("write topology-mutation dump");
         let mutation_error = verify_mux_dump_artifact(&mutated_topology_path)
             .expect_err("a recomputed payload checksum must not hide changed pane topology");
-        assert!(mutation_error
-            .to_string()
-            .contains("canonical redacted pane metadata"));
+        assert!(
+            mutation_error
+                .to_string()
+                .contains("canonical redacted pane metadata")
+        );
 
         let mut tampered = std::fs::read(&path).expect("read dump for tamper fixture");
         let index = tampered
@@ -94273,14 +94233,17 @@ recorder_backend = "rusqlite"
             "payload_sha256": wrong_identity_sha256,
             "payload": wrong_identity_payload,
         });
-        let mut wrong_identity_bytes =
-            serde_json::to_vec_pretty(&wrong_identity_envelope).unwrap();
+        let mut wrong_identity_bytes = serde_json::to_vec_pretty(&wrong_identity_envelope).unwrap();
         wrong_identity_bytes.push(b'\n');
         write_new_private_artifact(&wrong_identity_path, &wrong_identity_bytes)
             .expect("write wrong pane identity dump");
         let identity_error = verify_mux_dump_artifact(&wrong_identity_path)
             .expect_err("a recomputed checksum must not change an initial pane identity");
-        assert!(identity_error.to_string().contains("initial identity manifest"));
+        assert!(
+            identity_error
+                .to_string()
+                .contains("initial identity manifest")
+        );
 
         let hidden_field_path = dir.path().join("hidden-field-mux-dump.json");
         let mut hidden_field_payload = payload.clone();
@@ -94304,7 +94267,11 @@ recorder_backend = "rusqlite"
             .expect("write hidden-field dump");
         let hidden_field_error = verify_mux_dump_artifact(&hidden_field_path)
             .expect_err("a recomputed checksum must not authorize unknown v1 fields");
-        assert!(hidden_field_error.to_string().contains("frozen v1 field set"));
+        assert!(
+            hidden_field_error
+                .to_string()
+                .contains("frozen v1 field set")
+        );
 
         let duplicate_key_path = dir.path().join("duplicate-key-mux-dump.json");
         let mut duplicate_key_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
@@ -94326,15 +94293,16 @@ recorder_backend = "rusqlite"
             .expect("write duplicate-key dump");
         let duplicate_key_error = verify_mux_dump_artifact(&duplicate_key_path)
             .expect_err("duplicate JSON keys must not hide discarded unredacted bytes");
-        assert!(duplicate_key_error
-            .to_string()
-            .contains("canonical v1 artifact encoding"));
+        assert!(
+            duplicate_key_error
+                .to_string()
+                .contains("canonical v1 artifact encoding")
+        );
 
         let inconsistent_path = dir.path().join("internally-inconsistent-mux-dump.json");
         let mut inconsistent_payload = payload;
         inconsistent_payload["summary"]["content_bytes"] = serde_json::json!(1);
-        let inconsistent_sha256 =
-            sha256_hex(&serde_json::to_vec(&inconsistent_payload).unwrap());
+        let inconsistent_sha256 = sha256_hex(&serde_json::to_vec(&inconsistent_payload).unwrap());
         let inconsistent_envelope = serde_json::json!({
             "schema": "frankenterm.mux-content-dump.v1",
             "publication_state": "complete",
@@ -94384,7 +94352,11 @@ recorder_backend = "rusqlite"
         strings.max_string_bytes = 4;
         let error = verify_json_structure_bounded(br#"{"key":"value"}"#, strings)
             .expect_err("decoded keys and values share one string byte budget");
-        assert!(error.to_string().contains("decoded string byte safety limit"));
+        assert!(
+            error
+                .to_string()
+                .contains("decoded string byte safety limit")
+        );
 
         let mut depth = generous;
         depth.max_depth = 1;
@@ -94414,7 +94386,10 @@ recorder_backend = "rusqlite"
         let value = serde_json::json!({"text": "\0\0\0\0"});
         let compact = serialize_json_bounded(&value, 64, JsonSerializationStyle::Compact)
             .expect("fixture fits a sufficient bound");
-        assert!(compact.len() > 16, "control bytes must exercise JSON escaping");
+        assert!(
+            compact.len() > 16,
+            "control bytes must exercise JSON escaping"
+        );
         let (hashed_bytes, hashed_sha256) =
             hash_json_bounded(&value, 64, JsonSerializationStyle::Compact)
                 .expect("hash fixture within the same bound");
@@ -94423,10 +94398,18 @@ recorder_backend = "rusqlite"
 
         let error = serialize_json_bounded(&value, 16, JsonSerializationStyle::Compact)
             .expect_err("escaped JSON must fail before crossing its byte bound");
-        assert!(error.to_string().contains("bounded JSON serialization failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("bounded JSON serialization failed")
+        );
         let hash_error = hash_json_bounded(&value, 16, JsonSerializationStyle::Compact)
             .expect_err("hashing escaped JSON must fail at the identical bound");
-        assert!(hash_error.to_string().contains("bounded JSON hashing failed"));
+        assert!(
+            hash_error
+                .to_string()
+                .contains("bounded JSON hashing failed")
+        );
     }
 
     #[test]
@@ -99626,10 +99609,9 @@ log_level = "debug"
     #[cfg(unix)]
     #[test]
     fn remote_guardian_unit_is_private_independent_and_manual_stop_refusing() {
-        let unit = remote_guardian_service_unit(
-            "/home/operator/.local/bin/frankenterm-pty-guardian",
-        )
-        .expect("bounded absolute guardian path");
+        let unit =
+            remote_guardian_service_unit("/home/operator/.local/bin/frankenterm-pty-guardian")
+                .expect("bounded absolute guardian path");
 
         assert!(unit.contains("Before=frankenterm-mux-server.service"));
         assert!(unit.contains("RefuseManualStop=yes"));
@@ -99639,9 +99621,7 @@ log_level = "debug"
         assert!(unit.contains("RuntimeDirectoryPreserve=yes"));
         assert!(unit.contains("StateDirectory=frankenterm/guardian"));
         assert!(unit.contains("StateDirectoryMode=0700"));
-        assert!(unit.contains(
-            "serve --socket-path %t/frankenterm/guardian/guardian.sock"
-        ));
+        assert!(unit.contains("serve --socket-path %t/frankenterm/guardian/guardian.sock"));
         assert!(unit.contains("--token-path %S/frankenterm/guardian/guardian.token"));
         assert!(unit.contains("KillMode=control-group"));
         assert!(unit.contains("Restart=no"));
@@ -99669,11 +99649,7 @@ log_level = "debug"
         .expect("bounded absolute service paths");
 
         assert!(unit.contains("Wants=frankenterm-pty-guardian.service"));
-        assert!(
-            unit.contains(
-                "After=network.target frankenterm-pty-guardian.service"
-            )
-        );
+        assert!(unit.contains("After=network.target frankenterm-pty-guardian.service"));
         let probe = unit
             .find("ExecStartPre=/home/operator/.local/bin/frankenterm-pty-guardian probe")
             .expect("authenticated guardian probe gate");
@@ -99694,11 +99670,9 @@ log_level = "debug"
     #[cfg(unix)]
     #[test]
     fn remote_mux_legacy_unit_makes_no_false_guardian_readiness_claim() {
-        let unit = remote_mux_service_unit(
-            "/home/operator/.local/bin/frankenterm-mux-server",
-            None,
-        )
-        .expect("bounded absolute mux path");
+        let unit =
+            remote_mux_service_unit("/home/operator/.local/bin/frankenterm-mux-server", None)
+                .expect("bounded absolute mux path");
 
         assert!(!unit.contains("frankenterm-pty-guardian"));
         assert!(!unit.contains("ExecStartPre="));
@@ -99790,9 +99764,10 @@ log_level = "debug"
         run_remote_setup_with_runner("example", &options, &runner).unwrap();
 
         let cmds = { commands.lock().unwrap().clone() };
-        assert!(cmds
-            .iter()
-            .any(|cmd| cmd.contains("FT_REMOTE_COMMAND_CHANNEL_V1")));
+        assert!(
+            cmds.iter()
+                .any(|cmd| cmd.contains("FT_REMOTE_COMMAND_CHANNEL_V1"))
+        );
         assert!(cmds.iter().any(|cmd| cmd.contains("command -v apt-get")));
         assert!(cmds.iter().any(|cmd| cmd.contains("command -v wezterm")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("apt-get install")));
@@ -99802,12 +99777,10 @@ log_level = "debug"
 
     #[test]
     fn applied_remote_install_requires_caller_stable_transaction_id_before_ssh() {
-        let runner = |_: &str,
-                      _: &str,
-                      _: std::time::Duration|
-         -> anyhow::Result<RemoteCommandOutput> {
-            panic!("missing transaction identity must fail before SSH")
-        };
+        let runner =
+            |_: &str, _: &str, _: std::time::Duration| -> anyhow::Result<RemoteCommandOutput> {
+                panic!("missing transaction identity must fail before SSH")
+            };
         let options = RemoteSetupOptions {
             apply: true,
             dry_run: false,
@@ -99965,23 +99938,31 @@ log_level = "debug"
         assert!(pending.contains("$HOME/.local/share/frankenterm/process-family"));
         assert!(pending.contains("--expected-ft-sha256"));
         assert!(pending.contains("--expected-mux-sha256"));
-        assert!(pending.contains(
-            "--transaction-id \"0123456789abcdef0123456789abcdef\""
-        ));
+        assert!(pending.contains("--transaction-id \"0123456789abcdef0123456789abcdef\""));
         assert!(!pending.contains("--activate-current"));
         assert!(pending.matches(&"b".repeat(64)).count() >= 2);
         assert!(pending.matches(&"c".repeat(64)).count() >= 2);
         assert!(!pending.contains("mv -n"));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("backup_candidate=\"$service.previous-")));
-        assert!(!commands.iter().any(|command| command.contains("systemctl --user restart")));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("systemctl --user enable --now")));
-        assert!(!commands
-            .iter()
-            .any(|command| command == "systemctl --user enable frankenterm-mux-server"));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("backup_candidate=\"$service.previous-"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("systemctl --user restart"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("systemctl --user enable --now"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command == "systemctl --user enable frankenterm-mux-server")
+        );
     }
 
     #[cfg(unix)]
@@ -100057,15 +100038,21 @@ log_level = "debug"
             .find(|command| command.contains("__publish-remote-generation"))
             .expect("pending generation publication command");
         assert!(!publication.contains("--activate-current"));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("backup_candidate=\"$service.previous-")));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("systemctl --user daemon-reload")));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("systemctl --user enable --now")));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("backup_candidate=\"$service.previous-"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("systemctl --user daemon-reload"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("systemctl --user enable --now"))
+        );
     }
 
     #[cfg(unix)]
@@ -100121,21 +100108,31 @@ log_level = "debug"
         run_remote_setup_with_runner("example", &options, &runner)
             .expect("read-only service inspection should remain available");
         let commands = commands.lock().unwrap();
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("service.installing-")));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("cat \"$service\"")));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("mv -n \"$source\" \"$target\"")));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("systemctl --user daemon-reload")));
-        assert!(!commands
-            .iter()
-            .any(|command| command.contains("systemctl --user enable --now")));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("service.installing-"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("cat \"$service\""))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("mv -n \"$source\" \"$target\""))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("systemctl --user daemon-reload"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("systemctl --user enable --now"))
+        );
     }
 
     #[cfg(unix)]
@@ -100173,9 +100170,7 @@ log_level = "debug"
 
         let error = run_remote_setup_with_runner("example", &options, &runner)
             .expect_err("ambiguous ownership state must fail closed");
-        assert!(error
-            .to_string()
-            .contains("returned no unambiguous state"));
+        assert!(error.to_string().contains("returned no unambiguous state"));
         let commands = commands.lock().unwrap();
         assert_eq!(commands.len(), 2, "setup mutated after the ownership fence");
         assert!(commands[0].contains("FT_REMOTE_COMMAND_CHANNEL_V1"));
@@ -100224,7 +100219,11 @@ log_level = "debug"
             .expect_err("process inventory errors must fail closed");
         assert!(error.to_string().contains("ownership fence failed"));
         let commands = commands.lock().unwrap();
-        assert_eq!(commands.len(), 2, "setup mutated after a failed ownership probe");
+        assert_eq!(
+            commands.len(),
+            2,
+            "setup mutated after a failed ownership probe"
+        );
     }
 
     fn synthetic_remote_generation_family(
@@ -100262,16 +100261,14 @@ log_level = "debug"
 
     #[test]
     fn remote_generation_manifest_has_one_stable_content_derived_identity() {
-        let family = synthetic_remote_generation_family(
-            &"b".repeat(64),
-            101,
-            &"c".repeat(64),
-            202,
-        );
+        let family = synthetic_remote_generation_family(&"b".repeat(64), 101, &"c".repeat(64), 202);
         let first = RemoteGenerationManifest::from_process_family(&family).unwrap();
         let second = RemoteGenerationManifest::from_process_family(&family).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.generation_id, first.recompute_generation_id().unwrap());
+        assert_eq!(
+            first.generation_id,
+            first.recompute_generation_id().unwrap()
+        );
         assert_eq!(first.schema, REMOTE_GENERATION_MANIFEST_SCHEMA);
         assert_eq!(first.ft.filename, REMOTE_GENERATION_FT_FILE);
         assert_eq!(first.mux_server.filename, REMOTE_GENERATION_MUX_FILE);
@@ -100283,28 +100280,22 @@ log_level = "debug"
         assert_eq!(first.mux_server.mode, 0o500);
         assert_eq!(first.lifetime_lease.mode, 0o600);
         assert_eq!(first.lifetime_lease.byte_len, 0);
-        assert_eq!(first.codec_version, u64::try_from(codec::CODEC_VERSION).unwrap());
+        assert_eq!(
+            first.codec_version,
+            u64::try_from(codec::CODEC_VERSION).unwrap()
+        );
         let canonical = first.canonical_bytes().unwrap();
         assert_eq!(canonical.last(), Some(&b'\n'));
-        verify_exact_pretty_json_encoding(
-            &first,
-            &canonical,
-            REMOTE_GENERATION_MANIFEST_MAX_BYTES,
-        )
-        .unwrap();
+        verify_exact_pretty_json_encoding(&first, &canonical, REMOTE_GENERATION_MANIFEST_MAX_BYTES)
+            .unwrap();
 
-        let changed = synthetic_remote_generation_family(
-            &"b".repeat(64),
-            102,
-            &"c".repeat(64),
-            202,
-        );
+        let changed =
+            synthetic_remote_generation_family(&"b".repeat(64), 102, &"c".repeat(64), 202);
         let changed = RemoteGenerationManifest::from_process_family(&changed).unwrap();
         assert_ne!(first.generation_id, changed.generation_id);
 
         let mut rejected_legacy = first.clone();
-        rejected_legacy.schema =
-            "frankenterm.remote-process-family-generation.v1".to_string();
+        rejected_legacy.schema = "frankenterm.remote-process-family-generation.v1".to_string();
         rejected_legacy.generation_id = rejected_legacy.recompute_generation_id().unwrap();
         assert!(rejected_legacy.validate().is_err());
 
@@ -100317,12 +100308,7 @@ log_level = "debug"
 
     #[test]
     fn remote_generation_shell_command_delegates_one_atomic_publication() {
-        let family = synthetic_remote_generation_family(
-            &"b".repeat(64),
-            101,
-            &"c".repeat(64),
-            202,
-        );
+        let family = synthetic_remote_generation_family(&"b".repeat(64), 101, &"c".repeat(64), 202);
         let receipt = ProcessFamilyByteReceipt::from(&family);
         let suffix = "0123456789abcdef0123456789abcdef";
         let pending = uploaded_process_family_generation_command(suffix, &receipt).unwrap();
@@ -100334,9 +100320,7 @@ log_level = "debug"
         assert!(pending.contains("ft_descriptor=/proc/self/fd/8"));
         assert!(pending.contains("mux_descriptor=/proc/self/fd/9"));
         assert!(pending.contains("verify_descriptor \"$ft_descriptor\""));
-        assert!(pending.contains(
-            "chmod 0500 -- \"$ft_descriptor\" \"$mux_descriptor\""
-        ));
+        assert!(pending.contains("chmod 0500 -- \"$ft_descriptor\" \"$mux_descriptor\""));
         assert!(!pending.contains("chmod 0500 -- \"$ft_source\" \"$mux_source\""));
         assert!(pending.contains("exec \"$ft_descriptor\" setup"));
         assert!(!pending.contains("exec \"$ft_source\" setup"));
@@ -100366,10 +100350,12 @@ log_level = "debug"
             "banner\nFT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
         ))
         .is_err());
-        assert!(parse_remote_generation_publication_receipt(&format!(
-            "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:../{generation_id}\n"
-        ))
-        .is_err());
+        assert!(
+            parse_remote_generation_publication_receipt(&format!(
+                "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:../{generation_id}\n"
+            ))
+            .is_err()
+        );
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -100487,10 +100473,16 @@ log_level = "debug"
 
         let error = revalidate_remote_generations_binding(&root, &generations, effective_uid)
             .expect_err("a selector target must never be verified against a detached dirfd");
-        assert!(error.to_string().contains("stable nofollow owner directory"));
+        assert!(
+            error
+                .to_string()
+                .contains("stable nofollow owner directory")
+        );
         assert_eq!(
             generations.dir_metadata().expect("pinned metadata").ino(),
-            std::fs::metadata(&retained).expect("retained metadata").ino()
+            std::fs::metadata(&retained)
+                .expect("retained metadata")
+                .ino()
         );
         assert_ne!(
             generations.dir_metadata().expect("pinned metadata").ino(),
@@ -100519,21 +100511,16 @@ log_level = "debug"
             202,
         )
         .expect("create activation durability claim");
-        let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(
-            &root,
-            effective_uid,
-            claim,
-        )
-        .expect("open activation durability ledger");
+        let mut ledger =
+            remote_upgrade_ledger::RemoteUpgradeLedger::open(&root, effective_uid, claim)
+                .expect("open activation durability ledger");
         ledger
             .authorize_publication(remote_upgrade_ledger::SelectorAuthority::Missing)
             .expect("commit Prepared authorization")
             .consume_publication(&ledger)
             .expect("consume publication permit");
         let _selector_permit = ledger
-            .authorize_selector_after_publication(
-                remote_upgrade_ledger::SelectorAuthority::Missing,
-            )
+            .authorize_selector_after_publication(remote_upgrade_ledger::SelectorAuthority::Missing)
             .expect("commit Activating authorization");
 
         let error = commit_remote_generation_selector_after_redurable_evidence_with(
@@ -100577,20 +100564,15 @@ log_level = "debug"
             202,
         )
         .expect("create pending observation claim");
-        let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(
-            &root,
-            effective_uid,
-            claim,
-        )
-        .expect("open pending observation ledger");
+        let mut ledger =
+            remote_upgrade_ledger::RemoteUpgradeLedger::open(&root, effective_uid, claim)
+                .expect("open pending observation ledger");
         ledger
             .authorize_publication(remote_upgrade_ledger::SelectorAuthority::Missing)
             .expect("commit Prepared publication authorization")
             .consume_publication(&ledger)
             .expect("consume publication permit");
-        let transaction_path = root_path
-            .join("upgrade-transactions")
-            .join(transaction_id);
+        let transaction_path = root_path.join("upgrade-transactions").join(transaction_id);
         let entries_before = std::fs::read_dir(&transaction_path)
             .expect("read transaction before failed observation")
             .count();
@@ -100629,14 +100611,9 @@ log_level = "debug"
         let build_id = "d".repeat(64);
         let transaction_id = "abcdef0123456789abcdef0123456789";
         write_remote_generation_script_fixture(&ft, &build_id, "ft", "ft");
-        write_remote_generation_script_fixture(
-            &mux,
-            &build_id,
-            "frankenterm-mux-server",
-            "mux",
-        );
-        let family = validate_local_process_family(&ft, &mux)
-            .expect("validate post-rename process family");
+        write_remote_generation_script_fixture(&mux, &build_id, "frankenterm-mux-server", "mux");
+        let family =
+            validate_local_process_family(&ft, &mux).expect("validate post-rename process family");
         let expected = ProcessFamilyByteReceipt::from(&family);
         let pending = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
             root: &root_path,
@@ -100662,18 +100639,12 @@ log_level = "debug"
                 expected.mux_server.byte_len,
             )
             .expect("reconstruct exact pending claim");
-            let mut ledger = remote_upgrade_ledger::RemoteUpgradeLedger::open(
-                &root,
-                effective_uid,
-                claim,
-            )
-            .expect("open pending transaction ledger");
-            let selector_before = observe_remote_generation_selector_authority(
-                &root,
-                &generations,
-                effective_uid,
-            )
-            .expect("observe missing selector authority");
+            let mut ledger =
+                remote_upgrade_ledger::RemoteUpgradeLedger::open(&root, effective_uid, claim)
+                    .expect("open pending transaction ledger");
+            let selector_before =
+                observe_remote_generation_selector_authority(&root, &generations, effective_uid)
+                    .expect("observe missing selector authority");
             assert_eq!(
                 selector_before,
                 remote_upgrade_ledger::SelectorAuthority::Missing
@@ -100725,8 +100696,7 @@ log_level = "debug"
             .expect_err("post-rename fsync failure must not commit in the same call");
             assert_eq!(root_sync_calls, 2);
             assert!(
-                format!("{error:#}")
-                    .contains("planted post-rename selector-root fsync failure")
+                format!("{error:#}").contains("planted post-rename selector-root fsync failure")
             );
             assert!(error.to_string().contains("transaction remains Activating"));
             assert_eq!(
@@ -100740,16 +100710,15 @@ log_level = "debug"
             );
         }
 
-        let recovered =
-            publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
-                root: &root_path,
-                ft_source: &ft,
-                mux_server_source: &mux,
-                expected,
-                transaction_id,
-                activate_current: true,
-            })
-            .expect("the same transaction retry re-durabilizes and commits");
+        let recovered = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
+            root: &root_path,
+            ft_source: &ft,
+            mux_server_source: &mux,
+            expected,
+            transaction_id,
+            activate_current: true,
+        })
+        .expect("the same transaction retry re-durabilizes and commits");
         assert_eq!(recovered.generation_id, pending.generation_id);
         assert_eq!(recovered.activation, RemoteGenerationActivation::Current);
     }
@@ -100770,12 +100739,7 @@ log_level = "debug"
 
         let ft_one = fixture.path().join("ft-one");
         let mux_one = fixture.path().join("mux-one");
-        write_remote_generation_script_fixture(
-            &ft_one,
-            &"a".repeat(64),
-            "ft",
-            "first-ft",
-        );
+        write_remote_generation_script_fixture(&ft_one, &"a".repeat(64), "ft", "first-ft");
         write_remote_generation_script_fixture(
             &mux_one,
             &"a".repeat(64),
@@ -100844,12 +100808,7 @@ log_level = "debug"
 
         let ft_two = fixture.path().join("ft-two");
         let mux_two = fixture.path().join("mux-two");
-        write_remote_generation_script_fixture(
-            &ft_two,
-            &"e".repeat(64),
-            "ft",
-            "second-ft",
-        );
+        write_remote_generation_script_fixture(&ft_two, &"e".repeat(64), "ft", "second-ft");
         write_remote_generation_script_fixture(
             &mux_two,
             &"e".repeat(64),
@@ -100861,11 +100820,8 @@ log_level = "debug"
         let colliding_transaction = "99999999999999999999999999999999";
         let colliding_selector = format!(".selector-rollback-{colliding_transaction}");
         let retained_collision_target = PathBuf::from("generations").join(&current.generation_id);
-        std::os::unix::fs::symlink(
-            &retained_collision_target,
-            root.join(&colliding_selector),
-        )
-        .expect("plant transaction-selector collision");
+        std::os::unix::fs::symlink(&retained_collision_target, root.join(&colliding_selector))
+            .expect("plant transaction-selector collision");
         let collision_error =
             publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
                 root: &root,
@@ -100876,7 +100832,11 @@ log_level = "debug"
                 activate_current: true,
             })
             .expect_err("selector collision must fail without overwrite");
-        assert!(collision_error.to_string().contains("refusing to overwrite"));
+        assert!(
+            collision_error
+                .to_string()
+                .contains("refusing to overwrite")
+        );
         assert_eq!(
             std::fs::read_link(root.join(&colliding_selector)).unwrap(),
             retained_collision_target
@@ -100901,14 +100861,20 @@ log_level = "debug"
             PathBuf::from("generations").join(&second.generation_id)
         );
         assert_eq!(
-            std::fs::read_link(
-                root.join(".selector-rollback-44444444444444444444444444444444")
-            )
-            .unwrap(),
+            std::fs::read_link(root.join(".selector-rollback-44444444444444444444444444444444"))
+                .unwrap(),
             PathBuf::from("generations").join(&current.generation_id)
         );
-        assert!(root.join("generations").join(&current.generation_id).is_dir());
-        assert!(root.join("generations").join(&second.generation_id).is_dir());
+        assert!(
+            root.join("generations")
+                .join(&current.generation_id)
+                .is_dir()
+        );
+        assert!(
+            root.join("generations")
+                .join(&second.generation_id)
+                .is_dir()
+        );
         assert_eq!(
             std::fs::read(root.join("legacy-sentinel")).unwrap(),
             b"preserve-me"
@@ -100986,36 +100952,37 @@ log_level = "debug"
         );
         let symlink = fixture.path().join("ft-symlink");
         std::os::unix::fs::symlink(&ft, &symlink).expect("plant source symlink");
-        assert!(read_remote_generation_source_snapshot(
-            &symlink,
-            REMOTE_GENERATION_FT_FILE,
-            remote_generation_effective_uid(),
-        )
-        .is_err());
+        assert!(
+            read_remote_generation_source_snapshot(
+                &symlink,
+                REMOTE_GENERATION_FT_FILE,
+                remote_generation_effective_uid(),
+            )
+            .is_err()
+        );
 
         let hardlink = fixture.path().join("mux-hardlink");
         std::fs::hard_link(&mux, &hardlink).expect("plant source hard link");
-        assert!(read_remote_generation_source_snapshot(
-            &mux,
-            REMOTE_GENERATION_MUX_FILE,
-            remote_generation_effective_uid(),
-        )
-        .is_err());
+        assert!(
+            read_remote_generation_source_snapshot(
+                &mux,
+                REMOTE_GENERATION_MUX_FILE,
+                remote_generation_effective_uid(),
+            )
+            .is_err()
+        );
 
         let wrong_mode = fixture.path().join("wrong-mode");
-        write_remote_generation_script_fixture(
-            &wrong_mode,
-            &"a".repeat(64),
-            "ft",
-            "wrong-mode",
-        );
+        write_remote_generation_script_fixture(&wrong_mode, &"a".repeat(64), "ft", "wrong-mode");
         std::fs::set_permissions(&wrong_mode, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(read_remote_generation_source_snapshot(
-            &wrong_mode,
-            REMOTE_GENERATION_FT_FILE,
-            remote_generation_effective_uid(),
-        )
-        .is_err());
+        assert!(
+            read_remote_generation_source_snapshot(
+                &wrong_mode,
+                REMOTE_GENERATION_FT_FILE,
+                remote_generation_effective_uid(),
+            )
+            .is_err()
+        );
 
         let root = fixture.path().join("unsafe-root");
         std::fs::create_dir(&root).unwrap();
@@ -101043,7 +101010,10 @@ log_level = "debug"
         })
         .expect_err("unsafe existing current selector must fail closed");
         assert!(error.to_string().contains("selector"));
-        assert_eq!(std::fs::read_link(root.join("current")).unwrap(), PathBuf::from("../escape"));
+        assert_eq!(
+            std::fs::read_link(root.join("current")).unwrap(),
+            PathBuf::from("../escape")
+        );
     }
 
     #[test]
@@ -101094,9 +101064,10 @@ log_level = "debug"
         assert!(pending.contains("restore_pending_ft()"));
         assert!(pending.contains("FT_COMPONENT_ROLLBACK_INCOMPLETE="));
         assert!(!pending.contains("ft_backup=\"\""));
-        assert!(active.contains(
-            "FT_COMPONENT_PUBLICATION=active_compensating_publish_not_crash_atomic"
-        ));
+        assert!(
+            active
+                .contains("FT_COMPONENT_PUBLICATION=active_compensating_publish_not_crash_atomic")
+        );
         assert!(active.contains("ft_backup=\"\""));
         assert!(active.contains("test ! -L \"$ft_backup_candidate\""));
         assert!(active.contains("test ! -L \"$mux_backup_candidate\""));
@@ -101193,11 +101164,13 @@ log_level = "debug"
         );
         assert!(mux_stage.is_file());
         assert!(!bin.join(format!("ft.previous-{suffix}")).exists());
-        assert!(!bin
-            .join(format!("frankenterm-mux-server.previous-{suffix}"))
-            .exists());
-        assert!(!String::from_utf8_lossy(&output.stderr)
-            .contains("FT_COMPONENT_ROLLBACK_INCOMPLETE"));
+        assert!(
+            !bin.join(format!("frankenterm-mux-server.previous-{suffix}"))
+                .exists()
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("FT_COMPONENT_ROLLBACK_INCOMPLETE")
+        );
     }
 
     #[test]
@@ -101233,12 +101206,9 @@ log_level = "debug"
         assert_eq!(receipt.ft.sha256, ft_sha);
         assert_eq!(receipt.mux_server.byte_len, 202);
         assert_eq!(receipt.mux_server.sha256, mux_sha);
-        let stage = remote_release_stage_command(
-            "v0.15.2",
-            "0123456789abcdef0123456789abcdef",
-            &receipt,
-        )
-        .unwrap();
+        let stage =
+            remote_release_stage_command("v0.15.2", "0123456789abcdef0123456789abcdef", &receipt)
+                .unwrap();
         assert!(stage.matches(&receipt.ft.sha256).count() >= 2);
         assert!(stage.matches(&receipt.mux_server.sha256).count() >= 2);
         assert!(stage.contains("test ! -L \"$ft_stage\""));
@@ -101250,9 +101220,7 @@ log_level = "debug"
         assert!(!stage.contains("mv \"$ft_source\" \"$ft_stage\""));
         assert!(!stage.contains("mv \"$mux_source\" \"$mux_stage\""));
         assert!(stage.contains("FT_RELEASE_COMPONENT_STAGE_V1=v0.15.2"));
-        assert!(
-            remote_release_stage_command("v0.15.2", "bad-suffix", &receipt).is_err()
-        );
+        assert!(remote_release_stage_command("v0.15.2", "bad-suffix", &receipt).is_err());
 
         for rejected in [
             format!(
@@ -101309,12 +101277,7 @@ log_level = "debug"
                 "hostile remote host was accepted: {rejected:?}"
             );
         }
-        for accepted in [
-            "csd",
-            "user@trj.example.com",
-            "[fe80::1%en0]",
-            "builder_01",
-        ] {
+        for accepted in ["csd", "user@trj.example.com", "[fe80::1%en0]", "builder_01"] {
             assert_eq!(validate_remote_host(accepted).unwrap(), accepted);
         }
     }
@@ -101340,12 +101303,7 @@ log_level = "debug"
         );
     }
 
-    fn write_atomic_component_fixture(
-        path: &Path,
-        build_id: &str,
-        component: &str,
-        target: &str,
-    ) {
+    fn write_atomic_component_fixture(path: &Path, build_id: &str, component: &str, target: &str) {
         std::fs::write(
             path,
             format!(
@@ -101363,12 +101321,7 @@ log_level = "debug"
         let ft_path = dir.path().join("ft");
         let mux_path = dir.path().join("frankenterm-mux-server");
         let build_id = "a".repeat(64);
-        write_atomic_component_fixture(
-            &ft_path,
-            &build_id,
-            "ft",
-            "x86_64-unknown-linux-gnu",
-        );
+        write_atomic_component_fixture(&ft_path, &build_id, "ft", "x86_64-unknown-linux-gnu");
         write_atomic_component_fixture(
             &mux_path,
             &build_id,
@@ -101380,13 +101333,13 @@ log_level = "debug"
         assert_eq!(&family.ft.identity, &family.mux_server.identity);
         assert_eq!(family.ft.sha256.len(), 64);
         assert_eq!(family.mux_server.sha256.len(), 64);
-        assert_eq!(family.ft.byte_len, std::fs::metadata(&ft_path).unwrap().len());
+        assert_eq!(
+            family.ft.byte_len,
+            std::fs::metadata(&ft_path).unwrap().len()
+        );
         let expected_ft_sha256 =
             hex::encode(sha2::Sha256::digest(std::fs::read(&ft_path).unwrap()));
-        assert_eq!(
-            family.ft.sha256.as_str(),
-            expected_ft_sha256.as_str()
-        );
+        assert_eq!(family.ft.sha256.as_str(), expected_ft_sha256.as_str());
 
         let staging_suffix = "0123456789abcdef0123456789abcdef";
         let upload_preflight =
@@ -101404,11 +101357,7 @@ log_level = "debug"
         assert!(upload.contains("test ! -e \"$path\" && test ! -L \"$path\""));
         assert!(upload.contains("cat > \"$path\""));
 
-        let verification = remote_component_verification_command(
-            "ft",
-            staging_suffix,
-            &family.ft,
-        );
+        let verification = remote_component_verification_command("ft", staging_suffix, &family.ft);
         assert!(verification.contains("test -f \"$path\" && test ! -L \"$path\""));
         assert!(verification.contains(&format!(
             "test \"$actual_bytes\" = \"{}\"",
@@ -101427,9 +101376,7 @@ log_level = "debug"
             let remote_home = dir.path().join("remote-home");
             let remote_bin = remote_home.join(".local/bin");
             std::fs::create_dir_all(&remote_bin).expect("create remote component fixture path");
-            let remote_stage = remote_bin.join(
-                "ft.installing-0123456789abcdef0123456789abcdef",
-            );
+            let remote_stage = remote_bin.join("ft.installing-0123456789abcdef0123456789abcdef");
             let uploaded = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&upload)
@@ -101462,9 +101409,7 @@ log_level = "debug"
             );
             assert_eq!(
                 String::from_utf8_lossy(&replay_preflight.stdout),
-                format!(
-                    "FT_REMOTE_COMPONENT_UPLOAD_V1=existing_exact:ft:{staging_suffix}\n"
-                )
+                format!("FT_REMOTE_COMPONENT_UPLOAD_V1=existing_exact:ft:{staging_suffix}\n")
             );
 
             let refused_overwrite = std::process::Command::new("sh")
@@ -101533,22 +101478,17 @@ log_level = "debug"
                 "ft bytes must be verified both before execution and immediately before publication"
             );
             assert!(
-                publish_command
-                    .matches(&family.mux_server.sha256)
-                    .count()
-                    >= 2,
+                publish_command.matches(&family.mux_server.sha256).count() >= 2,
                 "mux bytes must be verified both before execution and immediately before publication"
             );
             assert!(publish_command.contains("--version >/dev/null"));
             assert!(
-                local_process_family_publish_command("not-a-suffix", &byte_receipt, false)
-                    .is_err(),
+                local_process_family_publish_command("not-a-suffix", &byte_receipt, false).is_err(),
                 "publication must reject a shell-unsafe staging suffix"
             );
 
-            let remote_mux_stage = remote_bin.join(
-                "frankenterm-mux-server.installing-0123456789abcdef0123456789abcdef",
-            );
+            let remote_mux_stage = remote_bin
+                .join("frankenterm-mux-server.installing-0123456789abcdef0123456789abcdef");
             std::fs::copy(&mux_path, &remote_mux_stage)
                 .expect("stage exact mux component fixture bytes");
             let rejected_publication = std::process::Command::new("sh")
@@ -101606,8 +101546,9 @@ log_level = "debug"
             assert!(pending_publish.matches(&family.mux_server.sha256).count() >= 2);
             let pending_suffix = "fedcba9876543210fedcba9876543210";
             let pending_ft_stage = remote_bin.join(format!("ft.installing-{pending_suffix}"));
-            let pending_mux_stage =
-                remote_bin.join(format!("frankenterm-mux-server.installing-{pending_suffix}"));
+            let pending_mux_stage = remote_bin.join(format!(
+                "frankenterm-mux-server.installing-{pending_suffix}"
+            ));
             std::fs::copy(&ft_path, &pending_ft_stage)
                 .expect("stage ft fixture for pending no-clobber test");
             std::fs::copy(&mux_path, &pending_mux_stage)
@@ -101629,9 +101570,11 @@ log_level = "debug"
             );
             assert!(pending_ft_stage.is_file());
             assert!(pending_mux_stage.is_file());
-            assert!(!remote_bin
-                .join(format!("frankenterm-mux-server.pending-{pending_suffix}"))
-                .exists());
+            assert!(
+                !remote_bin
+                    .join(format!("frankenterm-mux-server.pending-{pending_suffix}"))
+                    .exists()
+            );
 
             let release_suffix = "11111111111111111111111111111111";
             let release_dir = remote_home
@@ -101641,11 +101584,8 @@ log_level = "debug"
                 .expect("create verified release fixture directory");
             std::fs::copy(&ft_path, release_dir.join("ft"))
                 .expect("stage verified release ft fixture");
-            std::fs::copy(
-                &mux_path,
-                release_dir.join("frankenterm-mux-server"),
-            )
-            .expect("stage verified release mux fixture");
+            std::fs::copy(&mux_path, release_dir.join("frankenterm-mux-server"))
+                .expect("stage verified release mux fixture");
             let release_stage_command =
                 remote_release_stage_command("v0.15.2", release_suffix, &byte_receipt)
                     .expect("render verified release byte-binding transaction");
@@ -101666,10 +101606,8 @@ log_level = "debug"
             );
             assert_eq!(
                 hex::encode(sha2::Sha256::digest(
-                    std::fs::read(remote_bin.join(format!(
-                        "ft.installing-{release_suffix}"
-                    )))
-                    .unwrap()
+                    std::fs::read(remote_bin.join(format!("ft.installing-{release_suffix}")))
+                        .unwrap()
                 )),
                 family.ft.sha256
             );
@@ -101723,12 +101661,7 @@ log_level = "debug"
                 .to_string()
                 .contains("parent component")
         );
-        write_atomic_component_fixture(
-            &path,
-            "unsealed",
-            "ft",
-            "x86_64-unknown-linux-gnu",
-        );
+        write_atomic_component_fixture(&path, "unsealed", "ft", "x86_64-unknown-linux-gnu");
         assert!(read_local_component_snapshot(&path, "ft").is_err());
 
         write_atomic_component_fixture(
@@ -101844,8 +101777,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         std::fs::create_dir_all(&destination).expect("create partial destination");
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
             .expect("make partial destination private");
-        std::fs::write(destination.join("ft"), b"partial")
-            .expect("plant incomplete prior ft");
+        std::fs::write(destination.join("ft"), b"partial").expect("plant incomplete prior ft");
         std::fs::set_permissions(
             destination.join("ft"),
             std::fs::Permissions::from_mode(0o600),
@@ -101897,14 +101829,21 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
     fn top_level_installer_launch_probes_both_staged_components_before_backup() {
         let installer = include_str!("../../../install.sh");
         assert!(installer.contains("Refusing process-family source paths that are symlinks"));
-        assert!(installer.contains("Refusing to reuse an existing process-family transaction path"));
+        assert!(
+            installer.contains("Refusing to reuse an existing process-family transaction path")
+        );
         assert!(installer.contains("[ -L \"$ft_target\" ]"));
         assert!(installer.contains("[ -L \"$mux_target\" ]"));
         assert!(installer.contains("[ -L \"$ft_backup_candidate\" ]"));
         assert!(installer.contains("[ -L \"$mux_backup_candidate\" ]"));
         assert!(installer.contains("restore_preserved_component()"));
-        assert!(installer.contains("Cannot restore preserved $label because its target path is occupied"));
-        assert!(installer.contains("Process-family rollback was incomplete; preserved bytes require operator recovery"));
+        assert!(
+            installer
+                .contains("Cannot restore preserved $label because its target path is occupied")
+        );
+        assert!(installer.contains(
+            "Process-family rollback was incomplete; preserved bytes require operator recovery"
+        ));
         assert!(!installer.contains("mv \"$ft_backup\" \"$ft_target\" || true"));
         assert!(!installer.contains("mv \"$mux_backup\" \"$mux_target\" || true"));
         let ft_probe = installer
@@ -101929,9 +101868,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(installer.contains("command -v head >/dev/null 2>&1 || return 1"));
         assert!(installer.contains("command -v awk >/dev/null 2>&1 || return 1"));
         assert!(installer.contains("sed 's/:ft:/:ROLE:/' | sort -u"));
-        assert!(installer.contains(
-            "sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u"
-        ));
+        assert!(installer.contains("sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u"));
     }
 
     #[cfg(unix)]
@@ -101954,12 +101891,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         let ft_path = dir.path().join("ft");
         let mux_path = dir.path().join("frankenterm-mux-server");
         let build_id = "a".repeat(64);
-        write_atomic_component_fixture(
-            &ft_path,
-            &build_id,
-            "ft",
-            "x86_64-unknown-linux-gnu",
-        );
+        write_atomic_component_fixture(&ft_path, &build_id, "ft", "x86_64-unknown-linux-gnu");
         write_atomic_component_fixture(
             &mux_path,
             &build_id,
@@ -101971,8 +101903,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
                 .expect("read component fixture metadata")
                 .permissions();
             permissions.set_mode(0o755);
-            std::fs::set_permissions(path, permissions)
-                .expect("make component fixture executable");
+            std::fs::set_permissions(path, permissions).expect("make component fixture executable");
         }
 
         let check = |expected_success: bool| {
@@ -101999,16 +101930,8 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         );
         check(false);
 
-        for (path, component) in [
-            (&ft_path, "ft"),
-            (&mux_path, "frankenterm-mux-server"),
-        ] {
-            write_atomic_component_fixture(
-                path,
-                &build_id,
-                component,
-                "x86_64-unknown-linux-gnu",
-            );
+        for (path, component) in [(&ft_path, "ft"), (&mux_path, "frankenterm-mux-server")] {
+            write_atomic_component_fixture(path, &build_id, component, "x86_64-unknown-linux-gnu");
             let stale = std::fs::read_to_string(path)
                 .expect("read stale-version fixture")
                 .replace("release-interactive:0.15.2;", "release-interactive:0.15.1;");
@@ -102016,16 +101939,8 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         }
         check(false);
 
-        for (path, component) in [
-            (&ft_path, "ft"),
-            (&mux_path, "frankenterm-mux-server"),
-        ] {
-            write_atomic_component_fixture(
-                path,
-                &build_id,
-                component,
-                "x86_64-unknown-linux-gnu",
-            );
+        for (path, component) in [(&ft_path, "ft"), (&mux_path, "frankenterm-mux-server")] {
+            write_atomic_component_fixture(path, &build_id, component, "x86_64-unknown-linux-gnu");
             let debug = std::fs::read_to_string(path)
                 .expect("read non-shipping-profile fixture")
                 .replace("release-interactive:0.15.2;", "debug:0.15.2;");
@@ -102033,12 +101948,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         }
         check(false);
 
-        write_atomic_component_fixture(
-            &ft_path,
-            &build_id,
-            "ft",
-            "aarch64-unknown-linux-gnu",
-        );
+        write_atomic_component_fixture(&ft_path, &build_id, "ft", "aarch64-unknown-linux-gnu");
         write_atomic_component_fixture(
             &mux_path,
             &build_id,
@@ -102047,12 +101957,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         );
         check(false);
 
-        write_atomic_component_fixture(
-            &ft_path,
-            &build_id,
-            "ft",
-            "x86_64-unknown-linux-gnu",
-        );
+        write_atomic_component_fixture(&ft_path, &build_id, "ft", "x86_64-unknown-linux-gnu");
         write_atomic_component_fixture(
             &mux_path,
             &build_id,

@@ -3,7 +3,7 @@ use crate::client::{
     RpcGenerationScope,
 };
 use crate::pane::{ClientPane, ReliableInputQueue};
-use anyhow::{Context, anyhow, bail, ensure};
+use anyhow::{anyhow, bail, ensure, Context};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
@@ -3943,14 +3943,7 @@ impl Domain for ClientDomain {
             })?;
             let rpc = inner.client.rpc_scope();
             ensure!(
-                Self::sync_remote_topology(
-                    Arc::clone(mux),
-                    self,
-                    inner,
-                    &rpc,
-                    window_id,
-                )
-                .await?,
+                Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id,).await?,
                 "client attachment retired while coalescing an attach request"
             );
             return Ok(());
@@ -3975,74 +3968,75 @@ impl Domain for ClientDomain {
         let (ui, background_ui) = self.initial_attachment_ui(window_id)?;
         ui.title("FrankenTerm: Connecting...");
 
-        let attach_result = ui.async_run_and_log_error({
-            let ui = ui.clone();
-            let mux = Arc::clone(mux);
-            async move {
-                let result = with_mux_rpc_bootstrap_timeout(async {
-                    let mut cloned_ui = ui.clone();
-                    let mux_owner = Arc::downgrade(&mux);
-                    let client = spawn_into_new_thread(move || match &config {
-                        ClientDomainConfig::Unix(unix) => {
-                            let initial = true;
-                            let no_auto_start = false;
-                            Client::new_unix_domain(
-                                Some(domain_id),
-                                unix,
-                                initial,
-                                &mut cloned_ui,
-                                no_auto_start,
-                                mux_owner,
+        let attach_result = ui
+            .async_run_and_log_error({
+                let ui = ui.clone();
+                let mux = Arc::clone(mux);
+                async move {
+                    let result = with_mux_rpc_bootstrap_timeout(async {
+                        let mut cloned_ui = ui.clone();
+                        let mux_owner = Arc::downgrade(&mux);
+                        let client = spawn_into_new_thread(move || match &config {
+                            ClientDomainConfig::Unix(unix) => {
+                                let initial = true;
+                                let no_auto_start = false;
+                                Client::new_unix_domain(
+                                    Some(domain_id),
+                                    unix,
+                                    initial,
+                                    &mut cloned_ui,
+                                    no_auto_start,
+                                    mux_owner,
+                                )
+                            }
+                            ClientDomainConfig::Tls(tls) => {
+                                Client::new_tls(domain_id, tls, &mut cloned_ui, mux_owner)
+                            }
+                            ClientDomainConfig::Ssh(ssh) => {
+                                Client::new_ssh(domain_id, ssh, &mut cloned_ui, mux_owner)
+                            }
+                        })
+                        .await?;
+
+                        ui.output_str("Checking server version\n");
+                        let rpc = client.bootstrap_rpc_scope();
+                        let mut abort_guard = rpc.abort_guard(
+                            "initial mux RPC bootstrap failed, timed out, or was cancelled",
+                        )?;
+                        let attach_result = async {
+                            client.verify_version_compat_with_scope(&ui, &rpc).await?;
+
+                            ui.output_str(
+                                "Version check OK!  Requesting coherent topology snapshot...\n",
+                            );
+                            ClientDomain::finish_attach(
+                                &mux,
+                                domain_id,
+                                client,
+                                rpc,
+                                &abort_guard,
+                                InitialAttachmentRequest {
+                                    owner_client_id,
+                                    primary_window_id: window_id,
+                                },
                             )
+                            .await
                         }
-                        ClientDomainConfig::Tls(tls) => {
-                            Client::new_tls(domain_id, tls, &mut cloned_ui, mux_owner)
+                        .await;
+                        if attach_result.is_ok() {
+                            abort_guard.disarm();
                         }
-                        ClientDomainConfig::Ssh(ssh) => {
-                            Client::new_ssh(domain_id, ssh, &mut cloned_ui, mux_owner)
-                        }
+                        attach_result
                     })
-                    .await?;
-
-                    ui.output_str("Checking server version\n");
-                    let rpc = client.bootstrap_rpc_scope();
-                    let mut abort_guard = rpc.abort_guard(
-                        "initial mux RPC bootstrap failed, timed out, or was cancelled",
-                    )?;
-                    let attach_result = async {
-                        client.verify_version_compat_with_scope(&ui, &rpc).await?;
-
-                        ui.output_str(
-                            "Version check OK!  Requesting coherent topology snapshot...\n",
-                        );
-                        ClientDomain::finish_attach(
-                            &mux,
-                            domain_id,
-                            client,
-                            rpc,
-                            &abort_guard,
-                            InitialAttachmentRequest {
-                                owner_client_id,
-                                primary_window_id: window_id,
-                            },
-                        )
-                        .await
-                    }
                     .await;
-                    if attach_result.is_ok() {
-                        abort_guard.disarm();
-                    }
-                    attach_result
-                })
-                .await;
-                result
-            }
-        })
-        .await
-        .map_err(|e| {
-            ui.output_str(&format!("Error during attach: {:#}\n", e));
-            e
-        });
+                    result
+                }
+            })
+            .await
+            .map_err(|e| {
+                ui.output_str(&format!("Error during attach: {:#}\n", e));
+                e
+            });
         if attach_result.is_ok() {
             ui.output_str("Attached!\n");
         }
@@ -4162,9 +4156,7 @@ mod tests {
             unreachable!("test config is unix")
         };
         enabled.connect_automatically = true;
-        assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(
-            enabled.clone(),
-        )));
+        assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(enabled.clone(),)));
         assert!(domain.connect_automatically());
 
         enabled.connect_automatically = false;

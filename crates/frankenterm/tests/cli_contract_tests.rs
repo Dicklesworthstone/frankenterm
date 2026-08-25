@@ -4106,8 +4106,8 @@ fn session_orphan_file_limit_opt_in_admits_valid_nondefault_capacity() {
         .output()
         .expect("default bounded list should execute");
     assert!(default_output.status.success());
-    let default_payload: serde_json::Value = serde_json::from_slice(&default_output.stdout)
-        .expect("default list stdout should be JSON");
+    let default_payload: serde_json::Value =
+        serde_json::from_slice(&default_output.stdout).expect("default list stdout should be JSON");
     assert_eq!(default_payload["orphans"][0]["state"], "unsafe");
     assert_eq!(default_payload["orphans"][0]["unsafe_reason"], "oversized");
 
@@ -4182,8 +4182,7 @@ fn session_discard_removes_bin_retains_lock_and_disappears_from_list() {
             .expect("read stale lock metadata")
             .permissions();
         permissions.set_mode(0o600);
-        std::fs::set_permissions(&lock_path, permissions)
-            .expect("harden stale lock permissions");
+        std::fs::set_permissions(&lock_path, permissions).expect("harden stale lock permissions");
     }
 
     let output = wa_cmd_for(&ws)
@@ -4205,10 +4204,7 @@ fn session_discard_removes_bin_retains_lock_and_disappears_from_list() {
     assert_eq!(payload["action"], "discard");
     assert_eq!(payload["pane_uuid"], pane_uuid);
     assert_eq!(payload["removed"]["bin"], path.display().to_string());
-    assert_eq!(
-        payload["retained"]["lock"],
-        lock_path.display().to_string()
-    );
+    assert_eq!(payload["retained"]["lock"], lock_path.display().to_string());
     assert_eq!(
         payload["retained"]["reason"],
         "preserve_single_flock_inode_authority"
@@ -4304,12 +4300,15 @@ fn session_recover_requires_explicit_opt_in_before_retaining_an_incomplete_sourc
         "explicit partial recovery failed: {}",
         String::from_utf8_lossy(&retained.stderr)
     );
-    let retained_payload: serde_json::Value = serde_json::from_slice(&retained.stdout)
-        .expect("partial-recovery stdout should be JSON");
+    let retained_payload: serde_json::Value =
+        serde_json::from_slice(&retained.stdout).expect("partial-recovery stdout should be JSON");
     assert_eq!(retained_payload["ok"], true);
     assert_eq!(retained_payload["complete"], false);
     assert_eq!(retained_payload["partial_retention_authorized"], true);
-    assert_eq!(retained_payload["scrollback_export"]["status"], "unreplayable");
+    assert_eq!(
+        retained_payload["scrollback_export"]["status"],
+        "unreplayable"
+    );
     assert_eq!(
         retained_payload["scrollback_export"]["source_completeness"]["status"],
         "incomplete"
@@ -4396,7 +4395,10 @@ fn session_recover_exports_sigkill_orphan_without_mux_mutation() {
     assert_eq!(recover["pane_uuid"], pane_uuid);
     assert_eq!(recover["live_pty_mutated"], false);
     assert_eq!(recover["redaction_applied"], true);
-    assert_eq!(recover["output_path"], transcript_path.display().to_string());
+    assert_eq!(
+        recover["output_path"],
+        transcript_path.display().to_string()
+    );
     assert_eq!(recover["scrollback_export"]["status"], "replayed");
     assert_eq!(recover["scrollback_export"]["records_read"], 1);
     assert_eq!(recover["scrollback_export"]["records_replayed"], 1);

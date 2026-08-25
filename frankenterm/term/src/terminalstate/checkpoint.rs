@@ -393,16 +393,9 @@ impl CheckpointSrgba {
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum CheckpointColorAttribute {
     Default,
-    PaletteIndex {
-        index: u8,
-    },
-    TrueColorWithDefaultFallback {
-        color: CheckpointSrgba,
-    },
-    TrueColorWithPaletteFallback {
-        color: CheckpointSrgba,
-        index: u8,
-    },
+    PaletteIndex { index: u8 },
+    TrueColorWithDefaultFallback { color: CheckpointSrgba },
+    TrueColorWithPaletteFallback { color: CheckpointSrgba, index: u8 },
 }
 
 impl CheckpointColorAttribute {
@@ -469,11 +462,7 @@ impl CheckpointRgbColor {
     }
 
     fn into_live(self) -> RgbColor {
-        RgbColor::new_8bpc(
-            (self.0 >> 16) as u8,
-            (self.0 >> 8) as u8,
-            self.0 as u8,
-        )
+        RgbColor::new_8bpc((self.0 >> 16) as u8, (self.0 >> 8) as u8, self.0 as u8)
     }
 }
 
@@ -977,14 +966,14 @@ impl CheckpointKeyboardEncoding {
             Self::Xterm => KeyboardEncoding::Xterm,
             Self::CsiU => KeyboardEncoding::CsiU,
             Self::Win32 => KeyboardEncoding::Win32,
-            Self::Kitty(bits) => KeyboardEncoding::Kitty(
-                KittyKeyboardFlags::from_bits(bits).ok_or(
+            Self::Kitty(bits) => {
+                KeyboardEncoding::Kitty(KittyKeyboardFlags::from_bits(bits).ok_or(
                     TerminalCheckpointError::InvalidField {
                         field: "keyboard_encoding",
                         reason: "unknown Kitty keyboard flag bits",
                     },
-                )?,
-            ),
+                )?)
+            }
         })
     }
 }
@@ -1238,12 +1227,11 @@ impl CheckpointLine {
             .try_reserve_exact(line.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
         for cell in line.visible_cells() {
-            let width = u8::try_from(cell.width()).map_err(|_| {
-                TerminalCheckpointError::InvalidField {
+            let width =
+                u8::try_from(cell.width()).map_err(|_| TerminalCheckpointError::InvalidField {
                     field: "cell.width",
                     reason: "cell width does not fit the checkpoint wire type",
-                }
-            })?;
+                })?;
             if !(1..=2).contains(&width) {
                 return Err(TerminalCheckpointError::InvalidField {
                     field: "cell.width",
@@ -1322,12 +1310,7 @@ impl CheckpointLine {
                 reason: "line sequence number is newer than the terminal",
             });
         }
-        checked_accumulate(
-            &mut usage.lines,
-            1,
-            limits.max_total_lines,
-            "screen_lines",
-        )?;
+        checked_accumulate(&mut usage.lines, 1, limits.max_total_lines, "screen_lines")?;
         checked_accumulate(
             &mut usage.retained_capture_bytes,
             std::mem::size_of::<Line>() + std::mem::size_of::<CheckpointLine>(),
@@ -1554,12 +1537,14 @@ impl CheckpointCustomCellWidthTableBuilder {
         entries
             .try_reserve_exact(widths.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("custom_cell_width_maps"))?;
-        entries.extend(widths.iter().map(|(codepoint, width)| {
-            CheckpointCustomCellWidth {
-                codepoint: *codepoint,
-                width: *width,
-            }
-        }));
+        entries.extend(
+            widths
+                .iter()
+                .map(|(codepoint, width)| CheckpointCustomCellWidth {
+                    codepoint: *codepoint,
+                    width: *width,
+                }),
+        );
         entries.sort_unstable_by_key(|entry| entry.codepoint);
         self.tables.push(CheckpointCustomCellWidthMap { entries });
         self.total_entries = observed;
@@ -1663,9 +1648,13 @@ fn validate_live_custom_cell_width_maps(
             limits.max_total_custom_cell_widths,
             "custom_cell_widths",
         )?;
-        let retained_bytes = widths.len().checked_mul(48).ok_or(
-            TerminalCheckpointError::ArithmeticOverflow("retained_capture_bytes"),
-        )?;
+        let retained_bytes =
+            widths
+                .len()
+                .checked_mul(48)
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                    "retained_capture_bytes",
+                ))?;
         checked_accumulate(
             &mut usage.retained_capture_bytes,
             retained_bytes,
@@ -1720,22 +1709,21 @@ impl CheckpointUnicodeVersion {
         value: &UnicodeVersion,
         tables: &[CheckpointCustomCellWidthMap],
     ) -> Result<Self, TerminalCheckpointError> {
-        let custom_cell_width_map =
-            CheckpointCustomCellWidthTableBuilder::live_widths(value)
-                .map(|widths| {
-                    let index = tables
-                        .iter()
-                        .position(|table| table.matches_live(widths))
-                        .ok_or(TerminalCheckpointError::InvalidField {
-                            field: "custom_cell_width_maps",
-                            reason: "capture table is missing a registered live width map",
-                        })?;
-                    u32::try_from(index).map_err(|_| TerminalCheckpointError::InvalidField {
+        let custom_cell_width_map = CheckpointCustomCellWidthTableBuilder::live_widths(value)
+            .map(|widths| {
+                let index = tables
+                    .iter()
+                    .position(|table| table.matches_live(widths))
+                    .ok_or(TerminalCheckpointError::InvalidField {
                         field: "custom_cell_width_maps",
-                        reason: "custom-width table index does not fit the wire type",
-                    })
+                        reason: "capture table is missing a registered live width map",
+                    })?;
+                u32::try_from(index).map_err(|_| TerminalCheckpointError::InvalidField {
+                    field: "custom_cell_width_maps",
+                    reason: "custom-width table index does not fit the wire type",
                 })
-                .transpose()?;
+            })
+            .transpose()?;
         Ok(Self {
             version: value.version,
             ambiguous_are_wide: value.ambiguous_are_wide,
@@ -1771,10 +1759,7 @@ impl CheckpointUnicodeVersion {
         })
     }
 
-    fn validate(
-        &self,
-        table_count: usize,
-    ) -> Result<(), TerminalCheckpointError> {
+    fn validate(&self, table_count: usize) -> Result<(), TerminalCheckpointError> {
         self.referenced_index(table_count)?;
         Ok(())
     }
@@ -1785,12 +1770,11 @@ impl CheckpointUnicodeVersion {
     ) -> Result<Option<usize>, TerminalCheckpointError> {
         self.custom_cell_width_map
             .map(|index| {
-                let index = usize::try_from(index).map_err(|_| {
-                    TerminalCheckpointError::InvalidField {
+                let index =
+                    usize::try_from(index).map_err(|_| TerminalCheckpointError::InvalidField {
                         field: "unicode_version.custom_cell_width_map",
                         reason: "custom-width table index does not fit this architecture",
-                    }
-                })?;
+                    })?;
                 if index >= table_count {
                     return Err(TerminalCheckpointError::InvalidField {
                         field: "unicode_version.custom_cell_width_map",
@@ -1873,11 +1857,7 @@ impl PendingReplayConfigV2 {
             scrollback_size,
             limits.max_total_lines,
         )?;
-        ensure_limit(
-            "config.max_user_vars",
-            max_user_vars,
-            limits.max_user_vars,
-        )?;
+        ensure_limit("config.max_user_vars", max_user_vars, limits.max_user_vars)?;
         ensure_limit(
             "config.max_unicode_version_stack_depth",
             max_unicode_version_stack_depth,
@@ -1886,7 +1866,9 @@ impl PendingReplayConfigV2 {
         ensure_limit(
             "config.max_accumulating_title_len",
             max_accumulating_title_len,
-            limits.max_string_bytes.min(limits.max_terminal_string_bytes),
+            limits
+                .max_string_bytes
+                .min(limits.max_terminal_string_bytes),
         )?;
         let projection = Self {
             version: CHECKPOINT_REPLAY_CONFIG_VERSION,
@@ -1943,8 +1925,7 @@ impl PendingReplayConfigV2 {
             && checkpoint.color_palette == self.color_palette
             && checkpoint.enable_kitty_keyboard == self.enable_kitty_keyboard
             && checkpoint.max_user_vars == self.max_user_vars
-            && checkpoint.max_unicode_version_stack_depth
-                == self.max_unicode_version_stack_depth
+            && checkpoint.max_unicode_version_stack_depth == self.max_unicode_version_stack_depth
             && checkpoint.max_accumulating_title_len == self.max_accumulating_title_len
             && expected_unicode == self.unicode_version
             && checkpoint.normalize_output_to_unicode_nfc == self.normalize_output_to_unicode_nfc
@@ -2007,7 +1988,9 @@ impl CheckpointReplayConfigV2 {
         ensure_limit(
             "config.max_accumulating_title_len",
             max_title,
-            limits.max_string_bytes.min(limits.max_terminal_string_bytes),
+            limits
+                .max_string_bytes
+                .min(limits.max_terminal_string_bytes),
         )
     }
 
@@ -2017,10 +2000,7 @@ impl CheckpointReplayConfigV2 {
         tables: &[Arc<HashMap<u32, u8>>],
     ) -> Result<ReplayTerminalConfiguration, TerminalCheckpointError> {
         Ok(ReplayTerminalConfiguration {
-            scrollback_size: usize_from_u64(
-                self.scrollback_size,
-                "config.scrollback_size",
-            )?,
+            scrollback_size: usize_from_u64(self.scrollback_size, "config.scrollback_size")?,
             color_palette: self.color_palette.clone().into_live()?,
             enable_kitty_keyboard: self.enable_kitty_keyboard,
             max_user_vars: usize_from_u64(self.max_user_vars, "config.max_user_vars")?,
@@ -2149,7 +2129,6 @@ impl CheckpointSavedCursor {
             g1_charset: self.g1_charset.into_live(),
         })
     }
-
 
     fn validate(
         &self,
@@ -2343,9 +2322,11 @@ impl CheckpointScreen {
         if cols == 0 || cols > limits.max_cols {
             return Err(resource_limit("physical_cols", cols, limits.max_cols));
         }
-        let visible_grid_cells = rows.checked_mul(cols).ok_or(
-            TerminalCheckpointError::ArithmeticOverflow("visible_grid_cells"),
-        )?;
+        let visible_grid_cells =
+            rows.checked_mul(cols)
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                    "visible_grid_cells",
+                ))?;
         ensure_limit(
             "visible_grid_cells",
             visible_grid_cells,
@@ -2380,10 +2361,8 @@ impl CheckpointScreen {
                 reason: "screen has fewer lines than its visible height",
             });
         }
-        let cold_prefix_line_count = usize_from_u64(
-            self.cold_prefix_line_count,
-            "screen.cold_prefix_line_count",
-        )?;
+        let cold_prefix_line_count =
+            usize_from_u64(self.cold_prefix_line_count, "screen.cold_prefix_line_count")?;
         if cold_prefix_line_count > self.lines.len().saturating_sub(rows) {
             return Err(TerminalCheckpointError::InvalidField {
                 field: "screen.cold_prefix_line_count",
@@ -2413,18 +2392,14 @@ impl CheckpointScreen {
                 });
             }
         }
-        let line_count = u64::try_from(self.lines.len()).map_err(|_| {
-            TerminalCheckpointError::InvalidField {
+        let line_count =
+            u64::try_from(self.lines.len()).map_err(|_| TerminalCheckpointError::InvalidField {
                 field: "screen.lines",
                 reason: "line count does not fit the checkpoint wire type",
-            }
-        })?;
-        let stable_end = self
-            .stable_row_index_offset
-            .checked_add(line_count)
-            .ok_or(TerminalCheckpointError::ArithmeticOverflow(
-                "screen.stable_row_range",
-            ))?;
+            })?;
+        let stable_end = self.stable_row_index_offset.checked_add(line_count).ok_or(
+            TerminalCheckpointError::ArithmeticOverflow("screen.stable_row_range"),
+        )?;
         let stable_max = u64::try_from(StableRowIndex::MAX).unwrap_or(u64::MAX);
         if stable_end > stable_max {
             return Err(TerminalCheckpointError::InvalidField {
@@ -2513,8 +2488,7 @@ impl Default for TerminalCheckpointLimits {
             max_tab_stops: 32_768,
             max_user_vars: 512,
             max_unicode_stack_depth: 64,
-            max_total_custom_cell_widths: 2
-                * frankenterm_cell::MAX_CUSTOM_CELL_WIDTH_EXPANSION,
+            max_total_custom_cell_widths: 2 * frankenterm_cell::MAX_CUSTOM_CELL_WIDTH_EXPANSION,
             max_terminal_string_bytes: 8 * 1024 * 1024,
             max_pixel_dimension: 1_048_576,
             max_dpi: 1_000_000,
@@ -2586,8 +2560,16 @@ impl TerminalCheckpointLimits {
                 self.max_replay_actions_per_record,
                 Self::ABSOLUTE_MAX_REPLAY_ACTIONS_PER_RECORD,
             ),
-            ("configured_max_rows", self.max_rows, Self::ABSOLUTE_MAX_ROWS),
-            ("configured_max_cols", self.max_cols, Self::ABSOLUTE_MAX_COLS),
+            (
+                "configured_max_rows",
+                self.max_rows,
+                Self::ABSOLUTE_MAX_ROWS,
+            ),
+            (
+                "configured_max_cols",
+                self.max_cols,
+                Self::ABSOLUTE_MAX_COLS,
+            ),
             (
                 "configured_max_visible_grid_cells",
                 self.max_visible_grid_cells,
@@ -2704,7 +2686,10 @@ impl TerminalCheckpointLimits {
                 "limits.max_retained_capture_bytes",
                 self.max_retained_capture_bytes,
             ),
-            ("limits.max_replay_record_bytes", self.max_replay_record_bytes),
+            (
+                "limits.max_replay_record_bytes",
+                self.max_replay_record_bytes,
+            ),
             ("limits.max_replay_total_bytes", self.max_replay_total_bytes),
             ("limits.max_replay_records", self.max_replay_records),
             (
@@ -2713,15 +2698,9 @@ impl TerminalCheckpointLimits {
             ),
             ("limits.max_rows", self.max_rows),
             ("limits.max_cols", self.max_cols),
-            (
-                "limits.max_visible_grid_cells",
-                self.max_visible_grid_cells,
-            ),
+            ("limits.max_visible_grid_cells", self.max_visible_grid_cells),
             ("limits.max_total_lines", self.max_total_lines),
-            (
-                "limits.max_total_cell_records",
-                self.max_total_cell_records,
-            ),
+            ("limits.max_total_cell_records", self.max_total_cell_records),
             ("limits.max_total_cells", self.max_total_cells),
             (
                 "limits.max_total_cell_text_bytes",
@@ -3006,7 +2985,11 @@ impl TerminalCheckpointV2 {
             usage: &mut crate::screen::ScreenCheckpointUsage,
             limits: TerminalCheckpointLimits,
         ) -> Result<(), TerminalCheckpointError> {
-            ensure_limit("terminal_string_value_bytes", value.len(), limits.max_string_bytes)?;
+            ensure_limit(
+                "terminal_string_value_bytes",
+                value.len(),
+                limits.max_string_bytes,
+            )?;
             checked_accumulate(
                 total,
                 value.len(),
@@ -3142,9 +3125,12 @@ impl TerminalCheckpointV2 {
             }
         }
 
-        for version in std::iter::once(&terminal.unicode_version)
-            .chain(terminal.unicode_version_stack.iter().map(|entry| &entry.vers))
-        {
+        for version in std::iter::once(&terminal.unicode_version).chain(
+            terminal
+                .unicode_version_stack
+                .iter()
+                .map(|entry| &entry.vers),
+        ) {
             if let Some(widths) = version.cell_widths.as_ref() {
                 ensure_limit(
                     "custom_cell_widths_per_map",
@@ -3184,12 +3170,7 @@ impl TerminalCheckpointV2 {
             }
         }
 
-        charge_records(
-            usage,
-            terminal.saved_dec_private_modes.len(),
-            64,
-            limits,
-        )?;
+        charge_records(usage, terminal.saved_dec_private_modes.len(), 64, limits)?;
         charge_records(usage, terminal.color_map.len(), 64, limits)?;
         charge_records(
             usage,
@@ -3242,12 +3223,7 @@ impl TerminalCheckpointV2 {
                 });
             }
         }
-        Self::preflight_terminal_fields(
-            terminal,
-            limits,
-            &mut usage,
-            false,
-        )?;
+        Self::preflight_terminal_fields(terminal, limits, &mut usage, false)?;
         terminal
             .kitty_img
             .checkpoint_high_water_if_quiescent()
@@ -3323,22 +3299,13 @@ impl TerminalCheckpointV2 {
         let mut screen_usage = crate::screen::ScreenCheckpointUsage::default();
         validate_custom_cell_width_maps(&custom_cell_width_maps, limits, &mut screen_usage)?;
         replay_config.validate(limits, custom_cell_width_maps.len(), &mut screen_usage)?;
-        Self::preflight_terminal_fields(
-            terminal,
-            limits,
-            &mut screen_usage,
-            true,
-        )?;
+        Self::preflight_terminal_fields(terminal, limits, &mut screen_usage, true)?;
         let kitty_max_image_id = terminal
             .kitty_img
             .checkpoint_high_water_if_quiescent()
             .ok_or(TerminalCheckpointError::UnsupportedGraphicsState)?;
         let screen_limits = limits.screen_limits();
-        Self::preflight_checkpoint_attributes(
-            &terminal.pen,
-            limits,
-            &mut screen_usage,
-        )?;
+        Self::preflight_checkpoint_attributes(&terminal.pen, limits, &mut screen_usage)?;
         for saved in [
             terminal.screen.screen.saved_cursor.as_ref(),
             terminal.screen.alt_screen.saved_cursor.as_ref(),
@@ -3347,11 +3314,7 @@ impl TerminalCheckpointV2 {
         .copied()
         .flatten()
         {
-            Self::preflight_checkpoint_attributes(
-                &saved.pen,
-                limits,
-                &mut screen_usage,
-            )?;
+            Self::preflight_checkpoint_attributes(&saved.pen, limits, &mut screen_usage)?;
         }
         let primary_screen = terminal
             .screen
@@ -3366,15 +3329,10 @@ impl TerminalCheckpointV2 {
         let mut checkpoint_unicode_version_stack = Vec::new();
         checkpoint_unicode_version_stack
             .try_reserve_exact(terminal.unicode_version_stack.len())
-            .map_err(|_| {
-                TerminalCheckpointError::ResourceAllocation("unicode_version_stack")
-            })?;
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("unicode_version_stack"))?;
         for entry in &terminal.unicode_version_stack {
             checkpoint_unicode_version_stack.push(CheckpointUnicodeVersionStackEntry {
-                version: CheckpointUnicodeVersion::capture(
-                    &entry.vers,
-                    &custom_cell_width_maps,
-                )?,
+                version: CheckpointUnicodeVersion::capture(&entry.vers, &custom_cell_width_maps)?,
                 label: entry.label.clone(),
             });
         }
@@ -3404,14 +3362,8 @@ impl TerminalCheckpointV2 {
             dec_origin_mode: terminal.dec_origin_mode,
             top_margin: terminal.top_and_bottom_margins.start,
             bottom_margin: terminal.top_and_bottom_margins.end,
-            left_margin: u64_from_usize(
-                terminal.left_and_right_margins.start,
-                "left_margin",
-            )?,
-            right_margin: u64_from_usize(
-                terminal.left_and_right_margins.end,
-                "right_margin",
-            )?,
+            left_margin: u64_from_usize(terminal.left_and_right_margins.start, "left_margin")?,
+            right_margin: u64_from_usize(terminal.left_and_right_margins.end, "right_margin")?,
             left_and_right_margin_mode: terminal.left_and_right_margin_mode,
             application_cursor_keys: terminal.application_cursor_keys,
             modify_other_keys: terminal.modify_other_keys,
@@ -3476,10 +3428,7 @@ impl TerminalCheckpointV2 {
             enable_conpty_quirks: terminal.enable_conpty_quirks,
             suppress_initial_title_change: terminal.suppress_initial_title_change,
             accumulating_title: terminal.accumulating_title.clone(),
-            lost_focus_seqno: u64_from_usize(
-                terminal.lost_focus_seqno,
-                "lost_focus_seqno",
-            )?,
+            lost_focus_seqno: u64_from_usize(terminal.lost_focus_seqno, "lost_focus_seqno")?,
             lost_focus_alerted_seqno: u64_from_usize(
                 terminal.lost_focus_alerted_seqno,
                 "lost_focus_alerted_seqno",
@@ -3504,7 +3453,11 @@ impl TerminalCheckpointV2 {
             usage: &mut crate::screen::ScreenCheckpointUsage,
             limits: TerminalCheckpointLimits,
         ) -> Result<(), TerminalCheckpointError> {
-            ensure_limit("terminal_string_value_bytes", value.len(), limits.max_string_bytes)?;
+            ensure_limit(
+                "terminal_string_value_bytes",
+                value.len(),
+                limits.max_string_bytes,
+            )?;
             checked_accumulate(
                 total,
                 value.len(),
@@ -3600,21 +3553,19 @@ impl TerminalCheckpointV2 {
 
         let rows = self.primary_screen.physical_rows;
         let cols = self.primary_screen.physical_cols;
-        let rows_usize = usize::try_from(rows).map_err(|_| {
-            TerminalCheckpointError::InvalidField {
+        let rows_usize =
+            usize::try_from(rows).map_err(|_| TerminalCheckpointError::InvalidField {
                 field: "primary_screen.physical_rows",
                 reason: "value does not fit this target architecture",
-            }
-        })?;
-        let configured_scrollback = usize_from_u64(
-            self.replay_config.scrollback_size,
-            "config.scrollback_size",
-        )?;
-        let aggregate_visible_rows = rows_usize
-            .checked_mul(2)
-            .ok_or(TerminalCheckpointError::ArithmeticOverflow(
-                "configured_total_lines",
-            ))?;
+            })?;
+        let configured_scrollback =
+            usize_from_u64(self.replay_config.scrollback_size, "config.scrollback_size")?;
+        let aggregate_visible_rows =
+            rows_usize
+                .checked_mul(2)
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                    "configured_total_lines",
+                ))?;
         if configured_scrollback
             .checked_add(aggregate_visible_rows)
             .is_none_or(|total_lines| total_lines > limits.max_total_lines)
@@ -3795,12 +3746,7 @@ impl TerminalCheckpointV2 {
             });
         }
 
-        charge_records(
-            &mut usage,
-            self.saved_dec_private_modes.len(),
-            64,
-            limits,
-        )?;
+        charge_records(&mut usage, self.saved_dec_private_modes.len(), 64, limits)?;
         charge_records(&mut usage, self.color_map.len(), 64, limits)?;
         charge_records(
             &mut usage,
@@ -3905,8 +3851,8 @@ impl TerminalCheckpointV2 {
             .end()
             .map_err(|_| TerminalCheckpointError::Serialization)?;
 
-        let checkpoint: Self = serde_json::from_slice(bytes)
-            .map_err(|_| TerminalCheckpointError::Serialization)?;
+        let checkpoint: Self =
+            serde_json::from_slice(bytes).map_err(|_| TerminalCheckpointError::Serialization)?;
         checkpoint.validate(limits)?;
         let canonical = checkpoint.to_canonical_json(limits)?;
         if canonical.as_slice() != bytes {
@@ -3961,8 +3907,7 @@ impl ValidatedTerminalCheckpointV2 {
         };
         let replay_projection = self.checkpoint.replay_config.clone();
         let replay_config: Arc<dyn TerminalConfiguration> = Arc::new(
-            replay_projection
-                .to_replay_configuration(self.limits, &custom_cell_width_maps)?,
+            replay_projection.to_replay_configuration(self.limits, &custom_cell_width_maps)?,
         );
         let state = TerminalState::from_validated_checkpoint(
             self.checkpoint,
@@ -4002,11 +3947,11 @@ impl TerminalState {
             }
         })?;
         let configured_scrollback = config.scrollback_size();
-        let aggregate_visible_rows = rows
-            .checked_mul(2)
-            .ok_or(TerminalCheckpointError::ArithmeticOverflow(
-                "configured_total_lines",
-            ))?;
+        let aggregate_visible_rows =
+            rows.checked_mul(2)
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                    "configured_total_lines",
+                ))?;
         if configured_scrollback
             .checked_add(aggregate_visible_rows)
             .is_none_or(|total_lines| total_lines > limits.max_total_lines)
@@ -4139,9 +4084,7 @@ impl TerminalState {
         let mut restored_saved_modes = HashMap::new();
         restored_saved_modes
             .try_reserve(saved_dec_private_modes.len())
-            .map_err(|_| {
-                TerminalCheckpointError::ResourceAllocation("saved_dec_private_modes")
-            })?;
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("saved_dec_private_modes"))?;
         restored_saved_modes.extend(
             saved_dec_private_modes
                 .into_iter()
@@ -4159,9 +4102,7 @@ impl TerminalState {
         let mut restored_buttons = Vec::new();
         restored_buttons
             .try_reserve_exact(current_mouse_buttons.len())
-            .map_err(|_| {
-                TerminalCheckpointError::ResourceAllocation("current_mouse_buttons")
-            })?;
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("current_mouse_buttons"))?;
         for button in current_mouse_buttons {
             restored_buttons.push(button.into_live()?);
         }
@@ -4173,9 +4114,7 @@ impl TerminalState {
         let mut restored_unicode_stack = Vec::new();
         restored_unicode_stack
             .try_reserve_exact(unicode_version_stack.len())
-            .map_err(|_| {
-                TerminalCheckpointError::ResourceAllocation("unicode_version_stack")
-            })?;
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("unicode_version_stack"))?;
         for entry in unicode_version_stack {
             restored_unicode_stack.push(UnicodeVersionStackEntry {
                 vers: entry.version.into_live(custom_cell_width_maps)?,
@@ -4206,8 +4145,7 @@ impl TerminalState {
             .transpose()?;
         let restored_unicode_version = unicode_version.into_live(custom_cell_width_maps)?;
         let restored_bidi_hint = bidi_hint.map(CheckpointBidiHint::into_live);
-        let restored_lost_focus_seqno =
-            usize_from_u64(lost_focus_seqno, "lost_focus_seqno")?;
+        let restored_lost_focus_seqno = usize_from_u64(lost_focus_seqno, "lost_focus_seqno")?;
         let restored_lost_focus_alerted_seqno =
             usize_from_u64(lost_focus_alerted_seqno, "lost_focus_alerted_seqno")?;
         let restored_kitty = KittyImageState::quiescent_for_checkpoint_restore(
@@ -4528,10 +4466,8 @@ mod tests {
             &self,
             _expected_newest_exclusive: StableRowIndex,
             _limits: crate::config::ScrollbackSnapshotLimits,
-        ) -> Result<
-            crate::config::ScrollbackSnapshot,
-            crate::config::ScrollbackSpillError,
-        > {
+        ) -> Result<crate::config::ScrollbackSnapshot, crate::config::ScrollbackSpillError>
+        {
             Err(crate::config::ScrollbackSpillError::StorageUnavailable)
         }
 
@@ -4540,10 +4476,8 @@ mod tests {
             expected_generation: Option<crate::config::ScrollbackSnapshotGeneration>,
             prefix: crate::config::ScrollbackPrefix<'_>,
             _max_retained_rows: usize,
-        ) -> Result<
-            crate::config::ScrollbackReplaceCommit,
-            crate::config::ScrollbackSpillError,
-        > {
+        ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError>
+        {
             if expected_generation.is_some() {
                 return Err(crate::config::ScrollbackSpillError::SnapshotGenerationMismatch);
             }
@@ -4562,10 +4496,8 @@ mod tests {
 
         fn clear_scrollback(
             &self,
-        ) -> Result<
-            crate::config::ScrollbackClearCommit,
-            crate::config::ScrollbackSpillError,
-        > {
+        ) -> Result<crate::config::ScrollbackClearCommit, crate::config::ScrollbackSpillError>
+        {
             self.published_rows.store(0, Ordering::Relaxed);
             Ok(crate::config::ScrollbackClearCommit::new(
                 crate::config::ScrollbackSnapshotGeneration::new([9; 16], 1),
@@ -4592,9 +4524,7 @@ mod tests {
             }
         }
 
-        fn scrollback_spill_sink(
-            &self,
-        ) -> Option<Arc<dyn crate::config::ScrollbackSpillSink>> {
+        fn scrollback_spill_sink(&self) -> Option<Arc<dyn crate::config::ScrollbackSpillSink>> {
             if self.tier_enabled {
                 Some(self.sink.clone())
             } else {
@@ -4688,14 +4618,16 @@ mod tests {
                 .expect("current width map"),
             &saved_widths,
         ));
-        terminal.unicode_version_stack.push(UnicodeVersionStackEntry {
-            vers: UnicodeVersion {
-                version: 9,
-                ambiguous_are_wide: false,
-                cell_widths: Some(saved_widths),
-            },
-            label: Some("saved-width-map".into()),
-        });
+        terminal
+            .unicode_version_stack
+            .push(UnicodeVersionStackEntry {
+                vers: UnicodeVersion {
+                    version: 9,
+                    ambiguous_are_wide: false,
+                    cell_widths: Some(saved_widths),
+                },
+                label: Some("saved-width-map".into()),
+            });
         terminal
     }
 
@@ -4712,7 +4644,10 @@ mod tests {
         assert_eq!(decoded, checkpoint);
         assert!(checkpoint.alternate_screen_active);
         assert_eq!(checkpoint.title, "checkpoint-title");
-        assert_ne!(checkpoint.primary_screen.lines, checkpoint.alternate_screen.lines);
+        assert_ne!(
+            checkpoint.primary_screen.lines,
+            checkpoint.alternate_screen.lines
+        );
     }
 
     #[test]
@@ -4758,20 +4693,16 @@ mod tests {
         .expect("capture reverse-insertion custom-width terminal");
 
         assert_eq!(first.custom_cell_width_maps.len(), 2);
-        assert!(
-            first
-                .custom_cell_width_maps
-                .windows(2)
-                .all(|pair| pair[0] < pair[1])
-        );
+        assert!(first
+            .custom_cell_width_maps
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
         assert_ne!(
             first.replay_config.unicode_version.custom_cell_width_map,
             first.unicode_version.custom_cell_width_map,
         );
         assert_eq!(
-            first.unicode_version_stack[0]
-                .version
-                .custom_cell_width_map,
+            first.unicode_version_stack[0].version.custom_cell_width_map,
             first.unicode_version.custom_cell_width_map,
         );
         assert_eq!(
@@ -4810,8 +4741,10 @@ mod tests {
             limits,
         )
         .expect("capture custom-width terminal");
-        checkpoint.replay_config.unicode_version.custom_cell_width_map =
-            checkpoint.unicode_version.custom_cell_width_map;
+        checkpoint
+            .replay_config
+            .unicode_version
+            .custom_cell_width_map = checkpoint.unicode_version.custom_cell_width_map;
 
         assert!(matches!(
             checkpoint.validate(limits),
@@ -4924,7 +4857,8 @@ mod tests {
 
     #[test]
     fn canonical_restore_roundtrips_complete_semantic_projection() {
-        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(RichCheckpointTestConfig);
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+            Arc::new(RichCheckpointTestConfig);
         let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 24,
@@ -4956,10 +4890,12 @@ mod tests {
         terminal.palette = Some(ColorPalette::default());
         let mut prior_unicode_version = terminal.unicode_version.clone();
         prior_unicode_version.version = 9;
-        terminal.unicode_version_stack.push(UnicodeVersionStackEntry {
-            vers: prior_unicode_version,
-            label: Some("prior-unicode".into()),
-        });
+        terminal
+            .unicode_version_stack
+            .push(UnicodeVersionStackEntry {
+                vers: prior_unicode_version,
+                label: Some("prior-unicode".into()),
+            });
         terminal.accumulating_title = Some("pending-title-fragment".into());
 
         let limits = TerminalCheckpointLimits::default();
@@ -4986,7 +4922,8 @@ mod tests {
     #[test]
     fn writer_preparation_failure_returns_the_complete_retryable_inert_model() {
         let limits = TerminalCheckpointLimits::default();
-        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(RichCheckpointTestConfig);
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+            Arc::new(RichCheckpointTestConfig);
         let mut live = Terminal::new(
             TerminalSize::default(),
             Arc::clone(&config),
@@ -5012,7 +4949,10 @@ mod tests {
             Ok(_) => panic!("forced writer preparation must fail"),
             Err(failure) => failure,
         };
-        assert_eq!(failure.error(), &crate::InertTerminalError::WriterActivation);
+        assert_eq!(
+            failure.error(),
+            &crate::InertTerminalError::WriterActivation
+        );
         let (_error, recovered) = failure.into_parts();
         assert_eq!(
             recovered
@@ -5169,10 +5109,12 @@ mod tests {
         terminal.user_vars.insert("retained".into(), "value".into());
         let mut prior_unicode_version = terminal.unicode_version.clone();
         prior_unicode_version.version = 9;
-        terminal.unicode_version_stack.push(UnicodeVersionStackEntry {
-            vers: prior_unicode_version,
-            label: Some("retained".into()),
-        });
+        terminal
+            .unicode_version_stack
+            .push(UnicodeVersionStackEntry {
+                vers: prior_unicode_version,
+                label: Some("retained".into()),
+            });
         terminal.accumulating_title = Some("retained-title".into());
         let lowered: Arc<dyn TerminalConfiguration> = Arc::new(LoweredCheckpointTestConfig);
         terminal.set_config(Arc::clone(&lowered));

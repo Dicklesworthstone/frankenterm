@@ -6404,10 +6404,7 @@ impl Drop for BoundedPollCadence {
 #[cfg(any(windows, test))]
 impl Drop for BoundedPollReservation {
     fn drop(&mut self) {
-        if !self
-            .reservation_live
-            .swap(false, AtomicOrdering::AcqRel)
-        {
+        if !self.reservation_live.swap(false, AtomicOrdering::AcqRel) {
             return;
         }
         if let Some(cadence) = self.cadence.upgrade() {
@@ -6442,8 +6439,7 @@ impl BoundedPollCadence {
         minimum_delay: Duration,
     ) -> BoundedPollReservation {
         let now_micros = (self.now_micros)();
-        let minimum_delay_micros =
-            u64::try_from(minimum_delay.as_micros()).unwrap_or(u64::MAX);
+        let minimum_delay_micros = u64::try_from(minimum_delay.as_micros()).unwrap_or(u64::MAX);
         let not_before_micros = now_micros.saturating_add(minimum_delay_micros);
         let mut state = self.state.lock();
         let reservation_id = Self::allocate_reservation_id(&mut state);
@@ -6540,9 +6536,7 @@ impl BoundedPollCadence {
                 .expect("ready fallback-poll reservation must remain indexed");
             let removed_deadline = state.reservation_deadlines.remove(&reservation_id);
             debug_assert_eq!(removed_deadline, Some(not_before_micros));
-            let should_wake = entry
-                .reservation_live
-                .swap(false, AtomicOrdering::AcqRel);
+            let should_wake = entry.reservation_live.swap(false, AtomicOrdering::AcqRel);
             if should_wake {
                 state.next_dispatch_micros = state
                     .next_dispatch_micros
@@ -6561,15 +6555,14 @@ impl BoundedPollCadence {
     }
 
     fn arm_next_timer(self: &Arc<Self>, state: &mut BoundedPollCadenceState, now_micros: u64) {
-        let next = state
-            .reservations
-            .first_key_value()
-            .map(|(&(not_before_micros, reservation_id), entry)| {
+        let next = state.reservations.first_key_value().map(
+            |(&(not_before_micros, reservation_id), entry)| {
                 let deadline_micros = not_before_micros
                     .max(state.next_dispatch_micros)
                     .max(now_micros);
                 (deadline_micros, reservation_id, entry.timer.clone())
-            });
+            },
+        );
 
         if state.active_timer.as_ref().is_some_and(|active| {
             next.as_ref()
@@ -6595,8 +6588,8 @@ impl BoundedPollCadence {
             cadence: Arc::downgrade(self),
             live: Arc::clone(&live),
         }));
-        let deadline = timer.now()
-            + Duration::from_micros(deadline_micros.saturating_sub(now_micros));
+        let deadline =
+            timer.now() + Duration::from_micros(deadline_micros.saturating_sub(now_micros));
         let handle = timer.register(deadline, timer_waker);
         state.active_timer = Some(BoundedPollTimer {
             deadline_micros,
@@ -6625,11 +6618,9 @@ impl BoundedPollCadence {
 #[cfg(any(windows, test))]
 fn next_bounded_poll_backoff(backoff: &AtomicU8) -> Duration {
     let exponent = backoff
-        .fetch_update(
-            AtomicOrdering::AcqRel,
-            AtomicOrdering::Acquire,
-            |current| Some(current.saturating_add(1).min(6)),
-        )
+        .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+            Some(current.saturating_add(1).min(6))
+        })
         .unwrap_or(6)
         .min(6);
     Duration::from_millis((4_u64 << exponent).min(250))
@@ -6738,11 +6729,7 @@ static WINDOWS_SSH_POLL_CADENCE: std::sync::LazyLock<Arc<BoundedPollCadence>> =
     });
 
 #[cfg(windows)]
-fn fallback_rewake(
-    current: &Cx,
-    task_cx: &TaskContext<'_>,
-    fallback: &SshPollFallback,
-) -> bool {
+fn fallback_rewake(current: &Cx, task_cx: &TaskContext<'_>, fallback: &SshPollFallback) -> bool {
     if let Some(timer) = current.timer_driver() {
         let minimum_delay = next_bounded_poll_backoff(&fallback.backoff);
         fallback.arm(
@@ -6782,11 +6769,7 @@ fn route_client_unilateral_batch(
     Ok(())
 }
 
-type ClientThreadOutcome = (
-    anyhow::Result<()>,
-    Reconnectable,
-    Receiver<ReaderMessage>,
-);
+type ClientThreadOutcome = (anyhow::Result<()>, Reconnectable, Receiver<ReaderMessage>);
 
 fn client_thread(
     mut reconnectable: Reconnectable,
@@ -8008,9 +7991,7 @@ impl SshStream {
             }
 
             if waiting {
-                self.readiness_metrics
-                    .wake_without_readability
-                    .increment(1);
+                self.readiness_metrics.wake_without_readability.increment(1);
             }
 
             if let Err(error) = self.register_interest_for_read(task_cx) {
@@ -8082,9 +8063,7 @@ impl SshStream {
     ) -> std::io::Result<()> {
         let Some(current) = Cx::current() else {
             readiness_metrics.missing_cx.increment(1);
-            return Err(
-                SshReadinessAuthorityError::MissingContext { operation }.into_io_error(),
-            );
+            return Err(SshReadinessAuthorityError::MissingContext { operation }.into_io_error());
         };
 
         let mut registration = lock_registration_mutex(registration);
@@ -8108,9 +8087,7 @@ impl SshStream {
                 Err(source) => {
                     readiness_metrics.reactor_unavailable.increment(1);
                     return Err(SshReadinessAuthorityError::reactor_unavailable(
-                        operation,
-                        "rearm",
-                        source,
+                        operation, "rearm", source,
                     ));
                 }
             }
@@ -8138,9 +8115,7 @@ impl SshStream {
                 Err(source) => {
                     readiness_metrics.reactor_unavailable.increment(1);
                     Err(SshReadinessAuthorityError::reactor_unavailable(
-                        operation,
-                        "register",
-                        source,
+                        operation, "register", source,
                     ))
                 }
             }
@@ -8879,8 +8854,7 @@ impl Client {
         let incarnation = Arc::new(ClientIncarnation);
         let connection_generation = Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION));
         let rpc_transport = Arc::new(RpcTransportState::new());
-        let domain_reconnect_authorized =
-            Arc::new(AtomicBool::new(local_domain_id.is_none()));
+        let domain_reconnect_authorized = Arc::new(AtomicBool::new(local_domain_id.is_none()));
         let initial_dispatch_authority = ClientDispatchAuthority::new(
             local_domain_id,
             mux_owner,
@@ -9840,9 +9814,9 @@ impl TestRpcPeer {
         if !lease.matches(binding) {
             bail!("test reliable pane-write RPC lease lost its exact binding");
         }
-        let prepared = lease
-            .claim_for_reader()?
-            .ok_or_else(|| anyhow!("test reliable pane-write RPC was cancelled before reader claim"))?;
+        let prepared = lease.claim_for_reader()?.ok_or_else(|| {
+            anyhow!("test reliable pane-write RPC was cancelled before reader claim")
+        })?;
         let request = match prepared.pdu() {
             Pdu::ReliablePaneWriteV1(request) => request.clone(),
             other => bail!(
@@ -10210,13 +10184,7 @@ mod tests {
         let (cadence, now_micros, clock, timer) = test_poll_cadence(2_000);
         let wakes = Arc::new(AtomicU64::new(0));
         let reservations = (0..1_001)
-            .map(|_| {
-                cadence.reserve(
-                    timer.clone(),
-                    counting_poll_waker(&wakes),
-                    Duration::ZERO,
-                )
-            })
+            .map(|_| cadence.reserve(timer.clone(), counting_poll_waker(&wakes), Duration::ZERO))
             .collect::<Vec<_>>();
 
         for slot in 0..500 {
@@ -10278,14 +10246,8 @@ mod tests {
         assert_eq!(second_wakes.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(cadence.pending_reservations(), 1);
         assert_eq!(timer.pending_count(), 1);
-        assert_eq!(
-            advance_poll_cadence(&now_micros, &clock, &timer, 1_999),
-            0
-        );
-        assert_eq!(
-            advance_poll_cadence(&now_micros, &clock, &timer, 2_000),
-            1
-        );
+        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 1_999), 0);
+        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 2_000), 1);
         assert_eq!(second_wakes.load(AtomicOrdering::SeqCst), 1);
         drop((first, second));
     }
@@ -10323,10 +10285,7 @@ mod tests {
         assert_eq!(cadence.pending_reservations(), 2);
         assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 0), 1);
         assert_eq!(first_wakes.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(
-            advance_poll_cadence(&now_micros, &clock, &timer, 2_000),
-            1
-        );
+        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 2_000), 1);
         assert_eq!(surviving_wakes.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(cancelled_middle_wakes.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(cancelled_tail_wakes.load(AtomicOrdering::SeqCst), 0);
@@ -10392,10 +10351,7 @@ mod tests {
         assert_eq!(live.reservation_id, retired_id);
         drop(retired);
         assert_eq!(cadence.pending_reservations(), 1);
-        assert_eq!(
-            advance_poll_cadence(&now_micros, &clock, &timer, 2_000),
-            1
-        );
+        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 2_000), 1);
         assert_eq!(live_wakes.load(AtomicOrdering::SeqCst), 1);
         drop(live);
     }
@@ -10480,9 +10436,8 @@ mod tests {
                 fallback_for_reset.reset();
                 let _ = reset_done_tx.send(());
             });
-            let reset_completed_while_drop_was_blocked = reset_done_rx
-                .recv_timeout(Duration::from_secs(1))
-                .is_ok();
+            let reset_completed_while_drop_was_blocked =
+                reset_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
             allow_drop.wait();
             assert!(
                 reset_completed_while_drop_was_blocked,
@@ -10493,7 +10448,10 @@ mod tests {
         assert_eq!(cadence.pending_reservations(), 0);
         assert_eq!(timer.pending_count(), 0);
         assert_eq!(fallback.lock_reservation().generation, None);
-        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 250_000), 0);
+        assert_eq!(
+            advance_poll_cadence(&now_micros, &clock, &timer, 250_000),
+            0
+        );
         assert_eq!(replacement_wakes.load(AtomicOrdering::SeqCst), 0);
     }
 
@@ -10525,7 +10483,10 @@ mod tests {
         assert_eq!(fallback.lock_reservation().generation, None);
         assert_eq!(cadence.pending_reservations(), 0);
         assert_eq!(timer.pending_count(), 0);
-        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 250_000), 0);
+        assert_eq!(
+            advance_poll_cadence(&now_micros, &clock, &timer, 250_000),
+            0
+        );
         assert_eq!(last_generation_wakes.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(wrapped_generation_wakes.load(AtomicOrdering::SeqCst), 0);
     }
@@ -10560,14 +10521,8 @@ mod tests {
         assert_eq!(live_wakes.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(cadence.pending_reservations(), 1);
         assert_eq!(timer.pending_count(), 1);
-        assert_eq!(
-            advance_poll_cadence(&now_micros, &clock, &timer, 9_999),
-            0
-        );
-        assert_eq!(
-            advance_poll_cadence(&now_micros, &clock, &timer, 10_000),
-            1
-        );
+        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 9_999), 0);
+        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 10_000), 1);
         assert_eq!(live_wakes.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(retired_wakes.load(AtomicOrdering::SeqCst), 0);
         drop(live);
@@ -10601,10 +10556,7 @@ mod tests {
             0,
             "a self-rearming stream must not create a same-boundary burst"
         );
-        assert_eq!(
-            advance_poll_cadence(&now_micros, &clock, &timer, 2_000),
-            1
-        );
+        assert_eq!(advance_poll_cadence(&now_micros, &clock, &timer, 2_000), 1);
         assert_eq!(
             unrelated_wakes.load(AtomicOrdering::SeqCst),
             1,
@@ -17192,9 +17144,8 @@ mod tests {
             data: b"hello-remote".to_vec(),
         };
         let write_client = std::sync::Arc::clone(&client);
-        let result = asupersync_block_on(async move {
-            write_client.reliable_pane_write_v1(request).await
-        });
+        let result =
+            asupersync_block_on(async move { write_client.reliable_pane_write_v1(request).await });
         let response = result.expect("reliable pane write must round-trip without panic or hang");
         assert_eq!(response.pane_id, 1);
         assert_eq!(response.input_serial.get(), 73);
@@ -18444,8 +18395,7 @@ mod tests {
 
     #[test]
     fn ssh_wait_for_readable_fails_closed_without_task_context() {
-        let (stdin, remote_stdin) =
-            filedescriptor::socketpair().expect("create stdin socketpair");
+        let (stdin, remote_stdin) = filedescriptor::socketpair().expect("create stdin socketpair");
         let (remote_stdout, stdout) =
             filedescriptor::socketpair().expect("create stdout socketpair");
         let stream = SshStream::new(stdin, stdout).expect("construct ssh stream");
@@ -18472,8 +18422,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ssh_wait_for_readable_fails_closed_without_reactor() {
-        let (stdin, remote_stdin) =
-            filedescriptor::socketpair().expect("create stdin socketpair");
+        let (stdin, remote_stdin) = filedescriptor::socketpair().expect("create stdin socketpair");
         let (remote_stdout, stdout) =
             filedescriptor::socketpair().expect("create stdout socketpair");
         let stream = SshStream::new(stdin, stdout).expect("construct ssh stream");
@@ -18483,9 +18432,8 @@ mod tests {
             .build()
             .expect("construct runtime without an I/O reactor");
 
-        let first_poll = runtime.block_on(poll_fn(|task_cx| {
-            Poll::Ready(wait.as_mut().poll(task_cx))
-        }));
+        let first_poll =
+            runtime.block_on(poll_fn(|task_cx| Poll::Ready(wait.as_mut().poll(task_cx))));
         let Poll::Ready(Err(error)) = first_poll else {
             panic!("missing reactor must fail on the first readiness poll");
         };
@@ -18506,8 +18454,7 @@ mod tests {
 
     #[test]
     fn ssh_wait_for_readable_ignores_spurious_wake() {
-        let (stdin, remote_stdin) =
-            filedescriptor::socketpair().expect("create stdin socketpair");
+        let (stdin, remote_stdin) = filedescriptor::socketpair().expect("create stdin socketpair");
         let (remote_stdout, stdout) =
             filedescriptor::socketpair().expect("create stdout socketpair");
         let stream = SshStream::new(stdin, stdout).expect("construct ssh stream");

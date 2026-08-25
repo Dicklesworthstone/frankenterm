@@ -10,11 +10,10 @@
 
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{
-    RecoveryTerminalCheckpointV2,
-    terminalstate::checkpoint::TerminalCheckpointLimits,
+    terminalstate::checkpoint::TerminalCheckpointLimits, RecoveryTerminalCheckpointV2,
 };
 use hmac::{Hmac, KeyInit, Mac};
-use portable_pty::{PtySize, cmdbuilder::CommandBuilder};
+use portable_pty::{cmdbuilder::CommandBuilder, PtySize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
@@ -129,7 +128,9 @@ impl GuardianSecret {
     pub fn from_bytes(
         bytes: [u8; GUARDIAN_AUTH_TOKEN_BYTES],
     ) -> Result<Self, GuardianProtocolError> {
-        let combined = bytes.iter().fold(0_u8, |accumulator, byte| accumulator | byte);
+        let combined = bytes
+            .iter()
+            .fold(0_u8, |accumulator, byte| accumulator | byte);
         if combined == 0 {
             return Err(GuardianProtocolError::WeakSecret);
         }
@@ -500,8 +501,7 @@ impl GuardianRejectionCode {
         if matches!(
             status,
             GuardianResponseStatus::Success | GuardianResponseStatus::Indeterminate
-        )
-            || payload.len() != REJECTION_PAYLOAD_BYTES
+        ) || payload.len() != REJECTION_PAYLOAD_BYTES
             || payload.get(..4) != Some(REJECTION_PAYLOAD_MAGIC.as_slice())
         {
             return Err(GuardianProtocolError::InvalidRejectionPayload);
@@ -625,11 +625,7 @@ impl GuardianResponseEnvelope {
         }
         let payload = Zeroizing::new(reply.encode_for_operation(request.header.operation)?);
         let response = Self {
-            header: GuardianResponseHeader::new(
-                &request.header,
-                reply.response_status(),
-                &payload,
-            ),
+            header: GuardianResponseHeader::new(&request.header, reply.response_status(), &payload),
             payload,
         };
         reply.require_response_identity(&response.header)?;
@@ -649,10 +645,7 @@ impl GuardianResponseEnvelope {
         }
     }
 
-    pub fn rejection(
-        request: &AuthenticatedGuardianRequest,
-        code: GuardianRejectionCode,
-    ) -> Self {
+    pub fn rejection(request: &AuthenticatedGuardianRequest, code: GuardianRejectionCode) -> Self {
         let payload = Zeroizing::new(code.encode().to_vec());
         Self {
             header: GuardianResponseHeader::new(&request.header, code.status(), &payload),
@@ -1439,7 +1432,9 @@ fn checkpoint_chunk_digest_matches(observed: &[u8], expected: &[u8]) -> bool {
     observed
         .iter()
         .zip(expected)
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
         == 0
 }
 
@@ -1908,9 +1903,7 @@ impl GuardianCheckpointStageRequestV1 {
     ///
     /// This is the sole encoder for Chunk requests. Consuming `self` prevents
     /// repeated plaintext/digest copies from the same delivery capability.
-    pub fn into_zeroizing_payload(
-        self,
-    ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+    pub fn into_zeroizing_payload(self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
         self.validate()?;
         let capacity = self.encoded_capacity()?;
         let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
@@ -1999,10 +1992,8 @@ impl GuardianCheckpointStageRequestV1 {
         )?;
         let upload_id = read_required_uuid(payload, 40)?;
         let descriptor_end = 56 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES;
-        let descriptor = GuardianCheckpointDescriptorV1::decode(
-            &payload[56..descriptor_end],
-        )
-        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let descriptor = GuardianCheckpointDescriptorV1::decode(&payload[56..descriptor_end])
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
         let chunk_bytes = read_u32(payload, descriptor_end)?;
         let total_chunks = read_u32(payload, descriptor_end + 4)?;
         if checkpoint_total_chunks(descriptor.total_bytes, chunk_bytes)? != total_chunks {
@@ -2017,13 +2008,12 @@ impl GuardianCheckpointStageRequestV1 {
                 let offset = read_u64(payload, CHECKPOINT_STAGE_COMMON_BYTES + 4)?;
                 let mut chunk_digest = Zeroizing::new([0_u8; 32]);
                 chunk_digest.copy_from_slice(
-                    &payload[CHECKPOINT_STAGE_COMMON_BYTES + 12..CHECKPOINT_STAGE_COMMON_BYTES + 44],
+                    &payload
+                        [CHECKPOINT_STAGE_COMMON_BYTES + 12..CHECKPOINT_STAGE_COMMON_BYTES + 44],
                 );
-                let encoded_len = usize::try_from(read_u32(
-                    payload,
-                    CHECKPOINT_STAGE_COMMON_BYTES + 44,
-                )?)
-                    .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+                let encoded_len =
+                    usize::try_from(read_u32(payload, CHECKPOINT_STAGE_COMMON_BYTES + 44)?)
+                        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
                 let expected = CHECKPOINT_STAGE_CHUNK_FIXED_BYTES
                     .checked_add(encoded_len)
                     .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
@@ -2134,7 +2124,10 @@ impl GuardianCheckpointStageRequestV1 {
     }
 }
 
-fn checkpoint_total_chunks(total_bytes: u64, chunk_bytes: u32) -> Result<u32, GuardianProtocolError> {
+fn checkpoint_total_chunks(
+    total_bytes: u64,
+    chunk_bytes: u32,
+) -> Result<u32, GuardianProtocolError> {
     if total_bytes == 0
         || total_bytes > GUARDIAN_MAX_CHECKPOINT_BYTES
         || chunk_bytes == 0
@@ -2146,7 +2139,8 @@ fn checkpoint_total_chunks(total_bytes: u64, chunk_bytes: u32) -> Result<u32, Gu
         .checked_add(u64::from(chunk_bytes) - 1)
         .ok_or(GuardianProtocolError::InvalidOperationPayload)?
         / u64::from(chunk_bytes);
-    let chunks = u32::try_from(chunks).map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+    let chunks =
+        u32::try_from(chunks).map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
     if chunks == 0 || chunks > GUARDIAN_MAX_CHECKPOINT_CHUNKS {
         return Err(GuardianProtocolError::InvalidOperationPayload);
     }
@@ -2203,7 +2197,11 @@ impl GuardianCheckpointStageReplyV1 {
         payload[4..6].copy_from_slice(&CHECKPOINT_STAGE_WIRE_VERSION.to_be_bytes());
         match self {
             Self::Absent { upload_id } | Self::Quarantined { upload_id } => {
-                payload[6] = if matches!(self, Self::Absent { .. }) { 4 } else { 7 };
+                payload[6] = if matches!(self, Self::Absent { .. }) {
+                    4
+                } else {
+                    7
+                };
                 payload[8..24].copy_from_slice(upload_id.as_bytes());
             }
             Self::Ready {
@@ -2216,7 +2214,11 @@ impl GuardianCheckpointStageReplyV1 {
                 next_index,
                 committed_bytes,
             } => {
-                payload[6] = if matches!(self, Self::Ready { .. }) { 1 } else { 2 };
+                payload[6] = if matches!(self, Self::Ready { .. }) {
+                    1
+                } else {
+                    2
+                };
                 payload[8..24].copy_from_slice(upload_id.as_bytes());
                 payload[24..28].copy_from_slice(&next_index.to_be_bytes());
                 payload[28..36].copy_from_slice(&committed_bytes.to_be_bytes());
@@ -2994,9 +2996,7 @@ impl GuardianReplayAckV1 {
         if self.snapshot_id.is_nil()
             || digest_is_zero(self.snapshot_digest)
             || digest_is_zero(self.page_digest)
-            || self
-                .next_cursor_digest
-                .is_some_and(digest_is_zero)
+            || self.next_cursor_digest.is_some_and(digest_is_zero)
             || (self.through_sequence == 0) != through_digest_is_zero
             || (self.release_if_complete && self.next_cursor_digest.is_some())
         {
@@ -3189,9 +3189,7 @@ impl GuardianCheckpointDescriptorV1 {
         let canonical = GuardianCheckpointArtifactDescriptorV1::from_live_capture(capture)
             .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
         let descriptor = Self::from_canonical_descriptor(canonical, capture_generation)?;
-        descriptor.validate_canonical_payload(
-            capture.terminal_checkpoint().canonical_payload(),
-        )?;
+        descriptor.validate_canonical_payload(capture.terminal_checkpoint().canonical_payload())?;
         Ok(descriptor)
     }
 
@@ -3993,8 +3991,7 @@ fn validate_replay_records(
                     || predecessor.segment_id != prior.segment_id
                     || predecessor.last_sequence != prior.sequence
                     || predecessor.terminal_record_digest != prior.record_digest
-                    || predecessor.cumulative_plaintext_bytes
-                        != prior.cumulative_plaintext_bytes
+                    || predecessor.cumulative_plaintext_bytes != prior.cumulative_plaintext_bytes
                     || predecessor.committed_log_bytes != prior.committed_log_bytes
                 {
                     return Err(GuardianProtocolError::InvalidReplyPayload);
@@ -4060,8 +4057,8 @@ impl GuardianCheckpointChunkDelivery {
         bytes: Zeroizing<Vec<u8>>,
     ) -> Result<Self, GuardianProtocolError> {
         descriptor.validate()?;
-        let observed = u64::try_from(bytes.len())
-            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        let observed =
+            u64::try_from(bytes.len()).map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
         if bytes.is_empty()
             || observed > u64::from(GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES)
             || offset
@@ -4226,8 +4223,7 @@ impl GuardianReplayPageBodyDelivery {
                 ..
             } => {
                 if (*through_sequence == 0)
-                    != (digest_is_zero(*terminal_record_digest)
-                        && *cumulative_plaintext_bytes == 0)
+                    != (digest_is_zero(*terminal_record_digest) && *cumulative_plaintext_bytes == 0)
                     || (*through_sequence > 0
                         && (digest_is_zero(*terminal_record_digest)
                             || *cumulative_plaintext_bytes == 0))
@@ -4516,18 +4512,14 @@ impl GuardianReplayPageDelivery {
                     .checked_mul(records.records.len())
                     .and_then(|fixed| fixed.checked_add(REPLAY_OUTPUT_RECORDS_HEADER_BYTES))
                     .and_then(|fixed| {
-                        fixed.checked_add(
-                            usize::try_from(records.plaintext_bytes).ok()?,
-                        )
+                        fixed.checked_add(usize::try_from(records.plaintext_bytes).ok()?)
                     })
                     .ok_or(GuardianProtocolError::PayloadTooLarge)?
             }
             GuardianReplayPageBodyDelivery::Complete { .. } => REPLAY_COMPLETE_BYTES,
             GuardianReplayPageBodyDelivery::Gap { .. } => REPLAY_GAP_BYTES,
             GuardianReplayPageBodyDelivery::Compacted { .. } => REPLAY_COMPACTED_BYTES,
-            GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => {
-                REPLAY_SNAPSHOT_EXPIRED_BYTES
-            }
+            GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => REPLAY_SNAPSHOT_EXPIRED_BYTES,
         };
         let mut body = Zeroizing::new(Vec::with_capacity(body_capacity));
         match &self.body {
@@ -4561,7 +4553,9 @@ impl GuardianReplayPageDelivery {
                         push_uuid(&mut body, predecessor.segment_id);
                         body.extend_from_slice(&predecessor.last_sequence.to_be_bytes());
                         body.extend_from_slice(&predecessor.terminal_record_digest);
-                        body.extend_from_slice(&predecessor.cumulative_plaintext_bytes.to_be_bytes());
+                        body.extend_from_slice(
+                            &predecessor.cumulative_plaintext_bytes.to_be_bytes(),
+                        );
                         body.extend_from_slice(&predecessor.committed_log_bytes.to_be_bytes());
                     } else {
                         body.extend_from_slice(&[0; 72]);
@@ -4640,7 +4634,10 @@ impl GuardianReplayPageDelivery {
         let next_cursor = match payload[7] {
             0 if payload[156..REPLAY_PAGE_HEADER_BYTES]
                 .iter()
-                .all(|byte| *byte == 0) => None,
+                .all(|byte| *byte == 0) =>
+            {
+                None
+            }
             1 => Some(GuardianReplayCursorV1::decode(
                 &payload[156..REPLAY_PAGE_HEADER_BYTES],
             )?),
@@ -4687,9 +4684,12 @@ impl GuardianReplayPageDelivery {
         if let Some(next) = self.header.next_cursor {
             if next.snapshot_id != self.header.snapshot_id
                 || next.snapshot_digest != self.header.snapshot_digest
-                || next.page_index != self.header.page_index.checked_add(1).ok_or(
-                    GuardianProtocolError::InvalidReplyPayload,
-                )?
+                || next.page_index
+                    != self
+                        .header
+                        .page_index
+                        .checked_add(1)
+                        .ok_or(GuardianProtocolError::InvalidReplyPayload)?
                 || next.compute_digest() != next.cursor_digest
             {
                 return Err(GuardianProtocolError::InvalidReplyPayload);
@@ -4744,8 +4744,7 @@ impl GuardianReplayPageDelivery {
                     (
                         GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id },
                         GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
-                    ) if chunk.offset == 0
-                        && chunk.descriptor.checkpoint_id == checkpoint_id => {}
+                    ) if chunk.offset == 0 && chunk.descriptor.checkpoint_id == checkpoint_id => {}
                     (
                         GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id },
                         GuardianReplayPageBodyDelivery::Compacted {
@@ -4766,11 +4765,7 @@ impl GuardianReplayPageDelivery {
                         GuardianReplayPageBodyDelivery::OutputRecords(_)
                         | GuardianReplayPageBodyDelivery::Gap { .. },
                     ) => {
-                        validate_page_start(
-                            &self.body,
-                            next_sequence,
-                            previous_record_digest,
-                        )?;
+                        validate_page_start(&self.body, next_sequence, previous_record_digest)?;
                     }
                     (
                         GuardianReplaySelectorV1::Resume {
@@ -4783,11 +4778,7 @@ impl GuardianReplayPageDelivery {
                             ..
                         },
                     ) if *observed == checkpoint_id => {
-                        validate_page_start(
-                            &self.body,
-                            next_sequence,
-                            previous_record_digest,
-                        )?;
+                        validate_page_start(&self.body, next_sequence, previous_record_digest)?;
                     }
                     (
                         GuardianReplaySelectorV1::Resume { checkpoint_id, .. },
@@ -4830,8 +4821,8 @@ impl GuardianReplayPageDelivery {
                     | (
                         GuardianReplayPhaseV1::Output,
                         GuardianReplayPageBodyDelivery::OutputRecords(_)
-                            | GuardianReplayPageBodyDelivery::Complete { .. }
-                            | GuardianReplayPageBodyDelivery::Gap { .. },
+                        | GuardianReplayPageBodyDelivery::Complete { .. }
+                        | GuardianReplayPageBodyDelivery::Gap { .. },
                     ) => {
                         validate_page_start(
                             &self.body,
@@ -4923,9 +4914,10 @@ fn validate_next_cursor(
         (GuardianReplayPageBodyDelivery::CheckpointChunk(chunk), Some(next)) => {
             let chunk_end = chunk
                 .offset
-                .checked_add(u64::try_from(chunk.bytes.len()).map_err(|_| {
-                    GuardianProtocolError::InvalidReplyPayload
-                })?)
+                .checked_add(
+                    u64::try_from(chunk.bytes.len())
+                        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+                )
                 .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
             if chunk_end < chunk.descriptor.total_bytes {
                 let (sequence, digest) = chunk
@@ -4989,16 +4981,13 @@ fn decode_replay_page_body(
                 &payload[REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 8
                     ..REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 40],
             );
-            let chunk_len = usize::try_from(read_u32(
-                payload,
-                REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 40,
-            )?)
-            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+            let chunk_len =
+                usize::try_from(read_u32(payload, REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 40)?)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
             if REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES.checked_add(chunk_len) != Some(payload.len()) {
                 return Err(GuardianProtocolError::InvalidReplyPayload);
             }
-            let bytes =
-                zeroizing_vec_from_slice(&payload[REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES..]);
+            let bytes = zeroizing_vec_from_slice(&payload[REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES..]);
             let chunk = GuardianCheckpointChunkDelivery {
                 descriptor,
                 offset,
@@ -5060,8 +5049,7 @@ fn decode_replay_page_body(
                     .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
                 let mut record_digest = [0; 32];
                 record_digest.copy_from_slice(&fixed[136..168]);
-                let plaintext_digest =
-                    GuardianReplayProtectedDigest::from_wire(&fixed[168..200])?;
+                let plaintext_digest = GuardianReplayProtectedDigest::from_wire(&fixed[168..200])?;
                 let metadata = GuardianReplayRecordMetadataV1::new(
                     read_required_uuid(fixed, 0)?,
                     read_u64(fixed, 16)?,
@@ -5085,13 +5073,11 @@ fn decode_replay_page_body(
             if offset != payload.len() {
                 return Err(GuardianProtocolError::InvalidReplyPayload);
             }
-            GuardianReplayPageBodyDelivery::OutputRecords(
-                GuardianReplayOutputRecordsDelivery::new(
-                    first_sequence,
-                    previous_record_digest,
-                    records,
-                )?,
-            )
+            GuardianReplayPageBodyDelivery::OutputRecords(GuardianReplayOutputRecordsDelivery::new(
+                first_sequence,
+                previous_record_digest,
+                records,
+            )?)
         }
         3 if payload.len() == REPLAY_COMPLETE_BYTES => {
             let mut checkpoint_id = [0; 32];
@@ -5106,9 +5092,7 @@ fn decode_replay_page_body(
                 cumulative_plaintext_bytes: read_u64(payload, 72)?,
             }
         }
-        4 if payload.len() == REPLAY_GAP_BYTES
-            && payload[25..32].iter().all(|byte| *byte == 0) =>
-        {
+        4 if payload.len() == REPLAY_GAP_BYTES && payload[25..32].iter().all(|byte| *byte == 0) => {
             GuardianReplayPageBodyDelivery::Gap {
                 requested_sequence: read_u64(payload, 0)?,
                 oldest_retained_sequence: read_u64(payload, 8)?,
@@ -5131,10 +5115,7 @@ fn decode_replay_page_body(
                     payload,
                     32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES,
                 )?,
-                compaction_generation: read_u64(
-                    payload,
-                    40 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES,
-                )?,
+                compaction_generation: read_u64(payload, 40 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES)?,
             }
         }
         6 if payload.len() == REPLAY_SNAPSHOT_EXPIRED_BYTES => {
@@ -5720,8 +5701,7 @@ impl InputEffectState {
 
     fn validate_for_input_bytes(self, input_bytes: u32) -> Result<(), GuardianProtocolError> {
         if input_bytes == 0
-            || usize::try_from(input_bytes)
-                .map_or(true, |bytes| bytes > GUARDIAN_MAX_INPUT_BYTES)
+            || usize::try_from(input_bytes).map_or(true, |bytes| bytes > GUARDIAN_MAX_INPUT_BYTES)
         {
             return Err(GuardianProtocolError::InvalidInputDisposition);
         }
@@ -5764,15 +5744,26 @@ pub enum GuardianReply {
         guardian_incarnation: Uuid,
     },
     GuardedStopAccepted,
-    Spawned { pane_id: Uuid, generation: u64 },
+    Spawned {
+        pane_id: Uuid,
+        generation: u64,
+    },
     CensusPage {
         snapshot_id: Uuid,
         entries: Vec<GuardianCensusEntry>,
         next_cursor: Option<u64>,
         total_panes: u64,
     },
-    Claimed { pane_id: Uuid, generation: u64, next_sequence: u64 },
-    Attached { pane_id: Uuid, generation: u64, next_sequence: u64 },
+    Claimed {
+        pane_id: Uuid,
+        generation: u64,
+        next_sequence: u64,
+    },
+    Attached {
+        pane_id: Uuid,
+        generation: u64,
+        next_sequence: u64,
+    },
     InputReceipt {
         pane_id: Uuid,
         generation: u64,
@@ -5782,10 +5773,23 @@ pub enum GuardianReply {
     },
     CheckpointReceipt(GuardianCheckpointReceipt),
     CheckpointStage(GuardianCheckpointStageReplyV1),
-    MutationApplied { pane_id: Uuid, generation: u64, sequence: u64 },
-    LeaseRetired { pane_id: Uuid, generation: u64 },
-    InputEffect { effect_id: Uuid, state: InputEffectState },
-    ReplayReady { pane_id: Uuid, generation: u64 },
+    MutationApplied {
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+    },
+    LeaseRetired {
+        pane_id: Uuid,
+        generation: u64,
+    },
+    InputEffect {
+        effect_id: Uuid,
+        state: InputEffectState,
+    },
+    ReplayReady {
+        pane_id: Uuid,
+        generation: u64,
+    },
     ReplayAcked(GuardianReplayAckReceiptV1),
     /// The exact authenticated effect identity was committed, but its external
     /// callback may or may not have applied. The pane is permanently
@@ -5806,7 +5810,10 @@ impl GuardianReply {
                 if matches!(
                     receipt.disposition,
                     GuardianCheckpointDisposition::OutcomeIndeterminate
-                ) => GuardianResponseStatus::Indeterminate,
+                ) =>
+            {
+                GuardianResponseStatus::Indeterminate
+            }
             Self::EffectOutcomeIndeterminate { .. } => GuardianResponseStatus::Indeterminate,
             _ => GuardianResponseStatus::Success,
         }
@@ -5816,7 +5823,11 @@ impl GuardianReply {
         request: &AuthenticatedGuardianRequest,
         intended_reply: &Self,
     ) -> Result<Self, GuardianProtocolError> {
-        if !request.header.operation.supports_generic_effect_indeterminate() {
+        if !request
+            .header
+            .operation
+            .supports_generic_effect_indeterminate()
+        {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
         intended_reply.require_response_identity(&GuardianResponseHeader::new(
@@ -5824,12 +5835,13 @@ impl GuardianReply {
             GuardianResponseStatus::Success,
             &intended_reply.encode_for_operation(request.header.operation)?,
         ))?;
-        let effect_id = request
-            .header
-            .effect_id
-            .ok_or(GuardianProtocolError::InvalidOperationScope {
-                operation: request.header.operation,
-            })?;
+        let effect_id =
+            request
+                .header
+                .effect_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
         let (pane_id, generation, sequence) = match intended_reply {
             Self::Spawned {
                 pane_id,
@@ -5879,9 +5891,7 @@ impl GuardianReply {
                 })
                 .ok_or(GuardianProtocolError::PayloadTooLarge)?,
             Self::Spawned { .. } | Self::LeaseRetired { .. } | Self::ReplayReady { .. } => 24,
-            Self::Claimed { .. }
-            | Self::Attached { .. }
-            | Self::MutationApplied { .. } => 32,
+            Self::Claimed { .. } | Self::Attached { .. } | Self::MutationApplied { .. } => 32,
             Self::InputReceipt { .. } => INPUT_RECEIPT_PAYLOAD_BYTES,
             Self::CheckpointReceipt(..) => GUARDIAN_CHECKPOINT_RECEIPT_BYTES,
             Self::CheckpointStage(..) => CHECKPOINT_STAGE_REPLY_BYTES,
@@ -6117,9 +6127,7 @@ impl GuardianReply {
                     state: InputEffectState::from_wire(payload[48], read_u32(payload, 49)?)?,
                 }
             }
-            GuardianOperation::Resize
-            | GuardianOperation::Signal
-            | GuardianOperation::Close => {
+            GuardianOperation::Resize | GuardianOperation::Signal | GuardianOperation::Close => {
                 require_reply_len(payload, 32)?;
                 Self::MutationApplied {
                     pane_id: read_required_uuid(payload, 0)?,
@@ -6162,26 +6170,17 @@ impl GuardianReply {
         Ok(reply)
     }
 
-    fn require_operation(
-        &self,
-        operation: GuardianOperation,
-    ) -> Result<(), GuardianProtocolError> {
+    fn require_operation(&self, operation: GuardianOperation) -> Result<(), GuardianProtocolError> {
         let matches = matches!(
             (operation, self),
             (GuardianOperation::Hello, Self::Hello { .. })
-                | (
-                    GuardianOperation::GuardedStop,
-                    Self::GuardedStopAccepted
-                )
+                | (GuardianOperation::GuardedStop, Self::GuardedStopAccepted)
                 | (GuardianOperation::Spawn, Self::Spawned { .. })
                 | (GuardianOperation::Census, Self::CensusPage { .. })
                 | (GuardianOperation::Claim, Self::Claimed { .. })
                 | (GuardianOperation::Attach, Self::Attached { .. })
                 | (GuardianOperation::Input, Self::InputReceipt { .. })
-                | (
-                    GuardianOperation::Checkpoint,
-                    Self::CheckpointReceipt(..)
-                )
+                | (GuardianOperation::Checkpoint, Self::CheckpointReceipt(..))
                 | (
                     GuardianOperation::CheckpointStage,
                     Self::CheckpointStage(..)
@@ -6302,9 +6301,7 @@ impl GuardianReply {
                             GuardianOperation::Claim => *generation > 0 && *sequence > 0,
                             GuardianOperation::Resize
                             | GuardianOperation::Signal
-                            | GuardianOperation::RetireLease => {
-                                *generation > 0 && *sequence > 0
-                            }
+                            | GuardianOperation::RetireLease => *generation > 0 && *sequence > 0,
                             GuardianOperation::Close => {
                                 (*generation > 0 && *sequence > 0) || *sequence == 0
                             }
@@ -6380,8 +6377,7 @@ impl GuardianReply {
                     && header.effect_id == Some(receipt.effect_id)
             }
             Self::CheckpointStage(_) => {
-                header.operation == GuardianOperation::CheckpointStage
-                    && header.lease_sequence == 0
+                header.operation == GuardianOperation::CheckpointStage && header.lease_sequence == 0
             }
             Self::MutationApplied {
                 pane_id,
@@ -6497,7 +6493,8 @@ impl GuardianReply {
                 Ok(())
             }
             Self::CheckpointReceipt(receipt) => {
-                let identity = GuardianCheckpointEffectIdentity::from_authenticated_request(request)?;
+                let identity =
+                    GuardianCheckpointEffectIdentity::from_authenticated_request(request)?;
                 if receipt.matches_identity(identity) {
                     Ok(())
                 } else {
@@ -6562,7 +6559,10 @@ impl GuardianReply {
                         },
                     ) if checkpoint_id == stage.checkpoint_id()
                         && boundary_id == stage.boundary_id()
-                        && total_bytes == stage.total_bytes() => Ok(()),
+                        && total_bytes == stage.total_bytes() =>
+                    {
+                        Ok(())
+                    }
                     (
                         GuardianCheckpointStageKindV1::Seal,
                         GuardianCheckpointStageReplyV1::Sealed { .. },
@@ -6617,7 +6617,10 @@ impl GuardianReply {
                         },
                     ) if checkpoint_id == stage.checkpoint_id()
                         && boundary_id == stage.boundary_id()
-                        && total_bytes == stage.total_bytes() => Ok(()),
+                        && total_bytes == stage.total_bytes() =>
+                    {
+                        Ok(())
+                    }
                     (
                         GuardianCheckpointStageKindV1::Ack,
                         GuardianCheckpointStageReplyV1::Acked {
@@ -6630,7 +6633,10 @@ impl GuardianReply {
                     ) if Some(completion_id) == stage.completion_id()
                         && checkpoint_id == stage.checkpoint_id()
                         && boundary_id == stage.boundary_id()
-                        && total_bytes == stage.total_bytes() => Ok(()),
+                        && total_bytes == stage.total_bytes() =>
+                    {
+                        Ok(())
+                    }
                     _ => Err(GuardianProtocolError::ResponseRequestMismatch),
                 }
             }
@@ -6847,7 +6853,9 @@ impl GuardianCensusEntry {
         if self.pane_id.is_nil()
             || self.next_sequence == Some(0)
             || self.mux_incarnation.is_some_and(|value| value.is_nil())
-            || self.pending_input_effect.is_some_and(|value| value.is_nil())
+            || self
+                .pending_input_effect
+                .is_some_and(|value| value.is_nil())
             || self
                 .indeterminate_checkpoint_effect
                 .is_some_and(|value| value.is_nil())
@@ -7011,13 +7019,8 @@ pub enum GuardianProtocolError {
     SequenceExhausted,
     #[error("guardian pane or effect receipt bound is exhausted before mutation")]
     CapacityExhausted,
-    #[error(
-        "guardian pending effect {effect_id} reached its {max_aliases}-request alias ceiling"
-    )]
-    RequestAliasCapacityExhausted {
-        effect_id: Uuid,
-        max_aliases: usize,
-    },
+    #[error("guardian pending effect {effect_id} reached its {max_aliases}-request alias ceiling")]
+    RequestAliasCapacityExhausted { effect_id: Uuid, max_aliases: usize },
     #[error("guardian protocol state invariant failed at {0}")]
     StateInvariantViolation(&'static str),
     #[error("guardian input-effect query omitted the effect UUID")]
@@ -7064,17 +7067,13 @@ impl GuardianRejectionCode {
     #[must_use]
     pub const fn from_protocol_error(error: &GuardianProtocolError) -> Self {
         match error {
-            GuardianProtocolError::GuardianIncarnationMismatch => {
-                Self::GuardianIncarnationMismatch
-            }
+            GuardianProtocolError::GuardianIncarnationMismatch => Self::GuardianIncarnationMismatch,
             GuardianProtocolError::PaneNotFound(_) => Self::PaneNotFound,
             GuardianProtocolError::PaneAlreadyExists(_) => Self::PaneAlreadyExists,
             GuardianProtocolError::RequestIdentityConflict => Self::RequestIdentityConflict,
             GuardianProtocolError::EffectIdentityConflict => Self::EffectIdentityConflict,
             GuardianProtocolError::PaneTerminal => Self::PaneTerminal,
-            GuardianProtocolError::ClaimGenerationMismatch { .. } => {
-                Self::ClaimGenerationMismatch
-            }
+            GuardianProtocolError::ClaimGenerationMismatch { .. } => Self::ClaimGenerationMismatch,
             GuardianProtocolError::StaleLease => Self::StaleLease,
             GuardianProtocolError::RepeatedSequence { .. } => Self::RepeatedSequence,
             GuardianProtocolError::SequenceGap { .. } => Self::SequenceGap,
@@ -7097,9 +7096,7 @@ impl GuardianRejectionCode {
             GuardianProtocolError::CheckpointOutcomeIndeterminate => {
                 Self::CheckpointOutcomeIndeterminate
             }
-            GuardianProtocolError::CheckpointIdentityMismatch => {
-                Self::CheckpointIdentityMismatch
-            }
+            GuardianProtocolError::CheckpointIdentityMismatch => Self::CheckpointIdentityMismatch,
             GuardianProtocolError::TruncatedFrame
             | GuardianProtocolError::FrameLengthMismatch { .. }
             | GuardianProtocolError::FrameTooLarge
@@ -7166,7 +7163,10 @@ impl<E> std::fmt::Debug for GuardianEffectTransactionError<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protocol(error) => formatter.debug_tuple("Protocol").field(error).finish(),
-            Self::Effect(_) => formatter.debug_tuple("Effect").field(&"[REDACTED]").finish(),
+            Self::Effect(_) => formatter
+                .debug_tuple("Effect")
+                .field(&"[REDACTED]")
+                .finish(),
             Self::OutcomeIndeterminate(_) => formatter.write_str("OutcomeIndeterminate"),
         }
     }
@@ -7214,12 +7214,13 @@ impl EffectFingerprint {
     fn from_authenticated_request(
         request: &AuthenticatedGuardianRequest,
     ) -> Result<Self, GuardianProtocolError> {
-        let pane_id = request
-            .header
-            .pane_id
-            .ok_or(GuardianProtocolError::InvalidOperationScope {
-                operation: request.header.operation,
-            })?;
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
         Ok(Self {
             operation: request.header.operation,
             pane_id,
@@ -7381,25 +7382,28 @@ impl GuardianProtocolState {
         if request.header.guardian_incarnation != self.incarnation {
             return Err(GuardianProtocolError::GuardianIncarnationMismatch);
         }
-        if !request.header.operation.supports_generic_effect_indeterminate() {
+        if !request
+            .header
+            .operation
+            .supports_generic_effect_indeterminate()
+        {
             return Err(GuardianProtocolError::InvalidOperationScope {
                 operation: request.header.operation,
             });
         }
         let fingerprint = EffectFingerprint::from_authenticated_request(request)?;
-        let effect_id = request
-            .header
-            .effect_id
-            .ok_or(GuardianProtocolError::InvalidOperationScope {
-                operation: request.header.operation,
-            })?;
+        let effect_id =
+            request
+                .header
+                .effect_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
 
         let intended_reply = if let Some(stored_request) =
             self.requests.get(&request.header.request_id)
         {
-            if stored_request.fingerprint != fingerprint
-                || stored_request.effect_id != effect_id
-            {
+            if stored_request.fingerprint != fingerprint || stored_request.effect_id != effect_id {
                 return Err(GuardianProtocolError::RequestIdentityConflict);
             }
             let stored_effect = self.effects.get(&effect_id).ok_or(
@@ -7476,10 +7480,7 @@ impl GuardianProtocolState {
                 result.pending_input_panes += 1;
                 continue;
             }
-            if self
-                .indeterminate_checkpoints_by_pane
-                .contains_key(pane_id)
-            {
+            if self.indeterminate_checkpoints_by_pane.contains_key(pane_id) {
                 result.indeterminate_checkpoint_panes += 1;
                 continue;
             }
@@ -7490,7 +7491,11 @@ impl GuardianProtocolState {
         Ok(result)
     }
 
-    pub fn mark_exited(&mut self, pane_id: Uuid, exit_status: i32) -> Result<(), GuardianProtocolError> {
+    pub fn mark_exited(
+        &mut self,
+        pane_id: Uuid,
+        exit_status: i32,
+    ) -> Result<(), GuardianProtocolError> {
         let state = self
             .panes
             .get_mut(&pane_id)
@@ -7517,11 +7522,15 @@ impl GuardianProtocolState {
                 };
                 Ok(())
             }
-            GuardianPaneState::Quarantined { exit_status: slot, .. } if slot.is_none() => {
+            GuardianPaneState::Quarantined {
+                exit_status: slot, ..
+            } if slot.is_none() => {
                 *slot = Some(exit_status);
                 Ok(())
             }
-            GuardianPaneState::ClosedTerminal { exit_status: slot, .. } if slot.is_none() => {
+            GuardianPaneState::ClosedTerminal {
+                exit_status: slot, ..
+            } if slot.is_none() => {
                 *slot = Some(exit_status);
                 Ok(())
             }
@@ -7706,11 +7715,9 @@ impl GuardianProtocolState {
             }
             .into());
         }
-        self.apply_effect_transaction_inner(request, |reply| {
-            match prepare_durable_input(reply) {
-                Ok(()) => GuardianEffectOutcome::Applied,
-                Err(error) => GuardianEffectOutcome::DefinitelyNotApplied(error),
-            }
+        self.apply_effect_transaction_inner(request, |reply| match prepare_durable_input(reply) {
+            Ok(()) => GuardianEffectOutcome::Applied,
+            Err(error) => GuardianEffectOutcome::DefinitelyNotApplied(error),
         })
     }
 
@@ -7978,8 +7985,7 @@ impl GuardianProtocolState {
 
         let pending_reply = stored.reply.clone();
         let pending_receipt = Self::checkpoint_receipt_from_reply(&pending_reply)?;
-        if pending_receipt.disposition
-            != GuardianCheckpointDisposition::OutcomeIndeterminate
+        if pending_receipt.disposition != GuardianCheckpointDisposition::OutcomeIndeterminate
             || !pending_receipt.matches_identity(identity)
         {
             return Err(GuardianProtocolError::StateInvariantViolation(
@@ -7987,12 +7993,11 @@ impl GuardianProtocolState {
             ));
         }
         let fingerprint = stored.fingerprint.clone();
-        let request_id_set = self
-            .effect_request_ids
-            .get(&identity.effect_id)
-            .ok_or(GuardianProtocolError::StateInvariantViolation(
+        let request_id_set = self.effect_request_ids.get(&identity.effect_id).ok_or(
+            GuardianProtocolError::StateInvariantViolation(
                 "checkpoint-reconciliation-reverse-index",
-            ))?;
+            ),
+        )?;
         if request_id_set.is_empty() {
             return Err(GuardianProtocolError::StateInvariantViolation(
                 "checkpoint-reconciliation-empty-reverse-index",
@@ -8102,8 +8107,7 @@ impl GuardianProtocolState {
 
         let pending_reply = stored.reply.clone();
         let pending_receipt = Self::checkpoint_receipt_from_reply(&pending_reply)?;
-        if pending_receipt.disposition
-            != GuardianCheckpointDisposition::OutcomeIndeterminate
+        if pending_receipt.disposition != GuardianCheckpointDisposition::OutcomeIndeterminate
             || !pending_receipt.matches_identity(identity)
         {
             return Err(GuardianProtocolError::StateInvariantViolation(
@@ -8136,12 +8140,11 @@ impl GuardianProtocolState {
             _ => return Err(GuardianProtocolError::CheckpointIdentityMismatch),
         };
 
-        let request_ids = self
-            .effect_request_ids
-            .get(&identity.effect_id)
-            .ok_or(GuardianProtocolError::StateInvariantViolation(
+        let request_ids = self.effect_request_ids.get(&identity.effect_id).ok_or(
+            GuardianProtocolError::StateInvariantViolation(
                 "checkpoint-definite-not-published-reverse-index",
-            ))?;
+            ),
+        )?;
         if request_ids.is_empty() {
             return Err(GuardianProtocolError::StateInvariantViolation(
                 "checkpoint-definite-not-published-empty-reverse-index",
@@ -8223,8 +8226,10 @@ impl GuardianProtocolState {
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianReply, GuardianProtocolError> {
         if request.header.operation == GuardianOperation::Checkpoint {
-            self.apply_checkpoint_transactionally(request, |_| Ok::<(), std::convert::Infallible>(()))
-                .map(GuardianReply::CheckpointReceipt)
+            self.apply_checkpoint_transactionally(request, |_| {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .map(GuardianReply::CheckpointReceipt)
         } else if request.header.operation == GuardianOperation::Input {
             // Pure protocol fixtures deliberately bypass the descriptor-backed
             // journal. Production callers cannot: the public generic effect
@@ -8236,11 +8241,11 @@ impl GuardianProtocolState {
                 Ok(reply) => Ok(reply),
                 Err(GuardianEffectTransactionError::Protocol(error)) => Err(error),
                 Err(GuardianEffectTransactionError::Effect(never)) => match never {},
-                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => Err(
-                    GuardianProtocolError::StateInvariantViolation(
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => {
+                    Err(GuardianProtocolError::StateInvariantViolation(
                         "pure-input-effect-outcome-indeterminate",
-                    ),
-                ),
+                    ))
+                }
             }
         } else if request.header.operation.creates_effect() {
             match self.apply_effect_transactionally(request, |_| {
@@ -8249,11 +8254,11 @@ impl GuardianProtocolState {
                 Ok(reply) => Ok(reply),
                 Err(GuardianEffectTransactionError::Protocol(error)) => Err(error),
                 Err(GuardianEffectTransactionError::Effect(never)) => match never {},
-                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => Err(
-                    GuardianProtocolError::StateInvariantViolation(
+                Err(GuardianEffectTransactionError::OutcomeIndeterminate(_)) => {
+                    Err(GuardianProtocolError::StateInvariantViolation(
                         "pure-effect-outcome-indeterminate",
-                    ),
-                ),
+                    ))
+                }
             }
         } else {
             self.apply_observation(request)
@@ -8276,10 +8281,7 @@ impl GuardianProtocolState {
         identity: GuardianInputEffectIdentity,
         applied_bytes: u32,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        self.transition_pending_input(
-            identity,
-            InputEffectState::DurablePrefix { applied_bytes },
-        )
+        self.transition_pending_input(identity, InputEffectState::DurablePrefix { applied_bytes })
     }
 
     pub(crate) fn mark_input_known_not_applied(
@@ -8312,9 +8314,7 @@ impl GuardianProtocolState {
                     GuardianCensusEntry::from_state(
                         *pane_id,
                         state,
-                        self.indeterminate_checkpoints_by_pane
-                            .get(pane_id)
-                            .copied(),
+                        self.indeterminate_checkpoints_by_pane.get(pane_id).copied(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -8348,9 +8348,7 @@ impl GuardianProtocolState {
         let snapshot = self
             .census_snapshots
             .get(&snapshot_id)
-            .ok_or(GuardianProtocolError::CensusSnapshotNotFound(
-                snapshot_id,
-            ))?;
+            .ok_or(GuardianProtocolError::CensusSnapshotNotFound(snapshot_id))?;
         let total_panes = u64::try_from(snapshot.entries.len())
             .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
         if page.cursor > total_panes {
@@ -8359,11 +8357,12 @@ impl GuardianProtocolState {
                 pane_count: total_panes,
             });
         }
-        let start = usize::try_from(page.cursor)
-            .map_err(|_| GuardianProtocolError::InvalidCensusCursor {
+        let start = usize::try_from(page.cursor).map_err(|_| {
+            GuardianProtocolError::InvalidCensusCursor {
                 cursor: page.cursor,
                 pane_count: total_panes,
-            })?;
+            }
+        })?;
         let entries_by_bytes = (page.max_bytes - GUARDIAN_CENSUS_PAGE_HEADER_BYTES)
             / GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES;
         let page_capacity = usize::from(page.max_entries).min(
@@ -8456,11 +8455,12 @@ impl GuardianProtocolState {
                 "input-reconciliation-pending-reply",
             ));
         }
-        let expected_next_sequence = sequence.checked_add(1).ok_or(
-            GuardianProtocolError::StateInvariantViolation(
-                "input-reconciliation-sequence-fence",
-            ),
-        )?;
+        let expected_next_sequence =
+            sequence
+                .checked_add(1)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "input-reconciliation-sequence-fence",
+                ))?;
         let pane_fence_matches = match self.panes.get(&pane_id) {
             Some(GuardianPaneState::LiveClaimed {
                 generation: pane_generation,
@@ -8487,9 +8487,7 @@ impl GuardianProtocolState {
         }
 
         let request_id_set = self.effect_request_ids.get(&effect_id).ok_or(
-            GuardianProtocolError::StateInvariantViolation(
-                "input-reconciliation-reverse-index",
-            ),
+            GuardianProtocolError::StateInvariantViolation("input-reconciliation-reverse-index"),
         )?;
         if request_id_set.is_empty() {
             return Err(GuardianProtocolError::StateInvariantViolation(
@@ -8589,12 +8587,13 @@ impl GuardianProtocolState {
         &self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        let pane_id = request
-            .header
-            .pane_id
-            .ok_or(GuardianProtocolError::InvalidOperationScope {
-                operation: request.header.operation,
-            })?;
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
         match self.panes.get(&pane_id) {
             Some(GuardianPaneState::LiveClaimed {
                 generation,
@@ -8611,9 +8610,7 @@ impl GuardianProtocolState {
                 })
             }
             Some(GuardianPaneState::LiveUnclaimed { .. })
-            | Some(GuardianPaneState::LiveClaimed { .. }) => {
-                Err(GuardianProtocolError::StaleLease)
-            }
+            | Some(GuardianPaneState::LiveClaimed { .. }) => Err(GuardianProtocolError::StaleLease),
             Some(_) => Err(GuardianProtocolError::PaneTerminal),
             None => Err(GuardianProtocolError::PaneNotFound(pane_id)),
         }
@@ -8623,42 +8620,53 @@ impl GuardianProtocolState {
         &self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        let pane_id = request
-            .header
-            .pane_id
-            .ok_or(GuardianProtocolError::InvalidOperationScope {
-                operation: request.header.operation,
-            })?;
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
         let generation = match self.panes.get(&pane_id) {
             Some(GuardianPaneState::LiveClaimed {
                 generation,
                 mux_incarnation,
                 ..
             }) if *generation == request.header.lease_generation
-                && *mux_incarnation == request.header.mux_incarnation => *generation,
+                && *mux_incarnation == request.header.mux_incarnation =>
+            {
+                *generation
+            }
             // Exit and explicit terminal retention discard mutation ownership,
             // but not authenticated transcript/checkpoint recovery authority.
             // The exact persisted generation remains the fence after census.
             Some(GuardianPaneState::ExitedUnclaimed { generation, .. })
             | Some(GuardianPaneState::ClosedTerminal { generation, .. })
             | Some(GuardianPaneState::Quarantined { generation, .. })
-                if *generation == request.header.lease_generation => *generation,
+                if *generation == request.header.lease_generation =>
+            {
+                *generation
+            }
             Some(_) => return Err(GuardianProtocolError::StaleLease),
             None => return Err(GuardianProtocolError::PaneNotFound(pane_id)),
         };
-        Ok(GuardianReply::ReplayReady { pane_id, generation })
+        Ok(GuardianReply::ReplayReady {
+            pane_id,
+            generation,
+        })
     }
 
     fn query_input_effect(
         &self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        let pane_id = request
-            .header
-            .pane_id
-            .ok_or(GuardianProtocolError::InvalidOperationScope {
-                operation: request.header.operation,
-            })?;
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
         self.require_effect_query_authority(pane_id, request)?;
         let effect_id = request
             .header
@@ -8728,7 +8736,10 @@ impl GuardianProtocolState {
                 mux_incarnation,
                 ..
             }) if *generation == request.header.lease_generation
-                && *mux_incarnation == request.header.mux_incarnation => Ok(()),
+                && *mux_incarnation == request.header.mux_incarnation =>
+            {
+                Ok(())
+            }
             Some(GuardianPaneState::LiveUnclaimed { generation })
             | Some(GuardianPaneState::ExitedUnclaimed { generation, .. })
             | Some(GuardianPaneState::ClosedTerminal { generation, .. })
@@ -8747,18 +8758,20 @@ impl GuardianProtocolState {
         request: &AuthenticatedGuardianRequest,
         perform_effect: impl FnOnce(&GuardianReply) -> GuardianEffectOutcome<E>,
     ) -> Result<GuardianReply, GuardianEffectTransactionError<E>> {
-        let pane_id = request
-            .header
-            .pane_id
-            .ok_or(GuardianProtocolError::InvalidOperationScope {
-                operation: request.header.operation,
-            })?;
-        let effect_id = request
-            .header
-            .effect_id
-            .ok_or(GuardianProtocolError::InvalidOperationScope {
-                operation: request.header.operation,
-            })?;
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
+        let effect_id =
+            request
+                .header
+                .effect_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
         let fingerprint = EffectFingerprint::from_authenticated_request(request)?;
 
         if let Some(stored) = self.requests.get(&request.header.request_id) {
@@ -8837,8 +8850,7 @@ impl GuardianProtocolState {
             return Err(GuardianProtocolError::EffectIdentityConflict.into());
         }
 
-        let (reply, next_pane_state) =
-            self.plan_new_effect(pane_id, effect_id, request)?;
+        let (reply, next_pane_state) = self.plan_new_effect(pane_id, effect_id, request)?;
         let capacity = self.plan_receipt_capacity(true, true)?;
         self.requests
             .try_reserve(1)
@@ -8886,8 +8898,9 @@ impl GuardianProtocolState {
                 GuardianPaneState::ExitedUnclaimed { exit_status, .. } => Some(*exit_status),
                 GuardianPaneState::ClosedTerminal { exit_status, .. }
                 | GuardianPaneState::Quarantined { exit_status, .. } => *exit_status,
-                GuardianPaneState::LiveUnclaimed { .. }
-                | GuardianPaneState::LiveClaimed { .. } => None,
+                GuardianPaneState::LiveUnclaimed { .. } | GuardianPaneState::LiveClaimed { .. } => {
+                    None
+                }
             }),
         };
         if request.header.operation == GuardianOperation::Spawn {
@@ -8974,8 +8987,7 @@ impl GuardianProtocolState {
             self.protected_spawn_requests
                 .insert(request.header.request_id);
             self.protected_spawn_effects.insert(effect_id);
-        } else if !outcome_is_indeterminate
-            && request.header.operation != GuardianOperation::Input
+        } else if !outcome_is_indeterminate && request.header.operation != GuardianOperation::Input
         {
             self.transient_request_order
                 .push_back(request.header.request_id);
@@ -9106,8 +9118,7 @@ impl GuardianProtocolState {
                     next_state,
                 ))
             }
-            GuardianOperation::Resize
-            | GuardianOperation::Signal => {
+            GuardianOperation::Resize | GuardianOperation::Signal => {
                 let (sequence, next_state) = self.plan_exact_sequence(pane_id, request)?;
                 Ok((
                     GuardianReply::MutationApplied {
@@ -9254,7 +9265,8 @@ impl GuardianProtocolState {
                 .try_reserve(needed)
                 .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
             for (index, request_id) in self.transient_request_order.iter().enumerate() {
-                if self.requests.contains_key(request_id) && !plan.request_ids.contains(request_id) {
+                if self.requests.contains_key(request_id) && !plan.request_ids.contains(request_id)
+                {
                     plan.request_ids.push(*request_id);
                     if plan.request_ids.len() == needed {
                         plan.request_queue_pops = index + 1;
@@ -9328,16 +9340,16 @@ impl GuardianProtocolState {
                 next_sequence,
                 ..
             }) if *generation == request.header.lease_generation
-                && *mux_incarnation == request.header.mux_incarnation => Ok(*next_sequence),
-            Some(GuardianPaneState::LiveUnclaimed { .. })
-            | Some(GuardianPaneState::LiveClaimed { .. }) => {
-                Err(GuardianProtocolError::StaleLease)
+                && *mux_incarnation == request.header.mux_incarnation =>
+            {
+                Ok(*next_sequence)
             }
+            Some(GuardianPaneState::LiveUnclaimed { .. })
+            | Some(GuardianPaneState::LiveClaimed { .. }) => Err(GuardianProtocolError::StaleLease),
             Some(_) => Err(GuardianProtocolError::PaneTerminal),
             None => Err(GuardianProtocolError::PaneNotFound(pane_id)),
         }
     }
-
 }
 
 pub fn encode_guardian_request(
@@ -9359,7 +9371,10 @@ pub fn encode_guardian_request(
 
     let mut frame = GuardianWireFrame::with_capacity(total_len)?;
     let bytes = frame.bytes_mut();
-    push_u32(bytes, u32::try_from(frame_len).map_err(|_| GuardianProtocolError::FrameTooLarge)?);
+    push_u32(
+        bytes,
+        u32::try_from(frame_len).map_err(|_| GuardianProtocolError::FrameTooLarge)?,
+    );
     bytes.extend_from_slice(&FRAME_MAGIC);
     bytes.extend_from_slice(&request.header.protocol_version.to_be_bytes());
     bytes.push(request.header.operation as u8);
@@ -9679,15 +9694,13 @@ fn validate_operation_scope(
     }
     let pane_required = !matches!(
         operation,
-        GuardianOperation::Census
-            | GuardianOperation::Hello
-            | GuardianOperation::GuardedStop
+        GuardianOperation::Census | GuardianOperation::Hello | GuardianOperation::GuardedStop
     );
     let lease_required = operation.requires_lease();
     let effect_required =
         operation.creates_effect() || operation == GuardianOperation::QueryInputEffect;
-    let spawn_scope_ok = operation != GuardianOperation::Spawn
-        || (lease_generation == 0 && lease_sequence == 0);
+    let spawn_scope_ok =
+        operation != GuardianOperation::Spawn || (lease_generation == 0 && lease_sequence == 0);
     let observation_scope_ok = !matches!(
         operation,
         GuardianOperation::Census | GuardianOperation::Hello
@@ -9705,7 +9718,10 @@ fn validate_operation_scope(
     if pane_required != pane_id.is_some()
         || effect_required != effect_id.is_some()
         || (!lease_required
-            && !matches!(operation, GuardianOperation::Spawn | GuardianOperation::Claim)
+            && !matches!(
+                operation,
+                GuardianOperation::Spawn | GuardianOperation::Claim
+            )
             && (lease_generation != 0 || lease_sequence != 0))
         || !spawn_scope_ok
         || !observation_scope_ok
@@ -10052,8 +10068,7 @@ mod tests {
         canonical_payload: &[u8],
     ) -> GuardianCheckpointDescriptorV1 {
         let total_bytes = u64::try_from(canonical_payload.len()).unwrap();
-        let terminal_payload_digest =
-            checkpoint_terminal_payload_digest_oracle(canonical_payload);
+        let terminal_payload_digest = checkpoint_terminal_payload_digest_oracle(canonical_payload);
         let output_boundary = GuardianCheckpointOutputBoundaryV1::Record {
             segment_id: id(90),
             sequence: 7,
@@ -10109,14 +10124,7 @@ mod tests {
     ) -> GuardianRequestEnvelope {
         GuardianRequestEnvelope::new(
             GuardianRequestHeader::new(
-                operation,
-                guardian,
-                mux,
-                request_id,
-                pane_id,
-                generation,
-                sequence,
-                effect_id,
+                operation, guardian, mux, request_id, pane_id, generation, sequence, effect_id,
                 payload,
             ),
             payload.to_vec(),
@@ -10136,14 +10144,7 @@ mod tests {
         payload: Zeroizing<Vec<u8>>,
     ) -> GuardianRequestEnvelope {
         let header = GuardianRequestHeader::new(
-            operation,
-            guardian,
-            mux,
-            request_id,
-            pane_id,
-            generation,
-            sequence,
-            effect_id,
+            operation, guardian, mux, request_id, pane_id, generation, sequence, effect_id,
             &payload,
         );
         GuardianRequestEnvelope::from_zeroizing_payload(header, payload)
@@ -10175,9 +10176,7 @@ mod tests {
         state.apply(&authenticate(request))
     }
 
-    fn input_effect_identity(
-        request: &GuardianRequestEnvelope,
-    ) -> GuardianInputEffectIdentity {
+    fn input_effect_identity(request: &GuardianRequestEnvelope) -> GuardianInputEffectIdentity {
         GuardianInputEffectIdentity::from_authenticated_request(&authenticate(request))
             .expect("test input request carries an exact authenticated effect identity")
     }
@@ -10232,14 +10231,8 @@ mod tests {
         snapshot_id: Uuid,
         snapshot_digest: [u8; 32],
     ) -> GuardianReplayPageDelivery {
-        let predecessor = GuardianReplayPredecessorV1::new(
-            id(90),
-            7,
-            [0x55; 32],
-            512,
-            4_096,
-        )
-        .unwrap();
+        let predecessor =
+            GuardianReplayPredecessorV1::new(id(90), 7, [0x55; 32], 512, 4_096).unwrap();
         let first_plaintext = b"first\n";
         let first_metadata = GuardianReplayRecordMetadataV1::new(
             id(91),
@@ -10435,11 +10428,8 @@ mod tests {
         let insertion = hidden_field.len() - 1;
         hidden_field.splice(insertion..insertion, b",\"hidden\":true".iter().copied());
         let hidden_command_bytes = hidden_field.len() - SPAWN_PAYLOAD_FIXED_BYTES;
-        hidden_field[12..16].copy_from_slice(
-            &u32::try_from(hidden_command_bytes)
-                .unwrap()
-                .to_be_bytes(),
-        );
+        hidden_field[12..16]
+            .copy_from_slice(&u32::try_from(hidden_command_bytes).unwrap().to_be_bytes());
         assert_eq!(
             GuardianSpawnPayload::decode(&hidden_field),
             Err(GuardianProtocolError::InvalidOperationPayload)
@@ -10450,7 +10440,10 @@ mod tests {
         );
 
         let resize = GuardianResizePayload::new(pty_size(44, 132));
-        assert_eq!(GuardianResizePayload::decode(&resize.encode()).unwrap(), resize);
+        assert_eq!(
+            GuardianResizePayload::decode(&resize.encode()).unwrap(),
+            resize
+        );
         let zero_geometry = GuardianResizePayload::new(pty_size(0, 0));
         assert_eq!(
             GuardianResizePayload::decode(&zero_geometry.encode()).unwrap(),
@@ -10563,7 +10556,10 @@ mod tests {
         let encoded = intent.encode();
         assert_eq!(encoded.len(), GUARDIAN_CHECKPOINT_INTENT_BYTES);
         assert_eq!(&encoded[..4], CHECKPOINT_INTENT_PAYLOAD_MAGIC.as_slice());
-        assert_eq!(read_u16(&encoded, 4).unwrap(), GUARDIAN_CHECKPOINT_INTENT_VERSION);
+        assert_eq!(
+            read_u16(&encoded, 4).unwrap(),
+            GUARDIAN_CHECKPOINT_INTENT_VERSION
+        );
         assert_eq!(&encoded[6..8], &[0, 0]);
         assert_eq!(GuardianCheckpointIntent::decode(&encoded).unwrap(), intent);
 
@@ -10745,13 +10741,9 @@ mod tests {
             encode_guardian_request(&secret(), &hidden_payload),
             Err(GuardianProtocolError::InvalidOperationPayload)
         );
-        let census_page = GuardianCensusPageRequest::new(
-            Uuid::nil(),
-            0,
-            1,
-            GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-        )
-        .unwrap();
+        let census_page =
+            GuardianCensusPageRequest::new(Uuid::nil(), 0, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES)
+                .unwrap();
         let nil_guardian_census = request(
             GuardianOperation::Census,
             Uuid::nil(),
@@ -10788,11 +10780,9 @@ mod tests {
             b"",
         );
         let authenticated = authenticate(&stop);
-        let response = GuardianResponseEnvelope::success(
-            &authenticated,
-            &GuardianReply::GuardedStopAccepted,
-        )
-        .unwrap();
+        let response =
+            GuardianResponseEnvelope::success(&authenticated, &GuardianReply::GuardedStopAccepted)
+                .unwrap();
         let response_frame = encode_guardian_response(&secret(), &response).unwrap();
         let correlated = decode_guardian_response(&secret(), &response_frame)
             .unwrap()
@@ -10895,18 +10885,14 @@ mod tests {
 
     #[test]
     fn failed_runtime_effect_does_not_publish_spawn_or_consume_replay_identity() {
-        let sensitive_effect_error = GuardianEffectTransactionError::Effect(
-            std::io::Error::other("raw-input-or-dictionary-testable-digest"),
-        );
-        assert!(
-            !format!("{sensitive_effect_error:?}")
-                .contains("raw-input-or-dictionary-testable-digest")
-        );
-        assert!(
-            !sensitive_effect_error
-                .to_string()
-                .contains("raw-input-or-dictionary-testable-digest")
-        );
+        let sensitive_effect_error = GuardianEffectTransactionError::Effect(std::io::Error::other(
+            "raw-input-or-dictionary-testable-digest",
+        ));
+        assert!(!format!("{sensitive_effect_error:?}")
+            .contains("raw-input-or-dictionary-testable-digest"));
+        assert!(!sensitive_effect_error
+            .to_string()
+            .contains("raw-input-or-dictionary-testable-digest"));
         assert!(std::error::Error::source(&sensitive_effect_error).is_none());
 
         let guardian = id(1);
@@ -10921,16 +10907,16 @@ mod tests {
             GuardianEffectOutcome::DefinitelyNotApplied("injected spawn failure")
         });
         assert!(!format!("{failed:?}").contains("injected spawn failure"));
-        assert!(
-            !failed
-                .as_ref()
-                .expect_err("fixture effect fails")
-                .to_string()
-                .contains("injected spawn failure")
-        );
+        assert!(!failed
+            .as_ref()
+            .expect_err("fixture effect fails")
+            .to_string()
+            .contains("injected spawn failure"));
         assert!(matches!(
             failed,
-            Err(GuardianEffectTransactionError::Effect("injected spawn failure"))
+            Err(GuardianEffectTransactionError::Effect(
+                "injected spawn failure"
+            ))
         ));
         assert_eq!(invocations.get(), 1);
         assert_eq!(state.pane_state(pane), None);
@@ -11030,7 +11016,10 @@ mod tests {
                 Some(indeterminate_reply.clone())
             );
             let response = GuardianResponseEnvelope::reply(&request, &indeterminate_reply).unwrap();
-            assert_eq!(response.header().status, GuardianResponseStatus::Indeterminate);
+            assert_eq!(
+                response.header().status,
+                GuardianResponseStatus::Indeterminate
+            );
             let frame = encode_guardian_response(&secret(), &response).unwrap();
             let correlated = decode_guardian_response(&secret(), &frame)
                 .unwrap()
@@ -11064,9 +11053,7 @@ mod tests {
             let alias = authenticate(&alias_envelope);
             assert_eq!(
                 state.indeterminate_effect_reply(&alias).unwrap(),
-                Some(
-                    GuardianReply::effect_outcome_indeterminate(&alias, &intended_reply).unwrap()
-                )
+                Some(GuardianReply::effect_outcome_indeterminate(&alias, &intended_reply).unwrap())
             );
             assert!(matches!(
                 state.apply_effect_transactionally(&alias, |_| {
@@ -11144,11 +11131,7 @@ mod tests {
         let pane = id(3);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
         let input = authenticate(&request(
             GuardianOperation::Input,
             guardian,
@@ -11175,8 +11158,7 @@ mod tests {
         ));
         assert!(!generic_callback_invoked.get());
 
-        let failed =
-            state.apply_input_effect_transactionally(&input, |_| Err("zero-byte write"));
+        let failed = state.apply_input_effect_transactionally(&input, |_| Err("zero-byte write"));
         assert!(matches!(
             failed,
             Err(GuardianEffectTransactionError::Effect("zero-byte write"))
@@ -11225,11 +11207,7 @@ mod tests {
         let expected_identity = checkpoint_effect_identity(&checkpoint);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
 
         let generic_invocations = std::cell::Cell::new(0_usize);
         let generic = state.apply_effect_transactionally(&authenticated_checkpoint, |_| {
@@ -11262,7 +11240,10 @@ mod tests {
         assert_eq!(expected_identity.sequence(), 1);
         assert_eq!(expected_identity.effect_id(), id(9));
         assert_eq!(expected_identity.intent(), checkpoint_intent(0x31, 0x32));
-        assert_eq!(receipt.disposition(), GuardianCheckpointDisposition::Committed);
+        assert_eq!(
+            receipt.disposition(),
+            GuardianCheckpointDisposition::Committed
+        );
         assert_eq!(receipt.pane_id(), pane);
         assert_eq!(receipt.generation(), 1);
         assert_eq!(receipt.sequence(), 1);
@@ -11338,11 +11319,7 @@ mod tests {
         let identity = checkpoint_effect_identity(&checkpoint);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
 
         let invocations = std::cell::Cell::new(0_usize);
         let receipt = state
@@ -11545,9 +11522,7 @@ mod tests {
                 ))
             ));
         }
-        let second_checkpoint = checkpoint_request(
-            guardian, mux, pane, 1, 2, 32, 33, 0x61, 0x62,
-        );
+        let second_checkpoint = checkpoint_request(guardian, mux, pane, 1, 2, 32, 33, 0x61, 0x62);
         assert_eq!(
             state.apply_checkpoint_transactionally(&authenticate(&second_checkpoint), |_| {
                 blocked_callbacks.set(blocked_callbacks.get() + 1);
@@ -11565,13 +11540,9 @@ mod tests {
             }
         );
 
-        let census_page = GuardianCensusPageRequest::new(
-            Uuid::nil(),
-            0,
-            1,
-            GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-        )
-        .unwrap();
+        let census_page =
+            GuardianCensusPageRequest::new(Uuid::nil(), 0, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES)
+                .unwrap();
         let census_request = request(
             GuardianOperation::Census,
             guardian,
@@ -11625,7 +11596,10 @@ mod tests {
             committed.disposition(),
             GuardianCheckpointDisposition::Committed
         );
-        assert_eq!(state.mark_checkpoint_committed(identity).unwrap(), committed);
+        assert_eq!(
+            state.mark_checkpoint_committed(identity).unwrap(),
+            committed
+        );
         let committed_alias = state
             .apply_checkpoint_transactionally(&authenticated_alias, |_| {
                 invocations.set(invocations.get() + 1);
@@ -11670,11 +11644,7 @@ mod tests {
         let identity = checkpoint_effect_identity(&checkpoint);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
 
         let sequence_gap = checkpoint_request(guardian, mux, pane, 1, 2, 10, 11, 0x73, 0x74);
         let preflight_invocations = std::cell::Cell::new(0_usize);
@@ -11953,8 +11923,7 @@ mod tests {
         );
 
         let mut malformed_length = encode_guardian_response(&secret(), &response).unwrap();
-        malformed_length
-            [RESPONSE_PAYLOAD_LENGTH_OFFSET..RESPONSE_PAYLOAD_LENGTH_OFFSET + 4]
+        malformed_length[RESPONSE_PAYLOAD_LENGTH_OFFSET..RESPONSE_PAYLOAD_LENGTH_OFFSET + 4]
             .copy_from_slice(&((GUARDIAN_MAX_PAYLOAD_BYTES + 1) as u32).to_be_bytes());
         assert_eq!(
             decode_guardian_response(&secret(), &malformed_length),
@@ -12069,8 +12038,7 @@ mod tests {
             &authenticated_request,
             GuardianRejectionCode::CheckpointOutcomeIndeterminate,
         );
-        let mut forged_terminal =
-            encode_guardian_response(&secret(), &checkpoint_fence).unwrap();
+        let mut forged_terminal = encode_guardian_response(&secret(), &checkpoint_fence).unwrap();
         forged_terminal[11] = GuardianResponseStatus::Terminal as u8;
         let mac_start = forged_terminal.len() - GUARDIAN_MAC_BYTES;
         let tag = secret().mac(&forged_terminal[..mac_start]).unwrap();
@@ -12175,8 +12143,8 @@ mod tests {
             reply
         );
         let mut noncanonical_absent_exit_status = encoded.clone();
-        let first_exit_status_byte = usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap()
-            + 81;
+        let first_exit_status_byte =
+            usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap() + 81;
         noncanonical_absent_exit_status[first_exit_status_byte] = 1;
         assert_eq!(
             GuardianReply::decode_for_operation(
@@ -12214,13 +12182,8 @@ mod tests {
         .unwrap();
         assert_eq!(correlated.success_reply(&census_request).unwrap(), reply);
 
-        let entry_limited_page = GuardianCensusPageRequest::new(
-            Uuid::nil(),
-            0,
-            4,
-            GUARDIAN_MAX_CENSUS_BYTES,
-        )
-        .unwrap();
+        let entry_limited_page =
+            GuardianCensusPageRequest::new(Uuid::nil(), 0, 4, GUARDIAN_MAX_CENSUS_BYTES).unwrap();
         let entry_limited_request = authenticate(&request(
             GuardianOperation::Census,
             id(1),
@@ -12254,8 +12217,8 @@ mod tests {
             "the correlated consumer must independently enforce the exact request ceiling"
         );
 
-        let four_entry_bytes = GUARDIAN_CENSUS_PAGE_HEADER_BYTES
-            + 4 * GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES;
+        let four_entry_bytes =
+            GUARDIAN_CENSUS_PAGE_HEADER_BYTES + 4 * GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES;
         let byte_limited_page = GuardianCensusPageRequest::new(
             Uuid::nil(),
             0,
@@ -12291,8 +12254,7 @@ mod tests {
         );
 
         let mut malformed_flags = encoded;
-        let first_entry_flags =
-            usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap() + 86;
+        let first_entry_flags = usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap() + 86;
         malformed_flags[first_entry_flags] = 0x80;
         assert_eq!(
             GuardianReply::decode_for_operation(GuardianOperation::Census, &malformed_flags),
@@ -12323,8 +12285,8 @@ mod tests {
             Err(GuardianProtocolError::FrameTooLarge)
         );
 
-        let mut frame = encode_guardian_request(&secret(), &spawn_request(id(1), id(2), id(3)))
-            .unwrap();
+        let mut frame =
+            encode_guardian_request(&secret(), &spawn_request(id(1), id(2), id(3))).unwrap();
         let mut wrong_outer_length =
             encode_guardian_request(&secret(), &spawn_request(id(1), id(2), id(3))).unwrap();
         wrong_outer_length[..4].copy_from_slice(&0_u32.to_be_bytes());
@@ -12356,7 +12318,10 @@ mod tests {
             GUARDIAN_MAX_CENSUS_BYTES,
         )
         .unwrap();
-        assert_eq!(GuardianCensusPageRequest::decode(&page.encode()).unwrap(), page);
+        assert_eq!(
+            GuardianCensusPageRequest::decode(&page.encode()).unwrap(),
+            page
+        );
         assert_eq!(
             GuardianCensusPageRequest::new(
                 Uuid::nil(),
@@ -12371,30 +12336,15 @@ mod tests {
             Err(GuardianProtocolError::InvalidCensusPage)
         );
         assert_eq!(
-            GuardianCensusPageRequest::new(
-                Uuid::nil(),
-                0,
-                1,
-                GUARDIAN_MIN_CENSUS_PAGE_BYTES - 1,
-            ),
+            GuardianCensusPageRequest::new(Uuid::nil(), 0, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES - 1,),
             Err(GuardianProtocolError::InvalidCensusPage)
         );
         assert_eq!(
-            GuardianCensusPageRequest::new(
-                id(90),
-                0,
-                1,
-                GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-            ),
+            GuardianCensusPageRequest::new(id(90), 0, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES,),
             Err(GuardianProtocolError::InvalidCensusPage)
         );
         assert_eq!(
-            GuardianCensusPageRequest::new(
-                Uuid::nil(),
-                1,
-                1,
-                GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-            ),
+            GuardianCensusPageRequest::new(Uuid::nil(), 1, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES,),
             Err(GuardianProtocolError::InvalidCensusPage)
         );
         assert_eq!(
@@ -12424,11 +12374,7 @@ mod tests {
             &census
         );
         assert_eq!(
-            apply_request(
-                &mut GuardianProtocolState::new(guardian).unwrap(),
-                &census,
-            )
-            .unwrap(),
+            apply_request(&mut GuardianProtocolState::new(guardian).unwrap(), &census,).unwrap(),
             GuardianReply::CensusPage {
                 snapshot_id: Uuid::from_u128(1),
                 entries: Vec::new(),
@@ -12443,9 +12389,7 @@ mod tests {
         let guardian = id(1);
         let mux = id(2);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
-        for (pane_byte, request_byte, effect_byte) in
-            [(40, 41, 42), (20, 21, 22), (30, 31, 32)]
-        {
+        for (pane_byte, request_byte, effect_byte) in [(40, 41, 42), (20, 21, 22), (30, 31, 32)] {
             let payload = spawn_payload("census-pane");
             let spawn = request(
                 GuardianOperation::Spawn,
@@ -12462,13 +12406,8 @@ mod tests {
         }
 
         let census = |request_byte, snapshot_id, cursor, max_entries, max_bytes| {
-            let page = GuardianCensusPageRequest::new(
-                snapshot_id,
-                cursor,
-                max_entries,
-                max_bytes,
-            )
-            .unwrap();
+            let page = GuardianCensusPageRequest::new(snapshot_id, cursor, max_entries, max_bytes)
+                .unwrap();
             request(
                 GuardianOperation::Census,
                 guardian,
@@ -12481,13 +12420,10 @@ mod tests {
                 &page.encode(),
             )
         };
-        let two_entry_bytes = GUARDIAN_CENSUS_PAGE_HEADER_BYTES
-            + 2 * GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES;
-        let first = apply_request(
-            &mut state,
-            &census(50, Uuid::nil(), 0, 2, two_entry_bytes),
-        )
-        .unwrap();
+        let two_entry_bytes =
+            GUARDIAN_CENSUS_PAGE_HEADER_BYTES + 2 * GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES;
+        let first =
+            apply_request(&mut state, &census(50, Uuid::nil(), 0, 2, two_entry_bytes)).unwrap();
         let GuardianReply::CensusPage {
             snapshot_id: first_snapshot_id,
             entries,
@@ -12502,7 +12438,10 @@ mod tests {
         assert_eq!(total_panes, 3);
         assert_eq!(next_cursor, Some(2));
         assert_eq!(
-            entries.iter().map(|entry| entry.pane_id).collect::<Vec<_>>(),
+            entries
+                .iter()
+                .map(|entry| entry.pane_id)
+                .collect::<Vec<_>>(),
             vec![id(20), id(30)]
         );
         assert!(entries.iter().all(|entry| {
@@ -12516,13 +12455,9 @@ mod tests {
                 && entry.quarantine_reason.is_none()
         }));
 
-        let conflicting_page = GuardianCensusPageRequest::new(
-            snapshot_id,
-            2,
-            1,
-            GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-        )
-        .unwrap();
+        let conflicting_page =
+            GuardianCensusPageRequest::new(snapshot_id, 2, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES)
+                .unwrap();
         let conflicting_mux = request(
             GuardianOperation::Census,
             guardian,
@@ -12610,13 +12545,7 @@ mod tests {
         assert_eq!(
             apply_request(
                 &mut state,
-                &census(
-                    53,
-                    snapshot_id,
-                    4,
-                    1,
-                    GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-                ),
+                &census(53, snapshot_id, 4, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES,),
             ),
             Err(GuardianProtocolError::InvalidCensusCursor {
                 cursor: 4,
@@ -12627,13 +12556,7 @@ mod tests {
         assert_eq!(
             apply_request(
                 &mut state,
-                &census(
-                    54,
-                    missing_snapshot,
-                    1,
-                    1,
-                    GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-                ),
+                &census(54, missing_snapshot, 1, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES,),
             ),
             Err(GuardianProtocolError::CensusSnapshotNotFound(
                 missing_snapshot,
@@ -12648,13 +12571,9 @@ mod tests {
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         for offset in 0..=GUARDIAN_MAX_CENSUS_SNAPSHOTS {
             let offset = u8::try_from(offset).expect("test snapshot offset fits u8");
-            let page = GuardianCensusPageRequest::new(
-                Uuid::nil(),
-                0,
-                1,
-                GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-            )
-            .unwrap();
+            let page =
+                GuardianCensusPageRequest::new(Uuid::nil(), 0, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES)
+                    .unwrap();
             let census = request(
                 GuardianOperation::Census,
                 guardian,
@@ -12677,23 +12596,16 @@ mod tests {
                     && entries.is_empty()
             ));
         }
-        assert_eq!(
-            state.census_snapshots.len(),
-            GUARDIAN_MAX_CENSUS_SNAPSHOTS
-        );
+        assert_eq!(state.census_snapshots.len(), GUARDIAN_MAX_CENSUS_SNAPSHOTS);
         assert_eq!(
             state.census_snapshot_order.len(),
             GUARDIAN_MAX_CENSUS_SNAPSHOTS
         );
 
         let retired_snapshot = Uuid::from_u128(1);
-        let stale_page = GuardianCensusPageRequest::new(
-            retired_snapshot,
-            1,
-            1,
-            GUARDIAN_MIN_CENSUS_PAGE_BYTES,
-        )
-        .unwrap();
+        let stale_page =
+            GuardianCensusPageRequest::new(retired_snapshot, 1, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES)
+                .unwrap();
         let stale_census = request(
             GuardianOperation::Census,
             guardian,
@@ -12938,11 +12850,7 @@ mod tests {
         let pane = id(3);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
 
         let attach = request(
             GuardianOperation::Attach,
@@ -13011,11 +12919,7 @@ mod tests {
         let effect = id(20);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
 
         let input = request(
             GuardianOperation::Input,
@@ -13081,7 +12985,9 @@ mod tests {
             "an input whose disposition is unknown must not be evictable"
         );
         assert!(
-            !state.transient_request_order.contains(&input.header.request_id)
+            !state
+                .transient_request_order
+                .contains(&input.header.request_id)
                 && !state
                     .transient_request_order
                     .contains(&retry_after_ambiguous_response.header.request_id),
@@ -13160,7 +13066,9 @@ mod tests {
         );
         assert!(state.transient_effect_order.contains(&effect));
         assert!(
-            state.transient_request_order.contains(&input.header.request_id)
+            state
+                .transient_request_order
+                .contains(&input.header.request_id)
                 && state
                     .transient_request_order
                     .contains(&retry_after_ambiguous_response.header.request_id),
@@ -13219,9 +13127,8 @@ mod tests {
     #[test]
     fn terminal_capacity_exhaustion_never_yields_or_invokes_an_input_writer() {
         use crate::guardian_input_journal::{
-            GuardianInputJournal, GuardianInputJournalError, GuardianInputJournalLimits,
-            GuardianInputTransaction, GuardianInputTransactionError,
-            begin_guardian_input_transaction,
+            begin_guardian_input_transaction, GuardianInputJournal, GuardianInputJournalError,
+            GuardianInputJournalLimits, GuardianInputTransaction, GuardianInputTransactionError,
         };
         use crate::guardian_output_journal::GuardianOutputCipher;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -13246,11 +13153,7 @@ mod tests {
         let pane = id(3);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
         let input = request(
             GuardianOperation::Input,
             guardian,
@@ -13312,9 +13215,8 @@ mod tests {
     #[test]
     fn durable_partial_input_is_count_bound_and_exact_retries_never_reapply_prefix() {
         use crate::guardian_input_journal::{
-            GuardianInputJournal, GuardianInputJournalLimits, GuardianInputTransaction,
-            GuardianInputTransactionError, begin_guardian_input_transaction,
-            commit_guardian_input_outcome,
+            begin_guardian_input_transaction, commit_guardian_input_outcome, GuardianInputJournal,
+            GuardianInputJournalLimits, GuardianInputTransaction, GuardianInputTransactionError,
         };
         use crate::guardian_output_journal::GuardianOutputCipher;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -13340,11 +13242,7 @@ mod tests {
         let effect = id(60);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
         let input = request(
             GuardianOperation::Input,
             guardian,
@@ -13592,11 +13490,7 @@ mod tests {
         let pane = id(3);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
 
         let skipped = request(
             GuardianOperation::Resize,
@@ -13659,11 +13553,7 @@ mod tests {
         let effect = id(20);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
 
         let input = request(
             GuardianOperation::Input,
@@ -13696,7 +13586,9 @@ mod tests {
                 max_aliases: GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT,
             })
         );
-        assert!(!state.requests.contains_key(&rejected_alias.header.request_id));
+        assert!(!state
+            .requests
+            .contains_key(&rejected_alias.header.request_id));
         assert_eq!(
             state.effect_request_ids[&effect].len(),
             GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT,
@@ -13722,11 +13614,7 @@ mod tests {
         let effect = id(40);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
         let input = request(
             GuardianOperation::Input,
             guardian,
@@ -13816,11 +13704,7 @@ mod tests {
         let effect = id(9);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
         let input = request(
             GuardianOperation::Input,
             guardian,
@@ -13888,11 +13772,7 @@ mod tests {
         let effect = id(50);
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
         let input = request(
             GuardianOperation::Input,
             guardian,
@@ -13977,7 +13857,9 @@ mod tests {
         assert!(!state.requests.contains_key(&claim.header.request_id));
         assert!(!state.effects.contains_key(&claim.header.effect_id.unwrap()));
         assert!(!state.requests.contains_key(&resize_one.header.request_id));
-        assert!(!state.effects.contains_key(&resize_one.header.effect_id.unwrap()));
+        assert!(!state
+            .effects
+            .contains_key(&resize_one.header.effect_id.unwrap()));
 
         assert_eq!(apply_request(&mut state, &spawn).unwrap(), spawned);
         assert_eq!(
@@ -14006,11 +13888,7 @@ mod tests {
         let pane = id(3);
         let mut state = GuardianProtocolState::new_with_receipt_capacity(guardian, 4).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 6, 7),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
 
         let resize = |request_byte, effect_byte, sequence| {
             request(
@@ -14039,7 +13917,9 @@ mod tests {
         apply_request(&mut state, &resize(15, 16, 4)).unwrap();
 
         assert!(!state.effects.contains_key(&id(9)));
-        assert!(!state.requests.contains_key(&newer_first_alias.header.request_id));
+        assert!(!state
+            .requests
+            .contains_key(&newer_first_alias.header.request_id));
         assert!(!state
             .effect_request_ids
             .values()
@@ -14291,11 +14171,7 @@ mod tests {
         let pane = id(3);
         let mut generation_state =
             GuardianProtocolState::new_with_receipt_capacity(guardian, 1).unwrap();
-        apply_request(
-            &mut generation_state,
-            &spawn_request(guardian, mux, pane),
-        )
-        .unwrap();
+        apply_request(&mut generation_state, &spawn_request(guardian, mux, pane)).unwrap();
         generation_state.panes.insert(
             pane,
             GuardianPaneState::LiveUnclaimed {
@@ -14545,13 +14421,9 @@ mod tests {
         };
         let upload_id = id(71);
         let chunk_bytes = 1_024;
-        let begin = GuardianCheckpointStageRequestV1::begin(
-            scope,
-            upload_id,
-            descriptor,
-            chunk_bytes,
-        )
-        .unwrap();
+        let begin =
+            GuardianCheckpointStageRequestV1::begin(scope, upload_id, descriptor, chunk_bytes)
+                .unwrap();
         let begin_total_chunks = begin.total_chunks();
         let mut begin_wire: Zeroizing<Vec<u8>> = begin.into_zeroizing_payload().unwrap();
         let decoded_begin = GuardianCheckpointStageRequestV1::decode(&begin_wire).unwrap();
@@ -14559,9 +14431,7 @@ mod tests {
         assert_eq!(decoded_begin.descriptor(), descriptor);
         assert_eq!(decoded_begin.total_chunks(), begin_total_chunks);
 
-        let first_len = usize::try_from(chunk_bytes)
-            .unwrap()
-            .min(canonical.len());
+        let first_len = usize::try_from(chunk_bytes).unwrap().min(canonical.len());
         let chunk_plaintext = zeroizing_vec_from_slice(&canonical[..first_len]);
         let chunk = GuardianCheckpointStageRequestV1::chunk(
             scope,
@@ -14587,21 +14457,13 @@ mod tests {
         assert_eq!(decoded_position, (0, 0));
         assert_eq!(decoded_bytes.as_slice(), &canonical[..first_len]);
 
-        let seal = GuardianCheckpointStageRequestV1::seal(
-            scope,
-            upload_id,
-            descriptor,
-            chunk_bytes,
-        )
-        .unwrap();
+        let seal =
+            GuardianCheckpointStageRequestV1::seal(scope, upload_id, descriptor, chunk_bytes)
+                .unwrap();
         assert_eq!(seal.validate_staged_plaintext(canonical), Ok(()));
-        let query = GuardianCheckpointStageRequestV1::query(
-            scope,
-            upload_id,
-            descriptor,
-            chunk_bytes,
-        )
-        .unwrap();
+        let query =
+            GuardianCheckpointStageRequestV1::query(scope, upload_id, descriptor, chunk_bytes)
+                .unwrap();
         let query_wire = query.into_zeroizing_payload().unwrap();
         let decoded_query = GuardianCheckpointStageRequestV1::decode(&query_wire).unwrap();
         assert_eq!(decoded_query.kind(), GuardianCheckpointStageKindV1::Query);
@@ -14743,11 +14605,9 @@ mod tests {
         );
 
         let spawn_effect_id = id(79);
-        let genesis = GuardianCheckpointDescriptorV1::for_genesis_artifact(
-            spawn_effect_id,
-            &terminal,
-        )
-        .unwrap();
+        let genesis =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(spawn_effect_id, &terminal)
+                .unwrap();
         let mut genesis_origin_mutation = genesis.encode();
         genesis_origin_mutation[176] ^= 1;
         assert_eq!(
@@ -14782,15 +14642,11 @@ mod tests {
         let upload_id = id(77);
         let chunk_bytes = 1_024;
 
-        let begin_payload = GuardianCheckpointStageRequestV1::begin(
-            scope,
-            upload_id,
-            descriptor,
-            chunk_bytes,
-        )
-        .unwrap()
-        .into_zeroizing_payload()
-        .unwrap();
+        let begin_payload =
+            GuardianCheckpointStageRequestV1::begin(scope, upload_id, descriptor, chunk_bytes)
+                .unwrap()
+                .into_zeroizing_payload()
+                .unwrap();
         let begin = authenticate(&request_zeroizing(
             GuardianOperation::CheckpointStage,
             guardian,
@@ -14808,12 +14664,14 @@ mod tests {
             committed_bytes: 0,
         };
         let ready_wire = ready.encode().unwrap();
-        assert_eq!(GuardianCheckpointStageReplyV1::decode(&ready_wire), Ok(ready));
-        assert!(GuardianResponseEnvelope::success(
-            &begin,
-            &GuardianReply::CheckpointStage(ready),
-        )
-        .is_ok());
+        assert_eq!(
+            GuardianCheckpointStageReplyV1::decode(&ready_wire),
+            Ok(ready)
+        );
+        assert!(
+            GuardianResponseEnvelope::success(&begin, &GuardianReply::CheckpointStage(ready),)
+                .is_ok()
+        );
         assert_eq!(
             GuardianResponseEnvelope::success(
                 &begin,
@@ -14896,15 +14754,11 @@ mod tests {
             Err(GuardianProtocolError::InvalidReplyPayload)
         );
 
-        let seal_payload = GuardianCheckpointStageRequestV1::seal(
-            scope,
-            upload_id,
-            descriptor,
-            chunk_bytes,
-        )
-        .unwrap()
-        .into_zeroizing_payload()
-        .unwrap();
+        let seal_payload =
+            GuardianCheckpointStageRequestV1::seal(scope, upload_id, descriptor, chunk_bytes)
+                .unwrap()
+                .into_zeroizing_payload()
+                .unwrap();
         let seal = authenticate(&request_zeroizing(
             GuardianOperation::CheckpointStage,
             guardian,
@@ -14923,16 +14777,12 @@ mod tests {
             boundary_id: descriptor.boundary_id(),
             total_bytes: descriptor.total_bytes(),
         };
-        assert!(GuardianResponseEnvelope::success(
-            &seal,
-            &GuardianReply::CheckpointStage(sealed),
-        )
-        .is_ok());
+        assert!(
+            GuardianResponseEnvelope::success(&seal, &GuardianReply::CheckpointStage(sealed),)
+                .is_ok()
+        );
         assert_eq!(
-            GuardianResponseEnvelope::success(
-                &seal,
-                &GuardianReply::CheckpointStage(ready),
-            ),
+            GuardianResponseEnvelope::success(&seal, &GuardianReply::CheckpointStage(ready),),
             Err(GuardianProtocolError::ResponseRequestMismatch)
         );
         assert_eq!(
@@ -14950,15 +14800,11 @@ mod tests {
             Err(GuardianProtocolError::ResponseRequestMismatch)
         );
 
-        let query_payload = GuardianCheckpointStageRequestV1::query(
-            scope,
-            upload_id,
-            descriptor,
-            chunk_bytes,
-        )
-        .unwrap()
-        .into_zeroizing_payload()
-        .unwrap();
+        let query_payload =
+            GuardianCheckpointStageRequestV1::query(scope, upload_id, descriptor, chunk_bytes)
+                .unwrap()
+                .into_zeroizing_payload()
+                .unwrap();
         let query = authenticate(&request_zeroizing(
             GuardianOperation::CheckpointStage,
             guardian,
@@ -15025,11 +14871,10 @@ mod tests {
             None,
             ack_payload,
         ));
-        assert!(GuardianResponseEnvelope::success(
-            &ack,
-            &GuardianReply::CheckpointStage(acked),
-        )
-        .is_ok());
+        assert!(
+            GuardianResponseEnvelope::success(&ack, &GuardianReply::CheckpointStage(acked),)
+                .is_ok()
+        );
         assert_eq!(
             GuardianResponseEnvelope::success(
                 &ack,
@@ -15057,12 +14902,13 @@ mod tests {
         let terminal = terminal_checkpoint();
         assert_eq!(terminal.parser_stream_bytes(), 0);
         let spawn_effect_id = id(72);
-        let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(
-            spawn_effect_id,
-            &terminal,
-        )
-        .unwrap();
-        assert_eq!(descriptor.capture_generation(), GUARDIAN_GENESIS_CAPTURE_GENERATION);
+        let descriptor =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(spawn_effect_id, &terminal)
+                .unwrap();
+        assert_eq!(
+            descriptor.capture_generation(),
+            GUARDIAN_GENESIS_CAPTURE_GENERATION
+        );
         assert_eq!(descriptor.durable_pane_id(), None);
         assert!(matches!(
             descriptor.output_boundary(),
@@ -15238,7 +15084,10 @@ mod tests {
 
         let receipt = GuardianReplayAckReceiptV1::from_ack(ack);
         let receipt_wire = receipt.encode().unwrap();
-        assert_eq!(GuardianReplayAckReceiptV1::decode(&receipt_wire), Ok(receipt));
+        assert_eq!(
+            GuardianReplayAckReceiptV1::decode(&receipt_wire),
+            Ok(receipt)
+        );
         let mut noncanonical_receipt = receipt_wire;
         noncanonical_receipt[131] = 1;
         assert_eq!(
@@ -15351,11 +15200,7 @@ mod tests {
         let metadata = records
             .into_records()
             .into_iter()
-            .map(|record| {
-                record
-                    .write_all_bounded(&mut *plaintext, 4_096)
-                    .unwrap()
-            })
+            .map(|record| record.write_all_bounded(&mut *plaintext, 4_096).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(plaintext.as_slice(), b"first\nlast\n");
         assert_eq!(
@@ -15368,14 +15213,10 @@ mod tests {
         assert_eq!(metadata[0].predecessor().unwrap().last_sequence(), 7);
         assert_eq!(metadata[1].cumulative_plaintext_bytes(), 523);
 
-        let mut page_digest_mutation: Zeroizing<Vec<u8>> = replay_output_page(
-            pane,
-            generation,
-            snapshot_id,
-            snapshot_digest,
-        )
-        .into_payload()
-        .unwrap();
+        let mut page_digest_mutation: Zeroizing<Vec<u8>> =
+            replay_output_page(pane, generation, snapshot_id, snapshot_digest)
+                .into_payload()
+                .unwrap();
         let last = page_digest_mutation.len() - 1;
         page_digest_mutation[last] ^= 1;
         assert!(matches!(
@@ -15383,18 +15224,13 @@ mod tests {
             Err(GuardianProtocolError::InvalidReplyPayload)
         ));
 
-        let mut plaintext_digest_mutation = replay_output_page(
-            pane,
-            generation,
-            snapshot_id,
-            snapshot_digest,
-        )
-        .into_payload()
-        .unwrap();
+        let mut plaintext_digest_mutation =
+            replay_output_page(pane, generation, snapshot_id, snapshot_digest)
+                .into_payload()
+                .unwrap();
         let last = plaintext_digest_mutation.len() - 1;
         plaintext_digest_mutation[last] ^= 1;
-        let repaired_page_digest =
-            compute_replay_page_digest(&plaintext_digest_mutation).unwrap();
+        let repaired_page_digest = compute_replay_page_digest(&plaintext_digest_mutation).unwrap();
         plaintext_digest_mutation[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
             .copy_from_slice(&repaired_page_digest.declassify_for_ack());
         assert!(matches!(
@@ -15402,26 +15238,15 @@ mod tests {
             Err(GuardianProtocolError::InvalidReplyPayload)
         ), "the per-record commitment must reject plaintext even after the outer page digest is recomputed");
 
-        let mut order_mutation = replay_output_page(
-            pane,
-            generation,
-            snapshot_id,
-            snapshot_digest,
-        )
-        .into_payload()
-        .unwrap();
+        let mut order_mutation = replay_output_page(pane, generation, snapshot_id, snapshot_digest)
+            .into_payload()
+            .unwrap();
         let first_record = REPLAY_PAGE_HEADER_BYTES + REPLAY_OUTPUT_RECORDS_HEADER_BYTES;
         let second_record = first_record + REPLAY_OUTPUT_RECORD_FIXED_BYTES + b"first\n".len();
         order_mutation[second_record + 104..second_record + 112]
             .copy_from_slice(&11_u64.to_be_bytes());
-        let predecessor = GuardianReplayPredecessorV1::new(
-            id(90),
-            7,
-            [0x55; 32],
-            512,
-            4_096,
-        )
-        .unwrap();
+        let predecessor =
+            GuardianReplayPredecessorV1::new(id(90), 7, [0x55; 32], 512, 4_096).unwrap();
         let altered_metadata = GuardianReplayRecordMetadataV1::new(
             id(91),
             8,
@@ -15440,10 +15265,13 @@ mod tests {
         let repaired_page_digest = compute_replay_page_digest(&order_mutation).unwrap();
         order_mutation[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
             .copy_from_slice(&repaired_page_digest.declassify_for_ack());
-        assert!(matches!(
-            GuardianReplayPageDelivery::decode(order_mutation),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "a self-consistent record digest cannot hide a sequence-order gap");
+        assert!(
+            matches!(
+                GuardianReplayPageDelivery::decode(order_mutation),
+                Err(GuardianProtocolError::InvalidReplyPayload)
+            ),
+            "a self-consistent record digest cannot hide a sequence-order gap"
+        );
 
         let too_small_replay = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
@@ -15561,34 +15389,29 @@ mod tests {
             )
             .unwrap()
         };
-        let complete_page = |
-            snapshot: Uuid,
-            incoming_cursor_digest: [u8; 32],
-            page_index: u32,
-            checkpoint_id: GuardianCheckpointIdentityDigest,
-        | {
-            GuardianReplayPageDelivery::new(
-                pane,
-                generation,
-                snapshot,
-                snapshot_digest,
-                incoming_cursor_digest,
-                page_index,
-                None,
-                GuardianReplayPageBodyDelivery::Complete {
-                    checkpoint_id,
-                    through_sequence: 7,
-                    terminal_record_digest: [0x55; 32],
-                    cumulative_plaintext_bytes: 512,
-                },
-            )
-            .unwrap()
-        };
-        let compacted_page = |
-            snapshot: Uuid,
-            incoming_cursor_digest: [u8; 32],
-            page_index: u32,
-        | {
+        let complete_page =
+            |snapshot: Uuid,
+             incoming_cursor_digest: [u8; 32],
+             page_index: u32,
+             checkpoint_id: GuardianCheckpointIdentityDigest| {
+                GuardianReplayPageDelivery::new(
+                    pane,
+                    generation,
+                    snapshot,
+                    snapshot_digest,
+                    incoming_cursor_digest,
+                    page_index,
+                    None,
+                    GuardianReplayPageBodyDelivery::Complete {
+                        checkpoint_id,
+                        through_sequence: 7,
+                        terminal_record_digest: [0x55; 32],
+                        cumulative_plaintext_bytes: 512,
+                    },
+                )
+                .unwrap()
+            };
+        let compacted_page = |snapshot: Uuid, incoming_cursor_digest: [u8; 32], page_index: u32| {
             GuardianReplayPageDelivery::new(
                 pane,
                 generation,
@@ -15656,8 +15479,7 @@ mod tests {
             .unwrap()
             .into_replay_page(&exact)
             .unwrap();
-        let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) =
-            exact_delivery.into_body()
+        let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) = exact_delivery.into_body()
         else {
             panic!("exact checkpoint replay must begin with checkpoint bytes");
         };
@@ -15669,13 +15491,19 @@ mod tests {
             .write_all_bounded(&mut *delivered_chunk, 4_096)
             .unwrap();
         assert_eq!(offset, 0);
-        assert_eq!(usize::try_from(delivered_bytes).unwrap(), expected_chunk.len());
+        assert_eq!(
+            usize::try_from(delivered_bytes).unwrap(),
+            expected_chunk.len()
+        );
         assert_eq!(delivered_chunk.as_slice(), expected_chunk.as_slice());
 
-        assert!(matches!(
-            GuardianResponseEnvelope::replay_page(&exact, checkpoint_page(1)),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "the first Exact page cannot begin mid-checkpoint");
+        assert!(
+            matches!(
+                GuardianResponseEnvelope::replay_page(&exact, checkpoint_page(1)),
+                Err(GuardianProtocolError::InvalidReplyPayload)
+            ),
+            "the first Exact page cannot begin mid-checkpoint"
+        );
         assert!(GuardianResponseEnvelope::replay_page(&exact, gap_page()).is_ok());
 
         let requested_exact_payload = GuardianReplayRequestV1::Open {
@@ -15725,27 +15553,36 @@ mod tests {
             &latest_payload,
         ));
         assert!(GuardianResponseEnvelope::replay_page(&latest, checkpoint_page(0)).is_ok());
-        assert!(matches!(
-            GuardianResponseEnvelope::replay_page(
-                &latest,
-                complete_page(snapshot_id, [0; 32], 0, descriptor.checkpoint_id()),
+        assert!(
+            matches!(
+                GuardianResponseEnvelope::replay_page(
+                    &latest,
+                    complete_page(snapshot_id, [0; 32], 0, descriptor.checkpoint_id()),
+                ),
+                Err(GuardianProtocolError::InvalidReplyPayload)
             ),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "Latest cannot silently skip the required checkpoint bytes");
-        assert!(matches!(
-            GuardianResponseEnvelope::replay_page(
-                &latest,
-                compacted_page(snapshot_id, [0; 32], 0),
+            "Latest cannot silently skip the required checkpoint bytes"
+        );
+        assert!(
+            matches!(
+                GuardianResponseEnvelope::replay_page(
+                    &latest,
+                    compacted_page(snapshot_id, [0; 32], 0),
+                ),
+                Err(GuardianProtocolError::InvalidReplyPayload)
             ),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "Latest has no requested checkpoint that a Compacted outcome could identify");
-        assert!(matches!(
-            GuardianResponseEnvelope::replay_page(
-                &exact,
-                complete_page(snapshot_id, [0; 32], 0, descriptor.checkpoint_id()),
+            "Latest has no requested checkpoint that a Compacted outcome could identify"
+        );
+        assert!(
+            matches!(
+                GuardianResponseEnvelope::replay_page(
+                    &exact,
+                    complete_page(snapshot_id, [0; 32], 0, descriptor.checkpoint_id()),
+                ),
+                Err(GuardianProtocolError::InvalidReplyPayload)
             ),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "Exact cannot silently skip the required checkpoint bytes");
+            "Exact cannot silently skip the required checkpoint bytes"
+        );
 
         let resume_payload = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
@@ -15775,13 +15612,16 @@ mod tests {
             complete_page(snapshot_id, [0; 32], 0, descriptor.checkpoint_id()),
         )
         .is_ok());
-        assert!(matches!(
-            GuardianResponseEnvelope::replay_page(
-                &resume,
-                complete_page(snapshot_id, [0; 32], 0, requested_checkpoint),
+        assert!(
+            matches!(
+                GuardianResponseEnvelope::replay_page(
+                    &resume,
+                    complete_page(snapshot_id, [0; 32], 0, requested_checkpoint),
+                ),
+                Err(GuardianProtocolError::InvalidReplyPayload)
             ),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "Resume Complete must name the exact checkpoint already held by the consumer");
+            "Resume Complete must name the exact checkpoint already held by the consumer"
+        );
 
         let checkpoint_cursor = GuardianReplayCursorV1::new(
             snapshot_id,
@@ -15812,25 +15652,31 @@ mod tests {
             None,
             &checkpoint_continue_payload,
         ));
-        assert!(matches!(
-            GuardianResponseEnvelope::replay_page(
-                &checkpoint_continue,
-                complete_page(
-                    snapshot_id,
-                    checkpoint_cursor.digest(),
-                    1,
-                    descriptor.checkpoint_id(),
+        assert!(
+            matches!(
+                GuardianResponseEnvelope::replay_page(
+                    &checkpoint_continue,
+                    complete_page(
+                        snapshot_id,
+                        checkpoint_cursor.digest(),
+                        1,
+                        descriptor.checkpoint_id(),
+                    ),
                 ),
+                Err(GuardianProtocolError::InvalidReplyPayload)
             ),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "checkpoint-phase continuation cannot complete before the remaining checkpoint bytes");
-        assert!(matches!(
-            GuardianResponseEnvelope::replay_page(
-                &checkpoint_continue,
-                compacted_page(snapshot_id, checkpoint_cursor.digest(), 1),
+            "checkpoint-phase continuation cannot complete before the remaining checkpoint bytes"
+        );
+        assert!(
+            matches!(
+                GuardianResponseEnvelope::replay_page(
+                    &checkpoint_continue,
+                    compacted_page(snapshot_id, checkpoint_cursor.digest(), 1),
+                ),
+                Err(GuardianProtocolError::InvalidReplyPayload)
             ),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "an already pinned snapshot cannot change recovery base mid-stream");
+            "an already pinned snapshot cannot change recovery base mid-stream"
+        );
 
         let expired = GuardianReplayPageDelivery::new(
             pane,
@@ -15859,10 +15705,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(
-            GuardianResponseEnvelope::replay_page(&checkpoint_continue, retargeted),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "a continuation cannot be retargeted to another snapshot");
+        assert!(
+            matches!(
+                GuardianResponseEnvelope::replay_page(&checkpoint_continue, retargeted),
+                Err(GuardianProtocolError::InvalidReplyPayload)
+            ),
+            "a continuation cannot be retargeted to another snapshot"
+        );
 
         let output_cursor = GuardianReplayCursorV1::new(
             snapshot_id,
@@ -15921,20 +15770,23 @@ mod tests {
             Err(GuardianProtocolError::InvalidReplyPayload)
         ));
 
-        let mut false_compaction_boundary =
-            compacted_page(snapshot_id, [0; 32], 0).into_payload().unwrap();
+        let mut false_compaction_boundary = compacted_page(snapshot_id, [0; 32], 0)
+            .into_payload()
+            .unwrap();
         let retained_sequence_offset =
             REPLAY_PAGE_HEADER_BYTES + 32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES;
         false_compaction_boundary[retained_sequence_offset..retained_sequence_offset + 8]
             .copy_from_slice(&9_u64.to_be_bytes());
-        let repaired_page_digest =
-            compute_replay_page_digest(&false_compaction_boundary).unwrap();
+        let repaired_page_digest = compute_replay_page_digest(&false_compaction_boundary).unwrap();
         false_compaction_boundary[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
             .copy_from_slice(&repaired_page_digest.declassify_for_ack());
-        assert!(matches!(
-            GuardianReplayPageDelivery::decode(false_compaction_boundary),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "Compacted cannot misstate the replacement checkpoint's suffix boundary");
+        assert!(
+            matches!(
+                GuardianReplayPageDelivery::decode(false_compaction_boundary),
+                Err(GuardianProtocolError::InvalidReplyPayload)
+            ),
+            "Compacted cannot misstate the replacement checkpoint's suffix boundary"
+        );
 
         let mut invalid_expired_snapshot = GuardianReplayPageDelivery::new(
             pane,
@@ -15949,10 +15801,8 @@ mod tests {
         .unwrap()
         .into_payload()
         .unwrap();
-        invalid_expired_snapshot[REPLAY_PAGE_HEADER_BYTES..REPLAY_PAGE_HEADER_BYTES + 16]
-            .fill(0);
-        let repaired_page_digest =
-            compute_replay_page_digest(&invalid_expired_snapshot).unwrap();
+        invalid_expired_snapshot[REPLAY_PAGE_HEADER_BYTES..REPLAY_PAGE_HEADER_BYTES + 16].fill(0);
+        let repaired_page_digest = compute_replay_page_digest(&invalid_expired_snapshot).unwrap();
         invalid_expired_snapshot[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
             .copy_from_slice(&repaired_page_digest.declassify_for_ack());
         assert!(matches!(
@@ -15998,16 +15848,10 @@ mod tests {
             assert!(!source.contains(forbidden));
         }
         for forbidden in [
-            concat!(
-                "let chunk_plaintext = canonical[..first_len]",
-                ".to_vec();"
-            ),
+            concat!("let chunk_plaintext = canonical[..first_len]", ".to_vec();"),
             concat!("let chunk_wire = chunk.", "encode().unwrap();"),
             concat!("let mut digest_mutation = chunk_wire", ".clone();"),
-            concat!(
-                "payload[CHECKPOINT_STAGE_CHUNK_FIXED_BYTES..]",
-                ".to_vec()"
-            ),
+            concat!("payload[CHECKPOINT_STAGE_CHUNK_FIXED_BYTES..]", ".to_vec()"),
             concat!(
                 "payload[REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES..]",
                 ".to_vec()"

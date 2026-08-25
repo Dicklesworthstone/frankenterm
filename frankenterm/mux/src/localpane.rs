@@ -15,12 +15,12 @@ use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
+use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 use frankenterm_term::{
     Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
     RecoveryTerminalCheckpointV2, SemanticZone, StableRowIndex, Terminal, TerminalConfiguration,
     TerminalSize,
 };
-use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use procinfo::LocalProcessInfo;
@@ -3446,12 +3446,7 @@ mod tests {
         let identity = guardian_lifetime_test_identity(1);
         let control = Arc::new(FencedGuardianLeaseControl::new(identity));
         let kills = Arc::new(AtomicUsize::new(0));
-        let pane = guardian_lifetime_test_pane(
-            701,
-            identity,
-            control.clone(),
-            Arc::clone(&kills),
-        );
+        let pane = guardian_lifetime_test_pane(701, identity, control.clone(), Arc::clone(&kills));
         assert_eq!(
             Pane::durable_pane_id(&pane),
             Some(*identity.pane_id().as_bytes()),
@@ -3475,12 +3470,7 @@ mod tests {
         let identity = guardian_lifetime_test_identity(1);
         let control = Arc::new(FencedGuardianLeaseControl::new(identity));
         let kills = Arc::new(AtomicUsize::new(0));
-        let pane = guardian_lifetime_test_pane(
-            702,
-            identity,
-            control.clone(),
-            Arc::clone(&kills),
-        );
+        let pane = guardian_lifetime_test_pane(702, identity, control.clone(), Arc::clone(&kills));
 
         Pane::kill(&pane);
         Pane::kill(&pane);
@@ -5133,7 +5123,10 @@ mod disruptor_ring_keep_gate {
             pane.action_ring.is_empty(),
             "checkpoint left disruptor actions staged"
         );
-        assert!(pending.is_empty(), "checkpoint left parser actions unapplied");
+        assert!(
+            pending.is_empty(),
+            "checkpoint left parser actions unapplied"
+        );
         assert_eq!(checkpoint.parser_stream_bytes(), 2);
         assert_eq!(
             pane.terminal.lock().cursor_pos().x,

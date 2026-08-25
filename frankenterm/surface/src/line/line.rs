@@ -572,9 +572,7 @@ impl Line {
             CellStorage::V(cells) => cells
                 .iter()
                 .any(|cell| cell.attrs().has_image_attachments()),
-            CellStorage::C(line) => line
-                .iter()
-                .any(|cell| cell.attrs().has_image_attachments()),
+            CellStorage::C(line) => line.iter().any(|cell| cell.attrs().has_image_attachments()),
         }
     }
 

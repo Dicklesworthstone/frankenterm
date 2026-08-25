@@ -7,11 +7,12 @@ use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
 use downcast_rs::{impl_downcast, Downcast};
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::{
-    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
-    RecoveryTerminalCheckpointV2, StableRowIndex, TerminalConfiguration, TerminalSize,
-};
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+use frankenterm_term::{
+    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
+    RecoveryTerminalCheckpointV2, SemanticZone, StableRowIndex, TerminalConfiguration,
+    TerminalSize,
+};
 use parking_lot::MappedMutexGuard;
 use rangeset::RangeSet;
 use serde::{Deserialize, Serialize};

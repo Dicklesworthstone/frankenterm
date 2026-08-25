@@ -12121,8 +12121,7 @@ where
                 )));
             }
             let mut data = Vec::new();
-            data.try_reserve(hinted)
-                .map_err(serde::de::Error::custom)?;
+            data.try_reserve(hinted).map_err(serde::de::Error::custom)?;
             while let Some(byte) = sequence.next_element::<u8>()? {
                 if data.len() == MAX_RELIABLE_PANE_WRITE_DATA_BYTES {
                     return Err(serde::de::Error::custom(format_args!(
@@ -12158,8 +12157,12 @@ pub enum ReliablePaneWriteRejectionV1 {
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
 pub enum ReliablePaneWriteOutcomeV1 {
-    AppliedPrefix { bytes: u32 },
-    DuplicateAppliedPrefix { bytes: u32 },
+    AppliedPrefix {
+        bytes: u32,
+    },
+    DuplicateAppliedPrefix {
+        bytes: u32,
+    },
     Retry(ReliablePaneWriteRetryV1),
     Rejected(ReliablePaneWriteRejectionV1),
     /// The pane callback began but panicked, violated the `Write` contract, or
@@ -12325,9 +12328,9 @@ impl ReliablePaneWriteV1Response {
             ReliablePaneWriteOutcomeV1::Retry(ReliablePaneWriteRetryV1::Input(retry)) => {
                 validate_reliable_input_retry(retry).map_err(Into::into)
             }
-            ReliablePaneWriteOutcomeV1::Retry(
-                ReliablePaneWriteRetryV1::DefinitelyNotApplied { retry_after_ns },
-            ) => validate_reliable_retry_delay(retry_after_ns).map_err(Into::into),
+            ReliablePaneWriteOutcomeV1::Retry(ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+                retry_after_ns,
+            }) => validate_reliable_retry_delay(retry_after_ns).map_err(Into::into),
             ReliablePaneWriteOutcomeV1::Rejected(_) | ReliablePaneWriteOutcomeV1::Indeterminate => {
                 Ok(())
             }
@@ -12514,12 +12517,7 @@ fn reserve_input_serials(
     loop {
         let first = wall_clock.max(observed.checked_add(1)?);
         let last = first.checked_add(count.checked_sub(1)?)?;
-        match counter.compare_exchange_weak(
-            observed,
-            last,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(observed, last, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return Some((first, last)),
             Err(current) => observed = current,
         }
@@ -21598,11 +21596,9 @@ mod test {
         let outcomes = [
             ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 3 },
             ReliablePaneWriteOutcomeV1::DuplicateAppliedPrefix { bytes: 3 },
-            ReliablePaneWriteOutcomeV1::Retry(
-                ReliablePaneWriteRetryV1::DefinitelyNotApplied {
-                    retry_after_ns: 1_000_000,
-                },
-            ),
+            ReliablePaneWriteOutcomeV1::Retry(ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+                retry_after_ns: 1_000_000,
+            }),
             ReliablePaneWriteOutcomeV1::Rejected(
                 ReliablePaneWriteRejectionV1::DefinitelyNotApplied,
             ),
@@ -21619,12 +21615,11 @@ mod test {
             assert_eq!(decoded.pdu, request_pdu);
 
             for outcome in outcomes {
-                let response_pdu =
-                    Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
-                        pane_id: request.pane_id,
-                        input_serial: request.input_serial,
-                        outcome,
-                    });
+                let response_pdu = Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                    pane_id: request.pane_id,
+                    input_serial: request.input_serial,
+                    outcome,
+                });
                 let frame = response_pdu
                     .encode_frame_with_mode(51, mode)
                     .expect("valid exact-prefix response should frame");
@@ -21702,7 +21697,10 @@ mod test {
             "unexpected bounded field error: {error}"
         );
 
-        for bytes in [0, u32::try_from(MAX_RELIABLE_PANE_WRITE_DATA_BYTES + 1).unwrap()] {
+        for bytes in [
+            0,
+            u32::try_from(MAX_RELIABLE_PANE_WRITE_DATA_BYTES + 1).unwrap(),
+        ] {
             let mut frame = Vec::new();
             Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
                 pane_id: valid.pane_id,
@@ -22719,9 +22717,7 @@ mod test {
                 37 | 39 | 44 | 53..=55 | 83 | 90 => Cap::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Cap::Render,
                 3 | 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 75 | 77 | 81 | 86 | 93 => Cap::Query,
-                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 => {
-                    Cap::BulkData
-                }
+                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 => Cap::BulkData,
                 ident => panic!("PDU {} is missing from the admission-cap census", ident),
             };
             let expected_qos = match spec.ident {

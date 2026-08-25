@@ -199,9 +199,9 @@ pub enum RecoveryTerminalCheckpointError {
 impl std::fmt::Display for RecoveryTerminalCheckpointError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ParserNotRecoveryGround => formatter.write_str(
-                "terminal parser is not at a recoverable output boundary",
-            ),
+            Self::ParserNotRecoveryGround => {
+                formatter.write_str("terminal parser is not at a recoverable output boundary")
+            }
             Self::Checkpoint(error) => std::fmt::Display::fmt(error, formatter),
         }
     }
@@ -268,7 +268,10 @@ impl std::fmt::Display for InertTerminalError {
                 "guardian replay {resource} exceeds its limit: {observed} > {maximum}"
             ),
             Self::ReplayAccountingOverflow(resource) => {
-                write!(formatter, "guardian replay {resource} accounting overflowed")
+                write!(
+                    formatter,
+                    "guardian replay {resource} accounting overflowed"
+                )
             }
             Self::ReplayActionAllocation => {
                 formatter.write_str("guardian replay could not reserve its action batch")
@@ -282,18 +285,17 @@ impl std::fmt::Display for InertTerminalError {
             Self::ActivationPoisoned => formatter.write_str(
                 "guardian activation is quarantined after an indeterminate cold-store publication",
             ),
-            Self::ParserNotRecoveryGround => formatter.write_str(
-                "guardian replay parser is not at a recoverable output boundary",
-            ),
+            Self::ParserNotRecoveryGround => formatter
+                .write_str("guardian replay parser is not at a recoverable output boundary"),
             Self::UnsupportedGraphicsAction => formatter.write_str(
                 "guardian replay rejected a graphics action with external or uncheckpointed state",
             ),
             Self::ReplayConfigurationMismatch => formatter.write_str(
                 "guardian replay configuration does not match the intended live configuration",
             ),
-            Self::LiveConfigurationChanged => formatter.write_str(
-                "intended live configuration changed during guardian recovery",
-            ),
+            Self::LiveConfigurationChanged => {
+                formatter.write_str("intended live configuration changed during guardian recovery")
+            }
             Self::ScrollbackActivation(error) => std::fmt::Display::fmt(error, formatter),
             Self::WriterActivation => {
                 formatter.write_str("guardian replay could not activate the live writer")
@@ -463,7 +465,9 @@ impl InertTerminal {
             .is_none_or(|next| next == SequenceNo::MAX)
         {
             self.replay_failed = true;
-            return Err(InertTerminalError::ReplayAccountingOverflow("terminal_seqno"));
+            return Err(InertTerminalError::ReplayAccountingOverflow(
+                "terminal_seqno",
+            ));
         }
 
         let mut actions = Vec::new();
@@ -474,9 +478,7 @@ impl InertTerminal {
         let max_action_batch_bytes = self.checkpoint_limits.max_retained_capture_bytes;
         const ACTION_RESERVE_CHUNK: usize = 256;
         self.terminal.parser.parse(bytes, |action| {
-            if allocation_failed
-                || action_limit_exceeded
-                || action_memory_limit_exceeded.is_some()
+            if allocation_failed || action_limit_exceeded || action_memory_limit_exceeded.is_some()
             {
                 return;
             }
@@ -544,12 +546,14 @@ impl InertTerminal {
             return Err(InertTerminalError::UnsupportedGraphicsAction);
         }
         self.terminal.perform_actions(actions);
-        if let Err(error) = crate::terminalstate::checkpoint::TerminalCheckpointV2::validate_inert_replay_resources(
-            &self.terminal,
-            &self.replay_projection,
-            &self.custom_cell_width_maps,
-            self.checkpoint_limits,
-        ) {
+        if let Err(error) =
+            crate::terminalstate::checkpoint::TerminalCheckpointV2::validate_inert_replay_resources(
+                &self.terminal,
+                &self.replay_projection,
+                &self.custom_cell_width_maps,
+                self.checkpoint_limits,
+            )
+        {
             self.replay_failed = true;
             return Err(InertTerminalError::Checkpoint(error));
         }
@@ -919,13 +923,14 @@ mod tests {
         let checkpoint = terminal
             .capture_recovery_checkpoint(limits)
             .expect("capture recovery checkpoint");
-        let mut inert = crate::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
-            checkpoint.canonical_payload(),
-            limits,
-        )
-        .expect("validate recovery checkpoint")
-        .restore_inert(config)
-        .expect("restore inert terminal");
+        let mut inert =
+            crate::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+                checkpoint.canonical_payload(),
+                limits,
+            )
+            .expect("validate recovery checkpoint")
+            .restore_inert(config)
+            .expect("restore inert terminal");
 
         inert
             .replay_bytes(b"\x1b[1;2;3;4;5")

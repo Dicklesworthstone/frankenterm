@@ -408,9 +408,7 @@ impl OscState {
         } else if !self.full {
             let mut buf = [0u8; 8];
             let encoded = param.encode_utf8(&mut buf).as_bytes();
-            if encoded.len()
-                > max_string_sequence_bytes.saturating_sub(self.buffer.len())
-            {
+            if encoded.len() > max_string_sequence_bytes.saturating_sub(self.buffer.len()) {
                 self.buffer.clear();
                 self.discarding = true;
                 return Some(StringSequenceError::LimitExceeded {
@@ -790,7 +788,8 @@ impl VTParser {
                     self.apc_data.shrink_to_fit();
                 }
             }
-            Action::ApcPut => {
+            Action::ApcPut =>
+            {
                 #[cfg(any(feature = "std", feature = "alloc"))]
                 if !self.apc_discarding {
                     if self.apc_data.len() >= self.max_string_sequence_bytes {
@@ -811,7 +810,8 @@ impl VTParser {
                     }
                 }
             }
-            Action::ApcEnd => {
+            Action::ApcEnd =>
+            {
                 #[cfg(any(feature = "std", feature = "alloc"))]
                 if self.apc_discarding {
                     self.apc_data.clear();

@@ -581,12 +581,8 @@ impl std::fmt::Display for ScrollbackSpillError {
             Self::SnapshotGenerationMismatch => {
                 formatter.write_str("cold scrollback snapshot generation mismatch")
             }
-            Self::SnapshotRowMissing => {
-                formatter.write_str("cold scrollback snapshot row missing")
-            }
-            Self::StorageUnavailable => {
-                formatter.write_str("cold scrollback storage unavailable")
-            }
+            Self::SnapshotRowMissing => formatter.write_str("cold scrollback snapshot row missing"),
+            Self::StorageUnavailable => formatter.write_str("cold scrollback storage unavailable"),
             Self::RevisionExhausted => {
                 formatter.write_str("cold scrollback snapshot revision exhausted")
             }
@@ -637,8 +633,9 @@ impl std::fmt::Display for ScrollbackActivationError {
             Self::InvalidRecoveryBoundary => {
                 formatter.write_str("recovery cold-prefix boundary is inconsistent")
             }
-            Self::ConfiguredRetentionInsufficient => formatter
-                .write_str("live scrollback retention cannot preserve every recovered row"),
+            Self::ConfiguredRetentionInsufficient => {
+                formatter.write_str("live scrollback retention cannot preserve every recovered row")
+            }
             Self::MissingStorageCapability => {
                 formatter.write_str("live configuration has no required cold-store capability")
             }
@@ -783,9 +780,9 @@ impl<'rows> ScrollbackPrefix<'rows> {
             (Some(oldest), count) if count != 0 => {
                 let count = StableRowIndex::try_from(count)
                     .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
-                let observed_newest = oldest.checked_add(count).ok_or(
-                    ScrollbackSpillError::ArithmeticOverflow("stable_row_range"),
-                )?;
+                let observed_newest = oldest
+                    .checked_add(count)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
                 if observed_newest != newest_stable_row_exclusive {
                     return Err(ScrollbackSpillError::SnapshotRangeMismatch);
                 }

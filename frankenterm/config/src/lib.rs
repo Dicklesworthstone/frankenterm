@@ -510,17 +510,14 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
         if before.permissions().mode() & 0o7777 != 0o700 {
             directory
                 .set_permissions(std::fs::Permissions::from_mode(0o700))
-                .with_context(|| {
-                    format!("tightening private user directory {}", p.display())
-                })?;
+                .with_context(|| format!("tightening private user directory {}", p.display()))?;
         }
 
         let after = directory
             .metadata()
             .with_context(|| format!("re-inspecting private user directory {}", p.display()))?;
-        let path_after = std::fs::symlink_metadata(p).with_context(|| {
-            format!("revalidating private user directory name {}", p.display())
-        })?;
+        let path_after = std::fs::symlink_metadata(p)
+            .with_context(|| format!("revalidating private user directory name {}", p.display()))?;
         if path_after.file_type().is_symlink()
             || !path_after.is_dir()
             || path_after.dev() != after.dev()
@@ -544,7 +541,10 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
         let metadata = std::fs::symlink_metadata(p)
             .with_context(|| format!("inspecting private user directory {}", p.display()))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!("private user path is not a direct directory: {}", p.display());
+            bail!(
+                "private user path is not a direct directory: {}",
+                p.display()
+            );
         }
     }
 
@@ -1525,7 +1525,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn user_owned_directory_creation_is_private_and_symlink_safe() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         let fixture = tempfile::tempdir().expect("private-directory fixture");
         let private = fixture.path().join("state").join("nested");

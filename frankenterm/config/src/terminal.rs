@@ -89,12 +89,8 @@ fn bump_overlay_generation(generation: &AtomicUsize) {
                 "terminal configuration overlay generation exhausted; refusing to reuse an identity"
             )
         });
-        match generation.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ) {
+        match generation.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed)
+        {
             Ok(_) => return,
             Err(observed) => current = observed,
         }
@@ -222,9 +218,7 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
         }
         drop(current);
 
-        Box::new(TermConfigRecoveryActivationLease {
-            _guard: activation,
-        })
+        Box::new(TermConfigRecoveryActivationLease { _guard: activation })
     }
 
     fn scrollback_size(&self) -> usize {
@@ -427,9 +421,7 @@ mod tests {
 
         fn replace_scrollback_prefix(
             &self,
-            _expected_generation: Option<
-                frankenterm_term::config::ScrollbackSnapshotGeneration,
-            >,
+            _expected_generation: Option<frankenterm_term::config::ScrollbackSnapshotGeneration>,
             _prefix: frankenterm_term::config::ScrollbackPrefix<'_>,
             _max_retained_rows: usize,
         ) -> Result<

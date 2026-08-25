@@ -85,7 +85,10 @@ impl RemoteUpgradeClaim {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.schema == CLAIM_SCHEMA, "upgrade claim schema is unsupported");
+        anyhow::ensure!(
+            self.schema == CLAIM_SCHEMA,
+            "upgrade claim schema is unsupported"
+        );
         validate_transaction_id(&self.transaction_id)?;
         anyhow::ensure!(
             self.operation == "publish_process_family_generation",
@@ -107,8 +110,8 @@ impl RemoteUpgradeClaim {
 
     fn canonical_bytes(&self) -> anyhow::Result<Vec<u8>> {
         self.validate()?;
-        let mut bytes = serde_json::to_vec(self)
-            .context("cannot serialize canonical remote upgrade claim")?;
+        let mut bytes =
+            serde_json::to_vec(self).context("cannot serialize canonical remote upgrade claim")?;
         anyhow::ensure!(
             bytes.len() < usize::try_from(MAX_RECORD_BYTES).unwrap_or(usize::MAX),
             "canonical remote upgrade claim exceeds its bound"
@@ -144,8 +147,7 @@ impl SelectorAuthority {
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("selector authority target is not UTF-8"))?;
         anyhow::ensure!(
-            is_lowercase_sha256(generation_id)
-                && target == format!("generations/{generation_id}"),
+            is_lowercase_sha256(generation_id) && target == format!("generations/{generation_id}"),
             "selector authority is not one canonical process-family generation"
         );
         Ok(Self::Selected {
@@ -212,14 +214,24 @@ impl RemoteUpgradeState {
     fn permits_successor(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::Prepared, Self::Prepared | Self::PendingLiveOwner | Self::Activating | Self::Indeterminate)
-                | (Self::PendingLiveOwner, Self::Activating | Self::Indeterminate)
-                | (Self::Activating, Self::Activating | Self::Committed | Self::RolledBack | Self::Indeterminate)
+            (
+                Self::Prepared,
+                Self::Prepared | Self::PendingLiveOwner | Self::Activating | Self::Indeterminate
+            ) | (
+                Self::PendingLiveOwner,
+                Self::Activating | Self::Indeterminate
+            ) | (
+                Self::Activating,
+                Self::Activating | Self::Committed | Self::RolledBack | Self::Indeterminate
+            )
         )
     }
 
     fn is_terminal(self) -> bool {
-        matches!(self, Self::Committed | Self::RolledBack | Self::Indeterminate)
+        matches!(
+            self,
+            Self::Committed | Self::RolledBack | Self::Indeterminate
+        )
     }
 }
 
@@ -235,8 +247,14 @@ fn record_transition_is_valid(
     if matches!(
         (previous_state, next_state),
         (RemoteUpgradeState::Prepared, RemoteUpgradeState::Prepared)
-            | (RemoteUpgradeState::PendingLiveOwner, RemoteUpgradeState::Activating)
-            | (RemoteUpgradeState::Activating, RemoteUpgradeState::Activating)
+            | (
+                RemoteUpgradeState::PendingLiveOwner,
+                RemoteUpgradeState::Activating
+            )
+            | (
+                RemoteUpgradeState::Activating,
+                RemoteUpgradeState::Activating
+            )
     ) {
         next_attempt > previous_attempt
     } else {
@@ -298,7 +316,10 @@ impl RemoteUpgradeRecord {
     }
 
     fn validate(&self, claim: &RemoteUpgradeClaim, claim_sha256: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(self.schema == RECORD_SCHEMA, "upgrade record schema is unsupported");
+        anyhow::ensure!(
+            self.schema == RECORD_SCHEMA,
+            "upgrade record schema is unsupported"
+        );
         anyhow::ensure!(
             self.transaction_id == claim.transaction_id
                 && self.claim_sha256 == claim_sha256
@@ -377,8 +398,8 @@ impl RemoteUpgradeRecord {
         claim_sha256: &str,
     ) -> anyhow::Result<Vec<u8>> {
         self.validate(claim, claim_sha256)?;
-        let mut bytes = serde_json::to_vec(self)
-            .context("cannot serialize canonical remote upgrade record")?;
+        let mut bytes =
+            serde_json::to_vec(self).context("cannot serialize canonical remote upgrade record")?;
         anyhow::ensure!(
             bytes.len() < usize::try_from(MAX_RECORD_BYTES).unwrap_or(usize::MAX),
             "canonical remote upgrade record exceeds its bound"
@@ -416,10 +437,7 @@ impl DurableEffectPermit {
         self,
         ledger: &RemoteUpgradeLedger<'_>,
     ) -> anyhow::Result<String> {
-        self.validate_latest_authorization(
-            ledger,
-            DurableEffectKind::PublishImmutableGeneration,
-        )?;
+        self.validate_latest_authorization(ledger, DurableEffectKind::PublishImmutableGeneration)?;
         Ok(self.artifact_transaction_id)
     }
 
@@ -533,7 +551,12 @@ impl<'root> RemoteUpgradeLedger<'root> {
             Some(root_device),
             "remote upgrade transaction ledger",
         )?;
-        validate_transaction_census(&transactions, effective_uid, root_device, claim.transaction_id())?;
+        validate_transaction_census(
+            &transactions,
+            effective_uid,
+            root_device,
+            claim.transaction_id(),
+        )?;
         let transaction = create_or_open_remote_generation_directory(
             &transactions,
             Path::new(claim.transaction_id()),
@@ -550,12 +573,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
             Some(root_device),
             "remote upgrade transaction",
         )?;
-        create_or_validate_claim(
-            &transaction,
-            effective_uid,
-            root_device,
-            &claim_sha256,
-        )?;
+        create_or_validate_claim(&transaction, effective_uid, root_device, &claim_sha256)?;
         let scan = scan_transaction(
             &transaction,
             effective_uid,
@@ -730,11 +748,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
             selector_before,
             receipt,
         )?;
-        Ok(self.permit_for(
-            &record,
-            DurableEffectKind::SwitchCurrentSelector,
-            false,
-        ))
+        Ok(self.permit_for(&record, DurableEffectKind::SwitchCurrentSelector, false))
     }
 
     pub(crate) fn authorize_selector_from_pending(
@@ -762,11 +776,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
             selector_before,
             receipt,
         )?;
-        Ok(self.permit_for(
-            &record,
-            DurableEffectKind::SwitchCurrentSelector,
-            false,
-        ))
+        Ok(self.permit_for(&record, DurableEffectKind::SwitchCurrentSelector, false))
     }
 
     pub(crate) fn reauthorize_selector(
@@ -794,11 +804,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
             selector_before,
             receipt,
         )?;
-        Ok(self.permit_for(
-            &record,
-            DurableEffectKind::SwitchCurrentSelector,
-            true,
-        ))
+        Ok(self.permit_for(&record, DurableEffectKind::SwitchCurrentSelector, true))
     }
 
     pub(crate) fn commit_current(
@@ -939,12 +945,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
         if let Some(latest) = self.latest.as_ref() {
             anyhow::ensure!(
                 !latest.state.is_terminal()
-                    && record_transition_is_valid(
-                        latest.state,
-                        latest.attempt,
-                        state,
-                        attempt,
-                    ),
+                    && record_transition_is_valid(latest.state, latest.attempt, state, attempt,),
                 "illegal remote upgrade transaction state transition"
             );
         } else {
@@ -1328,7 +1329,10 @@ fn scan_transaction(
             anyhow::bail!("remote upgrade transaction contains an unknown artifact");
         }
     }
-    anyhow::ensure!(saw_claim, "remote upgrade transaction has no immutable claim");
+    anyhow::ensure!(
+        saw_claim,
+        "remote upgrade transaction has no immutable claim"
+    );
     anyhow::ensure!(
         commits.len() <= usize::try_from(MAX_COMMITTED_RECORDS).unwrap_or(usize::MAX),
         "remote upgrade transaction exceeds its committed-record bound"
@@ -1544,7 +1548,10 @@ fn read_exact_file(
         effective_uid,
         expected_device,
     )?;
-    anyhow::ensure!(before == after, "upgrade artifact changed while it was read");
+    anyhow::ensure!(
+        before == after,
+        "upgrade artifact changed while it was read"
+    );
     Ok(bytes)
 }
 
@@ -1559,13 +1566,7 @@ fn parse_record_name(name: &str) -> anyhow::Result<RecordArtifact> {
         .next()
         .filter(|value| is_lowercase_sha256(value))
         .ok_or_else(|| anyhow::anyhow!("upgrade record filename has an invalid digest"))?;
-    let attempt = parse_fixed_decimal(
-        fields.next(),
-        2,
-        1,
-        u32::from(MAX_ATTEMPTS),
-        "attempt",
-    )?;
+    let attempt = parse_fixed_decimal(fields.next(), 2, 1, u32::from(MAX_ATTEMPTS), "attempt")?;
     anyhow::ensure!(
         fields.next().is_none(),
         "upgrade record filename has unexpected fields"
@@ -1685,11 +1686,7 @@ mod tests {
         .expect("create canonical upgrade claim")
     }
 
-    fn root_fixture() -> (
-        tempfile::TempDir,
-        cap_std::fs::Dir,
-        u32,
-    ) {
+    fn root_fixture() -> (tempfile::TempDir, cap_std::fs::Dir, u32) {
         let fixture = tempfile::tempdir().expect("create upgrade ledger fixture");
         let root_path = fixture.path().join("process-family");
         let effective_uid = super::super::remote_generation_effective_uid();
@@ -1788,10 +1785,7 @@ mod tests {
             32
         );
         ledger
-            .commit_pending_live_owner(
-                SelectorAuthority::Missing,
-                expected_receipt.clone(),
-            )
+            .commit_pending_live_owner(SelectorAuthority::Missing, expected_receipt.clone())
             .expect("commit pending terminal progress");
 
         let replay = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim)
@@ -1802,9 +1796,11 @@ mod tests {
         let conflict = RemoteUpgradeLedger::open(&root, effective_uid, claim('d'))
             .err()
             .expect("same transaction ID with a different payload must fail");
-        assert!(conflict
-            .to_string()
-            .contains("claimed by a different payload"));
+        assert!(
+            conflict
+                .to_string()
+                .contains("claimed by a different payload")
+        );
 
         let transaction_path = fixture
             .path()
@@ -1820,9 +1816,27 @@ mod tests {
                     .expect("artifact name is UTF-8")
             })
             .collect::<Vec<_>>();
-        assert_eq!(names.iter().filter(|name| name.starts_with("claim-")).count(), 1);
-        assert_eq!(names.iter().filter(|name| name.starts_with("record-")).count(), 2);
-        assert_eq!(names.iter().filter(|name| name.starts_with("commit-")).count(), 2);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("claim-"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("record-"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("commit-"))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1873,25 +1887,26 @@ mod tests {
         let wrong_kind_error = wrong_kind
             .consume_selector(&ledger)
             .expect_err("publication permit must not authorize a selector effect");
-        assert!(wrong_kind_error
-            .to_string()
-            .contains("not a valid one-shot authorization"));
+        assert!(
+            wrong_kind_error
+                .to_string()
+                .contains("not a valid one-shot authorization")
+        );
 
         let wrong_ledger = ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit a fresh Prepared publication authorization");
-        let other_ledger = RemoteUpgradeLedger::open(
-            &root,
-            effective_uid,
-            claim_for(OTHER_TRANSACTION_ID, 'd'),
-        )
-        .expect("create different durable ledger claim");
+        let other_ledger =
+            RemoteUpgradeLedger::open(&root, effective_uid, claim_for(OTHER_TRANSACTION_ID, 'd'))
+                .expect("create different durable ledger claim");
         let wrong_ledger_error = wrong_ledger
             .consume_publication(&other_ledger)
             .expect_err("permit must not cross durable ledger claims");
-        assert!(wrong_ledger_error
-            .to_string()
-            .contains("belongs to a different remote upgrade ledger claim"));
+        assert!(
+            wrong_ledger_error
+                .to_string()
+                .contains("belongs to a different remote upgrade ledger claim")
+        );
 
         let mut wrong_claim = ledger
             .authorize_publication(SelectorAuthority::Missing)
@@ -1900,9 +1915,11 @@ mod tests {
         let wrong_claim_error = wrong_claim
             .consume_publication(&ledger)
             .expect_err("permit with a substituted claim digest must fail");
-        assert!(wrong_claim_error
-            .to_string()
-            .contains("not a valid one-shot authorization"));
+        assert!(
+            wrong_claim_error
+                .to_string()
+                .contains("not a valid one-shot authorization")
+        );
 
         let mut wrong_artifact = ledger
             .authorize_publication(SelectorAuthority::Missing)
@@ -1911,9 +1928,11 @@ mod tests {
         let wrong_artifact_error = wrong_artifact
             .consume_publication(&ledger)
             .expect_err("permit with a substituted effect identity must fail");
-        assert!(wrong_artifact_error
-            .to_string()
-            .contains("artifact identity is not bound to its authorization"));
+        assert!(
+            wrong_artifact_error
+                .to_string()
+                .contains("artifact identity is not bound to its authorization")
+        );
     }
 
     #[test]
@@ -1944,9 +1963,11 @@ mod tests {
         let error = permit
             .consume_publication(&second)
             .expect_err("permit must not cross identical claims in different roots");
-        assert!(error
-            .to_string()
-            .contains("different pinned upgrade transaction"));
+        assert!(
+            error
+                .to_string()
+                .contains("different pinned upgrade transaction")
+        );
     }
 
     #[test]
@@ -1972,9 +1993,11 @@ mod tests {
             let error = stale_publication
                 .consume_publication(&ledger)
                 .expect_err("terminal Indeterminate must invalidate publication permit");
-            assert!(error
-                .to_string()
-                .contains("authorization is no longer the latest committed authority"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("authorization is no longer the latest committed authority")
+            );
             assert_eq!(transaction_names(&ledger), names_before);
         }
 
@@ -1997,9 +2020,11 @@ mod tests {
             let error = stale_selector
                 .consume_selector(&ledger)
                 .expect_err("terminal RolledBack must invalidate selector permit");
-            assert!(error
-                .to_string()
-                .contains("authorization is no longer the latest committed authority"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("authorization is no longer the latest committed authority")
+            );
             assert_eq!(transaction_names(&ledger), names_before);
         }
 
@@ -2017,13 +2042,9 @@ mod tests {
                 .expect("commit Activating selector authorization");
             let generation_id = "a".repeat(64);
             let target = format!("generations/{generation_id}");
-            let selector_after = SelectorAuthority::selected(
-                &generation_id,
-                Path::new(&target),
-                67,
-                71,
-            )
-            .expect("create committed selector authority");
+            let selector_after =
+                SelectorAuthority::selected(&generation_id, Path::new(&target), 67, 71)
+                    .expect("create committed selector authority");
             ledger
                 .commit_current(
                     selector_after,
@@ -2036,9 +2057,11 @@ mod tests {
             let error = stale_selector
                 .consume_selector(&ledger)
                 .expect_err("terminal Committed must invalidate selector permit");
-            assert!(error
-                .to_string()
-                .contains("authorization is no longer the latest committed authority"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("authorization is no longer the latest committed authority")
+            );
             assert_eq!(transaction_names(&ledger), names_before);
         }
     }
@@ -2047,9 +2070,8 @@ mod tests {
     fn cross_open_durable_advancement_invalidates_retained_permit() {
         let (_fixture, root, effective_uid) = root_fixture();
         let upgrade_claim = claim('a');
-        let mut original =
-            RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim.clone())
-                .expect("create original stale-permit ledger");
+        let mut original = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim.clone())
+            .expect("create original stale-permit ledger");
         let stale_permit = original
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared publication authorization");
@@ -2070,9 +2092,11 @@ mod tests {
         let error = stale_permit
             .consume_publication(&original)
             .expect_err("cross-open durable advancement must invalidate retained permit");
-        assert!(error
-            .to_string()
-            .contains("committed authority changed after it was pinned"));
+        assert!(
+            error
+                .to_string()
+                .contains("committed authority changed after it was pinned")
+        );
         assert_eq!(transaction_names(&advancing), names_before);
     }
 
@@ -2125,9 +2149,11 @@ mod tests {
                 ),
             )
             .expect_err("RolledBack must remain terminal");
-        assert!(error
-            .to_string()
-            .contains("illegal remote upgrade transaction state transition"));
+        assert!(
+            error
+                .to_string()
+                .contains("illegal remote upgrade transaction state transition")
+        );
         assert_eq!(transaction_names(&replay), terminal_names);
     }
 
@@ -2140,9 +2166,11 @@ mod tests {
         let unstarted_error = ledger
             .record_rolled_back(SelectorAuthority::Missing)
             .expect_err("rollback without any authorization must fail");
-        assert!(unstarted_error
-            .to_string()
-            .contains("no committed activation authorization"));
+        assert!(
+            unstarted_error
+                .to_string()
+                .contains("no committed activation authorization")
+        );
         assert_eq!(transaction_names(&ledger), unstarted_names);
 
         ledger
@@ -2154,9 +2182,11 @@ mod tests {
         let prepared_error = ledger
             .record_rolled_back(SelectorAuthority::Missing)
             .expect_err("Prepared publication authority cannot authorize rollback");
-        assert!(prepared_error
-            .to_string()
-            .contains("not preceded by Activating authority"));
+        assert!(
+            prepared_error
+                .to_string()
+                .contains("not preceded by Activating authority")
+        );
         assert_eq!(
             ledger.latest().expect("Prepared remains").state(),
             RemoteUpgradeState::Prepared
@@ -2182,21 +2212,19 @@ mod tests {
         let names_before = transaction_names(&ledger);
         let changed_generation = "d".repeat(64);
         let changed_target = format!("generations/{changed_generation}");
-        let changed = SelectorAuthority::selected(
-            &changed_generation,
-            Path::new(&changed_target),
-            41,
-            43,
-        )
-        .expect("create different resolved selector authority");
+        let changed =
+            SelectorAuthority::selected(&changed_generation, Path::new(&changed_target), 41, 43)
+                .expect("create different resolved selector authority");
 
         for observed in [changed, SelectorAuthority::unresolved_post_effect()] {
             let error = ledger
                 .record_rolled_back(observed)
                 .expect_err("non-restored authority must not become RolledBack");
-            assert!(error
-                .to_string()
-                .contains("did not restore the exact committed pre-effect authority"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not restore the exact committed pre-effect authority")
+            );
             assert_eq!(transaction_names(&ledger), names_before);
             assert_eq!(
                 ledger.latest().expect("Activating remains").state(),
@@ -2223,13 +2251,9 @@ mod tests {
         let authorization = ledger.latest().expect("Activating authorization");
         let changed_generation = "d".repeat(64);
         let changed_target = format!("generations/{changed_generation}");
-        let changed = SelectorAuthority::selected(
-            &changed_generation,
-            Path::new(&changed_target),
-            47,
-            53,
-        )
-        .expect("create forged post-rollback authority");
+        let changed =
+            SelectorAuthority::selected(&changed_generation, Path::new(&changed_target), 47, 53)
+                .expect("create forged post-rollback authority");
         let forged = RemoteUpgradeRecord {
             schema: RECORD_SCHEMA.to_string(),
             transaction_id: ledger.claim.transaction_id.clone(),
@@ -2250,9 +2274,11 @@ mod tests {
         let error = forged
             .canonical_bytes(&ledger.claim, &ledger.claim_sha256)
             .expect_err("forged changed authority must fail canonical record validation");
-        assert!(error
-            .to_string()
-            .contains("rolled-back record does not preserve one exact pre-effect authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("rolled-back record does not preserve one exact pre-effect authority")
+        );
     }
 
     #[test]
@@ -2274,13 +2300,9 @@ mod tests {
         let authorization = ledger.latest().expect("Activating authorization");
         let wrong_generation = "d".repeat(64);
         let wrong_target = format!("generations/{wrong_generation}");
-        let wrong_authority = SelectorAuthority::selected(
-            &wrong_generation,
-            Path::new(&wrong_target),
-            59,
-            61,
-        )
-        .expect("create wrong restored authority");
+        let wrong_authority =
+            SelectorAuthority::selected(&wrong_generation, Path::new(&wrong_target), 59, 61)
+                .expect("create wrong restored authority");
         let forged = RemoteUpgradeRecord {
             schema: RECORD_SCHEMA.to_string(),
             transaction_id: ledger.claim.transaction_id.clone(),
@@ -2332,9 +2354,11 @@ mod tests {
         let error = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim)
             .err()
             .expect("wrong-authority rollback must poison durable replay");
-        assert!(error
-            .to_string()
-            .contains("illegal state or attempt transition"));
+        assert!(
+            error
+                .to_string()
+                .contains("illegal state or attempt transition")
+        );
     }
 
     #[test]
@@ -2432,10 +2456,7 @@ mod tests {
         );
 
         let error = ledger
-            .commit_pending_live_owner(
-                SelectorAuthority::Missing,
-                intended_receipt,
-            )
+            .commit_pending_live_owner(SelectorAuthority::Missing, intended_receipt)
             .expect_err("conflicting orphan identity must poison the append");
         assert!(error.to_string().contains("conflicting orphan record"));
         assert_ne!(digest, intended_digest);
@@ -2479,7 +2500,10 @@ mod tests {
             .expect("plant bounded near-cap orphan");
             filler_bytes -= chunk;
         }
-        assert_eq!(filler_bytes, 0, "bounded orphan identities must cover the fixture");
+        assert_eq!(
+            filler_bytes, 0,
+            "bounded orphan identities must cover the fixture"
+        );
         sync_capability_directory(&ledger.transaction).expect("sync near-cap fixture");
         let names_before = transaction_names(&ledger);
 
@@ -2499,9 +2523,7 @@ mod tests {
         let permit = ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared authorization");
-        permit
-            .consume_publication(&ledger)
-            .expect("consume permit");
+        permit.consume_publication(&ledger).expect("consume permit");
         ledger
             .commit_pending_live_owner(
                 SelectorAuthority::Missing,
@@ -2547,27 +2569,23 @@ mod tests {
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared authorization");
 
-        let transactions_path = fixture
-            .path()
-            .join("process-family/upgrade-transactions");
+        let transactions_path = fixture.path().join("process-family/upgrade-transactions");
         let retained_path = fixture
             .path()
             .join("process-family/upgrade-transactions-retained");
         std::fs::rename(&transactions_path, retained_path)
             .expect("detach the pinned transaction namespace");
-        std::fs::create_dir(&transactions_path)
-            .expect("plant a replacement transaction namespace");
-        std::fs::set_permissions(
-            &transactions_path,
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .expect("set replacement transaction namespace mode");
+        std::fs::create_dir(&transactions_path).expect("plant a replacement transaction namespace");
+        std::fs::set_permissions(&transactions_path, std::fs::Permissions::from_mode(0o700))
+            .expect("set replacement transaction namespace mode");
 
         let error = ledger
             .revalidate_authority()
             .expect_err("a detached transaction namespace must not authorize an effect");
         assert!(
-            error.to_string().contains("not one stable nofollow owner directory"),
+            error
+                .to_string()
+                .contains("not one stable nofollow owner directory"),
             "unexpected detached-namespace rejection: {error:#}"
         );
     }
@@ -2589,10 +2607,7 @@ mod tests {
             .path()
             .join("process-family/upgrade-transactions")
             .join(TRANSACTION_ID);
-        let partial = transaction_path.join(format!(
-            "record-0002-{}-02.json",
-            "d".repeat(64)
-        ));
+        let partial = transaction_path.join(format!("record-0002-{}-02.json", "d".repeat(64)));
         std::fs::write(&partial, b"partial-after-crash")
             .expect("plant uncommitted partial record artifact");
         std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o400))
@@ -2656,22 +2671,15 @@ mod tests {
     fn state_machine_and_bounds_are_frozen() {
         assert!(RemoteUpgradeState::Prepared.permits_successor(RemoteUpgradeState::Prepared));
         assert!(
-            RemoteUpgradeState::Prepared
-                .permits_successor(RemoteUpgradeState::PendingLiveOwner)
+            RemoteUpgradeState::Prepared.permits_successor(RemoteUpgradeState::PendingLiveOwner)
         );
         assert!(
-            RemoteUpgradeState::PendingLiveOwner
-                .permits_successor(RemoteUpgradeState::Activating)
+            RemoteUpgradeState::PendingLiveOwner.permits_successor(RemoteUpgradeState::Activating)
         );
+        assert!(RemoteUpgradeState::Activating.permits_successor(RemoteUpgradeState::Committed));
+        assert!(RemoteUpgradeState::Activating.permits_successor(RemoteUpgradeState::RolledBack));
         assert!(
-            RemoteUpgradeState::Activating.permits_successor(RemoteUpgradeState::Committed)
-        );
-        assert!(
-            RemoteUpgradeState::Activating.permits_successor(RemoteUpgradeState::RolledBack)
-        );
-        assert!(
-            RemoteUpgradeState::Activating
-                .permits_successor(RemoteUpgradeState::Indeterminate)
+            RemoteUpgradeState::Activating.permits_successor(RemoteUpgradeState::Indeterminate)
         );
         assert!(!RemoteUpgradeState::Committed.permits_successor(RemoteUpgradeState::Prepared));
         assert!(record_transition_is_valid(
@@ -2705,8 +2713,7 @@ mod tests {
             3,
         ));
         assert!(RemoteUpgradeState::RolledBack.is_terminal());
-        assert!(!RemoteUpgradeState::RolledBack
-            .permits_successor(RemoteUpgradeState::Activating));
+        assert!(!RemoteUpgradeState::RolledBack.permits_successor(RemoteUpgradeState::Activating));
         assert_eq!(MAX_RECORD_BYTES, 64 * 1024);
         assert_eq!(MAX_COMMITTED_RECORDS, 32);
         assert_eq!(MAX_ATTEMPTS, 16);

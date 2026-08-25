@@ -61,13 +61,11 @@ use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
 use crate::guardian_checkpoint::{
-    LiveParserCaptureAndBindError, LiveParserCheckpointAck, capture_and_bind_live_parser_checkpoint,
-};
-use crate::guardian_output_journal::{
-    GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
+    capture_and_bind_live_parser_checkpoint, LiveParserCaptureAndBindError, LiveParserCheckpointAck,
 };
 #[cfg(test)]
 use crate::guardian_checkpoint::{GuardianCheckpointBoundary, GuardianCheckpointBoundaryError};
+use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity};
 #[cfg(test)]
 use crate::guardian_output_journal::{
     GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalTail,
@@ -89,8 +87,8 @@ use filedescriptor::{
     poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
 };
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
-use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use log::error;
@@ -126,8 +124,8 @@ pub mod client;
 pub mod connui;
 pub mod domain;
 pub mod events;
-pub mod guardian_input_journal;
 pub mod guardian_checkpoint;
+pub mod guardian_input_journal;
 pub mod guardian_output_journal;
 pub mod guardian_protocol;
 pub mod layout;
@@ -2072,8 +2070,14 @@ impl std::fmt::Debug for GuardianOutputReplayPreparation {
             )
             .field("checkpoint_receipt", &self.checkpoint_receipt)
             .field("suffix_record_count", &self.suffix_record_count())
-            .field("next_recovery_sequence", &self.batch.next_recovery_sequence())
-            .field("committed_next_sequence", &self.batch.committed_next_sequence())
+            .field(
+                "next_recovery_sequence",
+                &self.batch.next_recovery_sequence(),
+            )
+            .field(
+                "committed_next_sequence",
+                &self.batch.committed_next_sequence(),
+            )
             .field("committed_log_bytes", &self.batch.committed_log_bytes())
             .field(
                 "cumulative_plaintext_bytes",
@@ -2135,8 +2139,9 @@ struct PendingLiveParserCheckpoint {
     limits: TerminalCheckpointLimits,
     expected_pane: Weak<dyn Pane>,
     expected_generation: Weak<PaneRegistrationGeneration>,
-    completion:
-        Option<std::sync::mpsc::SyncSender<Result<LiveParserCheckpointAck, LiveParserCheckpointError>>>,
+    completion: Option<
+        std::sync::mpsc::SyncSender<Result<LiveParserCheckpointAck, LiveParserCheckpointError>>,
+    >,
     capturing: bool,
     cancelled: bool,
 }
@@ -2370,10 +2375,7 @@ impl LiveParserCheckpointControl {
         }
     }
 
-    fn poison_locked(
-        state: &mut LiveParserCheckpointState,
-        reason: &'static str,
-    ) -> &'static str {
+    fn poison_locked(state: &mut LiveParserCheckpointState, reason: &'static str) -> &'static str {
         let canonical_reason = match state.poison {
             Some(canonical_reason) => canonical_reason,
             None => {
@@ -2381,10 +2383,7 @@ impl LiveParserCheckpointControl {
                 reason
             }
         };
-        Self::fail_pending_locked(
-            state,
-            LiveParserCheckpointError::Poisoned(canonical_reason),
-        );
+        Self::fail_pending_locked(state, LiveParserCheckpointError::Poisoned(canonical_reason));
         canonical_reason
     }
 
@@ -2476,8 +2475,7 @@ impl LiveParserCheckpointControl {
             } else {
                 state.delivery_call_in_flight = false;
                 wake_parser = state.pending.as_ref().is_some_and(|pending| {
-                    state.delivered_bytes == pending.target
-                        && state.parsed_bytes == pending.target
+                    state.delivered_bytes == pending.target && state.parsed_bytes == pending.target
                 });
                 if let Some(reason) = state.poison {
                     Err(std::io::Error::other(
@@ -2594,10 +2592,7 @@ impl LiveParserCheckpointControl {
                     Some(next) => next,
                     None => {
                         state.socket_write_in_flight = false;
-                        Self::poison_locked(
-                            &mut state,
-                            "socket delivery watermark overflowed",
-                        );
+                        Self::poison_locked(&mut state, "socket delivery watermark overflowed");
                         drop(state);
                         self.delivery_gate.notify_all();
                         self.wake_parser();
@@ -2673,10 +2668,7 @@ impl LiveParserCheckpointControl {
                 .as_ref()
                 .is_some_and(|pending| !pending.capturing);
             if fail_now {
-                Self::fail_pending_locked(
-                    &mut state,
-                    LiveParserCheckpointError::StaleRegistration,
-                );
+                Self::fail_pending_locked(&mut state, LiveParserCheckpointError::StaleRegistration);
             }
         }
         self.delivery_gate.notify_all();
@@ -2760,8 +2752,7 @@ impl LiveParserCheckpointControl {
                 if predecessor.segment_id() != previous.segment_id
                     || predecessor.last_sequence() != previous.output_sequence
                     || predecessor.terminal_record_digest() != previous.output_record_digest
-                    || predecessor.committed_log_bytes()
-                        != previous.output_committed_log_bytes
+                    || predecessor.committed_log_bytes() != previous.output_committed_log_bytes
                     || predecessor.cumulative_plaintext_bytes()
                         != previous.journal_cumulative_plaintext_bytes
                     || segment.first_sequence() != expected_sequence
@@ -2815,9 +2806,7 @@ impl LiveParserCheckpointControl {
     ) -> Result<
         (
             u64,
-            std::sync::mpsc::Receiver<
-                Result<LiveParserCheckpointAck, LiveParserCheckpointError>,
-            >,
+            std::sync::mpsc::Receiver<Result<LiveParserCheckpointAck, LiveParserCheckpointError>>,
         ),
         LiveParserCheckpointError,
     > {
@@ -2839,10 +2828,8 @@ impl LiveParserCheckpointControl {
             if state.pending.is_some() {
                 return Err(LiveParserCheckpointError::CheckpointBusy);
             }
-            if !std::ptr::eq(
-                Arc::as_ref(&generation.live_parser_checkpoint),
-                self,
-            ) || state.registration_wire_identity != generation.wire_identity
+            if !std::ptr::eq(Arc::as_ref(&generation.live_parser_checkpoint), self)
+                || state.registration_wire_identity != generation.wire_identity
             {
                 return Err(LiveParserCheckpointError::StaleRegistration);
             }
@@ -2993,8 +2980,10 @@ impl LiveParserCheckpointControl {
                 target: pending.target,
             });
         }
-        Ok((state.delivered_bytes == pending.target && state.parsed_bytes == pending.target)
-            .then_some(pending.target))
+        Ok(
+            (state.delivered_bytes == pending.target && state.parsed_bytes == pending.target)
+                .then_some(pending.target),
+        )
     }
 
     fn reject_ready_checkpoint(&self, error: LiveParserCheckpointError) {
@@ -3093,7 +3082,9 @@ impl LiveParserCheckpointControl {
                 if state.delivered_bytes > delivery_target {
                     drop(state);
                     delivery_reservation.abort("guardian delivery endpoint was overshot");
-                    return Err(std::io::Error::other("guardian delivery endpoint was overshot"));
+                    return Err(std::io::Error::other(
+                        "guardian delivery endpoint was overshot",
+                    ));
                 }
                 let remaining = delivery_target - state.delivered_bytes;
                 allowance = allowance.min(usize::try_from(remaining).unwrap_or(usize::MAX));
@@ -3102,16 +3093,17 @@ impl LiveParserCheckpointControl {
                 if state.delivered_bytes > pending_target {
                     drop(state);
                     delivery_reservation.abort("live parser delivery fence was overshot");
-                    return Err(std::io::Error::other("live parser delivery fence was overshot"));
+                    return Err(std::io::Error::other(
+                        "live parser delivery fence was overshot",
+                    ));
                 }
                 let remaining = pending_target - state.delivered_bytes;
                 allowance = allowance.min(usize::try_from(remaining).unwrap_or(usize::MAX));
             }
             if allowance == 0 {
                 drop(state);
-                delivery_reservation.abort(
-                    "delivery allowance reached zero before the exact payload completed",
-                );
+                delivery_reservation
+                    .abort("delivery allowance reached zero before the exact payload completed");
                 return Err(std::io::Error::other(
                     "delivery allowance reached zero before payload completion",
                 ));
@@ -4118,12 +4110,10 @@ mod pane_registration_handle {
             if durable_pane_id.is_nil() {
                 return Err(LiveParserCheckpointError::NilDurablePaneIdentity);
             }
-            let endpoint = self.generation.live_parser_checkpoint.authorize_guardian_delivery(
-                durable_pane_id,
-                segment,
-                output,
-                payload,
-            )?;
+            let endpoint = self
+                .generation
+                .live_parser_checkpoint
+                .authorize_guardian_delivery(durable_pane_id, segment, output, payload)?;
             let remains_current = {
                 let _registration = mux.pane_registration.lock();
                 mux.panes
@@ -4208,11 +4198,10 @@ mod pane_registration_handle {
             }
 
             if let Some(next) = batch.next_recovery_sequence() {
-                let last = previous_sequence.ok_or(
-                    GuardianOutputReplayPreparationError::InvalidPage(
+                let last =
+                    previous_sequence.ok_or(GuardianOutputReplayPreparationError::InvalidPage(
                         "an empty replay page cannot advertise a continuation",
-                    ),
-                )?;
+                    ))?;
                 if last.checked_add(1) != Some(next)
                     || batch
                         .committed_next_sequence()
@@ -4230,16 +4219,15 @@ mod pane_registration_handle {
                 ));
             }
 
-            let terminal = batch
-                .terminal_receipt()
-                .ok_or(GuardianOutputReplayPreparationError::InvalidPage(
+            let terminal = batch.terminal_receipt().ok_or(
+                GuardianOutputReplayPreparationError::InvalidPage(
                     "a nonempty replay page has no authenticated terminal receipt",
-                ))?;
+                ),
+            )?;
             if terminal.segment_id() != segment.segment_id()
                 || terminal.sequence().checked_add(1) != batch.committed_next_sequence()
                 || terminal.committed_log_bytes() != batch.committed_log_bytes()
-                || terminal.cumulative_plaintext_bytes()
-                    != batch.cumulative_plaintext_bytes()
+                || terminal.cumulative_plaintext_bytes() != batch.cumulative_plaintext_bytes()
                 || (batch.next_recovery_sequence().is_none()
                     && previous_sequence != Some(terminal.sequence()))
             {
@@ -4328,10 +4316,8 @@ mod pane_registration_handle {
             if durable_pane_id.is_nil() {
                 return Err(LiveParserCheckpointError::NilDurablePaneIdentity);
             }
-            let (request_id, completion) = self
-                .generation
-                .live_parser_checkpoint
-                .register_checkpoint(
+            let (request_id, completion) =
+                self.generation.live_parser_checkpoint.register_checkpoint(
                     &pane,
                     &self.generation,
                     durable_pane_id,
@@ -9718,14 +9704,8 @@ fn parse_buffered_data(
     let mut deadline: Option<Instant> = None;
 
     loop {
-        match attempt_live_parser_checkpoint(
-            &pane,
-            &generation,
-            dead,
-            &parser,
-            &mut actions,
-            &hold,
-        ) {
+        match attempt_live_parser_checkpoint(&pane, &generation, dead, &parser, &mut actions, &hold)
+        {
             LiveParserAttemptOutcome::Fatal => break,
             LiveParserAttemptOutcome::Completed if actions.is_empty() => {
                 action_size = 0;
@@ -9754,12 +9734,7 @@ fn parse_buffered_data(
         match poll(&mut readiness, poll_delay) {
             Ok(0) => {
                 if !actions.is_empty() && !hold.is_holding() {
-                    send_actions_to_mux(
-                        &pane,
-                        &generation,
-                        dead,
-                        std::mem::take(&mut actions),
-                    );
+                    send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
                     action_size = 0;
                     deadline = None;
                 }
@@ -9945,8 +9920,7 @@ fn parse_buffered_data(
                         action_size = 0;
                         deadline = None;
                     }
-                    LiveParserAttemptOutcome::Completed
-                    | LiveParserAttemptOutcome::NoRequest => {}
+                    LiveParserAttemptOutcome::Completed | LiveParserAttemptOutcome::NoRequest => {}
                 }
                 if hold.is_holding() && action_size >= max_held_synchronized_output_bytes() {
                     // A buggy app can enter synchronized-output mode and never
@@ -10143,8 +10117,7 @@ fn read_from_pane_pty(
     dead: Arc<AtomicBool>,
     parser_done: std::sync::mpsc::Receiver<()>,
 ) {
-    let data_writer_guard =
-        LiveParserDataWriterGuard::new(&generation.live_parser_checkpoint);
+    let data_writer_guard = LiveParserDataWriterGuard::new(&generation.live_parser_checkpoint);
     let mut buf = vec![0; mux_socket_buffer_size()];
 
     let pane_for_lifecycle = Weak::clone(&pane);
@@ -14197,8 +14170,8 @@ impl Mux {
             })?;
             tx.set_non_blocking(true)
                 .with_context(|| format!("make pane {pane_id} parser writer nonblocking"))?;
-            let (mut checkpoint_wake_tx, mut checkpoint_wake_rx) =
-                allocate_socketpair().with_context(|| {
+            let (mut checkpoint_wake_tx, mut checkpoint_wake_rx) = allocate_socketpair()
+                .with_context(|| {
                     format!(
                         "failed to allocate pane checkpoint control socketpair for pane {pane_id}"
                     )
@@ -14243,9 +14216,7 @@ impl Mux {
                     .name(format!("mux-parse-pane-{pane_id}"))
                     .spawn(move || {
                         let _checkpoint_worker = LiveParserWorkerGuard {
-                            control: Arc::clone(
-                                &parser_generation.live_parser_checkpoint,
-                            ),
+                            control: Arc::clone(&parser_generation.live_parser_checkpoint),
                             dead: Arc::clone(&parser_dead),
                         };
                         if fail_parser_ready {
@@ -19090,10 +19061,7 @@ impl Mux {
     /// attaches on this exact mux.  Later installation attempts are harmless:
     /// the process-lifetime authority that admitted the first request remains
     /// in force and cannot be replaced during a config reload.
-    pub fn install_domain_spawn_lifecycle(
-        &self,
-        lifecycle: Arc<dyn DomainSpawnLifecycle>,
-    ) {
+    pub fn install_domain_spawn_lifecycle(&self, lifecycle: Arc<dyn DomainSpawnLifecycle>) {
         let _ = self.domain_spawn_lifecycle.set(lifecycle);
     }
 
@@ -19126,9 +19094,7 @@ impl Mux {
         }
 
         if prepared.state() == DomainState::Detached {
-            prepared
-                .attach(self, owner_client_id, window_id)
-                .await?;
+            prepared.attach(self, owner_client_id, window_id).await?;
         }
         Ok(prepared)
     }
@@ -19358,11 +19324,7 @@ impl Mux {
         drop(target_operation);
 
         let domain = self
-            .prepare_domain_for_spawn(
-                domain,
-                owner_client_id.clone(),
-                Some(target.window_id()),
-            )
+            .prepare_domain_for_spawn(domain, owner_client_id.clone(), Some(target.window_id()))
             .await?;
         if owner_client_id
             .as_ref()
@@ -20097,13 +20059,13 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pane::{ForEachPaneLogicalLine, LogicalLine, WithPaneLines};
-    use crate::renderable::{RenderableDimensions, StableCursorPosition};
-    use crate::tab::{DomainFloatingPaneReconcileReceipt, DomainFloatingPaneState};
     use crate::guardian_output_journal::{
         GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
         GuardianOutputRecoveryLimits,
     };
+    use crate::pane::{ForEachPaneLogicalLine, LogicalLine, WithPaneLines};
+    use crate::renderable::{RenderableDimensions, StableCursorPosition};
+    use crate::tab::{DomainFloatingPaneReconcileReceipt, DomainFloatingPaneState};
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{
         KeyCode, KeyModifiers, MouseEvent, StableRowIndex, Terminal, TerminalConfiguration,
@@ -20116,8 +20078,8 @@ mod tests {
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
-    use termwiz::surface::{Line, SequenceNo};
     use tempfile::tempdir;
+    use termwiz::surface::{Line, SequenceNo};
 
     fn global_test_lock() -> StdMutexGuard<'static, ()> {
         crate::MUX_TEST_LOCK
@@ -20850,9 +20812,10 @@ mod tests {
             frankenterm_term::RecoveryTerminalCheckpointV2,
             crate::guardian_checkpoint::LiveParserPaneCaptureError,
         > {
-            let checkpoint = self.checkpoint.as_ref().ok_or(
-                crate::guardian_checkpoint::LiveParserPaneCaptureError::Unsupported,
-            )?;
+            let checkpoint = self
+                .checkpoint
+                .as_ref()
+                .ok_or(crate::guardian_checkpoint::LiveParserPaneCaptureError::Unsupported)?;
             if let Some(hook) = checkpoint.hook.lock().take() {
                 hook();
             }
@@ -20912,13 +20875,9 @@ mod tests {
         Vec<GuardianOutputAppendReceipt>,
     ) {
         assert!(!payloads.is_empty());
-        let segment = GuardianOutputSegmentIdentity::new(
-            durable_pane_id,
-            uuid::Uuid::new_v4(),
-            1,
-            None,
-        )
-        .expect("valid live checkpoint segment");
+        let segment =
+            GuardianOutputSegmentIdentity::new(durable_pane_id, uuid::Uuid::new_v4(), 1, None)
+                .expect("valid live checkpoint segment");
         let receipts = live_checkpoint_receipts_for_segment(segment, payloads);
         (segment, receipts)
     }
@@ -20973,11 +20932,8 @@ mod tests {
             hook: Option<Box<dyn FnOnce() + Send>>,
         ) -> Self {
             let mux = Arc::new(Mux::new(None));
-            let pane = KillCountingPane::new_live_checkpoint(
-                pane_id,
-                *durable_pane_id.as_bytes(),
-                hook,
-            );
+            let pane =
+                KillCountingPane::new_live_checkpoint(pane_id, *durable_pane_id.as_bytes(), hook);
             mux.add_pane(&pane)
                 .expect("register live checkpoint test pane");
             let registration = pane
@@ -21104,8 +21060,7 @@ mod tests {
         ];
         for (case, (prefix, suffix)) in cases.iter().copied().enumerate() {
             let durable_pane_id = uuid::Uuid::new_v4();
-            let (segment, receipts) =
-                live_checkpoint_receipts(durable_pane_id, &[prefix, suffix]);
+            let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[prefix, suffix]);
             let harness = LiveParserTestHarness::new(600 + case, durable_pane_id, None);
 
             let first_target = harness.authorize(segment, receipts[0], prefix);
@@ -21145,7 +21100,10 @@ mod tests {
         let ack = harness
             .capture(segment, receipts[0], Duration::from_secs(2))
             .expect("control fd wakes an idle parser");
-        assert_eq!(ack.parser_stream_bytes(), u64::try_from(payload.len()).unwrap());
+        assert_eq!(
+            ack.parser_stream_bytes(),
+            u64::try_from(payload.len()).unwrap()
+        );
         assert_eq!(
             harness
                 .generation
@@ -21192,15 +21150,16 @@ mod tests {
         )
         .expect("valid successor segment");
         let second_payload = b"two";
-        let second_receipts =
-            live_checkpoint_receipts_for_segment(successor, &[second_payload]);
+        let second_receipts = live_checkpoint_receipts_for_segment(successor, &[second_payload]);
         let second_target = harness.authorize(successor, second_receipts[0], second_payload);
         assert_eq!(
             second_target,
             (first_payload.len() + second_payload.len()) as u64,
             "parser-incarnation watermark remains global across journal segment rollover"
         );
-        harness.write(second_payload).expect("deliver successor segment");
+        harness
+            .write(second_payload)
+            .expect("deliver successor segment");
         harness.wait_until_parsed(second_target);
         let second_ack = harness
             .capture(successor, second_receipts[0], Duration::from_secs(2))
@@ -21228,15 +21187,11 @@ mod tests {
             .write(true)
             .open(directory.path().join("recovery.segment"))
             .expect("create recovery journal");
-        let segment = GuardianOutputSegmentIdentity::new(
-            durable_pane_id,
-            uuid::Uuid::new_v4(),
-            1,
-            None,
-        )
-        .expect("valid recovery segment");
-        let cipher = GuardianOutputCipher::try_from_key_slice(&[0x6d; 32])
-            .expect("valid recovery cipher");
+        let segment =
+            GuardianOutputSegmentIdentity::new(durable_pane_id, uuid::Uuid::new_v4(), 1, None)
+                .expect("valid recovery segment");
+        let cipher =
+            GuardianOutputCipher::try_from_key_slice(&[0x6d; 32]).expect("valid recovery cipher");
         let mut journal = GuardianOutputJournal::open(
             file,
             segment,
@@ -21259,7 +21214,9 @@ mod tests {
 
         let source = LiveParserTestHarness::new(619, durable_pane_id, None);
         let checkpoint_target = source.authorize(segment, receipts[0], payloads[0]);
-        source.write(payloads[0]).expect("deliver checkpoint record");
+        source
+            .write(payloads[0])
+            .expect("deliver checkpoint record");
         source.wait_until_parsed(checkpoint_target);
         let checkpoint = source
             .capture(segment, receipts[0], Duration::from_secs(2))
@@ -21566,7 +21523,9 @@ mod tests {
         harness.mux.remove_pane(harness.pane.pane_id());
         release_capture_tx.send(()).expect("release stale capture");
         assert!(matches!(
-            capture_thread.join().expect("capture thread does not panic"),
+            capture_thread
+                .join()
+                .expect("capture thread does not panic"),
             Err(LiveParserCheckpointError::StaleRegistration)
         ));
     }
@@ -21602,10 +21561,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("timeout callback starts");
         assert!(matches!(
-            timeout_thread.join().expect("timeout thread does not panic"),
+            timeout_thread
+                .join()
+                .expect("timeout thread does not panic"),
             Err(LiveParserCheckpointError::Timeout)
         ));
-        release_capture_tx.send(()).expect("release timed out capture");
+        release_capture_tx
+            .send(())
+            .expect("release timed out capture");
         let deadline = Instant::now() + Duration::from_secs(5);
         while harness
             .generation
@@ -21615,7 +21578,10 @@ mod tests {
             .pending
             .is_some()
         {
-            assert!(Instant::now() < deadline, "timed-out capture gate stayed pending");
+            assert!(
+                Instant::now() < deadline,
+                "timed-out capture gate stayed pending"
+            );
             std::thread::yield_now();
         }
 
@@ -21626,10 +21592,11 @@ mod tests {
         let panic_harness = LiveParserTestHarness::new(
             615,
             panic_pane_id,
-            Some(Box::new(|| panic!("injected content-free checkpoint panic"))),
+            Some(Box::new(|| {
+                panic!("injected content-free checkpoint panic")
+            })),
         );
-        let panic_target =
-            panic_harness.authorize(panic_segment, panic_receipts[0], panic_payload);
+        let panic_target = panic_harness.authorize(panic_segment, panic_receipts[0], panic_payload);
         panic_harness
             .write(panic_payload)
             .expect("deliver panic fixture");
@@ -21673,12 +21640,20 @@ mod tests {
             .pending
             .is_none()
         {
-            assert!(Instant::now() < deadline, "checkpoint request was not registered");
+            assert!(
+                Instant::now() < deadline,
+                "checkpoint request was not registered"
+            );
             std::thread::yield_now();
         }
-        harness.generation.live_parser_checkpoint.close_data_writer();
+        harness
+            .generation
+            .live_parser_checkpoint
+            .close_data_writer();
         assert!(matches!(
-            capture_thread.join().expect("capture thread does not panic"),
+            capture_thread
+                .join()
+                .expect("capture thread does not panic"),
             Err(LiveParserCheckpointError::IncompleteBoundary { .. })
         ));
     }
@@ -22610,34 +22585,21 @@ mod tests {
         mux.register_client(Arc::clone(&client));
         let data: Arc<[u8]> = Arc::from(&b"abcdef"[..]);
 
-        let ReliableInputClaimOutcome::Execute(mut permit) = mux.claim_reliable_pane_write(
-            Some(&client),
-            &registration,
-            31,
-            data.as_ref(),
-        ) else {
+        let ReliableInputClaimOutcome::Execute(mut permit) =
+            mux.claim_reliable_pane_write(Some(&client), &registration, 31, data.as_ref())
+        else {
             panic!("first exact pane-write identity must own execution");
         };
         assert!(permit.begin_side_effect());
         assert!(permit.commit_pane_write_applied_prefix(2));
         assert!(matches!(
-            mux.claim_reliable_pane_write(
-                Some(&client),
-                &registration,
-                31,
-                data.as_ref(),
-            ),
+            mux.claim_reliable_pane_write(Some(&client), &registration, 31, data.as_ref(),),
             ReliableInputClaimOutcome::DuplicateApplied(
                 ReliableInputAppliedEffect::PaneWritePrefix { bytes: 2 }
             )
         ));
         assert!(matches!(
-            mux.claim_reliable_pane_write(
-                Some(&client),
-                &registration,
-                31,
-                b"abcdeg",
-            ),
+            mux.claim_reliable_pane_write(Some(&client), &registration, 31, b"abcdeg",),
             ReliableInputClaimOutcome::IdentityConflict
         ));
         assert!(matches!(
@@ -22665,40 +22627,26 @@ mod tests {
         mux.register_client(Arc::clone(&client));
         let data: Arc<[u8]> = Arc::from(&b"zero-or-unknown"[..]);
 
-        let ReliableInputClaimOutcome::Execute(cancelled) = mux.claim_reliable_pane_write(
-            Some(&client),
-            &registration,
-            41,
-            data.as_ref(),
-        ) else {
+        let ReliableInputClaimOutcome::Execute(cancelled) =
+            mux.claim_reliable_pane_write(Some(&client), &registration, 41, data.as_ref())
+        else {
             panic!("first pane write must own execution");
         };
         drop(cancelled);
         assert!(matches!(
-            mux.claim_reliable_pane_write(
-                Some(&client),
-                &registration,
-                41,
-                b"different",
-            ),
+            mux.claim_reliable_pane_write(Some(&client), &registration, 41, b"different",),
             ReliableInputClaimOutcome::IdentityConflict
         ));
-        let ReliableInputClaimOutcome::Execute(mut retry) = mux.claim_reliable_pane_write(
-            Some(&client),
-            &registration,
-            41,
-            data.as_ref(),
-        ) else {
+        let ReliableInputClaimOutcome::Execute(mut retry) =
+            mux.claim_reliable_pane_write(Some(&client), &registration, 41, data.as_ref())
+        else {
             panic!("pre-effect cancellation must allow only the exact retry");
         };
         assert!(retry.begin_side_effect());
         assert!(retry.commit_definitely_not_applied());
-        let ReliableInputClaimOutcome::Execute(mut ambiguous) = mux.claim_reliable_pane_write(
-            Some(&client),
-            &registration,
-            41,
-            data.as_ref(),
-        ) else {
+        let ReliableInputClaimOutcome::Execute(mut ambiguous) =
+            mux.claim_reliable_pane_write(Some(&client), &registration, 41, data.as_ref())
+        else {
             panic!("proven-zero callback result must allow the exact retry");
         };
         assert!(ambiguous.begin_side_effect());

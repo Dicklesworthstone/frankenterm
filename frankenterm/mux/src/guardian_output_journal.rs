@@ -17,14 +17,14 @@
 //! later segment manager must seal it and publish a fresh successor segment.
 //! This avoids deleting or overwriting crash evidence.
 
-use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
-    aead::{
-        Aead, KeyInit, Payload,
-        rand_core::{OsRng, RngCore as _},
-    },
-};
 use base64::Engine as _;
+use chacha20poly1305::{
+    aead::{
+        rand_core::{OsRng, RngCore as _},
+        Aead, KeyInit, Payload,
+    },
+    XChaCha20Poly1305, XNonce,
+};
 use sha2::{Digest as _, Sha256};
 use std::convert::{TryFrom, TryInto};
 use std::fs::File;
@@ -208,9 +208,7 @@ impl GuardianScrollbackAppendWalAuthentication {
         }
         let version = read_u32(&bytes[0..4]);
         if version != SCROLLBACK_APPEND_WAL_AUTH_VERSION {
-            return Err(GuardianScrollbackAppendWalError::UnsupportedVersion {
-                observed: version,
-            });
+            return Err(GuardianScrollbackAppendWalError::UnsupportedVersion { observed: version });
         }
         let mut key_id = [0; KEY_ID_BYTES];
         key_id.copy_from_slice(&bytes[4..12]);
@@ -637,10 +635,7 @@ impl GuardianOutputKey {
     }
 
     /// Persist the exact key bytes to a caller-owned private descriptor.
-    pub fn write_exact<W: Write>(
-        &self,
-        writer: &mut W,
-    ) -> Result<(), GuardianOutputJournalError> {
+    pub fn write_exact<W: Write>(&self, writer: &mut W) -> Result<(), GuardianOutputJournalError> {
         writer
             .write_all(&self.bytes)
             .map_err(GuardianOutputJournalError::KeyFileWrite)
@@ -1104,11 +1099,7 @@ fn scrollback_append_wal_aad(
     canonical_wal: &[u8],
 ) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
-        SCROLLBACK_APPEND_WAL_AEAD_DOMAIN.len()
-            + 4
-            + KEY_ID_BYTES
-            + 4
-            + canonical_wal.len(),
+        SCROLLBACK_APPEND_WAL_AEAD_DOMAIN.len() + 4 + KEY_ID_BYTES + 4 + canonical_wal.len(),
     );
     aad.extend_from_slice(SCROLLBACK_APPEND_WAL_AEAD_DOMAIN);
     aad.extend_from_slice(&SCROLLBACK_APPEND_WAL_AUTH_VERSION.to_le_bytes());
@@ -1829,8 +1820,7 @@ impl GuardianOutputRecoveryCursor {
         loop {
             if self.offset == self.committed_bytes {
                 if self.record_count != self.expected_record_count
-                    || self.cumulative_plaintext_bytes
-                        != self.expected_cumulative_plaintext_bytes
+                    || self.cumulative_plaintext_bytes != self.expected_cumulative_plaintext_bytes
                     || self.next_sequence != self.expected_next_sequence
                     || self.terminal_receipt != self.expected_terminal_receipt
                 {
@@ -1883,9 +1873,7 @@ impl GuardianOutputRecoveryCursor {
                     observed: record_header_bytes,
                 });
             }
-            if record_header[28..32] != [0_u8; 4]
-                || record_header[88..96] != [0_u8; 8]
-            {
+            if record_header[28..32] != [0_u8; 4] || record_header[88..96] != [0_u8; 8] {
                 return Err(GuardianOutputJournalError::NonCanonicalRecordHeader {
                     offset: record_offset,
                 });
@@ -2003,10 +1991,7 @@ impl GuardianOutputRecoveryCursor {
             }
 
             if sequence >= self.requested_first_sequence {
-                return Ok(Some(GuardianRecoveredOutputRecord {
-                    receipt,
-                    plaintext,
-                }));
+                return Ok(Some(GuardianRecoveredOutputRecord { receipt, plaintext }));
             }
         }
     }
@@ -2060,9 +2045,7 @@ pub enum GuardianOutputJournalError {
     RecoveryCursorFailed,
     #[error("guardian output recovery receipt does not match its plaintext payload")]
     RecoveryPayloadBindingMismatch,
-    #[error(
-        "guardian output delivery plaintext bound exceeded: {observed} > {maximum}"
-    )]
+    #[error("guardian output delivery plaintext bound exceeded: {observed} > {maximum}")]
     DeliveryPayloadByteLimit { observed: u64, maximum: u32 },
     #[error("invalid guardian output encryption key: {0}")]
     InvalidEncryptionKey(&'static str),
@@ -2106,7 +2089,9 @@ pub enum GuardianOutputJournalError {
     RecordLimit { maximum: u64 },
     #[error("guardian output journal record at byte {offset} has invalid magic")]
     InvalidRecordMagic { offset: u64 },
-    #[error("guardian output journal record at byte {offset} has invalid header length {observed}")]
+    #[error(
+        "guardian output journal record at byte {offset} has invalid header length {observed}"
+    )]
     InvalidRecordHeaderLength { offset: u64, observed: u32 },
     #[error("guardian output journal record at byte {offset} has nonzero reserved bytes")]
     NonCanonicalRecordHeader { offset: u64 },
@@ -2134,7 +2119,9 @@ pub enum GuardianOutputJournalError {
     RecordDigestMismatch { sequence: u64 },
     #[error("guardian output journal sequence space is exhausted")]
     SequenceExhausted,
-    #[error("new guardian output segment is not active until its parent directory is synchronized")]
+    #[error(
+        "new guardian output segment is not active until its parent directory is synchronized"
+    )]
     DirectoryEntryNotDurable,
     #[error("guardian output journal has an incomplete tail and must be sealed")]
     IncompleteTail,
@@ -2218,10 +2205,8 @@ impl RecoveryCollector {
         self.records
             .try_reserve(1)
             .map_err(|_| GuardianOutputJournalError::RecoveryAllocationFailed)?;
-        self.records.push(GuardianRecoveredOutputRecord {
-            receipt,
-            plaintext,
-        });
+        self.records
+            .push(GuardianRecoveredOutputRecord { receipt, plaintext });
         self.plaintext_bytes = projected_plaintext_bytes;
         Ok(())
     }
@@ -2618,9 +2603,9 @@ impl GuardianOutputJournal {
             .cumulative_plaintext_bytes
             .checked_add(u64::from(payload_bytes))
             .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
-        let (nonce, ciphertext) = self
-            .cipher
-            .seal(self.identity, sequence, payload_bytes, payload)?;
+        let (nonce, ciphertext) =
+            self.cipher
+                .seal(self.identity, sequence, payload_bytes, payload)?;
         let ciphertext_bytes = u32::try_from(ciphertext.len())
             .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
         let expected_ciphertext_bytes = payload_bytes
@@ -3097,11 +3082,7 @@ fn read_i64(bytes: &[u8]) -> i64 {
     i64::from_le_bytes(fixed)
 }
 
-fn read_exact_file_at(
-    file: &File,
-    mut buffer: &mut [u8],
-    mut offset: u64,
-) -> std::io::Result<()> {
+fn read_exact_file_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     while !buffer.is_empty() {
         match read_file_at(file, buffer, offset) {
             Ok(0) => {
@@ -3188,13 +3169,8 @@ mod tests {
     }
 
     fn identity() -> GuardianOutputSegmentIdentity {
-        GuardianOutputSegmentIdentity::new(
-            pane(),
-            Uuid::from_bytes([0x24; 16]),
-            1,
-            None,
-        )
-        .expect("fixture segment identity is valid")
+        GuardianOutputSegmentIdentity::new(pane(), Uuid::from_bytes([0x24; 16]), 1, None)
+            .expect("fixture segment identity is valid")
     }
 
     fn cipher() -> GuardianOutputCipher {
@@ -3246,14 +3222,7 @@ mod tests {
         let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
             .expect("wrong-key fixture is structurally valid");
         assert!(matches!(
-            wrong_cipher.open_scrollback_row(
-                &parsed,
-                [0x42; 16],
-                [0x24; 16],
-                -3,
-                11,
-                1024,
-            ),
+            wrong_cipher.open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 1024,),
             Err(GuardianScrollbackRowError::KeyIdentityMismatch)
         ));
 
@@ -3261,14 +3230,7 @@ mod tests {
             GuardianEncryptedScrollbackRow::parse(&encoded).expect("reparse exact row");
         header_tampered.identity.stable_row = -2;
         assert!(matches!(
-            cipher.open_scrollback_row(
-                &header_tampered,
-                [0x42; 16],
-                [0x24; 16],
-                -2,
-                11,
-                1024,
-            ),
+            cipher.open_scrollback_row(&header_tampered, [0x42; 16], [0x24; 16], -2, 11, 1024,),
             Err(GuardianScrollbackRowError::DecryptionFailed)
         ));
 
@@ -3449,10 +3411,7 @@ mod tests {
         ));
     }
 
-    fn journal_bytes_for(
-        identity: GuardianOutputSegmentIdentity,
-        records: &[&[u8]],
-    ) -> Vec<u8> {
+    fn journal_bytes_for(identity: GuardianOutputSegmentIdentity, records: &[&[u8]]) -> Vec<u8> {
         let cipher = cipher();
         let mut bytes = encode_file_header(identity, &cipher)
             .expect("fixture file-header authentication succeeds")
@@ -3607,9 +3566,8 @@ mod tests {
 
     #[test]
     fn journal_limit_requires_room_for_one_nonempty_authenticated_frame() {
-        let one_byte_short = FILE_HEADER_BYTES_U64
-            + RECORD_HEADER_BYTES_U64
-            + u64::from(AEAD_TAG_BYTES);
+        let one_byte_short =
+            FILE_HEADER_BYTES_U64 + RECORD_HEADER_BYTES_U64 + u64::from(AEAD_TAG_BYTES);
         let error = GuardianOutputJournalLimits {
             max_record_bytes: 1,
             max_log_bytes: one_byte_short,
@@ -3688,20 +3646,15 @@ mod tests {
     #[test]
     fn record_digest_rejects_cross_segment_transplant() {
         let source = identity();
-        let target = GuardianOutputSegmentIdentity::new(
-            pane(),
-            Uuid::from_bytes([0x25; 16]),
-            1,
-            None,
-        )
-        .expect("target segment identity is valid");
+        let target =
+            GuardianOutputSegmentIdentity::new(pane(), Uuid::from_bytes([0x25; 16]), 1, None)
+                .expect("target segment identity is valid");
         let mut bytes = journal_bytes_for(source, &[b"bound to source segment"]);
         let cipher = cipher();
-        bytes[0..FILE_HEADER_BYTES]
-            .copy_from_slice(
-                &encode_file_header(target, &cipher)
-                    .expect("target file-header authentication succeeds"),
-            );
+        bytes[0..FILE_HEADER_BYTES].copy_from_slice(
+            &encode_file_header(target, &cipher)
+                .expect("target file-header authentication succeeds"),
+        );
         let mut cursor = Cursor::new(bytes.clone());
         let error = scan_journal(
             &mut cursor,
@@ -3793,8 +3746,7 @@ mod tests {
         let mut cursor = Cursor::new(bytes.clone());
         let mut recovery = RecoveryCollector::new(
             1,
-            GuardianOutputRecoveryLimits::new(2, 1024)
-                .expect("fixture recovery limits are valid"),
+            GuardianOutputRecoveryLimits::new(2, 1024).expect("fixture recovery limits are valid"),
         )
         .expect("fixture recovery collector is valid");
         let error = scan_journal_with_recovery(
@@ -3862,10 +3814,8 @@ mod tests {
     #[test]
     fn sequence_gap_fails_before_accepting_payload() {
         let mut bytes = journal_bytes(&[b"first", b"second"]);
-        let second_header = FILE_HEADER_BYTES
-            + RECORD_HEADER_BYTES
-            + b"first".len()
-            + AEAD_TAG_BYTES_USIZE;
+        let second_header =
+            FILE_HEADER_BYTES + RECORD_HEADER_BYTES + b"first".len() + AEAD_TAG_BYTES_USIZE;
         bytes[second_header + 8..second_header + 16].copy_from_slice(&3_u64.to_le_bytes());
         let mut cursor = Cursor::new(bytes.clone());
         let cipher = cipher();
@@ -3977,9 +3927,7 @@ mod tests {
             u64::try_from(bytes.len()).expect("journal length fits u64"),
             committed_after_first
         );
-        assert!(!bytes
-            .windows(payload.len())
-            .any(|window| window == payload));
+        assert!(!bytes.windows(payload.len()).any(|window| window == payload));
 
         let reopened_file = std::fs::OpenOptions::new()
             .read(true)
@@ -4096,10 +4044,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recovery_cursor_is_pinned_to_its_frozen_prefix_while_append_authority_advances() {
-        let (_directory, _path, mut journal, receipts) = real_journal_with_records(
-            "frozen-cursor.ftgout",
-            &[b"frozen-first", b"frozen-second"],
-        );
+        let (_directory, _path, mut journal, receipts) =
+            real_journal_with_records("frozen-cursor.ftgout", &[b"frozen-first", b"frozen-second"]);
         let mut cursor = journal
             .recovery_cursor(1, 1024)
             .expect("create frozen-prefix cursor");
@@ -4646,7 +4592,10 @@ mod tests {
         assert_eq!(page.records()[0].plaintext(), b"terminal");
         assert_eq!(page.next_recovery_sequence(), None);
         assert_eq!(page.committed_next_sequence(), None);
-        assert_eq!(page.terminal_predecessor(), Some(terminal.into_predecessor()));
+        assert_eq!(
+            page.terminal_predecessor(),
+            Some(terminal.into_predecessor())
+        );
 
         let mut cursor = reopened
             .recovery_cursor(u64::MAX, 1024)
@@ -4812,8 +4761,8 @@ mod tests {
             Err(GuardianOutputJournalError::SegmentIdentityMismatch)
         ));
 
-        let mut tampered_bytes = std::fs::read(&successor_path)
-            .expect("read successor bytes for header tamper check");
+        let mut tampered_bytes =
+            std::fs::read(&successor_path).expect("read successor bytes for header tamper check");
         tampered_bytes[120..128].copy_from_slice(
             &wrong_cumulative_predecessor
                 .cumulative_plaintext_bytes()

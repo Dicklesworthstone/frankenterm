@@ -26,13 +26,13 @@ use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
 use url::Url;
 
+#[cfg(feature = "use_serde")]
+pub mod checkpoint;
 mod image;
 mod iterm;
 mod keyboard;
 mod kitty;
 mod mouse;
-#[cfg(feature = "use_serde")]
-pub mod checkpoint;
 pub(crate) mod performer;
 mod sixel;
 use crate::terminalstate::image::*;
@@ -633,9 +633,9 @@ impl std::io::Write for ThreadedWriter {
         match self {
             Self::Live { sender } => {
                 let mut owned = Vec::new();
-                owned.try_reserve_exact(buf.len()).map_err(|_| {
-                    std::io::Error::other("terminal writer allocation failed")
-                })?;
+                owned
+                    .try_reserve_exact(buf.len())
+                    .map_err(|_| std::io::Error::other("terminal writer allocation failed"))?;
                 owned.extend_from_slice(buf);
                 sender
                     .send(WriterMessage::Data(owned))
@@ -864,10 +864,8 @@ impl TerminalState {
     ) -> Result<(), crate::config::ScrollbackActivationError> {
         self.screen
             .activate_recovered_scrollback(&prepared_config.config)?;
-        self.screen.install_prepared_config(
-            &prepared_config.config,
-            prepared_config.resize_wrap_policy,
-        );
+        self.screen
+            .install_prepared_config(&prepared_config.config, prepared_config.resize_wrap_policy);
         self.kitty_img.image_budget_bytes = prepared_config.kitty_image_budget_bytes;
         self.kitty_img
             .set_max_transmission_bytes(prepared_config.kitty_image_max_transmission_bytes);
