@@ -8716,7 +8716,6 @@ mod tests {
         let mut expected_construction_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext",
             "GuardianCheckpointDurableCompletionReceiptV1@GuardianCheckpointCipher::inspect_durable_manifest_receipt",
-            "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue_for_test",
             "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
             "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
             "GuardianCheckpointOrderedChunkSetBuilderV1@GuardianCheckpointOrderedChunkSetBuilderV1::new",
@@ -8726,7 +8725,6 @@ mod tests {
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly",
-            "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test",
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture",
         ]
