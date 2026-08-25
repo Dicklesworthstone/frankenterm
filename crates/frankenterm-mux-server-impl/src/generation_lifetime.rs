@@ -174,9 +174,8 @@ impl GenerationLifetimeLease {
     pub fn acquire_for_current_process() -> Result<Self, GenerationLifetimeError> {
         #[cfg(target_os = "linux")]
         {
-            let executable = std::env::current_exe().map_err(|source| {
-                GenerationLifetimeError::CurrentExecutable { source }
-            })?;
+            let executable = std::env::current_exe()
+                .map_err(|source| GenerationLifetimeError::CurrentExecutable { source })?;
             let ExecutablePathClass::Managed(managed) = classify_executable_path(&executable)?
             else {
                 return Ok(Self {
@@ -271,11 +270,12 @@ fn classify_executable_path(path: &Path) -> Result<ExecutablePathClass, Generati
         });
     }
 
-    let generation_id = normal[normal.len() - 2].to_str().ok_or(
-        GenerationLifetimeError::MalformedManagedPath {
-            reason: "the generation identifier is not UTF-8",
-        },
-    )?;
+    let generation_id =
+        normal[normal.len() - 2]
+            .to_str()
+            .ok_or(GenerationLifetimeError::MalformedManagedPath {
+                reason: "the generation identifier is not UTF-8",
+            })?;
     if generation_id.len() != GENERATION_ID_HEX_LEN
         || !generation_id
             .bytes()
@@ -317,14 +317,11 @@ fn io_error(operation: &'static str, source: impl Into<std::io::Error>) -> Gener
 }
 
 #[cfg(target_os = "linux")]
-fn snapshot_from_stat(
-    stat: &rustix::fs::Stat,
-) -> Result<NodeSnapshot, GenerationLifetimeError> {
-    let byte_len = u64::try_from(stat.st_size).map_err(|_| {
-        GenerationLifetimeError::InvalidAuthority {
+fn snapshot_from_stat(stat: &rustix::fs::Stat) -> Result<NodeSnapshot, GenerationLifetimeError> {
+    let byte_len =
+        u64::try_from(stat.st_size).map_err(|_| GenerationLifetimeError::InvalidAuthority {
             reason: "a managed filesystem object reports a negative length",
-        }
-    })?;
+        })?;
     Ok(NodeSnapshot {
         identity: GenerationObjectIdentity {
             device: stat.st_dev,
@@ -430,9 +427,7 @@ fn open_regular_file_at_nofollow(
     let descriptor = rustix::fs::openat(
         parent,
         name,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
     )
     .map_err(|source| io_error(operation, source))?;
@@ -513,8 +508,8 @@ fn require_same_named_object(
 }
 
 #[cfg(target_os = "linux")]
-fn current_process_executable_identity(
-) -> Result<GenerationObjectIdentity, GenerationLifetimeError> {
+fn current_process_executable_identity() -> Result<GenerationObjectIdentity, GenerationLifetimeError>
+{
     let descriptor = rustix::fs::openat(
         rustix::fs::CWD,
         Path::new("/proc/self/exe"),
@@ -800,7 +795,9 @@ mod linux_tests {
 
     fn fixture(label: &str, lease_shape: LeaseFixtureShape) -> Fixture {
         let root = retained_temp_directory(label);
-        let generations = root.join(PROCESS_FAMILY_DIRECTORY).join(GENERATIONS_DIRECTORY);
+        let generations = root
+            .join(PROCESS_FAMILY_DIRECTORY)
+            .join(GENERATIONS_DIRECTORY);
         let generation = generations.join(TEST_GENERATION_ID);
         std::fs::create_dir_all(&generation).expect("create managed fixture directories");
         let executable = generation.join(MUX_SERVER_FILENAME);
@@ -945,8 +942,11 @@ mod linux_tests {
             .expect("seal real generation directory");
         std::fs::set_permissions(&real_generations, std::fs::Permissions::from_mode(0o700))
             .expect("set real generations mode");
-        std::os::unix::fs::symlink("generations-real", process_family.join(GENERATIONS_DIRECTORY))
-            .expect("create generations symlink fixture");
+        std::os::unix::fs::symlink(
+            "generations-real",
+            process_family.join(GENERATIONS_DIRECTORY),
+        )
+        .expect("create generations symlink fixture");
         let managed_path = process_family
             .join(GENERATIONS_DIRECTORY)
             .join(TEST_GENERATION_ID)
@@ -1019,9 +1019,11 @@ mod linux_tests {
         let error = result
             .err()
             .expect("stale managed launch must fail behind exclusive retirement");
-        assert!(error
-            .to_string()
-            .contains("nonblocking shared generation lifetime lease"));
+        assert!(
+            error
+                .to_string()
+                .contains("nonblocking shared generation lifetime lease")
+        );
         drop(exclusive);
         launch.join().expect("settle stale-launch probe");
     }
@@ -1030,11 +1032,17 @@ mod linux_tests {
     fn fixture_paths_retain_exact_generation_layout() {
         let fixture = fixture("layout", LeaseFixtureShape::Regular);
         assert_eq!(
-            fixture.generations.file_name().and_then(|name| name.to_str()),
+            fixture
+                .generations
+                .file_name()
+                .and_then(|name| name.to_str()),
             Some(GENERATIONS_DIRECTORY)
         );
         assert_eq!(
-            fixture.generation.file_name().and_then(|name| name.to_str()),
+            fixture
+                .generation
+                .file_name()
+                .and_then(|name| name.to_str()),
             Some(TEST_GENERATION_ID)
         );
     }
@@ -1044,8 +1052,7 @@ mod linux_tests {
 mod path_tests {
     use super::*;
 
-    const GENERATION_ID: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const GENERATION_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn managed_path(generation: &str) -> PathBuf {
         PathBuf::from("/srv/frankenterm")

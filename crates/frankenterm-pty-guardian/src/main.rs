@@ -151,19 +151,18 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::Serve(_)));
-        assert!(Cli::try_parse_from([
-            "frankenterm-pty-guardian",
-            "--socket-path",
-            "/private/tmp/guardian/socket",
-            "--token-path",
-            "/private/tmp/guardian/token",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "frankenterm-pty-guardian",
+                "--socket-path",
+                "/private/tmp/guardian/socket",
+                "--token-path",
+                "/private/tmp/guardian/token",
+            ])
+            .is_err()
+        );
 
-        for (name, expected) in [
-            ("probe", "probe"),
-            ("guarded-stop", "guarded-stop"),
-        ] {
+        for (name, expected) in [("probe", "probe"), ("guarded-stop", "guarded-stop")] {
             let cli = Cli::try_parse_from([
                 "frankenterm-pty-guardian",
                 name,

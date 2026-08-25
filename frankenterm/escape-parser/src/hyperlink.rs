@@ -4,7 +4,7 @@ use frankenterm_dynamic::{
     Error as DynamicError, FromDynamic, FromDynamicOptions, ToDynamic, Value,
 };
 #[cfg(feature = "use_serde")]
-use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::allocate::*;
@@ -261,11 +261,9 @@ impl FromDynamic for Hyperlink {
             options,
         )
         .map_err(|error| dynamic_field_error("params", error))?;
-        let uri = GuardedString::from_dynamic(
-            object.get_by_str("uri").unwrap_or(&Value::Null),
-            options,
-        )
-        .map_err(|error| dynamic_field_error("uri", error))?;
+        let uri =
+            GuardedString::from_dynamic(object.get_by_str("uri").unwrap_or(&Value::Null), options)
+                .map_err(|error| dynamic_field_error("uri", error))?;
         let implicit = bool::from_dynamic(
             object.get_by_str("implicit").unwrap_or(&Value::Null),
             options,
@@ -479,10 +477,8 @@ impl Hyperlink {
             #[cfg(feature = "std")]
             link.params.reserve(guarded_params.len());
             for (key, value) in &mut guarded_params {
-                link.params.insert(
-                    core::mem::take(&mut **key),
-                    core::mem::take(&mut **value),
-                );
+                link.params
+                    .insert(core::mem::take(&mut **key), core::mem::take(&mut **value));
             }
 
             Ok(Some(link))
@@ -778,11 +774,7 @@ mod tests {
 
     #[test]
     fn parse_duplicate_param_keeps_the_last_guarded_value() {
-        let osc: Vec<&[u8]> = vec![
-            b"8",
-            b"id=first:id=second",
-            b"https://example.com/private",
-        ];
+        let osc: Vec<&[u8]> = vec![b"8", b"id=first:id=second", b"https://example.com/private"];
 
         let link = Hyperlink::parse(&osc).unwrap().unwrap();
 

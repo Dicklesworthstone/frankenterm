@@ -27,12 +27,11 @@ pub mod runtime;
 pub mod transport;
 
 #[cfg(unix)]
-pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};
-#[cfg(unix)]
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
+#[cfg(unix)]
+pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};
 #[cfg(unix)]
 pub use transport::{
     GuardianClient, GuardianClientError, GuardianProbeReport, GuardianService,
-    GuardianServiceConfig, GuardianServiceError, ProvisionTokenOutcome,
-    provision_guardian_token,
+    GuardianServiceConfig, GuardianServiceError, ProvisionTokenOutcome, provision_guardian_token,
 };

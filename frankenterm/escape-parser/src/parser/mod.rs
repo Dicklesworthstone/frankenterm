@@ -366,9 +366,7 @@ impl Parser {
             ..Default::default()
         };
         Self {
-            state_machine: VTParser::new_with_max_string_sequence_bytes(
-                max_string_sequence_bytes,
-            ),
+            state_machine: VTParser::new_with_max_string_sequence_bytes(max_string_sequence_bytes),
             state: RefCell::new(state),
             recovery_stream_bytes: Some(0),
             print_batching: default_print_batching(),
@@ -390,12 +388,7 @@ impl Parser {
     pub fn take_string_sequence_error(&mut self) -> Option<crate::StringSequenceError> {
         self.state_machine
             .take_string_sequence_error()
-            .or_else(|| {
-                self.state
-                    .borrow_mut()
-                    .pending_string_sequence_error
-                    .take()
-            })
+            .or_else(|| self.state.borrow_mut().pending_string_sequence_error.take())
     }
 
     /// Returns whether this parser can be replaced by a fresh parser at the
@@ -831,10 +824,12 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         self.state.dcs.take();
         self.state.discarding_short_dcs = false;
         if byte == b'q' && intermediates.is_empty() && !ignored_extra_intermediates {
-            self.state.sixel.replace(SixelBuilder::new_with_max_retained_bytes(
-                params,
-                max_string_sequence_bytes,
-            ));
+            self.state
+                .sixel
+                .replace(SixelBuilder::new_with_max_retained_bytes(
+                    params,
+                    max_string_sequence_bytes,
+                ));
         } else if byte == b'q' && intermediates == [b'+'] {
             self.state
                 .get_tcap
@@ -850,12 +845,9 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
             #[cfg(feature = "tmux_cc")]
             if byte == b'p' && params == [1000] {
                 // into tmux_cc mode
-                self.state.borrow_mut().tmux_state =
-                    Some(RefCell::new(
-                        crate::tmux_cc::Parser::new_with_max_retained_bytes(
-                            max_string_sequence_bytes,
-                        ),
-                    ));
+                self.state.borrow_mut().tmux_state = Some(RefCell::new(
+                    crate::tmux_cc::Parser::new_with_max_retained_bytes(max_string_sequence_bytes),
+                ));
             }
             (self.callback)(Action::DeviceControl(DeviceControlMode::Enter(Box::new(
                 EnterDeviceControlMode {

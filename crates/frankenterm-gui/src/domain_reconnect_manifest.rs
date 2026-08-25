@@ -7,16 +7,16 @@
 //! the opposite choice.
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+#[cfg(unix)]
+use cap_std::fs::DirBuilderExt as _;
+#[cfg(windows)]
+use cap_std::fs::MetadataExt as CapWindowsMetadataExt;
 use cap_std::fs::{
     Dir as CapDir, DirBuilder as CapDirBuilder, File as CapFile, Metadata as CapMetadata,
 };
 #[cfg(unix)]
-use cap_std::fs::DirBuilderExt as _;
-use cap_std::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt as _};
-#[cfg(unix)]
 use cap_std::fs::{MetadataExt as CapUnixMetadataExt, PermissionsExt as _};
-#[cfg(windows)]
-use cap_std::fs::MetadataExt as CapWindowsMetadataExt;
+use cap_std::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt as _};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -236,9 +236,8 @@ fn open_existing_directory_nofollow(
     directory: &Path,
 ) -> Result<CapDir, DomainReconnectManifestError> {
     let Some(name) = directory.file_name() else {
-        return CapDir::open_ambient_dir(directory, cap_std::ambient_authority()).map_err(
-            |error| DomainReconnectManifestError::io("open manifest directory", error),
-        );
+        return CapDir::open_ambient_dir(directory, cap_std::ambient_authority())
+            .map_err(|error| DomainReconnectManifestError::io("open manifest directory", error));
     };
     let parent_path = directory
         .parent()
@@ -373,9 +372,8 @@ fn open_or_create_directory_tree_durably(
                 reason: "manifest directory has no terminal name",
             });
         }
-        return CapDir::open_ambient_dir(directory, cap_std::ambient_authority()).map_err(
-            |error| DomainReconnectManifestError::io("open manifest directory", error),
-        );
+        return CapDir::open_ambient_dir(directory, cap_std::ambient_authority())
+            .map_err(|error| DomainReconnectManifestError::io("open manifest directory", error));
     };
     let parent_path = directory
         .parent()
@@ -447,11 +445,9 @@ fn validate_private_file(
     }
     #[cfg(unix)]
     {
-        let directory_metadata = directory
-            .dir_metadata()
-            .map_err(|error| {
-                DomainReconnectManifestError::io("inspect manifest directory", error)
-            })?;
+        let directory_metadata = directory.dir_metadata().map_err(|error| {
+            DomainReconnectManifestError::io("inspect manifest directory", error)
+        })?;
         if metadata.permissions().mode() & 0o7777 != 0o600 {
             return Err(DomainReconnectManifestError::UnsafeFile {
                 reason: "authority file mode is not 0600",
@@ -604,10 +600,7 @@ struct ManifestLease {
 }
 
 impl ManifestLease {
-    fn acquire(
-        path: &Path,
-        exclusive: bool,
-    ) -> Result<Self, DomainReconnectManifestError> {
+    fn acquire(path: &Path, exclusive: bool) -> Result<Self, DomainReconnectManifestError> {
         let directory = open_manifest_directory(path)?;
         let name = OsStr::new(LOCK_NAME);
         let before = match directory.symlink_metadata(name) {
@@ -622,10 +615,7 @@ impl ManifestLease {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => {
-                return Err(DomainReconnectManifestError::io(
-                    "inspect lock",
-                    error,
-                ));
+                return Err(DomainReconnectManifestError::io("inspect lock", error));
             }
         };
         let mut options = CapOpenOptions::new();
@@ -639,12 +629,7 @@ impl ManifestLease {
         let lock_authority = directory
             .open_with(name, &options)
             .map_err(|error| DomainReconnectManifestError::io("open lock", error))?;
-        let opened = validate_opened_name(
-            &directory,
-            name,
-            &lock_authority,
-            "lock open",
-        )?;
+        let opened = validate_opened_name(&directory, name, &lock_authority, "lock open")?;
         if opened.len() != 0
             || before
                 .as_ref()
@@ -702,9 +687,7 @@ impl Drop for ManifestLease {
     }
 }
 
-fn checksum_domain(
-    schema_version: u32,
-) -> Result<&'static [u8], DomainReconnectManifestError> {
+fn checksum_domain(schema_version: u32) -> Result<&'static [u8], DomainReconnectManifestError> {
     match schema_version {
         LEGACY_SCHEMA_VERSION => Ok(LEGACY_CHECKSUM_DOMAIN),
         SCHEMA_VERSION => Ok(CHECKSUM_DOMAIN),
@@ -793,11 +776,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<DecodedManifest, DomainReconnectManif
             reason: "reserved header bytes are nonzero",
         });
     }
-    let generation = u64::from_le_bytes(
-        bytes[16..24]
-            .try_into()
-            .expect("fixed generation slice"),
-    );
+    let generation = u64::from_le_bytes(bytes[16..24].try_into().expect("fixed generation slice"));
     if generation == 0 {
         return Err(DomainReconnectManifestError::Invalid {
             reason: "published generation is zero",
@@ -861,10 +840,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<DecodedManifest, DomainReconnectManif
     })
 }
 
-fn read_slot(
-    directory: &CapDir,
-    name: &OsStr,
-) -> Result<SlotRead, DomainReconnectManifestError> {
+fn read_slot(directory: &CapDir, name: &OsStr) -> Result<SlotRead, DomainReconnectManifestError> {
     let before = match directory.symlink_metadata(name) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Ok(SlotRead::Invalid(
@@ -888,12 +864,10 @@ fn read_slot(
         }
     };
     if before.len() > MAX_MANIFEST_BYTES {
-        return Ok(SlotRead::Invalid(
-            DomainReconnectManifestError::Oversized {
-                actual: before.len(),
-                maximum: MAX_MANIFEST_BYTES,
-            },
-        ));
+        return Ok(SlotRead::Invalid(DomainReconnectManifestError::Oversized {
+            actual: before.len(),
+            maximum: MAX_MANIFEST_BYTES,
+        }));
     }
     let mut options = CapOpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
@@ -917,12 +891,11 @@ fn read_slot(
         }
         Err(error) => return Ok(SlotRead::Invalid(error)),
     };
-    let capacity = usize::try_from(opened.len()).map_err(|_| {
-        DomainReconnectManifestError::Oversized {
+    let capacity =
+        usize::try_from(opened.len()).map_err(|_| DomainReconnectManifestError::Oversized {
             actual: opened.len(),
             maximum: MAX_MANIFEST_BYTES,
-        }
-    })?;
+        })?;
     let mut bytes = Vec::with_capacity(capacity);
     (&mut file)
         .take(MAX_MANIFEST_BYTES.saturating_add(1))
@@ -930,26 +903,19 @@ fn read_slot(
         .map_err(|error| DomainReconnectManifestError::io("read authority slot", error))?;
     let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if actual > MAX_MANIFEST_BYTES {
-        return Ok(SlotRead::Invalid(
-            DomainReconnectManifestError::Oversized {
-                actual,
-                maximum: MAX_MANIFEST_BYTES,
-            },
-        ));
+        return Ok(SlotRead::Invalid(DomainReconnectManifestError::Oversized {
+            actual,
+            maximum: MAX_MANIFEST_BYTES,
+        }));
     }
     let after = match validate_opened_name(directory, name, &file, "slot read completion") {
         Ok(metadata) => metadata,
         Err(error) => return Ok(SlotRead::Invalid(error)),
     };
-    if actual != opened.len()
-        || actual != after.len()
-        || !same_file_identity(&opened, &after)
-    {
-        return Ok(SlotRead::Invalid(
-            DomainReconnectManifestError::Invalid {
-                reason: "authority slot length changed while reading",
-            },
-        ));
+    if actual != opened.len() || actual != after.len() || !same_file_identity(&opened, &after) {
+        return Ok(SlotRead::Invalid(DomainReconnectManifestError::Invalid {
+            reason: "authority slot length changed while reading",
+        }));
     }
     if bytes.is_empty() {
         return Ok(SlotRead::Empty);
@@ -999,8 +965,7 @@ fn select_v2_authority(
             .iter()
             .filter_map(valid_record)
             .filter(|record| {
-                record.schema_version == SCHEMA_VERSION
-                    && record.manifest == candidate.manifest
+                record.schema_version == SCHEMA_VERSION && record.manifest == candidate.manifest
             })
             .count();
         if replicas >= 2 {
@@ -1044,9 +1009,7 @@ fn select_legacy_authority(
     let [first, second, third] = slots;
     let third_is_missing = match third {
         SlotRead::Missing => true,
-        SlotRead::Empty | SlotRead::Invalid(DomainReconnectManifestError::Invalid { .. }) => {
-            false
-        }
+        SlotRead::Empty | SlotRead::Invalid(DomainReconnectManifestError::Invalid { .. }) => false,
         SlotRead::Invalid(error) => return Err(error),
         SlotRead::Valid(_) => return Err(DomainReconnectManifestError::LegacyAmbiguous),
     };
@@ -1080,8 +1043,7 @@ fn select_legacy_authority(
             }
         }
         (SlotRead::Valid(first), SlotRead::Missing)
-            if first.schema_version == LEGACY_SCHEMA_VERSION
-                && first.manifest.generation == 1 =>
+            if first.schema_version == LEGACY_SCHEMA_VERSION && first.manifest.generation == 1 =>
         {
             Ok(LegacyAuthority::Published(LegacySelection {
                 manifest: first.manifest,
@@ -1089,9 +1051,7 @@ fn select_legacy_authority(
             }))
         }
         (SlotRead::Invalid(error), _) | (_, SlotRead::Invalid(error)) => Err(error),
-        (SlotRead::Missing, SlotRead::Missing) if third_is_missing => {
-            Ok(LegacyAuthority::Pristine)
-        }
+        (SlotRead::Missing, SlotRead::Missing) if third_is_missing => Ok(LegacyAuthority::Pristine),
         (
             SlotRead::Missing | SlotRead::Empty | SlotRead::Valid(_),
             SlotRead::Missing | SlotRead::Empty | SlotRead::Valid(_),
@@ -1139,11 +1099,7 @@ fn complete_cross_schema_migration(
             write_slot(directory, OsStr::new(SLOT_NAMES[index]), manifest)?;
         }
     }
-    write_slot(
-        directory,
-        OsStr::new(SLOT_NAMES[legacy_anchor]),
-        manifest,
-    )?;
+    write_slot(directory, OsStr::new(SLOT_NAMES[legacy_anchor]), manifest)?;
     verify_fully_replicated(directory, manifest)
 }
 
@@ -1312,12 +1268,7 @@ fn load_locked(
             legacy_anchor,
         }) => {
             validate_retained_authority(&manifest, retained)?;
-            complete_cross_schema_migration(
-                directory,
-                &slots,
-                &manifest,
-                legacy_anchor,
-            )?;
+            complete_cross_schema_migration(directory, &slots, &manifest, legacy_anchor)?;
             Ok(LoadedManifest { manifest })
         }
         None => match select_legacy_authority(slots)? {
@@ -1537,12 +1488,7 @@ pub fn set_intent_fenced(
     intent: DomainAttachmentIntent,
     retained: Option<&DomainReconnectManifest>,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
-    set_intent_production_at(
-        config::DATA_DIR.as_path(),
-        domain_name,
-        intent,
-        retained,
-    )
+    set_intent_production_at(config::DATA_DIR.as_path(), domain_name, intent, retained)
 }
 
 #[cfg(test)]
@@ -1578,9 +1524,11 @@ mod tests {
 
     fn assert_slots_omit_name(directory: &Path, domain_name: &str) {
         for bytes in namespace_slot_bytes(directory).into_iter().flatten() {
-            assert!(!bytes
-                .windows(domain_name.len())
-                .any(|window| window == domain_name.as_bytes()));
+            assert!(
+                !bytes
+                    .windows(domain_name.len())
+                    .any(|window| window == domain_name.as_bytes())
+            );
         }
     }
 
@@ -1590,12 +1538,7 @@ mod tests {
         let legacy_name = "private-legacy-trj-domain";
         let added_name = "private-added-csd-domain";
         let legacy = attached_manifest(legacy_name);
-        write_fixture(
-            data_directory.path(),
-            0,
-            &legacy,
-            LEGACY_SCHEMA_VERSION,
-        );
+        write_fixture(data_directory.path(), 0, &legacy, LEGACY_SCHEMA_VERSION);
 
         let migrated = load_production_from(data_directory.path(), None)
             .expect("load and migrate root schema-v1 authority");
@@ -1797,12 +1740,8 @@ mod tests {
             .expect("model an older broadly readable data root");
         let authority = private_manifest_directory(root.path());
 
-        let persisted = set_intent_at(
-            &authority,
-            "trj",
-            DomainAttachmentIntent::Attached,
-        )
-        .expect("persist inside dedicated private leaf");
+        let persisted = set_intent_at(&authority, "trj", DomainAttachmentIntent::Attached)
+            .expect("persist inside dedicated private leaf");
         assert_eq!(
             load_from(&authority).expect("reload private-leaf authority"),
             persisted
@@ -1927,21 +1866,13 @@ mod tests {
         assert!(missing.should_connect("trj", true));
         assert!(!missing.should_connect("trj", false));
 
-        set_intent_at(
-            temp.path(),
-            "trj",
-            DomainAttachmentIntent::Attached,
-        )
-        .expect("persist attach");
+        set_intent_at(temp.path(), "trj", DomainAttachmentIntent::Attached)
+            .expect("persist attach");
         let attached = load_from(temp.path()).expect("reload attached");
         assert!(attached.should_connect("trj", false));
 
-        set_intent_at(
-            temp.path(),
-            "trj",
-            DomainAttachmentIntent::Detached,
-        )
-        .expect("persist detach");
+        set_intent_at(temp.path(), "trj", DomainAttachmentIntent::Detached)
+            .expect("persist detach");
         let detached = load_from(temp.path()).expect("reload detached");
         assert!(!detached.should_connect("trj", true));
         assert_eq!(detached.generation(), 2);
@@ -2045,9 +1976,8 @@ mod tests {
         write_fixture(temp.path(), 0, &rolled_back, SCHEMA_VERSION);
         write_fixture(temp.path(), 1, &rolled_back, SCHEMA_VERSION);
         write_fixture(temp.path(), 2, &retained, SCHEMA_VERSION);
-        let before = manifest_paths(temp.path()).map(|path| {
-            std::fs::read(path).expect("read exact pre-fence replica bytes")
-        });
+        let before = manifest_paths(temp.path())
+            .map(|path| std::fs::read(path).expect("read exact pre-fence replica bytes"));
 
         assert!(matches!(
             load_fenced_from(temp.path(), Some(&retained)),
@@ -2057,9 +1987,8 @@ mod tests {
             })
         ));
         assert_eq!(
-            manifest_paths(temp.path()).map(|path| {
-                std::fs::read(path).expect("read exact post-load replica bytes")
-            }),
+            manifest_paths(temp.path())
+                .map(|path| { std::fs::read(path).expect("read exact post-load replica bytes") }),
             before,
             "a rejected load must not repair over surviving high-water evidence"
         );
@@ -2077,9 +2006,8 @@ mod tests {
             })
         ));
         assert_eq!(
-            manifest_paths(temp.path()).map(|path| {
-                std::fs::read(path).expect("read exact post-write replica bytes")
-            }),
+            manifest_paths(temp.path())
+                .map(|path| { std::fs::read(path).expect("read exact post-write replica bytes") }),
             before,
             "a rejected write must not repair or advance a rolled-back quorum"
         );
@@ -2093,9 +2021,8 @@ mod tests {
         write_fixture(temp.path(), 0, &replacement, SCHEMA_VERSION);
         write_fixture(temp.path(), 1, &replacement, SCHEMA_VERSION);
         write_fixture(temp.path(), 2, &retained, SCHEMA_VERSION);
-        let before = manifest_paths(temp.path()).map(|path| {
-            std::fs::read(path).expect("read exact pre-ABA replica bytes")
-        });
+        let before = manifest_paths(temp.path())
+            .map(|path| std::fs::read(path).expect("read exact pre-ABA replica bytes"));
 
         assert!(matches!(
             load_fenced_from(temp.path(), Some(&retained)),
@@ -2111,9 +2038,8 @@ mod tests {
             Err(DomainReconnectManifestError::AuthorityDivergence { generation: 10 })
         ));
         assert_eq!(
-            manifest_paths(temp.path()).map(|path| {
-                std::fs::read(path).expect("read exact post-ABA replica bytes")
-            }),
+            manifest_paths(temp.path())
+                .map(|path| { std::fs::read(path).expect("read exact post-ABA replica bytes") }),
             before,
             "same-generation replacement must be rejected before repair or write"
         );
@@ -2176,8 +2102,7 @@ mod tests {
         let attached = attached_manifest("trj");
         let detached = detached_manifest("trj");
 
-        let first_publication =
-            tempfile::tempdir().expect("first-publication migration directory");
+        let first_publication = tempfile::tempdir().expect("first-publication migration directory");
         write_fixture(
             first_publication.path(),
             0,
@@ -2191,18 +2116,8 @@ mod tests {
         assert_fully_replicated_v2(first_publication.path(), &attached);
 
         let ordinary = tempfile::tempdir().expect("ordinary migration directory");
-        write_fixture(
-            ordinary.path(),
-            0,
-            &attached,
-            LEGACY_SCHEMA_VERSION,
-        );
-        write_fixture(
-            ordinary.path(),
-            1,
-            &detached,
-            LEGACY_SCHEMA_VERSION,
-        );
+        write_fixture(ordinary.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
+        write_fixture(ordinary.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         assert_eq!(
             load_from(ordinary.path()).expect("migrate legacy authority"),
             detached
@@ -2210,18 +2125,8 @@ mod tests {
         assert_fully_replicated_v2(ordinary.path(), &detached);
 
         let torn_third = tempfile::tempdir().expect("third-slot-cut migration directory");
-        write_fixture(
-            torn_third.path(),
-            0,
-            &attached,
-            LEGACY_SCHEMA_VERSION,
-        );
-        write_fixture(
-            torn_third.path(),
-            1,
-            &detached,
-            LEGACY_SCHEMA_VERSION,
-        );
+        write_fixture(torn_third.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
+        write_fixture(torn_third.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         write_corrupt_fixture(torn_third.path(), 2);
         assert_eq!(
             load_from(torn_third.path()).expect("resume torn third-slot publication"),
@@ -2230,18 +2135,8 @@ mod tests {
         assert_fully_replicated_v2(torn_third.path(), &detached);
 
         let after_first = tempfile::tempdir().expect("first-cut migration directory");
-        write_fixture(
-            after_first.path(),
-            0,
-            &attached,
-            LEGACY_SCHEMA_VERSION,
-        );
-        write_fixture(
-            after_first.path(),
-            1,
-            &detached,
-            LEGACY_SCHEMA_VERSION,
-        );
+        write_fixture(after_first.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
+        write_fixture(after_first.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         write_fixture(after_first.path(), 2, &detached, SCHEMA_VERSION);
         assert_eq!(
             load_from(after_first.path()).expect("resume after first migration publication"),
@@ -2251,12 +2146,7 @@ mod tests {
 
         let torn_stale = tempfile::tempdir().expect("stale-cut migration directory");
         write_corrupt_fixture(torn_stale.path(), 0);
-        write_fixture(
-            torn_stale.path(),
-            1,
-            &detached,
-            LEGACY_SCHEMA_VERSION,
-        );
+        write_fixture(torn_stale.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         write_fixture(torn_stale.path(), 2, &detached, SCHEMA_VERSION);
         assert_eq!(
             load_from(torn_stale.path()).expect("resume torn stale migration publication"),
@@ -2266,12 +2156,7 @@ mod tests {
 
         let after_stale = tempfile::tempdir().expect("post-stale migration directory");
         write_fixture(after_stale.path(), 0, &detached, SCHEMA_VERSION);
-        write_fixture(
-            after_stale.path(),
-            1,
-            &detached,
-            LEGACY_SCHEMA_VERSION,
-        );
+        write_fixture(after_stale.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         write_fixture(after_stale.path(), 2, &detached, SCHEMA_VERSION);
         assert_eq!(
             load_from(after_stale.path()).expect("resume after stale-slot publication"),
@@ -2284,12 +2169,7 @@ mod tests {
     fn ambiguous_legacy_singleton_fails_closed_without_repair() {
         let temp = tempfile::tempdir().expect("temporary legacy ambiguity directory");
         let attached = attached_manifest("trj");
-        write_fixture(
-            temp.path(),
-            0,
-            &attached,
-            LEGACY_SCHEMA_VERSION,
-        );
+        write_fixture(temp.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
         write_corrupt_fixture(temp.path(), 1);
 
         assert!(matches!(
@@ -2306,18 +2186,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary mixed-schema directory");
         let attached = attached_manifest("trj");
         let detached = detached_manifest("trj");
-        write_fixture(
-            temp.path(),
-            0,
-            &attached,
-            LEGACY_SCHEMA_VERSION,
-        );
-        write_fixture(
-            temp.path(),
-            1,
-            &attached,
-            LEGACY_SCHEMA_VERSION,
-        );
+        write_fixture(temp.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
+        write_fixture(temp.path(), 1, &attached, LEGACY_SCHEMA_VERSION);
         write_fixture(temp.path(), 2, &detached, SCHEMA_VERSION);
 
         assert!(matches!(
@@ -2381,12 +2251,8 @@ mod tests {
         ));
 
         let temp = tempfile::tempdir().expect("temporary directory");
-        set_intent_at(
-            temp.path(),
-            "trj",
-            DomainAttachmentIntent::Attached,
-        )
-        .expect("persist manifest");
+        set_intent_at(temp.path(), "trj", DomainAttachmentIntent::Attached)
+            .expect("persist manifest");
         let paths = manifest_paths(temp.path());
         std::fs::set_permissions(&paths[0], std::fs::Permissions::from_mode(0o644))
             .expect("make slot unsafe");
@@ -2429,12 +2295,8 @@ mod tests {
     #[test]
     fn replacing_an_open_slot_is_detected_by_descriptor_identity() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let manifest = set_intent_at(
-            temp.path(),
-            "trj",
-            DomainAttachmentIntent::Attached,
-        )
-        .expect("persist manifest");
+        let manifest = set_intent_at(temp.path(), "trj", DomainAttachmentIntent::Attached)
+            .expect("persist manifest");
         let directory = open_manifest_directory(temp.path()).expect("open manifest directory");
         let name = OsStr::new(SLOT_NAMES[0]);
         let mut options = CapOpenOptions::new();
@@ -2468,12 +2330,8 @@ mod tests {
 
         let parent = tempfile::tempdir().expect("temporary parent directory");
         let authority_path = parent.path().join("authority");
-        set_intent_at(
-            &authority_path,
-            "trj",
-            DomainAttachmentIntent::Attached,
-        )
-        .expect("persist manifest");
+        set_intent_at(&authority_path, "trj", DomainAttachmentIntent::Attached)
+            .expect("persist manifest");
         let lease = ManifestLease::acquire(&authority_path, true).expect("acquire manifest lease");
         std::fs::rename(&authority_path, parent.path().join("displaced-authority"))
             .expect("displace manifest directory");
@@ -2495,12 +2353,8 @@ mod tests {
     #[test]
     fn hard_linked_authority_slot_is_rejected() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        set_intent_at(
-            temp.path(),
-            "trj",
-            DomainAttachmentIntent::Attached,
-        )
-        .expect("persist manifest");
+        set_intent_at(temp.path(), "trj", DomainAttachmentIntent::Attached)
+            .expect("persist manifest");
         std::fs::hard_link(
             &manifest_paths(temp.path())[0],
             temp.path().join("unexpected-hard-link"),
@@ -2517,17 +2371,15 @@ mod tests {
     fn diagnostics_and_persisted_bytes_do_not_contain_domain_names() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let secret_name = "private-production-host";
-        set_intent_at(
-            temp.path(),
-            secret_name,
-            DomainAttachmentIntent::Attached,
-        )
-        .expect("persist manifest");
+        set_intent_at(temp.path(), secret_name, DomainAttachmentIntent::Attached)
+            .expect("persist manifest");
         for path in manifest_paths(temp.path()) {
             if let Ok(bytes) = std::fs::read(path) {
-                assert!(!bytes
-                    .windows(secret_name.len())
-                    .any(|window| window == secret_name.as_bytes()));
+                assert!(
+                    !bytes
+                        .windows(secret_name.len())
+                        .any(|window| window == secret_name.as_bytes())
+                );
             }
         }
     }

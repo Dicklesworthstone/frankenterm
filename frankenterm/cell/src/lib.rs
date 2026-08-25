@@ -949,9 +949,7 @@ impl CellAttributes {
     /// terminal checkpoint projection.
     #[cfg(feature = "use_image")]
     pub fn has_image_attachments(&self) -> bool {
-        self.fat
-            .as_ref()
-            .is_some_and(|fat| !fat.image.is_empty())
+        self.fat.as_ref().is_some_and(|fat| !fat.image.is_empty())
     }
 
     /// Returns the list of attached images in z-index order.

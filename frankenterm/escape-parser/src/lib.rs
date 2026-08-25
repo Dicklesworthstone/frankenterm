@@ -71,9 +71,7 @@ pub use self::csi::CSI;
 pub use self::error::{Error, Result};
 pub use self::esc::{Esc, EscCode};
 pub use self::osc::OperatingSystemCommand;
-pub use vtparse::{
-    DEFAULT_MAX_STRING_SEQUENCE_BYTES, StringSequenceError, StringSequenceKind,
-};
+pub use vtparse::{DEFAULT_MAX_STRING_SEQUENCE_BYTES, StringSequenceError, StringSequenceKind};
 
 use vtparse::CsiParam;
 

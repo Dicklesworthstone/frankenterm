@@ -2,21 +2,20 @@
 
 use crate::output::GuardianOutputPipeline;
 use crate::runtime::{
-    GuardianInputRoute, GuardianInputSubmission, GuardianRuntime,
-    GuardianRuntimeConfig, GuardianRuntimeCounters,
-    GuardianRuntimeInputCompletionState,
+    GuardianInputRoute, GuardianInputSubmission, GuardianRuntime, GuardianRuntimeConfig,
+    GuardianRuntimeCounters, GuardianRuntimeInputCompletionState,
 };
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_protocol::{
-    AuthenticatedGuardianRequest, GuardianCensusPageRequest, GuardianInputEffectQuery,
-    GuardianOperation, GuardianProtocolError, GuardianReply, GuardianRequestEnvelope,
-    GuardianRequestHeader, GuardianRejectionCode, GuardianResponseEnvelope,
-    GuardianResponseStatus, GuardianSecret, GuardianResizePayload, GuardianSignal,
-    GuardianSpawnPayload, GuardianWireFrame, InputEffectState, GUARDIAN_AUTH_TOKEN_BYTES,
-    GUARDIAN_MAX_CENSUS_BYTES, GUARDIAN_MAX_CENSUS_ENTRIES, GUARDIAN_MAX_FRAME_BYTES,
-    GUARDIAN_MAX_PANES, decode_guardian_request, decode_guardian_response,
-    encode_guardian_request, encode_guardian_response,
+    AuthenticatedGuardianRequest, GUARDIAN_AUTH_TOKEN_BYTES, GUARDIAN_MAX_CENSUS_BYTES,
+    GUARDIAN_MAX_CENSUS_ENTRIES, GUARDIAN_MAX_FRAME_BYTES, GUARDIAN_MAX_PANES,
+    GuardianCensusPageRequest, GuardianInputEffectQuery, GuardianOperation, GuardianProtocolError,
+    GuardianRejectionCode, GuardianReply, GuardianRequestEnvelope, GuardianRequestHeader,
+    GuardianResizePayload, GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret,
+    GuardianSignal, GuardianSpawnPayload, GuardianWireFrame, InputEffectState,
+    decode_guardian_request, decode_guardian_response, encode_guardian_request,
+    encode_guardian_response,
 };
 use nix::unistd::geteuid;
 use portable_pty::{CommandBuilder, PtySize};
@@ -88,18 +87,16 @@ impl GuardianServiceConfig {
                 "max_panes is outside the guardian protocol bound",
             ));
         }
-        if max_output_bytes_per_pane == 0
-            || max_output_bytes_per_pane > MAX_OUTPUT_BYTES_PER_PANE
-        {
+        if max_output_bytes_per_pane == 0 || max_output_bytes_per_pane > MAX_OUTPUT_BYTES_PER_PANE {
             return Err(GuardianServiceError::InvalidConfiguration(
                 "max_output_bytes_per_pane is outside its supported nonzero bound",
             ));
         }
-        let possible_output_bytes = max_panes
-            .checked_mul(max_output_bytes_per_pane)
-            .ok_or(GuardianServiceError::InvalidConfiguration(
+        let possible_output_bytes = max_panes.checked_mul(max_output_bytes_per_pane).ok_or(
+            GuardianServiceError::InvalidConfiguration(
                 "configured pane output capacity overflows the platform",
-            ))?;
+            ),
+        )?;
         if max_total_output_bytes == 0
             || max_total_output_bytes > MAX_TOTAL_OUTPUT_BYTES
             || max_total_output_bytes > possible_output_bytes
@@ -315,9 +312,7 @@ impl MuxConnectionTracker {
         }
         let mut live_connections = HashMap::new();
         live_connections.try_reserve(max_connections).map_err(|_| {
-            GuardianServiceError::InvalidConfiguration(
-                "mux connection tracker allocation failed",
-            )
+            GuardianServiceError::InvalidConfiguration("mux connection tracker allocation failed")
         })?;
         let mut pending_retirements = Vec::new();
         pending_retirements
@@ -631,11 +626,13 @@ impl GuardianService {
         validate_private_parent(&config.socket_path)?;
         validate_private_parent(&config.token_path)?;
         let socket_parent = open_private_parent(&config.socket_path)?;
-        let socket_name = config.socket_path.file_name().ok_or(
-            GuardianServiceError::InvalidConfiguration(
-                "guardian socket path has no file name",
-            ),
-        )?;
+        let socket_name =
+            config
+                .socket_path
+                .file_name()
+                .ok_or(GuardianServiceError::InvalidConfiguration(
+                    "guardian socket path has no file name",
+                ))?;
         require_absent_at(&socket_parent, socket_name)?;
         let secret = load_guardian_secret(&config.token_path)?;
 
@@ -694,9 +691,11 @@ impl GuardianService {
             })?;
         free_connection_tokens.extend((1..=config.max_connections).rev());
         let mut connections = HashMap::new();
-        connections.try_reserve(config.max_connections).map_err(|_| {
-            GuardianServiceError::InvalidConfiguration("connection map allocation failed")
-        })?;
+        connections
+            .try_reserve(config.max_connections)
+            .map_err(|_| {
+                GuardianServiceError::InvalidConfiguration("connection map allocation failed")
+            })?;
         let mux_connections = MuxConnectionTracker::new(config.max_connections)?;
         let events = Events::with_capacity(endpoint_capacity);
 
@@ -1026,11 +1025,10 @@ impl GuardianService {
             };
             return match self.process_frame(token, connection, &completed_frame) {
                 FrameProcessing::Response(response) => {
-                    connection.write_buf =
-                        match encode_guardian_response(&self.secret, &response) {
-                            Ok(frame) => Some(frame),
-                            Err(_) => return false,
-                        };
+                    connection.write_buf = match encode_guardian_response(&self.secret, &response) {
+                        Ok(frame) => Some(frame),
+                        Err(_) => return false,
+                    };
                     connection.write_offset = 0;
                     self.poll
                         .registry()
@@ -1130,14 +1128,10 @@ impl GuardianService {
                     let mux_incarnation = request.header().mux_incarnation;
                     if self
                         .mux_connections
-                        .observe_authenticated_hello(
-                            connection.identity(token),
-                            mux_incarnation,
-                        )
+                        .observe_authenticated_hello(connection.identity(token), mux_incarnation)
                         .is_err()
                     {
-                        self.transport_failures =
-                            self.transport_failures.saturating_add(1);
+                        self.transport_failures = self.transport_failures.saturating_add(1);
                         request.zeroize_payload();
                         return FrameProcessing::Close;
                     }
@@ -1174,8 +1168,7 @@ impl GuardianService {
                         .lifecycle
                         .begin_guarded_stop(authority, self.runtime.pane_count())
                     {
-                        let response =
-                            GuardianResponseEnvelope::rejection(&request, code);
+                        let response = GuardianResponseEnvelope::rejection(&request, code);
                         request.zeroize_payload();
                         return FrameProcessing::Response(response);
                     }
@@ -1311,9 +1304,7 @@ impl GuardianService {
                     return;
                 }
             };
-            if result.pending_input_panes != 0
-                || result.indeterminate_checkpoint_panes != 0
-            {
+            if result.pending_input_panes != 0 || result.indeterminate_checkpoint_panes != 0 {
                 return;
             }
             if self
@@ -1332,8 +1323,7 @@ impl GuardianService {
         self.ready.clear();
         for (token, connection) in &self.connections {
             if connection.mux_incarnation.is_none()
-                && now.saturating_duration_since(connection.accepted_at)
-                    >= AUTHENTICATION_DEADLINE
+                && now.saturating_duration_since(connection.accepted_at) >= AUTHENTICATION_DEADLINE
             {
                 self.ready.push(ReadyEvent {
                     token: *token,
@@ -1367,10 +1357,7 @@ fn take_exact_ready_connection(
     connections.remove(&event.token)
 }
 
-fn monitor_pending_input_connection(
-    connection: &mut Connection,
-    event: ReadyEvent,
-) -> bool {
+fn monitor_pending_input_connection(connection: &mut Connection, event: ReadyEvent) -> bool {
     if event.closed {
         return false;
     }
@@ -1450,10 +1437,9 @@ impl OwnedClientRequest {
         self.request.zeroize_payload();
         #[cfg(test)]
         if let Some(probe) = self.wipe_probe.as_ref() {
-            probe.explicit_wipe.store(
-                self.request.payload().is_empty(),
-                Ordering::SeqCst,
-            );
+            probe
+                .explicit_wipe
+                .store(self.request.payload().is_empty(), Ordering::SeqCst);
         }
     }
 }
@@ -1463,10 +1449,9 @@ impl Drop for OwnedClientRequest {
         self.request.zeroize_payload();
         #[cfg(test)]
         if let Some(probe) = self.wipe_probe.as_ref() {
-            probe.drop_wipe.store(
-                self.request.payload().is_empty(),
-                Ordering::SeqCst,
-            );
+            probe
+                .drop_wipe
+                .store(self.request.payload().is_empty(), Ordering::SeqCst);
         }
     }
 }
@@ -1500,10 +1485,9 @@ impl OwnedEncodedFrame {
         self.frame.zeroize_bytes();
         #[cfg(test)]
         if let Some(probe) = self.wipe_probe.as_ref() {
-            probe.encoded_frame_wipe.store(
-                self.frame.iter().all(|byte| *byte == 0),
-                Ordering::SeqCst,
-            );
+            probe
+                .encoded_frame_wipe
+                .store(self.frame.iter().all(|byte| *byte == 0), Ordering::SeqCst);
         }
     }
 }
@@ -1513,10 +1497,9 @@ impl Drop for OwnedEncodedFrame {
         self.frame.zeroize_bytes();
         #[cfg(test)]
         if let Some(probe) = self.wipe_probe.as_ref() {
-            probe.encoded_frame_drop_wipe.store(
-                self.frame.iter().all(|byte| *byte == 0),
-                Ordering::SeqCst,
-            );
+            probe
+                .encoded_frame_drop_wipe
+                .store(self.frame.iter().all(|byte| *byte == 0), Ordering::SeqCst);
         }
     }
 }
@@ -1868,8 +1851,8 @@ impl GuardianClient {
             } else if expected_total != Some(total_panes) || snapshot_id != returned_snapshot {
                 return Err(GuardianClientError::UnexpectedReply);
             }
-            let entry_count = u64::try_from(entries.len())
-                .map_err(|_| GuardianClientError::UnexpectedReply)?;
+            let entry_count =
+                u64::try_from(entries.len()).map_err(|_| GuardianClientError::UnexpectedReply)?;
             let next_observed = cursor
                 .checked_add(entry_count)
                 .ok_or(GuardianClientError::UnexpectedReply)?;
@@ -1956,10 +1939,9 @@ impl GuardianClient {
         #[cfg(test)]
         if authenticated.header().operation == GuardianOperation::Input {
             if let Some(probe) = self.request_wipe_probe.as_ref() {
-                probe.authenticated_input_wipe.store(
-                    authenticated.payload().is_empty(),
-                    Ordering::SeqCst,
-                );
+                probe
+                    .authenticated_input_wipe
+                    .store(authenticated.payload().is_empty(), Ordering::SeqCst);
             }
         }
         self.stream.write_all(frame.as_slice())?;
@@ -1971,9 +1953,9 @@ impl GuardianClient {
             GuardianResponseStatus::Success => correlated
                 .success_reply(&authenticated)
                 .map_err(GuardianClientError::from),
-            GuardianResponseStatus::Rejected | GuardianResponseStatus::Terminal => Err(
-                GuardianClientError::Rejected(correlated.rejection_code()?),
-            ),
+            GuardianResponseStatus::Rejected | GuardianResponseStatus::Terminal => {
+                Err(GuardianClientError::Rejected(correlated.rejection_code()?))
+            }
             GuardianResponseStatus::Indeterminate => correlated
                 .typed_reply(&authenticated)
                 .map_err(GuardianClientError::from),
@@ -2015,18 +1997,14 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
 ) -> Result<ProvisionTokenOutcome, GuardianServiceError> {
     validate_absolute_path(path)?;
     validate_pinned_private_parent(path, parent_authority)?;
-    let active_name = path.file_name().ok_or(
-        GuardianServiceError::InvalidConfiguration(
+    let active_name = path
+        .file_name()
+        .ok_or(GuardianServiceError::InvalidConfiguration(
             "guardian token path has no file name",
-        ),
-    )?;
+        ))?;
     match open_private_file_read_at(parent_authority, active_name) {
         Ok(file) => {
-            let _ = load_guardian_secret_from_open_file_at(
-                parent_authority,
-                active_name,
-                file,
-            )?;
+            let _ = load_guardian_secret_from_open_file_at(parent_authority, active_name, file)?;
             sync_pinned_private_parent(path, parent_authority)?;
             return Ok(ProvisionTokenOutcome::Existing);
         }
@@ -2036,16 +2014,16 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
 
     let stage_path = token_stage_path(path)?;
     let commit_path = token_stage_commit_path(&stage_path)?;
-    let stage_name = stage_path.file_name().ok_or(
-        GuardianServiceError::InvalidConfiguration(
+    let stage_name = stage_path
+        .file_name()
+        .ok_or(GuardianServiceError::InvalidConfiguration(
             "guardian token stage path has no file name",
-        ),
-    )?;
-    let commit_name = commit_path.file_name().ok_or(
-        GuardianServiceError::InvalidConfiguration(
+        ))?;
+    let commit_name = commit_path
+        .file_name()
+        .ok_or(GuardianServiceError::InvalidConfiguration(
             "guardian token stage commit path has no file name",
-        ),
-    )?;
+        ))?;
     // Retain the exclusive stage-file lock through publication and active-path
     // validation. A concurrent provisioner therefore cannot mutate the inode
     // after it has become the active token.
@@ -2057,11 +2035,7 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
         commit_name,
         &mut prepared,
     )?;
-    match publish_token_stage_noreplace(
-        parent_authority,
-        stage_name,
-        active_name,
-    ) {
+    match publish_token_stage_noreplace(parent_authority, stage_name, active_name) {
         Ok(()) => {
             validate_published_token_binding(
                 parent_authority,
@@ -2083,18 +2057,11 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             let file = open_private_file_read_at(parent_authority, active_name)
                 .map_err(|error| GuardianServiceError::io("token-raced-active-open", error))?;
-            let _ = load_guardian_secret_from_open_file_at(
-                parent_authority,
-                active_name,
-                file,
-            )?;
+            let _ = load_guardian_secret_from_open_file_at(parent_authority, active_name, file)?;
             sync_pinned_private_parent(path, parent_authority)?;
             Ok(ProvisionTokenOutcome::Existing)
         }
-        Err(error) => Err(GuardianServiceError::io(
-            "token-no-replace-publish",
-            error,
-        )),
+        Err(error) => Err(GuardianServiceError::io("token-no-replace-publish", error)),
     }
 }
 
@@ -2114,25 +2081,15 @@ struct PreparedTokenStage {
     target_os = "visionos",
     target_os = "watchos",
 ))]
-fn open_private_file_at(
-    parent: &File,
-    name: &OsStr,
-    create_new: bool,
-) -> std::io::Result<File> {
-    let mut flags = rustix::fs::OFlags::RDWR
-        | rustix::fs::OFlags::CLOEXEC
-        | rustix::fs::OFlags::NOFOLLOW;
+fn open_private_file_at(parent: &File, name: &OsStr, create_new: bool) -> std::io::Result<File> {
+    let mut flags =
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
     if create_new {
         flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
     }
-    rustix::fs::openat(
-        parent,
-        name,
-        flags,
-        rustix::fs::Mode::from_raw_mode(0o600),
-    )
-    .map(File::from)
-    .map_err(std::io::Error::from)
+    rustix::fs::openat(parent, name, flags, rustix::fs::Mode::from_raw_mode(0o600))
+        .map(File::from)
+        .map_err(std::io::Error::from)
 }
 
 #[cfg(not(any(
@@ -2144,11 +2101,7 @@ fn open_private_file_at(
     target_os = "visionos",
     target_os = "watchos",
 )))]
-fn open_private_file_at(
-    _parent: &File,
-    _name: &OsStr,
-    _create_new: bool,
-) -> std::io::Result<File> {
+fn open_private_file_at(_parent: &File, _name: &OsStr, _create_new: bool) -> std::io::Result<File> {
     Err(std::io::Error::new(
         ErrorKind::Unsupported,
         "descriptor-relative guardian token staging is unsupported on this Unix target",
@@ -2168,9 +2121,7 @@ fn open_private_file_read_at(parent: &File, name: &OsStr) -> std::io::Result<Fil
     rustix::fs::openat(
         parent,
         name,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
     )
     .map(File::from)
@@ -2194,9 +2145,11 @@ fn open_private_file_read_at(_parent: &File, _name: &OsStr) -> std::io::Result<F
 }
 
 fn token_stage_path(path: &Path) -> Result<PathBuf, GuardianServiceError> {
-    let file_name = path.file_name().ok_or(GuardianServiceError::InvalidConfiguration(
-        "guardian token path has no file name",
-    ))?;
+    let file_name = path
+        .file_name()
+        .ok_or(GuardianServiceError::InvalidConfiguration(
+            "guardian token path has no file name",
+        ))?;
     let mut stage_name = file_name.to_os_string();
     stage_name.push(".provisioning");
     let stage_path = path.with_file_name(stage_name);
@@ -2210,11 +2163,11 @@ fn token_stage_path(path: &Path) -> Result<PathBuf, GuardianServiceError> {
 }
 
 fn token_stage_commit_path(stage_path: &Path) -> Result<PathBuf, GuardianServiceError> {
-    let file_name = stage_path.file_name().ok_or(
-        GuardianServiceError::InvalidConfiguration(
+    let file_name = stage_path
+        .file_name()
+        .ok_or(GuardianServiceError::InvalidConfiguration(
             "guardian token stage path has no file name",
-        ),
-    )?;
+        ))?;
     let mut commit_name = file_name.to_os_string();
     commit_name.push(".ready");
     let commit_path = stage_path.with_file_name(commit_name);
@@ -2244,9 +2197,10 @@ fn prepare_token_stage(
             match open_private_file_at(parent, stage_name, true) {
                 Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    let file = open_private_file_at(parent, stage_name, false).map_err(|error| {
-                        GuardianServiceError::io("token-stage-race-open", error)
-                    })?;
+                    let file =
+                        open_private_file_at(parent, stage_name, false).map_err(|error| {
+                            GuardianServiceError::io("token-stage-race-open", error)
+                        })?;
                     let metadata = file.metadata().map_err(|error| {
                         GuardianServiceError::io("token-stage-race-metadata", error)
                     })?;
@@ -2260,8 +2214,7 @@ fn prepare_token_stage(
         }
         Err(error) => return Err(GuardianServiceError::io("token-stage-open", error)),
     };
-    lock_token_stage(&file)
-        .map_err(|error| GuardianServiceError::io("token-stage-lock", error))?;
+    lock_token_stage(&file).map_err(|error| GuardianServiceError::io("token-stage-lock", error))?;
     let before = file
         .metadata()
         .map_err(|error| GuardianServiceError::io("token-stage-opened-metadata", error))?;
@@ -2282,8 +2235,8 @@ fn prepare_token_stage(
         .map_err(|error| GuardianServiceError::io("token-stage-rewind", error))?;
     file.read_exact(&mut existing[..existing_len])
         .map_err(|error| GuardianServiceError::io("token-stage-read", error))?;
-    let complete_nonzero = existing_len == GUARDIAN_AUTH_TOKEN_BYTES
-        && existing.iter().any(|byte| *byte != 0);
+    let complete_nonzero =
+        existing_len == GUARDIAN_AUTH_TOKEN_BYTES && existing.iter().any(|byte| *byte != 0);
     let mut commit = open_token_stage_commit(parent, commit_name)?;
     let commit_before = commit
         .metadata()
@@ -2300,9 +2253,7 @@ fn prepare_token_stage(
     let expected_commit = token_stage_commit_record(&existing[..]);
     let mut observed_commit = [0_u8; TOKEN_STAGE_COMMIT_BYTES];
     let commit_len = usize::try_from(commit_before.len()).map_err(|_| {
-        GuardianServiceError::FilesystemSecurity(
-            "guardian token stage commit length is invalid",
-        )
+        GuardianServiceError::FilesystemSecurity("guardian token stage commit length is invalid")
     })?;
     commit
         .rewind()
@@ -2326,15 +2277,15 @@ fn prepare_token_stage(
         .map_err(|error| GuardianServiceError::io("token-stage-sync", error))?;
     let expected_commit = token_stage_commit_record(&existing[..]);
     if !commit_matches {
-        commit.set_len(0).map_err(|error| {
-            GuardianServiceError::io("token-stage-commit-reset", error)
-        })?;
-        commit.rewind().map_err(|error| {
-            GuardianServiceError::io("token-stage-commit-reset-rewind", error)
-        })?;
-        commit.write_all(&expected_commit).map_err(|error| {
-            GuardianServiceError::io("token-stage-commit-write", error)
-        })?;
+        commit
+            .set_len(0)
+            .map_err(|error| GuardianServiceError::io("token-stage-commit-reset", error))?;
+        commit
+            .rewind()
+            .map_err(|error| GuardianServiceError::io("token-stage-commit-reset-rewind", error))?;
+        commit
+            .write_all(&expected_commit)
+            .map_err(|error| GuardianServiceError::io("token-stage-commit-write", error))?;
     }
     commit
         .sync_all()
@@ -2351,9 +2302,9 @@ fn prepare_token_stage(
         validate_token_metadata,
         "token-stage-final-binding-open",
     )?;
-    let commit_after_open = commit.metadata().map_err(|error| {
-        GuardianServiceError::io("token-stage-commit-metadata-after", error)
-    })?;
+    let commit_after_open = commit
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("token-stage-commit-metadata-after", error))?;
     validate_token_stage_commit_ready_metadata(&commit_after_open)?;
     require_same_object(&commit_before, &commit_after_open)?;
     require_descriptor_relative_binding(
@@ -2430,12 +2381,10 @@ fn read_token_stage_commit(
     })?;
     validate_token_stage_commit_ready_metadata(&before)?;
     let mut record = [0_u8; TOKEN_STAGE_COMMIT_BYTES];
-    file.rewind().map_err(|error| {
-        GuardianServiceError::io("token-stage-commit-read-rewind", error)
-    })?;
-    file.read_exact(&mut record).map_err(|error| {
-        GuardianServiceError::io("token-stage-commit-read-exact", error)
-    })?;
+    file.rewind()
+        .map_err(|error| GuardianServiceError::io("token-stage-commit-read-rewind", error))?;
+    file.read_exact(&mut record)
+        .map_err(|error| GuardianServiceError::io("token-stage-commit-read-exact", error))?;
     let mut extra = [0_u8; 1];
     if file
         .read(&mut extra)
@@ -2460,9 +2409,10 @@ fn validate_prepared_token_stage_binding(
     commit_name: &OsStr,
     prepared: &mut PreparedTokenStage,
 ) -> Result<(), GuardianServiceError> {
-    let stage_metadata = prepared.stage.metadata().map_err(|error| {
-        GuardianServiceError::io("token-stage-prepublish-metadata", error)
-    })?;
+    let stage_metadata = prepared
+        .stage
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("token-stage-prepublish-metadata", error))?;
     validate_token_metadata(&stage_metadata)?;
     require_descriptor_relative_binding(
         parent,
@@ -2539,9 +2489,10 @@ fn validate_published_token_binding(
         }
     }
 
-    let stage_metadata = prepared.stage.metadata().map_err(|error| {
-        GuardianServiceError::io("token-published-stage-metadata", error)
-    })?;
+    let stage_metadata = prepared
+        .stage
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("token-published-stage-metadata", error))?;
     validate_token_metadata(&stage_metadata)?;
     if token_material_digest(&mut prepared.stage)? != prepared.material_digest {
         return Err(GuardianServiceError::FilesystemSecurity(
@@ -2551,9 +2502,9 @@ fn validate_published_token_binding(
 
     let mut active = open_private_file_read_at(parent, active_name)
         .map_err(|error| GuardianServiceError::io("token-published-active-open", error))?;
-    let active_metadata = active.metadata().map_err(|error| {
-        GuardianServiceError::io("token-published-active-metadata", error)
-    })?;
+    let active_metadata = active
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("token-published-active-metadata", error))?;
     validate_token_metadata(&active_metadata)?;
     require_same_file(&stage_metadata, &active_metadata)?;
     if token_material_digest(&mut active)? != prepared.material_digest {
@@ -2569,9 +2520,10 @@ fn validate_published_token_binding(
         "token-published-active-binding-open",
     )?;
 
-    let readiness_metadata = prepared.readiness.metadata().map_err(|error| {
-        GuardianServiceError::io("token-published-readiness-metadata", error)
-    })?;
+    let readiness_metadata = prepared
+        .readiness
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("token-published-readiness-metadata", error))?;
     validate_token_stage_commit_ready_metadata(&readiness_metadata)?;
     require_descriptor_relative_binding(
         parent,
@@ -2588,10 +2540,7 @@ fn validate_published_token_binding(
     Ok(())
 }
 
-fn open_token_stage_commit(
-    parent: &File,
-    name: &OsStr,
-) -> Result<File, GuardianServiceError> {
+fn open_token_stage_commit(parent: &File, name: &OsStr) -> Result<File, GuardianServiceError> {
     let file = match open_private_file_at(parent, name, false) {
         Ok(file) => {
             let opened = file.metadata().map_err(|error| {
@@ -2609,10 +2558,7 @@ fn open_token_stage_commit(
                     })?
                 }
                 Err(error) => {
-                    return Err(GuardianServiceError::io(
-                        "token-stage-commit-create",
-                        error,
-                    ));
+                    return Err(GuardianServiceError::io("token-stage-commit-create", error));
                 }
             }
         }
@@ -2647,9 +2593,7 @@ fn validate_token_stage_metadata(metadata: &Metadata) -> Result<(), GuardianServ
     Ok(())
 }
 
-fn validate_token_stage_commit_metadata(
-    metadata: &Metadata,
-) -> Result<(), GuardianServiceError> {
+fn validate_token_stage_commit_metadata(metadata: &Metadata) -> Result<(), GuardianServiceError> {
     if !metadata.is_file()
         || metadata.uid() != geteuid().as_raw()
         || metadata.mode() & 0o777 != 0o600
@@ -2696,11 +2640,8 @@ fn fill_nonzero_secret(
     target_os = "watchos",
 ))]
 fn lock_token_stage(file: &std::fs::File) -> std::io::Result<()> {
-    rustix::fs::flock(
-        file,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    )
-    .map_err(std::io::Error::from)
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(std::io::Error::from)
 }
 
 #[cfg(not(any(
@@ -2802,9 +2743,11 @@ fn validate_absolute_path(path: &Path) -> Result<(), GuardianServiceError> {
 
 fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
     validate_absolute_path(path)?;
-    let parent = path.parent().ok_or(GuardianServiceError::FilesystemSecurity(
-        "guardian path has no parent directory",
-    ))?;
+    let parent = path
+        .parent()
+        .ok_or(GuardianServiceError::FilesystemSecurity(
+            "guardian path has no parent directory",
+        ))?;
     let mut current = PathBuf::from("/");
     for component in parent.components() {
         match component {
@@ -2841,9 +2784,11 @@ fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
 
 fn open_private_parent(path: &Path) -> Result<std::fs::File, GuardianServiceError> {
     validate_private_parent(path)?;
-    let parent = path.parent().ok_or(GuardianServiceError::FilesystemSecurity(
-        "guardian path has no parent directory",
-    ))?;
+    let parent = path
+        .parent()
+        .ok_or(GuardianServiceError::FilesystemSecurity(
+            "guardian path has no parent directory",
+        ))?;
     let before = std::fs::symlink_metadata(parent)
         .map_err(|error| GuardianServiceError::io("private-parent-metadata-before", error))?;
     let directory = OpenOptions::new()
@@ -2867,9 +2812,11 @@ fn validate_pinned_private_parent(
     directory: &std::fs::File,
 ) -> Result<(), GuardianServiceError> {
     validate_private_parent(path)?;
-    let parent = path.parent().ok_or(GuardianServiceError::FilesystemSecurity(
-        "guardian path has no parent directory",
-    ))?;
+    let parent = path
+        .parent()
+        .ok_or(GuardianServiceError::FilesystemSecurity(
+            "guardian path has no parent directory",
+        ))?;
     let opened = directory
         .metadata()
         .map_err(|error| GuardianServiceError::io("pinned-parent-metadata", error))?;
@@ -2893,10 +2840,7 @@ fn sync_private_parent_authority(directory: &File) -> Result<(), GuardianService
     let before = directory
         .metadata()
         .map_err(|error| GuardianServiceError::io("token-parent-authority-before", error))?;
-    if !before.is_dir()
-        || before.uid() != geteuid().as_raw()
-        || before.mode() & 0o077 != 0
-    {
+    if !before.is_dir() || before.uid() != geteuid().as_raw() || before.mode() & 0o077 != 0 {
         return Err(GuardianServiceError::FilesystemSecurity(
             "guardian pinned parent authority is not a current-user owner-only directory",
         ));
@@ -2994,14 +2938,10 @@ fn socket_path_identity_at(
     parent: &File,
     name: &OsStr,
 ) -> Result<SocketPathIdentity, GuardianServiceError> {
-    let metadata = rustix::fs::statat(
-        parent,
-        name,
-        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .map_err(|error| {
-        GuardianServiceError::io("socket-metadata-at", std::io::Error::from(error))
-    })?;
+    let metadata = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| {
+            GuardianServiceError::io("socket-metadata-at", std::io::Error::from(error))
+        })?;
     let mode = u32::try_from(metadata.st_mode).map_err(|_| {
         GuardianServiceError::FilesystemSecurity("guardian socket mode is not representable")
     })?;
@@ -3115,11 +3055,11 @@ fn validate_existing_socket(path: &Path) -> Result<(), GuardianServiceError> {
 
 fn load_guardian_secret(path: &Path) -> Result<GuardianSecret, GuardianServiceError> {
     let parent = open_private_parent(path)?;
-    let name = path.file_name().ok_or(
-        GuardianServiceError::InvalidConfiguration(
+    let name = path
+        .file_name()
+        .ok_or(GuardianServiceError::InvalidConfiguration(
             "guardian token path has no file name",
-        ),
-    )?;
+        ))?;
     let file = open_private_file_read_at(&parent, name)
         .map_err(|error| GuardianServiceError::io("token-open", error))?;
     let secret = load_guardian_secret_from_open_file_at(&parent, name, file)?;
@@ -3247,34 +3187,18 @@ mod tests {
 
     #[test]
     fn delayed_input_completion_cannot_route_to_a_recycled_connection_token() {
-        let original = GuardianInputRoute::new(
-            Token(7),
-            11,
-            Uuid::from_u128(12),
-            Uuid::from_u128(13),
-        )
-        .unwrap();
-        let recycled = GuardianInputRoute::new(
-            Token(7),
-            12,
-            Uuid::from_u128(12),
-            Uuid::from_u128(13),
-        )
-        .unwrap();
-        let aliased_request = GuardianInputRoute::new(
-            Token(7),
-            11,
-            Uuid::from_u128(14),
-            Uuid::from_u128(13),
-        )
-        .unwrap();
-        let aliased_effect = GuardianInputRoute::new(
-            Token(7),
-            11,
-            Uuid::from_u128(12),
-            Uuid::from_u128(15),
-        )
-        .unwrap();
+        let original =
+            GuardianInputRoute::new(Token(7), 11, Uuid::from_u128(12), Uuid::from_u128(13))
+                .unwrap();
+        let recycled =
+            GuardianInputRoute::new(Token(7), 12, Uuid::from_u128(12), Uuid::from_u128(13))
+                .unwrap();
+        let aliased_request =
+            GuardianInputRoute::new(Token(7), 11, Uuid::from_u128(14), Uuid::from_u128(13))
+                .unwrap();
+        let aliased_effect =
+            GuardianInputRoute::new(Token(7), 11, Uuid::from_u128(12), Uuid::from_u128(15))
+                .unwrap();
 
         assert!(pending_input_route_matches(11, Some(original), original));
         assert!(!pending_input_route_matches(12, Some(recycled), original));
@@ -3289,13 +3213,10 @@ mod tests {
             original,
         ));
         assert!(!pending_input_route_matches(11, None, original));
-        assert!(GuardianInputRoute::new(
-            Token(7),
-            0,
-            Uuid::from_u128(12),
-            Uuid::from_u128(13),
-        )
-        .is_none());
+        assert!(
+            GuardianInputRoute::new(Token(7), 0, Uuid::from_u128(12), Uuid::from_u128(13),)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3411,10 +3332,7 @@ mod tests {
             .observe_disconnect(incumbent, Some(mux_incarnation))
             .unwrap();
         let retirement = unrelated_hello.pending_retirements[0];
-        assert_eq!(
-            unrelated_hello.next_replayable_retirement().unwrap(),
-            None
-        );
+        assert_eq!(unrelated_hello.next_replayable_retirement().unwrap(), None);
         unrelated_hello
             .observe_authenticated_hello(candidate, other_mux)
             .unwrap();
@@ -3474,10 +3392,7 @@ mod tests {
         let (old_stream, _old_peer) = std::os::unix::net::UnixStream::pair().unwrap();
         old_stream.set_nonblocking(true).unwrap();
         let mut connections = HashMap::new();
-        connections.insert(
-            token,
-            Connection::new(UnixStream::from_std(old_stream), 12),
-        );
+        connections.insert(token, Connection::new(UnixStream::from_std(old_stream), 12));
 
         let stale = ReadyEvent {
             token,
@@ -3496,9 +3411,7 @@ mod tests {
             connection_identity: None,
             ..stale
         };
-        assert!(
-            take_exact_ready_connection(&mut connections, missing_snapshot).is_none()
-        );
+        assert!(take_exact_ready_connection(&mut connections, missing_snapshot).is_none());
         assert_eq!(connections[&token].generation, 12);
 
         let exact = ReadyEvent {
@@ -3575,17 +3488,20 @@ mod tests {
             .split("    fn finish_connection")
             .nth(1)
             .and_then(|source| {
-                source.split("    /// Replay only a readiness-loop-owned").next()
+                source
+                    .split("    /// Replay only a readiness-loop-owned")
+                    .next()
             })
             .expect("finish_connection production body is present");
 
         assert!(service_source.contains("self.mux_connections.observe_accept(identity)"));
         assert!(service_source.contains("connection_identity: self"));
-        assert!(service_source.contains("take_exact_ready_connection(&mut self.connections, event)"));
+        assert!(
+            service_source.contains("take_exact_ready_connection(&mut self.connections, event)")
+        );
         assert!(service_source.contains(".observe_authenticated_hello(\n                            connection.identity(token),\n                            mux_incarnation,"));
         assert!(
-            service_source
-                .contains(".observe_disconnect(identity, connection.mux_incarnation)")
+            service_source.contains(".observe_disconnect(identity, connection.mux_incarnation)")
         );
         assert!(accept_batch < connection_event_loop);
         assert!(authentication_expiry > handle_input_completions);
@@ -3713,9 +3629,7 @@ mod tests {
             while (!server_wipe_probe
                 .authenticated_input_wipe
                 .load(Ordering::SeqCst)
-                || !server_wipe_probe
-                    .encoded_frame_wipe
-                    .load(Ordering::SeqCst))
+                || !server_wipe_probe.encoded_frame_wipe.load(Ordering::SeqCst))
                 && Instant::now() < wipe_deadline
             {
                 std::thread::yield_now();
@@ -3768,9 +3682,7 @@ mod tests {
     #[test]
     fn encoded_input_frame_wipes_on_socket_write_error() {
         let (client_stream, _peer_stream) = BlockingUnixStream::pair().unwrap();
-        client_stream
-            .shutdown(std::net::Shutdown::Write)
-            .unwrap();
+        client_stream.shutdown(std::net::Shutdown::Write).unwrap();
         let wipe_probe = Arc::new(ClientRequestWipeProbe::default());
         let mut client = GuardianClient {
             stream: client_stream,
@@ -3800,15 +3712,10 @@ mod tests {
 
     #[test]
     fn query_payload_survives_until_its_typed_reply_is_validated() {
-        let secret =
-            GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
+        let secret = GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
         let effect_id = Uuid::from_u128(31);
-        let query = GuardianInputEffectQuery::new(
-            8,
-            9,
-            Sha256::digest(b"forgotten-input").into(),
-        )
-        .unwrap();
+        let query =
+            GuardianInputEffectQuery::new(8, 9, Sha256::digest(b"forgotten-input").into()).unwrap();
         let encoded_query = query.encode();
         let request = GuardianRequestEnvelope::new(
             GuardianRequestHeader::new(
@@ -3872,7 +3779,10 @@ mod tests {
             let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
             let frame = read_blocking_frame(&mut server_stream).unwrap();
             let request = decode_guardian_request(&secret, &frame).unwrap();
-            assert_eq!(request.header().operation, GuardianOperation::QueryInputEffect);
+            assert_eq!(
+                request.header().operation,
+                GuardianOperation::QueryInputEffect
+            );
             assert_eq!(request.header().guardian_incarnation, guardian_incarnation);
             assert_eq!(request.header().mux_incarnation, mux_incarnation);
             assert_eq!(request.header().request_id, request_id);
@@ -3988,11 +3898,8 @@ mod tests {
             parent,
             socket_path: socket_path.clone(),
             leaf_name: name.to_os_string(),
-            identity: socket_path_identity_at(
-                &open_private_parent(&socket_path).unwrap(),
-                name,
-            )
-            .unwrap(),
+            identity: socket_path_identity_at(&open_private_parent(&socket_path).unwrap(), name)
+                .unwrap(),
         };
         authority.validate().unwrap();
 
@@ -4059,10 +3966,12 @@ mod tests {
             provision_guardian_token(&link_path),
             Err(GuardianServiceError::FilesystemSecurity(_))
         ));
-        assert!(std::fs::symlink_metadata(&link_path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read(&token_path).unwrap(), first_bytes);
 
         let invalid_path = directory.join("invalid-existing.token");
@@ -4105,9 +4014,7 @@ mod tests {
             .mode(0o600)
             .open(&stage_path)
             .unwrap();
-        stage
-            .write_all(&[0x5a; GUARDIAN_AUTH_TOKEN_BYTES])
-            .unwrap();
+        stage.write_all(&[0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
         stage.sync_all().unwrap();
         drop(stage);
 
@@ -4221,19 +4128,10 @@ mod tests {
         std::fs::rename(&directory, &retained_replacement).unwrap();
         std::fs::rename(&retained_original, &directory).unwrap();
         validate_pinned_private_parent(&active_path, &pinned).unwrap();
-        validate_prepared_token_stage_binding(
-            &pinned,
-            stage_name,
-            commit_name,
-            &mut prepared,
-        )
-        .unwrap();
-        publish_token_stage_noreplace(
-            &pinned,
-            stage_name,
-            active_path.file_name().unwrap(),
-        )
-        .unwrap();
+        validate_prepared_token_stage_binding(&pinned, stage_name, commit_name, &mut prepared)
+            .unwrap();
+        publish_token_stage_noreplace(&pinned, stage_name, active_path.file_name().unwrap())
+            .unwrap();
         validate_published_token_binding(
             &pinned,
             stage_name,
@@ -4291,13 +4189,8 @@ mod tests {
         drop(impostor);
 
         assert!(
-            validate_prepared_token_stage_binding(
-                &pinned,
-                stage_name,
-                commit_name,
-                &mut prepared,
-            )
-            .is_err()
+            validate_prepared_token_stage_binding(&pinned, stage_name, commit_name, &mut prepared,)
+                .is_err()
         );
         assert!(!active_path.exists());
         assert!(displaced.exists());
@@ -4406,7 +4299,9 @@ mod tests {
             .mode(0o600)
             .open(&symlink_target)
             .unwrap();
-        target.write_all(&[0x31; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
+        target
+            .write_all(&[0x31; GUARDIAN_AUTH_TOKEN_BYTES])
+            .unwrap();
         target.sync_all().unwrap();
         drop(target);
         symlink(&symlink_target, &symlink_stage).unwrap();
@@ -4418,10 +4313,12 @@ mod tests {
             std::fs::symlink_metadata(&symlink_active),
             Err(error) if error.kind() == ErrorKind::NotFound
         ));
-        assert!(std::fs::symlink_metadata(&symlink_stage)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&symlink_stage)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
 
         let oversized_active = directory.join("oversized.token");
         let oversized_stage = token_stage_path(&oversized_active).unwrap();
@@ -4491,9 +4388,11 @@ mod tests {
             std::fs::symlink_metadata(&commit_link_active),
             Err(error) if error.kind() == ErrorKind::NotFound
         ));
-        assert!(std::fs::symlink_metadata(&commit_link_marker)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&commit_link_marker)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

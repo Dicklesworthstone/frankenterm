@@ -13,10 +13,9 @@ use crate::transport::provision_guardian_token_in_pinned_parent;
 use mio::Waker;
 use mux::guardian_checkpoint::{
     GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES, GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES,
-    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
-    GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES, GuardianCheckpointArtifactDescriptorV1,
-    GuardianCheckpointBoundaryError, GuardianCheckpointCandidateIdentityV1,
-    GuardianCheckpointCipher, GuardianCheckpointCipherError,
+    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES, GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES,
+    GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointBoundaryError,
+    GuardianCheckpointCandidateIdentityV1, GuardianCheckpointCipher, GuardianCheckpointCipherError,
     GuardianCheckpointOrderedChunkSetBuilderV1, GuardianCheckpointOrderedChunkSetIdentityV1,
     GuardianCheckpointStageBindingV1, GuardianCheckpointStageRecordContextV1,
     GuardianCheckpointStageRecordKindV1, GuardianCheckpointStageScopeV1,
@@ -35,8 +34,7 @@ use mux::guardian_output_journal::{
     GuardianOutputKey, GuardianOutputPredecessor, GuardianOutputSegmentIdentity,
 };
 use mux::guardian_protocol::{
-    AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES,
-    GUARDIAN_MAX_CHECKPOINT_CHUNKS,
+    AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
     GuardianCheckpointDescriptorV1, GuardianCheckpointScopeV1, GuardianCheckpointStageKindV1,
     GuardianCheckpointStageReplyV1, GuardianCheckpointStageRequestV1,
     GuardianEffectTransactionError, GuardianProtocolError, GuardianProtocolState, GuardianReply,
@@ -63,8 +61,7 @@ const OUTPUT_KEY_NAME: &str = "journal.key";
 const INPUT_JOURNAL_SUFFIX: &str = "ftgin";
 const OUTPUT_WORKER_THREADS: usize = 2;
 const OUTPUT_MAX_IN_FLIGHT: usize = 64;
-const OUTPUT_MANIFEST_CHECKSUM_DOMAIN: &[u8] =
-    b"frankenterm.guardian-output-manifest.v1\0";
+const OUTPUT_MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"frankenterm.guardian-output-manifest.v1\0";
 const OUTPUT_MANIFEST_MAGIC: [u8; 8] = *b"FTGOMF01";
 const OUTPUT_MANIFEST_VERSION: u32 = 1;
 const OUTPUT_MANIFEST_HEADER_BYTES: usize = 132;
@@ -301,9 +298,9 @@ impl CheckpointStagePathScope {
             Self::Pane {
                 pane_id,
                 generation,
-            } => format!(
-                "checkpoint-pane-{pane_id}.generation-{generation:020}.upload-{upload_id}"
-            ),
+            } => {
+                format!("checkpoint-pane-{pane_id}.generation-{generation:020}.upload-{upload_id}")
+            }
             Self::Genesis { spawn_effect_id } => {
                 format!("checkpoint-genesis-{spawn_effect_id}.upload-{upload_id}")
             }
@@ -737,8 +734,7 @@ impl PaneJournalAuthority {
             || manifest_tail.path != self.manifest.path
             || manifest_tail.file_identity != self.manifest.file_identity
             || manifest_tail.publication_path != self.manifest.publication_path
-            || manifest_tail.publication_file_identity
-                != self.manifest.publication_file_identity
+            || manifest_tail.publication_file_identity != self.manifest.publication_file_identity
         {
             return Err(OutputCommitError::SegmentManager);
         }
@@ -749,7 +745,7 @@ impl PaneJournalAuthority {
             &self.manifest.path,
             self.manifest.file_identity,
         )
-            .map_err(|_| OutputCommitError::PersistenceAuthority)?;
+        .map_err(|_| OutputCommitError::PersistenceAuthority)?;
         validate_file_identity_at(
             &self.directory,
             &self.directory_path,
@@ -764,7 +760,7 @@ impl PaneJournalAuthority {
                 &manifest.path,
                 manifest.file_identity,
             )
-                .map_err(|_| OutputCommitError::PersistenceAuthority)?;
+            .map_err(|_| OutputCommitError::PersistenceAuthority)?;
             validate_file_identity_at(
                 &self.directory,
                 &self.directory_path,
@@ -780,7 +776,7 @@ impl PaneJournalAuthority {
                 &segment.path,
                 segment.file_identity,
             )
-                .map_err(|_| OutputCommitError::PersistenceAuthority)?;
+            .map_err(|_| OutputCommitError::PersistenceAuthority)?;
         }
         Ok(())
     }
@@ -808,8 +804,8 @@ impl PaneJournalAuthority {
             .len()
             .checked_add(1)
             .ok_or(OutputCommitError::Capacity)?;
-        let next_manifest_bytes = manifest_encoded_bytes(next_segment_count)
-            .map_err(|_| OutputCommitError::Capacity)?;
+        let next_manifest_bytes =
+            manifest_encoded_bytes(next_segment_count).map_err(|_| OutputCommitError::Capacity)?;
         let projected_total_files = self
             .total_relevant_file_bytes
             .checked_add(OUTPUT_V3_FILE_HEADER_BYTES)
@@ -888,10 +884,9 @@ impl PaneJournalAuthority {
 
     fn receipt_is_current(&self, receipt: GuardianOutputAppendReceipt) -> bool {
         self.current_journal.terminal_receipt() == Some(receipt)
-            && self
-                .segments
-                .last()
-                .is_some_and(|segment| segment.segment_identity.segment_id() == receipt.segment_id())
+            && self.segments.last().is_some_and(|segment| {
+                segment.segment_identity.segment_id() == receipt.segment_id()
+            })
     }
 
     fn can_accept_min_record(&self) -> bool {
@@ -912,12 +907,7 @@ impl PaneJournalAuthority {
         {
             return false;
         }
-        if journal_can_append(
-            &self.current_journal,
-            self.policy.journal_limits,
-            1,
-        )
-        .unwrap_or(false)
+        if journal_can_append(&self.current_journal, self.policy.journal_limits, 1).unwrap_or(false)
         {
             return true;
         }
@@ -1067,11 +1057,11 @@ impl GuardianCheckpointStageStore {
         policy: GuardianCheckpointStagePolicy,
     ) -> Result<Self, GuardianOutputError> {
         let policy = policy.validate()?;
-        persistence
-            .validate(directory)
-            .map_err(|_| GuardianOutputError::FilesystemAuthority(
+        persistence.validate(directory).map_err(|_| {
+            GuardianOutputError::FilesystemAuthority(
                 "guardian checkpoint persistence authority changed during initialization",
-            ))?;
+            )
+        })?;
         let name_max = checkpoint_stage_name_max(directory)?;
         if name_max < checkpoint_stage_longest_name_bytes() {
             return Err(GuardianOutputError::FilesystemAuthority(
@@ -1109,26 +1099,16 @@ impl GuardianCheckpointStageStore {
         self.with_exclusive_directory(|inner| {
             let mut census = checkpoint_stage_census(inner)?;
             let has_candidate = census.entries.iter().any(|entry| {
-                entry.key == shape.key()
-                    && entry.role == CheckpointStageFileRole::Candidate
+                entry.key == shape.key() && entry.role == CheckpointStageFileRole::Candidate
             });
-            let has_any = census
-                .entries
-                .iter()
-                .any(|entry| entry.key == shape.key());
+            let has_any = census.entries.iter().any(|entry| entry.key == shape.key());
             if !has_candidate {
                 if has_any {
                     return Err(GuardianCheckpointStageStoreError::Poisoned);
                 }
                 let publication_id = Uuid::new_v4();
                 let record_bytes = checkpoint_record_bytes_for_plaintext(begin_payload.len())?;
-                checkpoint_stage_require_capacity(
-                    inner,
-                    &census,
-                    shape.key(),
-                    1,
-                    record_bytes,
-                )?;
+                checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes)?;
                 let path = checkpoint_candidate_path(inner, shape.key())?;
                 match checkpoint_create_record_new(inner, &path)? {
                     CheckpointStageCreateOutcome::Created(file) => {
@@ -1151,7 +1131,7 @@ impl GuardianCheckpointStageStore {
                 &shape,
                 CheckpointStageSealInspection::Reject,
             )?
-                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             Ok(GuardianCheckpointStageReplyV1::Ready {
                 upload_id: shape.upload_id,
                 next_index: inspection.next_index,
@@ -1180,7 +1160,7 @@ impl GuardianCheckpointStageStore {
                 &shape,
                 CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
             )?
-                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if index < inspection.next_index {
                 checkpoint_validate_exact_chunk_retry(
                     inner,
@@ -1197,19 +1177,8 @@ impl GuardianCheckpointStageStore {
                 return Err(GuardianCheckpointStageStoreError::OutOfOrder);
             }
             let record_bytes = checkpoint_record_bytes_for_plaintext(bytes.len())?;
-            checkpoint_stage_require_capacity(
-                inner,
-                &census,
-                shape.key(),
-                1,
-                record_bytes,
-            )?;
-            let path = checkpoint_chunk_path(
-                inner,
-                shape.key(),
-                inspection.publication_id,
-                index,
-            )?;
+            checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes)?;
+            let path = checkpoint_chunk_path(inner, shape.key(), inspection.publication_id, index)?;
             match checkpoint_create_record_new(inner, &path)? {
                 CheckpointStageCreateOutcome::Created(file) => {
                     let intent = GuardianCheckpointStageSealIntentV1::chunk(
@@ -1243,7 +1212,7 @@ impl GuardianCheckpointStageStore {
                 &shape,
                 CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
             )?
-                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if inspection.next_index <= index {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
@@ -1295,12 +1264,8 @@ impl GuardianCheckpointStageStore {
             let ordered_chunk_set_identity = inspection
                 .ordered_chunk_set_identity
                 .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-            let payload = checkpoint_assemble_payload(
-                inner,
-                &census,
-                &shape,
-                inspection.publication_id,
-            )?;
+            let payload =
+                checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)?;
             request.validate_staged_plaintext(payload.as_slice())?;
             let seal_request = GuardianCheckpointStageRequestV1::seal(
                 shape.scope,
@@ -1319,11 +1284,8 @@ impl GuardianCheckpointStageStore {
                             })
                 })
                 .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-            let (_, record, _) = checkpoint_read_record(
-                inner,
-                seal_entry,
-                GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
-            )?;
+            let (_, record, _) =
+                checkpoint_read_record(inner, seal_entry, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)?;
             let completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
                 &shape.binding,
                 seal_request,
@@ -1412,12 +1374,8 @@ impl GuardianCheckpointStageStore {
             let ordered_chunk_set_identity = inspection
                 .ordered_chunk_set_identity
                 .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
-            let payload = checkpoint_assemble_payload(
-                inner,
-                &census,
-                &shape,
-                inspection.publication_id,
-            )?;
+            let payload =
+                checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)?;
             request.validate_staged_plaintext(payload.as_slice())?;
             let seal_request = GuardianCheckpointStageRequestV1::seal(
                 shape.scope,
@@ -1436,11 +1394,8 @@ impl GuardianCheckpointStageStore {
                             })
                 })
                 .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-            let (_, seal_record, _) = checkpoint_read_record(
-                inner,
-                seal_entry,
-                GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
-            )?;
+            let (_, seal_record, _) =
+                checkpoint_read_record(inner, seal_entry, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)?;
             let completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
                 &shape.binding,
                 seal_request,
@@ -1449,11 +1404,7 @@ impl GuardianCheckpointStageStore {
                 ordered_chunk_set_identity,
                 &seal_record,
             )?;
-            let ack_path = checkpoint_ack_path(
-                inner,
-                shape.key(),
-                inspection.publication_id,
-            )?;
+            let ack_path = checkpoint_ack_path(inner, shape.key(), inspection.publication_id)?;
             let ack_plaintext_bytes = u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
                 .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
             if inspection.ack_present {
@@ -1474,16 +1425,9 @@ impl GuardianCheckpointStageStore {
                     .cipher
                     .inspect_ack_finalizer(&completion_receipt, &request, &ack_record)?;
             } else {
-                let record_bytes = checkpoint_record_bytes_for_plaintext(
-                    CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES,
-                )?;
-                checkpoint_stage_require_capacity(
-                    inner,
-                    &census,
-                    shape.key(),
-                    1,
-                    record_bytes,
-                )?;
+                let record_bytes =
+                    checkpoint_record_bytes_for_plaintext(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)?;
+                checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes)?;
                 match checkpoint_create_record_new(inner, &ack_path)? {
                     CheckpointStageCreateOutcome::Created(file) => {
                         let record = inner
@@ -1541,7 +1485,7 @@ impl GuardianCheckpointStageStore {
                 &shape,
                 CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
             )?
-                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if inspection.next_index != shape.total_chunks
                 || inspection.committed_bytes != shape.total_bytes
             {
@@ -1550,20 +1494,14 @@ impl GuardianCheckpointStageStore {
             let ordered_chunk_set_identity = inspection
                 .ordered_chunk_set_identity
                 .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
-            let payload = checkpoint_assemble_payload(
-                inner,
-                &census,
-                &shape,
-                inspection.publication_id,
-            )?;
+            let payload =
+                checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)?;
             request.validate_staged_plaintext(payload.as_slice())?;
             let manifest_authority = match origin_authority {
                 GuardianCheckpointOriginAuthority::Record {
                     journal,
                     manifest_authority,
-                }
-                    if matches!(shape.path_scope, CheckpointStagePathScope::Pane { .. }) =>
-                {
+                } if matches!(shape.path_scope, CheckpointStagePathScope::Pane { .. }) => {
                     journal.validate_checkpoint_record_origin(&shape.canonical_descriptor)?;
                     manifest_authority
                 }
@@ -1584,11 +1522,7 @@ impl GuardianCheckpointStageStore {
                 ordered_chunk_set_identity,
             )?;
             let (primary, retry) = capabilities.into_primary_and_retry();
-            let seal_path = checkpoint_seal_path(
-                inner,
-                shape.key(),
-                inspection.publication_id,
-            )?;
+            let seal_path = checkpoint_seal_path(inner, shape.key(), inspection.publication_id)?;
             if inspection.seal_present {
                 let seal_entry = census
                     .entries
@@ -1612,13 +1546,7 @@ impl GuardianCheckpointStageStore {
                     usize::try_from(GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)
                         .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
                 )?;
-                checkpoint_stage_require_capacity(
-                    inner,
-                    &census,
-                    shape.key(),
-                    1,
-                    record_bytes,
-                )?;
+                checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes)?;
                 match checkpoint_create_record_new(inner, &seal_path)? {
                     CheckpointStageCreateOutcome::Created(file) => {
                         let record = inner.cipher.seal_manifest(primary)?;
@@ -1667,8 +1595,7 @@ impl GuardianCheckpointStageStore {
             .gate
             .lock()
             .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
-        let mut directory_lock =
-            CheckpointStageDirectoryLock::exclusive(&self.inner.directory)?;
+        let mut directory_lock = CheckpointStageDirectoryLock::exclusive(&self.inner.directory)?;
         self.inner
             .persistence
             .validate(&self.inner.directory)
@@ -1744,8 +1671,7 @@ fn checkpoint_stage_lock_directory(directory: &File) -> std::io::Result<()> {
     target_os = "watchos",
 ))]
 fn checkpoint_stage_unlock_directory(directory: &File) -> std::io::Result<()> {
-    rustix::fs::flock(directory, rustix::fs::FlockOperation::Unlock)
-        .map_err(std::io::Error::from)
+    rustix::fs::flock(directory, rustix::fs::FlockOperation::Unlock).map_err(std::io::Error::from)
 }
 
 #[cfg(not(any(
@@ -1788,9 +1714,11 @@ fn checkpoint_stage_name_max(directory: &File) -> Result<usize, GuardianOutputEr
         .ok_or(GuardianOutputError::FilesystemAuthority(
             "guardian checkpoint directory has no finite name bound",
         ))?;
-    usize::try_from(observed).map_err(|_| GuardianOutputError::FilesystemAuthority(
-        "guardian checkpoint directory name bound is invalid",
-    ))
+    usize::try_from(observed).map_err(|_| {
+        GuardianOutputError::FilesystemAuthority(
+            "guardian checkpoint directory name bound is invalid",
+        )
+    })
 }
 
 fn checkpoint_stage_longest_name_bytes() -> usize {
@@ -1938,15 +1866,12 @@ fn checkpoint_stage_census(
 
 fn checkpoint_parse_stage_name(
     raw: &[u8],
-) -> Result<
-    (CheckpointStageUploadKey, CheckpointStageFileRole),
-    GuardianCheckpointStageStoreError,
-> {
+) -> Result<(CheckpointStageUploadKey, CheckpointStageFileRole), GuardianCheckpointStageStoreError>
+{
     if !raw.is_ascii() {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let name = std::str::from_utf8(raw)
-        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    let name = std::str::from_utf8(raw).map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     let (scope, after_scope) = if let Some(rest) = name.strip_prefix("checkpoint-pane-") {
         let (pane, rest) = checkpoint_take_uuid(rest)?;
         let rest = rest
@@ -1973,10 +1898,7 @@ fn checkpoint_parse_stage_name(
         )
     } else if let Some(rest) = name.strip_prefix("checkpoint-genesis-") {
         let (spawn_effect_id, rest) = checkpoint_take_uuid(rest)?;
-        (
-            CheckpointStagePathScope::Genesis { spawn_effect_id },
-            rest,
-        )
+        (CheckpointStagePathScope::Genesis { spawn_effect_id }, rest)
     } else {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     };
@@ -2003,9 +1925,7 @@ fn checkpoint_parse_stage_name(
             let index = index_text
                 .parse::<u32>()
                 .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
-            if index >= GUARDIAN_MAX_CHECKPOINT_CHUNKS
-                || format!("{index:010}") != index_text
-            {
+            if index >= GUARDIAN_MAX_CHECKPOINT_CHUNKS || format!("{index:010}") != index_text {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
             CheckpointStageFileRole::Chunk {
@@ -2016,23 +1936,15 @@ fn checkpoint_parse_stage_name(
     } else {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     };
-    Ok((
-        CheckpointStageUploadKey {
-            scope,
-            upload_id,
-        },
-        role,
-    ))
+    Ok((CheckpointStageUploadKey { scope, upload_id }, role))
 }
 
-fn checkpoint_take_uuid(
-    value: &str,
-) -> Result<(Uuid, &str), GuardianCheckpointStageStoreError> {
+fn checkpoint_take_uuid(value: &str) -> Result<(Uuid, &str), GuardianCheckpointStageStoreError> {
     let encoded = value
         .get(..36)
         .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-    let identity = Uuid::parse_str(encoded)
-        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    let identity =
+        Uuid::parse_str(encoded).map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     if identity.is_nil() || identity.to_string() != encoded {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
@@ -2145,9 +2057,8 @@ fn checkpoint_write_created_record(
     file.write_all(record.ciphertext()).map_err(|error| {
         GuardianCheckpointStageStoreError::io("checkpoint-record-ciphertext-write", error)
     })?;
-    file.sync_all().map_err(|error| {
-        GuardianCheckpointStageStoreError::io("checkpoint-record-sync", error)
-    })?;
+    file.sync_all()
+        .map_err(|error| GuardianCheckpointStageStoreError::io("checkpoint-record-sync", error))?;
     let metadata = file.metadata().map_err(|error| {
         GuardianCheckpointStageStoreError::io("checkpoint-record-metadata", error)
     })?;
@@ -2160,12 +2071,7 @@ fn checkpoint_write_created_record(
         .persistence
         .validate(&inner.directory)
         .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
-    validate_file_identity_at(
-        &inner.directory,
-        &inner.directory_path,
-        path,
-        identity,
-    )?;
+    validate_file_identity_at(&inner.directory, &inner.directory_path, path, identity)?;
     checkpoint_remember_durable_record(inner, identity)?;
     Ok(())
 }
@@ -2214,12 +2120,8 @@ fn checkpoint_read_record(
     if entry.bytes == 0 || entry.bytes > maximum_file_bytes {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let mut file = open_private_file_at(
-        &inner.directory,
-        &inner.directory_path,
-        &entry.path,
-        false,
-    )?;
+    let mut file =
+        open_private_file_at(&inner.directory, &inner.directory_path, &entry.path, false)?;
     let metadata_before = file.metadata().map_err(|error| {
         GuardianCheckpointStageStoreError::io("checkpoint-record-open-metadata", error)
     })?;
@@ -2282,10 +2184,7 @@ fn checkpoint_read_record(
             GuardianCheckpointStageStoreError::io("checkpoint-record-retry-sync", error)
         })?;
         inner.directory.sync_all().map_err(|error| {
-            GuardianCheckpointStageStoreError::io(
-                "checkpoint-record-retry-directory-sync",
-                error,
-            )
+            GuardianCheckpointStageStoreError::io("checkpoint-record-retry-directory-sync", error)
         })?;
         inner
             .persistence
@@ -2325,14 +2224,10 @@ fn checkpoint_open_record(
     entry: &CheckpointStageCensusEntry,
     max_plaintext_bytes: u32,
 ) -> Result<
-    (
-        GuardianCheckpointStageRecordContextV1,
-        Zeroizing<Vec<u8>>,
-    ),
+    (GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>),
     GuardianCheckpointStageStoreError,
 > {
-    let (context, record, identity) =
-        checkpoint_read_record(inner, entry, max_plaintext_bytes)?;
+    let (context, record, identity) = checkpoint_read_record(inner, entry, max_plaintext_bytes)?;
     let plaintext = inner
         .cipher
         .open(&context, &record, max_plaintext_bytes)
@@ -2552,8 +2447,8 @@ fn checkpoint_inspect_upload(
             .checked_add(expected_bytes)
             .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
     }
-    let next_index = u32::try_from(chunks.len())
-        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let next_index =
+        u32::try_from(chunks.len()).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
     let ordered_chunk_set_identity =
         if next_index == shape.total_chunks && committed_bytes == shape.total_bytes {
             Some(ordered_chunk_set.finish()?)
@@ -2596,8 +2491,7 @@ fn checkpoint_validate_exact_chunk_retry(
     }
     let max_plaintext_bytes = u32::try_from(expected_plaintext.len())
         .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
-    let (context, observed_plaintext) =
-        checkpoint_open_record(inner, entry, max_plaintext_bytes)?;
+    let (context, observed_plaintext) = checkpoint_open_record(inner, entry, max_plaintext_bytes)?;
     if !checkpoint_bytes_match(observed_plaintext.as_slice(), expected_plaintext.as_slice()) {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
@@ -2697,7 +2591,9 @@ fn checkpoint_bytes_match(left: &[u8], right: &[u8]) -> bool {
     }
     left.iter()
         .zip(right)
-        .fold(0_u8, |difference, (left, right)| difference | (*left ^ *right))
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (*left ^ *right)
+        })
         == 0
 }
 
@@ -2743,13 +2639,9 @@ pub(crate) enum GuardianPaneInputCompletionError {
 
 impl GuardianPaneInputJournal {
     fn validate_path_authority(&self) -> Result<(), GuardianOutputError> {
-        self.persistence
-            .validate(&self.directory)
-            .map_err(|_| {
-                GuardianOutputError::FilesystemAuthority(
-                    "guardian input persistence authority changed",
-                )
-            })?;
+        self.persistence.validate(&self.directory).map_err(|_| {
+            GuardianOutputError::FilesystemAuthority("guardian input persistence authority changed")
+        })?;
         validate_file_identity_at(
             &self.directory,
             &self.directory_path,
@@ -2786,9 +2678,8 @@ impl GuardianPaneInputJournal {
         let transaction = begin_guardian_input_transaction(protocol, &mut self.journal, request);
         match transaction {
             Ok(transaction) => {
-                self.validate_path_authority().map_err(|_| {
-                    GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
-                })?;
+                self.validate_path_authority()
+                    .map_err(|_| GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable)?;
                 Ok(transaction)
             }
             Err(GuardianInputTransactionError::Protocol(error)) => {
@@ -2804,18 +2695,16 @@ impl GuardianPaneInputJournal {
                 accepted_reply: _,
                 error: _,
             }) => {
-                self.validate_path_authority().map_err(|_| {
-                    GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
-                })?;
+                self.validate_path_authority()
+                    .map_err(|_| GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable)?;
                 Err(GuardianPaneInputTransactionError::AcceptedJournalUnavailable)
             }
             Err(GuardianInputTransactionError::AcceptedProtocolUnavailable {
                 accepted_reply: _,
                 error: _,
             }) => {
-                self.validate_path_authority().map_err(|_| {
-                    GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable
-                })?;
+                self.validate_path_authority()
+                    .map_err(|_| GuardianPaneInputTransactionError::AcceptedAuthorityUnavailable)?;
                 Err(GuardianPaneInputTransactionError::AcceptedProtocolUnavailable)
             }
         }
@@ -2929,7 +2818,10 @@ impl OutputQueue {
     }
 
     fn try_push(&self, job: OutputJob) -> Result<(), OutputQueuePushError> {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if state.shutdown {
             return Err(OutputQueuePushError::Shutdown(job));
         }
@@ -2943,7 +2835,10 @@ impl OutputQueue {
     }
 
     fn pop(&self) -> Option<OutputJob> {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         loop {
             if state.shutdown {
                 return None;
@@ -2959,7 +2854,10 @@ impl OutputQueue {
     }
 
     fn complete_one(&self) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if state.outstanding == 0 {
             state.shutdown = true;
             self.ready.notify_all();
@@ -2970,7 +2868,10 @@ impl OutputQueue {
     }
 
     fn available_slots(&self) -> usize {
-        let state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if state.shutdown {
             0
         } else {
@@ -2979,7 +2880,10 @@ impl OutputQueue {
     }
 
     fn shutdown(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         state.shutdown = true;
         while let Some(mut job) = state.jobs.pop_front() {
             job.payload.zeroize();
@@ -3026,10 +2930,8 @@ impl GuardianOutputPipeline {
         let policy = policy.validate()?;
         let (directory, directory_path, parent_identity, directory_identity) =
             open_output_directory(token_path)?;
-        let (cipher, key_path, key_identity) = load_or_create_output_key(
-            &directory,
-            &directory_path,
-        )?;
+        let (cipher, key_path, key_identity) =
+            load_or_create_output_key(&directory, &directory_path)?;
         let parent_path = directory_path
             .parent()
             .ok_or(GuardianOutputError::InvalidPath)?
@@ -3064,11 +2966,7 @@ impl GuardianOutputPipeline {
             let spawn = thread::Builder::new()
                 .name(format!("ft-guardian-output-{index}"))
                 .spawn(move || {
-                    output_worker(
-                        &worker_queue,
-                        &worker_completions,
-                        &worker_waker,
-                    );
+                    output_worker(&worker_queue, &worker_completions, &worker_waker);
                 });
             match spawn {
                 Ok(worker) => workers.push(worker),
@@ -3108,11 +3006,11 @@ impl GuardianOutputPipeline {
         guardian_incarnation: Uuid,
         pane_id: Uuid,
     ) -> Result<GuardianPaneOutputJournal, GuardianOutputError> {
-        self.persistence
-            .validate(&self.directory)
-            .map_err(|_| GuardianOutputError::FilesystemAuthority(
+        self.persistence.validate(&self.directory).map_err(|_| {
+            GuardianOutputError::FilesystemAuthority(
                 "guardian output persistence authority changed",
-            ))?;
+            )
+        })?;
         let authority = open_or_create_pane_segment_manager(
             &self.directory,
             &self.directory_path,
@@ -3149,46 +3047,33 @@ impl GuardianOutputPipeline {
         guardian_incarnation: Uuid,
         pane_id: Uuid,
     ) -> Result<GuardianPaneInputJournal, GuardianOutputError> {
-        self.persistence
-            .validate(&self.directory)
-            .map_err(|_| {
-                GuardianOutputError::FilesystemAuthority(
-                    "guardian input persistence authority changed",
-                )
-            })?;
+        self.persistence.validate(&self.directory).map_err(|_| {
+            GuardianOutputError::FilesystemAuthority("guardian input persistence authority changed")
+        })?;
         let directory = self
             .directory
             .try_clone()
             .map_err(|error| GuardianOutputError::io("input-directory-clone", error))?;
         let path = input_journal_path(&self.directory_path, guardian_incarnation, pane_id);
-        let (file, created) = match open_private_file_at(
-            &directory,
-            &self.directory_path,
-            &path,
-            false,
-        ) {
-            Ok(file) => (file, false),
-            Err(GuardianOutputError::Io { source, .. })
-                if source.kind() == ErrorKind::NotFound =>
-            {
-                (
-                    create_private_file_new_at(&directory, &self.directory_path, &path)?,
-                    true,
-                )
-            }
-            Err(error) => return Err(error),
-        };
+        let (file, created) =
+            match open_private_file_at(&directory, &self.directory_path, &path, false) {
+                Ok(file) => (file, false),
+                Err(GuardianOutputError::Io { source, .. })
+                    if source.kind() == ErrorKind::NotFound =>
+                {
+                    (
+                        create_private_file_new_at(&directory, &self.directory_path, &path)?,
+                        true,
+                    )
+                }
+                Err(error) => return Err(error),
+            };
         let opened = file
             .metadata()
             .map_err(|error| GuardianOutputError::io("input-journal-metadata", error))?;
         validate_private_file_metadata(&opened, None)?;
         let file_identity = FileIdentity::capture(&opened, None);
-        validate_file_identity_at(
-            &directory,
-            &self.directory_path,
-            &path,
-            file_identity,
-        )?;
+        validate_file_identity_at(&directory, &self.directory_path, &path, file_identity)?;
         if !created {
             return Err(GuardianOutputError::FilesystemAuthority(
                 "guardian input WAL reopen requires durable anti-rollback authority",
@@ -3252,11 +3137,7 @@ impl GuardianOutputPipeline {
         guardian_incarnation: Uuid,
         pane_id: Uuid,
     ) -> Result<Vec<PathBuf>, GuardianOutputError> {
-        list_relevant_pane_paths(
-            &self.directory_path,
-            guardian_incarnation,
-            pane_id,
-        )
+        list_relevant_pane_paths(&self.directory_path, guardian_incarnation, pane_id)
     }
 
     #[cfg(test)]
@@ -3274,18 +3155,14 @@ impl GuardianOutputPipeline {
             revision,
             manifest_id,
         );
-        let mut file = create_private_file_new_at(
-            &self.directory,
-            &self.directory_path,
-            &path,
-        )?;
+        let mut file = create_private_file_new_at(&self.directory, &self.directory_path, &path)?;
         file.write_all(b"torn-manifest-crash-cut")
             .map_err(|error| GuardianOutputError::io("output-manifest-crash-cut-write", error))?;
         file.sync_all()
             .map_err(|error| GuardianOutputError::io("output-manifest-crash-cut-sync", error))?;
-        self.directory
-            .sync_all()
-            .map_err(|error| GuardianOutputError::io("output-manifest-crash-cut-dir-sync", error))?;
+        self.directory.sync_all().map_err(|error| {
+            GuardianOutputError::io("output-manifest-crash-cut-dir-sync", error)
+        })?;
         Ok(path)
     }
 }
@@ -3294,8 +3171,7 @@ fn pane_journal_handle(
     authority: PaneJournalAuthority,
 ) -> Result<GuardianPaneOutputJournal, GuardianOutputError> {
     let initial_next_sequence = authority.current_journal.next_sequence();
-    let initial_cumulative_plaintext_bytes =
-        authority.current_journal.cumulative_plaintext_bytes();
+    let initial_cumulative_plaintext_bytes = authority.current_journal.cumulative_plaintext_bytes();
     let initial_remaining_records = authority.remaining_records()?;
     if initial_next_sequence.is_none()
         || initial_remaining_records == 0
@@ -3445,11 +3321,7 @@ fn pane_file_prefix(guardian_incarnation: Uuid, pane_id: Uuid) -> String {
     format!("pane-{pane_id}.guardian-{guardian_incarnation}.")
 }
 
-fn input_journal_path(
-    directory_path: &Path,
-    guardian_incarnation: Uuid,
-    pane_id: Uuid,
-) -> PathBuf {
+fn input_journal_path(directory_path: &Path, guardian_incarnation: Uuid, pane_id: Uuid) -> PathBuf {
     // This intentionally does not begin with `pane_file_prefix`: the output
     // manifest scanner must never count an input WAL as an output artifact.
     directory_path.join(format!(
@@ -3540,12 +3412,8 @@ fn create_collision_resistant_segment(
 ) -> Result<(GuardianOutputJournal, SegmentPathAuthority), GuardianOutputError> {
     for _ in 0..OUTPUT_PATH_COLLISION_ATTEMPTS {
         let segment_id = Uuid::new_v4();
-        let identity = GuardianOutputSegmentIdentity::new(
-            pane_id,
-            segment_id,
-            first_sequence,
-            predecessor,
-        )?;
+        let identity =
+            GuardianOutputSegmentIdentity::new(pane_id, segment_id, first_sequence, predecessor)?;
         match create_segment_at_identity(
             directory,
             directory_path,
@@ -3717,8 +3585,7 @@ fn publish_manifest_snapshot(
             manifest_id,
             snapshot.checksum,
         );
-        let publication =
-            create_private_file_new_at(directory, directory_path, &publication_path)?;
+        let publication = create_private_file_new_at(directory, directory_path, &publication_path)?;
         publication
             .sync_all()
             .map_err(|error| GuardianOutputError::io("output-manifest-publication-sync", error))?;
@@ -3794,9 +3661,7 @@ fn validate_manifest_structure(
     Ok(())
 }
 
-fn encode_manifest(
-    snapshot: &mut OutputManifestSnapshot,
-) -> Result<Vec<u8>, GuardianOutputError> {
+fn encode_manifest(snapshot: &mut OutputManifestSnapshot) -> Result<Vec<u8>, GuardianOutputError> {
     validate_manifest_structure(snapshot.revision, snapshot.predecessor, &snapshot.segments)?;
     let body_bytes = OUTPUT_MANIFEST_HEADER_BYTES
         .checked_add(
@@ -3890,12 +3755,12 @@ impl<'a> ManifestDecoder<'a> {
             .offset
             .checked_add(N)
             .ok_or(GuardianOutputError::Allocation)?;
-        let source = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(GuardianOutputError::FilesystemAuthority(
-                "guardian output manifest is truncated",
-            ))?;
+        let source =
+            self.bytes
+                .get(self.offset..end)
+                .ok_or(GuardianOutputError::FilesystemAuthority(
+                    "guardian output manifest is truncated",
+                ))?;
         let mut value = [0; N];
         value.copy_from_slice(source);
         self.offset = end;
@@ -3941,7 +3806,9 @@ fn decode_manifest(bytes: &[u8]) -> Result<OutputManifestSnapshot, GuardianOutpu
     if observed_checksum
         .iter()
         .zip(expected_checksum.iter())
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
         != 0
     {
         return Err(GuardianOutputError::FilesystemAuthority(
@@ -3949,9 +3816,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<OutputManifestSnapshot, GuardianOutpu
         ));
     }
     let mut decoder = ManifestDecoder::new(&bytes[..checksum_offset]);
-    if decoder.take::<8>()? != OUTPUT_MANIFEST_MAGIC
-        || decoder.u32()? != OUTPUT_MANIFEST_VERSION
-    {
+    if decoder.take::<8>()? != OUTPUT_MANIFEST_MAGIC || decoder.u32()? != OUTPUT_MANIFEST_VERSION {
         return Err(GuardianOutputError::FilesystemAuthority(
             "guardian output manifest magic or version is invalid",
         ));
@@ -3970,7 +3835,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<OutputManifestSnapshot, GuardianOutpu
     let predecessor_checksum = decoder.take::<OUTPUT_MANIFEST_CHECKSUM_BYTES>()?;
     let predecessor = match predecessor_present {
         0 if predecessor_id.is_nil()
-            && predecessor_checksum == [0; OUTPUT_MANIFEST_CHECKSUM_BYTES] => None,
+            && predecessor_checksum == [0; OUTPUT_MANIFEST_CHECKSUM_BYTES] =>
+        {
+            None
+        }
         1 if !predecessor_id.is_nil() => Some(ManifestPredecessor {
             manifest_id: predecessor_id,
             checksum: predecessor_checksum,
@@ -3981,8 +3849,8 @@ fn decode_manifest(bytes: &[u8]) -> Result<OutputManifestSnapshot, GuardianOutpu
             ));
         }
     };
-    let segment_count = usize::try_from(decoder.u32()?)
-        .map_err(|_| GuardianOutputError::Allocation)?;
+    let segment_count =
+        usize::try_from(decoder.u32()?).map_err(|_| GuardianOutputError::Allocation)?;
     if decoder.u32()? != 0 {
         return Err(GuardianOutputError::FilesystemAuthority(
             "guardian output manifest reserved count bytes are nonzero",
@@ -4023,7 +3891,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<OutputManifestSnapshot, GuardianOutpu
                 && previous_last_sequence == 0
                 && previous_digest == [0; 32]
                 && previous_cumulative == 0
-                && previous_committed == 0 => None,
+                && previous_committed == 0 =>
+            {
+                None
+            }
             1 => Some(GuardianOutputPredecessor::new(
                 previous_segment_id,
                 previous_last_sequence,
@@ -4145,9 +4016,9 @@ fn scan_pane_publications(
         }
         let path = directory_path.join(&file_name);
         let opened = open_private_file_at(directory, directory_path, &path, false)?;
-        let opened_metadata = opened
-            .metadata()
-            .map_err(|error| GuardianOutputError::io("output-publication-opened-metadata", error))?;
+        let opened_metadata = opened.metadata().map_err(|error| {
+            GuardianOutputError::io("output-publication-opened-metadata", error)
+        })?;
         validate_private_file_metadata(&opened_metadata, None)?;
         validate_file_identity_at(
             directory,
@@ -4185,12 +4056,7 @@ fn scan_pane_publications(
             let manifest_identity =
                 FileIdentity::capture(&opened_metadata, Some(opened_metadata.len()));
             let bytes = read_manifest_file_bounded(opened, &opened_metadata)?;
-            validate_file_identity_at(
-                directory,
-                directory_path,
-                &path,
-                manifest_identity,
-            )?;
+            validate_file_identity_at(directory, directory_path, &path, manifest_identity)?;
             let snapshot = decode_manifest(&bytes).ok();
             if snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.durable_pane_id != pane_id
@@ -4231,10 +4097,7 @@ fn scan_pane_publications(
             "guardian output pane publication path is not canonical",
         ));
     }
-    let manifests = pair_manifest_publications(
-        &mut manifest_candidates,
-        manifest_publications,
-    )?;
+    let manifests = pair_manifest_publications(&mut manifest_candidates, manifest_publications)?;
     let (head, manifest_history) = select_manifest_chain(manifests)?;
     Ok(PanePublicationScan {
         head,
@@ -4268,12 +4131,13 @@ fn pair_manifest_publications(
                 "guardian output manifest has more than one publication marker",
             ));
         }
-        let snapshot = candidate
-            .snapshot
-            .clone()
-            .ok_or(GuardianOutputError::FilesystemAuthority(
-                "published guardian output manifest is torn or corrupt",
-            ))?;
+        let snapshot =
+            candidate
+                .snapshot
+                .clone()
+                .ok_or(GuardianOutputError::FilesystemAuthority(
+                    "published guardian output manifest is torn or corrupt",
+                ))?;
         if snapshot.checksum != publication.checksum {
             return Err(GuardianOutputError::FilesystemAuthority(
                 "guardian output publication marker checksum does not match its manifest",
@@ -4293,10 +4157,7 @@ fn pair_manifest_publications(
 
 fn select_manifest_chain(
     mut manifests: Vec<DiscoveredManifest>,
-) -> Result<
-    (Option<DiscoveredManifest>, Vec<ManifestPathAuthority>),
-    GuardianOutputError,
-> {
+) -> Result<(Option<DiscoveredManifest>, Vec<ManifestPathAuthority>), GuardianOutputError> {
     if manifests.is_empty() {
         return Ok((None, Vec::new()));
     }
@@ -4330,10 +4191,8 @@ fn select_manifest_chain(
         };
         if candidate.snapshot.revision != expected_revision
             || candidate.snapshot.predecessor != Some(expected_predecessor)
-            || candidate.snapshot.segments.len()
-                != head.snapshot.segments.len().saturating_add(1)
-            || candidate.snapshot.segments[..head.snapshot.segments.len()]
-                != head.snapshot.segments
+            || candidate.snapshot.segments.len() != head.snapshot.segments.len().saturating_add(1)
+            || candidate.snapshot.segments[..head.snapshot.segments.len()] != head.snapshot.segments
         {
             return Err(GuardianOutputError::FilesystemAuthority(
                 "guardian output manifest history forks, gaps, or rewrites its prefix",
@@ -4369,11 +4228,8 @@ fn parse_manifest_file_name(remainder: &str) -> Option<(u64, Uuid)> {
     }
     let revision = revision.parse().ok()?;
     let manifest_id: Uuid = manifest_id.parse().ok()?;
-    (remainder
-        == format!(
-            "manifest-{revision:020}-{manifest_id}.ftgmanifest"
-        ))
-    .then_some((revision, manifest_id))
+    (remainder == format!("manifest-{revision:020}-{manifest_id}.ftgmanifest"))
+        .then_some((revision, manifest_id))
 }
 
 fn parse_manifest_publication_file_name(
@@ -4449,17 +4305,12 @@ fn open_or_create_pane_segment_manager(
     guardian_incarnation: Uuid,
     pane_id: Uuid,
 ) -> Result<PaneJournalAuthority, GuardianOutputError> {
-    persistence
-        .validate(directory)
-        .map_err(|_| GuardianOutputError::FilesystemAuthority(
+    persistence.validate(directory).map_err(|_| {
+        GuardianOutputError::FilesystemAuthority(
             "guardian output persistence authority changed before pane open",
-        ))?;
-    let scan = scan_pane_publications(
-        directory,
-        directory_path,
-        guardian_incarnation,
-        pane_id,
-    )?;
+        )
+    })?;
+    let scan = scan_pane_publications(directory, directory_path, guardian_incarnation, pane_id)?;
     if scan.head.is_some() {
         return open_scanned_pane_segment_manager(
             directory,
@@ -4536,11 +4387,11 @@ fn open_or_create_pane_segment_manager(
         relevant_files: 3,
         failed: false,
     };
-    authority
-        .validate_path_authority()
-        .map_err(|_| GuardianOutputError::FilesystemAuthority(
+    authority.validate_path_authority().map_err(|_| {
+        GuardianOutputError::FilesystemAuthority(
             "guardian output initial publication authority changed",
-        ))?;
+        )
+    })?;
     Ok(authority)
 }
 
@@ -4554,17 +4405,12 @@ fn open_existing_pane_segment_manager(
     guardian_incarnation: Uuid,
     pane_id: Uuid,
 ) -> Result<PaneJournalAuthority, GuardianOutputError> {
-    persistence
-        .validate(directory)
-        .map_err(|_| GuardianOutputError::FilesystemAuthority(
+    persistence.validate(directory).map_err(|_| {
+        GuardianOutputError::FilesystemAuthority(
             "guardian output persistence authority changed before cold open",
-        ))?;
-    let scan = scan_pane_publications(
-        directory,
-        directory_path,
-        guardian_incarnation,
-        pane_id,
-    )?;
+        )
+    })?;
+    let scan = scan_pane_publications(directory, directory_path, guardian_incarnation, pane_id)?;
     if scan.head.is_none() {
         return Err(GuardianOutputError::FilesystemAuthority(
             "guardian output pane has no valid published manifest",
@@ -4660,11 +4506,11 @@ fn open_scanned_pane_segment_manager(
         relevant_files: scan.relevant_files,
         failed: false,
     };
-    authority
-        .validate_path_authority()
-        .map_err(|_| GuardianOutputError::FilesystemAuthority(
+    authority.validate_path_authority().map_err(|_| {
+        GuardianOutputError::FilesystemAuthority(
             "guardian output cold-open publication authority changed",
-        ))?;
+        )
+    })?;
     Ok(authority)
 }
 
@@ -4757,13 +4603,7 @@ fn validate_replayable_segment_chain(
     cipher: &GuardianOutputCipher,
     policy: OutputSegmentPolicy,
 ) -> Result<(), GuardianOutputError> {
-    let _ = open_and_validate_segment_chain(
-        directory,
-        directory_path,
-        segments,
-        cipher,
-        policy,
-    )?;
+    let _ = open_and_validate_segment_chain(directory, directory_path, segments, cipher, policy)?;
     Ok(())
 }
 
@@ -4797,12 +4637,10 @@ fn recover_all_segment_bytes(
             authority.policy.journal_limits.max_record_bytes,
         )?;
         while let Some(record) = cursor.next_record()? {
-            record
-                .into_authenticated_delivery()?
-                .write_all_bounded(
-                    &mut recovered,
-                    authority.policy.journal_limits.max_record_bytes,
-                )?;
+            record.into_authenticated_delivery()?.write_all_bounded(
+                &mut recovered,
+                authority.policy.journal_limits.max_record_bytes,
+            )?;
         }
     }
     Ok(recovered)
@@ -4819,8 +4657,8 @@ fn list_relevant_pane_paths(
     for entry in std::fs::read_dir(directory_path)
         .map_err(|error| GuardianOutputError::io("output-test-directory-scan", error))?
     {
-        let entry = entry
-            .map_err(|error| GuardianOutputError::io("output-test-directory-entry", error))?;
+        let entry =
+            entry.map_err(|error| GuardianOutputError::io("output-test-directory-entry", error))?;
         if entry
             .file_name()
             .to_str()
@@ -4857,7 +4695,9 @@ fn open_output_directory(
     token_path: &Path,
 ) -> Result<(File, PathBuf, FileIdentity, FileIdentity), GuardianOutputError> {
     validate_normalized_absolute_file_path(token_path)?;
-    let parent = token_path.parent().ok_or(GuardianOutputError::InvalidPath)?;
+    let parent = token_path
+        .parent()
+        .ok_or(GuardianOutputError::InvalidPath)?;
     validate_private_directory(parent)?;
     let parent_before = std::fs::symlink_metadata(parent)
         .map_err(|error| GuardianOutputError::io("output-parent-metadata-before", error))?;
@@ -4895,11 +4735,9 @@ fn open_output_directory(
     parent_directory
         .sync_all()
         .map_err(|error| GuardianOutputError::io("output-parent-directory-sync", error))?;
-    let rebound_directory = open_private_directory_at(
-        &parent_directory,
-        OsStr::new(OUTPUT_DIRECTORY_NAME),
-    )
-    .map_err(|error| GuardianOutputError::io("output-directory-reopen-at", error))?;
+    let rebound_directory =
+        open_private_directory_at(&parent_directory, OsStr::new(OUTPUT_DIRECTORY_NAME))
+            .map_err(|error| GuardianOutputError::io("output-directory-reopen-at", error))?;
     let rebound_metadata = rebound_directory
         .metadata()
         .map_err(|error| GuardianOutputError::io("output-directory-reopened-metadata", error))?;
@@ -4946,9 +4784,7 @@ fn load_or_create_output_key(
                 .map_err(|error| GuardianOutputError::io("output-key-metadata-at", error))?;
             validate_private_file_metadata(&metadata, Some(expected_len))?;
         }
-        Err(GuardianOutputError::Io { source, .. })
-            if source.kind() == ErrorKind::NotFound =>
-        {
+        Err(GuardianOutputError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
             ensure_absent_output_key_has_no_abandoned_ciphertext(
                 directory,
                 directory_path,
@@ -5078,14 +4914,12 @@ fn ensure_absent_output_key_has_no_abandoned_ciphertext(
     // of a split replacement authority.
     match open_private_file_at(directory, directory_path, key_path, false) {
         Ok(file) => validate_private_file_metadata(
-            &file
-                .metadata()
-                .map_err(|error| GuardianOutputError::io("output-key-census-final-metadata", error))?,
+            &file.metadata().map_err(|error| {
+                GuardianOutputError::io("output-key-census-final-metadata", error)
+            })?,
             Some(expected_key_bytes),
         ),
-        Err(GuardianOutputError::Io { source, .. })
-            if source.kind() == ErrorKind::NotFound =>
-        {
+        Err(GuardianOutputError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
             Err(GuardianOutputError::FilesystemAuthority(
                 "guardian output artifacts exist without their encryption key",
             ))
@@ -5110,9 +4944,8 @@ fn open_private_file_at(
     create_new: bool,
 ) -> Result<File, GuardianOutputError> {
     let name = output_child_name(directory_path, path)?;
-    let mut flags = rustix::fs::OFlags::RDWR
-        | rustix::fs::OFlags::CLOEXEC
-        | rustix::fs::OFlags::NOFOLLOW;
+    let mut flags =
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
     if create_new {
         flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
     }
@@ -5354,10 +5187,7 @@ fn require_same_directory_identity(
     Ok(())
 }
 
-fn validate_path_identity(
-    path: &Path,
-    identity: FileIdentity,
-) -> Result<(), GuardianOutputError> {
+fn validate_path_identity(path: &Path, identity: FileIdentity) -> Result<(), GuardianOutputError> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| GuardianOutputError::io("output-authority-revalidation", error))?;
     if !identity.matches(&metadata) {
@@ -5434,12 +5264,7 @@ mod tests {
         let token_path = directory.join("guardian.token");
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), Token(1))?);
-        let pipeline = GuardianOutputPipeline::open_with_policy(
-            &token_path,
-            1,
-            waker,
-            policy,
-        )?;
+        let pipeline = GuardianOutputPipeline::open_with_policy(&token_path, 1, waker, policy)?;
         Ok((directory, poll, pipeline))
     }
 
@@ -5450,12 +5275,7 @@ mod tests {
         let token_path = directory.join("guardian.token");
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), Token(1))?);
-        let pipeline = GuardianOutputPipeline::open_with_policy(
-            &token_path,
-            1,
-            waker,
-            policy,
-        )?;
+        let pipeline = GuardianOutputPipeline::open_with_policy(&token_path, 1, waker, policy)?;
         Ok((poll, pipeline))
     }
 
@@ -5466,11 +5286,7 @@ mod tests {
         payload: &[u8],
     ) -> Result<GuardianOutputAppendReceipt, Box<dyn std::error::Error>> {
         pipeline
-            .try_submit(
-                pane_id,
-                journal.clone(),
-                zeroizing_test_bytes(payload),
-            )
+            .try_submit(pane_id, journal.clone(), zeroizing_test_bytes(payload))
             .map_err(|_| "output submission was unexpectedly rejected")?;
         completion(pipeline)?
             .result
@@ -5480,7 +5296,11 @@ mod tests {
     fn checkpoint_test_terminal_digest(payload: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(b"frankenterm.guardian-checkpoint-terminal-payload.v1\0");
-        hasher.update(u64::try_from(payload.len()).expect("fixture length fits u64").to_le_bytes());
+        hasher.update(
+            u64::try_from(payload.len())
+                .expect("fixture length fits u64")
+                .to_le_bytes(),
+        );
         hasher.update(payload);
         hasher.finalize().into()
     }
@@ -5504,15 +5324,11 @@ mod tests {
         let replay_identity = mux::guardian_checkpoint::current_replay_identity_digest();
         let terminal_digest = checkpoint_test_terminal_digest(terminal_payload);
         let mut boundary_hasher = Sha256::new();
-        boundary_hasher.update(
-            b"frankenterm.guardian-checkpoint-genesis-boundary-identity.v1\0",
-        );
+        boundary_hasher.update(b"frankenterm.guardian-checkpoint-genesis-boundary-identity.v1\0");
         boundary_hasher.update(spawn_effect_id.as_bytes());
         let boundary_digest: [u8; 32] = boundary_hasher.finalize().into();
         let mut checkpoint_hasher = Sha256::new();
-        checkpoint_hasher.update(
-            b"frankenterm.guardian-checkpoint-artifact-identity.v1\0",
-        );
+        checkpoint_hasher.update(b"frankenterm.guardian-checkpoint-artifact-identity.v1\0");
         checkpoint_hasher.update(boundary_digest);
         checkpoint_hasher.update(0_u64.to_le_bytes());
         checkpoint_hasher.update(replay_identity);
@@ -5537,8 +5353,7 @@ mod tests {
         let wire_bytes = CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
             .checked_add(trailing_bytes)
             .ok_or(GuardianProtocolError::PayloadTooLarge)?;
-        let mut wire: Zeroizing<Vec<u8>> =
-            Zeroizing::new(Vec::with_capacity(wire_bytes));
+        let mut wire: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(wire_bytes));
         wire.resize(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES, 0);
         wire[..4].copy_from_slice(b"GCS1");
         wire[4..6].copy_from_slice(&2_u16.to_be_bytes());
@@ -5629,16 +5444,11 @@ mod tests {
         );
         assert_eq!(
             checkpoint_parse_stage_name(ack_name.as_bytes()).expect("parse canonical ACK"),
-            (
-                key,
-                CheckpointStageFileRole::Ack { publication_id },
-            )
+            (key, CheckpointStageFileRole::Ack { publication_id },)
         );
 
-        let uppercase = chunk_name.replace(
-            &pane_id.to_string(),
-            &pane_id.to_string().to_uppercase(),
-        );
+        let uppercase =
+            chunk_name.replace(&pane_id.to_string(), &pane_id.to_string().to_uppercase());
         assert!(matches!(
             checkpoint_parse_stage_name(uppercase.as_bytes()),
             Err(GuardianCheckpointStageStoreError::Poisoned)
@@ -5680,15 +5490,13 @@ mod tests {
             })
             .and_then(|bytes| {
                 bytes.checked_add(
-                    u64::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES)
-                        .expect("seal size")
+                    u64::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES).expect("seal size")
                         + record_overhead,
                 )
             })
             .and_then(|bytes| {
                 bytes.checked_add(
-                    u64::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
-                        .expect("ack size")
+                    u64::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES).expect("ack size")
                         + record_overhead,
                 )
             })
@@ -5708,8 +5516,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_stage_shared_logical_identities_are_content_stable_and_complete_only(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_stage_shared_logical_identities_are_content_stable_and_complete_only()
+    -> Result<(), Box<dyn std::error::Error>> {
         let source = include_str!("output.rs");
         assert!(source.contains(concat!(
             "fn zeroizing_test_bytes(bytes: &[u8]) -> ",
@@ -5744,13 +5552,9 @@ mod tests {
         let shape = CheckpointStageRequestShape::from_request(&begin)?;
         let begin_payload: Zeroizing<Vec<u8>> = shape.begin_payload()?;
         let candidate_identity =
-            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
-                &begin_payload,
-            )?;
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(&begin_payload)?;
         let exact_retry_identity =
-            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
-                &begin_payload,
-            )?;
+            GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(&begin_payload)?;
         assert_eq!(candidate_identity, exact_retry_identity);
 
         let changed_begin = checkpoint_test_genesis_request(
@@ -5816,8 +5620,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_stage_begin_chunk_retry_and_gap_are_durable_and_exact(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_stage_begin_chunk_retry_and_gap_are_durable_and_exact()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (directory, poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-stage-",
             OutputSegmentPolicy::production(),
@@ -5985,8 +5789,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_stage_torn_candidate_poison_is_retained_but_fresh_upload_progresses(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_stage_torn_candidate_poison_is_retained_but_fresh_upload_progresses()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-cut-",
             OutputSegmentPolicy::production(),
@@ -6042,8 +5846,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_stage_conflicting_begin_cannot_relabel_the_durable_candidate(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_stage_conflicting_begin_cannot_relabel_the_durable_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-conflict-",
             OutputSegmentPolicy::production(),
@@ -6082,8 +5886,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_stage_global_retention_cap_fails_closed_without_reclamation(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_stage_global_retention_cap_fails_closed_without_reclamation()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-retention-",
             OutputSegmentPolicy::production(),
@@ -6128,8 +5932,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_stage_invalid_utf8_prefixed_entry_is_never_ignored(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_stage_invalid_utf8_prefixed_entry_is_never_ignored()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-raw-name-",
             OutputSegmentPolicy::production(),
@@ -6167,8 +5971,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_stage_torn_seal_is_quarantined_without_hiding_other_uploads(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_stage_torn_seal_is_quarantined_without_hiding_other_uploads()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (directory, poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-seal-cut-",
             OutputSegmentPolicy::production(),
@@ -6205,12 +6009,8 @@ mod tests {
             &shape,
             CheckpointStageSealInspection::Reject,
         )?
-            .ok_or("durable candidate disappeared")?;
-        let seal_path = checkpoint_seal_path(
-            &store.inner,
-            shape.key(),
-            inspection.publication_id,
-        )?;
+        .ok_or("durable candidate disappeared")?;
+        let seal_path = checkpoint_seal_path(&store.inner, shape.key(), inspection.publication_id)?;
         let mut torn = create_private_file_new_at(
             &store.inner.directory,
             &store.inner.directory_path,
@@ -6271,19 +6071,15 @@ mod tests {
     }
 
     #[test]
-    fn input_wal_reopen_is_withheld_without_anti_rollback_authority_and_stays_out_of_output_namespace(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn input_wal_reopen_is_withheld_without_anti_rollback_authority_and_stays_out_of_output_namespace()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-input-spawn-retry-",
             OutputSegmentPolicy::production(),
         )?;
         let guardian_incarnation = Uuid::from_u128(0x71);
         let pane_id = Uuid::from_u128(0x72);
-        let path = input_journal_path(
-            &pipeline.directory_path,
-            guardian_incarnation,
-            pane_id,
-        );
+        let path = input_journal_path(&pipeline.directory_path, guardian_incarnation, pane_id);
         assert!(
             !path
                 .file_name()
@@ -6313,8 +6109,8 @@ mod tests {
         target_os = "watchos",
     ))]
     #[test]
-    fn output_directory_creation_stays_with_pinned_parent_across_aba_restore(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn output_directory_creation_stays_with_pinned_parent_across_aba_restore()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = kept_private_directory("ft-guardian-output-parent-aba-")?;
         let pinned = open_directory_no_follow(&directory)?;
         let retained_original = directory.with_file_name(format!(
@@ -6323,10 +6119,7 @@ mod tests {
         ));
         std::fs::rename(&directory, &retained_original)?;
         std::fs::create_dir(&directory)?;
-        std::fs::set_permissions(
-            &directory,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
 
         create_private_directory_at(&pinned, OsStr::new(OUTPUT_DIRECTORY_NAME))?;
         let created = open_private_directory_at(&pinned, OsStr::new(OUTPUT_DIRECTORY_NAME))?;
@@ -6355,15 +6148,12 @@ mod tests {
         target_os = "watchos",
     ))]
     #[test]
-    fn output_artifact_access_stays_with_pinned_directory_across_aba_restore(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn output_artifact_access_stays_with_pinned_directory_across_aba_restore()
+    -> Result<(), Box<dyn std::error::Error>> {
         let parent = kept_private_directory("ft-guardian-output-artifact-aba-")?;
         let output_directory = parent.join(OUTPUT_DIRECTORY_NAME);
         std::fs::create_dir(&output_directory)?;
-        std::fs::set_permissions(
-            &output_directory,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&output_directory, std::fs::Permissions::from_mode(0o700))?;
         let pinned = open_directory_no_follow(&output_directory)?;
         let retained_original = parent.join(format!(
             "{OUTPUT_DIRECTORY_NAME}-original-{}",
@@ -6371,14 +6161,10 @@ mod tests {
         ));
         std::fs::rename(&output_directory, &retained_original)?;
         std::fs::create_dir(&output_directory)?;
-        std::fs::set_permissions(
-            &output_directory,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&output_directory, std::fs::Permissions::from_mode(0o700))?;
 
         let artifact_path = output_directory.join("descriptor-bound-artifact");
-        let mut artifact =
-            create_private_file_new_at(&pinned, &output_directory, &artifact_path)?;
+        let mut artifact = create_private_file_new_at(&pinned, &output_directory, &artifact_path)?;
         artifact.write_all(b"pinned-original")?;
         artifact.sync_all()?;
         let identity = FileIdentity::capture(&artifact.metadata()?, Some(15));
@@ -6389,12 +6175,14 @@ mod tests {
             b"pinned-original"
         );
         assert!(!output_directory.join("descriptor-bound-artifact").exists());
-        assert!(create_private_file_new_at(
-            &pinned,
-            &output_directory,
-            &parent.join("escaped-artifact"),
-        )
-        .is_err());
+        assert!(
+            create_private_file_new_at(
+                &pinned,
+                &output_directory,
+                &parent.join("escaped-artifact"),
+            )
+            .is_err()
+        );
 
         let retained_replacement = parent.join(format!(
             "{OUTPUT_DIRECTORY_NAME}-replacement-{}",
@@ -6404,26 +6192,27 @@ mod tests {
         std::fs::rename(&retained_original, &output_directory)?;
 
         validate_file_identity_at(&pinned, &output_directory, &artifact_path, identity)?;
-        assert!(read_directory_names(&pinned)?
-            .iter()
-            .any(|name| name.as_os_str() == OsStr::new("descriptor-bound-artifact")));
+        assert!(
+            read_directory_names(&pinned)?
+                .iter()
+                .any(|name| name.as_os_str() == OsStr::new("descriptor-bound-artifact"))
+        );
         assert_eq!(std::fs::read(&artifact_path)?, b"pinned-original");
-        assert!(!retained_replacement
-            .join("descriptor-bound-artifact")
-            .exists());
+        assert!(
+            !retained_replacement
+                .join("descriptor-bound-artifact")
+                .exists()
+        );
         Ok(())
     }
 
     #[test]
-    fn output_key_provisioning_resumes_partial_private_stage_without_partial_final_name(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn output_key_provisioning_resumes_partial_private_stage_without_partial_final_name()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = kept_private_directory("ft-guardian-output-key-stage-")?;
         let output_directory = directory.join(OUTPUT_DIRECTORY_NAME);
         std::fs::create_dir(&output_directory)?;
-        std::fs::set_permissions(
-            &output_directory,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&output_directory, std::fs::Permissions::from_mode(0o700))?;
         let stage = output_directory.join(format!("{OUTPUT_KEY_NAME}.provisioning"));
         let readiness = output_directory.join(format!("{OUTPUT_KEY_NAME}.provisioning.ready"));
         let mut stage_file = OpenOptions::new()
@@ -6464,15 +6253,12 @@ mod tests {
     }
 
     #[test]
-    fn partial_final_output_key_fails_closed_without_overwrite(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn partial_final_output_key_fails_closed_without_overwrite()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = kept_private_directory("ft-guardian-output-key-final-cut-")?;
         let output_directory = directory.join(OUTPUT_DIRECTORY_NAME);
         std::fs::create_dir(&output_directory)?;
-        std::fs::set_permissions(
-            &output_directory,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&output_directory, std::fs::Permissions::from_mode(0o700))?;
         let key_path = output_directory.join(OUTPUT_KEY_NAME);
         let mut key_file = OpenOptions::new()
             .write(true)
@@ -6492,15 +6278,12 @@ mod tests {
     }
 
     #[test]
-    fn existing_output_key_is_never_loaded_through_a_replaced_directory_name(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn existing_output_key_is_never_loaded_through_a_replaced_directory_name()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = kept_private_directory("ft-guardian-output-key-parent-swap-")?;
         let output_directory = directory.join(OUTPUT_DIRECTORY_NAME);
         std::fs::create_dir(&output_directory)?;
-        std::fs::set_permissions(
-            &output_directory,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&output_directory, std::fs::Permissions::from_mode(0o700))?;
         let original_key = [0x11_u8; GuardianOutputCipher::KEY_BYTES];
         let mut key = OpenOptions::new()
             .write(true)
@@ -6519,10 +6302,7 @@ mod tests {
         ));
         std::fs::rename(&output_directory, &retained)?;
         std::fs::create_dir(&output_directory)?;
-        std::fs::set_permissions(
-            &output_directory,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&output_directory, std::fs::Permissions::from_mode(0o700))?;
         let replacement_key = [0x22_u8; GuardianOutputCipher::KEY_BYTES];
         let mut replacement = OpenOptions::new()
             .write(true)
@@ -6544,15 +6324,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_output_key_never_creates_a_split_authority_over_existing_artifacts(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn missing_output_key_never_creates_a_split_authority_over_existing_artifacts()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = kept_private_directory("ft-guardian-output-key-missing-")?;
         let output_directory = directory.join(OUTPUT_DIRECTORY_NAME);
         std::fs::create_dir(&output_directory)?;
-        std::fs::set_permissions(
-            &output_directory,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&output_directory, std::fs::Permissions::from_mode(0o700))?;
         let retained_ciphertext = output_directory.join(
             "00000000-0000-0000-0000-000000000001-00000000-0000-0000-0000-000000000002-segment-00000000-0000-0000-0000-000000000003.ftgout",
         );
@@ -6570,9 +6347,11 @@ mod tests {
         let waker = Arc::new(Waker::new(poll.registry(), Token(1))?);
         assert!(GuardianOutputPipeline::open(&token_path, 1, waker).is_err());
         assert!(!output_directory.join(OUTPUT_KEY_NAME).exists());
-        assert!(!output_directory
-            .join(format!("{OUTPUT_KEY_NAME}.provisioning"))
-            .exists());
+        assert!(
+            !output_directory
+                .join(format!("{OUTPUT_KEY_NAME}.provisioning"))
+                .exists()
+        );
         assert_eq!(
             std::fs::read(&retained_ciphertext)?,
             b"retained encrypted crash evidence"
@@ -6581,8 +6360,8 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_commits_are_ordered_and_recoverable_only_after_sync_receipts(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn encrypted_commits_are_ordered_and_recoverable_only_after_sync_receipts()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = kept_private_directory("ft-guardian-output-order-")?;
         let token_path = directory.join("guardian.token");
         let poll = Poll::new()?;
@@ -6611,13 +6390,11 @@ mod tests {
     }
 
     #[test]
-    fn rotation_cold_open_and_replay_preserve_exact_cross_segment_authority(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn rotation_cold_open_and_replay_preserve_exact_cross_segment_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
         let policy = tiny_rotation_policy(4);
-        let (directory, poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-rotation-",
-            policy,
-        )?;
+        let (directory, poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-rotation-", policy)?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
@@ -6653,8 +6430,7 @@ mod tests {
             }
             for (index, segment) in authority.segments.iter().enumerate() {
                 assert!(authority.segments[..index].iter().all(|prior| {
-                    prior.segment_identity.segment_id()
-                        != segment.segment_identity.segment_id()
+                    prior.segment_identity.segment_id() != segment.segment_identity.segment_id()
                 }));
             }
             assert_eq!(recover_all_segment_bytes(&authority)?, b"abbccc");
@@ -6664,10 +6440,8 @@ mod tests {
         drop(poll);
 
         let (_reopened_poll, reopened_pipeline) = reopen_pipeline(&directory, policy)?;
-        let reopened = reopened_pipeline.cold_open_pane_for_validation(
-            guardian_incarnation,
-            pane_id,
-        )?;
+        let reopened =
+            reopened_pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id)?;
         let final_receipt = durable_commit(&reopened_pipeline, pane_id, &reopened, b"dddd")?;
         assert_eq!(final_receipt.sequence(), 4);
         assert!(reopened.receipt_is_current(final_receipt));
@@ -6688,8 +6462,8 @@ mod tests {
     }
 
     #[test]
-    fn log_byte_limit_rolls_over_before_the_frozen_append_seam_rejects_payload(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn log_byte_limit_rolls_over_before_the_frozen_append_seam_rejects_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
         let policy = OutputSegmentPolicy {
             journal_limits: GuardianOutputJournalLimits {
                 max_record_bytes: 64,
@@ -6699,10 +6473,8 @@ mod tests {
             max_segments: 3,
             max_durable_pane_bytes: 4 * 1024,
         };
-        let (_directory, _poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-log-rollover-",
-            policy,
-        )?;
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-log-rollover-", policy)?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
@@ -6725,29 +6497,20 @@ mod tests {
     }
 
     #[test]
-    fn torn_manifest_rolls_back_to_last_exact_chain_without_reclamation(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, _poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-manifest-cut-",
-            tiny_rotation_policy(4),
-        )?;
+    fn torn_manifest_rolls_back_to_last_exact_chain_without_reclamation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-manifest-cut-", tiny_rotation_policy(4))?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
         durable_commit(&pipeline, pane_id, &journal, b"one")?;
         durable_commit(&pipeline, pane_id, &journal, b"two")?;
-        let torn = pipeline.publish_torn_manifest_candidate(
-            guardian_incarnation,
-            pane_id,
-            3,
-        )?;
+        let torn = pipeline.publish_torn_manifest_candidate(guardian_incarnation, pane_id, 3)?;
         assert!(torn.exists());
         drop(journal);
 
-        let reopened = pipeline.cold_open_pane_for_validation(
-            guardian_incarnation,
-            pane_id,
-        )?;
+        let reopened = pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id)?;
         {
             let authority = reopened
                 .authority
@@ -6763,10 +6526,7 @@ mod tests {
         assert!(torn.exists());
         drop(reopened);
 
-        let validated = pipeline.cold_open_pane_for_validation(
-            guardian_incarnation,
-            pane_id,
-        )?;
+        let validated = pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id)?;
         let authority = validated
             .authority
             .lock()
@@ -6775,19 +6535,19 @@ mod tests {
         assert_eq!(authority.manifest_history.len(), 3);
         assert_eq!(authority.relevant_files, 10);
         assert_eq!(recover_all_segment_bytes(&authority)?, b"onetwothree");
-        assert!(pipeline
-            .relevant_pane_paths(guardian_incarnation, pane_id)?
-            .contains(&torn));
+        assert!(
+            pipeline
+                .relevant_pane_paths(guardian_incarnation, pane_id)?
+                .contains(&torn)
+        );
         Ok(())
     }
 
     #[test]
-    fn empty_published_spawn_preparation_is_idempotent_but_nonempty_retry_is_blocked(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, _poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-spawn-retry-",
-            tiny_rotation_policy(3),
-        )?;
+    fn empty_published_spawn_preparation_is_idempotent_but_nonempty_retry_is_blocked()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-spawn-retry-", tiny_rotation_policy(3))?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let first = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
@@ -6814,7 +6574,10 @@ mod tests {
                 .authority
                 .lock()
                 .map_err(|_| "retry journal authority was poisoned")?;
-            assert_eq!(authority.segments[0].segment_identity.segment_id(), segment_id);
+            assert_eq!(
+                authority.segments[0].segment_identity.segment_id(),
+                segment_id
+            );
             assert_eq!(authority.manifest.snapshot.manifest_id, manifest_id);
             assert_eq!(authority.manifest.snapshot.checksum, manifest_checksum);
             assert_eq!(authority.total_records, 0);
@@ -6827,9 +6590,11 @@ mod tests {
 
         durable_commit(&pipeline, pane_id, &retry, b"child-output")?;
         drop(retry);
-        assert!(pipeline
-            .prepare_pane(guardian_incarnation, pane_id)
-            .is_err());
+        assert!(
+            pipeline
+                .prepare_pane(guardian_incarnation, pane_id)
+                .is_err()
+        );
         assert_eq!(
             pipeline.relevant_pane_paths(guardian_incarnation, pane_id)?,
             initial_paths
@@ -6838,8 +6603,8 @@ mod tests {
     }
 
     #[test]
-    fn path_link_change_fails_closed_before_plaintext_is_committed(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn path_link_change_fails_closed_before_plaintext_is_committed()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = kept_private_directory("ft-guardian-output-link-")?;
         let token_path = directory.join("guardian.token");
         let poll = Poll::new()?;
@@ -6877,12 +6642,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_hardlink_is_rejected_on_cold_open_and_retained_as_evidence(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (directory, _poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-manifest-link-",
-            tiny_rotation_policy(3),
-        )?;
+    fn manifest_hardlink_is_rejected_on_cold_open_and_retained_as_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-manifest-link-", tiny_rotation_policy(3))?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
@@ -6897,9 +6660,11 @@ mod tests {
         hard_link(&manifest_path, &evidence_link)?;
         drop(journal);
 
-        assert!(pipeline
-            .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-            .is_err());
+        assert!(
+            pipeline
+                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
+                .is_err()
+        );
         assert_eq!(std::fs::metadata(&manifest_path)?.nlink(), 2);
         assert!(manifest_path.exists());
         assert!(evidence_link.exists());
@@ -6907,8 +6672,8 @@ mod tests {
     }
 
     #[test]
-    fn marked_manifest_checksum_corruption_fails_closed_instead_of_rolling_back(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn marked_manifest_checksum_corruption_fails_closed_instead_of_rolling_back()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-output-manifest-corrupt-",
             tiny_rotation_policy(3),
@@ -6941,9 +6706,11 @@ mod tests {
         drop(manifest);
         drop(journal);
 
-        assert!(pipeline
-            .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-            .is_err());
+        assert!(
+            pipeline
+                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
+                .is_err()
+        );
         assert_eq!(std::fs::metadata(&manifest_path)?.len(), manifest_bytes);
         assert!(manifest_path.exists());
         assert!(publication_path.exists());
@@ -6951,8 +6718,8 @@ mod tests {
     }
 
     #[test]
-    fn orphan_publication_marker_fails_closed_and_is_never_reclaimed(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn orphan_publication_marker_fails_closed_and_is_never_reclaimed()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-output-orphan-publication-",
             tiny_rotation_policy(3),
@@ -6968,30 +6735,27 @@ mod tests {
             Uuid::new_v4(),
             [0; OUTPUT_MANIFEST_CHECKSUM_BYTES],
         );
-        let marker = create_private_file_new_at(
-            &pipeline.directory,
-            &pipeline.directory_path,
-            &orphan,
-        )?;
+        let marker =
+            create_private_file_new_at(&pipeline.directory, &pipeline.directory_path, &orphan)?;
         marker.sync_all()?;
         pipeline.directory.sync_all()?;
         drop(marker);
         drop(journal);
 
-        assert!(pipeline
-            .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-            .is_err());
+        assert!(
+            pipeline
+                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
+                .is_err()
+        );
         assert!(orphan.exists());
         Ok(())
     }
 
     #[test]
-    fn preexisting_symlink_cannot_capture_a_collision_resistant_segment_path(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (directory, _poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-symlink-",
-            tiny_rotation_policy(3),
-        )?;
+    fn preexisting_symlink_cannot_capture_a_collision_resistant_segment_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-symlink-", tiny_rotation_policy(3))?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let segment_id = Uuid::new_v4();
@@ -7012,34 +6776,42 @@ mod tests {
         );
         symlink(&target, &collision_path)?;
 
-        assert!(create_segment_at_identity(
-            &pipeline.directory,
-            &pipeline.directory_path,
-            guardian_incarnation,
-            identity,
-            pipeline.cipher.clone(),
-            pipeline.policy.journal_limits,
-        )
-        .is_err());
-        assert!(std::fs::symlink_metadata(&collision_path)?
-            .file_type()
-            .is_symlink());
+        assert!(
+            create_segment_at_identity(
+                &pipeline.directory,
+                &pipeline.directory_path,
+                guardian_incarnation,
+                identity,
+                pipeline.cipher.clone(),
+                pipeline.policy.journal_limits,
+            )
+            .is_err()
+        );
+        assert!(
+            std::fs::symlink_metadata(&collision_path)?
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read(&target)?, b"unchanged");
         Ok(())
     }
 
     #[test]
-    fn segment_count_exhaustion_fails_closed_without_creating_or_reclaiming_files(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, _poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-capacity-",
-            tiny_rotation_policy(2),
-        )?;
+    fn segment_count_exhaustion_fails_closed_without_creating_or_reclaiming_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-capacity-", tiny_rotation_policy(2))?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
-        assert_eq!(durable_commit(&pipeline, pane_id, &journal, b"one")?.sequence(), 1);
-        assert_eq!(durable_commit(&pipeline, pane_id, &journal, b"two")?.sequence(), 2);
+        assert_eq!(
+            durable_commit(&pipeline, pane_id, &journal, b"one")?.sequence(),
+            1
+        );
+        assert_eq!(
+            durable_commit(&pipeline, pane_id, &journal, b"two")?.sequence(),
+            2
+        );
         assert!(!journal.can_accept_min_record());
         let paths_at_capacity = pipeline.relevant_pane_paths(guardian_incarnation, pane_id)?;
         assert_eq!(paths_at_capacity.len(), 6);
@@ -7068,8 +6840,8 @@ mod tests {
     }
 
     #[test]
-    fn total_disk_byte_bound_stops_admission_before_an_extra_record_or_publication(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn total_disk_byte_bound_stops_admission_before_an_extra_record_or_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
         let policy = OutputSegmentPolicy {
             journal_limits: GuardianOutputJournalLimits {
                 max_record_bytes: 64,
@@ -7079,10 +6851,8 @@ mod tests {
             max_segments: 4,
             max_durable_pane_bytes: 620,
         };
-        let (_directory, _poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-disk-cap-",
-            policy,
-        )?;
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-disk-cap-", policy)?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
@@ -7096,11 +6866,7 @@ mod tests {
         assert_eq!(paths_at_capacity.len(), 3);
 
         pipeline
-            .try_submit(
-                pane_id,
-                journal.clone(),
-                zeroizing_test_bytes(b"x"),
-            )
+            .try_submit(pane_id, journal.clone(), zeroizing_test_bytes(b"x"))
             .map_err(|_| "disk capacity probe submission was unexpectedly rejected")?;
         assert!(completion(&pipeline)?.result.is_err());
         assert_eq!(
@@ -7117,12 +6883,10 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_segment_tail_is_rejected_without_truncation_or_reclamation(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, _poll, pipeline) = pipeline_with_policy(
-            "ft-guardian-output-segment-cut-",
-            tiny_rotation_policy(3),
-        )?;
+    fn incomplete_segment_tail_is_rejected_without_truncation_or_reclamation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-segment-cut-", tiny_rotation_policy(3))?;
         let guardian_incarnation = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
@@ -7142,17 +6906,19 @@ mod tests {
         drop(segment);
         drop(journal);
 
-        assert!(pipeline
-            .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-            .is_err());
+        assert!(
+            pipeline
+                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
+                .is_err()
+        );
         assert_eq!(std::fs::metadata(&segment_path)?.len(), torn_bytes);
         assert!(segment_path.exists());
         Ok(())
     }
 
     #[test]
-    fn queue_admission_is_bounded_even_without_a_draining_worker(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn queue_admission_is_bounded_even_without_a_draining_worker()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = kept_private_directory("ft-guardian-output-bound-")?;
         let token_path = directory.join("guardian.token");
         let poll = Poll::new()?;
@@ -7172,8 +6938,9 @@ mod tests {
             journal,
             payload: zeroizing_test_bytes(b"backpressured"),
         };
-        let OutputQueuePushError::Saturated(mut second) =
-            queue.try_push(second).expect_err("full queue must reject atomically as saturated")
+        let OutputQueuePushError::Saturated(mut second) = queue
+            .try_push(second)
+            .expect_err("full queue must reject atomically as saturated")
         else {
             return Err("full live queue was misclassified as shut down".into());
         };

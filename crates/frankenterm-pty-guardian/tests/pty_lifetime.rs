@@ -6,8 +6,8 @@ use frankenterm_pty_guardian::{
     GuardianServiceError,
 };
 use mux::guardian_protocol::{
-    GuardianCensusPageRequest, GuardianCensusPaneStatus, GuardianRejectionCode, GuardianReply,
-    GUARDIAN_MAX_CENSUS_BYTES,
+    GUARDIAN_MAX_CENSUS_BYTES, GuardianCensusPageRequest, GuardianCensusPaneStatus,
+    GuardianRejectionCode, GuardianReply,
 };
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
@@ -74,9 +74,8 @@ fn empty_guarded_stop_returns_authenticated_success_before_service_exit() -> any
     let abort = Arc::new(AtomicBool::new(false));
     let service_stop = Arc::clone(&stop);
     let service_abort = Arc::clone(&abort);
-    let handle = thread::spawn(move || {
-        service.run_until_with_test_abort(&service_stop, &service_abort)
-    });
+    let handle =
+        thread::spawn(move || service.run_until_with_test_abort(&service_stop, &service_abort));
     let mut service_thread = ServiceThread {
         stop,
         abort,
@@ -136,9 +135,8 @@ fn guardian_owned_native_pty_survives_final_mux_connection_drop() -> anyhow::Res
     let abort = Arc::new(AtomicBool::new(false));
     let service_stop = Arc::clone(&stop);
     let service_abort = Arc::clone(&abort);
-    let handle = thread::spawn(move || {
-        service.run_until_with_test_abort(&service_stop, &service_abort)
-    });
+    let handle =
+        thread::spawn(move || service.run_until_with_test_abort(&service_stop, &service_abort));
     let mut service_thread = ServiceThread {
         stop,
         abort,
@@ -147,8 +145,7 @@ fn guardian_owned_native_pty_survives_final_mux_connection_drop() -> anyhow::Res
     let _release_on_failure = ReleaseMarker(release_path.clone());
 
     let pane_id = Uuid::new_v4();
-    let mut first_client =
-        GuardianClient::connect(&socket_path, &token_path, Uuid::new_v4())?;
+    let mut first_client = GuardianClient::connect(&socket_path, &token_path, Uuid::new_v4())?;
     let guardian_incarnation = first_client.guardian_incarnation();
     let mut command = CommandBuilder::new("/bin/sh");
     command.arg("-c");
@@ -222,10 +219,9 @@ fn guardian_owned_native_pty_survives_final_mux_connection_drop() -> anyhow::Res
         "test reconnected to a different guardian incarnation"
     );
     let retired = wait_until(Duration::from_secs(3), || {
-        census_status(&mut successor, pane_id)
-            .is_some_and(|(status, generation)| {
-                status == GuardianCensusPaneStatus::LiveUnclaimed && generation == 1
-            })
+        census_status(&mut successor, pane_id).is_some_and(|(status, generation)| {
+            status == GuardianCensusPaneStatus::LiveUnclaimed && generation == 1
+        })
     });
     anyhow::ensure!(
         retired,
@@ -255,12 +251,14 @@ fn guardian_owned_native_pty_survives_final_mux_connection_drop() -> anyhow::Res
 
     write_new_file(&release_path, b"release")?;
     let exited = wait_until(Duration::from_secs(4), || {
-        census_status(&mut successor, pane_id)
-            .is_some_and(|(status, generation)| {
-                status == GuardianCensusPaneStatus::ExitedUnclaimed && generation == 1
-            })
+        census_status(&mut successor, pane_id).is_some_and(|(status, generation)| {
+            status == GuardianCensusPaneStatus::ExitedUnclaimed && generation == 1
+        })
     });
-    anyhow::ensure!(exited, "guardian did not observe and reap the released child");
+    anyhow::ensure!(
+        exited,
+        "guardian did not observe and reap the released child"
+    );
 
     let close = successor.close(pane_id, 1, 0, Uuid::new_v4(), Uuid::new_v4())?;
     anyhow::ensure!(
@@ -297,13 +295,8 @@ fn census_status(
     client: &mut GuardianClient,
     pane_id: Uuid,
 ) -> Option<(GuardianCensusPaneStatus, u64)> {
-    let page = GuardianCensusPageRequest::new(
-        Uuid::nil(),
-        0,
-        16,
-        GUARDIAN_MAX_CENSUS_BYTES,
-    )
-    .ok()?;
+    let page =
+        GuardianCensusPageRequest::new(Uuid::nil(), 0, 16, GUARDIAN_MAX_CENSUS_BYTES).ok()?;
     let GuardianReply::CensusPage { entries, .. } = client.census(page).ok()? else {
         return None;
     };

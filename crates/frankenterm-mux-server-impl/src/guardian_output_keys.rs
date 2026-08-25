@@ -8,15 +8,15 @@
 //! available for historical segment recovery.
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir as CapDir, File as CapFile, Metadata as CapMetadata};
 #[cfg(not(target_os = "wasi"))]
 use cap_std::fs::DirBuilder as CapDirBuilder;
-use cap_std::fs::OpenOptions as CapOpenOptions;
-use cap_std::fs::OpenOptionsExt as _;
-#[cfg(unix)]
-use cap_std::fs::{DirBuilderExt as _, MetadataExt as CapUnixMetadataExt, PermissionsExt as _};
 #[cfg(windows)]
 use cap_std::fs::MetadataExt as CapWindowsMetadataExt;
+use cap_std::fs::OpenOptions as CapOpenOptions;
+use cap_std::fs::OpenOptionsExt as _;
+use cap_std::fs::{Dir as CapDir, File as CapFile, Metadata as CapMetadata};
+#[cfg(unix)]
+use cap_std::fs::{DirBuilderExt as _, MetadataExt as CapUnixMetadataExt, PermissionsExt as _};
 use mux::guardian_output_journal::{
     GuardianOutputCipher, GuardianOutputJournalError, GuardianOutputKey,
 };
@@ -407,9 +407,7 @@ impl GuardianOutputKeyring {
             .transpose()
     }
 
-    fn refresh_latest_authority_unlocked(
-        &mut self,
-    ) -> Result<(), GuardianOutputKeyringError> {
+    fn refresh_latest_authority_unlocked(&mut self) -> Result<(), GuardianOutputKeyringError> {
         validate_directory(&self.directory)?;
         let mut current = inventory(&self.directory)?;
         if current.pending.is_some() {
@@ -444,9 +442,7 @@ fn open_inventory(
         .latest
         .ok_or(GuardianOutputKeyringError::OrphanedKeyMaterial)?;
     let active_key = load_key(&directory, active.key_id).map_err(|error| match error {
-        GuardianOutputKeyringError::Io(ref io)
-            if io.kind() == std::io::ErrorKind::NotFound =>
-        {
+        GuardianOutputKeyringError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound => {
             GuardianOutputKeyringError::MissingActivatedKey
         }
         other => other,
@@ -551,10 +547,7 @@ fn validate_owned_path(
     Ok(())
 }
 
-fn open_private_child(
-    parent: &CapDir,
-    name: &str,
-) -> Result<CapDir, GuardianOutputKeyringError> {
+fn open_private_child(parent: &CapDir, name: &str) -> Result<CapDir, GuardianOutputKeyringError> {
     let before = parent.symlink_metadata(name)?;
     if !before.file_type().is_dir() {
         return Err(GuardianOutputKeyringError::DirectoryNotPrivate);
@@ -672,12 +665,7 @@ fn open_authority_lock_file(
     // directory sync, so observing `before = Some` is not durability proof.
     file.sync_all()?;
     sync_directory(directory)?;
-    validate_opened_file(
-        directory,
-        OsStr::new(AUTHORITY_LOCK_NAME),
-        &file,
-        0,
-    )?;
+    validate_opened_file(directory, OsStr::new(AUTHORITY_LOCK_NAME), &file, 0)?;
     Ok(file.into_std())
 }
 
@@ -753,11 +741,8 @@ fn inventory(directory: &CapDir) -> Result<Inventory, GuardianOutputKeyringError
             continue;
         }
         if let Some(maximum_bytes) = parse_stage_name(name) {
-            let _stage = validate_named_stage_candidate(
-                directory,
-                OsStr::new(name),
-                maximum_bytes,
-            )?;
+            let _stage =
+                validate_named_stage_candidate(directory, OsStr::new(name), maximum_bytes)?;
             continue;
         }
         if let Some(named_activation) = parse_activation_name(name) {
@@ -824,9 +809,7 @@ fn inventory(directory: &CapDir) -> Result<Inventory, GuardianOutputKeyringError
             return Err(GuardianOutputKeyringError::OrphanedKeyMaterial);
         }
         let validated_key = load_key(directory, *key_id)?;
-        if let Some(intent) = inventory
-            .pending
-            .filter(|intent| intent.key_id == *key_id)
+        if let Some(intent) = inventory.pending.filter(|intent| intent.key_id == *key_id)
             && validated_key.material_sha256() != intent.key_sha256
         {
             return Err(GuardianOutputKeyringError::InvalidIntent);
@@ -856,10 +839,11 @@ fn validate_intent_inventory(
         if intent.authority_id == [0_u8; 16]
             || intent.generation == 0
             || intent.key_id == [0_u8; 8]
-            || intent.activation_digest != activation_digest(Activation {
-                generation: intent.generation,
-                key_id: intent.key_id,
-            })
+            || intent.activation_digest
+                != activation_digest(Activation {
+                    generation: intent.generation,
+                    key_id: intent.key_id,
+                })
         {
             return Err(GuardianOutputKeyringError::InvalidIntent);
         }
@@ -886,9 +870,7 @@ fn validate_intent_inventory(
                 .activations
                 .iter()
                 .copied()
-                .find(|activation| {
-                    activation.generation.checked_add(1) == Some(intent.generation)
-                })
+                .find(|activation| activation.generation.checked_add(1) == Some(intent.generation))
                 .ok_or(GuardianOutputKeyringError::InvalidIntent)?;
             if intent.predecessor_generation != predecessor.generation
                 || intent.predecessor_key_id != predecessor.key_id
@@ -917,11 +899,9 @@ fn validate_intent_inventory(
             None => {
                 if index + 1 != inventory.intents.len()
                     || inventory.pending.is_some()
-                    || inventory
-                        .latest
-                        .map_or(intent.generation != 1, |latest| {
-                            latest.generation.checked_add(1) != Some(intent.generation)
-                        })
+                    || inventory.latest.map_or(intent.generation != 1, |latest| {
+                        latest.generation.checked_add(1) != Some(intent.generation)
+                    })
                 {
                     return Err(GuardianOutputKeyringError::InvalidIntent);
                 }
@@ -1130,11 +1110,7 @@ fn publish_intent(
     )?;
     stage_exact_bytes(directory, &stage, &bytes)?;
     publish_staged_bytes(directory, &stage, &final_name, &bytes)?;
-    let file = open_validated_file(
-        directory,
-        OsStr::new(&final_name),
-        INTENT_BYTES as u64,
-    )?;
+    let file = open_validated_file(directory, OsStr::new(&final_name), INTENT_BYTES as u64)?;
     if read_intent(file)? != intent {
         return Err(GuardianOutputKeyringError::InvalidIntent);
     }
@@ -1160,18 +1136,15 @@ fn stage_key(
     })();
     match publication {
         Ok(()) => Ok(name),
-        Err(publication_error) => match load_exact_key_named(
-            directory,
-            &name,
-            key.key_id(),
-            key.material_sha256(),
-        ) {
-            Ok(_) => {
-                sync_directory(directory)?;
-                Ok(name)
+        Err(publication_error) => {
+            match load_exact_key_named(directory, &name, key.key_id(), key.material_sha256()) {
+                Ok(_) => {
+                    sync_directory(directory)?;
+                    Ok(name)
+                }
+                Err(_) => Err(publication_error),
             }
-            Err(_) => Err(publication_error),
-        },
+        }
     }
 }
 
@@ -1185,31 +1158,29 @@ fn publish_staged_key(
         .and_then(|()| sync_directory(directory));
     match publication {
         Ok(()) => {
-            let _published = load_exact_key_named(
-                directory,
-                &final_name,
-                key.key_id(),
-                key.material_sha256(),
-            )?;
+            let _published =
+                load_exact_key_named(directory, &final_name, key.key_id(), key.material_sha256())?;
             sync_directory(directory)
         }
-        Err(publication_error) => match load_exact_key_named(
-            directory,
-            &final_name,
-            key.key_id(),
-            key.material_sha256(),
-        ) {
-            Ok(_) => {
-                sync_directory(directory)?;
-                Ok(())
+        Err(publication_error) => {
+            match load_exact_key_named(directory, &final_name, key.key_id(), key.material_sha256())
+            {
+                Ok(_) => {
+                    sync_directory(directory)?;
+                    Ok(())
+                }
+                Err(_)
+                    if matches!(
+                        publication_error,
+                        GuardianOutputKeyringError::Io(ref io)
+                            if io.kind() == std::io::ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    Err(GuardianOutputKeyringError::KeyIdCollision)
+                }
+                Err(_) => Err(publication_error),
             }
-            Err(_) if matches!(
-                publication_error,
-                GuardianOutputKeyringError::Io(ref io)
-                    if io.kind() == std::io::ErrorKind::AlreadyExists
-            ) => Err(GuardianOutputKeyringError::KeyIdCollision),
-            Err(_) => Err(publication_error),
-        },
+        }
     }
 }
 
@@ -1277,24 +1248,13 @@ fn recover_pending_intent(
         .ok_or(GuardianOutputKeyringError::PendingActivation)?;
     let final_key_name = key_name(intent.key_id);
     let key = match directory.symlink_metadata(&final_key_name) {
-        Ok(_) => load_exact_key_named(
-            directory,
-            &final_key_name,
-            intent.key_id,
-            intent.key_sha256,
-        )?,
+        Ok(_) => {
+            load_exact_key_named(directory, &final_key_name, intent.key_id, intent.key_sha256)?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let stage_name = key_stage_name(
-                intent.generation,
-                intent.key_id,
-                intent.key_sha256,
-            );
-            let staged = load_exact_key_named(
-                directory,
-                &stage_name,
-                intent.key_id,
-                intent.key_sha256,
-            )?;
+            let stage_name = key_stage_name(intent.generation, intent.key_id, intent.key_sha256);
+            let staged =
+                load_exact_key_named(directory, &stage_name, intent.key_id, intent.key_sha256)?;
             sync_directory(directory)?;
             publish_staged_key(directory, &stage_name, &staged)?;
             staged
@@ -1650,7 +1610,9 @@ fn intent_name(intent: PublicationIntent) -> String {
 }
 
 fn parse_intent_name(name: &str) -> Option<(u64, [u8; 8])> {
-    let body = name.strip_prefix(INTENT_PREFIX)?.strip_suffix(FORMAT_SUFFIX)?;
+    let body = name
+        .strip_prefix(INTENT_PREFIX)?
+        .strip_suffix(FORMAT_SUFFIX)?;
     let (generation, key_id) = body.split_once('-')?;
     Some((parse_generation(generation)?, parse_key_id_hex(key_id)?))
 }
@@ -1679,8 +1641,7 @@ fn unique_stage_name(
 
 fn random_publication_identifier() -> Result<[u8; 16], GuardianOutputKeyringError> {
     let mut identifier = [0_u8; 16];
-    getrandom::fill(&mut identifier)
-        .map_err(|_| GuardianOutputKeyringError::EntropyUnavailable)?;
+    getrandom::fill(&mut identifier).map_err(|_| GuardianOutputKeyringError::EntropyUnavailable)?;
     if identifier == [0_u8; 16] {
         return Err(GuardianOutputKeyringError::EntropyUnavailable);
     }
@@ -1856,18 +1817,14 @@ fn read_intent(mut file: CapFile) -> Result<PublicationIntent, GuardianOutputKey
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = [0_u8; INTENT_BYTES];
     file.read_exact(&mut bytes)?;
-    let authority_id: [u8; 16] = bytes[16..32]
-        .try_into()
-        .expect("fixed authority ID slice");
+    let authority_id: [u8; 16] = bytes[16..32].try_into().expect("fixed authority ID slice");
     let generation = u64::from_le_bytes(
         bytes[32..40]
             .try_into()
             .expect("fixed intent generation slice"),
     );
     let key_id: [u8; 8] = bytes[40..48].try_into().expect("fixed intent key ID slice");
-    let key_sha256: [u8; 32] = bytes[48..80]
-        .try_into()
-        .expect("fixed key digest slice");
+    let key_sha256: [u8; 32] = bytes[48..80].try_into().expect("fixed key digest slice");
     let record_digest: [u8; 32] = bytes[192..224]
         .try_into()
         .expect("fixed intent digest slice");
@@ -1924,8 +1881,7 @@ mod tests {
     const MULTIPROCESS_KEYRING_MODE: &str = "FT_TEST_GUARDIAN_KEYRING_CHILD_MODE";
     const MULTIPROCESS_KEYRING_BASE: &str = "FT_TEST_GUARDIAN_KEYRING_CHILD_BASE";
     const MULTIPROCESS_KEYRING_START: &str = "FT_TEST_GUARDIAN_KEYRING_CHILD_START";
-    const MULTIPROCESS_KEYRING_TEST: &str =
-        "guardian_output_keys::tests::scrollback_sibling_interprocess_provision_and_rotation_are_serialized";
+    const MULTIPROCESS_KEYRING_TEST: &str = "guardian_output_keys::tests::scrollback_sibling_interprocess_provision_and_rotation_are_serialized";
 
     fn wait_for_multiprocess_start(path: &Path) {
         for _ in 0..2_000 {
@@ -1937,11 +1893,7 @@ mod tests {
         panic!("timed out waiting for guardian keyring child start marker");
     }
 
-    fn spawn_keyring_child(
-        base: &Path,
-        start: &Path,
-        mode: &str,
-    ) -> std::process::Child {
+    fn spawn_keyring_child(base: &Path, start: &Path, mode: &str) -> std::process::Child {
         std::process::Command::new(std::env::current_exe().expect("resolve test executable"))
             .arg(MULTIPROCESS_KEYRING_TEST)
             .arg("--exact")
@@ -2028,8 +1980,8 @@ mod tests {
 
         let reopened = GuardianOutputKeyring::open_existing_scrollback_sibling(&scrollback)
             .expect("reopen rotated sibling keyring");
-        let parsed = GuardianEncryptedScrollbackRow::parse(&record)
-            .expect("parse historical encrypted row");
+        let parsed =
+            GuardianEncryptedScrollbackRow::parse(&record).expect("parse historical encrypted row");
         assert_eq!(parsed.key_id(), first_key_id);
         let historical_cipher = reopened
             .cipher_for_key_id(parsed.key_id())
@@ -2055,9 +2007,8 @@ mod tests {
                     .expect("guardian keyring child start path"),
             );
             wait_for_multiprocess_start(&start);
-            let mut keyring =
-                GuardianOutputKeyring::open_or_provision_scrollback_sibling(&base)
-                    .expect("child opens shared guardian keyring");
+            let mut keyring = GuardianOutputKeyring::open_or_provision_scrollback_sibling(&base)
+                .expect("child opens shared guardian keyring");
             if mode == "rotate" {
                 keyring.rotate().expect("child rotates guardian keyring");
             } else {
@@ -2154,10 +2105,9 @@ mod tests {
         let accepted_root = tempfile::tempdir().expect("create accepted lock storage root");
         let accepted_scrollback = accepted_root.path().join("scrollback-lines");
         std::fs::create_dir(&accepted_scrollback).expect("create accepted scrollback directory");
-        let accepted = GuardianOutputKeyring::open_or_provision_scrollback_sibling(
-            &accepted_scrollback,
-        )
-        .expect("provision authority with durable lock file");
+        let accepted =
+            GuardianOutputKeyring::open_or_provision_scrollback_sibling(&accepted_scrollback)
+                .expect("provision authority with durable lock file");
         let accepted_inventory = inventory(&accepted.directory).expect("inventory safe authority");
         assert_eq!(accepted_inventory.entries, 3);
         assert_eq!(
@@ -2229,27 +2179,31 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().expect("create keyring directory");
-        let mut keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("provision keyring");
+        let mut keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("provision keyring");
         let original_id = keyring.active_key_id();
         assert_eq!(keyring.active_generation(), 1);
         assert_eq!(
-            keyring.active_cipher().expect("derive active cipher").key_id(),
+            keyring
+                .active_cipher()
+                .expect("derive active cipher")
+                .key_id(),
             original_id
         );
 
         for entry in std::fs::read_dir(directory.path()).expect("enumerate keyring") {
-            let metadata = entry.expect("read keyring entry").metadata().expect("metadata");
+            let metadata = entry
+                .expect("read keyring entry")
+                .metadata()
+                .expect("metadata");
             assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
         }
 
         drop(keyring);
-        let mut keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("reopen keyring");
+        let mut keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("reopen keyring");
         assert_eq!(keyring.active_generation(), 1);
         assert_eq!(keyring.active_key_id(), original_id);
 
@@ -2266,10 +2220,9 @@ mod tests {
         );
 
         drop(keyring);
-        let keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("reopen rotated keyring");
+        let keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("reopen rotated keyring");
         assert_eq!(keyring.active_generation(), 2);
         assert_eq!(keyring.active_key_id(), rotated_id);
         assert_eq!(
@@ -2285,10 +2238,9 @@ mod tests {
     #[test]
     fn unretained_semantic_key_final_fails_closed_without_authorization() {
         let directory = tempfile::tempdir().expect("create interrupted keyring");
-        let keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("provision keyring");
+        let keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("provision keyring");
         let unactivated = GuardianOutputKey::generate().expect("generate interrupted key");
         publish_key(&keyring.directory, &unactivated).expect("publish interrupted key leaf");
         drop(keyring);
@@ -2297,17 +2249,21 @@ mod tests {
             GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path())),
             Err(GuardianOutputKeyringError::OrphanedKeyMaterial)
         ));
-        assert!(directory.path().join(key_name(unactivated.key_id())).is_file());
+        assert!(
+            directory
+                .path()
+                .join(key_name(unactivated.key_id()))
+                .is_file()
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn exact_publication_retries_reconcile_acknowledgement_loss() {
         let directory = tempfile::tempdir().expect("create retry keyring");
-        let keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("provision keyring");
+        let keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("provision keyring");
         let next_key = GuardianOutputKey::generate().expect("generate retry key");
         let activation = Activation {
             generation: 2,
@@ -2321,8 +2277,7 @@ mod tests {
         publish_intent(&keyring.directory, intent).expect("publish retry intent");
         publish_intent(&keyring.directory, intent)
             .expect("reconcile exact already-published intent");
-        publish_staged_key(&keyring.directory, &key_stage, &next_key)
-            .expect("publish retry key");
+        publish_staged_key(&keyring.directory, &key_stage, &next_key).expect("publish retry key");
         publish_staged_key(&keyring.directory, &key_stage, &next_key)
             .expect("reconcile exact already-published key");
         publish_activation(&keyring.directory, activation).expect("publish activation");
@@ -2352,10 +2307,9 @@ mod tests {
     #[cfg(unix)]
     fn exercise_intent_crash_cut(cut: IntentCrashCut) {
         let directory = tempfile::tempdir().expect("create crash-cut keyring");
-        let keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("provision crash-cut predecessor");
+        let keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("provision crash-cut predecessor");
         let predecessor_id = keyring.active_key_id();
         let current = inventory(&keyring.directory).expect("inventory crash-cut predecessor");
         let key = GuardianOutputKey::generate().expect("generate crash-cut successor key");
@@ -2363,8 +2317,8 @@ mod tests {
             generation: 2,
             key_id: key.key_id(),
         };
-        let intent = publication_intent(&current, &key, activation)
-            .expect("construct crash-cut intent");
+        let intent =
+            publication_intent(&current, &key, activation).expect("construct crash-cut intent");
         let key_stage = key_stage_name(
             activation.generation,
             activation.key_id,
@@ -2381,7 +2335,8 @@ mod tests {
                 .expect("create partial deterministic key stage");
             file.write_all(&[0x41; GuardianOutputCipher::KEY_BYTES / 2])
                 .expect("write partial deterministic key stage");
-            file.sync_all().expect("sync partial deterministic key stage");
+            file.sync_all()
+                .expect("sync partial deterministic key stage");
             sync_directory(&keyring.directory).expect("sync partial key-stage name");
         } else {
             stage_key(&keyring.directory, activation.generation, &key)
@@ -2477,10 +2432,9 @@ mod tests {
         }
         drop(keyring);
 
-        let reopened = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("recover crash-cut authority");
+        let reopened =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("recover crash-cut authority");
         if matches!(
             cut,
             IntentCrashCut::KeyStageCreated
@@ -2524,10 +2478,9 @@ mod tests {
     #[test]
     fn read_only_open_reports_pending_intent_and_never_authorizes_its_key() {
         let directory = tempfile::tempdir().expect("create read-only pending keyring");
-        let keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("provision read-only predecessor");
+        let keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("provision read-only predecessor");
         let predecessor = keyring.active_key_id();
         let current = inventory(&keyring.directory).expect("inventory read-only predecessor");
         let key = GuardianOutputKey::generate().expect("generate pending read-only key");
@@ -2541,10 +2494,9 @@ mod tests {
         publish_intent(&keyring.directory, intent).expect("publish pending read-only intent");
         drop(keyring);
 
-        let read_only = GuardianOutputKeyring::open_existing(open_private_directory(
-            directory.path(),
-        ))
-        .expect("read prior activation while next intent is pending");
+        let read_only =
+            GuardianOutputKeyring::open_existing(open_private_directory(directory.path()))
+                .expect("read prior activation while next intent is pending");
         assert_eq!(read_only.active_generation(), 1);
         assert_eq!(read_only.active_key_id(), predecessor);
         assert_eq!(read_only.pending_activation_generation(), Some(2));
@@ -2554,10 +2506,9 @@ mod tests {
         ));
 
         drop(read_only);
-        let recovered = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("writable open completes exact pending intent");
+        let recovered =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("writable open completes exact pending intent");
         assert_eq!(recovered.active_generation(), 2);
         assert_eq!(recovered.active_key_id(), activation.key_id);
     }
@@ -2575,8 +2526,7 @@ mod tests {
             generation: 1,
             key_id: key.key_id(),
         };
-        stage_key(&capability, activation.generation, &key)
-            .expect("stage initial pending key");
+        stage_key(&capability, activation.generation, &key).expect("stage initial pending key");
         let intent = publication_intent(&current, &key, activation)
             .expect("construct initial pending intent");
         publish_intent(&capability, intent).expect("publish initial pending intent");
@@ -2588,10 +2538,9 @@ mod tests {
         drop(_authority_lease);
         drop(capability);
 
-        let recovered = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("recover initial pending intent");
+        let recovered =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("recover initial pending intent");
         assert_eq!(recovered.active_generation(), 1);
         assert_eq!(recovered.active_key_id(), activation.key_id);
         assert_eq!(recovered.pending_activation_generation(), None);
@@ -2602,18 +2551,16 @@ mod tests {
     fn partial_semantic_final_key_or_activation_is_never_ignored() {
         for partial_key in [true, false] {
             let directory = tempfile::tempdir().expect("create partial-final keyring");
-            let keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-                directory.path(),
-            ))
-            .expect("provision partial-final predecessor");
+            let keyring =
+                GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                    .expect("provision partial-final predecessor");
             let current = inventory(&keyring.directory).expect("inventory predecessor");
             let key = GuardianOutputKey::generate().expect("generate partial-final key");
             let activation = Activation {
                 generation: 2,
                 key_id: key.key_id(),
             };
-            let _stage =
-                stage_key(&keyring.directory, 2, &key).expect("stage partial-final key");
+            let _stage = stage_key(&keyring.directory, 2, &key).expect("stage partial-final key");
             let intent = publication_intent(&current, &key, activation)
                 .expect("construct partial-final intent");
             publish_intent(&keyring.directory, intent).expect("publish partial-final intent");
@@ -2633,15 +2580,14 @@ mod tests {
                         .expect("create partial semantic activation");
                 file.write_all(&bytes[..ACTIVATION_BYTES / 2])
                     .expect("write partial semantic activation");
-                file.sync_all()
-                    .expect("sync partial semantic activation");
+                file.sync_all().expect("sync partial semantic activation");
             }
             sync_directory(&keyring.directory).expect("sync partial semantic final");
             drop(keyring);
-            assert!(GuardianOutputKeyring::open_or_provision(open_private_directory(
-                directory.path()
-            ))
-            .is_err());
+            assert!(
+                GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                    .is_err()
+            );
         }
     }
 
@@ -2697,10 +2643,9 @@ mod tests {
         ));
 
         let fork_directory = tempfile::tempdir().expect("create forked intent keyring");
-        let mut keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            fork_directory.path(),
-        ))
-        .expect("provision fork predecessor");
+        let mut keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(fork_directory.path()))
+                .expect("provision fork predecessor");
         keyring.rotate().expect("create second chained intent");
         let current = inventory(&keyring.directory).expect("inventory fork predecessor");
         let next_key = GuardianOutputKey::generate().expect("generate fork key");
@@ -2709,7 +2654,11 @@ mod tests {
             key_id: next_key.key_id(),
         };
         let latest = current.latest.expect("fork predecessor activation");
-        let authority_id = current.intents.last().expect("fork predecessor intent").authority_id;
+        let authority_id = current
+            .intents
+            .last()
+            .expect("fork predecessor intent")
+            .authority_id;
         let forked = PublicationIntent::new(
             authority_id,
             next_activation,
@@ -2726,9 +2675,7 @@ mod tests {
         ));
         drop(keyring);
         assert!(matches!(
-            GuardianOutputKeyring::open_or_provision(open_private_directory(
-                fork_directory.path()
-            )),
+            GuardianOutputKeyring::open_or_provision(open_private_directory(fork_directory.path())),
             Err(GuardianOutputKeyringError::InvalidIntent)
         ));
     }
@@ -2748,21 +2695,32 @@ mod tests {
             },
         )
         .expect("publish legacy activation");
-        assert!(inventory(&capability).expect("inventory legacy chain").intents.is_empty());
+        assert!(
+            inventory(&capability)
+                .expect("inventory legacy chain")
+                .intents
+                .is_empty()
+        );
         drop(capability);
 
-        let mut keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("open legacy authority");
-        keyring.rotate().expect("rotate into retained-intent protocol");
+        let mut keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("open legacy authority");
+        keyring
+            .rotate()
+            .expect("rotate into retained-intent protocol");
         let transitioned = inventory(&keyring.directory).expect("inventory transitioned chain");
         assert_eq!(transitioned.intents.len(), 1);
         assert_eq!(transitioned.intents[0].generation, 2);
         assert_eq!(transitioned.intents[0].predecessor_generation, 1);
-        assert_eq!(transitioned.intents[0].predecessor_intent_digest, [0_u8; 32]);
+        assert_eq!(
+            transitioned.intents[0].predecessor_intent_digest,
+            [0_u8; 32]
+        );
 
-        keyring.rotate().expect("extend transitioned retained-intent chain");
+        keyring
+            .rotate()
+            .expect("extend transitioned retained-intent chain");
         let extended = inventory(&keyring.directory).expect("inventory extended chain");
         assert_eq!(extended.intents.len(), 2);
         assert_eq!(extended.intents[1].generation, 3);
@@ -2785,8 +2743,8 @@ mod tests {
         let oversized_capability = open_private_directory(oversized_directory.path());
         let key = GuardianOutputKey::generate().expect("generate oversized-stage identity");
         let stage = key_stage_name(1, key.key_id(), key.material_sha256());
-        let mut file = create_private_file(&oversized_capability, &stage)
-            .expect("create oversized key stage");
+        let mut file =
+            create_private_file(&oversized_capability, &stage).expect("create oversized key stage");
         file.write_all(&[0x41; GuardianOutputCipher::KEY_BYTES + 1])
             .expect("write oversized key stage");
         file.sync_all().expect("sync oversized key stage");
@@ -2799,24 +2757,14 @@ mod tests {
         let linked_directory = tempfile::tempdir().expect("create linked-stage keyring");
         let linked_capability = open_private_directory(linked_directory.path());
         let digest = [0x22; 32];
-        let first_stage = unique_stage_name(
-            ACTIVATION_STAGE_PREFIX,
-            1,
-            [0x11; 8],
-            digest,
-        )
-        .expect("generate first linked-stage nonce");
+        let first_stage = unique_stage_name(ACTIVATION_STAGE_PREFIX, 1, [0x11; 8], digest)
+            .expect("generate first linked-stage nonce");
         create_private_file(&linked_capability, &first_stage)
             .expect("create first linked stage")
             .sync_all()
             .expect("sync first linked stage");
-        let second_stage = unique_stage_name(
-            ACTIVATION_STAGE_PREFIX,
-            1,
-            [0x11; 8],
-            digest,
-        )
-        .expect("generate second linked-stage nonce");
+        let second_stage = unique_stage_name(ACTIVATION_STAGE_PREFIX, 1, [0x11; 8], digest)
+            .expect("generate second linked-stage nonce");
         std::fs::hard_link(
             linked_directory.path().join(&first_stage),
             linked_directory.path().join(&second_stage),
@@ -2830,13 +2778,8 @@ mod tests {
         let symlink_directory = tempfile::tempdir().expect("create symlink-stage keyring");
         let symlink_capability = open_private_directory(symlink_directory.path());
         let target = tempfile::NamedTempFile::new().expect("create external stage target");
-        let symlink_stage = unique_stage_name(
-            INTENT_STAGE_PREFIX,
-            1,
-            [0x11; 8],
-            digest,
-        )
-        .expect("generate symlink-stage nonce");
+        let symlink_stage = unique_stage_name(INTENT_STAGE_PREFIX, 1, [0x11; 8], digest)
+            .expect("generate symlink-stage nonce");
         symlink(target.path(), symlink_directory.path().join(symlink_stage))
             .expect("symlink recognized stage name");
         assert!(matches!(
@@ -2870,10 +2813,9 @@ mod tests {
     #[test]
     fn active_key_mutation_is_detected_before_new_cipher_use() {
         let directory = tempfile::tempdir().expect("create mutation keyring");
-        let keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
-            directory.path(),
-        ))
-        .expect("provision keyring");
+        let keyring =
+            GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
+                .expect("provision keyring");
         let active_path = directory.path().join(key_name(keyring.active_key_id()));
         let replacement = GuardianOutputKey::generate().expect("generate replacement key");
         let mut file = std::fs::OpenOptions::new()
@@ -2904,11 +2846,9 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .expect("make directory unsafe");
-        let unsafe_cap = CapDir::open_ambient_dir(
-            unsafe_directory.path(),
-            cap_std::ambient_authority(),
-        )
-        .expect("open unsafe capability directory");
+        let unsafe_cap =
+            CapDir::open_ambient_dir(unsafe_directory.path(), cap_std::ambient_authority())
+                .expect("open unsafe capability directory");
         assert!(matches!(
             GuardianOutputKeyring::open_or_provision(unsafe_cap),
             Err(GuardianOutputKeyringError::DirectoryNotPrivate)

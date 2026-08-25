@@ -1,5 +1,5 @@
 use crate::color::{LinearRgba, RgbColor};
-use crate::{StringSequenceError, StringSequenceKind, Sixel, SixelData};
+use crate::{Sixel, SixelData, StringSequenceError, StringSequenceKind};
 
 const MAX_PARAMS: usize = 5;
 const MAX_SIXEL_SIZE: usize = 100_000_000;
@@ -62,10 +62,7 @@ impl SixelBuilder {
         Self::new_with_max_retained_bytes(params, MAX_SIXEL_RETAINED_BYTES)
     }
 
-    pub(super) fn new_with_max_retained_bytes(
-        params: &[i64],
-        max_retained_bytes: usize,
-    ) -> Self {
+    pub(super) fn new_with_max_retained_bytes(params: &[i64], max_retained_bytes: usize) -> Self {
         let max_retained_bytes = max_retained_bytes.min(MAX_SIXEL_RETAINED_BYTES);
         let pan = match params.get(0).unwrap_or(&0) {
             7 | 8 | 9 => 1,

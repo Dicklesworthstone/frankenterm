@@ -37,9 +37,9 @@ enum MuxDomainConfigAdmissionRetryState {
     Running,
 }
 
-static MUX_DOMAIN_CONFIG_ADMISSION_RETRY_STATE:
-    std::sync::Mutex<MuxDomainConfigAdmissionRetryState> =
-    std::sync::Mutex::new(MuxDomainConfigAdmissionRetryState::Idle);
+static MUX_DOMAIN_CONFIG_ADMISSION_RETRY_STATE: std::sync::Mutex<
+    MuxDomainConfigAdmissionRetryState,
+> = std::sync::Mutex::new(MuxDomainConfigAdmissionRetryState::Idle);
 const FT_ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
 /// [ft-gqbpk] Shared shutdown-flag handle. Tests use this to assert
@@ -221,9 +221,7 @@ fn main() {
     std::process::exit(0);
 }
 
-fn run(
-    generation_lifetime: &mut Option<GenerationLifetimeLease>,
-) -> anyhow::Result<()> {
+fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Result<()> {
     //stats::Stats::init()?;
     config::designate_this_as_the_main_thread();
     let _saver = umask::UmaskSaver::new();
@@ -484,8 +482,8 @@ fn try_admit_mux_domain_config_reconciliation(generation: u64) -> MuxDomainConfi
     }
 }
 
-fn lock_mux_domain_config_admission_retry_state(
-) -> std::sync::MutexGuard<'static, MuxDomainConfigAdmissionRetryState> {
+fn lock_mux_domain_config_admission_retry_state()
+-> std::sync::MutexGuard<'static, MuxDomainConfigAdmissionRetryState> {
     MUX_DOMAIN_CONFIG_ADMISSION_RETRY_STATE
         .lock()
         .unwrap_or_else(|poisoned| {
@@ -506,9 +504,7 @@ fn ensure_mux_domain_config_admission_retry(
             // The startup owner holds this mutex through thread creation.
             // Observing STARTING after acquiring it therefore means poison
             // recovery exposed an abandoned handoff.
-            log::error!(
-                "mux-server domain-config admission retry recovered an abandoned startup"
-            );
+            log::error!("mux-server domain-config admission retry recovered an abandoned startup");
             *state = MuxDomainConfigAdmissionRetryState::Idle;
         }
         MuxDomainConfigAdmissionRetryState::Idle => {}
@@ -530,8 +526,7 @@ fn ensure_mux_domain_config_admission_retry(
 fn finish_mux_domain_config_admission_retry(observed_generation: u64) -> bool {
     let mut state = lock_mux_domain_config_admission_retry_state();
     let has_newer_request =
-        MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
-            != observed_generation;
+        MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != observed_generation;
     *state = if has_newer_request {
         MuxDomainConfigAdmissionRetryState::Running
     } else {
@@ -541,8 +536,7 @@ fn finish_mux_domain_config_admission_retry(observed_generation: u64) -> bool {
 }
 
 fn stop_mux_domain_config_admission_retry() {
-    *lock_mux_domain_config_admission_retry_state() =
-        MuxDomainConfigAdmissionRetryState::Idle;
+    *lock_mux_domain_config_admission_retry_state() = MuxDomainConfigAdmissionRetryState::Idle;
 }
 
 fn start_mux_domain_config_admission_retry() {
@@ -569,8 +563,7 @@ fn retry_mux_domain_config_admission() {
         let generation = MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire);
         match try_admit_mux_domain_config_reconciliation(generation) {
             MuxDomainConfigAdmission::Started => {
-                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
-                    != generation
+                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != generation
                 {
                     continue;
                 }
@@ -617,8 +610,7 @@ async fn reconcile_mux_domain_config_until_converged(generation: u64) {
 
     let mut retirement_round = 0_u64;
     let mut retry_delay = std::time::Duration::from_millis(25);
-    const MAX_RECONCILIATION_DELAY: std::time::Duration =
-        std::time::Duration::from_secs(1);
+    const MAX_RECONCILIATION_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
     loop {
         if shutdown_requested() || !mux_domain_config_reconciliation_is_current(generation) {
             return;
@@ -640,9 +632,7 @@ async fn reconcile_mux_domain_config_until_converged(generation: u64) {
                     );
                 }
                 promise::spawn::sleep(retry_delay).await;
-                retry_delay = retry_delay
-                    .saturating_mul(2)
-                    .min(MAX_RECONCILIATION_DELAY);
+                retry_delay = retry_delay.saturating_mul(2).min(MAX_RECONCILIATION_DELAY);
             }
             Err(error) => {
                 metrics::counter!(
@@ -867,7 +857,9 @@ mod tests {
         assert_ne!(error_cleanup, success_cleanup);
 
         let run_source = &source[run_start..];
-        let parse = run_source.find("let opts = Opt::parse();").expect("parse opts");
+        let parse = run_source
+            .find("let opts = Opt::parse();")
+            .expect("parse opts");
         let foreground = run_source
             .find("if !opts.daemonize {")
             .expect("separate mux owner from daemonizing parent");

@@ -1022,8 +1022,7 @@ impl Parser {
                     );
                     begun.error = true;
                     begun.output.clear();
-                    let message =
-                        "tmux control response exceeded the bounded guarded-output limit";
+                    let message = "tmux control response exceeded the bounded guarded-output limit";
                     if message.len() <= self.max_guarded_output_len
                         && begun.output.try_reserve(message.len()).is_ok()
                     {

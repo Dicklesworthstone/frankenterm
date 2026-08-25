@@ -2,33 +2,26 @@
 
 use crate::output::{
     GuardianOutputCompletionState, GuardianOutputPipeline, GuardianOutputSubmitError,
-    GuardianPaneInputCompletionError, GuardianPaneInputJournal,
-    GuardianPaneInputTransaction, GuardianPaneInputTransactionError,
-    GuardianPaneOutputJournal, OUTPUT_RECORD_BYTES,
+    GuardianPaneInputCompletionError, GuardianPaneInputJournal, GuardianPaneInputTransaction,
+    GuardianPaneInputTransactionError, GuardianPaneOutputJournal, OUTPUT_RECORD_BYTES,
 };
 use mio::Waker;
 use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
-use mux::guardian_input_journal::{
-    GuardianInputDisposition, catch_guardian_input_worker_panic,
-};
+use mux::guardian_input_journal::{GuardianInputDisposition, catch_guardian_input_worker_panic};
 use mux::guardian_protocol::{
-    AuthenticatedGuardianRequest, GuardianEffectOutcome, GuardianEffectTransactionError,
-    GuardianMuxLeaseRetirement, GuardianOperation, GuardianPaneState, GuardianProtocolError,
-    GuardianProtocolState, GuardianRejectionCode, GuardianReply, GuardianResizePayload,
-    GuardianResponseEnvelope, GuardianSignal, GuardianSpawnPayload, InputEffectState,
-    GUARDIAN_MAX_PANES,
+    AuthenticatedGuardianRequest, GUARDIAN_MAX_PANES, GuardianEffectOutcome,
+    GuardianEffectTransactionError, GuardianMuxLeaseRetirement, GuardianOperation,
+    GuardianPaneState, GuardianProtocolError, GuardianProtocolState, GuardianRejectionCode,
+    GuardianReply, GuardianResizePayload, GuardianResponseEnvelope, GuardianSignal,
+    GuardianSpawnPayload, InputEffectState,
 };
-use portable_pty::{
-    Child, ChildKiller, MasterPty, PollablePtyReader, native_pty_system,
-};
+use portable_pty::{Child, ChildKiller, MasterPty, PollablePtyReader, native_pty_system};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
-use std::sync::mpsc::{
-    Receiver, SyncSender, TryRecvError, TrySendError, sync_channel,
-};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -147,10 +140,7 @@ struct OutputRearmCursor {
 }
 
 impl OutputRearmCursor {
-    fn select(
-        &mut self,
-        candidates: impl IntoIterator<Item = Uuid>,
-    ) -> Option<Uuid> {
+    fn select(&mut self, candidates: impl IntoIterator<Item = Uuid>) -> Option<Uuid> {
         let selected = round_robin_successor(self.last_serviced, candidates)?;
         self.last_serviced = Some(selected);
         Some(selected)
@@ -175,15 +165,14 @@ impl GuardianInputRoute {
         request_id: Uuid,
         effect_id: Uuid,
     ) -> Option<Self> {
-        (connection_generation != 0
-            && !request_id.is_nil()
-            && !effect_id.is_nil())
-        .then_some(Self {
-            connection_token,
-            connection_generation,
-            request_id,
-            effect_id,
-        })
+        (connection_generation != 0 && !request_id.is_nil() && !effect_id.is_nil()).then_some(
+            Self {
+                connection_token,
+                connection_generation,
+                request_id,
+                effect_id,
+            },
+        )
     }
 }
 
@@ -322,9 +311,7 @@ impl GuardianInputPipeline {
             .name("ft-guardian-input".to_string())
             .spawn(move || input_worker(job_receiver, completion_sender, worker_waker))
             .map_err(|_| {
-                GuardianProtocolError::StateInvariantViolation(
-                    "guardian-input-worker-spawn",
-                )
+                GuardianProtocolError::StateInvariantViolation("guardian-input-worker-spawn")
             })?;
         Ok(Self {
             jobs: Some(jobs),
@@ -421,10 +408,7 @@ fn execute_input_job(job: &mut InputJob) -> InputJobExecution {
             // The original authenticated byte length remains available for
             // terminal correlation, so plaintext can die before terminal fsync.
             job.request.zeroize_payload();
-            match job
-                .journal
-                .complete_write(&mut job.protocol, outcome)
-            {
+            match job.journal.complete_write(&mut job.protocol, outcome) {
                 Ok(reply) => input_reply_execution(&job.request, reply),
                 Err(
                     GuardianPaneInputCompletionError::DispositionIndeterminate
@@ -480,9 +464,7 @@ fn input_reply_execution(
             InputEffectState::DurablePrefix { applied_bytes } => {
                 Some(GuardianInputDisposition::DurablePrefix { applied_bytes })
             }
-            InputEffectState::KnownNotApplied => {
-                Some(GuardianInputDisposition::KnownNotApplied)
-            }
+            InputEffectState::KnownNotApplied => Some(GuardianInputDisposition::KnownNotApplied),
             InputEffectState::NotSeen | InputEffectState::DispositionUnavailable => None,
         },
         _ => None,
@@ -495,13 +477,9 @@ fn input_reply_execution(
             ))
         }
         Some(
-            GuardianInputDisposition::DurableFull
-            | GuardianInputDisposition::DurablePrefix { .. },
+            GuardianInputDisposition::DurableFull | GuardianInputDisposition::DurablePrefix { .. },
         ) => GuardianResponseEnvelope::reply(request, &reply).ok(),
-        Some(
-            GuardianInputDisposition::Intent
-            | GuardianInputDisposition::AcceptedNotDurable,
-        )
+        Some(GuardianInputDisposition::Intent | GuardianInputDisposition::AcceptedNotDurable)
         | None => None,
     };
     InputJobExecution {
@@ -528,8 +506,7 @@ pub struct GuardianRuntime {
     // in flight.  Retain the descriptor-pinned WAL and writer even then: an
     // invariant failure must quarantine input, never silently drop its only
     // recovery authority.
-    orphaned_input_authority:
-        Option<(Box<dyn Write + Send>, GuardianPaneInputJournal)>,
+    orphaned_input_authority: Option<(Box<dyn Write + Send>, GuardianPaneInputJournal)>,
     pending_child_exits: Vec<(Uuid, i32)>,
     output_pipeline_failed: bool,
     output_rearm_cursor: OutputRearmCursor,
@@ -653,10 +630,8 @@ impl GuardianRuntime {
             GuardianOperation::Input => {
                 // A borrowed request cannot cross the worker boundary. The
                 // transport must route owned Input through `submit_input`.
-                self.counters.input_activation_rejections = self
-                    .counters
-                    .input_activation_rejections
-                    .saturating_add(1);
+                self.counters.input_activation_rejections =
+                    self.counters.input_activation_rejections.saturating_add(1);
                 return None;
             }
             GuardianOperation::Checkpoint
@@ -705,10 +680,14 @@ impl GuardianRuntime {
             // connection without a false terminal rejection. The exact
             // authenticated retry can then recover the retained receipt.
             Ok(reply) => GuardianResponseEnvelope::reply(request, &reply).ok(),
-            Err(_) if newly_indeterminate_effect(
-                effect_was_indeterminate,
-                self.indeterminate_effect,
-            ) => None,
+            Err(_)
+                if newly_indeterminate_effect(
+                    effect_was_indeterminate,
+                    self.indeterminate_effect,
+                ) =>
+            {
+                None
+            }
             Err(code) => Some(GuardianResponseEnvelope::rejection(request, code)),
         }
     }
@@ -729,12 +708,10 @@ impl GuardianRuntime {
             || request.header().request_id != route.request_id
             || request.header().effect_id != Some(route.effect_id)
         {
-            return GuardianInputSubmission::Respond(
-                GuardianResponseEnvelope::rejection(
-                    &request,
-                    GuardianRejectionCode::InvalidRequest,
-                ),
-            );
+            return GuardianInputSubmission::Respond(GuardianResponseEnvelope::rejection(
+                &request,
+                GuardianRejectionCode::InvalidRequest,
+            ));
         }
         if self.input_pipeline_failed || self.protocol.is_none() {
             self.counters.input_retryable_capacity_closes = self
@@ -756,20 +733,16 @@ impl GuardianRuntime {
             };
         }
         let Some(pane_id) = request.header().pane_id else {
-            return GuardianInputSubmission::Respond(
-                GuardianResponseEnvelope::rejection(
-                    &request,
-                    GuardianRejectionCode::InvalidRequest,
-                ),
-            );
+            return GuardianInputSubmission::Respond(GuardianResponseEnvelope::rejection(
+                &request,
+                GuardianRejectionCode::InvalidRequest,
+            ));
         };
         let Some(pane) = self.panes.get_mut(&pane_id) else {
-            return GuardianInputSubmission::Respond(
-                GuardianResponseEnvelope::rejection(
-                    &request,
-                    GuardianRejectionCode::PaneNotFound,
-                ),
-            );
+            return GuardianInputSubmission::Respond(GuardianResponseEnvelope::rejection(
+                &request,
+                GuardianRejectionCode::PaneNotFound,
+            ));
         };
         let Some(writer) = pane.writer.take() else {
             self.counters.input_retryable_capacity_closes = self
@@ -805,10 +778,8 @@ impl GuardianRuntime {
         };
         match self.input_pipeline.try_submit(job) {
             Ok(()) => {
-                self.counters.input_transactions_submitted = self
-                    .counters
-                    .input_transactions_submitted
-                    .saturating_add(1);
+                self.counters.input_transactions_submitted =
+                    self.counters.input_transactions_submitted.saturating_add(1);
                 GuardianInputSubmission::Pending
             }
             Err(InputSubmitError::Saturated(job)) => {
@@ -822,10 +793,8 @@ impl GuardianRuntime {
             Err(InputSubmitError::Unavailable(job)) => {
                 self.restore_unsent_input_job(job);
                 self.input_pipeline_failed = true;
-                self.counters.input_worker_disconnects = self
-                    .counters
-                    .input_worker_disconnects
-                    .saturating_add(1);
+                self.counters.input_worker_disconnects =
+                    self.counters.input_worker_disconnects.saturating_add(1);
                 GuardianInputSubmission::CloseRetryably
             }
         }
@@ -835,10 +804,8 @@ impl GuardianRuntime {
         debug_assert!(self.protocol.is_none());
         self.protocol = Some(job.protocol);
         if !self.restore_pane_input_authority(job.pane_id, job.writer, job.journal) {
-            self.counters.protocol_transition_failures = self
-                .counters
-                .protocol_transition_failures
-                .saturating_add(1);
+            self.counters.protocol_transition_failures =
+                self.counters.protocol_transition_failures.saturating_add(1);
         }
     }
 
@@ -875,10 +842,8 @@ impl GuardianRuntime {
                     completion.writer,
                     completion.journal,
                 ) {
-                    self.counters.protocol_transition_failures = self
-                        .counters
-                        .protocol_transition_failures
-                        .saturating_add(1);
+                    self.counters.protocol_transition_failures =
+                        self.counters.protocol_transition_failures.saturating_add(1);
                     self.replay_deferred_child_exits();
                     return GuardianRuntimeInputCompletionState::Ready(
                         GuardianRuntimeInputCompletion {
@@ -887,10 +852,8 @@ impl GuardianRuntime {
                         },
                     );
                 }
-                self.counters.input_transactions_completed = self
-                    .counters
-                    .input_transactions_completed
-                    .saturating_add(1);
+                self.counters.input_transactions_completed =
+                    self.counters.input_transactions_completed.saturating_add(1);
                 if completion.worker_panicked {
                     // The outer job bundle survived, but a panic can leave an
                     // inner protocol/journal/writer operation at an unknown
@@ -898,23 +861,17 @@ impl GuardianRuntime {
                     // second write; the global quarantine fences unrelated
                     // mutations from trusting possibly half-updated state.
                     self.indeterminate_effect = true;
-                    self.counters.input_worker_panics = self
-                        .counters
-                        .input_worker_panics
-                        .saturating_add(1);
+                    self.counters.input_worker_panics =
+                        self.counters.input_worker_panics.saturating_add(1);
                 }
                 match completion.disposition {
                     Some(GuardianInputDisposition::KnownNotApplied) => {
-                        self.counters.input_known_not_applied = self
-                            .counters
-                            .input_known_not_applied
-                            .saturating_add(1);
+                        self.counters.input_known_not_applied =
+                            self.counters.input_known_not_applied.saturating_add(1);
                     }
                     Some(GuardianInputDisposition::DurablePrefix { .. }) => {
-                        self.counters.input_durable_prefixes = self
-                            .counters
-                            .input_durable_prefixes
-                            .saturating_add(1);
+                        self.counters.input_durable_prefixes =
+                            self.counters.input_durable_prefixes.saturating_add(1);
                     }
                     Some(
                         GuardianInputDisposition::Intent
@@ -924,12 +881,10 @@ impl GuardianRuntime {
                     | None => {}
                 }
                 self.replay_deferred_child_exits();
-                GuardianRuntimeInputCompletionState::Ready(
-                    GuardianRuntimeInputCompletion {
-                        route: completion.route,
-                        response: completion.response,
-                    },
-                )
+                GuardianRuntimeInputCompletionState::Ready(GuardianRuntimeInputCompletion {
+                    route: completion.route,
+                    response: completion.response,
+                })
             }
             GuardianRuntimeInputCompletionStateInternal::Empty => {
                 GuardianRuntimeInputCompletionState::Empty
@@ -937,10 +892,8 @@ impl GuardianRuntime {
             GuardianRuntimeInputCompletionStateInternal::Disconnected => {
                 if !self.input_pipeline_failed {
                     self.input_pipeline_failed = true;
-                    self.counters.input_worker_disconnects = self
-                        .counters
-                        .input_worker_disconnects
-                        .saturating_add(1);
+                    self.counters.input_worker_disconnects =
+                        self.counters.input_worker_disconnects.saturating_add(1);
                 }
                 GuardianRuntimeInputCompletionState::Disconnected
             }
@@ -957,10 +910,8 @@ impl GuardianRuntime {
                 Ok(()) | Err(GuardianProtocolError::PaneTerminal)
             ) {
                 self.indeterminate_effect = true;
-                self.counters.protocol_transition_failures = self
-                    .counters
-                    .protocol_transition_failures
-                    .saturating_add(1);
+                self.counters.protocol_transition_failures =
+                    self.counters.protocol_transition_failures.saturating_add(1);
             }
         }
         self.release_silent_closed_panes();
@@ -996,14 +947,12 @@ impl GuardianRuntime {
         let Some(pane_id) = self.pty_tokens.get(&token).copied() else {
             return;
         };
-        let pipeline_has_capacity = !self.output_pipeline_failed
-            && self.output_pipeline.available_slots() != 0;
+        let pipeline_has_capacity =
+            !self.output_pipeline_failed && self.output_pipeline.available_slots() != 0;
         let read_count = {
             let Some(pane) = self.panes.get_mut(&pane_id) else {
-                self.counters.protocol_transition_failures = self
-                    .counters
-                    .protocol_transition_failures
-                    .saturating_add(1);
+                self.counters.protocol_transition_failures =
+                    self.counters.protocol_transition_failures.saturating_add(1);
                 return;
             };
             if pane.output.failed
@@ -1015,19 +964,15 @@ impl GuardianRuntime {
             }
             if pane.output.expected_sequence.is_none() {
                 pane.output.failed = true;
-                self.counters.output_commit_failures = self
-                    .counters
-                    .output_commit_failures
-                    .saturating_add(1);
+                self.counters.output_commit_failures =
+                    self.counters.output_commit_failures.saturating_add(1);
                 deregister_reader(&self.registry, pane, &mut self.counters);
                 return;
             }
             if pane.output.remaining_record_capacity == 0 {
                 pane.output.failed = true;
-                self.counters.output_segment_exhaustions = self
-                    .counters
-                    .output_segment_exhaustions
-                    .saturating_add(1);
+                self.counters.output_segment_exhaustions =
+                    self.counters.output_segment_exhaustions.saturating_add(1);
                 deregister_reader(&self.registry, pane, &mut self.counters);
                 return;
             }
@@ -1036,11 +981,7 @@ impl GuardianRuntime {
                 deregister_reader(&self.registry, pane, &mut self.counters);
                 return;
             }
-            let remaining = remaining_output_capacity(
-                self.config,
-                0,
-                self.buffered_output_bytes,
-            );
+            let remaining = remaining_output_capacity(self.config, 0, self.buffered_output_bytes);
             if remaining == 0 {
                 pane.output.waiting_for_slot = true;
                 deregister_reader(&self.registry, pane, &mut self.counters);
@@ -1050,8 +991,7 @@ impl GuardianRuntime {
             let read_len = remaining.min(OUTPUT_RECORD_BYTES);
             let mut bytes = Zeroizing::new(Vec::new());
             if bytes.try_reserve_exact(read_len).is_err() {
-                self.counters.pty_read_failures =
-                    self.counters.pty_read_failures.saturating_add(1);
+                self.counters.pty_read_failures = self.counters.pty_read_failures.saturating_add(1);
                 pane.output.failed = true;
                 deregister_reader(&self.registry, pane, &mut self.counters);
                 return;
@@ -1079,15 +1019,13 @@ impl GuardianRuntime {
             debug_assert!(count <= read_len);
             bytes.truncate(count);
             let Some(next_total) = self.buffered_output_bytes.checked_add(count) else {
-                self.counters.pty_read_failures =
-                    self.counters.pty_read_failures.saturating_add(1);
+                self.counters.pty_read_failures = self.counters.pty_read_failures.saturating_add(1);
                 pane.output.failed = true;
                 deregister_reader(&self.registry, pane, &mut self.counters);
                 return;
             };
             if next_total > self.config.max_total_output_bytes {
-                self.counters.pty_read_failures =
-                    self.counters.pty_read_failures.saturating_add(1);
+                self.counters.pty_read_failures = self.counters.pty_read_failures.saturating_add(1);
                 pane.output.failed = true;
                 deregister_reader(&self.registry, pane, &mut self.counters);
                 return;
@@ -1110,19 +1048,15 @@ impl GuardianRuntime {
             match self.output_pipeline.try_completion() {
                 GuardianOutputCompletionState::Ready(completion) => {
                     let Some(pane) = self.panes.get_mut(&completion.pane_id) else {
-                        self.counters.protocol_transition_failures = self
-                            .counters
-                            .protocol_transition_failures
-                            .saturating_add(1);
+                        self.counters.protocol_transition_failures =
+                            self.counters.protocol_transition_failures.saturating_add(1);
                         continue;
                     };
                     if pane.output.in_flight_bytes != completion.payload_bytes {
                         pane.output.failed = true;
                         pane.output.waiting_for_slot = false;
-                        self.counters.output_commit_failures = self
-                            .counters
-                            .output_commit_failures
-                            .saturating_add(1);
+                        self.counters.output_commit_failures =
+                            self.counters.output_commit_failures.saturating_add(1);
                         continue;
                     }
                     let Some(remaining_buffered_bytes) = self
@@ -1131,10 +1065,8 @@ impl GuardianRuntime {
                     else {
                         pane.output.failed = true;
                         pane.output.waiting_for_slot = false;
-                        self.counters.output_commit_failures = self
-                            .counters
-                            .output_commit_failures
-                            .saturating_add(1);
+                        self.counters.output_commit_failures =
+                            self.counters.output_commit_failures.saturating_add(1);
                         continue;
                     };
                     self.buffered_output_bytes = remaining_buffered_bytes;
@@ -1157,10 +1089,8 @@ impl GuardianRuntime {
                             else {
                                 pane.output.failed = true;
                                 pane.output.waiting_for_slot = false;
-                                self.counters.output_commit_failures = self
-                                    .counters
-                                    .output_commit_failures
-                                    .saturating_add(1);
+                                self.counters.output_commit_failures =
+                                    self.counters.output_commit_failures.saturating_add(1);
                                 continue;
                             };
                             pane.output.durable_plaintext_bytes =
@@ -1188,19 +1118,15 @@ impl GuardianRuntime {
                                 .pty_records_durably_committed
                                 .saturating_add(1);
                             if !has_append_capacity {
-                                self.counters.output_segment_exhaustions = self
-                                    .counters
-                                    .output_segment_exhaustions
-                                    .saturating_add(1);
+                                self.counters.output_segment_exhaustions =
+                                    self.counters.output_segment_exhaustions.saturating_add(1);
                             }
                         }
                         Ok(_) | Err(_) => {
                             pane.output.failed = true;
                             pane.output.waiting_for_slot = false;
-                            self.counters.output_commit_failures = self
-                                .counters
-                                .output_commit_failures
-                                .saturating_add(1);
+                            self.counters.output_commit_failures =
+                                self.counters.output_commit_failures.saturating_add(1);
                         }
                     }
                 }
@@ -1208,10 +1134,8 @@ impl GuardianRuntime {
                 GuardianOutputCompletionState::Disconnected => {
                     if !self.output_pipeline_failed {
                         self.output_pipeline_failed = true;
-                        self.counters.output_worker_disconnects = self
-                            .counters
-                            .output_worker_disconnects
-                            .saturating_add(1);
+                        self.counters.output_worker_disconnects =
+                            self.counters.output_worker_disconnects.saturating_add(1);
                         for pane in self.panes.values_mut() {
                             if let Some(mut payload) = pane.output.pending_plaintext.take() {
                                 let payload_bytes = payload.len();
@@ -1288,9 +1212,8 @@ impl GuardianRuntime {
                     if let Some(remaining) = buffered_output_bytes.checked_sub(payload_bytes) {
                         *buffered_output_bytes = remaining;
                     } else {
-                        counters.protocol_transition_failures = counters
-                            .protocol_transition_failures
-                            .saturating_add(1);
+                        counters.protocol_transition_failures =
+                            counters.protocol_transition_failures.saturating_add(1);
                     }
                     pane.output.failed = true;
                     pane.output.waiting_for_slot = false;
@@ -1311,17 +1234,16 @@ impl GuardianRuntime {
             if available_slots == 0 {
                 break;
             }
-            let Some(pane_id) = output_rearm_cursor.select(
-                panes.iter().filter_map(|(pane_id, pane)| {
+            let Some(pane_id) =
+                output_rearm_cursor.select(panes.iter().filter_map(|(pane_id, pane)| {
                     pane_is_rearm_candidate(pane).then_some(*pane_id)
-                }),
-            ) else {
+                }))
+            else {
                 break;
             };
             let Some(pane) = panes.get_mut(&pane_id) else {
-                counters.protocol_transition_failures = counters
-                    .protocol_transition_failures
-                    .saturating_add(1);
+                counters.protocol_transition_failures =
+                    counters.protocol_transition_failures.saturating_add(1);
                 continue;
             };
             if register_reader(registry, pane) {
@@ -1330,8 +1252,7 @@ impl GuardianRuntime {
             } else {
                 pane.output.failed = true;
                 pane.output.waiting_for_slot = false;
-                counters.output_rearm_failures =
-                    counters.output_rearm_failures.saturating_add(1);
+                counters.output_rearm_failures = counters.output_rearm_failures.saturating_add(1);
             }
         }
     }
@@ -1358,9 +1279,8 @@ impl GuardianRuntime {
                         match protocol.mark_exited(*pane_id, exit_status) {
                             Ok(()) | Err(GuardianProtocolError::PaneTerminal) => true,
                             Err(_) => {
-                                counters.protocol_transition_failures = counters
-                                    .protocol_transition_failures
-                                    .saturating_add(1);
+                                counters.protocol_transition_failures =
+                                    counters.protocol_transition_failures.saturating_add(1);
                                 false
                             }
                         }
@@ -1371,9 +1291,8 @@ impl GuardianRuntime {
                         // Never drop an exit observation under bounded-memory
                         // pressure. Quarantine all later mutations instead.
                         *indeterminate_effect = true;
-                        counters.protocol_transition_failures = counters
-                            .protocol_transition_failures
-                            .saturating_add(1);
+                        counters.protocol_transition_failures =
+                            counters.protocol_transition_failures.saturating_add(1);
                         false
                     };
                     if recorded {
@@ -1382,8 +1301,7 @@ impl GuardianRuntime {
                 }
                 Ok(None) => {}
                 Err(_) => {
-                    counters.child_poll_failures =
-                        counters.child_poll_failures.saturating_add(1);
+                    counters.child_poll_failures = counters.child_poll_failures.saturating_add(1);
                 }
             }
         }
@@ -1728,12 +1646,12 @@ fn effect_result(
         Err(GuardianEffectTransactionError::Protocol(error)) => {
             Err(GuardianRejectionCode::from_protocol_error(&error))
         }
-        Err(GuardianEffectTransactionError::Effect(
-            RuntimeEffectError::CapacityExhausted,
-        )) => Err(GuardianRejectionCode::CapacityExhausted),
-        Err(GuardianEffectTransactionError::Effect(
-            RuntimeEffectError::InternalInvariant,
-        )) => Err(GuardianRejectionCode::InternalInvariant),
+        Err(GuardianEffectTransactionError::Effect(RuntimeEffectError::CapacityExhausted)) => {
+            Err(GuardianRejectionCode::CapacityExhausted)
+        }
+        Err(GuardianEffectTransactionError::Effect(RuntimeEffectError::InternalInvariant)) => {
+            Err(GuardianRejectionCode::InternalInvariant)
+        }
         Err(GuardianEffectTransactionError::OutcomeIndeterminate(intended_reply)) => {
             *indeterminate_effect = true;
             GuardianReply::effect_outcome_indeterminate(request, &intended_reply)
@@ -1779,11 +1697,7 @@ fn spawn_runtime_pane(
         .map_err(|_| RuntimeEffectError::InternalInvariant)?;
     let raw_fd = reader.as_fd().as_raw_fd();
     registry
-        .register(
-            &mut SourceFd(&raw_fd),
-            token,
-            Interest::READABLE,
-        )
+        .register(&mut SourceFd(&raw_fd), token, Interest::READABLE)
         .map_err(|_| RuntimeEffectError::InternalInvariant)?;
 
     let child = match pair.slave.spawn_command(command) {
@@ -1833,9 +1747,7 @@ fn deregister_reader(
         // fail the pane closed so no more PTY bytes are read under ambiguity.
         pane.output.failed = true;
         pane.output.waiting_for_slot = false;
-        counters.output_deregister_failures = counters
-            .output_deregister_failures
-            .saturating_add(1);
+        counters.output_deregister_failures = counters.output_deregister_failures.saturating_add(1);
     }
 }
 
@@ -1845,11 +1757,7 @@ fn register_reader(registry: &Registry, pane: &mut RuntimePane) -> bool {
     }
     let raw_fd = pane.reader.as_fd().as_raw_fd();
     if registry
-        .register(
-            &mut SourceFd(&raw_fd),
-            pane.token,
-            Interest::READABLE,
-        )
+        .register(&mut SourceFd(&raw_fd), pane.token, Interest::READABLE)
         .is_err()
     {
         return false;
@@ -1864,8 +1772,7 @@ mod tests {
     use mio::{Poll, Waker};
     use mux::guardian_protocol::{
         GuardianRequestEnvelope, GuardianRequestHeader, GuardianResponseEnvelope,
-        GuardianResponseStatus, GuardianSecret, decode_guardian_request,
-        encode_guardian_request,
+        GuardianResponseStatus, GuardianSecret, decode_guardian_request, encode_guardian_request,
     };
     use portable_pty::{CommandBuilder, PtySize};
     use std::io;
@@ -1894,13 +1801,8 @@ mod tests {
             Arc::clone(&completion_waker),
         )
         .expect("create runtime output pipeline");
-        let config = GuardianRuntimeConfig::new(
-            1,
-            OUTPUT_RECORD_BYTES,
-            OUTPUT_RECORD_BYTES,
-            2,
-        )
-        .expect("valid runtime test limits");
+        let config = GuardianRuntimeConfig::new(1, OUTPUT_RECORD_BYTES, OUTPUT_RECORD_BYTES, 2)
+            .expect("valid runtime test limits");
         let runtime = GuardianRuntime::new(
             poll.registry()
                 .try_clone()
@@ -2117,11 +2019,7 @@ mod tests {
     ) -> (std::path::PathBuf, Poll, GuardianRuntime, Uuid) {
         let (directory, poll, mut runtime) = runtime_for_input_rejection();
         let pane_id = Uuid::from_u128(31);
-        let spawn = successful_spawn_request(
-            Uuid::from_u128(32),
-            pane_id,
-            Uuid::from_u128(33),
-        );
+        let spawn = successful_spawn_request(Uuid::from_u128(32), pane_id, Uuid::from_u128(33));
         assert_eq!(
             runtime
                 .dispatch(&spawn)
@@ -2130,11 +2028,7 @@ mod tests {
                 .status,
             GuardianResponseStatus::Success
         );
-        let claim = authenticated_claim_request(
-            Uuid::from_u128(34),
-            pane_id,
-            Uuid::from_u128(35),
-        );
+        let claim = authenticated_claim_request(Uuid::from_u128(34), pane_id, Uuid::from_u128(35));
         assert_eq!(
             runtime
                 .dispatch(&claim)
@@ -2165,9 +2059,7 @@ mod tests {
         .expect("valid input route")
     }
 
-    fn wait_for_input_completion(
-        runtime: &mut GuardianRuntime,
-    ) -> GuardianRuntimeInputCompletion {
+    fn wait_for_input_completion(runtime: &mut GuardianRuntime) -> GuardianRuntimeInputCompletion {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             match runtime.try_input_completion() {
@@ -2255,12 +2147,12 @@ mod tests {
             wipe_probe: Option<Arc<InputRequestWipeProbe>>,
         ) -> InputJob {
             let protocol = runtime.protocol.take().expect("test protocol authority");
-            let pane = runtime.panes.get_mut(&pane_id).expect("test pane authority");
+            let pane = runtime
+                .panes
+                .get_mut(&pane_id)
+                .expect("test pane authority");
             let writer = pane.writer.take().expect("test writer authority");
-            let journal = pane
-                .input_journal
-                .take()
-                .expect("test journal authority");
+            let journal = pane.input_journal.take().expect("test journal authority");
             let mut request = OwnedInputRequest::new(request);
             request.set_wipe_probe(wipe_probe);
             InputJob {
@@ -2355,11 +2247,9 @@ mod tests {
     }
 
     fn input_reply_state(response: &GuardianResponseEnvelope) -> InputEffectState {
-        let reply = GuardianReply::decode_for_operation(
-            GuardianOperation::Input,
-            response.payload(),
-        )
-        .expect("input response payload decodes");
+        let reply =
+            GuardianReply::decode_for_operation(GuardianOperation::Input, response.payload())
+                .expect("input response payload decodes");
         let GuardianReply::InputReceipt { state, .. } = reply else {
             panic!("input response must carry an input receipt");
         };
@@ -2425,13 +2315,9 @@ mod tests {
             Uuid::from_u128(103),
             &[0xa5; 17],
         );
-        let mismatched_route = GuardianInputRoute::new(
-            Token(7),
-            1,
-            Uuid::from_u128(104),
-            Uuid::from_u128(103),
-        )
-        .unwrap();
+        let mismatched_route =
+            GuardianInputRoute::new(Token(7), 1, Uuid::from_u128(104), Uuid::from_u128(103))
+                .unwrap();
         assert!(matches!(
             runtime.submit_input(request, mismatched_route),
             GuardianInputSubmission::Respond(_)
@@ -2475,13 +2361,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (entered_tx, entered_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
-        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
-            BlockingWriter {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(BlockingWriter {
                 calls,
                 entered: entered_tx,
                 release: release_rx,
-            },
-        ));
+            }));
         let first = authenticated_input_request_for(
             Uuid::from_u128(111),
             pane_id,
@@ -2530,7 +2415,10 @@ mod tests {
         ));
         assert!(unavailable_probe.drop_wipe.load(Ordering::SeqCst));
         assert!(runtime.protocol.is_some());
-        let pane = runtime.panes.get(&pane_id).expect("pane authority restored");
+        let pane = runtime
+            .panes
+            .get(&pane_id)
+            .expect("pane authority restored");
         assert!(pane.writer.is_some());
         assert!(pane.input_journal.is_some());
     }
@@ -2538,22 +2426,17 @@ mod tests {
     #[test]
     fn live_input_commits_before_success_and_exact_retry_never_writes_twice() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
-            CountingWriter {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(CountingWriter {
                 calls: Arc::clone(&calls),
                 mode: TestWriteMode::Full,
-            },
-        ));
+            }));
         let first_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&first_probe));
         let request_id = Uuid::from_u128(41);
         let effect_id = Uuid::from_u128(42);
-        let request = authenticated_input_request_for(
-            request_id,
-            pane_id,
-            effect_id,
-            b"durable-input",
-        );
+        let request =
+            authenticated_input_request_for(request_id, pane_id, effect_id, b"durable-input");
         let route = input_route(7, 1, &request);
         assert!(matches!(
             runtime.submit_input(request, route),
@@ -2565,19 +2448,21 @@ mod tests {
         assert_worker_request_wiped_before_completion(&first_probe);
         assert_eq!(first.route, route);
         let first_response = first.response.expect("durable input response");
-        assert_eq!(first_response.header().status, GuardianResponseStatus::Success);
-        assert_eq!(input_reply_state(&first_response), InputEffectState::DurableFull);
+        assert_eq!(
+            first_response.header().status,
+            GuardianResponseStatus::Success
+        );
+        assert_eq!(
+            input_reply_state(&first_response),
+            InputEffectState::DurableFull
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(runtime.protocol.is_some());
 
         let retry_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&retry_probe));
-        let retry = authenticated_input_request_for(
-            request_id,
-            pane_id,
-            effect_id,
-            b"durable-input",
-        );
+        let retry =
+            authenticated_input_request_for(request_id, pane_id, effect_id, b"durable-input");
         let retry_route = input_route(8, 2, &retry);
         assert!(matches!(
             runtime.submit_input(retry, retry_route),
@@ -2593,22 +2478,17 @@ mod tests {
     #[test]
     fn zero_byte_write_persists_known_not_applied_and_retries_terminally_reject_without_write() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
-            CountingWriter {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(CountingWriter {
                 calls: Arc::clone(&calls),
                 mode: TestWriteMode::Zero,
-            },
-        ));
+            }));
         let first_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&first_probe));
         let request_id = Uuid::from_u128(51);
         let effect_id = Uuid::from_u128(52);
-        let request = authenticated_input_request_for(
-            request_id,
-            pane_id,
-            effect_id,
-            b"known-zero",
-        );
+        let request =
+            authenticated_input_request_for(request_id, pane_id, effect_id, b"known-zero");
         let route = input_route(7, 1, &request);
         assert!(matches!(
             runtime.submit_input(request, route),
@@ -2617,7 +2497,10 @@ mod tests {
         let first = wait_for_input_completion(&mut runtime);
         assert_worker_request_wiped_before_completion(&first_probe);
         let first_response = first.response.expect("known-zero terminal response");
-        assert_eq!(first_response.header().status, GuardianResponseStatus::Terminal);
+        assert_eq!(
+            first_response.header().status,
+            GuardianResponseStatus::Terminal
+        );
         assert_eq!(
             GuardianRejectionCode::decode(
                 first_response.header().status,
@@ -2630,12 +2513,7 @@ mod tests {
 
         let retry_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&retry_probe));
-        let retry = authenticated_input_request_for(
-            request_id,
-            pane_id,
-            effect_id,
-            b"known-zero",
-        );
+        let retry = authenticated_input_request_for(request_id, pane_id, effect_id, b"known-zero");
         let retry_route = input_route(8, 2, &retry);
         assert!(matches!(
             runtime.submit_input(retry, retry_route),
@@ -2650,22 +2528,17 @@ mod tests {
     #[test]
     fn partial_write_is_a_durable_terminal_prefix_and_exact_retry_is_inert() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
-            CountingWriter {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(CountingWriter {
                 calls: Arc::clone(&calls),
                 mode: TestWriteMode::Prefix(3),
-            },
-        ));
+            }));
         let first_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&first_probe));
         let request_id = Uuid::from_u128(61);
         let effect_id = Uuid::from_u128(62);
-        let request = authenticated_input_request_for(
-            request_id,
-            pane_id,
-            effect_id,
-            b"partial-input",
-        );
+        let request =
+            authenticated_input_request_for(request_id, pane_id, effect_id, b"partial-input");
         let route = input_route(7, 1, &request);
         assert!(matches!(
             runtime.submit_input(request, route),
@@ -2681,12 +2554,8 @@ mod tests {
 
         let retry_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&retry_probe));
-        let retry = authenticated_input_request_for(
-            request_id,
-            pane_id,
-            effect_id,
-            b"partial-input",
-        );
+        let retry =
+            authenticated_input_request_for(request_id, pane_id, effect_id, b"partial-input");
         let retry_route = input_route(8, 2, &retry);
         assert!(matches!(
             runtime.submit_input(retry, retry_route),
@@ -2703,13 +2572,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (entered_tx, entered_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
-        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
-            BlockingWriter {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(BlockingWriter {
                 calls: Arc::clone(&calls),
                 entered: entered_tx,
                 release: release_rx,
-            },
-        ));
+            }));
         let first = authenticated_input_request_for(
             Uuid::from_u128(71),
             pane_id,
@@ -2729,7 +2597,10 @@ mod tests {
         let hello_response = runtime
             .dispatch(&hello)
             .expect("cached incarnation serves Hello while protocol is in flight");
-        assert_eq!(hello_response.header().status, GuardianResponseStatus::Success);
+        assert_eq!(
+            hello_response.header().status,
+            GuardianResponseStatus::Success
+        );
         assert_eq!(
             GuardianReply::decode_for_operation(
                 GuardianOperation::Hello,
@@ -2762,21 +2633,16 @@ mod tests {
     #[test]
     fn recovered_writer_panic_retains_every_authority_and_permanently_fences_replay() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
-            PanickingWriter {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(PanickingWriter {
                 calls: Arc::clone(&calls),
-            },
-        ));
+            }));
         let panic_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&panic_probe));
         let request_id = Uuid::from_u128(77);
         let effect_id = Uuid::from_u128(78);
-        let request = authenticated_input_request_for(
-            request_id,
-            pane_id,
-            effect_id,
-            b"panic-once",
-        );
+        let request =
+            authenticated_input_request_for(request_id, pane_id, effect_id, b"panic-once");
         let route = input_route(7, 1, &request);
         assert!(matches!(
             runtime.submit_input(request, route),
@@ -2789,7 +2655,10 @@ mod tests {
         assert!(completion.response.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(runtime.protocol.is_some());
-        let pane = runtime.panes.get(&pane_id).expect("pane authority retained");
+        let pane = runtime
+            .panes
+            .get(&pane_id)
+            .expect("pane authority retained");
         assert!(pane.writer.is_some());
         assert!(pane.input_journal.is_some());
         assert!(runtime.indeterminate_effect);
@@ -2797,12 +2666,7 @@ mod tests {
 
         let retry_probe = Arc::new(InputRequestWipeProbe::default());
         runtime.input_request_wipe_probe = Some(Arc::clone(&retry_probe));
-        let retry = authenticated_input_request_for(
-            request_id,
-            pane_id,
-            effect_id,
-            b"panic-once",
-        );
+        let retry = authenticated_input_request_for(request_id, pane_id, effect_id, b"panic-once");
         let retry_route = input_route(8, 2, &retry);
         assert!(matches!(
             runtime.submit_input(retry, retry_route),
@@ -2817,13 +2681,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (entered_tx, entered_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
-        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
-            BlockingWriter {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(BlockingWriter {
                 calls,
                 entered: entered_tx,
                 release: release_rx,
-            },
-        ));
+            }));
         let request = authenticated_input_request_for(
             Uuid::from_u128(81),
             pane_id,
@@ -2873,8 +2736,7 @@ mod tests {
     fn exact_spawn_retry_at_runtime_capacity_replays_without_a_second_pty() {
         let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
         let pane_id = Uuid::from_u128(31);
-        let request =
-            successful_spawn_request(Uuid::from_u128(32), pane_id, Uuid::from_u128(33));
+        let request = successful_spawn_request(Uuid::from_u128(32), pane_id, Uuid::from_u128(33));
 
         let first = runtime.dispatch(&request).expect("first spawn response");
         assert_eq!(first.header().status, GuardianResponseStatus::Success);
@@ -2895,7 +2757,9 @@ mod tests {
             .cloned()
             .expect("spawn installs pane protocol state");
 
-        let replay = runtime.dispatch(&request).expect("exact spawn replay response");
+        let replay = runtime
+            .dispatch(&request)
+            .expect("exact spawn replay response");
         assert_eq!(replay, first);
         let protocol_after_replay = runtime
             .protocol
@@ -2971,8 +2835,8 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_rearm_serves_more_waiting_panes_than_fixed_worker_slots(
-    ) -> Result<(), &'static str> {
+    fn round_robin_rearm_serves_more_waiting_panes_than_fixed_worker_slots()
+    -> Result<(), &'static str> {
         let pane_ids = (1_u128..=5).map(Uuid::from_u128).collect::<Vec<_>>();
         let worker_slots = 2;
         let mut cursor = OutputRearmCursor::default();
@@ -3008,9 +2872,7 @@ mod tests {
             last_serviced: Some(pane_ids[2]),
         };
         assert_eq!(
-            stale_cursor.select(
-                [pane_ids[0], pane_ids[1], pane_ids[3], pane_ids[4]],
-            ),
+            stale_cursor.select([pane_ids[0], pane_ids[1], pane_ids[3], pane_ids[4]],),
             Some(pane_ids[3])
         );
         stale_cursor.last_serviced = Some(pane_ids[4]);
