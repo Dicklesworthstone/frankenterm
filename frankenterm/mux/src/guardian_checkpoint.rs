@@ -1288,11 +1288,19 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
 
     /// Mint Genesis publication authority only from a canonical pre-spawn
     /// terminal checkpoint and the one retained Spawn-effect permit.
+    ///
+    /// The returned nonduplicable reservation identity is the sole continuation
+    /// into catalog admission. This one-time split lets manifest sealing and
+    /// durable catalog publication consume distinct capabilities without ever
+    /// cloning or reissuing the authenticated Spawn permit.
     pub fn from_genesis_spawn_permit(
         binding: &GuardianCheckpointStageBindingV1,
         permit: GuardianCheckpointGenesisSpawnPermitV1,
         terminal_checkpoint: &RecoveryTerminalCheckpointV2,
-    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+    ) -> Result<
+        (Self, GuardianGenesisReservationIdentityV1),
+        GuardianCheckpointBoundaryError,
+    > {
         let reservation = permit.into_reservation_identity();
         let spawn_effect_id = reservation.spawn_effect_id();
         let authoritative_descriptor =
@@ -1316,10 +1324,14 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
         {
             return Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch);
         }
-        Ok(Self {
-            binding: *binding,
-            genesis_upload_id: Some(reservation.upload_id()),
-        })
+        let upload_id = reservation.upload_id();
+        Ok((
+            Self {
+                binding: *binding,
+                genesis_upload_id: Some(upload_id),
+            },
+            reservation,
+        ))
     }
 
     /// Consume this one publication authority and bind it to one exact
@@ -10599,7 +10611,7 @@ mod tests {
             ),
             Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
         ));
-        let genesis_authority =
+        let (genesis_authority, genesis_catalog_continuation) =
             GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
                 &genesis_binding,
                 GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(
@@ -10610,6 +10622,11 @@ mod tests {
                 &genesis_terminal,
             )
             .expect("mint exact Genesis terminal and retained Spawn authority");
+        assert_eq!(genesis_catalog_continuation.upload_id(), genesis_upload_id);
+        assert_eq!(
+            genesis_catalog_continuation.spawn_effect_id(),
+            spawn_effect_id
+        );
         let genesis_publication_id = Uuid::new_v4();
         let genesis_protocol_descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(
             spawn_effect_id,

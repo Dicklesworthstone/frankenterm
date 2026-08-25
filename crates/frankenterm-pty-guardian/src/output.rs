@@ -17,8 +17,8 @@ use mux::guardian_checkpoint::{
     GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES, GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES,
     GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointBoundaryError,
     GuardianCheckpointCandidateIdentityV1, GuardianCheckpointCipher, GuardianCheckpointCipherError,
-    GuardianCheckpointGenesisSpawnPermitV1, GuardianCheckpointOrderedChunkSetBuilderV1,
-    GuardianCheckpointOrderedChunkSetIdentityV1, GuardianCheckpointStageBindingV1,
+    GuardianCheckpointOrderedChunkSetBuilderV1, GuardianCheckpointOrderedChunkSetIdentityV1,
+    GuardianCheckpointStageBindingV1,
     GuardianCheckpointStageRecordContextV1, GuardianCheckpointStageRecordKindV1,
     GuardianCheckpointStageScopeV1, GuardianCheckpointStageSealIntentV1,
     GuardianCheckpointValidatedManifestAuthorityV1, GuardianEncryptedCheckpointStageRecordV1,
@@ -2145,14 +2145,14 @@ impl GuardianCheckpointStageStore {
         })
     }
 
-    /// Consume the exact authenticated Spawn reservation, publish its already
-    /// sealed Genesis upload, and return PTY-admission authority only after a
-    /// candidate + marker directory sync and a complete catalog rescan.
+    /// Consume the exact reservation continuation produced when the nonclone
+    /// Spawn permit was split into Genesis-seal authority, publish its already
+    /// sealed upload, and return PTY-admission authority only after a candidate
+    /// + marker directory sync and a complete catalog rescan.
     pub(crate) fn publish_genesis_catalog_admission(
         &self,
-        permit: GuardianCheckpointGenesisSpawnPermitV1,
+        reservation_identity: GuardianGenesisReservationIdentityV1,
     ) -> Result<GuardianPublishedGenesisAdmissionPermitV1, GuardianCheckpointStageStoreError> {
-        let reservation_identity = permit.into_reservation_identity();
         let reservation = CheckpointCatalogGenesisReservationBinding::from(&reservation_identity);
         let catalog_candidate_checksum = self.with_exclusive_directory(|inner| {
             let census = checkpoint_stage_census(inner)?;
@@ -7325,6 +7325,56 @@ fn checkpoint_catalog_resync_file(
     Ok(())
 }
 
+enum CheckpointCatalogGenesisCandidatePlan<'a> {
+    Create,
+    Reuse(&'a DiscoveredCheckpointCatalogCandidate),
+}
+
+fn checkpoint_catalog_genesis_candidate_plan<'a>(
+    scan: &'a CheckpointCatalogScan,
+    identity: CheckpointCatalogIdentity,
+    candidate_path: &Path,
+) -> Result<CheckpointCatalogGenesisCandidatePlan<'a>, GuardianCheckpointStageStoreError> {
+    match scan.unpublished_candidates.as_slice() {
+        [] => Ok(CheckpointCatalogGenesisCandidatePlan::Create),
+        [existing] if existing.identity == identity && existing.path == candidate_path => {
+            Ok(CheckpointCatalogGenesisCandidatePlan::Reuse(existing))
+        }
+        [_] | [_, ..] => Err(GuardianCheckpointStageStoreError::Poisoned),
+    }
+}
+
+fn checkpoint_catalog_genesis_added_resources(
+    plan: &CheckpointCatalogGenesisCandidatePlan<'_>,
+    candidate_bytes: usize,
+    marker_bytes: usize,
+) -> Result<(usize, u64), GuardianCheckpointStageStoreError> {
+    let (added_files, added_bytes) = match plan {
+        CheckpointCatalogGenesisCandidatePlan::Create => {
+            let bytes = candidate_bytes
+                .checked_add(marker_bytes)
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+            (2, bytes)
+        }
+        CheckpointCatalogGenesisCandidatePlan::Reuse(_) => (1, marker_bytes),
+    };
+    Ok((
+        added_files,
+        u64::try_from(added_bytes).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    ))
+}
+
+fn checkpoint_catalog_require_exact_genesis_candidate_bytes(
+    observed: &[u8],
+    expected: &[u8],
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    if checkpoint_bytes_match(observed, expected) {
+        Ok(())
+    } else {
+        Err(GuardianCheckpointStageStoreError::Poisoned)
+    }
+}
+
 fn checkpoint_catalog_publish_genesis_stage(
     inner: &GuardianCheckpointStageStoreInner,
     request: &GuardianCheckpointStageRequestV1,
@@ -7387,31 +7437,20 @@ fn checkpoint_catalog_publish_genesis_stage(
         }
         return Ok(recovered_member.clone());
     }
-    if scan.unpublished_candidates.len() > 1 {
-        return Err(GuardianCheckpointStageStoreError::Poisoned);
-    }
-
     let mut candidate =
         checkpoint_catalog_candidate_from_genesis_stage(inner, request, identity, reservation)?;
     let encoded_candidate = checkpoint_catalog_encode_candidate(&mut candidate)?;
     let marker = checkpoint_catalog_marker_for_candidate(&candidate);
     let encoded_marker = checkpoint_catalog_encode_marker(&marker);
-    let candidate_was_present = !scan.unpublished_candidates.is_empty();
-    let added_files = usize::from(!candidate_was_present)
-        .checked_add(1)
-        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
-    let added_bytes = u64::try_from(encoded_marker.len())
-        .ok()
-        .and_then(|marker_bytes| {
-            if candidate_was_present {
-                Some(marker_bytes)
-            } else {
-                u64::try_from(encoded_candidate.len())
-                    .ok()
-                    .and_then(|candidate_bytes| candidate_bytes.checked_add(marker_bytes))
-            }
-        })
-        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let candidate_path =
+        checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Candidate)?;
+    let candidate_plan =
+        checkpoint_catalog_genesis_candidate_plan(&scan, identity, &candidate_path)?;
+    let (added_files, added_bytes) = checkpoint_catalog_genesis_added_resources(
+        &candidate_plan,
+        encoded_candidate.len(),
+        encoded_marker.len(),
+    )?;
     if scan
         .relevant_files
         .checked_add(added_files)
@@ -7423,21 +7462,18 @@ fn checkpoint_catalog_publish_genesis_stage(
     {
         return Err(GuardianCheckpointStageStoreError::Capacity);
     }
-    let candidate_path =
-        checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Candidate)?;
-    let candidate_file_identity = if let Some(existing) = scan.unpublished_candidates.first() {
-        if existing.identity != identity || existing.path != candidate_path {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
+    let candidate_file_identity = match candidate_plan {
+        CheckpointCatalogGenesisCandidatePlan::Reuse(existing) => {
         let existing_bytes = checkpoint_catalog_read_file(
             inner,
             &existing.path,
             existing.file_identity,
             CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
         )?;
-        if !checkpoint_bytes_match(&existing_bytes, &encoded_candidate) {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
+        checkpoint_catalog_require_exact_genesis_candidate_bytes(
+            &existing_bytes,
+            &encoded_candidate,
+        )?;
         let decoded = checkpoint_catalog_decode_candidate(&existing_bytes)?;
         if decoded.metadata.identity != identity
             || decoded.metadata != candidate.metadata
@@ -7453,14 +7489,14 @@ fn checkpoint_catalog_publish_genesis_stage(
             "checkpoint-catalog-genesis-candidate-retry-sync",
         )?;
         existing.file_identity
-    } else {
-        checkpoint_catalog_create_file(
+        }
+        CheckpointCatalogGenesisCandidatePlan::Create => checkpoint_catalog_create_file(
             inner,
             &candidate_path,
             &encoded_candidate,
             "checkpoint-catalog-genesis-candidate-write",
             "checkpoint-catalog-genesis-candidate-sync",
-        )?
+        )?,
     };
     inner.directory.sync_all().map_err(|error| {
         GuardianCheckpointStageStoreError::io(
