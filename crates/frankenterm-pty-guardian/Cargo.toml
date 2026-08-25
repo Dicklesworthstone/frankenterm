@@ -27,6 +27,7 @@ zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 getrandom.workspace = true
+frankenterm-sigpipe.workspace = true
 libc.workspace = true
 mio = { workspace = true, features = ["net", "os-ext", "os-poll"] }
 mux.workspace = true

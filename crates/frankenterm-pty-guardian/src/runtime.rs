@@ -1,25 +1,28 @@
 //! Guardian-owned PTY and child lifetime state.
 
 use crate::output::{
-    GuardianOutputCompletionState, GuardianOutputPipeline, GuardianOutputSubmitError,
-    GuardianPaneInputCompletionError, GuardianPaneInputJournal, GuardianPaneInputTransaction,
-    GuardianPaneInputTransactionError, GuardianPaneOutputJournal, OUTPUT_RECORD_BYTES,
+    GuardianCheckpointStageStore, GuardianOutputCompletionState, GuardianOutputPipeline,
+    GuardianOutputSubmitError, GuardianPaneInputCompletionError, GuardianPaneInputJournal,
+    GuardianPaneInputTransaction, GuardianPaneInputTransactionError, GuardianPaneOutputJournal,
+    OUTPUT_RECORD_BYTES,
 };
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mio::Waker;
 use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
 use mux::guardian_input_journal::{GuardianInputDisposition, catch_guardian_input_worker_panic};
 use mux::guardian_protocol::{
-    AuthenticatedGuardianRequest, GUARDIAN_MAX_PANES, GuardianEffectOutcome,
-    GuardianEffectTransactionError, GuardianMuxLeaseRetirement, GuardianOperation,
-    GuardianPaneState, GuardianProtocolError, GuardianProtocolState, GuardianRejectionCode,
-    GuardianReply, GuardianResizePayload, GuardianResponseEnvelope, GuardianSignal,
-    GuardianSpawnPayload, InputEffectState,
+    AuthenticatedGuardianRequest, GUARDIAN_MAX_PANES, GuardianCheckpointStageKindV1,
+    GuardianEffectOutcome, GuardianEffectTransactionError, GuardianMuxLeaseRetirement,
+    GuardianOperation, GuardianPaneState, GuardianProtocolError, GuardianProtocolState,
+    GuardianRejectionCode, GuardianReply, GuardianResizePayload, GuardianResponseEnvelope,
+    GuardianSignal, GuardianSpawnPayload, InputEffectState,
 };
 use portable_pty::{Child, ChildKiller, MasterPty, PollablePtyReader, native_pty_system};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
