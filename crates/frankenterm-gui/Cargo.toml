@@ -89,6 +89,7 @@ internal-glyphcache-test-harness = []
 
 [build-dependencies]
 anyhow.workspace = true
+frankenterm-build-identity.workspace = true
 
 [dependencies]
 # Core library

@@ -9229,4 +9229,203 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ft_dir);
     }
+
+    #[test]
+    fn terminal_certificate_synthesized_on_completion() {
+        let plan = make_plan(2);
+        let mut ledger = TxExecutionLedger::new("exec-cert-1", "test-plan", plan.hash());
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger.transition_phase(TxPhase::Committing).unwrap();
+
+        let key0 = make_key("test-plan", "step-0");
+        let key1 = make_key("test-plan", "step-1");
+        ledger
+            .append(
+                key0,
+                StepOutcome::Success {
+                    result: Some("ok0".to_string()),
+                },
+                StepRisk::Low,
+                "agent",
+                1000,
+            )
+            .unwrap();
+        ledger
+            .append(
+                key1,
+                StepOutcome::Success {
+                    result: Some("ok1".to_string()),
+                },
+                StepRisk::Low,
+                "agent",
+                2000,
+            )
+            .unwrap();
+
+        ledger.transition_phase(TxPhase::Completed).unwrap();
+        let cert = ledger
+            .terminal_certificate()
+            .expect("certificate synthesized on Completed");
+        assert_eq!(cert.disposition, TerminalDispositionKind::Committed);
+        assert_eq!(cert.completed_step_ids, vec!["step-0", "step-1"]);
+        assert!(cert.failed_step_ids.is_empty());
+        assert!(cert.compensated_step_ids.is_empty());
+
+        let json = serde_json::to_string(&ledger).unwrap();
+        let deserialized: TxExecutionLedger = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.terminal_certificate(),
+            Some(cert)
+        );
+
+        let ctx = ResumeContext::from_ledger(&deserialized, &plan);
+        assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
+    }
+
+    #[test]
+    fn terminal_certificate_synthesized_on_rollback() {
+        let plan = make_plan(2);
+        let mut ledger = TxExecutionLedger::new("exec-cert-rollback", "test-plan", plan.hash());
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger.transition_phase(TxPhase::Committing).unwrap();
+
+        let key0 = make_key("test-plan", "step-0");
+        let key1 = make_key("test-plan", "step-1");
+        ledger
+            .append(
+                key0.clone(),
+                StepOutcome::Success {
+                    result: Some("ok0".to_string()),
+                },
+                StepRisk::Low,
+                "agent",
+                1000,
+            )
+            .unwrap();
+        ledger
+            .append(
+                key1,
+                StepOutcome::Failed {
+                    error_code: "ERR".to_string(),
+                    error_message: "boom".to_string(),
+                    compensated: true,
+                },
+                StepRisk::Low,
+                "agent",
+                2000,
+            )
+            .unwrap();
+
+        ledger.transition_phase(TxPhase::Compensating).unwrap();
+        let comp_key0 = IdempotencyKey::for_compensation("test-plan", "step-0", 1000);
+        ledger
+            .append(
+                comp_key0,
+                StepOutcome::Compensated {
+                    original_outcome: Box::new(StepOutcome::Success {
+                        result: Some("ok0".to_string()),
+                    }),
+                    compensation_result: "undone".to_string(),
+                },
+                StepRisk::Low,
+                "agent",
+                3000,
+            )
+            .unwrap();
+
+        ledger.transition_phase(TxPhase::Completed).unwrap();
+        let cert = ledger
+            .terminal_certificate()
+            .expect("certificate synthesized on rollback Completed");
+        assert_eq!(cert.disposition, TerminalDispositionKind::RolledBack);
+        assert_eq!(cert.completed_step_ids, vec!["step-0"]);
+        assert_eq!(cert.failed_step_ids, vec!["step-1"]);
+        assert_eq!(cert.compensated_step_ids, vec!["step-0"]);
+
+        let ctx = ResumeContext::from_ledger(&ledger, &plan);
+        assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
+    }
+
+    #[test]
+    fn resume_context_detects_missing_plan_coverage_in_partial_completed_ledger() {
+        let plan = make_plan(3);
+        let mut ledger = TxExecutionLedger::new("exec-partial", "test-plan", plan.hash());
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger.transition_phase(TxPhase::Committing).unwrap();
+
+        let key0 = make_key("test-plan", "step-0");
+        ledger
+            .append(
+                key0,
+                StepOutcome::Success {
+                    result: Some("ok0".to_string()),
+                },
+                StepRisk::Low,
+                "agent",
+                1000,
+            )
+            .unwrap();
+
+        ledger.transition_phase(TxPhase::Completed).unwrap();
+        let ctx = ResumeContext::from_ledger(&ledger, &plan);
+        assert_eq!(ctx.recommendation, ResumeRecommendation::RestartFresh);
+    }
+
+    #[test]
+    fn terminal_ledger_deserialization_rejects_missing_or_forged_certificate() {
+        let plan = make_plan(1);
+        let mut ledger = TxExecutionLedger::new("exec-cert-tamper", "test-plan", plan.hash());
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger.transition_phase(TxPhase::Committing).unwrap();
+        let key0 = make_key("test-plan", "step-0");
+        ledger
+            .append(
+                key0,
+                StepOutcome::Success {
+                    result: Some("ok0".to_string()),
+                },
+                StepRisk::Low,
+                "agent",
+                1000,
+            )
+            .unwrap();
+        ledger.transition_phase(TxPhase::Completed).unwrap();
+
+        // 1. Deserialization fails if terminal_certificate is missing
+        let mut json_val: serde_json::Value = serde_json::to_value(&ledger).unwrap();
+        json_val
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_certificate");
+        let err = serde_json::from_value::<TxExecutionLedger>(json_val).unwrap_err();
+        assert!(err.to_string().contains("lacks a terminal disposition certificate"));
+
+        // 2. Deserialization fails if certificate execution_id is forged
+        let mut json_val: serde_json::Value = serde_json::to_value(&ledger).unwrap();
+        json_val
+            .get_mut("terminal_certificate")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "execution_id".to_string(),
+                serde_json::Value::String("forged-id".to_string()),
+            );
+        let err = serde_json::from_value::<TxExecutionLedger>(json_val).unwrap_err();
+        assert!(err.to_string().contains("execution_id"));
+
+        // 3. Deserialization fails if completed_step_ids is forged
+        let mut json_val: serde_json::Value = serde_json::to_value(&ledger).unwrap();
+        json_val
+            .get_mut("terminal_certificate")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "completed_step_ids".to_string(),
+                serde_json::json!(["step-0", "step-unexecuted"]),
+            );
+        let err = serde_json::from_value::<TxExecutionLedger>(json_val).unwrap_err();
+        assert!(err.to_string().contains("completed_step_ids"));
+    }
 }

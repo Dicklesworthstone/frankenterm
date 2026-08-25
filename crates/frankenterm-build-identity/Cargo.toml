@@ -1,0 +1,13 @@
+[package]
+name = "frankenterm-build-identity"
+description = "Shared atomic component build-identity grammar for FrankenTerm binaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

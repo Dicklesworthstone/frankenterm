@@ -22,6 +22,9 @@ path = "../../tests/e2e_workflow_trigger.rs"
 [lints]
 workspace = true
 
+[build-dependencies]
+frankenterm-build-identity.workspace = true
+
 [dependencies]
 uuid = { workspace = true, features = ["v4", "rng"] }
 frankenterm-core = { workspace = true, default-features = false }

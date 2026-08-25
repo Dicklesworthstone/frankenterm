@@ -19,6 +19,9 @@ default = ["jemalloc"]
 jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
 io-uring = ["frankenterm-mux-server-impl/io-uring"]
 
+[build-dependencies]
+frankenterm-build-identity.workspace = true
+
 [dependencies]
 anyhow.workspace = true
 async_ossl = { workspace = true, default-features = false, features = ["async-asupersync"] }
