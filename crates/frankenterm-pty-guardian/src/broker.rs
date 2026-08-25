@@ -41,13 +41,18 @@
 use crate::SealedAtomicBuildIdentity;
 use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
 use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
-use mux::guardian_protocol::{GUARDIAN_MAX_PAYLOAD_BYTES, GuardianSpawnPayload};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use mux::guardian_protocol::{
+    GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1, GuardianSpawnPayload,
+};
 #[cfg(test)]
 use portable_pty::ExitStatus;
 use portable_pty::{Child, MasterPty, PollablePtyReader, PtyPair, PtySize, native_pty_system};
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Write};
+use std::fs::File;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::panic::AssertUnwindSafe;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -57,9 +62,427 @@ const BROKER_DEFAULT_MAX_PROXY_OPERATION_BYTES: usize = 64 * 1024;
 const BROKER_DEFAULT_MAX_BUFFERED_OUTPUT_BYTES: usize = 1024 * 1024;
 const BROKER_ABSOLUTE_MAX_BUFFERED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const BROKER_OUTPUT_PUMP_CHUNK_BYTES: usize = 8 * 1024;
+const BROKER_SPAWN_WAL_FILE_MAGIC: [u8; 8] = *b"FTBSW001";
+const BROKER_SPAWN_HEAD_FILE_MAGIC: [u8; 8] = *b"FTBSH001";
+const BROKER_SPAWN_WAL_RECORD_MAGIC: [u8; 8] = *b"FTBSR001";
+const BROKER_SPAWN_HEAD_RECORD_MAGIC: [u8; 8] = *b"FTBHR001";
+const BROKER_SPAWN_WAL_FORMAT_VERSION: u32 = 1;
+const BROKER_SPAWN_WAL_FILE_HEADER_BYTES: usize = 192;
+const BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U32: u32 = 192;
+const BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64: u64 = 192;
+const BROKER_SPAWN_WAL_RECORD_BYTES: usize = 176;
+const BROKER_SPAWN_WAL_RECORD_BYTES_U32: u32 = 176;
+const BROKER_SPAWN_WAL_RECORD_BYTES_U64: u64 = 176;
+const BROKER_SPAWN_HEAD_RECORD_BYTES: usize = 120;
+const BROKER_SPAWN_HEAD_RECORD_BYTES_U32: u32 = 120;
+const BROKER_SPAWN_HEAD_RECORD_BYTES_U64: u64 = 120;
+const BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES: usize = 160;
+const BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES: usize = 144;
+const BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES: usize = 88;
+const BROKER_SPAWN_WAL_MAC_BYTES: usize = 32;
+const BROKER_SPAWN_WAL_KEY_ID_BYTES: usize = 8;
+const BROKER_SPAWN_WAL_MAX_RECORDS: u64 = 4;
 
 fn is_pty_terminal_eio(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::EIO)
+}
+
+/// Exact identity bound into one broker Spawn WAL and its local head anchor.
+///
+/// One WAL exists per durable Spawn effect. The binding digest commits to the
+/// complete canonical Genesis reservation, including payload digest, geometry,
+/// mux/guardian builds, checkpoint, boundary, and upload identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrokerSpawnWalIdentityV1 {
+    journal_id: Uuid,
+    broker_lineage_id: Uuid,
+    mux_incarnation: Uuid,
+    durable_pane_id: Uuid,
+    spawn_effect_id: Uuid,
+    origin_request_id: Uuid,
+    spawn_payload_bytes: u64,
+    binding_digest: [u8; 32],
+}
+
+impl BrokerSpawnWalIdentityV1 {
+    fn from_binding(
+        journal_id: Uuid,
+        broker_lineage_id: Uuid,
+        binding: BrokerGenesisBinding,
+    ) -> Result<Self, BrokerSpawnWalError> {
+        binding
+            .validate()
+            .map_err(|_| BrokerSpawnWalError::InvalidIdentity)?;
+        let identity = Self {
+            journal_id,
+            broker_lineage_id,
+            mux_incarnation: binding.mux_incarnation,
+            durable_pane_id: binding.durable_pane_id,
+            spawn_effect_id: binding.spawn_effect_id,
+            origin_request_id: binding.origin_request_id,
+            spawn_payload_bytes: binding.spawn_payload_bytes,
+            binding_digest: broker_genesis_binding_digest(binding),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(self) -> Result<(), BrokerSpawnWalError> {
+        if self.journal_id.is_nil()
+            || self.broker_lineage_id.is_nil()
+            || self.mux_incarnation.is_nil()
+            || self.durable_pane_id.is_nil()
+            || self.spawn_effect_id.is_nil()
+            || self.origin_request_id.is_nil()
+            || self.spawn_payload_bytes == 0
+            || self.binding_digest == [0; 32]
+        {
+            return Err(BrokerSpawnWalError::InvalidIdentity);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn journal_id(self) -> Uuid {
+        self.journal_id
+    }
+
+    #[must_use]
+    pub const fn broker_lineage_id(self) -> Uuid {
+        self.broker_lineage_id
+    }
+
+    #[must_use]
+    pub const fn durable_pane_id(self) -> Uuid {
+        self.durable_pane_id
+    }
+
+    #[must_use]
+    pub const fn spawn_effect_id(self) -> Uuid {
+        self.spawn_effect_id
+    }
+
+    #[must_use]
+    pub const fn origin_request_id(self) -> Uuid {
+        self.origin_request_id
+    }
+
+    #[must_use]
+    pub const fn spawn_payload_bytes(self) -> u64 {
+        self.spawn_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn binding_digest(self) -> [u8; 32] {
+        self.binding_digest
+    }
+}
+
+/// Durable phase of one broker-managed Spawn effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerSpawnWalPhaseV1 {
+    Intent,
+    Attempted,
+    SpawnObserved,
+    ReplyAcknowledged,
+}
+
+impl BrokerSpawnWalPhaseV1 {
+    const fn to_wire(self) -> u8 {
+        match self {
+            Self::Intent => 1,
+            Self::Attempted => 2,
+            Self::SpawnObserved => 3,
+            Self::ReplyAcknowledged => 4,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self, BrokerSpawnWalError> {
+        match value {
+            1 => Ok(Self::Intent),
+            2 => Ok(Self::Attempted),
+            3 => Ok(Self::SpawnObserved),
+            4 => Ok(Self::ReplyAcknowledged),
+            observed => Err(BrokerSpawnWalError::InvalidPhase { observed }),
+        }
+    }
+}
+
+/// Non-recycled child identity supplied by a platform identity verifier.
+///
+/// A PID alone is insufficient because it may be reused. The digest must bind
+/// the OS process birth identity (for example pidfd/start-time provenance) to
+/// the exact child returned by the one authorized spawn callback. No
+/// production constructor exists in this module until that platform verifier
+/// is wired; tests exercise the WAL independently of that future OS seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrokerKernelChildIdentityV1 {
+    process_id: u32,
+    broker_child_nonce: Uuid,
+    kernel_start_identity_digest: [u8; 32],
+}
+
+impl BrokerKernelChildIdentityV1 {
+    fn validate(self) -> Result<(), BrokerSpawnWalError> {
+        if self.process_id == 0
+            || self.broker_child_nonce.is_nil()
+            || self.kernel_start_identity_digest == [0; 32]
+        {
+            return Err(BrokerSpawnWalError::InvalidChildIdentity);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn process_id(self) -> u32 {
+        self.process_id
+    }
+
+    #[must_use]
+    pub const fn broker_child_nonce(self) -> Uuid {
+        self.broker_child_nonce
+    }
+
+    #[must_use]
+    pub const fn kernel_start_identity_digest(self) -> [u8; 32] {
+        self.kernel_start_identity_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerSpawnWalTailV1 {
+    Clean,
+    Incomplete {
+        wal_trailing_bytes: u64,
+        head_trailing_bytes: u64,
+    },
+}
+
+/// Content-free, authenticated Query result for one broker Spawn effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrokerSpawnWalStatusV1 {
+    pub identity: BrokerSpawnWalIdentityV1,
+    pub phase: Option<BrokerSpawnWalPhaseV1>,
+    pub attempt_id: Option<Uuid>,
+    pub child_identity: Option<BrokerKernelChildIdentityV1>,
+    pub reply_ack_id: Option<Uuid>,
+    pub committed_records: u64,
+    pub committed_wal_bytes: u64,
+    pub committed_head_bytes: u64,
+    pub tail: BrokerSpawnWalTailV1,
+    pub append_authority_withheld: bool,
+    pub head_reconciliation_required: bool,
+}
+
+impl BrokerSpawnWalStatusV1 {
+    /// Any durable phase is a global fence against the legacy Spawn path.
+    #[must_use]
+    pub const fn fences_legacy_spawn(self) -> bool {
+        self.phase.is_some()
+    }
+
+    /// A synchronized attempt permanently consumes retry authority even when
+    /// no later child-observation record is available.
+    #[must_use]
+    pub const fn spawn_outcome_is_indeterminate(self) -> bool {
+        matches!(self.phase, Some(BrokerSpawnWalPhaseV1::Attempted))
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct BrokerSpawnWalReceiptV1 {
+    sequence: u64,
+    phase: BrokerSpawnWalPhaseV1,
+    committed_wal_bytes: u64,
+    committed_head_bytes: u64,
+    record_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    head_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+}
+
+impl BrokerSpawnWalReceiptV1 {
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn phase(self) -> BrokerSpawnWalPhaseV1 {
+        self.phase
+    }
+}
+
+impl std::fmt::Debug for BrokerSpawnWalReceiptV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerSpawnWalReceiptV1")
+            .field("sequence", &self.sequence)
+            .field("phase", &self.phase)
+            .field("committed_wal_bytes", &self.committed_wal_bytes)
+            .field("committed_head_bytes", &self.committed_head_bytes)
+            .field("record_mac", &"[REDACTED]")
+            .field("head_mac", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerSpawnWalRecordState {
+    phase: BrokerSpawnWalPhaseV1,
+    operation_id: Uuid,
+    attempt_id: Uuid,
+    child_identity: Option<BrokerKernelChildIdentityV1>,
+    receipt: BrokerSpawnWalReceiptV1,
+}
+
+struct BrokerSpawnWalScan {
+    committed_bytes: u64,
+    trailing_bytes: u64,
+    records: Vec<BrokerSpawnWalRecordState>,
+}
+
+struct BrokerSpawnHeadScan {
+    committed_bytes: u64,
+    trailing_bytes: u64,
+    record_macs: Vec<[u8; BROKER_SPAWN_WAL_MAC_BYTES]>,
+    terminal_head_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+}
+
+/// Exclusive append/recovery authority for one broker-managed Spawn effect.
+///
+/// Every phase first synchronizes the WAL record and then synchronizes a
+/// matching append-only local head anchor. Any write or sync error poisons the
+/// live authority. Recovery accepts a clean exact pair or one complete WAL
+/// record ahead of the head (the only valid crash cut), but never grants append
+/// authority until the service revalidates both descriptors and reconciles the
+/// head. A valid-prefix rollback by a hostile same-UID actor is outside this
+/// local crash-durability threat model.
+pub struct BrokerSpawnJournalV1 {
+    wal: File,
+    head: File,
+    identity: BrokerSpawnWalIdentityV1,
+    authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    header_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    committed_wal_bytes: u64,
+    committed_head_bytes: u64,
+    records: Vec<BrokerSpawnWalRecordState>,
+    terminal_head_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    directory_entry_sync_required: bool,
+    recovery_append_authority_withheld: bool,
+    head_reconciliation_required: bool,
+    poisoned: bool,
+    #[cfg(test)]
+    injected_fault: Option<BrokerSpawnWalInjectedFault>,
+}
+
+/// Opaque proof that the service revalidated the pinned WAL, head, key, and
+/// parent-directory identities after recovery.
+pub(crate) struct BrokerSpawnWalFilesystemRevalidationV1 {
+    identity: BrokerSpawnWalIdentityV1,
+    observed_wal_bytes: u64,
+    observed_head_bytes: u64,
+}
+
+/// Nonduplicable authority to invoke one Spawn callback after durable Attempt.
+#[must_use = "a durable broker Spawn attempt permit must be consumed exactly once"]
+pub struct BrokerSpawnAttemptPermitV1 {
+    identity: BrokerSpawnWalIdentityV1,
+    attempt_id: Uuid,
+    attempt_record_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+}
+
+pub enum BrokerSpawnAttemptAdmissionV1 {
+    Authorized(BrokerSpawnAttemptPermitV1),
+    Reconciled(BrokerSpawnWalStatusV1),
+}
+
+/// Permit produced only by the successful callback invoked through a durable
+/// attempt. It binds the observed child identity to that exact attempt.
+#[must_use = "a successful broker Spawn observation must be durably committed"]
+pub struct BrokerSpawnObservationPermitV1 {
+    identity: BrokerSpawnWalIdentityV1,
+    attempt_id: Uuid,
+    attempt_record_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    child_identity: BrokerKernelChildIdentityV1,
+}
+
+pub enum BrokerSpawnAttemptExecutionV1<T> {
+    EffectSucceeded {
+        value: T,
+        observation: BrokerSpawnObservationPermitV1,
+    },
+    OutcomeIndeterminate,
+}
+
+#[derive(Debug, Error)]
+pub enum BrokerSpawnWalError {
+    #[error("broker Spawn WAL identity is invalid")]
+    InvalidIdentity,
+    #[error("broker Spawn WAL child identity is invalid")]
+    InvalidChildIdentity,
+    #[error("broker Spawn WAL descriptor is not a regular file")]
+    NotRegularFile,
+    #[error("broker Spawn WAL parent descriptor is not a directory")]
+    NotDirectory,
+    #[error("new broker Spawn WAL or head descriptor is not empty")]
+    NewJournalNotEmpty,
+    #[error("broker Spawn WAL file header is torn")]
+    TornFileHeader,
+    #[error("broker Spawn WAL file magic is invalid")]
+    InvalidFileMagic,
+    #[error("unsupported broker Spawn WAL version {observed}")]
+    UnsupportedVersion { observed: u32 },
+    #[error("broker Spawn WAL file header length is invalid")]
+    InvalidFileHeaderLength,
+    #[error("broker Spawn WAL file header is noncanonical")]
+    NonCanonicalFileHeader,
+    #[error("broker Spawn WAL key identity does not match")]
+    KeyIdentityMismatch,
+    #[error("broker Spawn WAL identity does not match")]
+    IdentityMismatch,
+    #[error("broker Spawn WAL authentication failed")]
+    AuthenticationFailed,
+    #[error("broker Spawn WAL record magic or length is invalid")]
+    InvalidRecordFraming,
+    #[error("broker Spawn WAL record is noncanonical")]
+    NonCanonicalRecord,
+    #[error("broker Spawn WAL phase value {observed} is invalid")]
+    InvalidPhase { observed: u8 },
+    #[error("broker Spawn WAL sequence mismatch")]
+    SequenceMismatch,
+    #[error("broker Spawn WAL phase transition is invalid")]
+    InvalidTransition,
+    #[error("broker Spawn WAL record chain does not match")]
+    RecordChainMismatch,
+    #[error("broker Spawn WAL local head is ahead of or conflicts with the WAL")]
+    HeadAnchorMismatch,
+    #[error("broker Spawn WAL has more than one unreconciled head record")]
+    HeadReconciliationGap,
+    #[error("broker Spawn WAL has an incomplete tail and is sealed")]
+    IncompleteTail,
+    #[error("broker Spawn WAL must synchronize both new directory entries before append")]
+    DirectoryEntryNotDurable,
+    #[error("broker Spawn WAL recovery append authority is withheld")]
+    RecoveryAuthorityUnavailable,
+    #[error("broker Spawn WAL filesystem revalidation authority does not match")]
+    FilesystemRevalidationMismatch,
+    #[error("broker Spawn WAL is poisoned after an ambiguous append or sync failure")]
+    Poisoned,
+    #[error("broker Spawn WAL length changed outside its exclusive owner")]
+    ExternalLengthChange,
+    #[error("broker Spawn WAL effect identity conflicts with durable state")]
+    EffectIdentityConflict,
+    #[error("broker Spawn WAL capacity is exhausted")]
+    CapacityExhausted,
+    #[error("broker Spawn WAL I/O failed")]
+    Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerSpawnWalInjectedFault {
+    BeforeWalWrite,
+    AfterWalSyncBeforeHead,
+    BeforeHeadSync,
 }
 
 /// Hard per-pane limits checked before the broker allocates a PTY.

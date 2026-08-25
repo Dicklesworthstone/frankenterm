@@ -1637,77 +1637,94 @@ where
     publication_hasher.update([0]);
     publication_hasher.update(bytes);
     let publication_id = hex::encode(publication_hasher.finalize());
-    for attempt in 0_u8..32 {
-        let temporary_name = format!(
-            "{PENDING_ARTIFACT_PREFIX}{publication_id}-{}-{attempt:02}",
-            std::process::id()
-        );
-        let mut options = cap_std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No)
-            .mode(REMOTE_GENERATION_MANIFEST_MODE);
-        let mut file = match directory.open_with(&temporary_name, &options) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).context("cannot create upgrade artifact publication temp");
-            }
-        };
-        file.write_all(bytes)?;
-        file.set_permissions(cap_std::fs::Permissions::from_mode(
-            REMOTE_GENERATION_MANIFEST_MODE,
-        ))?;
-        file.sync_all()?;
-        validate_remote_generation_file_metadata(
-            directory,
-            Path::new(&temporary_name),
-            &file,
-            REMOTE_GENERATION_MANIFEST_MODE,
-            Some(expected_len),
-            effective_uid,
-            expected_device,
-        )?;
-        match renameat2(
-            directory,
-            temporary_name.as_str(),
-            directory,
-            name,
-            RenameFlags::RENAME_NOREPLACE,
-        ) {
-            Ok(()) => {
-                post_publish_sync(directory).with_context(|| {
-                    format!(
-                        "upgrade artifact {} is visible but its parent sync failed; retry reconciles the same bytes",
-                        name.display()
-                    )
-                })?;
-            }
-            Err(nix::errno::Errno::EEXIST) => {
-                sync_capability_directory(directory)?;
-            }
-            Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "atomic no-replace upgrade artifact publication failed: {error}"
-                ));
-            }
+    let temporary_name = format!("{PENDING_ARTIFACT_PREFIX}{publication_id}");
+    let temporary_exists = match directory.symlink_metadata(&temporary_name) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).context("cannot inspect deterministic upgrade publication temp")
         }
-        let persisted = read_exact_file(
+    };
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .follow(FollowSymlinks::No)
+        .mode(REMOTE_GENERATION_MANIFEST_MODE);
+    if !temporary_exists {
+        options.create_new(true);
+    }
+    let mut file = directory
+        .open_with(&temporary_name, &options)
+        .context("cannot open deterministic upgrade artifact publication temp")?;
+    let retained_len = file.metadata()?.len();
+    anyhow::ensure!(
+        retained_len <= MAX_RECORD_BYTES,
+        "deterministic upgrade publication temp exceeds its bounded length"
+    );
+    validate_remote_generation_file_metadata(
+        directory,
+        Path::new(&temporary_name),
+        &file,
+        REMOTE_GENERATION_MANIFEST_MODE,
+        Some(retained_len),
+        effective_uid,
+        expected_device,
+    )?;
+    // The temp name is a digest of the final name and canonical bytes. Under
+    // the transaction lock it can safely be rewritten after any truncated
+    // prefix crash, so retry allocation is constant instead of PID-proportional.
+    file.set_len(0)?;
+    file.write_all(bytes)?;
+    file.set_permissions(cap_std::fs::Permissions::from_mode(
+        REMOTE_GENERATION_MANIFEST_MODE,
+    ))?;
+    file.sync_all()?;
+    validate_remote_generation_file_metadata(
+        directory,
+        Path::new(&temporary_name),
+        &file,
+        REMOTE_GENERATION_MANIFEST_MODE,
+        Some(expected_len),
+        effective_uid,
+        expected_device,
+    )?;
+    match renameat2(
+        directory,
+        temporary_name.as_str(),
+        directory,
+        name,
+        RenameFlags::RENAME_NOREPLACE,
+    ) {
+        Ok(()) => {
+            post_publish_sync(directory).with_context(|| {
+                format!(
+                    "upgrade artifact {} is visible but its parent sync failed; retry reconciles the same bytes",
+                    name.display()
+                )
+            })?;
+        }
+        Err(nix::errno::Errno::EEXIST) => {
+            sync_capability_directory(directory)?;
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "atomic no-replace upgrade artifact publication failed: {error}"
+            ));
+        }
+    }
+    let persisted = read_exact_file(
             directory,
             name,
             MAX_RECORD_BYTES,
             effective_uid,
             expected_device,
         )?;
-        anyhow::ensure!(
-            persisted == bytes,
-            "published upgrade artifact differs from its synchronized temp bytes"
-        );
-        return Ok(());
-    }
-    anyhow::bail!("upgrade artifact publication temp namespace is exhausted")
+    anyhow::ensure!(
+        persisted == bytes,
+        "published upgrade artifact differs from its synchronized temp bytes"
+    );
+    Ok(())
 }
 
 fn validate_exact_file(
