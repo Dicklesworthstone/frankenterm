@@ -5368,10 +5368,7 @@ fn create_private_file_new_at(
 
 fn open_output_directory(
     token_path: &Path,
-) -> Result<
-    (File, PathBuf, DirectoryIdentity, DirectoryIdentity),
-    GuardianOutputError,
-> {
+) -> Result<(File, PathBuf, DirectoryIdentity, DirectoryIdentity), GuardianOutputError> {
     validate_normalized_absolute_file_path(token_path)?;
     let parent = token_path
         .parent()
@@ -5864,22 +5861,12 @@ fn validate_directory_path_identity(
     path: &Path,
     identity: DirectoryIdentity,
 ) -> Result<(), GuardianOutputError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| GuardianOutputError::io("output-directory-authority-revalidation", error))?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        GuardianOutputError::io("output-directory-authority-revalidation", error)
+    })?;
     if !identity.matches(&metadata) {
         return Err(GuardianOutputError::FilesystemAuthority(
             "guardian output directory identity changed",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_path_identity(path: &Path, identity: FileIdentity) -> Result<(), GuardianOutputError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| GuardianOutputError::io("output-authority-revalidation", error))?;
-    if !identity.matches(&metadata) {
-        return Err(GuardianOutputError::FilesystemAuthority(
-            "guardian output filesystem identity changed",
         ));
     }
     Ok(())
@@ -7076,6 +7063,25 @@ mod tests {
         let mut owned = Zeroizing::new(Vec::with_capacity(bytes.len()));
         owned.extend_from_slice(bytes);
         owned
+    }
+
+    #[test]
+    fn directory_identity_ignores_child_link_count_but_rejects_mode_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = kept_private_directory("ft-guardian-directory-identity-")?;
+        let before = std::fs::symlink_metadata(&directory)?;
+        let identity = DirectoryIdentity::capture(&before);
+
+        std::fs::create_dir(directory.join("child"))?;
+        let after_child = std::fs::symlink_metadata(&directory)?;
+        assert_ne!(before.nlink(), after_child.nlink());
+        assert!(identity.matches(&after_child));
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750))?;
+        assert!(!identity.matches(&std::fs::symlink_metadata(&directory)?));
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        assert!(identity.matches(&std::fs::symlink_metadata(&directory)?));
+        Ok(())
     }
 
     fn kept_private_directory(prefix: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
