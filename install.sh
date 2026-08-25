@@ -77,6 +77,9 @@ INSTALL_APP=-1
 APP_DEST="${APP_DEST:-}"
 APP_ASSET="FrankenTerm-darwin-arm64.app.tar.xz"
 APP_INSTALLED_PATH=""
+ACTIVE_PROCESS_FAMILY_MANIFEST=""
+ACTIVE_PROCESS_FAMILY_VERIFIER=""
+ACTIVE_ATOMIC_TRANSITION_HELPER=""
 OFFLINE_TARBALL=""
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
@@ -87,16 +90,21 @@ ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/ft-install.lock"
 HARDCODED_FALLBACK_VERSION="v0.2.0"
 
-# Cleanup state. Initialised to safe defaults so the EXIT trap (registered
-# *before* lock acquisition) can run even if we abort partway through init —
-# e.g., between `mkdir $LOCK_DIR` and `mktemp -d`. Without this, an mktemp
-# failure on a held lock would leak the lock dir permanently.
+# Cleanup state. The permanent lock inode is never unlinked; a Python holder
+# owns its kernel advisory lock until the shell closes the control FIFO.
 TMP=""
-LOCK_DIR=""
 LOCKED=0
+LOCK_HOLDER_PID=""
+LOCK_CONTROL_FIFO=""
+LOCK_READY_FILE=""
 cleanup() {
   [ -n "$TMP" ] && rm -rf "$TMP"
-  [ "$LOCKED" -eq 1 ] && [ -n "$LOCK_DIR" ] && rm -rf "$LOCK_DIR"
+  if [ "$LOCKED" -eq 1 ]; then
+    exec 9>&- 2>/dev/null || true
+    [ -n "$LOCK_HOLDER_PID" ] && wait "$LOCK_HOLDER_PID" 2>/dev/null || true
+  fi
+  [ -n "$LOCK_CONTROL_FIFO" ] && rm -f "$LOCK_CONTROL_FIFO"
+  [ -n "$LOCK_READY_FILE" ] && rm -f "$LOCK_READY_FILE"
 }
 trap cleanup EXIT
 
@@ -683,6 +691,57 @@ finally:
 PY
 }
 
+ensure_exact_staged_file() {
+  local source="$1" target="$2" mode="$3"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] && cmp "$source" "$target" >/dev/null 2>&1 || return 1
+    chmod "$mode" "$target" || return 1
+  else
+    install -m "$mode" "$source" "$target" || return 1
+  fi
+}
+
+validate_installer_stage_inventory() {
+  local root="$1" kind="$2"
+  python3 - "$root" "$kind" <<'PY'
+import os, stat, sys
+
+root, kind = sys.argv[1:]
+expected = {
+    "generation": {
+        "ft", "frankenterm-mux-server", "frankenterm-pty-guardian",
+        "verify-components.sh", "process-family.component-manifest.json",
+    },
+    "legacy": {
+        "ft", "frankenterm-mux-server", "frankenterm-pty-guardian",
+        "legacy-family.json",
+    },
+}[kind]
+fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+             getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+try:
+    names = os.listdir(fd)
+    if len(names) > len(expected) or not set(names).issubset(expected):
+        raise SystemExit("retained installer stage has an unexpected inventory")
+    for name in names:
+        observed = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise SystemExit("retained installer stage contains an unsafe entry")
+finally:
+    os.close(fd)
+PY
+}
+
+installer_stage_mode() {
+  python3 - "$1" <<'PY'
+import os, stat, sys
+observed = os.lstat(sys.argv[1])
+if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode) or observed.st_uid != os.geteuid():
+    raise SystemExit("installer stage is not one owner-controlled directory")
+print(f"{stat.S_IMODE(observed.st_mode):04o}")
+PY
+}
+
 atomic_transition_txid() {
   python3 - "$1" <<'PY'
 import hashlib, sys
@@ -733,14 +792,40 @@ for role in roles:
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
     try:
         before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 1024 * 1024 * 1024:
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 512 * 1024 * 1024:
             raise SystemExit("unsafe legacy process-family member")
-        data = b""
+        digest = hashlib.sha256()
+        length = 0
+        carry = b""
+        prefix_count = 0
+        found = []
         while True:
             chunk = os.read(fd, 1024 * 1024)
             if not chunk:
                 break
-            data += chunk
+            previous_length = length
+            length += len(chunk)
+            if length > 512 * 1024 * 1024:
+                raise SystemExit("legacy process-family member exceeds component cap")
+            digest.update(chunk)
+            payload = carry + chunk
+            payload_offset = previous_length - len(carry)
+            offset = 0
+            while True:
+                offset = payload.find(b"FT_ATOMIC_COMPONENT_IDENTITY_V1:", offset)
+                if offset < 0:
+                    break
+                if payload_offset + offset + len(b"FT_ATOMIC_COMPONENT_IDENTITY_V1:") > previous_length:
+                    prefix_count += 1
+                    if prefix_count > 1:
+                        raise SystemExit("legacy component contains duplicate raw atomic markers")
+                offset += 1
+            for match in marker.finditer(payload):
+                if payload_offset + match.end() > previous_length:
+                    found.append(match.groups())
+                    if len(found) > 1:
+                        raise SystemExit("legacy component contains duplicate valid atomic markers")
+            carry = payload[-2048:]
         after = os.fstat(fd)
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
             after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
@@ -748,8 +833,7 @@ for role in roles:
             raise SystemExit("legacy process-family member changed while read")
     finally:
         os.close(fd)
-    found = marker.findall(data)
-    if data.count(b"FT_ATOMIC_COMPONENT_IDENTITY_V1:") != 1 or len(found) != 1:
+    if prefix_count != 1 or len(found) != 1:
         raise SystemExit("legacy component must contain exactly one raw atomic marker")
     build, found_role, target, profile, version = (item.decode() for item in found[0])
     if found_role != role:
@@ -759,7 +843,7 @@ for role in roles:
         identity = normalized
     elif identity != normalized:
         raise SystemExit("legacy process family is mixed")
-    records.append({"bytes": len(data), "path": role, "sha256": hashlib.sha256(data).hexdigest()})
+    records.append({"bytes": length, "path": role, "sha256": digest.hexdigest()})
 manifest = {
     "files": records,
     "identity": {"build_id": identity[0], "target": identity[1], "profile": identity[2], "version": identity[3]},
@@ -780,13 +864,12 @@ PY
 }
 
 verify_canonical_generation() {
-  local generation="$1" expected_version="${2:-}" metadata manifest_id build_id source_revision
-  local version target profile feature_contract verifier manifest
-  verifier="$generation/verify-components.sh"
+  local generation="$1" expected_version="${2:-}" verifier_authority="${3:-}"
+  local metadata manifest_id build_id source_revision version target profile feature_contract manifest
   manifest="$generation/process-family.component-manifest.json"
-  [ -f "$verifier" ] && [ ! -L "$verifier" ] && [ -x "$verifier" ] || return 1
+  [ -f "$verifier_authority" ] && [ ! -L "$verifier_authority" ] || return 1
   [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 1
-  bash "$verifier" verify --root "$generation" --manifest "$manifest" >/dev/null || return 1
+  bash "$verifier_authority" verify --root "$generation" --manifest "$manifest" >/dev/null || return 1
   metadata=$(process_family_manifest_metadata "$manifest" triplet) || return 1
   IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract <<<"$metadata"
   [ "$(basename "$generation")" = "${manifest_id#sha256:}" ] || return 1
@@ -871,18 +954,30 @@ install_process_family() {
   generation="$generations/$generation_id"
   if [ -e "$generation" ] || [ -L "$generation" ]; then
     [ -d "$generation" ] && [ ! -L "$generation" ] && \
-      verify_canonical_generation "$generation" "$version" || return 1
+      verify_canonical_generation "$generation" "$version" "$verifier_source" || return 1
   else
-    stage_name=".generation-${generation_id}.installing-$$"
+    # The deterministic stage is a durable retry address. A kill at any
+    # prefix is resumed only when every retained member is an exact byte match;
+    # malformed residue is preserved and fails closed instead of allocating an
+    # unbounded succession of PID-named full-family stages.
+    stage_name=".generation-${generation_id}.installing"
     stage="$generations/$stage_name"
-    [ ! -e "$stage" ] && [ ! -L "$stage" ] || return 1
-    mkdir -m 0700 "$stage" || return 1
-    install -m 0555 "$ft_source" "$stage/ft" || return 1
-    install -m 0555 "$mux_source" "$stage/frankenterm-mux-server" || return 1
-    install -m 0555 "$guardian_source" "$stage/frankenterm-pty-guardian" || return 1
-    install -m 0555 "$verifier_source" "$stage/verify-components.sh" || return 1
-    install -m 0444 "$manifest_source" "$stage/process-family.component-manifest.json" || return 1
-    bash "$stage/verify-components.sh" verify --root "$stage" \
+    if [ -e "$stage" ] || [ -L "$stage" ]; then
+      [ -d "$stage" ] && [ ! -L "$stage" ] || return 1
+      if ! bash "$verifier_source" verify --root "$stage" \
+          --manifest "$stage/process-family.component-manifest.json" >/dev/null 2>&1; then
+        [ "$(installer_stage_mode "$stage")" = 0700 ] || return 1
+        validate_installer_stage_inventory "$stage" generation || return 1
+      fi
+    else
+      mkdir -m 0700 "$stage" || return 1
+    fi
+    ensure_exact_staged_file "$ft_source" "$stage/ft" 0555 || return 1
+    ensure_exact_staged_file "$mux_source" "$stage/frankenterm-mux-server" 0555 || return 1
+    ensure_exact_staged_file "$guardian_source" "$stage/frankenterm-pty-guardian" 0555 || return 1
+    ensure_exact_staged_file "$verifier_source" "$stage/verify-components.sh" 0555 || return 1
+    ensure_exact_staged_file "$manifest_source" "$stage/process-family.component-manifest.json" 0444 || return 1
+    bash "$verifier_source" verify --root "$stage" \
       --manifest "$stage/process-family.component-manifest.json" >/dev/null || return 1
     "$stage/ft" --version >/dev/null 2>&1 || return 1
     "$stage/frankenterm-mux-server" --version >/dev/null 2>&1 || return 1
@@ -893,7 +988,7 @@ install_process_family() {
     txid=$(atomic_transition_txid "generation:$DEST:$generation_id") || return 1
     atomic_path_transition "$helper" "$generations" "$stage_name" "$generation_id" \
       "$txid" "$stage_id" missing publish-noreplace || return 1
-    verify_canonical_generation "$generation" "$version" || return 1
+    verify_canonical_generation "$generation" "$version" "$verifier_source" || return 1
   fi
   installer_failpoint after-generation-publish
 
@@ -905,7 +1000,7 @@ install_process_family() {
     selected_generation="$managed/$current_target"
     [ -d "$selected_generation" ] && [ ! -L "$selected_generation" ] || return 1
     if [[ "$current_target" =~ ^generations/[0-9a-f]{64}$ ]]; then
-      verify_canonical_generation "$selected_generation" || return 1
+      verify_canonical_generation "$selected_generation" "" "$verifier_source" || return 1
     else
       [ -f "$selected_generation/legacy-family.json" ] || return 1
       [ "$(legacy_process_family_manifest "$selected_generation" -)" = \
@@ -965,13 +1060,23 @@ install_process_family() {
         [ -d "$selected_generation" ] && [ ! -L "$selected_generation" ] || return 1
         [ "$(legacy_process_family_manifest "$selected_generation" -)" = "$legacy_manifest_id" ] || return 1
       else
-        legacy_stage_name=".${legacy_id}.installing-$$"
+        legacy_stage_name=".${legacy_id}.installing"
         legacy_stage="$generations/$legacy_stage_name"
-        mkdir -m 0700 "$legacy_stage" || return 1
+        if [ -e "$legacy_stage" ] || [ -L "$legacy_stage" ]; then
+          [ -d "$legacy_stage" ] && [ ! -L "$legacy_stage" ] || return 1
+          if [ "$(legacy_process_family_manifest "$legacy_stage" - 2>/dev/null || true)" != \
+               "$legacy_manifest_id" ]; then
+            [ "$(installer_stage_mode "$legacy_stage")" = 0700 ] || return 1
+            validate_installer_stage_inventory "$legacy_stage" legacy || return 1
+          fi
+        else
+          mkdir -m 0700 "$legacy_stage" || return 1
+        fi
         for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-          install -m 0555 "$legacy_proof/$name" "$legacy_stage/$name" || return 1
+          ensure_exact_staged_file "$legacy_proof/$name" "$legacy_stage/$name" 0555 || return 1
         done
-        install -m 0444 "$legacy_manifest" "$legacy_stage/legacy-family.json" || return 1
+        ensure_exact_staged_file "$legacy_manifest" "$legacy_stage/legacy-family.json" 0444 || return 1
+        [ "$(legacy_process_family_manifest "$legacy_stage" -)" = "$legacy_manifest_id" ] || return 1
         chmod 0555 "$legacy_stage" || return 1
         fsync_installer_tree "$legacy_stage" || return 1
         stage_id=$(atomic_path_content_id "$helper" "$generations" "$legacy_stage_name") || return 1
@@ -1026,11 +1131,14 @@ install_process_family() {
     current_target="generations/$generation_id"
   fi
   installer_failpoint after-selector-switch
-  verify_canonical_generation "$managed/$current_target" "$version" || return 1
+  verify_canonical_generation "$managed/$current_target" "$version" "$verifier_source" || return 1
   for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
     stable_entrypoint_is_managed "$name" || return 1
     cmp "$DEST/$name" "$managed/$current_target/$name" >/dev/null 2>&1 || return 1
   done
+  ACTIVE_PROCESS_FAMILY_MANIFEST="$managed/$current_target/process-family.component-manifest.json"
+  ACTIVE_PROCESS_FAMILY_VERIFIER="$verifier_source"
+  ACTIVE_ATOMIC_TRANSITION_HELPER="$DEST/ft"
   ok "Installed atomic process-family generation $generation_id"
   info "Previous generations and displaced entrypoints were retained for recovery"
 }
@@ -1143,26 +1251,11 @@ retired_unmanifested_check_installed_version() {
 }
 
 check_installed_version() {
-  local target_ver="$1"
-  local managed="$DEST/.frankenterm-process-family" current_before current_after generation
-  local metadata manifest_id build_id source_revision version target profile feature_contract
-  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-    stable_entrypoint_is_managed "$name" || return 1
-  done
-  [ -L "$managed/current" ] || return 1
-  current_before=$(readlink "$managed/current") || return 1
-  [[ "$current_before" =~ ^generations/[0-9a-f]{64}$ ]] || return 1
-  generation="$managed/$current_before"
-  verify_canonical_generation "$generation" "$target_ver" || return 1
-  metadata=$(process_family_manifest_metadata \
-    "$generation/process-family.component-manifest.json" triplet) || return 1
-  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract <<<"$metadata"
-  [ "${manifest_id#sha256:}" = "${current_before#generations/}" ] || return 1
-  "$generation/ft" --version >/dev/null 2>&1 || return 1
-  "$generation/frankenterm-mux-server" --version >/dev/null 2>&1 || return 1
-  "$generation/frankenterm-pty-guardian" --version >/dev/null 2>&1 || return 1
-  current_after=$(readlink "$managed/current") || return 1
-  [ "$current_after" = "$current_before" ]
+  # A retained generation cannot authenticate its own verifier: a same-UID
+  # mutation could replace both executable bytes and that verifier. Refresh
+  # from the outer-checksum-authenticated release package instead of claiming
+  # a tamper-proof same-version fast path without an external trust root.
+  return 1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1752,7 +1845,7 @@ fi
 # extract the local tarball, and curl is used by ensure_rust /
 # install_pragmasevka even when the main download path is bypassed.
 # ───────────────────────────────────────────────────────────────────────────
-for required in curl tar; do
+for required in curl tar python3; do
   if ! command -v "$required" >/dev/null 2>&1; then
     err "Required tool not found: $required"
     err "Install $required via your package manager:"
@@ -1793,31 +1886,64 @@ mkdir -p "$DEST" 2>/dev/null || true
 preflight_checks
 
 # ───────────────────────────────────────────────────────────────────────────
-# Atomic lock (mkdir-based — works on macOS without flock)
+# Kernel advisory lock held on one permanent, descriptor-pinned inode.
 # ───────────────────────────────────────────────────────────────────────────
-LOCK_DIR="${LOCK_FILE}.d"
-if mkdir "$LOCK_DIR" 2>/dev/null; then
-  LOCKED=1
-  echo $$ > "$LOCK_DIR/pid"
-else
-  if [ -f "$LOCK_DIR/pid" ]; then
-    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
-      rm -rf "$LOCK_DIR"
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        LOCKED=1; echo $$ > "$LOCK_DIR/pid"
-      fi
-    fi
+LOCK_CONTROL_FIFO="/tmp/ft-install-lock-control-$$"
+LOCK_READY_FILE="/tmp/ft-install-lock-ready-$$"
+umask 077
+mkfifo "$LOCK_CONTROL_FIFO" || { err "Cannot create installer lock control FIFO"; exit 1; }
+exec 9<> "$LOCK_CONTROL_FIFO"
+python3 - "$LOCK_FILE" "$LOCK_READY_FILE" "$LOCK_CONTROL_FIFO" 3<"$LOCK_CONTROL_FIFO" 9>&- <<'PY' &
+import fcntl, os, stat, sys
+
+lock_path, ready_path, fifo_path = sys.argv[1:]
+flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+lock_fd = os.open(lock_path, flags, 0o600)
+try:
+    observed = os.fstat(lock_fd)
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.geteuid()
+        or observed.st_nlink != 1
+        or observed.st_mode & 0o077
+    ):
+        raise SystemExit("unsafe installer lock inode")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.fchmod(lock_fd, 0o600)
+    os.fsync(lock_fd)
+    ready_fd = os.open(
+        ready_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.write(ready_fd, f"{os.getpid()}:{observed.st_dev}:{observed.st_ino}\n".encode())
+        os.fsync(ready_fd)
+    finally:
+        os.close(ready_fd)
+    os.read(3, 1)
+finally:
+    os.close(lock_fd)
+    for path in (ready_path, fifo_path):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+PY
+LOCK_HOLDER_PID=$!
+for ((_lock_wait=0; _lock_wait<100; _lock_wait++)); do
+  if [ -s "$LOCK_READY_FILE" ]; then
+    LOCKED=1
+    break
   fi
-  if [ "$LOCKED" -eq 0 ]; then
-    err "Another installer is running (lock $LOCK_DIR)"
-    err "If you're certain no installer is running (e.g., previous run was"
-    err "SIGKILL'd between mkdir and PID write), remove the lock manually:"
-    err "  rm -rf $LOCK_DIR"
-    # Clear LOCK_DIR so the trap doesn't try to clean another installer's lock
-    LOCK_DIR=""
-    exit 1
+  if ! kill -0 "$LOCK_HOLDER_PID" 2>/dev/null; then
+    break
   fi
+  sleep 0.05
+done
+if [ "$LOCKED" -ne 1 ]; then
+  err "Another installer owns the kernel lock at $LOCK_FILE, or the lock inode is unsafe"
+  exit 1
 fi
 
 # Already at target version short-circuit (unless --force or offline). This

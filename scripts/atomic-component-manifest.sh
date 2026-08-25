@@ -42,6 +42,7 @@ BUILD_IDENTITY_SCHEMA = "ft.atomic_build_identity.v1"
 MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 MAX_FILES = 100_000
 MAX_INVENTORY_ENTRIES = 200_000
+MAX_INVENTORY_NAME_BYTES = 64 * 1024 * 1024
 MAX_INPUTS = 10_000
 MAX_CONTRACTS = 256
 MAX_PATH_BYTES = 4096
@@ -472,7 +473,35 @@ class AnchoredRoot:
                 directory_fd, prefix = pending.pop()
                 try:
                     try:
-                        entries = sorted(os.scandir(directory_fd), key=lambda entry: entry.name)
+                        entries = []
+                        name_bytes = 0
+                        with os.scandir(directory_fd) as iterator:
+                            for entry in iterator:
+                                if len(entries) >= MAX_INVENTORY_ENTRIES:
+                                    fail(
+                                        "inventory_too_large",
+                                        "package directory exceeds the bounded pre-sort entry limit",
+                                        path=prefix or ".",
+                                        maximum_entries=MAX_INVENTORY_ENTRIES,
+                                    )
+                                try:
+                                    encoded_name = entry.name.encode("utf-8")
+                                except UnicodeError:
+                                    fail(
+                                        "invalid_inventory_path",
+                                        "package contains a non-UTF-8 inventory name",
+                                        path=prefix or ".",
+                                    )
+                                name_bytes += len(encoded_name)
+                                if name_bytes > MAX_INVENTORY_NAME_BYTES:
+                                    fail(
+                                        "inventory_too_large",
+                                        "package directory exceeds the bounded pre-sort name-byte limit",
+                                        path=prefix or ".",
+                                        maximum_name_bytes=MAX_INVENTORY_NAME_BYTES,
+                                    )
+                                entries.append(entry)
+                        entries.sort(key=lambda entry: entry.name)
                     except OSError as exc:
                         fail(
                             "inventory_scan_failed",
