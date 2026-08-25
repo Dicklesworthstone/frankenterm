@@ -19,6 +19,7 @@
 //! See `wa-29k1` bead for the full design.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
