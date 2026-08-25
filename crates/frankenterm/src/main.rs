@@ -101385,31 +101385,14 @@ log_level = "debug"
 
     #[test]
     fn remote_local_process_family_has_a_pending_live_mux_publication_path() {
-        let identity = LocalComponentIdentity {
-            build_id: "a".repeat(64),
-            target: "x86_64-unknown-linux-gnu".to_string(),
-            profile: "release-interactive".to_string(),
-            version: "0.15.2".to_string(),
-        };
-        let family = ValidatedLocalProcessFamily {
-            ft: LocalComponentSnapshot {
-                identity: LocalComponentIdentity {
-                    build_id: identity.build_id.clone(),
-                    target: identity.target.clone(),
-                    profile: identity.profile.clone(),
-                    version: identity.version.clone(),
-                },
-                sha256: "b".repeat(64),
-                byte_len: 101,
-                source_identity: DiagnosticFileSnapshot::synthetic(101, 1),
-            },
-            mux_server: LocalComponentSnapshot {
-                identity,
-                sha256: "c".repeat(64),
-                byte_len: 202,
-                source_identity: DiagnosticFileSnapshot::synthetic(202, 2),
-            },
-        };
+        let family = synthetic_remote_generation_family(
+            &"b".repeat(64),
+            101,
+            &"c".repeat(64),
+            202,
+            &"d".repeat(64),
+            303,
+        );
         let suffix = "0123456789abcdef0123456789abcdef";
         let receipt = ProcessFamilyByteReceipt::from(&family);
         let pending = local_process_family_publish_command(suffix, &receipt, true).unwrap();
@@ -101424,11 +101407,14 @@ log_level = "debug"
         assert!(pending.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"));
         assert!(pending.contains(&format!("ft.pending-{suffix}")));
         assert!(pending.contains(&format!("frankenterm-mux-server.pending-{suffix}")));
+        assert!(pending.contains(&format!("frankenterm-pty-guardian.pending-{suffix}")));
         assert!(pending.contains("test ! -e \"$ft_pending\""));
         assert!(pending.contains("test ! -e \"$mux_pending\""));
+        assert!(pending.contains("test ! -e \"$guardian_pending\""));
         assert!(pending.contains("test ! -L \"$ft_pending\""));
         assert!(pending.contains("test ! -L \"$mux_pending\""));
-        assert!(pending.contains("restore_pending_ft()"));
+        assert!(pending.contains("test ! -L \"$guardian_pending\""));
+        assert!(pending.contains("restore_pending_component()"));
         assert!(pending.contains("FT_COMPONENT_ROLLBACK_INCOMPLETE="));
         assert!(!pending.contains("ft_backup=\"\""));
         assert!(
@@ -101438,7 +101424,9 @@ log_level = "debug"
         assert!(active.contains("ft_backup=\"\""));
         assert!(active.contains("test ! -L \"$ft_backup_candidate\""));
         assert!(active.contains("test ! -L \"$mux_backup_candidate\""));
+        assert!(active.contains("test ! -L \"$guardian_backup_candidate\""));
         assert!(active.contains("test ! -L \"$ft_failed\""));
+        assert!(active.contains("test ! -L \"$mux_failed\""));
         assert!(active.contains("if test -e \"$bin/ft\" || test -L \"$bin/ft\""));
         assert!(active.contains("test -f \"$bin/ft\" && test ! -L \"$bin/ft\""));
         assert!(active.contains(
@@ -101446,6 +101434,12 @@ log_level = "debug"
         ));
         assert!(active.contains(
             "test -f \"$bin/frankenterm-mux-server\" && test ! -L \"$bin/frankenterm-mux-server\""
+        ));
+        assert!(active.contains(
+            "if test -e \"$bin/frankenterm-pty-guardian\" || test -L \"$bin/frankenterm-pty-guardian\""
+        ));
+        assert!(active.contains(
+            "test -f \"$bin/frankenterm-pty-guardian\" && test ! -L \"$bin/frankenterm-pty-guardian\""
         ));
         for command in [&pending, &active] {
             assert!(command.contains("command -v flock"));
@@ -101455,17 +101449,19 @@ log_level = "debug"
             assert!(command.contains("mv -n \"$source\" \"$target\""));
             assert!(command.matches(&receipt.ft.sha256).count() >= 2);
             assert!(command.matches(&receipt.mux_server.sha256).count() >= 2);
+            assert!(command.matches(&receipt.guardian.sha256).count() >= 2);
         }
         assert!(active.contains("restore_preserved_component()"));
         assert!(active.contains("test ! -e \"$target\" && test ! -L \"$target\""));
         assert!(active.contains("FT_COMPONENT_ROLLBACK_INCOMPLETE="));
         assert!(!active.contains("test -z \"$ft_backup\" || mv"));
         assert!(!active.contains("test -z \"$mux_backup\" || mv"));
+        assert!(!active.contains("test -z \"$guardian_backup\" || mv"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn remote_process_family_partial_publish_restores_old_pair_without_overwrite() {
+    fn remote_process_family_partial_publish_restores_old_triplet_without_overwrite() {
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -101484,14 +101480,19 @@ log_level = "debug"
         let suffix = "0123456789abcdef0123456789abcdef";
         let ft_stage = bin.join(format!("ft.installing-{suffix}"));
         let mux_stage = bin.join(format!("frankenterm-mux-server.installing-{suffix}"));
+        let guardian_stage = bin.join(format!("frankenterm-pty-guardian.installing-{suffix}"));
         let ft_target = bin.join("ft");
         let mux_target = bin.join("frankenterm-mux-server");
+        let guardian_target = bin.join("frankenterm-pty-guardian");
         let new_ft = "#!/bin/sh\nexit 0\n";
         let new_mux = "#!/bin/sh\nexit 0\n";
+        let new_guardian = "#!/bin/sh\n# guardian\nexit 0\n";
         write_executable(&ft_stage, new_ft);
         write_executable(&mux_stage, new_mux);
+        write_executable(&guardian_stage, new_guardian);
         write_executable(&ft_target, "old-ft\n");
         write_executable(&mux_target, "old-mux\n");
+        write_executable(&guardian_target, "old-guardian\n");
 
         let failing_mv = shim_bin.join("mv");
         write_executable(
@@ -101506,6 +101507,11 @@ log_level = "debug"
             mux_server: ComponentByteReceipt {
                 sha256: hex::encode(sha2::Sha256::digest(new_mux.as_bytes())),
                 byte_len: u64::try_from(new_mux.len()).expect("mux fixture length fits u64"),
+            },
+            guardian: ComponentByteReceipt {
+                sha256: hex::encode(sha2::Sha256::digest(new_guardian.as_bytes())),
+                byte_len: u64::try_from(new_guardian.len())
+                    .expect("guardian fixture length fits u64"),
             },
         };
         let command = local_process_family_publish_command(suffix, &receipt, false)
@@ -101526,13 +101532,22 @@ log_level = "debug"
         assert_eq!(std::fs::read(&ft_target).unwrap(), b"old-ft\n");
         assert_eq!(std::fs::read(&mux_target).unwrap(), b"old-mux\n");
         assert_eq!(
+            std::fs::read(&guardian_target).unwrap(),
+            b"old-guardian\n"
+        );
+        assert_eq!(
             std::fs::read(bin.join(format!("ft.failed-publish-{suffix}"))).unwrap(),
             new_ft.as_bytes()
         );
         assert!(mux_stage.is_file());
+        assert!(guardian_stage.is_file());
         assert!(!bin.join(format!("ft.previous-{suffix}")).exists());
         assert!(
             !bin.join(format!("frankenterm-mux-server.previous-{suffix}"))
+                .exists()
+        );
+        assert!(
+            !bin.join(format!("frankenterm-pty-guardian.previous-{suffix}"))
                 .exists()
         );
         assert!(
@@ -101565,62 +101580,92 @@ log_level = "debug"
     fn remote_release_component_receipt_is_exact_bounded_and_final() {
         let ft_sha = "b".repeat(64);
         let mux_sha = "c".repeat(64);
+        let guardian_sha = "d".repeat(64);
         let valid = format!(
-            "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{ft_sha}:mux:202:{mux_sha}\n"
+            "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{ft_sha}:mux:202:{mux_sha}:guardian:303:{guardian_sha}\n"
         );
         let receipt = parse_remote_release_component_receipt(&valid, "v0.15.2").unwrap();
         assert_eq!(receipt.ft.byte_len, 101);
         assert_eq!(receipt.ft.sha256, ft_sha);
         assert_eq!(receipt.mux_server.byte_len, 202);
         assert_eq!(receipt.mux_server.sha256, mux_sha);
+        assert_eq!(receipt.guardian.byte_len, 303);
+        assert_eq!(receipt.guardian.sha256, guardian_sha);
         let stage =
             remote_release_stage_command("v0.15.2", "0123456789abcdef0123456789abcdef", &receipt)
                 .unwrap();
         assert!(stage.matches(&receipt.ft.sha256).count() >= 2);
         assert!(stage.matches(&receipt.mux_server.sha256).count() >= 2);
+        assert!(stage.matches(&receipt.guardian.sha256).count() >= 2);
         assert!(stage.contains("test ! -L \"$ft_stage\""));
         assert!(stage.contains("test ! -L \"$mux_stage\""));
+        assert!(stage.contains("test ! -L \"$guardian_stage\""));
         assert!(stage.contains("move_no_clobber()"));
         assert!(stage.contains("mv -n \"$source\" \"$target\""));
         assert!(stage.contains("flock -n 9"));
         assert!(stage.contains("FT_RELEASE_STAGE_ROLLBACK_INCOMPLETE="));
         assert!(!stage.contains("mv \"$ft_source\" \"$ft_stage\""));
         assert!(!stage.contains("mv \"$mux_source\" \"$mux_stage\""));
-        assert!(stage.contains("FT_RELEASE_COMPONENT_STAGE_V1=v0.15.2"));
+        assert!(!stage.contains("mv \"$guardian_source\" \"$guardian_stage\""));
+        assert!(stage.contains("FT_RELEASE_COMPONENT_STAGE_V2=v0.15.2"));
         assert!(remote_release_stage_command("v0.15.2", "bad-suffix", &receipt).is_err());
 
         for rejected in [
             format!(
-                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.3:ft:101:{}:mux:202:{}\n",
-                "b".repeat(64),
-                "c".repeat(64)
-            ),
-            format!(
-                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:0:{}:mux:202:{}\n",
-                "b".repeat(64),
-                "c".repeat(64)
-            ),
-            format!(
-                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\ntrailing output\n",
-                "b".repeat(64),
-                "c".repeat(64)
-            ),
-            format!(
-                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\nFT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\n",
+                "FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.3:ft:101:{}:mux:202:{}:guardian:303:{}\n",
                 "b".repeat(64),
                 "c".repeat(64),
+                "d".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:0:{}:mux:202:{}:guardian:303:{}\n",
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:mux:202:{}:guardian:303:{}\ntrailing output\n",
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:mux:202:{}:guardian:303:{}\nFT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:mux:202:{}:guardian:303:{}\n",
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:mux:202:{}:guardian:303:{}",
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:mux:202:{}:guardian:303:{}\r\n",
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:mux:202:{}\n",
                 "b".repeat(64),
                 "c".repeat(64)
             ),
             format!(
-                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}",
+                "FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:guardian:303:{}:mux:202:{}\n",
                 "b".repeat(64),
+                "d".repeat(64),
                 "c".repeat(64)
             ),
             format!(
-                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\r\n",
+                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}:guardian:303:{}\n",
                 "b".repeat(64),
-                "c".repeat(64)
+                "c".repeat(64),
+                "d".repeat(64)
             ),
         ] {
             assert!(

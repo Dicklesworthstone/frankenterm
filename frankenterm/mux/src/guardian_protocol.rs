@@ -19,7 +19,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use portable_pty::{cmdbuilder::CommandBuilder, PtySize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::panic::AssertUnwindSafe;
 use thiserror::Error;
 use uuid::Uuid;
@@ -11540,6 +11540,415 @@ mod tests {
             None,
             payload,
         )
+    }
+
+    #[test]
+    fn genesis_hello_authority_requires_an_authenticated_sealed_build() {
+        let state = GuardianProtocolState::new(id(1)).unwrap();
+        let legacy_hello = authenticate(&request(
+            GuardianOperation::Hello,
+            Uuid::nil(),
+            id(2),
+            id(70),
+            None,
+            0,
+            0,
+            None,
+            b"",
+        ));
+        assert!(matches!(
+            state.authenticate_mux_connection_for_genesis(&legacy_hello),
+            Err(GuardianProtocolError::GenesisAuthorityUnavailable)
+        ));
+
+        let unsealed_payload = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::UnsealedDevelopment,
+        )
+        .encode();
+        let unsealed_hello = authenticate(&request(
+            GuardianOperation::Hello,
+            Uuid::nil(),
+            id(2),
+            id(71),
+            None,
+            0,
+            0,
+            None,
+            &unsealed_payload,
+        ));
+        assert!(matches!(
+            state.authenticate_mux_connection_for_genesis(&unsealed_hello),
+            Err(GuardianProtocolError::GenesisBuildIdentityUnavailable)
+        ));
+        assert!(matches!(
+            state.live_build_authority_from_identity(AtomicBuildIdentity::UnsealedDevelopment),
+            Err(GuardianProtocolError::GenesisBuildIdentityUnavailable)
+        ));
+
+        let zero_payload = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0)),
+        )
+        .encode();
+        let zero_hello = authenticate(&request(
+            GuardianOperation::Hello,
+            Uuid::nil(),
+            id(2),
+            id(72),
+            None,
+            0,
+            0,
+            None,
+            &zero_payload,
+        ));
+        assert!(matches!(
+            state.authenticate_mux_connection_for_genesis(&zero_hello),
+            Err(GuardianProtocolError::GenesisBuildIdentityUnavailable)
+        ));
+
+        let authority = mux_genesis_authority(&state, id(2), 0x51);
+        assert_eq!(authority.guardian_incarnation, id(1));
+        assert_eq!(authority.mux_incarnation, id(2));
+        assert_eq!(authority.hello_request_id, id(70));
+        assert_eq!(
+            authority.mux_build_identity,
+            sealed_build_identity(0x51)
+        );
+        let debug = format!("{authority:?}");
+        assert!(!debug.contains(&"51".repeat(32)));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn genesis_reservation_issues_once_binds_every_identity_and_cannot_spawn() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let upload_id = id(72);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        let spawn_envelope = spawn_request(guardian, mux, pane);
+        let spawn = authenticate(&spawn_envelope);
+        let terminal = terminal_checkpoint();
+        let begin = authenticate(&genesis_begin_request(
+            guardian,
+            mux,
+            id(71),
+            id(5),
+            upload_id,
+            &terminal,
+        ));
+        let begin_stage = GuardianCheckpointStageRequestV1::decode(begin.payload()).unwrap();
+        let mux_authority = mux_genesis_authority(&state, mux, 0x51);
+        let live_authority = live_genesis_authority(&state, 0x52);
+
+        let permit = state
+            .reserve_genesis_spawn(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                Some(&live_authority),
+            )
+            .unwrap();
+        let identity = permit.reservation_identity();
+        assert_eq!(identity.mux_incarnation(), mux);
+        assert_eq!(identity.spawn_effect_id(), id(5));
+        assert_eq!(identity.durable_pane_id(), pane);
+        assert_eq!(identity.origin_request_id(), id(4));
+        assert_eq!(
+            identity.spawn_payload_bytes(),
+            u64::try_from(spawn_envelope.payload().len()).unwrap()
+        );
+        assert_eq!(
+            identity.spawn_payload_digest(),
+            spawn_envelope.header.payload_sha256
+        );
+        assert_eq!(
+            identity.spawning_mux_build_identity_digest(),
+            sealed_build_identity(0x51).into_bytes()
+        );
+        assert_eq!(
+            identity.live_guardian_build_identity_digest(),
+            sealed_build_identity(0x52).into_bytes()
+        );
+        assert_eq!(
+            (identity.rows(), identity.cols()),
+            (24, 80)
+        );
+        assert_eq!(
+            (identity.pixel_width(), identity.pixel_height()),
+            (0, 0)
+        );
+        assert_eq!(
+            identity.checkpoint_identity_digest(),
+            begin_stage.checkpoint_id().into_bytes()
+        );
+        assert_eq!(
+            identity.boundary_identity_digest(),
+            begin_stage.boundary_id().into_bytes()
+        );
+        assert_eq!(identity.upload_id(), upload_id);
+
+        assert!(matches!(
+            state.reserve_genesis_spawn(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                Some(&live_authority),
+            ),
+            Err(GuardianProtocolError::GenesisReservationAlreadyIssued)
+        ));
+
+        let callback_calls = std::cell::Cell::new(0_u8);
+        let result = state.apply_effect_transactionally(&spawn, |_| {
+            callback_calls.set(callback_calls.get() + 1);
+            GuardianEffectOutcome::<()>::Applied
+        });
+        assert!(matches!(
+            result,
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            ))
+        ));
+        assert_eq!(callback_calls.get(), 0);
+        assert!(state.panes.is_empty());
+        assert_eq!(state.genesis_reservations_by_request.len(), 1);
+        assert_eq!(state.genesis_reservation_effects.len(), 1);
+        assert_eq!(state.genesis_reservation_panes.len(), 1);
+    }
+
+    #[test]
+    fn genesis_reservation_fails_closed_on_absent_or_mismatched_authority() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        let spawn = authenticate(&spawn_request(guardian, mux, pane));
+        let terminal = terminal_checkpoint();
+        let begin = authenticate(&genesis_begin_request(
+            guardian,
+            mux,
+            id(71),
+            id(5),
+            id(72),
+            &terminal,
+        ));
+        let mux_authority = mux_genesis_authority(&state, mux, 0x51);
+        let live_authority = live_genesis_authority(&state, 0x52);
+
+        assert!(matches!(
+            state.reserve_genesis_spawn(&spawn, &begin, None, Some(&live_authority)),
+            Err(GuardianProtocolError::GenesisAuthorityUnavailable)
+        ));
+        assert!(matches!(
+            state.reserve_genesis_spawn(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                None,
+            ),
+            Err(GuardianProtocolError::GenesisAuthorityUnavailable)
+        ));
+
+        let foreign_mux_authority = mux_genesis_authority(&state, id(9), 0x51);
+        assert!(matches!(
+            state.reserve_genesis_spawn(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &foreign_mux_authority,
+                )),
+                Some(&live_authority),
+            ),
+            Err(GuardianProtocolError::GenesisAuthorityMismatch)
+        ));
+
+        let foreign_state = GuardianProtocolState::new(id(8)).unwrap();
+        let foreign_connection_authority = mux_genesis_authority(&foreign_state, mux, 0x51);
+        let foreign_live_authority = live_genesis_authority(&foreign_state, 0x52);
+        assert!(matches!(
+            state.reserve_genesis_spawn(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &foreign_connection_authority,
+                )),
+                Some(&live_authority),
+            ),
+            Err(GuardianProtocolError::GenesisAuthorityMismatch)
+        ));
+        assert!(matches!(
+            state.reserve_genesis_spawn(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                Some(&foreign_live_authority),
+            ),
+            Err(GuardianProtocolError::GenesisAuthorityMismatch)
+        ));
+
+        let mismatched_terminal = terminal_checkpoint_with_size(25, 80, 640, 400);
+        let wrong_geometry_begin = authenticate(&genesis_begin_request(
+            guardian,
+            mux,
+            id(73),
+            id(5),
+            id(74),
+            &mismatched_terminal,
+        ));
+        assert!(matches!(
+            state.reserve_genesis_spawn(
+                &spawn,
+                &wrong_geometry_begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                Some(&live_authority),
+            ),
+            Err(GuardianProtocolError::InvalidGenesisReservation)
+        ));
+
+        let wrong_effect_begin = authenticate(&genesis_begin_request(
+            guardian,
+            mux,
+            id(75),
+            id(6),
+            id(76),
+            &terminal,
+        ));
+        assert!(matches!(
+            state.reserve_genesis_spawn(
+                &spawn,
+                &wrong_effect_begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                Some(&live_authority),
+            ),
+            Err(GuardianProtocolError::InvalidGenesisReservation)
+        ));
+        assert!(state.genesis_reservations_by_request.is_empty());
+        assert!(state.genesis_reservation_effects.is_empty());
+        assert!(state.genesis_reservation_panes.is_empty());
+    }
+
+    #[test]
+    fn genesis_reservation_binds_payload_geometry_and_upload_mutations() {
+        let terminal = terminal_checkpoint();
+        let baseline = issued_genesis_identity(
+            "bounded-command",
+            pty_size(24, 80),
+            &terminal,
+            id(72),
+        );
+        let changed_command = issued_genesis_identity(
+            "bounded-commane",
+            pty_size(24, 80),
+            &terminal,
+            id(72),
+        );
+        assert_eq!(
+            baseline.spawn_payload_bytes(),
+            changed_command.spawn_payload_bytes()
+        );
+        assert_ne!(
+            baseline.spawn_payload_digest(),
+            changed_command.spawn_payload_digest()
+        );
+
+        let changed_pixels = issued_genesis_identity(
+            "bounded-command",
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+            },
+            &terminal,
+            id(72),
+        );
+        assert_eq!(changed_pixels.pixel_width(), 640);
+        assert_eq!(changed_pixels.pixel_height(), 384);
+        assert_ne!(
+            baseline.spawn_payload_digest(),
+            changed_pixels.spawn_payload_digest()
+        );
+
+        let resized_terminal = terminal_checkpoint_with_size(25, 81, 648, 400);
+        let resized = issued_genesis_identity(
+            "bounded-command",
+            pty_size(25, 81),
+            &resized_terminal,
+            id(72),
+        );
+        assert_eq!((resized.rows(), resized.cols()), (25, 81));
+        assert_ne!(
+            baseline.checkpoint_identity_digest(),
+            resized.checkpoint_identity_digest()
+        );
+
+        let changed_upload = issued_genesis_identity(
+            "bounded-command",
+            pty_size(24, 80),
+            &terminal,
+            id(73),
+        );
+        assert_eq!(
+            baseline.checkpoint_identity_digest(),
+            changed_upload.checkpoint_identity_digest()
+        );
+        assert_eq!(
+            baseline.boundary_identity_digest(),
+            changed_upload.boundary_identity_digest()
+        );
+        assert_ne!(baseline.upload_id(), changed_upload.upload_id());
+    }
+
+    #[test]
+    fn successor_handoff_shape_can_issue_only_when_every_identity_matches() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        let spawn = authenticate(&spawn_request(guardian, mux, pane));
+        let terminal = terminal_checkpoint();
+        let begin = authenticate(&genesis_begin_request(
+            guardian,
+            mux,
+            id(71),
+            id(5),
+            id(72),
+            &terminal,
+        ));
+        let live_authority = live_genesis_authority(&state, 0x52);
+        let successor_authority = GuardianSuccessorMuxHandoffAuthorityV1 {
+            guardian_incarnation: guardian,
+            successor_mux_incarnation: mux,
+            handoff_id: id(73),
+            successor_mux_build_identity: sealed_build_identity(0x61),
+        };
+        let permit = state
+            .reserve_genesis_spawn(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::SuccessorHandoff(
+                    &successor_authority,
+                )),
+                Some(&live_authority),
+            )
+            .unwrap();
+        assert_eq!(
+            permit
+                .reservation_identity()
+                .spawning_mux_build_identity_digest(),
+            sealed_build_identity(0x61).into_bytes()
+        );
     }
 
     #[test]

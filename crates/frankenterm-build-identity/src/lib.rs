@@ -73,7 +73,7 @@ impl SealedAtomicBuildIdentity {
         }
 
         let mut decoded = [0_u8; 32];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let high = decode_lower_hex_nibble(pair[0])
                 .ok_or(AtomicComponentIdentityError::InvalidBuildIdentity)?;
             let low = decode_lower_hex_nibble(pair[1])
@@ -367,10 +367,10 @@ pub fn parse_atomic_component_marker(
 ///
 /// Callers that serialize a release manifest should use this API instead of
 /// reparsing the marker grammar themselves.
-pub fn parse_atomic_component_marker_details<'a>(
-    marker: &'a str,
+pub fn parse_atomic_component_marker_details(
+    marker: &str,
     expected_role: AtomicComponentRole,
-) -> Result<ParsedAtomicComponentMarker<'a>, AtomicComponentIdentityError> {
+) -> Result<ParsedAtomicComponentMarker<'_>, AtomicComponentIdentityError> {
     let payload = marker
         .strip_prefix(ATOMIC_COMPONENT_MARKER_PREFIX)
         .and_then(|value| value.strip_suffix(';'))
@@ -424,10 +424,10 @@ pub fn parse_sealed_atomic_component_marker(
 
 /// Parse every validated field from one exact-role marker and require sealed
 /// build authority.
-pub fn parse_sealed_atomic_component_marker_details<'a>(
-    marker: &'a str,
+pub fn parse_sealed_atomic_component_marker_details(
+    marker: &str,
     expected_role: AtomicComponentRole,
-) -> Result<ParsedSealedAtomicComponentMarker<'a>, AtomicComponentIdentityError> {
+) -> Result<ParsedSealedAtomicComponentMarker<'_>, AtomicComponentIdentityError> {
     parse_atomic_component_marker_details(marker, expected_role)?.require_sealed()
 }
 
