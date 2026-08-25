@@ -59,7 +59,12 @@ deny = [
 # *directly* depend on tokio"; transitive pulls through reputable
 # third-party crates are out of scope for this bead.
 skip-tree = [
+    { name = "frankensearch" },
+    { name = "frankensearch-embed" },
+    { name = "frankensearch-fusion" },
     { name = "fastembed" },
+    { name = "hf-hub" },
+    { name = "criterion" },
     { name = "reqwest" },
     { name = "hyper" },
     { name = "hyper-util" },
@@ -92,6 +97,7 @@ allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
+    "MIT-0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
