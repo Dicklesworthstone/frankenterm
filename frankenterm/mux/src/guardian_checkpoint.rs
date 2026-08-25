@@ -8890,8 +8890,8 @@ mod tests {
             expected_authority_field("GuardianCheckpointGenesisSpawnPermitV1", "_private", "()"),
             expected_authority_field(
                 "GuardianCheckpointGenesisSpawnPermitV1",
-                "spawn_effect_id",
-                "Uuid",
+                "identity",
+                "GuardianGenesisReservationIdentityV1",
             ),
             expected_authority_field(
                 "GuardianCheckpointManifestRetryCapabilityV1",
@@ -8964,6 +8964,11 @@ mod tests {
                 "GuardianCheckpointStageBindingV1",
             ),
             expected_authority_field(
+                "GuardianCheckpointValidatedManifestAuthorityV1",
+                "genesis_upload_id",
+                "Option<Uuid>",
+            ),
+            expected_authority_field(
                 "GuardianCheckpointValidatedManifestOperationV1",
                 "binding",
                 "GuardianCheckpointStageBindingV1",
@@ -9018,6 +9023,73 @@ mod tests {
                 "seal_request",
                 "GuardianCheckpointStageRequestV1",
             ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "boundary_identity_digest",
+                "[u8; 32]",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "checkpoint_identity_digest",
+                "[u8; 32]",
+            ),
+            expected_authority_field("GuardianGenesisReservationIdentityV1", "cols", "u16"),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "durable_pane_id",
+                "Uuid",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "live_guardian_build_identity_digest",
+                "[u8; 32]",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "mux_incarnation",
+                "Uuid",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "origin_request_id",
+                "Uuid",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "pixel_height",
+                "u16",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "pixel_width",
+                "u16",
+            ),
+            expected_authority_field("GuardianGenesisReservationIdentityV1", "rows", "u16"),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "spawn_effect_id",
+                "Uuid",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "spawn_payload_bytes",
+                "u64",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "spawn_payload_digest",
+                "[u8; 32]",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "spawning_mux_build_identity_digest",
+                "[u8; 32]",
+            ),
+            expected_authority_field(
+                "GuardianGenesisReservationIdentityV1",
+                "upload_id",
+                "Uuid",
+            ),
             expected_authority_field("LiveParserCaptureAuthority", "_private", "()"),
             expected_authority_field(
                 "LiveParserCheckpointAck",
@@ -9068,6 +9140,10 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1:Debug",
             "GuardianCheckpointValidatedStageAssemblyV1:<inherent>",
             "GuardianCheckpointValidatedStageAssemblyV1:Debug",
+            "GuardianGenesisReservationIdentityV1:<inherent>",
+            "GuardianGenesisReservationIdentityV1:Debug",
+            "GuardianGenesisReservationIdentityV1:Eq",
+            "GuardianGenesisReservationIdentityV1:PartialEq",
             "LiveParserCaptureAuthority:<inherent>",
             "LiveParserCheckpointAck:<inherent>",
             "LiveParserCheckpointAck:Debug",
@@ -9083,7 +9159,10 @@ mod tests {
             "GuardianCheckpointCandidateIdentityV1::digest:private:production",
             "GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext:pub:production",
             "GuardianCheckpointCandidateIdentityV1::is_zero:private:production",
+            "GuardianCheckpointGenesisSpawnPermitV1::into_reservation_identity:pub:production",
+            "GuardianCheckpointGenesisSpawnPermitV1::issue:pub(crate):production",
             "GuardianCheckpointGenesisSpawnPermitV1::issue_for_test:private:test",
+            "GuardianCheckpointGenesisSpawnPermitV1::reservation_identity:pub:production",
             "GuardianCheckpointManifestRetryCapabilityV1::context:pub:production",
             "GuardianCheckpointManifestSealCapabilitiesV1::from_authority:private:production",
             "GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
@@ -9105,6 +9184,23 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
             "GuardianCheckpointValidatedManifestOperationV1::validate:private:production",
             "GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
+            "GuardianGenesisReservationIdentityV1::boundary_identity_digest:pub:production",
+            "GuardianGenesisReservationIdentityV1::checkpoint_identity_digest:pub:production",
+            "GuardianGenesisReservationIdentityV1::cols:pub:production",
+            "GuardianGenesisReservationIdentityV1::durable_pane_id:pub:production",
+            "GuardianGenesisReservationIdentityV1::from_authenticated_spawn:pub(crate):production",
+            "GuardianGenesisReservationIdentityV1::live_guardian_build_identity_digest:pub:production",
+            "GuardianGenesisReservationIdentityV1::mux_incarnation:pub:production",
+            "GuardianGenesisReservationIdentityV1::origin_request_id:pub:production",
+            "GuardianGenesisReservationIdentityV1::pixel_height:pub:production",
+            "GuardianGenesisReservationIdentityV1::pixel_width:pub:production",
+            "GuardianGenesisReservationIdentityV1::rows:pub:production",
+            "GuardianGenesisReservationIdentityV1::spawn_effect_id:pub:production",
+            "GuardianGenesisReservationIdentityV1::spawn_payload_bytes:pub:production",
+            "GuardianGenesisReservationIdentityV1::spawn_payload_digest:pub:production",
+            "GuardianGenesisReservationIdentityV1::spawning_mux_build_identity_digest:pub:production",
+            "GuardianGenesisReservationIdentityV1::upload_id:pub:production",
+            "GuardianGenesisReservationIdentityV1::validate:private:production",
             "LiveParserCaptureAuthority::issue:private:production",
             "LiveParserCheckpointAck::boundary:pub:production",
             "LiveParserCheckpointAck::boundary_digest:pub:production",
@@ -9133,10 +9229,130 @@ mod tests {
         sort_authority_methods(&mut inventory.method_surfaces);
         let mut expected_method_surfaces = vec![
             expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub(crate)",
+                false,
+                "fn from_authenticated_spawn(mux_incarnation: Uuid, spawn_effect_id: Uuid, durable_pane_id: Uuid, origin_request_id: Uuid, spawn_payload_bytes: u64, spawn_payload_digest: [u8; 32], spawning_mux_build_identity_digest: [u8; 32], live_guardian_build_identity_digest: [u8; 32], rows: u16, cols: u16, pixel_width: u16, pixel_height: u16, checkpoint_identity_digest: [u8; 32], boundary_identity_digest: [u8; 32], upload_id: Uuid) -> Result<Self, GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "private",
+                false,
+                "fn validate(&self) -> Result<(), GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn mux_incarnation(&self) -> Uuid",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn spawn_effect_id(&self) -> Uuid",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn durable_pane_id(&self) -> Uuid",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn origin_request_id(&self) -> Uuid",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn spawn_payload_bytes(&self) -> u64",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn spawn_payload_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn spawning_mux_build_identity_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn live_guardian_build_identity_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn rows(&self) -> u16",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn cols(&self) -> u16",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn pixel_width(&self) -> u16",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn pixel_height(&self) -> u16",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn checkpoint_identity_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn boundary_identity_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianGenesisReservationIdentityV1",
+                "pub",
+                false,
+                "const fn upload_id(&self) -> Uuid",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointGenesisSpawnPermitV1",
+                "pub(crate)",
+                false,
+                "fn issue(identity: GuardianGenesisReservationIdentityV1) -> Result<Self, GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointGenesisSpawnPermitV1",
+                "pub",
+                false,
+                "const fn reservation_identity(&self) -> &GuardianGenesisReservationIdentityV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointGenesisSpawnPermitV1",
+                "pub",
+                false,
+                "fn into_reservation_identity(self) -> GuardianGenesisReservationIdentityV1",
+            ),
+            expected_authority_method(
                 "GuardianCheckpointGenesisSpawnPermitV1",
                 "private",
                 true,
-                "fn issue_for_test(spawn_effect_id: Uuid) -> Self",
+                "fn issue_for_test(spawn_effect_id: Uuid, terminal_checkpoint: &RecoveryTerminalCheckpointV2, upload_id: Uuid) -> Self",
             ),
             expected_authority_method(
                 "GuardianCheckpointCandidateIdentityV1",
@@ -9208,7 +9424,7 @@ mod tests {
                 "GuardianCheckpointValidatedManifestAuthorityV1",
                 "pub",
                 false,
-                "fn from_genesis_spawn_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointGenesisSpawnPermitV1, terminal_checkpoint: &RecoveryTerminalCheckpointV2) -> Result<Self, GuardianCheckpointBoundaryError>",
+                "fn from_genesis_spawn_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointGenesisSpawnPermitV1, terminal_checkpoint: &RecoveryTerminalCheckpointV2) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointValidatedManifestAuthorityV1",
@@ -9574,6 +9790,7 @@ mod tests {
             "GuardianCheckpointValidatedManifestAuthorityV1",
             "GuardianCheckpointValidatedManifestOperationV1",
             "GuardianCheckpointValidatedStageAssemblyV1",
+            "GuardianGenesisReservationIdentityV1",
             "LiveParserCheckpointAck",
         ] {
             expected_authority_signatures.push(expected_authority_method(
@@ -9586,6 +9803,7 @@ mod tests {
         for owner in [
             "GuardianCheckpointCandidateIdentityV1",
             "GuardianCheckpointOrderedChunkSetIdentityV1",
+            "GuardianGenesisReservationIdentityV1",
         ] {
             expected_authority_signatures.push(expected_authority_method(
                 owner,
@@ -9747,6 +9965,7 @@ mod tests {
         let mut expected_return_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext:pub:production",
             "GuardianCheckpointDurableCompletionReceiptV1@GuardianCheckpointCipher::inspect_durable_manifest_receipt:pub:production",
+            "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue:pub(crate):production",
             "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue_for_test:private:test",
             "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
             "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly:pub:production",
@@ -9763,6 +9982,10 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
+            "GuardianGenesisReservationIdentityV1@GuardianCheckpointGenesisSpawnPermitV1::into_reservation_identity:pub:production",
+            "GuardianGenesisReservationIdentityV1@GuardianCheckpointGenesisSpawnPermitV1::reservation_identity:pub:production",
+            "GuardianGenesisReservationIdentityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianGenesisReservationIdentityV1@GuardianGenesisReservationIdentityV1::from_authenticated_spawn:pub(crate):production",
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue:private:production",
             "LiveParserCheckpointAck@<free>::capture_and_bind_live_parser_checkpoint:pub(crate):production",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture:private:production",
@@ -9777,6 +10000,7 @@ mod tests {
         let mut expected_construction_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext",
             "GuardianCheckpointDurableCompletionReceiptV1@GuardianCheckpointCipher::inspect_durable_manifest_receipt",
+            "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue",
             "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
             "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
             "GuardianCheckpointOrderedChunkSetBuilderV1@GuardianCheckpointOrderedChunkSetBuilderV1::new",
@@ -9787,6 +10011,7 @@ mod tests {
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly",
+            "GuardianGenesisReservationIdentityV1@GuardianGenesisReservationIdentityV1::from_authenticated_spawn",
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture",
         ]
@@ -9864,7 +10089,13 @@ mod tests {
                     "static_assertions::assert_impl_all!(GuardianCheckpointDurableCompletionReceiptV1: zeroize::ZeroizeOnDrop);"
                 ),
                 expected_item_macro(
-                    "static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"
+                    "static_assertions::const_assert_eq!(std::mem::size_of::<GuardianGenesisReservationIdentityV1>(), 256);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianGenesisReservationIdentityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);"
                 ),
                 expected_item_macro(
                     "static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);"
