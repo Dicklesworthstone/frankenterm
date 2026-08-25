@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -6970,7 +6971,7 @@ pub struct CheckpointScrollbackSummary {
 pub struct CheckpointScrollbackPayload {
     /// Frozen integer schema version.
     pub schema_version: u32,
-    /// Artifact construction timestamp in epoch milliseconds.
+    /// Deterministic checkpoint-bound publication timestamp in epoch milliseconds.
     pub created_at_epoch_ms: u64,
     /// Current redaction catalog used for fixed-point verification.
     pub redaction_catalog_version: String,
@@ -7009,7 +7010,7 @@ pub struct CheckpointScrollbackArtifactReceipt {
     pub checkpoint_id: i64,
     /// Exact checkpoint state witness.
     pub checkpoint_state_hash: String,
-    /// Artifact construction timestamp in epoch milliseconds.
+    /// Deterministic checkpoint-bound publication timestamp in epoch milliseconds.
     pub created_at_epoch_ms: u64,
     /// Exact compact payload digest.
     pub payload_sha256: String,
@@ -7034,7 +7035,7 @@ pub struct CheckpointScrollbackArtifactReceipt {
 pub struct CheckpointScrollbackInventoryEntry {
     /// Leaf path relative to the inventoried directory.
     pub file_name: PathBuf,
-    /// Artifact creation timestamp.
+    /// Deterministic checkpoint-bound publication timestamp.
     pub created_at_epoch_ms: u64,
     /// Verified checkpoint row ID.
     pub checkpoint_id: i64,
@@ -7172,7 +7173,7 @@ fn serialize_checkpoint_artifact(
     artifact: &CheckpointScrollbackArtifact,
     limit: u64,
 ) -> Result<Vec<u8>, CheckpointScrollbackArtifactError> {
-    let mut writer = BoundedCheckpointArtifactWriter::new(limit.saturating_sub(1))?;
+    let mut writer = BoundedCheckpointArtifactWriter::new(limit)?;
     serde_json::to_writer_pretty(&mut writer, artifact)?;
     writer.write_all(b"\n")?;
     Ok(writer.into_inner())
@@ -7966,9 +7967,10 @@ fn build_checkpoint_scrollback_payload(
     }
     transaction.commit()?;
     let pane_count = checkpoint.panes.len();
+    let created_at_epoch_ms = checkpoint.checkpoint_at;
     Ok(CheckpointScrollbackPayload {
         schema_version: 1,
-        created_at_epoch_ms: epoch_ms(),
+        created_at_epoch_ms,
         redaction_catalog_version: crate::redact_backfill::current_catalog_version().to_string(),
         limits,
         capabilities: CheckpointScrollbackCapabilities::V1,
@@ -8872,7 +8874,7 @@ fn acquire_checkpoint_artifact_publication_lock(
         .write(true)
         .create(true)
         .truncate(false)
-        .follow(cap_std::fs::FollowSymlinks::No);
+        .follow(FollowSymlinks::No);
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt as _;
@@ -8969,85 +8971,27 @@ fn publish_checkpoint_artifact_noreplace(
     })
 }
 
-fn publish_checkpoint_artifact_bytes(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), CheckpointScrollbackArtifactError> {
-    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, true)?;
-    if parent.symlink_metadata(&leaf).is_ok() {
-        return Err(CheckpointScrollbackArtifactError::AlreadyExists);
-    }
-    let expected_len = u64::try_from(bytes.len()).map_err(|_| {
-        CheckpointScrollbackArtifactError::ResourceLimit(
-            "artifact length does not fit u64".to_string(),
-        )
-    })?;
-    for attempt in 0..CHECKPOINT_SCROLLBACK_MAX_STAGING_ATTEMPTS {
-        let staging_name = checkpoint_artifact_staging_name(&leaf, attempt);
-        let staging = Path::new(&staging_name);
-        let mut options = cap_std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .follow(cap_std::fs::FollowSymlinks::No);
-        #[cfg(unix)]
-        {
-            use cap_std::fs::OpenOptionsExt as _;
-
-            options.mode(0o600);
-        }
-        let mut file = match parent.open_with(staging, &options) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        };
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        let handle_metadata = file.metadata()?;
-        let path_metadata = parent.symlink_metadata(staging)?;
-        validate_checkpoint_artifact_file_metadata(
-            &path_metadata,
-            &handle_metadata,
-            Some(expected_len),
-        )?;
-        publish_checkpoint_artifact_noreplace(&parent, staging, &leaf)?;
-        sync_checkpoint_artifact_directory(&parent)?;
-        revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
-        let target_metadata = parent.symlink_metadata(&leaf)?;
-        let handle_metadata_after = file.metadata()?;
-        validate_checkpoint_artifact_file_metadata(
-            &target_metadata,
-            &handle_metadata_after,
-            Some(expected_len),
-        )?;
-        return Ok(());
-    }
-    Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
-        "all {CHECKPOINT_SCROLLBACK_MAX_STAGING_ATTEMPTS} bounded staging names are occupied"
-    )))
-}
-
-fn read_checkpoint_artifact_bounded(
-    path: &Path,
+fn read_checkpoint_artifact_from_parent_bounded(
+    parent: &cap_std::fs::Dir,
+    leaf: &Path,
     max_bytes: u64,
+    synchronize_file: bool,
 ) -> Result<Vec<u8>, CheckpointScrollbackArtifactError> {
-    use cap_fs_ext::OsMetadataExt as _;
-
-    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, false)?;
     let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(cap_std::fs::FollowSymlinks::No);
-    let mut file = parent.open_with(&leaf, &options)?;
-    let before = file.metadata()?;
-    let path_before = parent.symlink_metadata(&leaf)?;
-    validate_checkpoint_artifact_file_metadata(&path_before, &before, None)?;
-    if before.len() > max_bytes {
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = parent.open_with(leaf, &options)?;
+    let before = validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(leaf)?,
+        &file.metadata()?,
+        None,
+    )?;
+    if before.byte_len > max_bytes {
         return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
             "artifact has {} bytes, verifier limit {max_bytes}",
-            before.len()
+            before.byte_len
         )));
     }
-    let capacity = usize::try_from(before.len()).map_err(|_| {
+    let capacity = usize::try_from(before.byte_len).map_err(|_| {
         CheckpointScrollbackArtifactError::ResourceLimit(
             "artifact length does not fit this platform".to_string(),
         )
@@ -9066,24 +9010,193 @@ fn read_checkpoint_artifact_bounded(
             "artifact grew beyond the verifier limit during read".to_string(),
         ));
     }
-    let after = file.metadata()?;
-    let path_after = parent.symlink_metadata(&leaf)?;
-    validate_checkpoint_artifact_file_metadata(
-        &path_after,
-        &after,
+    if synchronize_file {
+        file.sync_all()?;
+    }
+    let after = validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(leaf)?,
+        &file.metadata()?,
         Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
     )?;
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.modified().ok() != after.modified().ok()
-    {
+    if before != after {
         return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
             "artifact changed while it was read".to_string(),
         ));
     }
+    Ok(bytes)
+}
+
+fn read_checkpoint_artifact_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>, CheckpointScrollbackArtifactError> {
+    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, false)?;
+    let bytes =
+        read_checkpoint_artifact_from_parent_bounded(&parent, &leaf, max_bytes, false)?;
     revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
     Ok(bytes)
+}
+
+fn checkpoint_artifact_existing_target_matches(
+    parent: &cap_std::fs::Dir,
+    leaf: &Path,
+    bytes: &[u8],
+) -> Result<bool, CheckpointScrollbackArtifactError> {
+    match parent.symlink_metadata(leaf) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let expected_len = u64::try_from(bytes.len()).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact length does not fit u64".to_string(),
+        )
+    })?;
+    let existing =
+        read_checkpoint_artifact_from_parent_bounded(parent, leaf, expected_len, true)?;
+    if existing != bytes {
+        return Err(CheckpointScrollbackArtifactError::AlreadyExists);
+    }
+    sync_checkpoint_artifact_directory(parent)?;
+    Ok(true)
+}
+
+fn open_or_rewrite_checkpoint_artifact_staging(
+    parent: &cap_std::fs::Dir,
+    staging: &Path,
+    bytes: &[u8],
+) -> Result<cap_std::fs::File, CheckpointScrollbackArtifactError> {
+    let expected_len = u64::try_from(bytes.len()).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact length does not fit u64".to_string(),
+        )
+    })?;
+    let mut create = cap_std::fs::OpenOptions::new();
+    create
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+
+        create.mode(0o600);
+    }
+    let (mut file, created) = match parent.open_with(staging, &create) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut existing = cap_std::fs::OpenOptions::new();
+            existing
+                .read(true)
+                .write(true)
+                .follow(FollowSymlinks::No);
+            (parent.open_with(staging, &existing)?, false)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let before = validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(staging)?,
+        &file.metadata()?,
+        None,
+    )?;
+
+    let exact_residue = if created || before.byte_len != expected_len {
+        false
+    } else {
+        let capacity = usize::try_from(expected_len).map_err(|_| {
+            CheckpointScrollbackArtifactError::ResourceLimit(
+                "artifact length does not fit this platform".to_string(),
+            )
+        })?;
+        let mut observed = Vec::new();
+        observed.try_reserve_exact(capacity).map_err(|error| {
+            CheckpointScrollbackArtifactError::ResourceLimit(format!(
+                "bounded staging allocation failed: {error}"
+            ))
+        })?;
+        (&mut file)
+            .take(expected_len.saturating_add(1))
+            .read_to_end(&mut observed)?;
+        let after_read = validate_checkpoint_artifact_file_metadata(
+            &parent.symlink_metadata(staging)?,
+            &file.metadata()?,
+            Some(u64::try_from(observed.len()).unwrap_or(u64::MAX)),
+        )?;
+        if before != after_read {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "staging residue changed while it was inspected".to_string(),
+            ));
+        }
+        observed == bytes
+    };
+
+    if !exact_residue {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(bytes)?;
+    }
+    file.sync_all()?;
+    validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(staging)?,
+        &file.metadata()?,
+        Some(expected_len),
+    )?;
+    Ok(file)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointArtifactPublicationOutcome {
+    Published,
+    AlreadyApplied,
+}
+
+fn publish_checkpoint_artifact_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<CheckpointArtifactPublicationOutcome, CheckpointScrollbackArtifactError> {
+    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, true)?;
+    let _publication_lock = acquire_checkpoint_artifact_publication_lock(&parent)?;
+    revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+    if checkpoint_artifact_existing_target_matches(&parent, &leaf, bytes)? {
+        revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+        return Ok(CheckpointArtifactPublicationOutcome::AlreadyApplied);
+    }
+
+    let artifact_sha256 = checkpoint_artifact_sha256(bytes);
+    let staging_name = checkpoint_artifact_staging_name(&leaf, &artifact_sha256);
+    let staging = Path::new(&staging_name);
+    let file = open_or_rewrite_checkpoint_artifact_staging(&parent, staging, bytes)?;
+    match publish_checkpoint_artifact_noreplace(&parent, staging, &leaf) {
+        Ok(()) => {}
+        Err(CheckpointScrollbackArtifactError::AlreadyExists) => {
+            if checkpoint_artifact_existing_target_matches(&parent, &leaf, bytes)? {
+                revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+                return Ok(CheckpointArtifactPublicationOutcome::AlreadyApplied);
+            }
+            return Err(CheckpointScrollbackArtifactError::AlreadyExists);
+        }
+        Err(error) => return Err(error),
+    }
+    sync_checkpoint_artifact_directory(&parent)?;
+    revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+    validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(&leaf)?,
+        &file.metadata()?,
+        Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+    )?;
+    let published = read_checkpoint_artifact_from_parent_bounded(
+        &parent,
+        &leaf,
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        true,
+    )?;
+    if published != bytes {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "published artifact bytes differ from the synchronized staging inode".to_string(),
+        ));
+    }
+    Ok(CheckpointArtifactPublicationOutcome::Published)
 }
 
 /// Construct, atomically publish, reread, and independently verify one artifact.

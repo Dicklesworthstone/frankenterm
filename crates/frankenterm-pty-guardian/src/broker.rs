@@ -413,7 +413,7 @@ pub enum BrokerSpawnAttemptExecutionV1<T> {
         value: T,
         observation: BrokerSpawnObservationPermitV1,
     },
-    OutcomeIndeterminate,
+    OutcomeIndeterminate { retained_value: Option<T> },
 }
 
 #[derive(Debug, Error)]
@@ -1002,6 +1002,334 @@ fn scan_broker_spawn_head(
             terminal_head_mac: previous_head_mac,
         },
     ))
+}
+
+impl BrokerSpawnJournalV1 {
+    /// Initialize two exclusively created, empty regular-file descriptors.
+    ///
+    /// Both authenticated headers are synchronized before this returns. No
+    /// record append is allowed until the exact parent directory descriptor is
+    /// synchronized, making publication of both names durable as one startup
+    /// barrier.
+    pub(crate) fn create(
+        mut wal: File,
+        mut head: File,
+        identity: BrokerSpawnWalIdentityV1,
+        authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<Self, BrokerSpawnWalError> {
+        identity.validate()?;
+        if !wal.metadata()?.file_type().is_file() || !head.metadata()?.file_type().is_file() {
+            return Err(BrokerSpawnWalError::NotRegularFile);
+        }
+        if wal.metadata()?.len() != 0 || head.metadata()?.len() != 0 {
+            return Err(BrokerSpawnWalError::NewJournalNotEmpty);
+        }
+        let wal_header = encode_broker_spawn_file_header(
+            BROKER_SPAWN_WAL_FILE_MAGIC,
+            identity,
+            &authenticator,
+        )?;
+        let head_header = encode_broker_spawn_file_header(
+            BROKER_SPAWN_HEAD_FILE_MAGIC,
+            identity,
+            &authenticator,
+        )?;
+        wal.seek(SeekFrom::Start(0))?;
+        wal.write_all(&wal_header)?;
+        wal.sync_all()?;
+        head.seek(SeekFrom::Start(0))?;
+        head.write_all(&head_header)?;
+        head.sync_all()?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(
+                usize::try_from(BROKER_SPAWN_WAL_MAX_RECORDS)
+                    .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?,
+            )
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        Ok(Self {
+            wal,
+            head,
+            identity,
+            authenticator,
+            header_mac: read_broker_array_32(&wal_header[160..192]),
+            head_header_mac: read_broker_array_32(&head_header[160..192]),
+            committed_wal_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            committed_head_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            wal_trailing_bytes: 0,
+            head_trailing_bytes: 0,
+            records,
+            terminal_head_mac: read_broker_array_32(&head_header[160..192]),
+            directory_entry_sync_required: true,
+            recovery_append_authority_withheld: false,
+            head_reconciliation_required: false,
+            poisoned: false,
+            #[cfg(test)]
+            injected_fault: None,
+        })
+    }
+
+    /// Authenticate and reconcile an existing WAL/head pair without granting
+    /// append authority.
+    ///
+    /// A complete WAL may be exactly one record ahead of its local head: that
+    /// is the deliberate crash cut after WAL `sync_all` and before head
+    /// `sync_all`. Head-ahead, divergent, multi-record-ahead, or incomplete
+    /// pairs fail closed and preserve all bytes.
+    pub(crate) fn open(
+        mut wal: File,
+        mut head: File,
+        identity: BrokerSpawnWalIdentityV1,
+        authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<Self, BrokerSpawnWalError> {
+        identity.validate()?;
+        let (header_mac, mut wal_scan) =
+            scan_broker_spawn_wal(&mut wal, identity, &authenticator)?;
+        let (head_header_mac, head_scan) =
+            scan_broker_spawn_head(&mut head, identity, &authenticator, &wal_scan.records)?;
+        let wal_record_count = wal_scan.records.len();
+        let head_record_count = head_scan.record_macs.len();
+        let head_gap = wal_record_count
+            .checked_sub(head_record_count)
+            .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
+        if head_gap > 1 {
+            return Err(BrokerSpawnWalError::HeadReconciliationGap);
+        }
+        for (index, head_mac) in head_scan.record_macs.iter().copied().enumerate() {
+            let record = wal_scan
+                .records
+                .get_mut(index)
+                .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
+            record.receipt.head_mac = head_mac;
+            record.receipt.committed_head_bytes = BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+                + u64::try_from(index + 1)
+                    .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?
+                    * BROKER_SPAWN_HEAD_RECORD_BYTES_U64;
+        }
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(
+                usize::try_from(BROKER_SPAWN_WAL_MAX_RECORDS)
+                    .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?,
+            )
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        records.extend(wal_scan.records);
+        Ok(Self {
+            wal,
+            head,
+            identity,
+            authenticator,
+            header_mac,
+            head_header_mac,
+            committed_wal_bytes: wal_scan.committed_bytes,
+            committed_head_bytes: head_scan.committed_bytes,
+            wal_trailing_bytes: wal_scan.trailing_bytes,
+            head_trailing_bytes: head_scan.trailing_bytes,
+            records,
+            terminal_head_mac: head_scan.terminal_head_mac,
+            directory_entry_sync_required: false,
+            recovery_append_authority_withheld: true,
+            head_reconciliation_required: head_gap == 1,
+            poisoned: false,
+            #[cfg(test)]
+            injected_fault: None,
+        })
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> BrokerSpawnWalIdentityV1 {
+        self.identity
+    }
+
+    #[must_use]
+    pub fn status(&self) -> BrokerSpawnWalStatusV1 {
+        let terminal = self.records.last().copied();
+        let child_identity = terminal.and_then(|record| record.child_identity);
+        BrokerSpawnWalStatusV1 {
+            identity: self.identity,
+            phase: terminal.map(|record| record.phase),
+            attempt_id: terminal
+                .filter(|record| !record.attempt_id.is_nil())
+                .map(|record| record.attempt_id),
+            child_identity,
+            reply_ack_id: terminal
+                .filter(|record| record.phase == BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+                .map(|record| record.operation_id),
+            committed_records: u64::try_from(self.records.len()).unwrap_or(u64::MAX),
+            committed_wal_bytes: self.committed_wal_bytes,
+            committed_head_bytes: self.committed_head_bytes,
+            tail: if self.wal_trailing_bytes == 0 && self.head_trailing_bytes == 0 {
+                BrokerSpawnWalTailV1::Clean
+            } else {
+                BrokerSpawnWalTailV1::Incomplete {
+                    wal_trailing_bytes: self.wal_trailing_bytes,
+                    head_trailing_bytes: self.head_trailing_bytes,
+                }
+            },
+            append_authority_withheld: self.directory_entry_sync_required
+                || self.recovery_append_authority_withheld
+                || self.head_reconciliation_required
+                || self.poisoned
+                || self.wal_trailing_bytes != 0
+                || self.head_trailing_bytes != 0,
+            head_reconciliation_required: self.head_reconciliation_required,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Synchronize the parent that published both newly created files.
+    pub fn sync_parent_directory_and_activate(
+        &mut self,
+        parent_directory: &File,
+    ) -> Result<(), BrokerSpawnWalError> {
+        if !self.directory_entry_sync_required {
+            return Ok(());
+        }
+        if !parent_directory.metadata()?.file_type().is_dir() {
+            return Err(BrokerSpawnWalError::NotDirectory);
+        }
+        parent_directory.sync_all()?;
+        self.directory_entry_sync_required = false;
+        Ok(())
+    }
+
+    /// Reconcile the only permitted recovery cut and restore append authority.
+    ///
+    /// The service must mint `authority` only after revalidating the no-follow,
+    /// owner-only, single-link WAL/head names, their exact open inodes, the
+    /// stable token identity, and the pinned parent directory. Incomplete tails
+    /// are never truncated or repaired in place.
+    pub(crate) fn reconcile_recovered_head_and_activate(
+        &mut self,
+        authority: BrokerSpawnWalFilesystemRevalidationV1,
+    ) -> Result<(), BrokerSpawnWalError> {
+        self.require_healthy_for_recovery()?;
+        if authority.identity != self.identity
+            || authority.observed_wal_bytes != self.committed_wal_bytes
+            || authority.observed_head_bytes != self.committed_head_bytes
+            || self.wal.metadata()?.len() != authority.observed_wal_bytes
+            || self.head.metadata()?.len() != authority.observed_head_bytes
+        {
+            return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
+        }
+        if self.head_reconciliation_required {
+            let record = self
+                .records
+                .last()
+                .copied()
+                .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
+            let expected_sequence = u64::try_from(self.records.len() - 1)
+                .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+            if record.receipt.sequence != expected_sequence {
+                return Err(BrokerSpawnWalError::SequenceMismatch);
+            }
+            let encoded = encode_broker_spawn_head_record(
+                self.head_header_mac,
+                &self.authenticator,
+                expected_sequence,
+                record.receipt.record_mac,
+                self.terminal_head_mac,
+            )?;
+            let result = (|| -> std::io::Result<()> {
+                self.head.seek(SeekFrom::Start(self.committed_head_bytes))?;
+                self.head.write_all(&encoded)?;
+                self.head.sync_all()
+            })();
+            if let Err(error) = result {
+                self.poisoned = true;
+                return Err(BrokerSpawnWalError::Io(error));
+            }
+            let head_mac = read_broker_array_32(&encoded[88..120]);
+            self.committed_head_bytes = self
+                .committed_head_bytes
+                .checked_add(BROKER_SPAWN_HEAD_RECORD_BYTES_U64)
+                .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+            self.terminal_head_mac = head_mac;
+            let terminal = self
+                .records
+                .last_mut()
+                .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
+            terminal.receipt.head_mac = head_mac;
+            terminal.receipt.committed_head_bytes = self.committed_head_bytes;
+            self.head_reconciliation_required = false;
+        }
+        self.recovery_append_authority_withheld = false;
+        Ok(())
+    }
+
+    fn require_healthy_for_recovery(&self) -> Result<(), BrokerSpawnWalError> {
+        if self.poisoned {
+            return Err(BrokerSpawnWalError::Poisoned);
+        }
+        if self.directory_entry_sync_required {
+            return Err(BrokerSpawnWalError::DirectoryEntryNotDurable);
+        }
+        if self.wal_trailing_bytes != 0 || self.head_trailing_bytes != 0 {
+            return Err(BrokerSpawnWalError::IncompleteTail);
+        }
+        Ok(())
+    }
+
+    fn require_append_authority(&self) -> Result<(), BrokerSpawnWalError> {
+        self.require_healthy_for_recovery()?;
+        if self.recovery_append_authority_withheld || self.head_reconciliation_required {
+            return Err(BrokerSpawnWalError::RecoveryAuthorityUnavailable);
+        }
+        if self.records.len()
+            >= usize::try_from(BROKER_SPAWN_WAL_MAX_RECORDS)
+                .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?
+        {
+            return Err(BrokerSpawnWalError::CapacityExhausted);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_fault(&mut self, fault: BrokerSpawnWalInjectedFault) {
+        self.injected_fault = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn fail_if_injected(&mut self, fault: BrokerSpawnWalInjectedFault) -> std::io::Result<()> {
+        if self.injected_fault == Some(fault) {
+            self.injected_fault = None;
+            Err(std::io::Error::other("injected broker Spawn WAL fault"))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(test))]
+    fn fail_if_injected(&mut self, _fault: ()) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl BrokerSpawnWalFilesystemRevalidationV1 {
+    /// Mint recovery authority after the service has revalidated both pinned
+    /// descriptors and their durable names. Raw wire fields must never call
+    /// this constructor.
+    pub(crate) fn from_revalidated_filesystem(
+        identity: BrokerSpawnWalIdentityV1,
+        observed_wal_bytes: u64,
+        observed_head_bytes: u64,
+    ) -> Result<Self, BrokerSpawnWalError> {
+        identity.validate()?;
+        if observed_wal_bytes < BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+            || observed_head_bytes < BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+        {
+            return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
+        }
+        Ok(Self {
+            identity,
+            observed_wal_bytes,
+            observed_head_bytes,
+        })
+    }
 }
 
 /// Hard per-pane limits checked before the broker allocates a PTY.

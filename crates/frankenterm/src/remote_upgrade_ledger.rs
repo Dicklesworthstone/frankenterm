@@ -1219,13 +1219,46 @@ fn validate_retained_publication_residue(
         metadata.is_file() && metadata.len() <= MAX_RECORD_BYTES,
         "remote upgrade retained publication residue is not one bounded regular file"
     );
-    validate_exact_file(
-        transaction,
-        Path::new(name),
-        metadata.len(),
-        effective_uid,
-        expected_device,
-    )
+    if name.starts_with(PENDING_ARTIFACT_PREFIX) {
+        let mode = metadata.permissions().mode() & 0o7777;
+        anyhow::ensure!(
+            matches!(mode, 0o400 | 0o600),
+            "remote upgrade pending publication residue has an unsafe mode"
+        );
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = transaction.open_with(name, &options)?;
+        validate_remote_generation_file_metadata(
+            transaction,
+            Path::new(name),
+            &file,
+            mode,
+            Some(metadata.len()),
+            effective_uid,
+            expected_device,
+        )?;
+        file.sync_all().with_context(|| {
+            format!("cannot re-durabilize pending upgrade artifact {name}")
+        })?;
+        validate_remote_generation_file_metadata(
+            transaction,
+            Path::new(name),
+            &file,
+            mode,
+            Some(metadata.len()),
+            effective_uid,
+            expected_device,
+        )?;
+        Ok(())
+    } else {
+        validate_exact_file(
+            transaction,
+            Path::new(name),
+            metadata.len(),
+            effective_uid,
+            expected_device,
+        )
+    }
 }
 
 fn create_or_validate_claim(
@@ -1631,32 +1664,67 @@ where
         }
     }
 
-    let mut publication_hasher = Sha256::new();
-    publication_hasher.update(b"frankenterm.remote-upgrade.artifact-publication.v2\0");
-    publication_hasher.update(name_text.as_bytes());
-    publication_hasher.update([0]);
-    publication_hasher.update(bytes);
-    let publication_id = hex::encode(publication_hasher.finalize());
-    let temporary_name = format!("{PENDING_ARTIFACT_PREFIX}{publication_id}");
-    let temporary_exists = match directory.symlink_metadata(&temporary_name) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(error).context("cannot inspect deterministic upgrade publication temp")
-        }
-    };
+    let temporary_name = synchronized_publication_temp_name(name_text, bytes);
     let mut options = cap_std::fs::OpenOptions::new();
     options
         .read(true)
         .write(true)
+        .create_new(true)
         .follow(FollowSymlinks::No)
-        .mode(REMOTE_GENERATION_MANIFEST_MODE);
-    if !temporary_exists {
-        options.create_new(true);
-    }
-    let mut file = directory
-        .open_with(&temporary_name, &options)
-        .context("cannot open deterministic upgrade artifact publication temp")?;
+        .mode(0o600);
+    let mut file = match directory.open_with(&temporary_name, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut retained_options = cap_std::fs::OpenOptions::new();
+            retained_options.read(true).follow(FollowSymlinks::No);
+            let retained = directory
+                .open_with(&temporary_name, &retained_options)
+                .context("cannot reopen deterministic upgrade publication temp")?;
+            let retained_metadata = retained.metadata()?;
+            let retained_mode = retained_metadata.permissions().mode() & 0o7777;
+            anyhow::ensure!(
+                matches!(retained_mode, 0o400 | 0o600),
+                "deterministic upgrade publication temp has an unsafe mode"
+            );
+            anyhow::ensure!(
+                retained_metadata.len() <= MAX_RECORD_BYTES,
+                "deterministic upgrade publication temp exceeds its bounded length"
+            );
+            validate_remote_generation_file_metadata(
+                directory,
+                Path::new(&temporary_name),
+                &retained,
+                retained_mode,
+                Some(retained_metadata.len()),
+                effective_uid,
+                expected_device,
+            )?;
+            retained.set_permissions(cap_std::fs::Permissions::from_mode(0o600))?;
+            retained.sync_all()?;
+            validate_remote_generation_file_metadata(
+                directory,
+                Path::new(&temporary_name),
+                &retained,
+                0o600,
+                Some(retained_metadata.len()),
+                effective_uid,
+                expected_device,
+            )?;
+            drop(retained);
+
+            let mut resume_options = cap_std::fs::OpenOptions::new();
+            resume_options
+                .read(true)
+                .write(true)
+                .follow(FollowSymlinks::No);
+            directory
+                .open_with(&temporary_name, &resume_options)
+                .context("cannot resume deterministic upgrade artifact publication temp")?
+        }
+        Err(error) => {
+            return Err(error).context("cannot create upgrade artifact publication temp");
+        }
+    };
     let retained_len = file.metadata()?.len();
     anyhow::ensure!(
         retained_len <= MAX_RECORD_BYTES,
@@ -1666,7 +1734,7 @@ where
         directory,
         Path::new(&temporary_name),
         &file,
-        REMOTE_GENERATION_MANIFEST_MODE,
+        0o600,
         Some(retained_len),
         effective_uid,
         expected_device,
@@ -1676,6 +1744,16 @@ where
     // prefix crash, so retry allocation is constant instead of PID-proportional.
     file.set_len(0)?;
     file.write_all(bytes)?;
+    file.sync_all()?;
+    validate_remote_generation_file_metadata(
+        directory,
+        Path::new(&temporary_name),
+        &file,
+        0o600,
+        Some(expected_len),
+        effective_uid,
+        expected_device,
+    )?;
     file.set_permissions(cap_std::fs::Permissions::from_mode(
         REMOTE_GENERATION_MANIFEST_MODE,
     ))?;
@@ -1714,17 +1792,29 @@ where
         }
     }
     let persisted = read_exact_file(
-            directory,
-            name,
-            MAX_RECORD_BYTES,
-            effective_uid,
-            expected_device,
-        )?;
+        directory,
+        name,
+        MAX_RECORD_BYTES,
+        effective_uid,
+        expected_device,
+    )?;
     anyhow::ensure!(
         persisted == bytes,
         "published upgrade artifact differs from its synchronized temp bytes"
     );
     Ok(())
+}
+
+fn synchronized_publication_temp_name(name: &str, bytes: &[u8]) -> String {
+    let mut publication_hasher = Sha256::new();
+    publication_hasher.update(b"frankenterm.remote-upgrade.artifact-publication.v2\0");
+    publication_hasher.update(name.as_bytes());
+    publication_hasher.update([0]);
+    publication_hasher.update(bytes);
+    format!(
+        "{PENDING_ARTIFACT_PREFIX}{}",
+        hex::encode(publication_hasher.finalize())
+    )
 }
 
 fn validate_exact_file(
