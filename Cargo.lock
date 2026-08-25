@@ -3645,6 +3645,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]
@@ -4094,6 +4095,7 @@ dependencies = [
  "thiserror 2.0.20",
  "vtparse 0.7.0",
  "winapi",
+ "zeroize",
 ]
 
 [[package]]
@@ -4502,6 +4504,7 @@ dependencies = [
  "serde_json",
  "siphasher",
  "unicode-segmentation",
+ "zeroize",
 ]
 
 [[package]]
@@ -7503,6 +7506,7 @@ dependencies = [
  "serial2",
  "sha2 0.11.0",
  "shell-words",
+ "static_assertions",
  "syn 2.0.119",
  "tempfile",
  "terminfo",

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 const TEMPLATE_REL_PATH: &str = "docs/release/attestation-bead-closing-template.md";
 const CHECKLIST_REL_PATH: &str = "docs/release/attestation-checklist.md";
+const RELEASE_WORKFLOW_REL_PATH: &str = ".github/workflows/release.yml";
 
 const REQUIRED_TEMPLATE_LINES: &[&str] = &[
     "Manifest slot category: `<category>`",
@@ -96,4 +97,31 @@ fn attestation_checklist_points_producing_beads_at_the_template_and_test() {
             "{CHECKLIST_REL_PATH} is missing required closing-convention breadcrumb: {required}"
         );
     }
+}
+
+#[test]
+fn release_workflow_attestation_pipeline_fails_closed() {
+    let workflow = read_workspace_file(RELEASE_WORKFLOW_REL_PATH);
+
+    assert!(
+        !workflow.contains("continue-on-error: true"),
+        "{RELEASE_WORKFLOW_REL_PATH} must not let a failed release gate publish artifacts"
+    );
+    for required in [
+        "scripts/attestation-build.sh",
+        "--sign cosign",
+        "--strict-deferred",
+        "scripts/attestation-verify.sh",
+        "--strict-required",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "{RELEASE_WORKFLOW_REL_PATH} is missing mandatory attestation gate: {required}"
+        );
+    }
+    assert_eq!(
+        workflow.matches("--target multi-platform-release").count(),
+        2,
+        "release build identity must name its target exactly once in derivation and generation"
+    );
 }

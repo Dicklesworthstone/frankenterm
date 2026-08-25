@@ -4088,7 +4088,6 @@ impl GuardianReplayPageHeaderV1 {
         self.page_index
     }
 
-    #[must_use]
     /// Explicitly declassify the authenticated page commitment for the wire
     /// acknowledgement. This is the only public raw-copy boundary.
     #[must_use]
