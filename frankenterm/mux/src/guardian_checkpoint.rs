@@ -8599,8 +8599,8 @@ mod tests {
         assert_eq!(
             inventory.item_macros,
             vec![
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);"),
