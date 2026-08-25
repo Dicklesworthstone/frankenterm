@@ -6200,12 +6200,18 @@ mod tests {
             19,
             "record-backed parser fixture carries the exact raw byte watermark"
         );
-        terminal
+        let checkpoint = terminal
             .capture_recovery_checkpoint_at_external_parser_ground(
                 ground,
                 TerminalCheckpointLimits::default(),
             )
-            .expect("capture canonical record-backed terminal fixture")
+            .expect("capture canonical record-backed terminal fixture");
+        assert_eq!(
+            checkpoint.parser_stream_bytes(),
+            19,
+            "record-backed terminal fixture retains the external parser watermark"
+        );
+        checkpoint
     }
 
     fn live_capture(
@@ -6216,7 +6222,7 @@ mod tests {
         checkpoint: RecoveryTerminalCheckpointV2,
     ) -> LiveParserCheckpointAck {
         let parser_stream_bytes = checkpoint.parser_stream_bytes();
-        LiveParserCheckpointAck::capture(
+        let capture = LiveParserCheckpointAck::capture(
             registration_wire_identity,
             pane,
             segment,
@@ -6224,7 +6230,13 @@ mod tests {
             parser_stream_bytes,
             checkpoint,
         )
-        .expect("capture registration-bound checkpoint fixture")
+        .expect("capture registration-bound checkpoint fixture");
+        assert_eq!(
+            capture.parser_stream_bytes(),
+            parser_stream_bytes,
+            "live capture retains the exact parser watermark"
+        );
+        capture
     }
 
     fn record_descriptor() -> (
