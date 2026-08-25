@@ -1583,7 +1583,7 @@ impl GuardianClient {
         size: PtySize,
     ) -> Result<GuardianReply, GuardianClientError> {
         let payload = GuardianSpawnPayload::new(command, size)?.encode()?;
-        let request = self.request(
+        let request = self.request_sensitive(
             GuardianOperation::Spawn,
             request_id,
             Some(pane_id),
@@ -1909,6 +1909,30 @@ impl GuardianClient {
             ),
             payload,
         )
+    }
+
+    fn request_sensitive(
+        &self,
+        operation: GuardianOperation,
+        request_id: Uuid,
+        pane_id: Option<Uuid>,
+        lease_generation: u64,
+        lease_sequence: u64,
+        effect_id: Option<Uuid>,
+        payload: Zeroizing<Vec<u8>>,
+    ) -> GuardianRequestEnvelope {
+        let header = GuardianRequestHeader::new(
+            operation,
+            self.guardian_incarnation,
+            self.mux_incarnation,
+            request_id,
+            pane_id,
+            lease_generation,
+            lease_sequence,
+            effect_id,
+            payload.as_slice(),
+        );
+        GuardianRequestEnvelope::from_zeroizing_payload(header, payload)
     }
 
     fn exchange(

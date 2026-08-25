@@ -26,7 +26,7 @@ struct Cluster {
 /// clusters of attribute data describing attributed ranges
 /// within the line
 #[cfg_attr(feature = "use_serde", derive(Serialize))]
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(crate) struct ClusteredLine {
     pub text: String,
     #[cfg_attr(
@@ -41,6 +41,37 @@ pub(crate) struct ClusteredLine {
     /// Length, measured in cells
     len: u32,
     last_cell_width: Option<NonZeroU8>,
+}
+
+impl core::fmt::Debug for ClusteredLine {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ClusteredLine")
+            .field("text_bytes", &self.text.len())
+            .field("cell_len", &self.len)
+            .field("cluster_count", &self.clusters.len())
+            .field("text", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn guarded_reserve_text(target: &mut String, additional: usize) {
+    let required = target
+        .len()
+        .checked_add(additional)
+        .expect("clustered line text length overflowed usize");
+    if required > target.capacity() {
+        let grown_capacity = target.capacity().saturating_mul(2).max(required);
+        let mut replacement = Zeroizing::new(String::with_capacity(grown_capacity));
+        replacement.push_str(target);
+        target.zeroize();
+        core::mem::swap(target, &mut *replacement);
+    }
+}
+
+fn guarded_push_str(target: &mut String, fragment: &str) {
+    guarded_reserve_text(target, fragment.len());
+    target.push_str(fragment);
 }
 
 /// Guards a successfully decoded text field until every later line field has
@@ -247,7 +278,7 @@ impl ClusteredLine {
                 is_double_wide.set(cell.cell_index(), true);
             }
 
-            text.push_str(cell.str());
+            guarded_push_str(&mut text, cell.str());
 
             last_cluster = match last_cluster.take() {
                 None => Some(Cluster {
@@ -324,6 +355,7 @@ impl ClusteredLine {
 
     pub fn append_grapheme(&mut self, text: &str, cell_width: usize, attrs: CellAttributes) {
         let cell_width = Self::normalize_cell_width(cell_width);
+        guarded_reserve_text(&mut self.text, text.len());
         let new_cluster = match self.clusters.last() {
             Some(cluster) => {
                 if cluster.attrs != attrs {
@@ -344,7 +376,6 @@ impl ClusteredLine {
             cluster.cell_width += cell_width;
         }
         self.text.push_str(text);
-
         if cell_width > 1 {
             let bitset = match self.is_double_wide.take() {
                 Some(mut bitset) => {
@@ -369,6 +400,7 @@ impl ClusteredLine {
         if text.is_empty() {
             return;
         }
+        guarded_reserve_text(&mut self.text, text.len());
 
         const MAX_CLUSTER_CELL_WIDTH: usize = u16::MAX as usize;
         let mut remaining = text;
@@ -410,6 +442,7 @@ impl ClusteredLine {
 
     pub fn append(&mut self, cell: Cell) {
         let cell_width = Self::normalize_cell_width(cell.width());
+        guarded_reserve_text(&mut self.text, cell.str().len());
         let new_cluster = match self.clusters.last() {
             Some(cluster) => {
                 if cluster.attrs != *cell.attrs() {
@@ -433,7 +466,6 @@ impl ClusteredLine {
             cluster.cell_width += cell_width;
         }
         self.text.push_str(cell.str());
-
         if cell_width > 1 {
             let bitset = match self.is_double_wide.take() {
                 Some(mut bitset) => {

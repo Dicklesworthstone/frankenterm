@@ -771,12 +771,13 @@ impl GuardianSpawnPayload {
         (self.command, self.size)
     }
 
-    pub fn encode(&self) -> Result<Vec<u8>, GuardianProtocolError> {
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
         self.validate()?;
         let command_limit = GUARDIAN_MAX_PAYLOAD_BYTES
             .checked_sub(SPAWN_PAYLOAD_FIXED_BYTES)
             .ok_or(GuardianProtocolError::PayloadTooLarge)?;
-        let mut command = GuardianBoundedPayloadBuffer::new(command_limit);
+        let command_bytes = guardian_json_encoded_size(&self.command, command_limit)?;
+        let mut command = GuardianBoundedPayloadBuffer::with_exact_capacity(command_bytes)?;
         if serde_json::to_writer(&mut command, &self.command).is_err() {
             return Err(if command.exceeded {
                 GuardianProtocolError::PayloadTooLarge
@@ -785,13 +786,19 @@ impl GuardianSpawnPayload {
             });
         }
         let command = command.into_inner();
+        if command.len() != command_bytes {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
         let total = SPAWN_PAYLOAD_FIXED_BYTES
             .checked_add(command.len())
             .ok_or(GuardianProtocolError::PayloadTooLarge)?;
         if total > GUARDIAN_MAX_PAYLOAD_BYTES {
             return Err(GuardianProtocolError::PayloadTooLarge);
         }
-        let mut payload = Vec::with_capacity(total);
+        let mut payload = Zeroizing::new(Vec::new());
+        payload
+            .try_reserve_exact(total)
+            .map_err(|_| GuardianProtocolError::PayloadTooLarge)?;
         payload.extend_from_slice(&SPAWN_PAYLOAD_MAGIC);
         encode_pty_size(&mut payload, self.size);
         payload.extend_from_slice(
@@ -831,11 +838,12 @@ impl GuardianSpawnPayload {
         let command_limit = GUARDIAN_MAX_PAYLOAD_BYTES
             .checked_sub(SPAWN_PAYLOAD_FIXED_BYTES)
             .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
-        let mut canonical = GuardianBoundedPayloadBuffer::new(command_limit);
+        let canonical_bytes = guardian_json_encoded_size(&command, command_limit)?;
+        let mut canonical = GuardianBoundedPayloadBuffer::with_exact_capacity(canonical_bytes)?;
         serde_json::to_writer(&mut canonical, &command)
             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
         let canonical = canonical.into_inner();
-        if canonical.as_slice() != command_bytes {
+        if canonical.len() != canonical_bytes || canonical.as_slice() != command_bytes {
             return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         Self::new(command, size)
@@ -4968,12 +4976,16 @@ struct GuardianBoundedPayloadBuffer {
 }
 
 impl GuardianBoundedPayloadBuffer {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            bytes: Zeroizing::new(Vec::new()),
+    fn with_exact_capacity(max_bytes: usize) -> Result<Self, GuardianProtocolError> {
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes
+            .try_reserve_exact(max_bytes)
+            .map_err(|_| GuardianProtocolError::PayloadTooLarge)?;
+        Ok(Self {
+            bytes,
             max_bytes,
             exceeded: false,
-        }
+        })
     }
 
     fn into_inner(mut self) -> Zeroizing<Vec<u8>> {
@@ -4994,9 +5006,6 @@ impl std::io::Write for GuardianBoundedPayloadBuffer {
                 "guardian payload serialization exceeded its byte ceiling",
             ));
         }
-        self.bytes
-            .try_reserve(bytes.len())
-            .map_err(|error| std::io::Error::other(format!("guardian payload reserve: {error}")))?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -5004,6 +5013,52 @@ impl std::io::Write for GuardianBoundedPayloadBuffer {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+struct GuardianPayloadSizer {
+    bytes: usize,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for GuardianPayloadSizer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("guardian payload length overflow"))?;
+        if next > self.max_bytes {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "guardian payload serialization exceeded its byte ceiling",
+            ));
+        }
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn guardian_json_encoded_size<T: serde::Serialize>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<usize, GuardianProtocolError> {
+    let mut sizer = GuardianPayloadSizer {
+        bytes: 0,
+        max_bytes,
+        exceeded: false,
+    };
+    if serde_json::to_writer(&mut sizer, value).is_err() {
+        return Err(if sizer.exceeded {
+            GuardianProtocolError::PayloadTooLarge
+        } else {
+            GuardianProtocolError::InvalidOperationPayload
+        });
+    }
+    Ok(sizer.bytes)
 }
 
 #[derive(Eq, PartialEq)]
@@ -9812,7 +9867,7 @@ mod tests {
         GuardianResizePayload::new(pty_size(rows, cols)).encode()
     }
 
-    fn spawn_payload(command: &str) -> Vec<u8> {
+    fn spawn_payload(command: &str) -> Zeroizing<Vec<u8>> {
         GuardianSpawnPayload::new(CommandBuilder::new(command), pty_size(24, 80))
             .unwrap()
             .encode()
