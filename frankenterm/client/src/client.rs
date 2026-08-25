@@ -9499,6 +9499,7 @@ impl Client {
         RpcGenerationScope::capture(self.sender.clone(), Arc::clone(&self.rpc_transport))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn agreed_codec_version(&self) -> Option<usize> {
         self.rpc_scope()
             .codec_authority()

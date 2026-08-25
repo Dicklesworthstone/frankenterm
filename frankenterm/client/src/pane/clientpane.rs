@@ -331,6 +331,7 @@ impl QueuedReliableInput {
         }
     }
 
+    #[allow(dead_code)]
     fn pane_id(&self) -> PaneId {
         match &self.payload {
             QueuedReliableInputPayload::Key { request, .. } => request.pane_id,
