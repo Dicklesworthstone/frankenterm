@@ -6497,6 +6497,73 @@ fn atomic_path_transition_artifact_inventory(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn acquire_atomic_path_transition_lock(
+    parent: &cap_std::fs::Dir,
+    parent_file: &fs::File,
+) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
+    use cap_std::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    // Serialize the whole parent namespace. Transaction- or pair-scoped locks
+    // do not cover different transactions whose entry sets overlap; in
+    // particular, two exchanges can otherwise toggle the same pair twice.
+    // This single permanent inode also keeps lock retention bounded.
+    let name = ".ft-atomic-transition.lock";
+    let mut create_options = cap_std::fs::OpenOptions::new();
+    create_options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .mode(0o600);
+    let (file, created) = match parent.open_with(&name, &create_options) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut open_options = cap_std::fs::OpenOptions::new();
+            open_options
+                .read(true)
+                .write(true)
+                .follow(FollowSymlinks::No);
+            (parent.open_with(&name, &open_options)?, false)
+        }
+        Err(error) => return Err(error).context("cannot create atomic transition lock"),
+    };
+    if created {
+        file.set_permissions(cap_std::fs::Permissions::from_mode(0o600))?;
+        file.sync_all()?;
+        parent_file.sync_all()?;
+    }
+    let metadata = file.metadata()?;
+    let named = parent.symlink_metadata(&name)?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && named.is_file()
+            && metadata.dev() == named.dev()
+            && metadata.ino() == named.ino()
+            && metadata.uid() == nix::unistd::geteuid().as_raw()
+            && named.uid() == nix::unistd::geteuid().as_raw()
+            && metadata.nlink() == 1
+            && named.nlink() == 1
+            && metadata.len() == 0
+            && metadata.permissions().mode() & 0o7777 == 0o600,
+        "atomic transition lock is not one exact private owner file"
+    );
+    let locked = nix::fcntl::Flock::lock(file.into_std(), nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_file, error)| {
+            anyhow::anyhow!("cannot acquire atomic transition lock: {error}")
+        })?;
+    let locked_metadata = locked.metadata()?;
+    let named_after = parent.symlink_metadata(&name)?;
+    anyhow::ensure!(
+        locked_metadata.dev() == named_after.dev()
+            && locked_metadata.ino() == named_after.ino()
+            && locked_metadata.len() == 0
+            && named_after.permissions().mode() & 0o7777 == 0o600,
+        "atomic transition lock changed identity while ownership was acquired"
+    );
+    Ok(locked)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_atomic_path_transition_json<T>(
     parent: &cap_std::fs::Dir,
     name: &str,
@@ -6812,8 +6879,32 @@ fn atomic_path_hash_node(
                 name
             );
             let mut names = Vec::new();
+            let mut enumerated_name_bytes = 0_u64;
             for entry in directory.entries()? {
-                names.push(entry?.file_name());
+                let name = entry?.file_name();
+                let name_bytes =
+                    u64::try_from(name.as_os_str().as_bytes().len()).map_err(|_| {
+                        anyhow::anyhow!("atomic path child name length does not fit u64")
+                    })?;
+                enumerated_name_bytes = enumerated_name_bytes
+                    .checked_add(name_bytes)
+                    .context("atomic path child-name byte counter overflowed")?;
+                anyhow::ensure!(
+                    budget
+                        .entries
+                        .checked_add(u64::try_from(names.len()).unwrap_or(u64::MAX))
+                        .and_then(|count| count.checked_add(1))
+                        .is_some_and(|count| count <= ATOMIC_PATH_HASH_MAX_ENTRIES)
+                        && budget
+                            .bytes
+                            .checked_add(enumerated_name_bytes)
+                            .is_some_and(|bytes| bytes <= ATOMIC_PATH_HASH_MAX_BYTES),
+                    "atomic path directory enumeration exceeds its bounded entry or name-byte budget"
+                );
+                names
+                    .try_reserve(1)
+                    .context("cannot reserve bounded atomic path directory inventory")?;
+                names.push(name);
             }
             names.sort_by(|left, right| {
                 left.as_os_str()
@@ -7018,6 +7109,7 @@ where
         "atomic-transition parent changed while its authority descriptor was opened"
     );
     let parent_dir = cap_std::fs::Dir::from_std_file(parent_file.try_clone()?);
+    let _transition_lock = acquire_atomic_path_transition_lock(&parent_dir, &parent_file)?;
 
     let claim_name = format!(".ft-atomic-transition-{transaction_id}.claim.json");
     let ack_name = format!(".ft-atomic-transition-{transaction_id}.ack.json");
@@ -82211,8 +82303,9 @@ fn verify_remote_generation_directory(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn run_descriptor_pinned_remote_generation_mux_version(
+fn run_descriptor_pinned_remote_generation_component_version(
     executable: &impl std::os::fd::AsFd,
+    role: &str,
 ) -> anyhow::Result<()> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
     use std::os::fd::AsRawFd as _;
@@ -82223,14 +82316,14 @@ fn run_descriptor_pinned_remote_generation_mux_version(
     // script. RAII closes this one-purpose duplicate after the bounded child
     // has been reaped; no ambient generation pathname is executed.
     let inherited = nix::unistd::dup(executable)
-        .map_err(|error| anyhow::anyhow!("cannot duplicate verified mux descriptor: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("cannot duplicate verified {role} descriptor: {error}"))?;
     let descriptor_flags = FdFlag::from_bits_truncate(
         fcntl(&inherited, FcntlArg::F_GETFD)
-            .map_err(|error| anyhow::anyhow!("cannot inspect verified mux descriptor: {error}"))?,
+        .map_err(|error| anyhow::anyhow!("cannot inspect verified {role} descriptor: {error}"))?,
     );
     anyhow::ensure!(
         !descriptor_flags.contains(FdFlag::FD_CLOEXEC),
-        "verified mux execution descriptor unexpectedly has close-on-exec set"
+        "verified {role} execution descriptor unexpectedly has close-on-exec set"
     );
     let inherited_number = inherited.as_raw_fd();
     let executable_path = PathBuf::from("/proc/self/fd").join(inherited_number.to_string());
@@ -82239,22 +82332,22 @@ fn run_descriptor_pinned_remote_generation_mux_version(
     let output = run_cmd_with_timeout(&mut command, Duration::from_secs(10), 64 * 1024, 64 * 1024)?;
     anyhow::ensure!(
         !output.stdout.overflowed && !output.stderr.overflowed,
-        "mux version probe output exceeded its bounded capture"
+        "{role} version probe output exceeded its bounded capture"
     );
     anyhow::ensure!(
         output.status.success(),
-        "hash-verified mux generation candidate failed --version with status {}",
+        "hash-verified {role} generation candidate failed --version with status {}",
         output.status
     );
     anyhow::ensure!(
         inherited.as_raw_fd() == inherited_number,
-        "verified mux execution descriptor identity changed during the version probe"
+        "verified {role} execution descriptor identity changed during the version probe"
     );
     Ok(())
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn run_verified_remote_generation_mux_version(
+fn run_verified_remote_generation_component_versions(
     stage: &cap_std::fs::Dir,
     manifest: &RemoteGenerationManifest,
     effective_uid: u32,
@@ -82264,20 +82357,25 @@ fn run_verified_remote_generation_mux_version(
     // its inherited `/proc/self/fd` identity, and re-admitted through both the
     // same handle and its nofollow named entry afterward. A version probe never
     // precedes hash admission and a name substitution cannot redirect exec.
-    let mut executable = open_verified_remote_generation_file(
-        stage,
-        &manifest.mux_server,
-        effective_uid,
-        stage_device,
-    )?;
-    run_descriptor_pinned_remote_generation_mux_version(&executable)?;
-    verify_open_remote_generation_file(
-        stage,
-        &manifest.mux_server,
-        &mut executable,
-        effective_uid,
-        stage_device,
-    )?;
+    for component in [&manifest.ft, &manifest.mux_server, &manifest.guardian] {
+        let mut executable = open_verified_remote_generation_file(
+            stage,
+            component,
+            effective_uid,
+            stage_device,
+        )?;
+        run_descriptor_pinned_remote_generation_component_version(
+            &executable,
+            &component.role,
+        )?;
+        verify_open_remote_generation_file(
+            stage,
+            component,
+            &mut executable,
+            effective_uid,
+            stage_device,
+        )?;
+    }
     Ok(())
 }
 
@@ -83250,16 +83348,18 @@ fn publish_remote_process_family_generation(
         sync_capability_directory(&generations)?;
     } else {
         let stage_name = format!(".stage-{generation_id}-{effect_transaction_id}");
-        let stage_created =
-            match create_private_child_directory(&generations, Path::new(&stage_name)) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "cannot create transaction-unique generation stage (stages are retained): {error}"
-                    ));
-                }
-            };
+        let stage_created = match create_private_child_directory(
+            &generations,
+            Path::new(&stage_name),
+        ) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "cannot create transaction-unique generation stage (stages are retained): {error}"
+                ));
+            }
+        };
         if stage_created {
             sync_capability_directory(&generations)?;
         }
@@ -83325,7 +83425,7 @@ fn publish_remote_process_family_generation(
                 effective_uid,
                 stage_device,
             )?;
-            run_verified_remote_generation_mux_version(
+            run_verified_remote_generation_component_versions(
                 &stage,
                 &manifest,
                 effective_uid,
@@ -83337,12 +83437,7 @@ fn publish_remote_process_family_generation(
                 effective_uid,
                 stage_device,
             )?;
-            ensure_remote_generation_manifest(
-                &stage,
-                &manifest,
-                effective_uid,
-                stage_device,
-            )?;
+            ensure_remote_generation_manifest(&stage, &manifest, effective_uid, stage_device)?;
             sync_capability_directory(&stage)?;
             stage
                 .open(".")?

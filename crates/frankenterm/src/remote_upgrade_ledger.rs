@@ -522,7 +522,7 @@ impl DurableEffectPermit {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RecordArtifact {
     name: String,
     sequence: u32,
@@ -951,7 +951,7 @@ impl<'root> RemoteUpgradeLedger<'root> {
         selector_after: SelectorAuthority,
         receipt: String,
     ) -> anyhow::Result<RemoteUpgradeRecord> {
-        let preflight = self.scan_revalidated_authority()?;
+        let mut preflight = self.scan_revalidated_authority()?;
         if let Some(latest) = self.latest.as_ref() {
             anyhow::ensure!(
                 !latest.state.is_terminal()
@@ -997,25 +997,45 @@ impl<'root> RemoteUpgradeLedger<'root> {
         let matching_identity = preflight
             .records
             .iter()
-            .find(|artifact| artifact.sequence == sequence && artifact.attempt == attempt);
+            .find(|artifact| artifact.sequence == sequence && artifact.attempt == attempt)
+            .cloned();
         let adopt_orphan = if let Some(artifact) = matching_identity {
             anyhow::ensure!(
                 artifact.name == record_name && artifact.digest == digest,
                 "remote upgrade transaction contains a conflicting orphan record for the intended sequence/attempt"
             );
-            let orphan = read_record(
+            match read_record(
                 &self.transaction,
-                artifact,
+                &artifact,
                 self.effective_uid,
                 self.device,
                 &self.claim,
                 &self.claim_sha256,
-            )?;
-            anyhow::ensure!(
-                orphan == record,
-                "remote upgrade orphan record is not the exact canonical intended outcome"
-            );
-            true
+            ) {
+                Ok(orphan) => {
+                    anyhow::ensure!(
+                        orphan == record,
+                        "remote upgrade orphan record is not the exact canonical intended outcome"
+                    );
+                    true
+                }
+                Err(read_error) => {
+                    quarantine_incomplete_intended_record(
+                        &self.transaction,
+                        &artifact,
+                        &bytes,
+                        self.effective_uid,
+                        self.device,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "intended orphan record was unreadable ({read_error:#}) and could not be retained outside the canonical namespace"
+                        )
+                    })?;
+                    preflight = self.scan_revalidated_authority()?;
+                    false
+                }
+            }
         } else {
             false
         };
@@ -1177,8 +1197,7 @@ fn validate_transaction_census(
 }
 
 fn is_retained_publication_residue_name(name: &str) -> bool {
-    (name.starts_with(PENDING_ARTIFACT_PREFIX)
-        || name.starts_with(QUARANTINED_ARTIFACT_PREFIX))
+    (name.starts_with(PENDING_ARTIFACT_PREFIX) || name.starts_with(QUARANTINED_ARTIFACT_PREFIX))
         && name.len() <= 255
         && name
             .bytes()
@@ -1490,6 +1509,60 @@ fn read_record(
     Ok(record)
 }
 
+fn quarantine_incomplete_intended_record(
+    transaction: &cap_std::fs::Dir,
+    artifact: &RecordArtifact,
+    intended_bytes: &[u8],
+    effective_uid: u32,
+    expected_device: u64,
+) -> anyhow::Result<()> {
+    use nix::fcntl::{RenameFlags, renameat2};
+
+    let observed = read_exact_file(
+        transaction,
+        Path::new(&artifact.name),
+        MAX_RECORD_BYTES,
+        effective_uid,
+        expected_device,
+    )?;
+    anyhow::ensure!(
+        observed != intended_bytes,
+        "exact intended record bytes failed semantic readback; refusing to quarantine them"
+    );
+    let observed_digest = hex::encode(Sha256::digest(&observed));
+    let quarantine_name = format!(
+        "{QUARANTINED_ARTIFACT_PREFIX}{}-{observed_digest}",
+        artifact.name
+    );
+    anyhow::ensure!(
+        is_retained_publication_residue_name(&quarantine_name),
+        "quarantined record name is outside the retained-residue grammar"
+    );
+    renameat2(
+        transaction,
+        artifact.name.as_str(),
+        transaction,
+        quarantine_name.as_str(),
+        RenameFlags::RENAME_NOREPLACE,
+    )
+    .map_err(|error| anyhow::anyhow!("cannot quarantine incomplete intended record: {error}"))?;
+    sync_capability_directory(transaction)?;
+    validate_retained_publication_residue(
+        transaction,
+        &quarantine_name,
+        effective_uid,
+        expected_device,
+    )?;
+    anyhow::ensure!(
+        matches!(
+            transaction.symlink_metadata(&artifact.name),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ),
+        "incomplete intended record remained in the canonical namespace after quarantine"
+    );
+    Ok(())
+}
+
 fn create_synchronized_file(
     directory: &cap_std::fs::Dir,
     name: &Path,
@@ -1497,33 +1570,144 @@ fn create_synchronized_file(
     effective_uid: u32,
     expected_device: u64,
 ) -> anyhow::Result<()> {
-    let expected_len = u64::try_from(bytes.len())
-        .map_err(|_| anyhow::anyhow!("upgrade artifact length does not fit this platform"))?;
-    let mut options = cap_std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .follow(FollowSymlinks::No)
-        .mode(REMOTE_GENERATION_MANIFEST_MODE);
-    let mut file = directory
-        .open_with(name, &options)
-        .with_context(|| format!("cannot create upgrade artifact {}", name.display()))?;
-    file.write_all(bytes)?;
-    file.set_permissions(cap_std::fs::Permissions::from_mode(
-        REMOTE_GENERATION_MANIFEST_MODE,
-    ))?;
-    file.sync_all()?;
-    validate_remote_generation_file_metadata(
+    create_synchronized_file_with_post_publish_sync(
         directory,
         name,
-        &file,
-        REMOTE_GENERATION_MANIFEST_MODE,
-        Some(expected_len),
+        bytes,
         effective_uid,
         expected_device,
-    )?;
-    Ok(())
+        sync_capability_directory,
+    )
+}
+
+fn create_synchronized_file_with_post_publish_sync<F>(
+    directory: &cap_std::fs::Dir,
+    name: &Path,
+    bytes: &[u8],
+    effective_uid: u32,
+    expected_device: u64,
+    post_publish_sync: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
+{
+    use nix::fcntl::{RenameFlags, renameat2};
+
+    let expected_len = u64::try_from(bytes.len())
+        .map_err(|_| anyhow::anyhow!("upgrade artifact length does not fit this platform"))?;
+    anyhow::ensure!(
+        expected_len <= MAX_RECORD_BYTES,
+        "upgrade artifact exceeds its bounded publication limit"
+    );
+    let name_text = name
+        .to_str()
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 192
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+        .ok_or_else(|| anyhow::anyhow!("upgrade artifact name is not one canonical component"))?;
+    match directory.symlink_metadata(name) {
+        Ok(_) => {
+            let persisted = read_exact_file(
+                directory,
+                name,
+                MAX_RECORD_BYTES,
+                effective_uid,
+                expected_device,
+            )?;
+            anyhow::ensure!(
+                persisted == bytes,
+                "upgrade artifact name is already bound to conflicting bytes"
+            );
+            sync_capability_directory(directory)?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("cannot inspect upgrade artifact publication name");
+        }
+    }
+
+    let mut publication_hasher = Sha256::new();
+    publication_hasher.update(b"frankenterm.remote-upgrade.artifact-publication.v2\0");
+    publication_hasher.update(name_text.as_bytes());
+    publication_hasher.update([0]);
+    publication_hasher.update(bytes);
+    let publication_id = hex::encode(publication_hasher.finalize());
+    for attempt in 0_u8..32 {
+        let temporary_name = format!(
+            "{PENDING_ARTIFACT_PREFIX}{publication_id}-{}-{attempt:02}",
+            std::process::id()
+        );
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No)
+            .mode(REMOTE_GENERATION_MANIFEST_MODE);
+        let mut file = match directory.open_with(&temporary_name, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).context("cannot create upgrade artifact publication temp");
+            }
+        };
+        file.write_all(bytes)?;
+        file.set_permissions(cap_std::fs::Permissions::from_mode(
+            REMOTE_GENERATION_MANIFEST_MODE,
+        ))?;
+        file.sync_all()?;
+        validate_remote_generation_file_metadata(
+            directory,
+            Path::new(&temporary_name),
+            &file,
+            REMOTE_GENERATION_MANIFEST_MODE,
+            Some(expected_len),
+            effective_uid,
+            expected_device,
+        )?;
+        match renameat2(
+            directory,
+            temporary_name.as_str(),
+            directory,
+            name,
+            RenameFlags::RENAME_NOREPLACE,
+        ) {
+            Ok(()) => {
+                post_publish_sync(directory).with_context(|| {
+                    format!(
+                        "upgrade artifact {} is visible but its parent sync failed; retry reconciles the same bytes",
+                        name.display()
+                    )
+                })?;
+            }
+            Err(nix::errno::Errno::EEXIST) => {
+                sync_capability_directory(directory)?;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "atomic no-replace upgrade artifact publication failed: {error}"
+                ));
+            }
+        }
+        let persisted = read_exact_file(
+            directory,
+            name,
+            MAX_RECORD_BYTES,
+            effective_uid,
+            expected_device,
+        )?;
+        anyhow::ensure!(
+            persisted == bytes,
+            "published upgrade artifact differs from its synchronized temp bytes"
+        );
+        return Ok(());
+    }
+    anyhow::bail!("upgrade artifact publication temp namespace is exhausted")
 }
 
 fn validate_exact_file(

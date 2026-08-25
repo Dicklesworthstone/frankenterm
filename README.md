@@ -3250,44 +3250,49 @@ must not rely on a bare long sleep/timeout for prompt shutdown.
 
 ---
 
-## Deep Dive: The `.ft` Directory Layout
+## Deep Dive: The `.ft` Directory and Platform Layout
 
-By default, `ft` keeps its state in `~/.local/share/ft/` (configurable via `[general].data_dir`). The per-workspace artifacts live in a `.ft/` directory relative to the workspace root:
+`ft` manages workspace-local state under `.ft/` in the workspace root, while global defaults and shared tooling follow OS platform conventions.
+
+### Workspace Layout (`<workspace>/.ft/`)
 
 ```
 .ft/
-├── config.toml              # workspace-local config (overrides ~/.config/ft/ft.toml)
+├── config.toml              # workspace-local config (overrides platform default)
+├── ft.db                    # SQLite database (default relative db_path)
+├── ft.db-wal                # SQLite WAL file
+├── ft.db-shm                # SQLite shared-memory index
+├── watch.lock               # single-writer watcher file lock
+├── ipc.sock                 # local IPC domain socket
+├── logs/
+│   └── ft-watch.log         # watcher service log
+├── crash/                   # crash dumps and reproduction bundles
+├── diag/                    # diagnostics bundles
+├── recordings/              # session recordings (.war files)
 ├── mission/
 │   ├── active.json          # current mission contract
 │   └── tx-active.json       # current tx contract
-├── recorder-log/
-│   ├── events.log           # append-log recorder backend (default)
-│   └── state.json           # recorder state snapshot
-├── search-daemon.sock       # IPC socket for the embedder daemon
-├── backups/                 # default destination for ft backup export
-├── crash-bundles/           # ft reproduce --kind crash output
-└── runtime-telemetry/       # rolling telemetry artifacts
+└── recorder-log/
+    ├── events.log           # append-log recorder backend
+    └── state.json           # recorder state snapshot
 ```
 
-The system-level data dir (default `~/.local/share/ft/`) holds:
+### Platform Default Locations
 
-```
-ft/
-├── ft.db                    # the SQLite database (canonical source of truth)
-├── ft.db-wal                # SQLite WAL file
-├── ft.db-shm                # SQLite shared-memory file
-├── watcher.lock             # single-writer file lock
-└── tantivy-index/           # Tantivy lexical index (when present)
-```
+| Platform | Default Config File | Default Data Directory (`data_dir`) |
+|---|---|---|
+| **Linux / XDG** | `~/.config/ft/ft.toml` (or `$XDG_CONFIG_HOME/ft/ft.toml`) | `~/.local/share/ft/` (or `$XDG_DATA_HOME/ft/`) |
+| **macOS** | `~/Library/Application Support/ft/ft.toml` | `~/Library/Application Support/ft/` |
+| **Windows** | `%APPDATA%\ft\ft.toml` | `%LOCALAPPDATA%\ft\` |
 
-### Why split workspace vs system
+### Workspace vs Global State
 
-- **Workspace state** (mission/tx contracts, recordings) is project-specific and belongs in version control or workspace-scoped backups.
-- **System state** (the DB, the watcher lock, the Tantivy index) is host-specific; moving it across hosts requires backup/restore, not file copy.
+- **Workspace state** (`.ft/`): contains workspace-scoped database, session checkpoints, watch locks, active contracts, and logs for that directory tree.
+- **Global / System state** (`data_dir`): holds global templates, cross-workspace backups (`backups/`), and tool caches.
 
-### Auto-create vs explicit
+### Directory Initialization
 
-`.ft/` and `~/.local/share/ft/` are auto-created on first watcher startup. No `ft init` step is required.
+Workspace directories (`.ft/`, `logs/`, `crash/`, `diag/`) are initialized when the workspace layout is ensured by `ft` runtime dispatch. Absolute `storage.db_path` or `general.data_dir` overrides can relocate specific stores outside the workspace root.
 
 ---
 

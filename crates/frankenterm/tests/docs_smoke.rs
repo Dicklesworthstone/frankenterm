@@ -1047,6 +1047,25 @@ fn smoke_unknown_subcommand_fails() {
 // =============================================================================
 
 #[test]
+fn workspace_layout_contract_docs_truth_gate() {
+    let readme = read_repo_doc("README.md");
+
+    assert_contains_all(
+        "workspace layout docs",
+        &readme,
+        &[
+            "watch.lock",
+            "ipc.sock",
+            "ft-watch.log",
+            "~/Library/Application Support/ft/ft.toml",
+            "~/.config/ft/ft.toml",
+            "%APPDATA%\\ft\\ft.toml",
+        ],
+    );
+    assert_excludes_all("workspace layout docs", &readme, &["watcher.lock"]);
+}
+
+#[test]
 fn smoke_generate_summary() {
     // This test runs last (alphabetically) and generates a summary artifact
     let commands = vec![
