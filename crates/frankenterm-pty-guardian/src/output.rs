@@ -1363,6 +1363,7 @@ impl GuardianCheckpointStageStore {
             }
             Ok(GuardianCheckpointStageReplyV1::Sealed {
                 upload_id: shape.upload_id,
+                completion_id: inspection.publication_id,
                 checkpoint_id: shape.descriptor.checkpoint_id(),
                 boundary_id: shape.descriptor.boundary_id(),
                 total_bytes: shape.total_bytes,

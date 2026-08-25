@@ -2227,32 +2227,36 @@ impl GuardianCheckpointStageReplyV1 {
                 checkpoint_id,
                 boundary_id,
                 total_bytes,
+            } => {
+                payload[6] = 3;
+                payload[8..24].copy_from_slice(upload_id.as_bytes());
+                payload[28..36].copy_from_slice(&total_bytes.to_be_bytes());
+                payload[36..68].copy_from_slice(&checkpoint_id.0);
+                payload[68..100].copy_from_slice(&boundary_id.0);
+                payload[100..116].copy_from_slice(completion_id.as_bytes());
             }
-            | Self::Acked {
-                upload_id,
-                completion_id,
-                checkpoint_id,
-                boundary_id,
-                total_bytes,
-            }
-            | Self::Expired {
+            Self::Acked {
                 upload_id,
                 completion_id,
                 checkpoint_id,
                 boundary_id,
                 total_bytes,
             } => {
-                payload[6] = match self {
-                    Self::Sealed { .. } => 3,
-                    Self::Acked { .. } => 5,
-                    Self::Expired { .. } => 6,
-                    Self::Absent { .. }
-                    | Self::Ready { .. }
-                    | Self::Progress { .. }
-                    | Self::Quarantined { .. } => unreachable!(
-                        "checkpoint completion reply branch is exhaustively matched"
-                    ),
-                };
+                payload[6] = 5;
+                payload[8..24].copy_from_slice(upload_id.as_bytes());
+                payload[28..36].copy_from_slice(&total_bytes.to_be_bytes());
+                payload[36..68].copy_from_slice(&checkpoint_id.0);
+                payload[68..100].copy_from_slice(&boundary_id.0);
+                payload[100..116].copy_from_slice(completion_id.as_bytes());
+            }
+            Self::Expired {
+                upload_id,
+                completion_id,
+                checkpoint_id,
+                boundary_id,
+                total_bytes,
+            } => {
+                payload[6] = 6;
                 payload[8..24].copy_from_slice(upload_id.as_bytes());
                 payload[28..36].copy_from_slice(&total_bytes.to_be_bytes());
                 payload[36..68].copy_from_slice(&checkpoint_id.0);
@@ -2322,7 +2326,7 @@ impl GuardianCheckpointStageReplyV1 {
                         boundary_id,
                         total_bytes: committed_bytes,
                     },
-                    _ => unreachable!("checkpoint completion reply kind is guarded"),
+                    _ => return Err(GuardianProtocolError::InvalidReplyPayload),
                 }
             }
             4 | 7
@@ -14525,6 +14529,7 @@ mod tests {
                 &begin,
                 &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Sealed {
                     upload_id,
+                    completion_id: id(81),
                     checkpoint_id: descriptor.checkpoint_id(),
                     boundary_id: descriptor.boundary_id(),
                     total_bytes: descriptor.total_bytes(),
@@ -14611,6 +14616,7 @@ mod tests {
         ));
         let sealed = GuardianCheckpointStageReplyV1::Sealed {
             upload_id,
+            completion_id: id(81),
             checkpoint_id: descriptor.checkpoint_id(),
             boundary_id: descriptor.boundary_id(),
             total_bytes: descriptor.total_bytes(),
@@ -14632,6 +14638,7 @@ mod tests {
                 &seal,
                 &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Sealed {
                     upload_id,
+                    completion_id: id(81),
                     checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes([0xa5; 32])
                         .unwrap(),
                     boundary_id: descriptor.boundary_id(),
