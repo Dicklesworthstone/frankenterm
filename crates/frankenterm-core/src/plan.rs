@@ -11490,7 +11490,8 @@ mod tests {
                         text: "echo ok".to_string(),
                     },
                 )],
-            ).with_compensations(vec![TxCompensation::new(
+            )
+            .with_compensations(vec![TxCompensation::new(
                 "step-0",
                 StepAction::SendText {
                     pane_id: 1,
@@ -11527,7 +11528,8 @@ mod tests {
                         text: "echo ok".to_string(),
                     },
                 )],
-            ).with_compensations(vec![TxCompensation::new(
+            )
+            .with_compensations(vec![TxCompensation::new(
                 "step-0",
                 StepAction::SendText {
                     pane_id: 1,
@@ -11574,7 +11576,8 @@ mod tests {
                         text: "echo ok".to_string(),
                     },
                 )],
-            ).with_compensations(vec![TxCompensation::new(
+            )
+            .with_compensations(vec![TxCompensation::new(
                 "step-0",
                 StepAction::SendText {
                     pane_id: 1,
@@ -11615,6 +11618,8 @@ mod tests {
         }));
 
         let err = contract.validate().unwrap_err();
-        assert!(err.contains("follows a compensation attempt; a new effect generation is required before recommit"));
+        assert!(err.contains(
+            "follows a compensation attempt; a new effect generation is required before recommit"
+        ));
     }
 }

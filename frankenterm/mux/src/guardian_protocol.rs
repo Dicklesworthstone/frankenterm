@@ -7975,8 +7975,8 @@ impl GuardianProtocolState {
 
         let mux_authority =
             mux_authority.ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?;
-        let live_guardian_authority = live_guardian_authority
-            .ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?;
+        let live_guardian_authority =
+            live_guardian_authority.ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?;
         let (authority_mux_incarnation, mux_build_identity) =
             mux_authority.validated_parts(self.incarnation)?;
         if live_guardian_authority.guardian_incarnation != self.incarnation
@@ -7994,31 +7994,31 @@ impl GuardianProtocolState {
             return Err(GuardianProtocolError::GenesisAuthorityMismatch);
         }
 
-        let spawn_effect_id = spawn_request.header.effect_id.ok_or(
-            GuardianProtocolError::InvalidOperationScope {
-                operation: GuardianOperation::Spawn,
-            },
-        )?;
-        let durable_pane_id = spawn_request.header.pane_id.ok_or(
-            GuardianProtocolError::InvalidOperationScope {
-                operation: GuardianOperation::Spawn,
-            },
-        )?;
+        let spawn_effect_id =
+            spawn_request
+                .header
+                .effect_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::Spawn,
+                })?;
+        let durable_pane_id =
+            spawn_request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::Spawn,
+                })?;
         let spawn_payload = GuardianSpawnPayload::decode(spawn_request.payload())?;
         let size = spawn_payload.size();
-        let genesis_begin = GuardianCheckpointStageRequestV1::decode(
-            genesis_begin_request.payload(),
-        )?;
+        let genesis_begin =
+            GuardianCheckpointStageRequestV1::decode(genesis_begin_request.payload())?;
         if genesis_begin.kind() != GuardianCheckpointStageKindV1::Begin
-            || genesis_begin.scope()
-                != (GuardianCheckpointScopeV1::Genesis { spawn_effect_id })
+            || genesis_begin.scope() != (GuardianCheckpointScopeV1::Genesis { spawn_effect_id })
         {
             return Err(GuardianProtocolError::InvalidGenesisReservation);
         }
         let descriptor = genesis_begin.descriptor();
-        if descriptor.rows() != u32::from(size.rows)
-            || descriptor.cols() != u32::from(size.cols)
-        {
+        if descriptor.rows() != u32::from(size.rows) || descriptor.cols() != u32::from(size.cols) {
             return Err(GuardianProtocolError::InvalidGenesisReservation);
         }
 
@@ -8096,12 +8096,9 @@ impl GuardianProtocolState {
             .genesis_reservation_effects
             .get(&candidate.spawn_effect_id)
         {
-            let existing = self
-                .genesis_reservations_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
-                    "genesis-effect-request-index",
-                ))?;
+            let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation("genesis-effect-request-index"),
+            )?;
             return Err(if existing == candidate {
                 GuardianProtocolError::GenesisReservationAlreadyIssued
             } else {
@@ -8120,18 +8117,13 @@ impl GuardianProtocolState {
             .genesis_reservation_panes
             .get(&candidate.durable_pane_id)
         {
-            let existing = self
-                .genesis_reservations_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
-                    "genesis-pane-request-index",
-                ))?;
+            let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation("genesis-pane-request-index"),
+            )?;
             return Err(if existing == candidate {
                 GuardianProtocolError::GenesisReservationAlreadyIssued
             } else {
-                GuardianProtocolError::PaneAlreadyExists(
-                    candidate.durable_pane_id,
-                )
+                GuardianProtocolError::PaneAlreadyExists(candidate.durable_pane_id)
             });
         }
         if self.panes.contains_key(&candidate.durable_pane_id) {
@@ -8168,36 +8160,34 @@ impl GuardianProtocolState {
                 GuardianProtocolError::RequestIdentityConflict
             });
         }
-        let effect_id = request.header.effect_id.ok_or(
-            GuardianProtocolError::InvalidOperationScope {
-                operation: GuardianOperation::Spawn,
-            },
-        )?;
+        let effect_id =
+            request
+                .header
+                .effect_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::Spawn,
+                })?;
         if let Some(request_id) = self.genesis_reservation_effects.get(&effect_id) {
-            let existing = self
-                .genesis_reservations_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
-                    "genesis-effect-spawn-fence",
-                ))?;
+            let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation("genesis-effect-spawn-fence"),
+            )?;
             return Err(if existing.matches_authenticated_spawn(request) {
                 GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
             } else {
                 GuardianProtocolError::EffectIdentityConflict
             });
         }
-        let pane_id = request.header.pane_id.ok_or(
-            GuardianProtocolError::InvalidOperationScope {
-                operation: GuardianOperation::Spawn,
-            },
-        )?;
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::Spawn,
+                })?;
         if let Some(request_id) = self.genesis_reservation_panes.get(&pane_id) {
-            let existing = self
-                .genesis_reservations_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
-                    "genesis-pane-spawn-fence",
-                ))?;
+            let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation("genesis-pane-spawn-fence"),
+            )?;
             return Err(if existing.matches_authenticated_spawn(request) {
                 GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
             } else {
@@ -11369,9 +11359,9 @@ mod tests {
         build_byte: u8,
     ) -> GuardianLiveBuildAuthorityV1 {
         state
-            .live_build_authority_from_identity(AtomicBuildIdentity::Sealed(
-                sealed_build_identity(build_byte),
-            ))
+            .live_build_authority_from_identity(AtomicBuildIdentity::Sealed(sealed_build_identity(
+                build_byte,
+            )))
             .unwrap()
     }
 
@@ -11609,10 +11599,7 @@ mod tests {
         assert_eq!(authority.guardian_incarnation, id(1));
         assert_eq!(authority.mux_incarnation, id(2));
         assert_eq!(authority.hello_request_id, id(70));
-        assert_eq!(
-            authority.mux_build_identity,
-            sealed_build_identity(0x51)
-        );
+        assert_eq!(authority.mux_build_identity, sealed_build_identity(0x51));
         let debug = format!("{authority:?}");
         assert!(!debug.contains(&"51".repeat(32)));
         assert!(debug.contains("[REDACTED]"));
@@ -11671,14 +11658,8 @@ mod tests {
             identity.live_guardian_build_identity_digest(),
             sealed_build_identity(0x52).into_bytes()
         );
-        assert_eq!(
-            (identity.rows(), identity.cols()),
-            (24, 80)
-        );
-        assert_eq!(
-            (identity.pixel_width(), identity.pixel_height()),
-            (0, 0)
-        );
+        assert_eq!((identity.rows(), identity.cols()), (24, 80));
+        assert_eq!((identity.pixel_width(), identity.pixel_height()), (0, 0));
         assert_eq!(
             identity.checkpoint_identity_digest(),
             begin_stage.checkpoint_id().into_bytes()
@@ -11841,18 +11822,10 @@ mod tests {
     #[test]
     fn genesis_reservation_binds_payload_geometry_and_upload_mutations() {
         let terminal = terminal_checkpoint();
-        let baseline = issued_genesis_identity(
-            "bounded-command",
-            pty_size(24, 80),
-            &terminal,
-            id(72),
-        );
-        let changed_command = issued_genesis_identity(
-            "bounded-commane",
-            pty_size(24, 80),
-            &terminal,
-            id(72),
-        );
+        let baseline =
+            issued_genesis_identity("bounded-command", pty_size(24, 80), &terminal, id(72));
+        let changed_command =
+            issued_genesis_identity("bounded-commane", pty_size(24, 80), &terminal, id(72));
         assert_eq!(
             baseline.spawn_payload_bytes(),
             changed_command.spawn_payload_bytes()
@@ -11893,12 +11866,8 @@ mod tests {
             resized.checkpoint_identity_digest()
         );
 
-        let changed_upload = issued_genesis_identity(
-            "bounded-command",
-            pty_size(24, 80),
-            &terminal,
-            id(73),
-        );
+        let changed_upload =
+            issued_genesis_identity("bounded-command", pty_size(24, 80), &terminal, id(73));
         assert_eq!(
             baseline.checkpoint_identity_digest(),
             changed_upload.checkpoint_identity_digest()

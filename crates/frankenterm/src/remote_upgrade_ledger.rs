@@ -1853,7 +1853,9 @@ mod tests {
     fn guardian_identity_and_length_are_bound_into_claim_hash_and_transaction_authority() {
         let (_fixture, root, effective_uid) = root_fixture();
         let baseline = claim('a');
-        let baseline_bytes = baseline.canonical_bytes().expect("serialize baseline claim");
+        let baseline_bytes = baseline
+            .canonical_bytes()
+            .expect("serialize baseline claim");
         let baseline_hash = domain_hash(CLAIM_HASH_DOMAIN, &baseline_bytes);
         RemoteUpgradeLedger::open(&root, effective_uid, baseline)
             .expect("persist baseline triplet claim");
@@ -1874,7 +1876,11 @@ mod tests {
             let conflict = RemoteUpgradeLedger::open(&root, effective_uid, mutation)
                 .err()
                 .expect("same transaction must reject guardian mutation");
-            assert!(conflict.to_string().contains("claimed by a different payload"));
+            assert!(
+                conflict
+                    .to_string()
+                    .contains("claimed by a different payload")
+            );
         }
     }
 

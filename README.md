@@ -49,7 +49,7 @@
 | Auditing the claims | [Trust & Attestation](#trust--attestation) → [Threat Model](#deep-dive-threat-model) → [Formal Methods](#deep-dive-formal-methods-in-this-repo) |
 | Reading the algorithms | [Algorithm & Data Structure Catalog](#algorithm--data-structure-catalog) → [Pattern Engine](#deep-dive-pattern-engine-architecture) → [Cx Cancellation Model](#deep-dive-the-cx-cancellation-model) |
 
-**A swarm-native terminal platform designed to observe, control, and audit large fleets of concurrent AI coding agents.** The retained 200-pane figures are synthetic benchmark-lane results, not a qualified native or target-class operating envelope. <!--count:workspace_members-->81<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->536<!--/count--> core-library modules, <!--count:core_loc-->1259610<!--/count-->+ lines of Rust, <!--count:test_count-->60535<!--/count-->+ test annotations across <!--count:core_rust_test_files-->1042<!--/count--> integration test files.
+**A swarm-native terminal platform designed to observe, control, and audit large fleets of concurrent AI coding agents.** The retained 200-pane figures are synthetic benchmark-lane results, not a qualified native or target-class operating envelope. <!--count:workspace_members-->83<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->536<!--/count--> core-library modules, <!--count:core_loc-->1259610<!--/count-->+ lines of Rust, <!--count:test_count-->60535<!--/count-->+ test annotations across <!--count:core_rust_test_files-->1042<!--/count--> integration test files.
 
 _Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe. Developer checks use the live worktree by default; release snapshots use `--source=head` so unrelated dirty files cannot alter the attested counts._
 
@@ -1544,7 +1544,7 @@ Operator-tunable runtime constants live under `[tuning]` sections such as `[tuni
 ### Workspace Structure
 
 ```
-frankenterm/                              # <!--count:workspace_members-->81<!--/count--> workspace members (auto-stamped)
+frankenterm/                              # <!--count:workspace_members-->83<!--/count--> workspace members (auto-stamped)
 ├── Cargo.toml
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft)
@@ -4396,6 +4396,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*<!--count:workspace_members-->81<!--/count--> workspace crates. <!--count:core_top_level_modules-->536<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1259610<!--/count-->+ lines. <!--count:test_count-->60535<!--/count-->+ test annotations. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
+*<!--count:workspace_members-->83<!--/count--> workspace crates. <!--count:core_top_level_modules-->536<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1259610<!--/count-->+ lines. <!--count:test_count-->60535<!--/count-->+ test annotations. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>

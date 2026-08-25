@@ -18,8 +18,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_build_identity::{
-    AtomicComponentRole, SealedAtomicBuildIdentity,
-    parse_sealed_atomic_component_marker_details,
+    AtomicComponentRole, SealedAtomicBuildIdentity, parse_sealed_atomic_component_marker_details,
 };
 use frankenterm_core::attention_router::{
     AttentionRouterSourceAdapterInput, AttentionRouterSurface, AttentionRouterSurfacePayload,
@@ -79889,7 +79888,9 @@ impl RemoteGenerationManifest {
             build_identity: RemoteGenerationBuildIdentity::from(&family.ft.identity),
         };
         let mux_server = RemoteGenerationComponentManifest {
-            role: AtomicComponentRole::FrankenTermMuxServer.as_str().to_string(),
+            role: AtomicComponentRole::FrankenTermMuxServer
+                .as_str()
+                .to_string(),
             filename: REMOTE_GENERATION_MUX_FILE.to_string(),
             sha256: family.mux_server.sha256.clone(),
             byte_len: family.mux_server.byte_len,
@@ -79897,7 +79898,9 @@ impl RemoteGenerationManifest {
             build_identity: RemoteGenerationBuildIdentity::from(&family.mux_server.identity),
         };
         let guardian = RemoteGenerationComponentManifest {
-            role: AtomicComponentRole::FrankenTermPtyGuardian.as_str().to_string(),
+            role: AtomicComponentRole::FrankenTermPtyGuardian
+                .as_str()
+                .to_string(),
             filename: REMOTE_GENERATION_GUARDIAN_FILE.to_string(),
             sha256: family.guardian.sha256.clone(),
             byte_len: family.guardian.byte_len,
@@ -80142,9 +80145,7 @@ fn read_local_component_snapshot(
     for marker_start in bytes
         .windows(marker_prefix.len())
         .enumerate()
-        .filter_map(|(offset, candidate)| {
-            (candidate == marker_prefix).then_some(offset)
-        })
+        .filter_map(|(offset, candidate)| (candidate == marker_prefix).then_some(offset))
     {
         let marker_suffix = &bytes[marker_start..];
         let marker_len = marker_suffix
@@ -80209,14 +80210,10 @@ fn validate_local_process_family(
     guardian_path: &Path,
 ) -> anyhow::Result<ValidatedLocalProcessFamily> {
     let ft = read_local_component_snapshot(ft_path, AtomicComponentRole::Ft)?;
-    let mux_server = read_local_component_snapshot(
-        mux_server_path,
-        AtomicComponentRole::FrankenTermMuxServer,
-    )?;
-    let guardian = read_local_component_snapshot(
-        guardian_path,
-        AtomicComponentRole::FrankenTermPtyGuardian,
-    )?;
+    let mux_server =
+        read_local_component_snapshot(mux_server_path, AtomicComponentRole::FrankenTermMuxServer)?;
+    let guardian =
+        read_local_component_snapshot(guardian_path, AtomicComponentRole::FrankenTermPtyGuardian)?;
     if ft.identity != mux_server.identity || ft.identity != guardian.identity {
         anyhow::bail!(
             "local ft, frankenterm-mux-server, and frankenterm-pty-guardian do not share one sealed build identity: ft={:?}, mux={:?}, guardian={:?}",
@@ -82799,12 +82796,13 @@ fn remote_generation_publication_command(
         [ft_source, mux_source, guardian_source]
             .into_iter()
             .all(|path| {
-            path.starts_with("$HOME/")
-                && !path.contains("..")
-                && path.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'/' | b'.' | b'_' | b'-')
-                })
-        }),
+                path.starts_with("$HOME/")
+                    && !path.contains("..")
+                    && path.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'$' | b'/' | b'.' | b'_' | b'-')
+                    })
+            }),
         "remote generation source is not a fixed HOME-relative shell path"
     );
     Ok(format!(
@@ -83498,13 +83496,9 @@ where
                 "component source flags require --install-ft so the matched process family is explicit"
             );
         }
-        (true, Some(ft_path), Some(mux_server_path), Some(guardian_path), None) => {
-            Some(validate_local_process_family(
-                ft_path,
-                mux_server_path,
-                guardian_path,
-            )?)
-        }
+        (true, Some(ft_path), Some(mux_server_path), Some(guardian_path), None) => Some(
+            validate_local_process_family(ft_path, mux_server_path, guardian_path)?,
+        ),
         (true, None, None, None, Some(tag)) => {
             validate_remote_release_tag(tag)?;
             None
@@ -83843,8 +83837,7 @@ fi"#,
                 options.ft_path,
                 options.mux_server_path,
                 options.guardian_path,
-            )
-            {
+            ) {
                 let process_family = local_process_family.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "validated local process-family snapshot is missing before remote copy"
@@ -83954,8 +83947,7 @@ fi"#,
             options.ft_path,
             options.mux_server_path,
             options.guardian_path,
-        )
-        {
+        ) {
             println!(
                 "• Would publish an immutable pending FrankenTerm generation via identity-fenced SSH upload; activation requires a cross-launcher lease"
             );
@@ -100612,9 +100604,9 @@ log_level = "debug"
         assert!(pending.contains(
             "chmod 0500 -- \"$ft_descriptor\" \"$mux_descriptor\" \"$guardian_descriptor\""
         ));
-        assert!(!pending.contains(
-            "chmod 0500 -- \"$ft_source\" \"$mux_source\" \"$guardian_source\""
-        ));
+        assert!(
+            !pending.contains("chmod 0500 -- \"$ft_source\" \"$mux_source\" \"$guardian_source\"")
+        );
         assert!(pending.contains("exec \"$ft_descriptor\" setup"));
         assert!(!pending.contains("exec \"$ft_source\" setup"));
         assert!(!pending.contains("--activate-current"));
@@ -100650,10 +100642,12 @@ log_level = "debug"
             ))
             .is_err()
         );
-        assert!(parse_remote_generation_publication_receipt(&format!(
-            "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
-        ))
-        .is_err());
+        assert!(
+            parse_remote_generation_publication_receipt(&format!(
+                "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
+            ))
+            .is_err()
+        );
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -101073,8 +101067,7 @@ log_level = "debug"
             "frankenterm-pty-guardian",
             "first-guardian",
         );
-        let first_family =
-            validate_local_process_family(&ft_one, &mux_one, &guardian_one).unwrap();
+        let first_family = validate_local_process_family(&ft_one, &mux_one, &guardian_one).unwrap();
         let first_expected = ProcessFamilyByteReceipt::from(&first_family);
         let pending = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
             root: &root,
@@ -101364,8 +101357,7 @@ log_level = "debug"
             "frankenterm-pty-guardian",
             "safe-guardian",
         );
-        let family =
-            validate_local_process_family(&ft_safe, &mux_safe, &guardian_safe).unwrap();
+        let family = validate_local_process_family(&ft_safe, &mux_safe, &guardian_safe).unwrap();
         let error = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
             root: &root,
             ft_source: &ft_safe,
@@ -101531,10 +101523,7 @@ log_level = "debug"
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert_eq!(std::fs::read(&ft_target).unwrap(), b"old-ft\n");
         assert_eq!(std::fs::read(&mux_target).unwrap(), b"old-mux\n");
-        assert_eq!(
-            std::fs::read(&guardian_target).unwrap(),
-            b"old-guardian\n"
-        );
+        assert_eq!(std::fs::read(&guardian_target).unwrap(), b"old-guardian\n");
         assert_eq!(
             std::fs::read(bin.join(format!("ft.failed-publish-{suffix}"))).unwrap(),
             new_ft.as_bytes()
@@ -102029,11 +102018,8 @@ log_level = "debug"
                 .expect("stage verified release ft fixture");
             std::fs::copy(&mux_path, release_dir.join("frankenterm-mux-server"))
                 .expect("stage verified release mux fixture");
-            std::fs::copy(
-                &guardian_path,
-                release_dir.join("frankenterm-pty-guardian"),
-            )
-            .expect("stage verified release guardian fixture");
+            std::fs::copy(&guardian_path, release_dir.join("frankenterm-pty-guardian"))
+                .expect("stage verified release guardian fixture");
             let release_stage_command =
                 remote_release_stage_command("v0.15.2", release_suffix, &byte_receipt)
                     .expect("render verified release byte-binding transaction");
@@ -102337,12 +102323,10 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(installer.contains("sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u"));
         assert!(installer.contains("sed 's/:frankenterm-pty-guardian:/:ROLE:/' | sort -u"));
         assert!(installer.contains("GUARDIAN_BIN=\"$PACKAGE_ROOT/frankenterm-pty-guardian\""));
-        assert!(installer.contains(
-            "-name \"frankenterm-pty-guardian\" -perm -111"
-        ));
-        assert!(installer.contains(
-            "install_process_family \"$BIN\" \"$MUX_BIN\" \"$GUARDIAN_BIN\""
-        ));
+        assert!(installer.contains("-name \"frankenterm-pty-guardian\" -perm -111"));
+        assert!(
+            installer.contains("install_process_family \"$BIN\" \"$MUX_BIN\" \"$GUARDIAN_BIN\"")
+        );
         let offline_verification = installer
             .find("Verifying atomic CLI/mux-server/PTY-guardian build identity")
             .expect("offline archive triplet verification");
@@ -102360,10 +102344,9 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             .expect("source-build function end");
         let source_build = &installer[source_build_start..source_build_end];
         assert!(source_build.contains("scripts/atomic-component-manifest.sh"));
-        assert!(
-            source_build
-                .contains("feature_contract=\"process-family-ft-mux-server-pty-guardian-default-features-v1\"")
-        );
+        assert!(source_build.contains(
+            "feature_contract=\"process-family-ft-mux-server-pty-guardian-default-features-v1\""
+        ));
         assert!(source_build.contains("${VERSION#v}"));
         assert!(source_build.contains("rustc -vV"));
         assert!(source_build.contains("derive-build-id"));
@@ -102379,12 +102362,10 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(source_build.contains(
             "--entry executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian"
         ));
-        assert!(source_build.contains(
-            "-p frankenterm-pty-guardian --bin frankenterm-pty-guardian"
-        ));
-        assert!(!source_build.contains(
-            "install_process_family \"$bin\" \"$mux_bin\""
-        ));
+        assert!(
+            source_build.contains("-p frankenterm-pty-guardian --bin frankenterm-pty-guardian")
+        );
+        assert!(!source_build.contains("install_process_family \"$bin\" \"$mux_bin\""));
         let identity_derivation = source_build
             .find("derive-build-id")
             .expect("canonical build identity derivation");
