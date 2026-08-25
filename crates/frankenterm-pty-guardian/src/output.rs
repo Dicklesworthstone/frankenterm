@@ -8013,6 +8013,10 @@ mod tests {
     fn checkpoint_catalog_test_marker(
         identity: CheckpointCatalogIdentity,
     ) -> CheckpointCatalogMarker {
+        let (adoption_effect_id, adoption_sequence) = match identity.scope {
+            CheckpointCatalogScope::Pane { .. } => (Uuid::from_u128(0xc004), 1),
+            CheckpointCatalogScope::Genesis { spawn_effect_id } => (spawn_effect_id, 0),
+        };
         CheckpointCatalogMarker {
             identity,
             predecessor_generation: None,
@@ -8025,8 +8029,214 @@ mod tests {
             terminal_payload_digest: [0x33; 32],
             candidate_checksum: [0x34; 32],
             adoption_mux_incarnation: Uuid::from_u128(0xc003),
-            adoption_effect_id: Uuid::from_u128(0xc004),
-            adoption_sequence: 1,
+            adoption_effect_id,
+            adoption_sequence,
+        }
+    }
+
+    fn checkpoint_catalog_test_genesis_reservation_binding()
+    -> CheckpointCatalogGenesisReservationBinding {
+        CheckpointCatalogGenesisReservationBinding {
+            mux_incarnation: Uuid::from_u128(0xe001),
+            spawn_effect_id: Uuid::from_u128(0xe002),
+            durable_pane_id: Uuid::from_u128(0xe003),
+            origin_request_id: Uuid::from_u128(0xe004),
+            spawn_payload_bytes: 73,
+            spawn_payload_digest: [0x51; 32],
+            process_family_build_identity_digest: [0x52; 32],
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 480,
+            checkpoint_identity_digest: [0x53; 32],
+            boundary_identity_digest: [0x54; 32],
+            upload_id: Uuid::from_u128(0xe005),
+        }
+    }
+
+    fn checkpoint_catalog_test_genesis_metadata(
+        reservation: CheckpointCatalogGenesisReservationBinding,
+    ) -> CheckpointCatalogMetadata {
+        CheckpointCatalogMetadata {
+            identity: CheckpointCatalogIdentity {
+                scope: CheckpointCatalogScope::Genesis {
+                    spawn_effect_id: reservation.spawn_effect_id,
+                },
+                generation: 1,
+                candidate_id: checkpoint_catalog_genesis_candidate_id(reservation),
+            },
+            predecessor: None,
+            upload_id: reservation.upload_id,
+            completion_id: Uuid::from_u128(0xe006),
+            checkpoint_id: reservation.checkpoint_identity_digest,
+            boundary_id: reservation.boundary_identity_digest,
+            terminal_payload_digest: [0x55; 32],
+            total_bytes: 17,
+            chunk_count: 1,
+            capture_generation: 1,
+            replay_semantics_id: [0x56; 32],
+            rows: u32::from(reservation.rows),
+            cols: u32::from(reservation.cols),
+            adoption_mux_incarnation: reservation.mux_incarnation,
+            adoption_effect_id: reservation.spawn_effect_id,
+            adoption_sequence: 0,
+            genesis_durable_pane_id: reservation.durable_pane_id,
+            genesis_origin_request_id: reservation.origin_request_id,
+            genesis_spawn_payload_bytes: reservation.spawn_payload_bytes,
+            genesis_spawn_payload_digest: reservation.spawn_payload_digest,
+            genesis_process_family_build_identity_digest: reservation
+                .process_family_build_identity_digest,
+            genesis_pixel_width: reservation.pixel_width,
+            genesis_pixel_height: reservation.pixel_height,
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_genesis_metadata_is_scope_specific_and_reservation_complete() {
+        let reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        let genesis = checkpoint_catalog_test_genesis_metadata(reservation);
+        checkpoint_catalog_validate_metadata(&genesis).expect("valid Genesis metadata");
+        assert!(checkpoint_catalog_genesis_metadata_matches_reservation(
+            &genesis,
+            reservation
+        ));
+
+        let pane_scope = CheckpointCatalogScope::Pane {
+            pane_id: Uuid::from_u128(0xe100),
+        };
+        let pane = checkpoint_catalog_test_member(pane_scope, 1, None, 0x21).metadata;
+        checkpoint_catalog_validate_metadata(&pane).expect("valid Pane metadata");
+        let mut pane_with_zero_sequence = pane;
+        pane_with_zero_sequence.adoption_sequence = 0;
+        assert!(checkpoint_catalog_validate_metadata(&pane_with_zero_sequence).is_err());
+        let mut pane_with_genesis_field = pane;
+        pane_with_genesis_field.genesis_durable_pane_id = reservation.durable_pane_id;
+        assert!(checkpoint_catalog_validate_metadata(&pane_with_genesis_field).is_err());
+
+        let mut wrong_generation = genesis;
+        wrong_generation.identity.generation = 2;
+        assert!(checkpoint_catalog_validate_metadata(&wrong_generation).is_err());
+        let mut wrong_capture_generation = genesis;
+        wrong_capture_generation.capture_generation = 2;
+        assert!(checkpoint_catalog_validate_metadata(&wrong_capture_generation).is_err());
+        let mut predecessor = genesis;
+        predecessor.predecessor = Some(CheckpointCatalogPredecessor {
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xe101),
+            candidate_checksum: [0x61; 32],
+            checkpoint_id: [0x62; 32],
+            boundary_id: [0x63; 32],
+        });
+        predecessor.identity.generation = 2;
+        assert!(checkpoint_catalog_validate_metadata(&predecessor).is_err());
+        let mut nonzero_sequence = genesis;
+        nonzero_sequence.adoption_sequence = 1;
+        assert!(checkpoint_catalog_validate_metadata(&nonzero_sequence).is_err());
+        let mut wrong_spawn = genesis;
+        wrong_spawn.adoption_effect_id = Uuid::from_u128(0xe102);
+        assert!(checkpoint_catalog_validate_metadata(&wrong_spawn).is_err());
+
+        let mut mutations = Vec::new();
+        let mut changed = genesis;
+        changed.upload_id = Uuid::from_u128(0xe110);
+        mutations.push(changed);
+        changed = genesis;
+        changed.checkpoint_id[0] ^= 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.boundary_id[0] ^= 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.rows += 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.cols += 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.adoption_mux_incarnation = Uuid::from_u128(0xe111);
+        mutations.push(changed);
+        changed = genesis;
+        changed.genesis_durable_pane_id = Uuid::from_u128(0xe112);
+        mutations.push(changed);
+        changed = genesis;
+        changed.genesis_origin_request_id = Uuid::from_u128(0xe113);
+        mutations.push(changed);
+        changed = genesis;
+        changed.genesis_spawn_payload_bytes += 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.genesis_spawn_payload_digest[0] ^= 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.genesis_process_family_build_identity_digest[0] ^= 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.genesis_pixel_width += 1;
+        mutations.push(changed);
+        changed = genesis;
+        changed.genesis_pixel_height += 1;
+        mutations.push(changed);
+        for mutation in mutations {
+            assert!(
+                !checkpoint_catalog_genesis_metadata_matches_reservation(
+                    &mutation,
+                    reservation
+                ),
+                "every reservation field must remain catalog-bound"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_genesis_candidate_identity_binds_every_reservation_field() {
+        let reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        let expected = checkpoint_catalog_genesis_candidate_id(reservation);
+        assert!(!expected.is_nil());
+        let mut mutations = Vec::new();
+        let mut changed = reservation;
+        changed.mux_incarnation = Uuid::from_u128(0xe201);
+        mutations.push(changed);
+        changed = reservation;
+        changed.spawn_effect_id = Uuid::from_u128(0xe202);
+        mutations.push(changed);
+        changed = reservation;
+        changed.durable_pane_id = Uuid::from_u128(0xe203);
+        mutations.push(changed);
+        changed = reservation;
+        changed.origin_request_id = Uuid::from_u128(0xe204);
+        mutations.push(changed);
+        changed = reservation;
+        changed.spawn_payload_bytes += 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.spawn_payload_digest[0] ^= 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.process_family_build_identity_digest[0] ^= 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.rows += 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.cols += 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.pixel_width += 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.pixel_height += 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.checkpoint_identity_digest[0] ^= 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.boundary_identity_digest[0] ^= 1;
+        mutations.push(changed);
+        changed = reservation;
+        changed.upload_id = Uuid::from_u128(0xe205);
+        mutations.push(changed);
+        for mutation in mutations {
+            assert_ne!(checkpoint_catalog_genesis_candidate_id(mutation), expected);
         }
     }
 
