@@ -1070,66 +1070,7 @@ pub enum GuardianCheckpointStageRecordKindV1 {
     CandidateMetadata = 1,
     Chunk = 2,
     SealManifest = 3,
-    Finalizer = 4,
 }
-
-/// Read-only proof that one exact immutable Seal manifest authenticated under
-/// the guardian output key. It grants no manifest creation or publication
-/// authority; its only mutating use is to bind the single ACK finalizer for
-/// this same upload and completion identity.
-#[must_use = "durable completion receipts must be queried or finalized"]
-pub struct GuardianCheckpointDurableCompletionReceiptV1 {
-    binding: GuardianCheckpointStageBindingV1,
-    upload_id: Uuid,
-    publication_id: Uuid,
-    _private: (),
-}
-
-impl std::fmt::Debug for GuardianCheckpointDurableCompletionReceiptV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("GuardianCheckpointDurableCompletionReceiptV1")
-            .field("binding", &"[REDACTED]")
-            .field("upload_id", &self.upload_id)
-            .field("publication_id", &self.publication_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl zeroize::ZeroizeOnDrop for GuardianCheckpointDurableCompletionReceiptV1 {}
-
-impl Drop for GuardianCheckpointDurableCompletionReceiptV1 {
-    fn drop(&mut self) {
-        match &mut self.binding.scope.kind {
-            GuardianCheckpointStageScopeKindV1::Pane { generation, .. } => generation.zeroize(),
-            GuardianCheckpointStageScopeKindV1::Genesis { .. } => {}
-        }
-        match &mut self.binding.descriptor.origin.kind {
-            GuardianCheckpointOriginKindV1::Genesis { .. } => {}
-            GuardianCheckpointOriginKindV1::Record {
-                output_sequence,
-                output_record_digest,
-                output_committed_log_bytes,
-                journal_cumulative_plaintext_bytes,
-                ..
-            } => {
-                output_sequence.zeroize();
-                output_record_digest.zeroize();
-                output_committed_log_bytes.zeroize();
-                journal_cumulative_plaintext_bytes.zeroize();
-            }
-        }
-        self.binding.descriptor.parser_stream_bytes.zeroize();
-        self.binding.descriptor.replay_identity_digest.zeroize();
-        self.binding.descriptor.rows.zeroize();
-        self.binding.descriptor.cols.zeroize();
-        self.binding.descriptor.terminal_payload_bytes.zeroize();
-        self.binding.descriptor.terminal_payload_digest.zeroize();
-    }
-}
-
-static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);
-static_assertions::assert_impl_all!(GuardianCheckpointDurableCompletionReceiptV1: zeroize::ZeroizeOnDrop);
 
 impl GuardianCheckpointStageRecordKindV1 {
     fn from_wire(value: u8) -> Result<Self, GuardianCheckpointCipherError> {
@@ -1137,7 +1078,6 @@ impl GuardianCheckpointStageRecordKindV1 {
             1 => Ok(Self::CandidateMetadata),
             2 => Ok(Self::Chunk),
             3 => Ok(Self::SealManifest),
-            4 => Ok(Self::Finalizer),
             _ => Err(GuardianCheckpointCipherError::InvalidRecordKind),
         }
     }
@@ -1424,11 +1364,7 @@ impl GuardianCheckpointStageSealIntentV1 {
         chunk_position: Option<(u32, u64)>,
         plaintext: Zeroizing<Vec<u8>>,
     ) -> Result<Self, GuardianCheckpointCipherError> {
-        if matches!(
-            kind,
-            GuardianCheckpointStageRecordKindV1::SealManifest
-                | GuardianCheckpointStageRecordKindV1::Finalizer
-        ) {
+        if kind == GuardianCheckpointStageRecordKindV1::SealManifest {
             return Err(GuardianCheckpointCipherError::InvalidKindAuthority);
         }
         let boundary_identity_digest = binding.boundary_identity_digest()?;
@@ -1831,8 +1767,7 @@ impl GuardianCheckpointStageRecordContextV1 {
             }
             (
                 GuardianCheckpointStageRecordKindV1::CandidateMetadata
-                | GuardianCheckpointStageRecordKindV1::SealManifest
-                | GuardianCheckpointStageRecordKindV1::Finalizer,
+                | GuardianCheckpointStageRecordKindV1::SealManifest,
                 None,
             ) => {}
             _ => return Err(GuardianCheckpointCipherError::InvalidChunkIdentity),
@@ -1897,14 +1832,12 @@ impl GuardianCheckpointStageRecordContextV1 {
             GuardianCheckpointStageRecordKindV1::Chunk => Some((chunk_index, chunk_offset)),
             GuardianCheckpointStageRecordKindV1::CandidateMetadata
             | GuardianCheckpointStageRecordKindV1::SealManifest
-            | GuardianCheckpointStageRecordKindV1::Finalizer
                 if chunk_index == 0 && chunk_offset == 0 =>
             {
                 None
             }
             GuardianCheckpointStageRecordKindV1::CandidateMetadata
-            | GuardianCheckpointStageRecordKindV1::SealManifest
-            | GuardianCheckpointStageRecordKindV1::Finalizer => {
+            | GuardianCheckpointStageRecordKindV1::SealManifest => {
                 return Err(GuardianCheckpointCipherError::InvalidChunkIdentity);
             }
         };
@@ -2077,108 +2010,6 @@ impl GuardianCheckpointCipher {
         self.open_validated_manifest(&retry.operation, record)
     }
 
-    /// Authenticate one already-durable Seal completion without minting any
-    /// publication authority.
-    ///
-    /// This recovery-only seam reconstructs the exact canonical manifest from
-    /// an authenticated Stage request and the opaque identities obtained by
-    /// opening its candidate and complete ordered chunk set. It can inspect an
-    /// existing encrypted record, but cannot create or retry-create one. That
-    /// asymmetry lets `Query` recover a lost Seal reply after process restart
-    /// without treating a filename, ciphertext digest, or caller UUID as
-    /// publication authority.
-    #[allow(clippy::too_many_arguments)]
-    pub fn inspect_durable_manifest_receipt(
-        &self,
-        binding: &GuardianCheckpointStageBindingV1,
-        seal_request: GuardianCheckpointStageRequestV1,
-        publication_id: Uuid,
-        candidate_identity: GuardianCheckpointCandidateIdentityV1,
-        ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1,
-        record: &GuardianEncryptedCheckpointStageRecordV1,
-    ) -> Result<GuardianCheckpointDurableCompletionReceiptV1, GuardianCheckpointCipherError> {
-        binding.validate_seal_request(&seal_request)?;
-        if publication_id.is_nil()
-            || candidate_identity.is_zero()
-            || ordered_chunk_set_identity.is_zero()
-        {
-            return Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest);
-        }
-        let encoded_request = Zeroizing::new(
-            seal_request
-                .encode()
-                .map_err(|_| GuardianCheckpointCipherError::InvalidSealRequest)?,
-        );
-        if encoded_request.len()
-            != usize::try_from(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
-                .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?
-        {
-            return Err(GuardianCheckpointCipherError::InvalidSealRequest);
-        }
-        let canonical_manifest = checkpoint_canonical_seal_manifest(
-            &encoded_request,
-            &candidate_identity,
-            &ordered_chunk_set_identity,
-        )?;
-        let expected_context = GuardianCheckpointStageRecordContextV1::from_persisted_parts(
-            GuardianCheckpointStageRecordKindV1::SealManifest,
-            binding.scope,
-            seal_request.upload_id(),
-            binding.boundary_identity_digest()?,
-            binding.checkpoint_identity_digest()?,
-            publication_id,
-            None,
-            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
-        )?;
-        let opened = self.open_exact_payload(
-            &expected_context,
-            record,
-            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
-        )?;
-        if checkpoint_stage_bytes_match(&opened, &canonical_manifest) {
-            Ok(GuardianCheckpointDurableCompletionReceiptV1 {
-                binding: *binding,
-                upload_id: seal_request.upload_id(),
-                publication_id,
-                _private: (),
-            })
-        } else {
-            Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch)
-        }
-    }
-
-    /// Seal the unique ACK finalizer for one authenticated durable completion.
-    pub fn seal_ack_finalizer(
-        &self,
-        receipt: &GuardianCheckpointDurableCompletionReceiptV1,
-        ack_request: &GuardianCheckpointStageRequestV1,
-    ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
-        let (context, canonical_ack, plaintext_digest) =
-            checkpoint_ack_finalizer_parts(receipt, ack_request)?;
-        self.seal_exact_payload(context, canonical_ack.as_slice(), &plaintext_digest)
-    }
-
-    /// Authenticate an existing ACK finalizer for the same exact completion.
-    pub fn inspect_ack_finalizer(
-        &self,
-        receipt: &GuardianCheckpointDurableCompletionReceiptV1,
-        ack_request: &GuardianCheckpointStageRequestV1,
-        record: &GuardianEncryptedCheckpointStageRecordV1,
-    ) -> Result<(), GuardianCheckpointCipherError> {
-        let (context, canonical_ack, _) = checkpoint_ack_finalizer_parts(receipt, ack_request)?;
-        let opened = self.open_exact_payload(
-            &context,
-            record,
-            u32::try_from(canonical_ack.len())
-                .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?,
-        )?;
-        if checkpoint_stage_bytes_match(&opened, &canonical_ack) {
-            Ok(())
-        } else {
-            Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
-        }
-    }
-
     fn open_validated_manifest(
         &self,
         operation: &GuardianCheckpointValidatedManifestOperationV1,
@@ -2204,11 +2035,7 @@ impl GuardianCheckpointCipher {
         record: &GuardianEncryptedCheckpointStageRecordV1,
         max_plaintext_bytes: u32,
     ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError> {
-        if matches!(
-            expected_context.kind,
-            GuardianCheckpointStageRecordKindV1::SealManifest
-                | GuardianCheckpointStageRecordKindV1::Finalizer
-        ) {
+        if expected_context.kind == GuardianCheckpointStageRecordKindV1::SealManifest {
             return Err(GuardianCheckpointCipherError::InvalidKindAuthority);
         }
         self.open_exact_payload(expected_context, record, max_plaintext_bytes)
@@ -2633,56 +2460,6 @@ fn checkpoint_zeroizing_copy(
         .map_err(|_| GuardianCheckpointCipherError::PlaintextAllocationFailed)?;
     copy.extend_from_slice(source);
     Ok(copy)
-}
-
-fn checkpoint_ack_finalizer_parts(
-    receipt: &GuardianCheckpointDurableCompletionReceiptV1,
-    ack_request: &GuardianCheckpointStageRequestV1,
-) -> Result<
-    (
-        GuardianCheckpointStageRecordContextV1,
-        Zeroizing<Vec<u8>>,
-        Zeroizing<[u8; 32]>,
-    ),
-    GuardianCheckpointCipherError,
-> {
-    if ack_request.kind() != GuardianCheckpointStageKindV1::Ack
-        || ack_request.upload_id() != receipt.upload_id
-        || ack_request.completion_id() != Some(receipt.publication_id)
-    {
-        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
-    }
-    let descriptor = ack_request
-        .descriptor()
-        .canonical_descriptor()
-        .map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)?;
-    let scope = checkpoint_stage_scope_from_protocol(ack_request.scope())?;
-    let binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
-        scope,
-        descriptor,
-        ack_request.descriptor().capture_generation(),
-    )?;
-    if binding != receipt.binding {
-        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
-    }
-    let canonical_ack = Zeroizing::new(
-        ack_request
-            .encode()
-            .map_err(|_| GuardianCheckpointCipherError::InvalidSealRequest)?,
-    );
-    let (plaintext_bytes, plaintext_digest) =
-        checkpoint_stage_plaintext_identity(canonical_ack.as_slice())?;
-    let context = GuardianCheckpointStageRecordContextV1::from_persisted_parts(
-        GuardianCheckpointStageRecordKindV1::Finalizer,
-        receipt.binding.scope,
-        receipt.upload_id,
-        receipt.binding.boundary_identity_digest()?,
-        receipt.binding.checkpoint_identity_digest()?,
-        receipt.publication_id,
-        None,
-        plaintext_bytes,
-    )?;
-    Ok((context, canonical_ack, plaintext_digest))
 }
 
 fn checkpoint_canonical_seal_manifest(
@@ -3651,7 +3428,6 @@ mod tests {
 
     const AUTHORITY_CRITICAL_TYPES: &[&str] = &[
         "GuardianCheckpointGenesisSpawnPermitV1",
-        "GuardianCheckpointDurableCompletionReceiptV1",
         "GuardianCheckpointCandidateIdentityV1",
         "GuardianCheckpointOrderedChunkSetIdentityV1",
         "GuardianCheckpointOrderedChunkSetBuilderV1",
@@ -5420,8 +5196,6 @@ mod tests {
                         Begin,
                         Chunk(GuardianCheckpointStageChunkDeliveryV1),
                         Seal,
-                        Query,
-                        Ack { completion_id: Uuid },
                     }
                 "#,
             )
@@ -5508,18 +5282,6 @@ mod tests {
             ),
             expected_authority_method(
                 "GuardianCheckpointStageRequestV1",
-                "pub",
-                false,
-                "fn query(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32) -> Result<Self, GuardianProtocolError>",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointStageRequestV1",
-                "pub",
-                false,
-                "fn ack(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32, completion_id: Uuid) -> Result<Self, GuardianProtocolError>",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointStageRequestV1",
                 "private",
                 false,
                 "fn new(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32, body: GuardianCheckpointStageBodyV1) -> Result<Self, GuardianProtocolError>",
@@ -5583,12 +5345,6 @@ mod tests {
                 "pub",
                 false,
                 "const fn chunk_position(&self) -> Option<(u32, u64)>",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointStageRequestV1",
-                "pub",
-                false,
-                "const fn completion_id(&self) -> Option<Uuid>",
             ),
             expected_authority_method(
                 "GuardianCheckpointStageRequestV1",
@@ -5719,9 +5475,7 @@ mod tests {
                         match self.body {
                             GuardianCheckpointStageBodyV1::Chunk(chunk) => Ok(chunk),
                             GuardianCheckpointStageBodyV1::Begin
-                            | GuardianCheckpointStageBodyV1::Seal
-                            | GuardianCheckpointStageBodyV1::Query
-                            | GuardianCheckpointStageBodyV1::Ack { .. } => {
+                            | GuardianCheckpointStageBodyV1::Seal => {
                                 Err(GuardianProtocolError::InvalidOperationPayload)
                             }
                         }
@@ -5768,11 +5522,9 @@ mod tests {
             "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new:pub:production",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::into_chunk:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::begin:pub:production",
-            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::new:private:production",
-            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::query:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal:pub:production",
         ]
         .into_iter()
@@ -5789,19 +5541,13 @@ mod tests {
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointChunkDelivery::new",
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointStageRequestV1::decode",
-            "GuardianCheckpointChunkNonDuplicable@GuardianReplayOutputRecordsDelivery::new",
-            "GuardianCheckpointChunkNonDuplicable@GuardianReplayProtectedDigest::zeroed",
-            "GuardianCheckpointChunkNonDuplicable@GuardianReplayRecordDelivery::new",
-            "GuardianCheckpointChunkNonDuplicable@GuardianWireFrame::with_capacity",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::decode",
             "GuardianCheckpointStageRequestV1@<free>::validate_request_envelope",
-            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::begin",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::new",
-            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::query",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal",
             "GuardianCheckpointStageRequestV1@GuardianReply::require_request_payload",
         ]
@@ -5819,34 +5565,6 @@ mod tests {
                 "private",
                 "Chunk:<unnamed:0>",
                 "GuardianCheckpointStageChunkDeliveryV1",
-            ),
-            expected_protocol_delivery_storage(
-                "struct",
-                "GuardianReplayOutputRecordsDelivery",
-                "pub",
-                "_nonduplicable",
-                "GuardianCheckpointChunkNonDuplicable",
-            ),
-            expected_protocol_delivery_storage(
-                "struct",
-                "GuardianReplayProtectedDigest",
-                "private",
-                "_nonduplicable",
-                "GuardianCheckpointChunkNonDuplicable",
-            ),
-            expected_protocol_delivery_storage(
-                "struct",
-                "GuardianReplayRecordDelivery",
-                "pub",
-                "_nonduplicable",
-                "GuardianCheckpointChunkNonDuplicable",
-            ),
-            expected_protocol_delivery_storage(
-                "struct",
-                "GuardianWireFrame",
-                "pub",
-                "_nonduplicable",
-                "GuardianCheckpointChunkNonDuplicable",
             ),
             expected_protocol_delivery_storage(
                 "enum",
@@ -5895,20 +5613,13 @@ mod tests {
         );
         assert_eq!(
             inventory.impl_associated_types,
-            vec![
-                (
-                    "AuthenticatedGuardianRequest".to_owned(),
-                    syn::parse_str::<syn::ImplItemType>(
-                        "type Target = GuardianRequestEnvelope;"
-                    )
-                    .expect("parse frozen authenticated request associated type"),
-                ),
-                (
-                    "GuardianWireFrame".to_owned(),
-                    syn::parse_str::<syn::ImplItemType>("type Target = [u8];")
-                        .expect("parse frozen guardian wire associated type"),
-                ),
-            ]
+            vec![(
+                "AuthenticatedGuardianRequest".to_owned(),
+                syn::parse_str::<syn::ImplItemType>(
+                    "type Target = GuardianRequestEnvelope;"
+                )
+                .expect("parse frozen guardian protocol associated type"),
+            )]
         );
         assert_eq!(
             inventory.trait_associated_types,
@@ -5922,25 +5633,7 @@ mod tests {
         );
         assert_eq!(inventory.conditional_surfaces, Vec::<String>::new());
         assert_eq!(inventory.out_of_line_modules, Vec::<String>::new());
-        assert_eq!(
-            inventory.item_macros,
-            vec![
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointChunkNonDuplicable: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianWireFrame: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianWireFrame: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayProtectedDigest: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayProtectedDigest: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayRecordDelivery: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayRecordDelivery: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayOutputRecordsDelivery: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayOutputRecordsDelivery: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: ZeroizeOnDrop);"),
-            ]
-        );
+        assert_eq!(inventory.item_macros, Vec::<syn::Macro>::new());
         assert_eq!(inventory.unexpected_macros, Vec::<syn::Macro>::new());
         inventory.projection_sites.sort();
         let mut expected_projection_sites = vec![
@@ -5949,8 +5642,6 @@ mod tests {
             "<free>::validate_request_envelope",
             "<free>::validate_response_envelope",
             "AuthenticatedGuardianRequest::deref",
-            "GuardianWireFrame::deref",
-            "GuardianWireFrame::deref_mut",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -7750,17 +7441,6 @@ mod tests {
 
         assert_protocol_delivery_surface_is_closed();
 
-        assert_eq!(GuardianCheckpointStageRecordKindV1::Finalizer as u8, 4);
-        assert_eq!(
-            GuardianCheckpointStageRecordKindV1::from_wire(4)
-                .expect("decode the frozen finalizer record discriminant"),
-            GuardianCheckpointStageRecordKindV1::Finalizer
-        );
-        assert!(matches!(
-            GuardianCheckpointStageRecordKindV1::from_wire(5),
-            Err(GuardianCheckpointCipherError::InvalidRecordKind)
-        ));
-
         assert_zeroize_on_drop::<Sha256>();
         assert!(std::mem::needs_drop::<GuardianCheckpointStageSealIntentV1>());
         assert!(std::mem::needs_drop::<
@@ -7775,10 +7455,6 @@ mod tests {
         assert!(std::mem::needs_drop::<
             GuardianCheckpointValidatedStageAssemblyV1
         >());
-        assert!(std::mem::needs_drop::<
-            GuardianCheckpointDurableCompletionReceiptV1
-        >());
-        assert_zeroize_on_drop::<GuardianCheckpointDurableCompletionReceiptV1>();
         assert!(!std::mem::needs_drop::<
             GuardianCheckpointStageRecordContextV1
         >());
@@ -7805,10 +7481,6 @@ mod tests {
         inventory.fields.sort();
         let mut expected_fields = vec![
             "GuardianCheckpointCandidateIdentityV1:digest:private",
-            "GuardianCheckpointDurableCompletionReceiptV1:_private:private",
-            "GuardianCheckpointDurableCompletionReceiptV1:binding:private",
-            "GuardianCheckpointDurableCompletionReceiptV1:publication_id:private",
-            "GuardianCheckpointDurableCompletionReceiptV1:upload_id:private",
             "GuardianCheckpointGenesisSpawnPermitV1:_private:private",
             "GuardianCheckpointGenesisSpawnPermitV1:spawn_effect_id:private",
             "GuardianCheckpointManifestRetryCapabilityV1:operation:private",
@@ -7854,26 +7526,6 @@ mod tests {
                 "GuardianCheckpointCandidateIdentityV1",
                 "digest",
                 "Zeroizing<[u8; 32]>",
-            ),
-            expected_authority_field(
-                "GuardianCheckpointDurableCompletionReceiptV1",
-                "_private",
-                "()",
-            ),
-            expected_authority_field(
-                "GuardianCheckpointDurableCompletionReceiptV1",
-                "binding",
-                "GuardianCheckpointStageBindingV1",
-            ),
-            expected_authority_field(
-                "GuardianCheckpointDurableCompletionReceiptV1",
-                "publication_id",
-                "Uuid",
-            ),
-            expected_authority_field(
-                "GuardianCheckpointDurableCompletionReceiptV1",
-                "upload_id",
-                "Uuid",
             ),
             expected_authority_field(
                 "GuardianCheckpointGenesisSpawnPermitV1",
@@ -8041,9 +7693,6 @@ mod tests {
             "GuardianCheckpointCandidateIdentityV1:Debug",
             "GuardianCheckpointCandidateIdentityV1:Eq",
             "GuardianCheckpointCandidateIdentityV1:PartialEq",
-            "GuardianCheckpointDurableCompletionReceiptV1:Debug",
-            "GuardianCheckpointDurableCompletionReceiptV1:Drop",
-            "GuardianCheckpointDurableCompletionReceiptV1:ZeroizeOnDrop",
             "GuardianCheckpointGenesisSpawnPermitV1:<inherent>",
             "GuardianCheckpointGenesisSpawnPermitV1:Debug",
             "GuardianCheckpointManifestRetryCapabilityV1:<inherent>",
@@ -8386,8 +8035,6 @@ mod tests {
         inventory.cipher_methods.sort();
         let mut expected_cipher_methods = vec![
             "from_output_cipher:pub:GuardianOutputCipher",
-            "inspect_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianEncryptedCheckpointStageRecordV1",
-            "inspect_durable_manifest_receipt:pub:GuardianCheckpointStageBindingV1,GuardianCheckpointStageRequestV1,Uuid,GuardianCheckpointCandidateIdentityV1,GuardianCheckpointOrderedChunkSetIdentityV1,GuardianEncryptedCheckpointStageRecordV1",
             "key_id:pub:",
             "open:pub:GuardianCheckpointStageRecordContextV1,GuardianEncryptedCheckpointStageRecordV1,u32",
             "open_exact_payload:private:GuardianCheckpointStageRecordContextV1,GuardianEncryptedCheckpointStageRecordV1,u32",
@@ -8396,7 +8043,6 @@ mod tests {
             "retry_open_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1,GuardianEncryptedCheckpointStageRecordV1",
             "retry_seal_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1",
             "seal:pub:GuardianCheckpointStageSealIntentV1",
-            "seal_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1",
             "seal_exact_payload:private:GuardianCheckpointStageRecordContextV1,u8,u8",
             "seal_manifest:pub:GuardianCheckpointValidatedManifestOperationV1",
             "seal_validated_manifest:private:GuardianCheckpointValidatedManifestOperationV1",
@@ -8438,24 +8084,6 @@ mod tests {
                 "pub",
                 false,
                 "fn retry_seal_manifest(&self, retry: &GuardianCheckpointManifestRetryCapabilityV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointCipher",
-                "pub",
-                false,
-                "fn inspect_durable_manifest_receipt(&self, binding: &GuardianCheckpointStageBindingV1, seal_request: GuardianCheckpointStageRequestV1, publication_id: Uuid, candidate_identity: GuardianCheckpointCandidateIdentityV1, ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<GuardianCheckpointDurableCompletionReceiptV1, GuardianCheckpointCipherError>",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointCipher",
-                "pub",
-                false,
-                "fn seal_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointCipher",
-                "pub",
-                false,
-                "fn inspect_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointCipher",
@@ -8510,7 +8138,6 @@ mod tests {
         let mut expected_authority_signatures = expected_method_surfaces.clone();
         for owner in [
             "GuardianCheckpointCandidateIdentityV1",
-            "GuardianCheckpointDurableCompletionReceiptV1",
             "GuardianCheckpointGenesisSpawnPermitV1",
             "GuardianCheckpointManifestRetryCapabilityV1",
             "GuardianCheckpointManifestSealCapabilitiesV1",
@@ -8541,12 +8168,6 @@ mod tests {
             ));
         }
         expected_authority_signatures.extend([
-            expected_authority_method(
-                "GuardianCheckpointDurableCompletionReceiptV1",
-                "private",
-                false,
-                "fn drop(&mut self)",
-            ),
             expected_authority_method(
                 "GuardianCheckpointArtifactDescriptorV1",
                 "pub",
@@ -8596,30 +8217,6 @@ mod tests {
                 "fn open_validated_manifest(&self, operation: &GuardianCheckpointValidatedManifestOperationV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
-                "GuardianCheckpointCipher",
-                "pub",
-                false,
-                "fn inspect_durable_manifest_receipt(&self, binding: &GuardianCheckpointStageBindingV1, seal_request: GuardianCheckpointStageRequestV1, publication_id: Uuid, candidate_identity: GuardianCheckpointCandidateIdentityV1, ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<GuardianCheckpointDurableCompletionReceiptV1, GuardianCheckpointCipherError>",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointCipher",
-                "pub",
-                false,
-                "fn seal_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
-            ),
-            expected_authority_method(
-                "GuardianCheckpointCipher",
-                "pub",
-                false,
-                "fn inspect_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
-            ),
-            expected_authority_method(
-                "<free>",
-                "private",
-                false,
-                "fn checkpoint_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>), GuardianCheckpointCipherError>",
-            ),
-            expected_authority_method(
                 "<free>",
                 "private",
                 false,
@@ -8641,7 +8238,6 @@ mod tests {
         inventory.return_sites.sort();
         let mut expected_return_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext:pub:production",
-            "GuardianCheckpointDurableCompletionReceiptV1@GuardianCheckpointCipher::inspect_durable_manifest_receipt:pub:production",
             "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue_for_test:private:test",
             "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
             "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly:pub:production",
@@ -8670,7 +8266,6 @@ mod tests {
         inventory.construction_sites.sort();
         let mut expected_construction_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext",
-            "GuardianCheckpointDurableCompletionReceiptV1@GuardianCheckpointCipher::inspect_durable_manifest_receipt",
             "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue_for_test",
             "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
             "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
@@ -8746,8 +8341,6 @@ mod tests {
         assert_eq!(
             inventory.item_macros,
             vec![
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointDurableCompletionReceiptV1: zeroize::ZeroizeOnDrop);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);"),
@@ -9084,28 +8677,6 @@ mod tests {
         let upload_id = Uuid::new_v4();
         let publication_id = Uuid::new_v4();
         let cipher = checkpoint_stage_cipher(0x73);
-        let receipt_begin = record_begin_request(&binding, &capture, upload_id);
-        let (receipt_candidate_identity, receipt_chunk_set_identity) =
-            manifest_component_identities(
-                &receipt_begin,
-                capture.terminal_checkpoint().canonical_payload(),
-            );
-        let receipt_seal_request = record_seal_request(&binding, &capture, upload_id);
-        let (receipt_pane_id, receipt_generation) = binding
-            .scope()
-            .pane_identity()
-            .expect("record completion fixture uses pane scope");
-        let receipt_ack_request = GuardianCheckpointStageRequestV1::ack(
-            GuardianCheckpointScopeV1::Pane {
-                pane_id: receipt_pane_id,
-                generation: receipt_generation,
-            },
-            upload_id,
-            receipt_seal_request.descriptor(),
-            receipt_seal_request.chunk_bytes(),
-            publication_id,
-        )
-        .expect("construct exact completion ACK");
 
         let candidate = GuardianCheckpointStageSealIntentV1::candidate_metadata(
             &binding,
@@ -9167,41 +8738,6 @@ mod tests {
         cipher
             .retry_open_manifest(&retry, &record)
             .expect("adopt only the separately bound exact retry");
-        let completion_receipt = cipher
-            .inspect_durable_manifest_receipt(
-                &binding,
-                receipt_seal_request,
-                publication_id,
-                receipt_candidate_identity,
-                receipt_chunk_set_identity,
-                &record,
-            )
-            .expect("recover the exact durable Seal receipt without publication authority");
-        let ack_record = cipher
-            .seal_ack_finalizer(&completion_receipt, &receipt_ack_request)
-            .expect("seal the unique completion ACK finalizer");
-        cipher
-            .inspect_ack_finalizer(
-                &completion_receipt,
-                &receipt_ack_request,
-                &ack_record,
-            )
-            .expect("recover an exact lost ACK reply");
-        let wrong_ack_request = GuardianCheckpointStageRequestV1::ack(
-            GuardianCheckpointScopeV1::Pane {
-                pane_id: receipt_pane_id,
-                generation: receipt_generation,
-            },
-            upload_id,
-            receipt_ack_request.descriptor(),
-            receipt_ack_request.chunk_bytes(),
-            Uuid::new_v4(),
-        )
-        .expect("construct conflicting completion ACK");
-        assert!(matches!(
-            cipher.seal_ack_finalizer(&completion_receipt, &wrong_ack_request),
-            Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch)
-        ));
 
         let (other_descriptor, _, _, other_capture) = record_descriptor();
         let other_binding = record_stage_binding(other_descriptor, 19);
