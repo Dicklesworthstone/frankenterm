@@ -8771,6 +8771,11 @@ mod tests {
         let mut expected_expression_macros = vec![
             expected_authority_macro(
                 "GuardianCheckpointCipher",
+                "open",
+                "matches!(expected_context.kind, GuardianCheckpointStageRecordKindV1::SealManifest | GuardianCheckpointStageRecordKindV1::Finalizer)",
+            ),
+            expected_authority_macro(
+                "GuardianCheckpointCipher",
                 "seal",
                 "matches!(context.kind, GuardianCheckpointStageRecordKindV1::CandidateMetadata | GuardianCheckpointStageRecordKindV1::Chunk)",
             ),
@@ -8778,6 +8783,11 @@ mod tests {
                 "GuardianCheckpointOriginV1",
                 "is_genesis",
                 "matches!(self.kind, GuardianCheckpointOriginKindV1::Genesis { .. })",
+            ),
+            expected_authority_macro(
+                "GuardianCheckpointStageSealIntentV1",
+                "from_binding",
+                "matches!(kind, GuardianCheckpointStageRecordKindV1::SealManifest | GuardianCheckpointStageRecordKindV1::Finalizer)",
             ),
         ];
         expected_expression_macros.sort_by(|left, right| {
