@@ -9233,7 +9233,7 @@ mod tests {
     #[test]
     fn terminal_certificate_synthesized_on_completion() {
         let plan = make_plan(2);
-        let mut ledger = TxExecutionLedger::new("exec-cert-1", "test-plan", plan.hash());
+        let mut ledger = TxExecutionLedger::new("exec-cert-1", "test-plan", plan.plan_hash);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         ledger.transition_phase(TxPhase::Committing).unwrap();
 
@@ -9282,7 +9282,7 @@ mod tests {
     #[test]
     fn terminal_certificate_synthesized_on_rollback() {
         let plan = make_plan(2);
-        let mut ledger = TxExecutionLedger::new("exec-cert-rollback", "test-plan", plan.hash());
+        let mut ledger = TxExecutionLedger::new("exec-cert-rollback", "test-plan", plan.plan_hash);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         ledger.transition_phase(TxPhase::Committing).unwrap();
 
@@ -9314,7 +9314,7 @@ mod tests {
             .unwrap();
 
         ledger.transition_phase(TxPhase::Compensating).unwrap();
-        let comp_key0 = IdempotencyKey::for_compensation("test-plan", "step-0", 1000);
+        let comp_key0 = IdempotencyKey::for_compensation("test-plan", "step-0", "rollback");
         ledger
             .append(
                 comp_key0,
@@ -9346,7 +9346,7 @@ mod tests {
     #[test]
     fn resume_context_detects_missing_plan_coverage_in_partial_completed_ledger() {
         let plan = make_plan(3);
-        let mut ledger = TxExecutionLedger::new("exec-partial", "test-plan", plan.hash());
+        let mut ledger = TxExecutionLedger::new("exec-partial", "test-plan", plan.plan_hash);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         ledger.transition_phase(TxPhase::Committing).unwrap();
 
@@ -9371,7 +9371,7 @@ mod tests {
     #[test]
     fn terminal_ledger_deserialization_rejects_missing_or_forged_certificate() {
         let plan = make_plan(1);
-        let mut ledger = TxExecutionLedger::new("exec-cert-tamper", "test-plan", plan.hash());
+        let mut ledger = TxExecutionLedger::new("exec-cert-tamper", "test-plan", plan.plan_hash);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         ledger.transition_phase(TxPhase::Committing).unwrap();
         let key0 = make_key("test-plan", "step-0");

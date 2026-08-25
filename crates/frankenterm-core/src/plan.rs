@@ -11479,35 +11479,15 @@ mod tests {
 
     #[test]
     fn validate_rejects_compensation_receipt_before_any_commit_receipt() {
-        let mut contract = MissionTxContract::new(
-            TxIntent::new("tx-test-reducer", "goal", 0),
-            TxPlan::new(
-                "plan-test-reducer",
-                vec![TxStep::new(
-                    "step-0",
-                    StepAction::SendText {
-                        pane_id: 1,
-                        text: "echo ok".to_string(),
-                    },
-                )],
-            )
-            .with_compensations(vec![TxCompensation::new(
-                "step-0",
-                StepAction::SendText {
-                    pane_id: 1,
-                    text: "echo rollback".to_string(),
-                },
-            )]),
-        );
-        contract.lifecycle_state = MissionTxState::Compensating;
+        let mut contract = sample_tx_contract(MissionTxState::Compensating);
         contract.receipts.push(serde_json::json!({
             "seq": 1,
             "phase": "compensate",
-            "step_id": "step-0",
+            "step_id": "tx-step:1",
             "state": "compensating",
             "outcome": "compensated",
-            "tx_id": "tx-test-reducer",
-            "plan_id": "plan-test-reducer",
+            "tx_id": "tx:test",
+            "plan_id": "plan:test",
             "emitted_at_ms": 1000
         }));
 
@@ -11517,45 +11497,25 @@ mod tests {
 
     #[test]
     fn validate_rejects_compensation_receipt_after_failed_commit_receipt() {
-        let mut contract = MissionTxContract::new(
-            TxIntent::new("tx-test-reducer-failed", "goal", 0),
-            TxPlan::new(
-                "plan-test-reducer-failed",
-                vec![TxStep::new(
-                    "step-0",
-                    StepAction::SendText {
-                        pane_id: 1,
-                        text: "echo ok".to_string(),
-                    },
-                )],
-            )
-            .with_compensations(vec![TxCompensation::new(
-                "step-0",
-                StepAction::SendText {
-                    pane_id: 1,
-                    text: "echo rollback".to_string(),
-                },
-            )]),
-        );
-        contract.lifecycle_state = MissionTxState::Compensating;
+        let mut contract = sample_tx_contract(MissionTxState::Compensating);
         contract.receipts.push(serde_json::json!({
             "seq": 1,
             "phase": "commit",
-            "step_id": "step-0",
+            "step_id": "tx-step:1",
             "state": "committing",
             "outcome": "failed",
-            "tx_id": "tx-test-reducer-failed",
-            "plan_id": "plan-test-reducer-failed",
+            "tx_id": "tx:test",
+            "plan_id": "plan:test",
             "emitted_at_ms": 1000
         }));
         contract.receipts.push(serde_json::json!({
             "seq": 2,
             "phase": "compensate",
-            "step_id": "step-0",
+            "step_id": "tx-step:1",
             "state": "compensating",
             "outcome": "compensated",
-            "tx_id": "tx-test-reducer-failed",
-            "plan_id": "plan-test-reducer-failed",
+            "tx_id": "tx:test",
+            "plan_id": "plan:test",
             "emitted_at_ms": 2000
         }));
 
@@ -11565,55 +11525,35 @@ mod tests {
 
     #[test]
     fn validate_rejects_recommit_after_compensation_attempt() {
-        let mut contract = MissionTxContract::new(
-            TxIntent::new("tx-test-recommit", "goal", 0),
-            TxPlan::new(
-                "plan-test-recommit",
-                vec![TxStep::new(
-                    "step-0",
-                    StepAction::SendText {
-                        pane_id: 1,
-                        text: "echo ok".to_string(),
-                    },
-                )],
-            )
-            .with_compensations(vec![TxCompensation::new(
-                "step-0",
-                StepAction::SendText {
-                    pane_id: 1,
-                    text: "echo rollback".to_string(),
-                },
-            )]),
-        );
-        contract.lifecycle_state = MissionTxState::Committing;
+        let mut contract = sample_tx_contract(MissionTxState::Committing);
         contract.receipts.push(serde_json::json!({
             "seq": 1,
             "phase": "commit",
-            "step_id": "step-0",
+            "step_id": "tx-step:1",
             "state": "committing",
             "outcome": "committed",
-            "tx_id": "tx-test-recommit",
-            "plan_id": "plan-test-recommit",
+            "tx_id": "tx:test",
+            "plan_id": "plan:test",
             "emitted_at_ms": 1000
         }));
         contract.receipts.push(serde_json::json!({
             "seq": 2,
             "phase": "compensate",
-            "step_id": "step-0",
+            "step_id": "tx-step:1",
             "state": "compensating",
             "outcome": "compensated",
-            "tx_id": "tx-test-recommit",
-            "plan_id": "plan-test-recommit",
+            "tx_id": "tx:test",
+            "plan_id": "plan:test",
             "emitted_at_ms": 2000
         }));
         contract.receipts.push(serde_json::json!({
             "seq": 3,
             "phase": "commit",
-            "step_id": "step-0",
+            "step_id": "tx-step:1",
             "state": "committing",
             "outcome": "committed",
-            "tx_id": "tx-test-recommit",
-            "plan_id": "plan-test-recommit",
+            "tx_id": "tx:test",
+            "plan_id": "plan:test",
             "emitted_at_ms": 3000
         }));
 
