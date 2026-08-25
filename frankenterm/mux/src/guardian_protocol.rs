@@ -11310,7 +11310,17 @@ mod tests {
         pane: Uuid,
         size: PtySize,
     ) -> GuardianRequestEnvelope {
-        let payload = spawn_payload_with_size("bounded-command", size);
+        spawn_request_for_command(guardian, mux, pane, "bounded-command", size)
+    }
+
+    fn spawn_request_for_command(
+        guardian: Uuid,
+        mux: Uuid,
+        pane: Uuid,
+        command: &str,
+        size: PtySize,
+    ) -> GuardianRequestEnvelope {
+        let payload = spawn_payload_with_size(command, size);
         request(
             GuardianOperation::Spawn,
             guardian,
@@ -11396,6 +11406,42 @@ mod tests {
             Some(spawn_effect_id),
             payload,
         )
+    }
+
+    fn issued_genesis_identity(
+        command: &str,
+        size: PtySize,
+        terminal: &RecoveryTerminalCheckpointV2,
+        upload_id: Uuid,
+    ) -> GuardianGenesisReservationIdentityV1 {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        let spawn = authenticate(&spawn_request_for_command(
+            guardian, mux, pane, command, size,
+        ));
+        let begin = authenticate(&genesis_begin_request(
+            guardian,
+            mux,
+            id(71),
+            id(5),
+            upload_id,
+            terminal,
+        ));
+        let mux_authority = mux_genesis_authority(&state, mux, 0x51);
+        let live_authority = live_genesis_authority(&state, 0x52);
+        state
+            .reserve_genesis_spawn(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                Some(&live_authority),
+            )
+            .unwrap()
+            .into_reservation_identity()
     }
 
     fn claim_request(

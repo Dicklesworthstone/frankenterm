@@ -100512,8 +100512,6 @@ log_level = "debug"
             202,
             &"d".repeat(64),
             303,
-            &"d".repeat(64),
-            303,
         );
         let first = RemoteGenerationManifest::from_process_family(&family).unwrap();
         let second = RemoteGenerationManifest::from_process_family(&family).unwrap();
@@ -100919,17 +100917,25 @@ log_level = "debug"
         let root_path = fixture.path().join("process-family");
         let ft = fixture.path().join("ft");
         let mux = fixture.path().join("frankenterm-mux-server");
+        let guardian = fixture.path().join("frankenterm-pty-guardian");
         let build_id = "d".repeat(64);
         let transaction_id = "abcdef0123456789abcdef0123456789";
         write_remote_generation_script_fixture(&ft, &build_id, "ft", "ft");
         write_remote_generation_script_fixture(&mux, &build_id, "frankenterm-mux-server", "mux");
-        let family =
-            validate_local_process_family(&ft, &mux).expect("validate post-rename process family");
+        write_remote_generation_script_fixture(
+            &guardian,
+            &build_id,
+            "frankenterm-pty-guardian",
+            "guardian",
+        );
+        let family = validate_local_process_family(&ft, &mux, &guardian)
+            .expect("validate post-rename process family");
         let expected = ProcessFamilyByteReceipt::from(&family);
         let pending = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
             root: &root_path,
             ft_source: &ft,
             mux_server_source: &mux,
+            guardian_source: &guardian,
             expected: expected.clone(),
             transaction_id,
             activate_current: false,
@@ -101027,6 +101033,7 @@ log_level = "debug"
             root: &root_path,
             ft_source: &ft,
             mux_server_source: &mux,
+            guardian_source: &guardian,
             expected,
             transaction_id,
             activate_current: true,
@@ -101052,6 +101059,7 @@ log_level = "debug"
 
         let ft_one = fixture.path().join("ft-one");
         let mux_one = fixture.path().join("mux-one");
+        let guardian_one = fixture.path().join("guardian-one");
         write_remote_generation_script_fixture(&ft_one, &"a".repeat(64), "ft", "first-ft");
         write_remote_generation_script_fixture(
             &mux_one,
@@ -101059,12 +101067,20 @@ log_level = "debug"
             "frankenterm-mux-server",
             "first-mux",
         );
-        let first_family = validate_local_process_family(&ft_one, &mux_one).unwrap();
+        write_remote_generation_script_fixture(
+            &guardian_one,
+            &"a".repeat(64),
+            "frankenterm-pty-guardian",
+            "first-guardian",
+        );
+        let first_family =
+            validate_local_process_family(&ft_one, &mux_one, &guardian_one).unwrap();
         let first_expected = ProcessFamilyByteReceipt::from(&first_family);
         let pending = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
             root: &root,
             ft_source: &ft_one,
             mux_server_source: &mux_one,
+            guardian_source: &guardian_one,
             expected: first_expected.clone(),
             transaction_id: "11111111111111111111111111111111",
             activate_current: false,
@@ -101082,6 +101098,7 @@ log_level = "debug"
             (REMOTE_GENERATION_LIFETIME_LEASE_FILE, 0o600),
             (REMOTE_GENERATION_FT_FILE, 0o500),
             (REMOTE_GENERATION_MUX_FILE, 0o500),
+            (REMOTE_GENERATION_GUARDIAN_FILE, 0o500),
             (REMOTE_GENERATION_MANIFEST_FILE, 0o400),
         ] {
             let metadata = std::fs::symlink_metadata(first_dir.join(filename)).unwrap();
@@ -101097,6 +101114,7 @@ log_level = "debug"
             root: &root,
             ft_source: &ft_one,
             mux_server_source: &mux_one,
+            guardian_source: &guardian_one,
             expected: first_expected.clone(),
             transaction_id: "11111111111111111111111111111111",
             activate_current: true,
@@ -101112,6 +101130,7 @@ log_level = "debug"
             root: &root,
             ft_source: &ft_one,
             mux_server_source: &mux_one,
+            guardian_source: &guardian_one,
             expected: first_expected,
             transaction_id: "33333333333333333333333333333333",
             activate_current: true,
@@ -101121,6 +101140,7 @@ log_level = "debug"
 
         let ft_two = fixture.path().join("ft-two");
         let mux_two = fixture.path().join("mux-two");
+        let guardian_two = fixture.path().join("guardian-two");
         write_remote_generation_script_fixture(&ft_two, &"e".repeat(64), "ft", "second-ft");
         write_remote_generation_script_fixture(
             &mux_two,
@@ -101128,7 +101148,14 @@ log_level = "debug"
             "frankenterm-mux-server",
             "second-mux",
         );
-        let second_family = validate_local_process_family(&ft_two, &mux_two).unwrap();
+        write_remote_generation_script_fixture(
+            &guardian_two,
+            &"e".repeat(64),
+            "frankenterm-pty-guardian",
+            "second-guardian",
+        );
+        let second_family =
+            validate_local_process_family(&ft_two, &mux_two, &guardian_two).unwrap();
         let second_expected = ProcessFamilyByteReceipt::from(&second_family);
         let colliding_transaction = "99999999999999999999999999999999";
         let colliding_selector = format!(".selector-rollback-{colliding_transaction}");
@@ -101140,6 +101167,7 @@ log_level = "debug"
                 root: &root,
                 ft_source: &ft_two,
                 mux_server_source: &mux_two,
+                guardian_source: &guardian_two,
                 expected: second_expected.clone(),
                 transaction_id: colliding_transaction,
                 activate_current: true,
@@ -101163,6 +101191,7 @@ log_level = "debug"
             root: &root,
             ft_source: &ft_two,
             mux_server_source: &mux_two,
+            guardian_source: &guardian_two,
             expected: second_expected,
             transaction_id: "44444444444444444444444444444444",
             activate_current: true,
@@ -101204,6 +101233,7 @@ log_level = "debug"
         let root = fixture.path().join("process-family");
         let ft = fixture.path().join("ft");
         let mux = fixture.path().join("mux");
+        let guardian = fixture.path().join("guardian");
         write_remote_generation_script_fixture(&ft, &"a".repeat(64), "ft", "ft");
         write_remote_generation_script_fixture(
             &mux,
@@ -101211,12 +101241,19 @@ log_level = "debug"
             "frankenterm-mux-server",
             "mux",
         );
-        let family = validate_local_process_family(&ft, &mux).unwrap();
+        write_remote_generation_script_fixture(
+            &guardian,
+            &"a".repeat(64),
+            "frankenterm-pty-guardian",
+            "guardian",
+        );
+        let family = validate_local_process_family(&ft, &mux, &guardian).unwrap();
         let expected = ProcessFamilyByteReceipt::from(&family);
         let first = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
             root: &root,
             ft_source: &ft,
             mux_server_source: &mux,
+            guardian_source: &guardian,
             expected: expected.clone(),
             transaction_id: "66666666666666666666666666666666",
             activate_current: false,
@@ -101238,6 +101275,7 @@ log_level = "debug"
             root: &root,
             ft_source: &ft,
             mux_server_source: &mux,
+            guardian_source: &guardian,
             expected,
             transaction_id: "77777777777777777777777777777777",
             activate_current: false,
@@ -101256,6 +101294,7 @@ log_level = "debug"
         let fixture = tempfile::tempdir().expect("create generation attack fixture");
         let ft = fixture.path().join("ft");
         let mux = fixture.path().join("mux");
+        let guardian = fixture.path().join("guardian");
         write_remote_generation_script_fixture(&ft, &"a".repeat(64), "ft", "ft");
         write_remote_generation_script_fixture(
             &mux,
@@ -101263,12 +101302,18 @@ log_level = "debug"
             "frankenterm-mux-server",
             "mux",
         );
+        write_remote_generation_script_fixture(
+            &guardian,
+            &"a".repeat(64),
+            "frankenterm-pty-guardian",
+            "guardian",
+        );
         let symlink = fixture.path().join("ft-symlink");
         std::os::unix::fs::symlink(&ft, &symlink).expect("plant source symlink");
         assert!(
             read_remote_generation_source_snapshot(
                 &symlink,
-                REMOTE_GENERATION_FT_FILE,
+                AtomicComponentRole::Ft,
                 remote_generation_effective_uid(),
             )
             .is_err()
@@ -101279,7 +101324,7 @@ log_level = "debug"
         assert!(
             read_remote_generation_source_snapshot(
                 &mux,
-                REMOTE_GENERATION_MUX_FILE,
+                AtomicComponentRole::FrankenTermMuxServer,
                 remote_generation_effective_uid(),
             )
             .is_err()
@@ -101291,7 +101336,7 @@ log_level = "debug"
         assert!(
             read_remote_generation_source_snapshot(
                 &wrong_mode,
-                REMOTE_GENERATION_FT_FILE,
+                AtomicComponentRole::Ft,
                 remote_generation_effective_uid(),
             )
             .is_err()
@@ -101305,6 +101350,7 @@ log_level = "debug"
         // Use fresh nlink=1 sources after the hardlink negative control.
         let ft_safe = fixture.path().join("ft-safe");
         let mux_safe = fixture.path().join("mux-safe");
+        let guardian_safe = fixture.path().join("guardian-safe");
         write_remote_generation_script_fixture(&ft_safe, &"f".repeat(64), "ft", "safe-ft");
         write_remote_generation_script_fixture(
             &mux_safe,
@@ -101312,11 +101358,19 @@ log_level = "debug"
             "frankenterm-mux-server",
             "safe-mux",
         );
-        let family = validate_local_process_family(&ft_safe, &mux_safe).unwrap();
+        write_remote_generation_script_fixture(
+            &guardian_safe,
+            &"f".repeat(64),
+            "frankenterm-pty-guardian",
+            "safe-guardian",
+        );
+        let family =
+            validate_local_process_family(&ft_safe, &mux_safe, &guardian_safe).unwrap();
         let error = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
             root: &root,
             ft_source: &ft_safe,
             mux_server_source: &mux_safe,
+            guardian_source: &guardian_safe,
             expected: ProcessFamilyByteReceipt::from(&family),
             transaction_id: "55555555555555555555555555555555",
             activate_current: true,

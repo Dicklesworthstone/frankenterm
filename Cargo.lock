@@ -7487,6 +7487,7 @@ dependencies = [
  "fancy-regex 0.18.0",
  "filedescriptor 0.8.3",
  "finl_unicode 1.3.0",
+ "frankenterm-build-identity",
  "frankenterm-dynamic",
  "frankenterm-sigpipe",
  "frankenterm-ssh",
