@@ -654,26 +654,299 @@ impl std::fmt::Debug for GuardianCheckpointArtifactDescriptorV1 {
     }
 }
 
+/// Complete fixed-width identity of one authenticated pre-Spawn reservation.
+///
+/// The reservation binds the exact authenticated protocol identities, the
+/// canonical Spawn payload without retaining its sensitive command plaintext,
+/// the process-family build, the complete PTY geometry, and the Genesis
+/// checkpoint upload that must finish before the child is admitted. Private
+/// fields prevent callers from manufacturing a partially bound identity. The
+/// sole production constructor is crate-private so only the guardian protocol
+/// can translate an already authenticated request into this value.
+#[repr(C)]
+pub struct GuardianGenesisReservationIdentityV1 {
+    mux_incarnation: Uuid,
+    spawn_effect_id: Uuid,
+    durable_pane_id: Uuid,
+    origin_request_id: Uuid,
+    spawn_payload_bytes: u64,
+    spawn_payload_digest: [u8; 32],
+    process_family_build_identity_digest: [u8; 32],
+    rows: u16,
+    cols: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+    checkpoint_identity_digest: [u8; 32],
+    boundary_identity_digest: [u8; 32],
+    upload_id: Uuid,
+}
+
+impl GuardianGenesisReservationIdentityV1 {
+    /// Validate the complete content-free identity extracted from one already
+    /// authenticated canonical Spawn request and its reserved Genesis upload.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_authenticated_spawn(
+        mux_incarnation: Uuid,
+        spawn_effect_id: Uuid,
+        durable_pane_id: Uuid,
+        origin_request_id: Uuid,
+        spawn_payload_bytes: u64,
+        spawn_payload_digest: [u8; 32],
+        process_family_build_identity_digest: [u8; 32],
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+        checkpoint_identity_digest: [u8; 32],
+        boundary_identity_digest: [u8; 32],
+        upload_id: Uuid,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        let identity = Self {
+            mux_incarnation,
+            spawn_effect_id,
+            durable_pane_id,
+            origin_request_id,
+            spawn_payload_bytes,
+            spawn_payload_digest,
+            process_family_build_identity_digest,
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+            checkpoint_identity_digest,
+            boundary_identity_digest,
+            upload_id,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<(), GuardianCheckpointBoundaryError> {
+        if self.mux_incarnation.is_nil() {
+            return Err(GuardianCheckpointBoundaryError::NilGenesisMuxIncarnation);
+        }
+        if self.spawn_effect_id.is_nil() {
+            return Err(GuardianCheckpointBoundaryError::NilGenesisEffectIdentity);
+        }
+        if self.durable_pane_id.is_nil() {
+            return Err(GuardianCheckpointBoundaryError::NilGenesisPaneIdentity);
+        }
+        if self.origin_request_id.is_nil() {
+            return Err(GuardianCheckpointBoundaryError::NilGenesisRequestIdentity);
+        }
+        if self.spawn_payload_bytes == 0 {
+            return Err(GuardianCheckpointBoundaryError::EmptyGenesisSpawnPayload);
+        }
+        if self.spawn_payload_digest == [0; 32] {
+            return Err(GuardianCheckpointBoundaryError::ZeroGenesisSpawnPayloadDigest);
+        }
+        if self.process_family_build_identity_digest == [0; 32] {
+            return Err(
+                GuardianCheckpointBoundaryError::ZeroGenesisProcessFamilyBuildIdentityDigest,
+            );
+        }
+        if self.rows == 0 || self.cols == 0 {
+            return Err(GuardianCheckpointBoundaryError::ZeroGeometry);
+        }
+        if self.checkpoint_identity_digest == [0; 32] {
+            return Err(GuardianCheckpointBoundaryError::ZeroGenesisCheckpointIdentityDigest);
+        }
+        if self.boundary_identity_digest == [0; 32] {
+            return Err(GuardianCheckpointBoundaryError::ZeroGenesisBoundaryIdentityDigest);
+        }
+        if self.upload_id.is_nil() {
+            return Err(GuardianCheckpointBoundaryError::NilGenesisUploadIdentity);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(&self) -> Uuid {
+        self.mux_incarnation
+    }
+
+    #[must_use]
+    pub const fn spawn_effect_id(&self) -> Uuid {
+        self.spawn_effect_id
+    }
+
+    #[must_use]
+    pub const fn durable_pane_id(&self) -> Uuid {
+        self.durable_pane_id
+    }
+
+    #[must_use]
+    pub const fn origin_request_id(&self) -> Uuid {
+        self.origin_request_id
+    }
+
+    #[must_use]
+    pub const fn spawn_payload_bytes(&self) -> u64 {
+        self.spawn_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn spawn_payload_digest(&self) -> [u8; 32] {
+        self.spawn_payload_digest
+    }
+
+    #[must_use]
+    pub const fn process_family_build_identity_digest(&self) -> [u8; 32] {
+        self.process_family_build_identity_digest
+    }
+
+    #[must_use]
+    pub const fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    #[must_use]
+    pub const fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    #[must_use]
+    pub const fn pixel_width(&self) -> u16 {
+        self.pixel_width
+    }
+
+    #[must_use]
+    pub const fn pixel_height(&self) -> u16 {
+        self.pixel_height
+    }
+
+    #[must_use]
+    pub const fn checkpoint_identity_digest(&self) -> [u8; 32] {
+        self.checkpoint_identity_digest
+    }
+
+    #[must_use]
+    pub const fn boundary_identity_digest(&self) -> [u8; 32] {
+        self.boundary_identity_digest
+    }
+
+    #[must_use]
+    pub const fn upload_id(&self) -> Uuid {
+        self.upload_id
+    }
+}
+
+impl PartialEq for GuardianGenesisReservationIdentityV1 {
+    fn eq(&self, other: &Self) -> bool {
+        self.mux_incarnation == other.mux_incarnation
+            && self.spawn_effect_id == other.spawn_effect_id
+            && self.durable_pane_id == other.durable_pane_id
+            && self.origin_request_id == other.origin_request_id
+            && self.spawn_payload_bytes == other.spawn_payload_bytes
+            && self.spawn_payload_digest == other.spawn_payload_digest
+            && self.process_family_build_identity_digest
+                == other.process_family_build_identity_digest
+            && self.rows == other.rows
+            && self.cols == other.cols
+            && self.pixel_width == other.pixel_width
+            && self.pixel_height == other.pixel_height
+            && self.checkpoint_identity_digest == other.checkpoint_identity_digest
+            && self.boundary_identity_digest == other.boundary_identity_digest
+            && self.upload_id == other.upload_id
+    }
+}
+
+impl Eq for GuardianGenesisReservationIdentityV1 {}
+
+impl std::fmt::Debug for GuardianGenesisReservationIdentityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianGenesisReservationIdentityV1")
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("spawn_effect_id", &self.spawn_effect_id)
+            .field("durable_pane_id", &self.durable_pane_id)
+            .field("origin_request_id", &self.origin_request_id)
+            .field("spawn_payload_bytes", &self.spawn_payload_bytes)
+            .field("spawn_payload_digest", &"[REDACTED]")
+            .field("process_family_build_identity_digest", &"[REDACTED]")
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("pixel_width", &self.pixel_width)
+            .field("pixel_height", &self.pixel_height)
+            .field("checkpoint_identity_digest", &"[REDACTED]")
+            .field("boundary_identity_digest", &"[REDACTED]")
+            .field("upload_id", &self.upload_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Nonconstructible permit retained by the guardian's Spawn transaction.
 ///
-/// This module deliberately exposes no production constructor from a raw UUID:
-/// an effect identifier is identity data, not evidence that the corresponding
-/// Spawn was authenticated, retained, and fenced against reuse. Until the
-/// guardian protocol hands this module its exact retained-effect permit,
-/// Genesis final sealing remains unavailable rather than manufacturing trust.
+/// An effect identifier is identity data, not evidence that the corresponding
+/// Spawn was authenticated, retained, and fenced against reuse. Production
+/// issuance therefore accepts only the complete validated reservation
+/// identity through a crate-private protocol boundary. The permit is neither
+/// duplicable nor serializable and retains no Spawn command plaintext.
+#[must_use = "Genesis Spawn permits must be consumed by pre-Spawn checkpoint admission"]
 pub struct GuardianCheckpointGenesisSpawnPermitV1 {
-    spawn_effect_id: Uuid,
+    identity: GuardianGenesisReservationIdentityV1,
     _private: (),
 }
 
 impl GuardianCheckpointGenesisSpawnPermitV1 {
-    #[cfg(test)]
-    fn issue_for_test(spawn_effect_id: Uuid) -> Self {
-        assert!(!spawn_effect_id.is_nil());
-        Self {
-            spawn_effect_id,
+    /// Issue exactly one permit from a complete validated reservation.
+    ///
+    /// This boundary is crate-private so `guardian_protocol` may call it only
+    /// after authentication, operation, identity, payload, and replay fences.
+    #[allow(dead_code)]
+    pub(crate) fn issue(
+        identity: GuardianGenesisReservationIdentityV1,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        identity.validate()?;
+        Ok(Self {
+            identity,
             _private: (),
-        }
+        })
+    }
+
+    #[must_use]
+    pub const fn reservation_identity(&self) -> &GuardianGenesisReservationIdentityV1 {
+        &self.identity
+    }
+
+    #[must_use]
+    pub fn into_reservation_identity(self) -> GuardianGenesisReservationIdentityV1 {
+        self.identity
+    }
+
+    #[cfg(test)]
+    fn issue_for_test(
+        spawn_effect_id: Uuid,
+        terminal_checkpoint: &RecoveryTerminalCheckpointV2,
+        upload_id: Uuid,
+    ) -> Self {
+        let descriptor = GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
+            spawn_effect_id,
+            terminal_checkpoint,
+        )
+        .expect("test Genesis checkpoint descriptor must be valid");
+        let identity = GuardianGenesisReservationIdentityV1::from_authenticated_spawn(
+            Uuid::from_u128(1),
+            spawn_effect_id,
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            1,
+            [1; 32],
+            [2; 32],
+            u16::try_from(terminal_checkpoint.rows()).expect("test Genesis rows must fit u16"),
+            u16::try_from(terminal_checkpoint.cols()).expect("test Genesis columns must fit u16"),
+            0,
+            0,
+            descriptor
+                .recompute_checkpoint_identity_digest()
+                .expect("test Genesis checkpoint identity must be valid"),
+            descriptor
+                .recompute_boundary_identity_digest()
+                .expect("test Genesis boundary identity must be valid"),
+            upload_id,
+        )
+        .expect("test Genesis reservation identity must be valid");
+        Self::issue(identity).expect("test Genesis Spawn permit must be valid")
     }
 }
 
@@ -681,7 +954,7 @@ impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GuardianCheckpointGenesisSpawnPermitV1")
-            .field("spawn_effect_id", &self.spawn_effect_id)
+            .field("identity", &self.identity)
             .finish_non_exhaustive()
     }
 }
@@ -966,6 +1239,7 @@ impl std::fmt::Debug for GuardianCheckpointValidatedStageAssemblyV1 {
 /// descriptor fields or a raw Spawn UUID as publication authority.
 pub struct GuardianCheckpointValidatedManifestAuthorityV1 {
     binding: GuardianCheckpointStageBindingV1,
+    genesis_upload_id: Option<Uuid>,
 }
 
 impl GuardianCheckpointValidatedManifestAuthorityV1 {
@@ -985,7 +1259,13 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
             return Err(GuardianCheckpointCipherError::InvalidSealRequest);
         }
         binding.validate_seal_request(&request)?;
-        Ok((Self { binding: *binding }, request))
+        Ok((
+            Self {
+                binding: *binding,
+                genesis_upload_id: None,
+            },
+            request,
+        ))
     }
 
     /// Mint publication authority only when this descriptor exactly matches
@@ -1000,7 +1280,10 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
         if binding.descriptor != captured_descriptor {
             return Err(GuardianCheckpointBoundaryError::LiveCaptureAuthorityMismatch);
         }
-        Ok(Self { binding: *binding })
+        Ok(Self {
+            binding: *binding,
+            genesis_upload_id: None,
+        })
     }
 
     /// Mint Genesis publication authority only from a canonical pre-spawn
@@ -1010,21 +1293,33 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
         permit: GuardianCheckpointGenesisSpawnPermitV1,
         terminal_checkpoint: &RecoveryTerminalCheckpointV2,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        let reservation = permit.into_reservation_identity();
+        let spawn_effect_id = reservation.spawn_effect_id();
         let authoritative_descriptor =
             GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
-                permit.spawn_effect_id,
+                spawn_effect_id,
                 terminal_checkpoint,
             )?;
         if !binding.descriptor.origin.is_genesis() {
             return Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority);
         }
-        if binding.descriptor.origin.spawn_effect_id() != Some(permit.spawn_effect_id) {
+        if binding.descriptor.origin.spawn_effect_id() != Some(spawn_effect_id) {
             return Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch);
         }
-        if binding.descriptor != authoritative_descriptor {
+        if binding.descriptor != authoritative_descriptor
+            || reservation.checkpoint_identity_digest()
+                != authoritative_descriptor.recompute_checkpoint_identity_digest()?
+            || reservation.boundary_identity_digest()
+                != authoritative_descriptor.recompute_boundary_identity_digest()?
+            || u32::from(reservation.rows()) != authoritative_descriptor.rows()
+            || u32::from(reservation.cols()) != authoritative_descriptor.cols()
+        {
             return Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch);
         }
-        Ok(Self { binding: *binding })
+        Ok(Self {
+            binding: *binding,
+            genesis_upload_id: Some(reservation.upload_id()),
+        })
     }
 
     /// Consume this one publication authority and bind it to one exact
@@ -1660,6 +1955,12 @@ impl GuardianCheckpointManifestSealCapabilitiesV1 {
             _private: (),
         } = assembly;
         authority.binding.validate_seal_request(&seal_request)?;
+        if authority
+            .genesis_upload_id
+            .is_some_and(|upload_id| upload_id != seal_request.upload_id())
+        {
+            return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+        }
         if seal_request.upload_id().is_nil() || publication_id.is_nil() {
             return Err(GuardianCheckpointCipherError::InvalidSealRequest);
         }
@@ -3806,6 +4107,24 @@ pub enum GuardianCheckpointBoundaryError {
     NilSegmentIdentity,
     #[error("guardian checkpoint has a nil Genesis Spawn effect identity")]
     NilGenesisEffectIdentity,
+    #[error("Genesis reservation has a nil mux incarnation")]
+    NilGenesisMuxIncarnation,
+    #[error("Genesis reservation has a nil durable pane identity")]
+    NilGenesisPaneIdentity,
+    #[error("Genesis reservation has a nil origin request identity")]
+    NilGenesisRequestIdentity,
+    #[error("Genesis reservation canonical Spawn payload must be nonempty")]
+    EmptyGenesisSpawnPayload,
+    #[error("Genesis reservation canonical Spawn payload digest must be nonzero")]
+    ZeroGenesisSpawnPayloadDigest,
+    #[error("Genesis reservation process-family build identity digest must be nonzero")]
+    ZeroGenesisProcessFamilyBuildIdentityDigest,
+    #[error("Genesis reservation checkpoint identity digest must be nonzero")]
+    ZeroGenesisCheckpointIdentityDigest,
+    #[error("Genesis reservation boundary identity digest must be nonzero")]
+    ZeroGenesisBoundaryIdentityDigest,
+    #[error("Genesis reservation has a nil upload identity")]
+    NilGenesisUploadIdentity,
     #[error("guardian checkpoint output sequence must be nonzero")]
     ZeroOutputSequence,
     #[error("guardian checkpoint output record digest must be nonzero")]
@@ -3860,7 +4179,9 @@ pub enum GuardianCheckpointBoundaryError {
 // them outside `cfg(test)` closes the configuration seam where a production-
 // only `Clone`/`Copy` implementation could otherwise coexist with a green
 // unit-test build.
-static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);
+static_assertions::const_assert_eq!(std::mem::size_of::<GuardianGenesisReservationIdentityV1>(), 224);
+static_assertions::assert_not_impl_any!(GuardianGenesisReservationIdentityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
+static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
 static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);
 static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);
 static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);

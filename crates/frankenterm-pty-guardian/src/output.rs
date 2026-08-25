@@ -21,7 +21,8 @@ use mux::guardian_checkpoint::{
     GuardianCheckpointStageBindingV1, GuardianCheckpointStageRecordContextV1,
     GuardianCheckpointStageRecordKindV1, GuardianCheckpointStageScopeV1,
     GuardianCheckpointStageSealIntentV1, GuardianCheckpointValidatedManifestAuthorityV1,
-    GuardianEncryptedCheckpointStageRecordV1,
+    GuardianCheckpointGenesisSpawnPermitV1, GuardianEncryptedCheckpointStageRecordV1,
+    GuardianGenesisReservationIdentityV1,
 };
 use mux::guardian_input_journal::{
     GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
@@ -100,10 +101,10 @@ const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_924_608;
 const CHECKPOINT_CATALOG_FILE_PREFIX: &str = "checkpoint-catalog-";
 const CHECKPOINT_CATALOG_CANDIDATE_SUFFIX: &str = ".ftgccandidate";
 const CHECKPOINT_CATALOG_MARKER_SUFFIX: &str = ".ftgccommit";
-const CHECKPOINT_CATALOG_CANDIDATE_MAGIC: [u8; 8] = *b"FTGCC001";
-const CHECKPOINT_CATALOG_MARKER_MAGIC: [u8; 8] = *b"FTGCM001";
-const CHECKPOINT_CATALOG_VERSION: u32 = 1;
-const CHECKPOINT_CATALOG_HEADER_BYTES: usize = 424;
+const CHECKPOINT_CATALOG_CANDIDATE_MAGIC: [u8; 8] = *b"FTGCC002";
+const CHECKPOINT_CATALOG_MARKER_MAGIC: [u8; 8] = *b"FTGCM002";
+const CHECKPOINT_CATALOG_VERSION: u32 = 2;
+const CHECKPOINT_CATALOG_HEADER_BYTES: usize = 536;
 const CHECKPOINT_CATALOG_MARKER_BODY_BYTES: usize = 312;
 const CHECKPOINT_CATALOG_MARKER_BYTES: usize =
     CHECKPOINT_CATALOG_MARKER_BODY_BYTES + OUTPUT_MANIFEST_CHECKSUM_BYTES;
@@ -111,6 +112,8 @@ const CHECKPOINT_CATALOG_CHECKSUM_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-catalog-candidate.v1\0";
 const CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-catalog-marker.v1\0";
+const CHECKPOINT_CATALOG_GENESIS_CANDIDATE_ID_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-catalog-genesis-candidate-id.v1\0";
 const CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS: usize = 8;
 // One immutable candidate and marker per retained member, plus one bounded
 // crash candidate per generation. No reclamation is performed in this phase.
@@ -536,6 +539,70 @@ struct CheckpointCatalogMetadata {
     adoption_mux_incarnation: Uuid,
     adoption_effect_id: Uuid,
     adoption_sequence: u64,
+    genesis_durable_pane_id: Uuid,
+    genesis_origin_request_id: Uuid,
+    genesis_spawn_payload_bytes: u64,
+    genesis_spawn_payload_digest: [u8; 32],
+    genesis_process_family_build_identity_digest: [u8; 32],
+    genesis_pixel_width: u16,
+    genesis_pixel_height: u16,
+}
+
+/// Guardian-private proof that one exact Genesis reservation is represented by
+/// a checksum-bound catalog candidate and its synchronously durable marker.
+///
+/// The only production constructor is the publication path below, after its
+/// post-marker directory sync and full catalog rescan. Keeping the complete
+/// mux-issued reservation identity inside this nonduplicable value lets the
+/// runtime consume the same authority when it finally opens the PTY.
+#[must_use = "Genesis admission authority must be consumed by the Spawn runtime"]
+pub(crate) struct GuardianPublishedGenesisAdmissionPermitV1 {
+    reservation_identity: GuardianGenesisReservationIdentityV1,
+    catalog_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+}
+
+impl GuardianPublishedGenesisAdmissionPermitV1 {
+    pub(crate) const fn reservation_identity(&self) -> &GuardianGenesisReservationIdentityV1 {
+        &self.reservation_identity
+    }
+
+    pub(crate) const fn catalog_candidate_checksum(
+        &self,
+    ) -> &[u8; OUTPUT_MANIFEST_CHECKSUM_BYTES] {
+        &self.catalog_candidate_checksum
+    }
+
+    pub(crate) fn into_reservation_identity(self) -> GuardianGenesisReservationIdentityV1 {
+        self.reservation_identity
+    }
+}
+
+impl std::fmt::Debug for GuardianPublishedGenesisAdmissionPermitV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianPublishedGenesisAdmissionPermitV1")
+            .field("reservation_identity", &self.reservation_identity)
+            .field("catalog_candidate_checksum", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointCatalogGenesisReservationBinding {
+    mux_incarnation: Uuid,
+    spawn_effect_id: Uuid,
+    durable_pane_id: Uuid,
+    origin_request_id: Uuid,
+    spawn_payload_bytes: u64,
+    spawn_payload_digest: [u8; 32],
+    process_family_build_identity_digest: [u8; 32],
+    rows: u16,
+    cols: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+    checkpoint_identity_digest: [u8; 32],
+    boundary_identity_digest: [u8; 32],
+    upload_id: Uuid,
 }
 
 struct CheckpointCatalogCandidate {
@@ -573,10 +640,12 @@ struct PublishedCheckpointCatalogMember {
 
 struct CheckpointCatalogScan {
     published: Vec<PublishedCheckpointCatalogMember>,
+    unpublished_candidates: Vec<DiscoveredCheckpointCatalogCandidate>,
     relevant_files: usize,
     relevant_bytes: u64,
 }
 
+#[derive(Clone)]
 struct DiscoveredCheckpointCatalogCandidate {
     identity: CheckpointCatalogIdentity,
     path: PathBuf,
