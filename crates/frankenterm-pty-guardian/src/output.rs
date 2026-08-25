@@ -5951,6 +5951,90 @@ fn checkpoint_catalog_checksum(
     hasher.finalize().into()
 }
 
+impl From<&GuardianGenesisReservationIdentityV1>
+    for CheckpointCatalogGenesisReservationBinding
+{
+    fn from(identity: &GuardianGenesisReservationIdentityV1) -> Self {
+        Self {
+            mux_incarnation: identity.mux_incarnation(),
+            spawn_effect_id: identity.spawn_effect_id(),
+            durable_pane_id: identity.durable_pane_id(),
+            origin_request_id: identity.origin_request_id(),
+            spawn_payload_bytes: identity.spawn_payload_bytes(),
+            spawn_payload_digest: identity.spawn_payload_digest(),
+            process_family_build_identity_digest: identity
+                .process_family_build_identity_digest(),
+            rows: identity.rows(),
+            cols: identity.cols(),
+            pixel_width: identity.pixel_width(),
+            pixel_height: identity.pixel_height(),
+            checkpoint_identity_digest: identity.checkpoint_identity_digest(),
+            boundary_identity_digest: identity.boundary_identity_digest(),
+            upload_id: identity.upload_id(),
+        }
+    }
+}
+
+fn checkpoint_catalog_genesis_candidate_id(
+    reservation: CheckpointCatalogGenesisReservationBinding,
+) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(CHECKPOINT_CATALOG_GENESIS_CANDIDATE_ID_DOMAIN);
+    hasher.update(reservation.mux_incarnation.as_bytes());
+    hasher.update(reservation.spawn_effect_id.as_bytes());
+    hasher.update(reservation.durable_pane_id.as_bytes());
+    hasher.update(reservation.origin_request_id.as_bytes());
+    hasher.update(reservation.spawn_payload_bytes.to_le_bytes());
+    hasher.update(reservation.spawn_payload_digest);
+    hasher.update(reservation.process_family_build_identity_digest);
+    hasher.update(reservation.rows.to_le_bytes());
+    hasher.update(reservation.cols.to_le_bytes());
+    hasher.update(reservation.pixel_width.to_le_bytes());
+    hasher.update(reservation.pixel_height.to_le_bytes());
+    hasher.update(reservation.checkpoint_identity_digest);
+    hasher.update(reservation.boundary_identity_digest);
+    hasher.update(reservation.upload_id.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut uuid_bytes = [0_u8; 16];
+    uuid_bytes.copy_from_slice(&digest[..16]);
+    // Encode a deterministic RFC-4122 variant/version so the canonical path
+    // cannot be confused with an arbitrary raw reservation field.
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x50;
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(uuid_bytes)
+}
+
+fn checkpoint_catalog_genesis_metadata_matches_reservation(
+    metadata: &CheckpointCatalogMetadata,
+    reservation: CheckpointCatalogGenesisReservationBinding,
+) -> bool {
+    metadata.identity.scope
+        == (CheckpointCatalogScope::Genesis {
+            spawn_effect_id: reservation.spawn_effect_id,
+        })
+        && metadata.identity.generation == 1
+        && metadata.identity.candidate_id
+            == checkpoint_catalog_genesis_candidate_id(reservation)
+        && metadata.predecessor.is_none()
+        && metadata.upload_id == reservation.upload_id
+        && metadata.checkpoint_id == reservation.checkpoint_identity_digest
+        && metadata.boundary_id == reservation.boundary_identity_digest
+        && metadata.capture_generation == 1
+        && metadata.rows == u32::from(reservation.rows)
+        && metadata.cols == u32::from(reservation.cols)
+        && metadata.adoption_mux_incarnation == reservation.mux_incarnation
+        && metadata.adoption_effect_id == reservation.spawn_effect_id
+        && metadata.adoption_sequence == 0
+        && metadata.genesis_durable_pane_id == reservation.durable_pane_id
+        && metadata.genesis_origin_request_id == reservation.origin_request_id
+        && metadata.genesis_spawn_payload_bytes == reservation.spawn_payload_bytes
+        && metadata.genesis_spawn_payload_digest == reservation.spawn_payload_digest
+        && metadata.genesis_process_family_build_identity_digest
+            == reservation.process_family_build_identity_digest
+        && metadata.genesis_pixel_width == reservation.pixel_width
+        && metadata.genesis_pixel_height == reservation.pixel_height
+}
+
 fn checkpoint_catalog_scope_from_wire(
     tag: u8,
     identity: Uuid,
@@ -5981,6 +6065,32 @@ fn checkpoint_catalog_validate_metadata(
                 && predecessor.boundary_id != [0; 32]
         }
     };
+    let scope_binding_valid = match metadata.identity.scope {
+        CheckpointCatalogScope::Pane { .. } => {
+            metadata.adoption_sequence > 0
+                && metadata.genesis_durable_pane_id.is_nil()
+                && metadata.genesis_origin_request_id.is_nil()
+                && metadata.genesis_spawn_payload_bytes == 0
+                && metadata.genesis_spawn_payload_digest == [0; 32]
+                && metadata.genesis_process_family_build_identity_digest == [0; 32]
+                && metadata.genesis_pixel_width == 0
+                && metadata.genesis_pixel_height == 0
+        }
+        CheckpointCatalogScope::Genesis { spawn_effect_id } => {
+            metadata.identity.generation == 1
+                && metadata.predecessor.is_none()
+                && metadata.capture_generation == 1
+                && metadata.adoption_effect_id == spawn_effect_id
+                && metadata.adoption_sequence == 0
+                && !metadata.genesis_durable_pane_id.is_nil()
+                && !metadata.genesis_origin_request_id.is_nil()
+                && metadata.genesis_spawn_payload_bytes > 0
+                && metadata.genesis_spawn_payload_digest != [0; 32]
+                && metadata.genesis_process_family_build_identity_digest != [0; 32]
+                && u16::try_from(metadata.rows).is_ok()
+                && u16::try_from(metadata.cols).is_ok()
+        }
+    };
     if metadata.identity.scope.identity().is_nil()
         || metadata.identity.generation == 0
         || metadata.identity.candidate_id.is_nil()
@@ -5999,8 +6109,8 @@ fn checkpoint_catalog_validate_metadata(
         || metadata.cols == 0
         || metadata.adoption_mux_incarnation.is_nil()
         || metadata.adoption_effect_id.is_nil()
-        || metadata.adoption_sequence == 0
         || !predecessor_valid
+        || !scope_binding_valid
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }

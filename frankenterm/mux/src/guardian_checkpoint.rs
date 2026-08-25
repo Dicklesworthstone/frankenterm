@@ -4179,7 +4179,10 @@ pub enum GuardianCheckpointBoundaryError {
 // them outside `cfg(test)` closes the configuration seam where a production-
 // only `Clone`/`Copy` implementation could otherwise coexist with a green
 // unit-test build.
-static_assertions::const_assert_eq!(std::mem::size_of::<GuardianGenesisReservationIdentityV1>(), 224);
+static_assertions::const_assert_eq!(
+    std::mem::size_of::<GuardianGenesisReservationIdentityV1>(),
+    224
+);
 static_assertions::assert_not_impl_any!(GuardianGenesisReservationIdentityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
 static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
 static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);
@@ -10299,10 +10302,15 @@ mod tests {
             GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION,
         )
         .expect("bind exact Genesis capture generation");
+        let genesis_upload_id = Uuid::new_v4();
         assert!(matches!(
             GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
                 &genesis_binding,
-                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(Uuid::new_v4()),
+                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(
+                    Uuid::new_v4(),
+                    &genesis_terminal,
+                    genesis_upload_id,
+                ),
                 &genesis_terminal,
             ),
             Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch)
@@ -10310,7 +10318,11 @@ mod tests {
         assert!(matches!(
             GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
                 &binding,
-                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
+                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(
+                    spawn_effect_id,
+                    &genesis_terminal,
+                    genesis_upload_id,
+                ),
                 &genesis_terminal,
             ),
             Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority)
@@ -10319,7 +10331,11 @@ mod tests {
         assert!(matches!(
             GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
                 &genesis_binding,
-                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
+                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(
+                    spawn_effect_id,
+                    &genesis_terminal,
+                    genesis_upload_id,
+                ),
                 &genesis_splice,
             ),
             Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
@@ -10327,11 +10343,14 @@ mod tests {
         let genesis_authority =
             GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
                 &genesis_binding,
-                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(spawn_effect_id),
+                GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(
+                    spawn_effect_id,
+                    &genesis_terminal,
+                    genesis_upload_id,
+                ),
                 &genesis_terminal,
             )
             .expect("mint exact Genesis terminal and retained Spawn authority");
-        let genesis_upload_id = Uuid::new_v4();
         let genesis_publication_id = Uuid::new_v4();
         let genesis_protocol_descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(
             spawn_effect_id,
