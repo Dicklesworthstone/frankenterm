@@ -8647,7 +8647,7 @@ mod tests {
                 "<free>",
                 "private",
                 false,
-                "fn checkpoint_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>), GuardianCheckpointCipherError>",
+                "fn checkpoint_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>,), GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
                 "<free>",
