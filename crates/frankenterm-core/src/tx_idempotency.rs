@@ -490,6 +490,39 @@ impl TxPhase {
 
 // ── Tx Execution Ledger ──────────────────────────────────────────────────────
 
+/// Kind of terminal disposition certified for a completed or aborted transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalDispositionKind {
+    /// All plan steps were successfully committed.
+    Committed,
+    /// Transaction failed or was aborted, and all committed steps were fully compensated.
+    RolledBack,
+    /// Transaction aborted or failed without full commit or rollback compensation.
+    Aborted,
+}
+
+/// Typed certificate proving terminal disposition of a transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalDispositionCertificate {
+    /// Certified disposition kind.
+    pub disposition: TerminalDispositionKind,
+    /// Unique execution instance ID.
+    pub execution_id: String,
+    /// Plan ID.
+    pub plan_id: String,
+    /// Plan hash.
+    pub plan_hash: u64,
+    /// Sorted list of step IDs that succeeded in the commit phase.
+    pub completed_step_ids: Vec<String>,
+    /// Sorted list of step IDs that failed in the commit phase.
+    pub failed_step_ids: Vec<String>,
+    /// Sorted list of step IDs that were compensated.
+    pub compensated_step_ids: Vec<String>,
+    /// Timestamp (ms) when the certificate was issued.
+    pub certified_at_ms: u64,
+}
+
 /// Ordered ledger of execution records for a single tx instance.
 ///
 /// Maintains a hash chain and provides lookup by idempotency key for dedup.
@@ -512,6 +545,9 @@ pub struct TxExecutionLedger {
     /// Index: idem_key → record ordinal for O(1) dedup lookup.
     #[serde(skip)]
     key_index: HashMap<IdempotencyKey, u64>,
+    /// Terminal disposition certificate, if in a terminal phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_certificate: Option<TerminalDispositionCertificate>,
 }
 
 #[derive(Deserialize)]
@@ -523,6 +559,8 @@ struct TxExecutionLedgerSerde {
     records: Vec<StepExecutionRecord>,
     last_hash: String,
     next_ordinal: u64,
+    #[serde(default)]
+    terminal_certificate: Option<TerminalDispositionCertificate>,
 }
 
 fn build_ledger_key_index(
@@ -605,6 +643,26 @@ impl<'de> Deserialize<'de> for TxExecutionLedger {
                     "terminal TxExecutionLedger contains ambiguous Pending/Skipped records at ordinals {ambiguous_ordinals:?}"
                 )));
             }
+            let cert = serialized.terminal_certificate.as_ref().ok_or_else(|| {
+                de::Error::custom(format!(
+                    "terminal TxExecutionLedger in phase {:?} lacks a terminal disposition certificate",
+                    serialized.phase
+                ))
+            })?;
+            let temp_ledger = Self {
+                execution_id: serialized.execution_id.clone(),
+                plan_id: serialized.plan_id.clone(),
+                plan_hash: serialized.plan_hash,
+                phase: serialized.phase,
+                records: serialized.records.clone(),
+                last_hash: serialized.last_hash.clone(),
+                next_ordinal: serialized.next_ordinal,
+                key_index: HashMap::new(),
+                terminal_certificate: None,
+            };
+            temp_ledger
+                .validate_certificate_against_ledger(cert, serialized.phase)
+                .map_err(de::Error::custom)?;
         }
         let key_index = build_ledger_key_index(&serialized.records).map_err(de::Error::custom)?;
 
@@ -679,6 +737,7 @@ impl<'de> Deserialize<'de> for TxExecutionLedger {
             last_hash: serialized.last_hash,
             next_ordinal: serialized.next_ordinal,
             key_index,
+            terminal_certificate: serialized.terminal_certificate,
         })
     }
 }
@@ -741,6 +800,226 @@ impl TxExecutionLedger {
         &self.records
     }
 
+    /// Terminal disposition certificate, if the ledger is in a terminal phase.
+    #[must_use]
+    pub fn terminal_certificate(&self) -> Option<&TerminalDispositionCertificate> {
+        self.terminal_certificate.as_ref()
+    }
+
+    /// Set an explicit terminal certificate before transitioning to a terminal phase.
+    pub fn set_terminal_certificate(
+        &mut self,
+        cert: TerminalDispositionCertificate,
+    ) -> Result<(), IdempotencyError> {
+        self.validate_certificate_against_ledger(&cert, self.phase)
+            .map_err(|reason| IdempotencyError::InvalidTerminalCertificate { reason })?;
+        self.terminal_certificate = Some(cert);
+        Ok(())
+    }
+
+    /// Validate a terminal certificate against this ledger's records.
+    pub fn validate_certificate_against_ledger(
+        &self,
+        cert: &TerminalDispositionCertificate,
+        target_phase: TxPhase,
+    ) -> Result<(), String> {
+        if cert.execution_id != self.execution_id {
+            return Err(format!(
+                "certificate execution_id {:?} does not match ledger execution_id {:?}",
+                cert.execution_id, self.execution_id
+            ));
+        }
+        if cert.plan_id != self.plan_id {
+            return Err(format!(
+                "certificate plan_id {:?} does not match ledger plan_id {:?}",
+                cert.plan_id, self.plan_id
+            ));
+        }
+        if cert.plan_hash != self.plan_hash {
+            return Err(format!(
+                "certificate plan_hash {} does not match ledger plan_hash {}",
+                cert.plan_hash, self.plan_hash
+            ));
+        }
+
+        let mut actual_completed = Vec::new();
+        let mut actual_failed = Vec::new();
+        let mut actual_compensated = Vec::new();
+
+        for record in &self.records {
+            let step_id = record.idem_key.step_id().to_string();
+            match &record.outcome {
+                StepOutcome::Success { .. } => {
+                    if !actual_completed.contains(&step_id) {
+                        actual_completed.push(step_id);
+                    }
+                }
+                StepOutcome::Failed { .. } => {
+                    if !actual_failed.contains(&step_id) {
+                        actual_failed.push(step_id);
+                    }
+                }
+                StepOutcome::Compensated { .. } => {
+                    if !actual_compensated.contains(&step_id) {
+                        actual_compensated.push(step_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        actual_completed.sort();
+        actual_failed.sort();
+        actual_compensated.sort();
+
+        if cert.completed_step_ids != actual_completed {
+            return Err(format!(
+                "certificate completed_step_ids {:?} does not match actual completed records {:?}",
+                cert.completed_step_ids, actual_completed
+            ));
+        }
+        if cert.failed_step_ids != actual_failed {
+            return Err(format!(
+                "certificate failed_step_ids {:?} does not match actual failed records {:?}",
+                cert.failed_step_ids, actual_failed
+            ));
+        }
+        if cert.compensated_step_ids != actual_compensated {
+            return Err(format!(
+                "certificate compensated_step_ids {:?} does not match actual compensated records {:?}",
+                cert.compensated_step_ids, actual_compensated
+            ));
+        }
+
+        match cert.disposition {
+            TerminalDispositionKind::Committed => {
+                if target_phase != TxPhase::Completed {
+                    return Err(format!(
+                        "Committed disposition requires Completed phase; target phase is {target_phase:?}"
+                    ));
+                }
+                if !cert.failed_step_ids.is_empty() {
+                    return Err(format!(
+                        "Committed disposition cannot have failed steps: {:?}",
+                        cert.failed_step_ids
+                    ));
+                }
+                if !cert.compensated_step_ids.is_empty() {
+                    return Err(format!(
+                        "Committed disposition cannot have compensated steps: {:?}",
+                        cert.compensated_step_ids
+                    ));
+                }
+            }
+            TerminalDispositionKind::RolledBack => {
+                if target_phase != TxPhase::Completed && target_phase != TxPhase::Aborted {
+                    return Err(format!(
+                        "RolledBack disposition requires Completed or Aborted phase; target phase is {target_phase:?}"
+                    ));
+                }
+                if cert.compensated_step_ids.is_empty() {
+                    return Err(
+                        "RolledBack disposition requires non-empty compensated steps"
+                            .to_string(),
+                    );
+                }
+                if cert.completed_step_ids != cert.compensated_step_ids {
+                    return Err(format!(
+                        "RolledBack disposition requires every completed step to be compensated; completed={:?}, compensated={:?}",
+                        cert.completed_step_ids, cert.compensated_step_ids
+                    ));
+                }
+            }
+            TerminalDispositionKind::Aborted => {
+                if target_phase != TxPhase::Aborted {
+                    return Err(format!(
+                        "Aborted disposition requires Aborted phase; target phase is {target_phase:?}"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Synthesize the canonical terminal certificate for this ledger in `target_phase`.
+    pub fn synthesize_terminal_certificate(
+        &self,
+        target_phase: TxPhase,
+    ) -> Result<TerminalDispositionCertificate, IdempotencyError> {
+        let mut actual_completed = Vec::new();
+        let mut actual_failed = Vec::new();
+        let mut actual_compensated = Vec::new();
+
+        for record in &self.records {
+            let step_id = record.idem_key.step_id().to_string();
+            match &record.outcome {
+                StepOutcome::Success { .. } => {
+                    if !actual_completed.contains(&step_id) {
+                        actual_completed.push(step_id);
+                    }
+                }
+                StepOutcome::Failed { .. } => {
+                    if !actual_failed.contains(&step_id) {
+                        actual_failed.push(step_id);
+                    }
+                }
+                StepOutcome::Compensated { .. } => {
+                    if !actual_compensated.contains(&step_id) {
+                        actual_compensated.push(step_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        actual_completed.sort();
+        actual_failed.sort();
+        actual_compensated.sort();
+
+        let disposition = match target_phase {
+            TxPhase::Completed => {
+                if actual_failed.is_empty() && actual_compensated.is_empty() {
+                    TerminalDispositionKind::Committed
+                } else if !actual_compensated.is_empty() && actual_compensated == actual_completed {
+                    TerminalDispositionKind::RolledBack
+                } else {
+                    return Err(IdempotencyError::InvalidTerminalCertificate {
+                        reason: format!(
+                            "cannot transition to Completed without proving all steps committed or all completed steps compensated on execution {}; completed={:?}, failed={:?}, compensated={:?}",
+                            self.execution_id, actual_completed, actual_failed, actual_compensated
+                        ),
+                    });
+                }
+            }
+            TxPhase::Aborted => {
+                if !actual_compensated.is_empty() && actual_compensated == actual_completed {
+                    TerminalDispositionKind::RolledBack
+                } else {
+                    TerminalDispositionKind::Aborted
+                }
+            }
+            _ => {
+                return Err(IdempotencyError::InvalidTerminalCertificate {
+                    reason: format!(
+                        "cannot synthesize terminal certificate for non-terminal phase {target_phase:?}"
+                    ),
+                });
+            }
+        };
+
+        let certified_at_ms = self.records.last().map(|r| r.timestamp_ms).unwrap_or(0);
+        let cert = TerminalDispositionCertificate {
+            disposition,
+            execution_id: self.execution_id.clone(),
+            plan_id: self.plan_id.clone(),
+            plan_hash: self.plan_hash,
+            completed_step_ids: actual_completed,
+            failed_step_ids: actual_failed,
+            compensated_step_ids: actual_compensated,
+            certified_at_ms,
+        };
+        Ok(cert)
+    }
+
     /// Transition to a new phase. Returns `Err` if the transition is invalid.
     pub fn transition_phase(&mut self, next: TxPhase) -> Result<TxPhase, IdempotencyError> {
         if !self.phase.can_transition_to(next) {
@@ -761,6 +1040,13 @@ impl TxExecutionLedger {
                     execution_id: self.execution_id.clone(),
                     ambiguous_ordinals,
                 });
+            }
+            if self.terminal_certificate.is_none() {
+                let cert = self.synthesize_terminal_certificate(next)?;
+                self.terminal_certificate = Some(cert);
+            } else if let Some(ref cert) = self.terminal_certificate {
+                self.validate_certificate_against_ledger(cert, next)
+                    .map_err(|reason| IdempotencyError::InvalidTerminalCertificate { reason })?;
             }
         }
         let prev = self.phase;
@@ -1282,10 +1568,32 @@ impl ResumeContext {
         } else if has_ambiguous_outcome {
             ResumeRecommendation::CompensateAndAbort
         } else if ledger.phase().is_terminal() {
-            ResumeRecommendation::AlreadyComplete
+            if let Some(cert) = ledger.terminal_certificate() {
+                match cert.disposition {
+                    TerminalDispositionKind::Committed => {
+                        let missing_plan_coverage =
+                            plan.steps.iter().any(|s| !completed.contains(&s.id));
+                        if missing_plan_coverage {
+                            ResumeRecommendation::RestartFresh
+                        } else {
+                            ResumeRecommendation::AlreadyComplete
+                        }
+                    }
+                    TerminalDispositionKind::RolledBack => ResumeRecommendation::AlreadyComplete,
+                    TerminalDispositionKind::Aborted => {
+                        if !completed.is_empty() && compensated != completed {
+                            ResumeRecommendation::CompensateAndAbort
+                        } else {
+                            ResumeRecommendation::AlreadyComplete
+                        }
+                    }
+                }
+            } else {
+                ResumeRecommendation::RestartFresh
+            }
         } else if !failed.is_empty() {
             ResumeRecommendation::CompensateAndAbort
-        } else if remaining.is_empty() && failed.is_empty() {
+        } else if remaining.is_empty() && failed.is_empty() && !completed.is_empty() {
             ResumeRecommendation::AlreadyComplete
         } else {
             ResumeRecommendation::ContinueFromCheckpoint
@@ -4278,6 +4586,9 @@ pub enum IdempotencyError {
         execution_id: String,
         ambiguous_ordinals: Vec<u64>,
     },
+
+    #[error("terminal disposition certificate invalid: {reason}")]
+    InvalidTerminalCertificate { reason: String },
 
     #[error("ledger index corrupt: {reason}")]
     LedgerIndexCorrupt { reason: String },

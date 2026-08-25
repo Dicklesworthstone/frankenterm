@@ -4509,6 +4509,8 @@ fn validate_persisted_tx_receipts(
         .collect::<HashSet<_>>();
     let mut validated = Vec::new();
     let mut previous_seq = 0u64;
+    let mut latest_successful_commit_receipts = HashMap::<String, TxReceipt>::new();
+    let mut steps_with_compensation_attempts = HashSet::<String>::new();
 
     for (persisted_index, receipt_value) in contract.receipts.iter().enumerate() {
         if !looks_like_persisted_tx_receipt(receipt_value) {
@@ -4561,6 +4563,14 @@ fn validate_persisted_tx_receipts(
                         receipt.outcome
                     ));
                 }
+                if receipt.outcome == "committed" {
+                    if steps_with_compensation_attempts.contains(step_id) {
+                        return Err(format!(
+                            "committed receipt for step {step_id} follows a compensation attempt; a new effect generation is required before recommit"
+                        ));
+                    }
+                    latest_successful_commit_receipts.insert(step_id.to_string(), receipt.clone());
+                }
             }
             "compensate" => {
                 if receipt.state != MissionTxState::Compensating {
@@ -4592,6 +4602,17 @@ fn validate_persisted_tx_receipts(
                         receipt.outcome
                     ));
                 }
+                let commit_receipt = latest_successful_commit_receipts.get(step_id).ok_or_else(|| {
+                    format!(
+                        "compensation receipt for step {step_id} has no preceding committed receipt"
+                    )
+                })?;
+                if receipt.seq <= commit_receipt.seq {
+                    return Err(format!(
+                        "compensation receipt for step {step_id} does not follow its committed receipt"
+                    ));
+                }
+                steps_with_compensation_attempts.insert(step_id.to_string());
             }
             "lifecycle" => {
                 if receipt.step_id.is_some() || receipt.outcome != "state_checkpoint" {
@@ -11454,5 +11475,146 @@ mod tests {
                 "Duplicate transition at index {i}: {key}",
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_compensation_receipt_before_any_commit_receipt() {
+        let mut contract = MissionTxContract::new(
+            TxIntent::new("tx-test-reducer", "goal", 0),
+            TxPlan::new(
+                "plan-test-reducer",
+                vec![TxStep::new(
+                    "step-0",
+                    StepAction::SendText {
+                        pane_id: 1,
+                        text: "echo ok".to_string(),
+                    },
+                )],
+            ).with_compensations(vec![TxCompensation::new(
+                "step-0",
+                StepAction::SendText {
+                    pane_id: 1,
+                    text: "echo rollback".to_string(),
+                },
+            )]),
+        );
+        contract.lifecycle_state = MissionTxState::Compensating;
+        contract.receipts.push(serde_json::json!({
+            "seq": 1,
+            "phase": "compensate",
+            "step_id": "step-0",
+            "state": "compensating",
+            "outcome": "compensated",
+            "tx_id": "tx-test-reducer",
+            "plan_id": "plan-test-reducer",
+            "emitted_at_ms": 1000
+        }));
+
+        let err = contract.validate().unwrap_err();
+        assert!(err.contains("has no preceding committed receipt"));
+    }
+
+    #[test]
+    fn validate_rejects_compensation_receipt_after_failed_commit_receipt() {
+        let mut contract = MissionTxContract::new(
+            TxIntent::new("tx-test-reducer-failed", "goal", 0),
+            TxPlan::new(
+                "plan-test-reducer-failed",
+                vec![TxStep::new(
+                    "step-0",
+                    StepAction::SendText {
+                        pane_id: 1,
+                        text: "echo ok".to_string(),
+                    },
+                )],
+            ).with_compensations(vec![TxCompensation::new(
+                "step-0",
+                StepAction::SendText {
+                    pane_id: 1,
+                    text: "echo rollback".to_string(),
+                },
+            )]),
+        );
+        contract.lifecycle_state = MissionTxState::Compensating;
+        contract.receipts.push(serde_json::json!({
+            "seq": 1,
+            "phase": "commit",
+            "step_id": "step-0",
+            "state": "committing",
+            "outcome": "failed",
+            "tx_id": "tx-test-reducer-failed",
+            "plan_id": "plan-test-reducer-failed",
+            "emitted_at_ms": 1000
+        }));
+        contract.receipts.push(serde_json::json!({
+            "seq": 2,
+            "phase": "compensate",
+            "step_id": "step-0",
+            "state": "compensating",
+            "outcome": "compensated",
+            "tx_id": "tx-test-reducer-failed",
+            "plan_id": "plan-test-reducer-failed",
+            "emitted_at_ms": 2000
+        }));
+
+        let err = contract.validate().unwrap_err();
+        assert!(err.contains("has no preceding committed receipt"));
+    }
+
+    #[test]
+    fn validate_rejects_recommit_after_compensation_attempt() {
+        let mut contract = MissionTxContract::new(
+            TxIntent::new("tx-test-recommit", "goal", 0),
+            TxPlan::new(
+                "plan-test-recommit",
+                vec![TxStep::new(
+                    "step-0",
+                    StepAction::SendText {
+                        pane_id: 1,
+                        text: "echo ok".to_string(),
+                    },
+                )],
+            ).with_compensations(vec![TxCompensation::new(
+                "step-0",
+                StepAction::SendText {
+                    pane_id: 1,
+                    text: "echo rollback".to_string(),
+                },
+            )]),
+        );
+        contract.lifecycle_state = MissionTxState::Committing;
+        contract.receipts.push(serde_json::json!({
+            "seq": 1,
+            "phase": "commit",
+            "step_id": "step-0",
+            "state": "committing",
+            "outcome": "committed",
+            "tx_id": "tx-test-recommit",
+            "plan_id": "plan-test-recommit",
+            "emitted_at_ms": 1000
+        }));
+        contract.receipts.push(serde_json::json!({
+            "seq": 2,
+            "phase": "compensate",
+            "step_id": "step-0",
+            "state": "compensating",
+            "outcome": "compensated",
+            "tx_id": "tx-test-recommit",
+            "plan_id": "plan-test-recommit",
+            "emitted_at_ms": 2000
+        }));
+        contract.receipts.push(serde_json::json!({
+            "seq": 3,
+            "phase": "commit",
+            "step_id": "step-0",
+            "state": "committing",
+            "outcome": "committed",
+            "tx_id": "tx-test-recommit",
+            "plan_id": "plan-test-recommit",
+            "emitted_at_ms": 3000
+        }));
+
+        let err = contract.validate().unwrap_err();
+        assert!(err.contains("follows a compensation attempt; a new effect generation is required before recommit"));
     }
 }
