@@ -8828,7 +8828,13 @@ mod tests {
         assert_eq!(inventory.traits, Vec::<String>::new());
         assert_eq!(inventory.associated_items, Vec::<String>::new());
         assert_eq!(inventory.external_storage_sites, Vec::<String>::new());
-        assert_eq!(inventory.projection_sites, Vec::<String>::new());
+        assert_eq!(
+            inventory.projection_sites,
+            vec![
+                "<free>::checkpoint_stage_plaintext_identity",
+                "<free>::checkpoint_candidate_identity",
+            ]
+        );
         assert_eq!(inventory.unexpected_attributes, Vec::<String>::new());
         assert_eq!(inventory.unexpected_derives, Vec::<String>::new());
 
