@@ -140,13 +140,13 @@ jobs:
           fi
           case "${{ matrix.target }}" in
             aarch64-apple-darwin)
-              FEATURE_CONTRACT="application-family-gui-ft-mux-server-default-features-v1"
+              FEATURE_CONTRACT="application-family-gui-ft-mux-server-pty-guardian-default-features-v1"
               ;;
             *windows*)
               FEATURE_CONTRACT="cli-ft-windows-curated-features-v1"
               ;;
             *)
-              FEATURE_CONTRACT="process-family-ft-mux-server-default-features-v1"
+              FEATURE_CONTRACT="process-family-ft-mux-server-pty-guardian-default-features-v1"
               ;;
           esac
           BUILD_ID="$(bash scripts/atomic-component-manifest.sh derive-build-id \
@@ -188,15 +188,17 @@ jobs:
             # family.  In particular, a breaking codec-floor bump cannot be
             # deployed safely if the Linux archive contains only the client:
             # long-lived remote mux servers would be stranded on the old
-            # dialect.  Build both artifacts from the frozen source identity.
+            # dialect. Build the CLI, mux server, and PTY guardian from the
+            # frozen source identity.
             cargo build --locked --profile release-interactive --target ${{ matrix.target }} \
               -p frankenterm --bin ft \
-              -p frankenterm-mux-server --bin frankenterm-mux-server
+              -p frankenterm-mux-server --bin frankenterm-mux-server \
+              -p frankenterm-pty-guardian --bin frankenterm-pty-guardian
           fi
 
           if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
             # The app bundle is a separate interactive process family. Build
-            # all three components together under the already-frozen shipped
+            # all four components together under the already-frozen shipped
             # identity. The standalone archive and bundled copy of `ft` are the
             # same profile/identity, so a second build cannot silently mint
             # incompatible CLI bytes.
@@ -204,6 +206,7 @@ jobs:
               --target ${{ matrix.target }} \
               --bin frankenterm-gui \
               --bin frankenterm-mux-server \
+              --bin frankenterm-pty-guardian \
               --bin ft
           fi
         shell: bash
@@ -235,6 +238,7 @@ jobs:
         run: |
           BINARY="target/${{ matrix.target }}/release-interactive/${{ matrix.artifact }}"
           MUX_SERVER_BINARY="target/${{ matrix.target }}/release-interactive/frankenterm-mux-server"
+          GUARDIAN_BINARY="target/${{ matrix.target }}/release-interactive/frankenterm-pty-guardian"
           echo "=== ft --version ==="
           "$BINARY" --version
           echo "=== ft version --full ==="
@@ -263,6 +267,8 @@ jobs:
           echo "$DOCTOR_OUTPUT" | python3 -c "import json,sys; json.loads(sys.stdin.read())"
           echo "=== frankenterm-mux-server --version ==="
           "$MUX_SERVER_BINARY" --version
+          echo "=== frankenterm-pty-guardian --version ==="
+          "$GUARDIAN_BINARY" --version
           echo "=== All smoke tests passed ==="
 
       - name: Smoke test binary (Windows)
@@ -306,10 +312,13 @@ jobs:
           cp "target/${{ matrix.target }}/release-interactive/${{ matrix.artifact }}" "$STAGING/ft"
           cp "target/${{ matrix.target }}/release-interactive/frankenterm-mux-server" \
             "$STAGING/frankenterm-mux-server"
+          cp "target/${{ matrix.target }}/release-interactive/frankenterm-pty-guardian" \
+            "$STAGING/frankenterm-pty-guardian"
           cp scripts/atomic-component-manifest.sh "$STAGING/verify-components.sh"
           chmod 0755 \
             "$STAGING/ft" \
             "$STAGING/frankenterm-mux-server" \
+            "$STAGING/frankenterm-pty-guardian" \
             "$STAGING/verify-components.sh"
 
           extract_numeric_rust_const() {
@@ -339,6 +348,7 @@ jobs:
             --feature-contract "$FT_ATOMIC_FEATURE_CONTRACT" \
             --entry executable:cli:ft:ft \
             --entry executable:mux-server:frankenterm-mux-server:frankenterm-mux-server \
+            --entry executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian \
             --entry verifier:offline-verifier:verify-components.sh \
             --source-match verify-components.sh=scripts/atomic-component-manifest.sh \
             --input workspace.manifest=Cargo.toml \
@@ -357,17 +367,19 @@ jobs:
             --contract core-wire.version="$CORE_WIRE_PROTOCOL_VERSION" \
             --contract storage.schema="$STORAGE_SCHEMA_VERSION" \
             --contract panic.cli=unwind \
-            --contract panic.mux-server=unwind
+            --contract panic.mux-server=unwind \
+            --contract panic.pty-guardian=unwind
           bash "$STAGING/verify-components.sh" verify \
             --root "$STAGING" \
             --manifest "$MANIFEST"
 
           tar -C "$STAGING" -cJf "dist/${{ matrix.asset }}.tar.xz" \
-            ft frankenterm-mux-server verify-components.sh \
+            ft frankenterm-mux-server frankenterm-pty-guardian verify-components.sh \
             "${{ matrix.asset }}.component-manifest.json"
           archive_entries="$(tar -tJf "dist/${{ matrix.asset }}.tar.xz")"
           grep -Fxq ft <<<"$archive_entries"
           grep -Fxq frankenterm-mux-server <<<"$archive_entries"
+          grep -Fxq frankenterm-pty-guardian <<<"$archive_entries"
           grep -Fxq verify-components.sh <<<"$archive_entries"
           grep -Fxq "${{ matrix.asset }}.component-manifest.json" <<<"$archive_entries"
           archive_checksum="$(shasum -a 256 "dist/${{ matrix.asset }}.tar.xz" | awk '{print $1}')"
@@ -383,8 +395,11 @@ jobs:
           cmp "$STAGING/ft" "$install_probe/ft"
           cmp "$STAGING/frankenterm-mux-server" \
             "$install_probe/frankenterm-mux-server"
+          cmp "$STAGING/frankenterm-pty-guardian" \
+            "$install_probe/frankenterm-pty-guardian"
           "$install_probe/ft" --version
           "$install_probe/frankenterm-mux-server" --version
+          "$install_probe/frankenterm-pty-guardian" --version
           cd dist
           shasum -a 256 "${{ matrix.asset }}.tar.xz" > "${{ matrix.asset }}.tar.xz.sha256"
 
@@ -392,7 +407,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           # The darwin build above produced the complete app process family
-          # (frankenterm-gui + frankenterm-mux-server + bundled ft) under
+          # (frankenterm-gui + frankenterm-mux-server + PTY guardian + bundled ft) under
           # target/<triple>/release-interactive with panic=unwind. Package it
           # into FrankenTerm.app (icon,
           # Info.plist, bundled Pragmasevka font, ad-hoc signature) and publish

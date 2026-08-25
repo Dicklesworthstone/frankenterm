@@ -344,33 +344,45 @@ restore_preserved_component() {
 install_process_family() {
   local ft_source="$1"
   local mux_source="$2"
+  local guardian_source="$3"
   local ft_target="$DEST/ft"
   local mux_target="$DEST/frankenterm-mux-server"
+  local guardian_target="$DEST/frankenterm-pty-guardian"
   local ft_stage="${ft_target}.installing-$$"
   local mux_stage="${mux_target}.installing-$$"
+  local guardian_stage="${guardian_target}.installing-$$"
   local ft_failed=""
+  local mux_failed=""
   local stamp
   local ft_backup=""
   local mux_backup=""
+  local guardian_backup=""
   local ft_backup_candidate=""
   local mux_backup_candidate=""
+  local guardian_backup_candidate=""
   local recovery_failed=0
   stamp=$(date +%Y%m%d%H%M%S)
   ft_failed="${ft_target}.failed-publish-${stamp}-$$"
+  mux_failed="${mux_target}.failed-publish-${stamp}-$$"
   ft_backup_candidate="${ft_target}.previous-${stamp}-$$"
   mux_backup_candidate="${mux_target}.previous-${stamp}-$$"
+  guardian_backup_candidate="${guardian_target}.previous-${stamp}-$$"
 
   if [ ! -f "$ft_source" ] || [ -L "$ft_source" ] || \
-     [ ! -f "$mux_source" ] || [ -L "$mux_source" ]; then
+     [ ! -f "$mux_source" ] || [ -L "$mux_source" ] || \
+     [ ! -f "$guardian_source" ] || [ -L "$guardian_source" ]; then
     err "Refusing process-family source paths that are symlinks or non-regular files"
     return 1
   fi
 
   if [ -e "$ft_stage" ] || [ -L "$ft_stage" ] || \
      [ -e "$mux_stage" ] || [ -L "$mux_stage" ] || \
+     [ -e "$guardian_stage" ] || [ -L "$guardian_stage" ] || \
      [ -e "$ft_failed" ] || [ -L "$ft_failed" ] || \
+     [ -e "$mux_failed" ] || [ -L "$mux_failed" ] || \
      [ -e "$ft_backup_candidate" ] || [ -L "$ft_backup_candidate" ] || \
-     [ -e "$mux_backup_candidate" ] || [ -L "$mux_backup_candidate" ]; then
+     [ -e "$mux_backup_candidate" ] || [ -L "$mux_backup_candidate" ] || \
+     [ -e "$guardian_backup_candidate" ] || [ -L "$guardian_backup_candidate" ]; then
     err "Refusing to reuse an existing process-family transaction path"
     return 1
   fi
@@ -384,11 +396,16 @@ install_process_family() {
     err "Refusing to replace non-regular or symlink frankenterm-mux-server target at $mux_target"
     return 1
   fi
+  if { [ -e "$guardian_target" ] || [ -L "$guardian_target" ]; } && \
+     { [ ! -f "$guardian_target" ] || [ -L "$guardian_target" ]; }; then
+    err "Refusing to replace non-regular or symlink frankenterm-pty-guardian target at $guardian_target"
+    return 1
+  fi
 
-  # Stage both binaries before changing either live name. A running mux keeps
+  # Stage all three binaries before changing any live name. A running mux keeps
   # its old executable inode; the new server bytes are picked up only after an
-  # explicit, operator-controlled restart. Preserve previous bytes so a failed
-  # publish or a breaking-codec rollback remains recoverable.
+  # explicit, operator-controlled handoff. Preserve previous bytes so a failed
+  # publish or a breaking-codec rollback remains recoverable as one triplet.
   if ! install -m 0755 "$ft_source" "$ft_stage"; then
     err "Failed to stage ft at $ft_stage"
     return 1
@@ -397,12 +414,20 @@ install_process_family() {
     err "Failed to stage frankenterm-mux-server at $mux_stage"
     return 1
   fi
+  if ! install -m 0755 "$guardian_source" "$guardian_stage"; then
+    err "Failed to stage frankenterm-pty-guardian at $guardian_stage"
+    return 1
+  fi
   if ! "$ft_stage" --version >/dev/null 2>&1; then
     err "Staged ft failed its launch/version probe; installed bytes are unchanged"
     return 1
   fi
   if ! "$mux_stage" --version >/dev/null 2>&1; then
     err "Staged frankenterm-mux-server failed its launch/version probe; installed bytes are unchanged"
+    return 1
+  fi
+  if ! "$guardian_stage" --version >/dev/null 2>&1; then
+    err "Staged frankenterm-pty-guardian failed its launch/version probe; installed bytes are unchanged"
     return 1
   fi
 
@@ -448,6 +473,42 @@ install_process_family() {
       return 1
     fi
   fi
+  if [ -e "$guardian_target" ] || [ -L "$guardian_target" ]; then
+    if [ ! -f "$guardian_target" ] || [ -L "$guardian_target" ]; then
+      err "Refusing to replace non-regular or symlink frankenterm-pty-guardian target at $guardian_target"
+      if ! restore_preserved_component "$mux_backup" "$mux_target" "frankenterm-mux-server"; then
+        recovery_failed=1
+      fi
+      if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+        recovery_failed=1
+      fi
+      [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
+      return 1
+    fi
+    guardian_backup="$guardian_backup_candidate"
+    if [ -e "$guardian_backup" ] || [ -L "$guardian_backup" ]; then
+      err "Refusing to overwrite existing frankenterm-pty-guardian backup at $guardian_backup"
+      if ! restore_preserved_component "$mux_backup" "$mux_target" "frankenterm-mux-server"; then
+        recovery_failed=1
+      fi
+      if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+        recovery_failed=1
+      fi
+      [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
+      return 1
+    fi
+    if ! move_no_clobber "$guardian_target" "$guardian_backup"; then
+      err "Failed to preserve existing frankenterm-pty-guardian at $guardian_backup"
+      if ! restore_preserved_component "$mux_backup" "$mux_target" "frankenterm-mux-server"; then
+        recovery_failed=1
+      fi
+      if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+        recovery_failed=1
+      fi
+      [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
+      return 1
+    fi
+  fi
 
   if ! move_no_clobber "$ft_stage" "$ft_target"; then
     err "Failed to publish staged ft at $ft_target"
@@ -455,6 +516,9 @@ install_process_family() {
       recovery_failed=1
     fi
     if ! restore_preserved_component "$mux_backup" "$mux_target" "frankenterm-mux-server"; then
+      recovery_failed=1
+    fi
+    if ! restore_preserved_component "$guardian_backup" "$guardian_target" "frankenterm-pty-guardian"; then
       recovery_failed=1
     fi
     [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
@@ -472,15 +536,44 @@ install_process_family() {
     if ! restore_preserved_component "$mux_backup" "$mux_target" "frankenterm-mux-server"; then
       recovery_failed=1
     fi
+    if ! restore_preserved_component "$guardian_backup" "$guardian_target" "frankenterm-pty-guardian"; then
+      recovery_failed=1
+    fi
+    [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
+    return 1
+  fi
+  if ! move_no_clobber "$guardian_stage" "$guardian_target"; then
+    err "Failed to publish staged frankenterm-pty-guardian at $guardian_target"
+    if ! move_no_clobber "$mux_target" "$mux_failed"; then
+      err "Failed to quarantine newly published frankenterm-mux-server at $mux_failed"
+      recovery_failed=1
+    fi
+    if ! move_no_clobber "$ft_target" "$ft_failed"; then
+      err "Failed to quarantine newly published ft at $ft_failed"
+      recovery_failed=1
+    fi
+    if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+      recovery_failed=1
+    fi
+    if ! restore_preserved_component "$mux_backup" "$mux_target" "frankenterm-mux-server"; then
+      recovery_failed=1
+    fi
+    if ! restore_preserved_component "$guardian_backup" "$guardian_target" "frankenterm-pty-guardian"; then
+      recovery_failed=1
+    fi
     [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
     return 1
   fi
 
   ok "Installed ft → $ft_target"
   ok "Installed frankenterm-mux-server → $mux_target"
+  ok "Installed frankenterm-pty-guardian → $guardian_target"
   if [ -n "$ft_backup" ]; then info "Previous ft preserved at $ft_backup"; fi
   if [ -n "$mux_backup" ]; then
     info "Previous frankenterm-mux-server preserved at $mux_backup"
+  fi
+  if [ -n "$guardian_backup" ]; then
+    info "Previous frankenterm-pty-guardian preserved at $guardian_backup"
   fi
 }
 
@@ -531,7 +624,7 @@ preflight_checks() {
 
 check_installed_version() {
   local target_ver="$1"
-  # Fail closed before invoking either installed component or entering a
+  # Fail closed before invoking any installed component or entering a
   # pipeline.  A missing pipeline utility must not be discovered only after one
   # side of the process family has already been executed.
   command -v head >/dev/null 2>&1 || return 1
@@ -543,15 +636,22 @@ check_installed_version() {
   [ -f "$DEST/frankenterm-mux-server" ] && \
     [ ! -L "$DEST/frankenterm-mux-server" ] && \
     [ -x "$DEST/frankenterm-mux-server" ] || return 1
-  local ft_cur mux_cur ft_identity mux_identity identity_profile_version
+  [ -f "$DEST/frankenterm-pty-guardian" ] && \
+    [ ! -L "$DEST/frankenterm-pty-guardian" ] && \
+    [ -x "$DEST/frankenterm-pty-guardian" ] || return 1
+  local ft_cur mux_cur guardian_cur ft_identity mux_identity guardian_identity
+  local identity_profile_version
   ft_cur=$("$DEST/ft" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
   mux_cur=$("$DEST/frankenterm-mux-server" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
+  guardian_cur=$("$DEST/frankenterm-pty-guardian" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
   [ -z "$ft_cur" ] && return 1
   [ -z "$mux_cur" ] && return 1
+  [ -z "$guardian_cur" ] && return 1
   # Strip leading 'v' from target_ver for comparison ("v0.2.0" vs "0.2.0")
   local stripped="${target_ver#v}"
   { [ "$ft_cur" = "$stripped" ] || [ "$ft_cur" = "$target_ver" ]; } || return 1
   { [ "$mux_cur" = "$stripped" ] || [ "$mux_cur" = "$target_ver" ]; } || return 1
+  { [ "$guardian_cur" = "$stripped" ] || [ "$guardian_cur" = "$target_ver" ]; } || return 1
 
   # Semver is not a process-family identity: two rebuilds of the same tag can
   # carry different codec or source bytes. Admit the fast path only when each
@@ -563,11 +663,18 @@ check_installed_version() {
     'FT_ATOMIC_COMPONENT_IDENTITY_V1:[0-9a-f]{64}:frankenterm-mux-server:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*;' \
     "$DEST/frankenterm-mux-server" 2>/dev/null | \
     sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u || true)
+  guardian_identity=$(LC_ALL=C grep -aoE \
+    'FT_ATOMIC_COMPONENT_IDENTITY_V1:[0-9a-f]{64}:frankenterm-pty-guardian:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*;' \
+    "$DEST/frankenterm-pty-guardian" 2>/dev/null | \
+    sed 's/:frankenterm-pty-guardian:/:ROLE:/' | sort -u || true)
   [ -n "$ft_identity" ] || return 1
   [ -n "$mux_identity" ] || return 1
+  [ -n "$guardian_identity" ] || return 1
   [ "$(printf '%s\n' "$ft_identity" | awk 'END { print NR }')" -eq 1 ] || return 1
   [ "$(printf '%s\n' "$mux_identity" | awk 'END { print NR }')" -eq 1 ] || return 1
+  [ "$(printf '%s\n' "$guardian_identity" | awk 'END { print NR }')" -eq 1 ] || return 1
   [ "$ft_identity" = "$mux_identity" ] || return 1
+  [ "$ft_identity" = "$guardian_identity" ] || return 1
   # Matching stale or non-shipping markers are still not the requested release.
   # The successful launch probes above are the native-executability authority;
   # do not compare against the prebuilt-asset target inferred by
@@ -938,9 +1045,10 @@ build_from_source() {
     err "Check network connectivity and confirm that the release tag exists."
     exit 1
   fi
-  # Build the CLI and mux server from the same source identity. Remote-domain
-  # releases are an atomic process family; a client-only fallback would recreate
-  # the exact codec-stranding failure that the prebuilt archives prevent.
+  # Build the CLI, mux server, and PTY guardian from the same source identity.
+  # Remote-domain releases are an atomic process family; omitting either
+  # long-lived service would recreate the stranding failure that the prebuilt
+  # archives prevent.
   local panic_contract_tool="$TMP/src/scripts/check-release-panic-contract.sh"
   if [ ! -f "$panic_contract_tool" ] || \
      ! bash "$panic_contract_tool" --profiles-only; then
@@ -950,7 +1058,7 @@ build_from_source() {
   local atomic_tool="$TMP/src/scripts/atomic-component-manifest.sh"
   if [ ! -f "$atomic_tool" ] || [ -L "$atomic_tool" ]; then
     err "Atomic component manifest tool is missing or unsafe: $atomic_tool"
-    err "Refusing to build an unverifiable CLI/mux-server process family."
+    err "Refusing to build an unverifiable CLI/mux/guardian process family."
     exit 1
   fi
 
@@ -961,7 +1069,7 @@ build_from_source() {
   local workspace_version=""
   local build_target=""
   local build_profile="release-interactive"
-  local feature_contract="process-family-ft-mux-server-default-features-v1"
+  local feature_contract="process-family-ft-mux-server-pty-guardian-default-features-v1"
   local build_id=""
   source_revision=$(git -C "$TMP/src" rev-parse HEAD 2>/dev/null) || {
     err "Cannot resolve the exact source revision for the cloned release tag."
@@ -1004,7 +1112,8 @@ build_from_source() {
       FT_ATOMIC_BUILD_PROFILE="$build_profile" \
       cargo build --locked --profile "$build_profile" --target "$build_target" \
       -p frankenterm --bin ft \
-      -p frankenterm-mux-server --bin frankenterm-mux-server ); then
+      -p frankenterm-mux-server --bin frankenterm-mux-server \
+      -p frankenterm-pty-guardian --bin frankenterm-pty-guardian ); then
     err "Source build failed."
     err "Common causes:"
     err "  - Missing system deps on Linux: pkg-config, libcairo2-dev,"
@@ -1016,8 +1125,10 @@ build_from_source() {
   fi
   local bin="$TMP/src/target/$build_target/$build_profile/ft"
   local mux_bin="$TMP/src/target/$build_target/$build_profile/frankenterm-mux-server"
+  local guardian_bin="$TMP/src/target/$build_target/$build_profile/frankenterm-pty-guardian"
   [ -x "$bin" ] || { err "Build did not produce $bin"; exit 1; }
   [ -x "$mux_bin" ] || { err "Build did not produce $mux_bin"; exit 1; }
+  [ -x "$guardian_bin" ] || { err "Build did not produce $guardian_bin"; exit 1; }
 
   # Verify the embedded role/build/target/profile/version markers before any
   # live destination is mutated.  A version probe alone cannot distinguish a
@@ -1026,7 +1137,8 @@ build_from_source() {
   local proof_manifest="$proof_root/source-family.component-manifest.json"
   if ! mkdir "$proof_root" \
       || ! install -m 0755 "$bin" "$proof_root/ft" \
-      || ! install -m 0755 "$mux_bin" "$proof_root/frankenterm-mux-server"; then
+      || ! install -m 0755 "$mux_bin" "$proof_root/frankenterm-mux-server" \
+      || ! install -m 0755 "$guardian_bin" "$proof_root/frankenterm-pty-guardian"; then
     err "Failed to stage the source-built process family for identity proof."
     exit 1
   fi
@@ -1042,14 +1154,18 @@ build_from_source() {
       --feature-contract "$feature_contract" \
       --entry executable:cli:ft:ft \
       --entry executable:mux-server:frankenterm-mux-server:frankenterm-mux-server \
+      --entry executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian \
       || ! bash "$atomic_tool" verify \
       --root "$proof_root" \
       --manifest "$proof_manifest"; then
-    err "Source-built ft and mux-server do not form one sealed atomic family."
+    err "Source-built ft, mux-server, and PTY guardian do not form one sealed atomic family."
     err "Installed bytes are unchanged."
     exit 1
   fi
-  install_process_family "$proof_root/ft" "$proof_root/frankenterm-mux-server"
+  install_process_family \
+    "$proof_root/ft" \
+    "$proof_root/frankenterm-mux-server" \
+    "$proof_root/frankenterm-pty-guardian"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1223,10 +1339,10 @@ fi
 # check belongs inside the installer lock: otherwise a concurrent same-semver
 # process-family publication can be observed between its two canonical moves.
 # check_installed_version also requires one exact sealed build identity across
-# both roles; matching --version output alone is not sufficient.
+# all three roles; matching --version output alone is not sufficient.
 if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] \
     && check_installed_version "$VERSION"; then
-  ok "ft + frankenterm-mux-server $VERSION are already installed at $DEST"
+  ok "ft + frankenterm-mux-server + frankenterm-pty-guardian $VERSION are already installed at $DEST"
   info "Use --force to reinstall"
   # Still honour the font / GUI-app side installs even when the CLI is current,
   # so a re-run can add the .app to an existing CLI-only install. Decide once
@@ -1310,22 +1426,23 @@ else
     exit 1
   fi
 
-  # A checksum proves archive bytes, but it cannot prove that the CLI and mux
-  # server came from one source/build identity.  Keep this atomic process-family
-  # verification mandatory even when --no-verify skips transport authenticity.
+  # A checksum proves archive bytes, but it cannot prove that the CLI, mux
+  # server, and PTY guardian came from one source/build identity. Keep this
+  # atomic process-family verification mandatory even when --no-verify skips
+  # transport authenticity.
   COMPONENT_VERIFIER="$PACKAGE_ROOT/verify-components.sh"
   COMPONENT_MANIFEST="$PACKAGE_ROOT/${ASSET%.tar.xz}.component-manifest.json"
   [ -f "$COMPONENT_VERIFIER" ] || {
     err "Atomic component verifier not found in tarball"
-    err "Refusing an unverifiable client/server process-family install"
+    err "Refusing an unverifiable CLI/mux/guardian process-family install"
     exit 1
   }
   [ -f "$COMPONENT_MANIFEST" ] || {
     err "Atomic component manifest not found in tarball: $(basename "$COMPONENT_MANIFEST")"
-    err "Refusing an unverifiable client/server process-family install"
+    err "Refusing an unverifiable CLI/mux/guardian process-family install"
     exit 1
   }
-  info "Verifying atomic CLI/mux-server build identity"
+  info "Verifying atomic CLI/mux-server/PTY-guardian build identity"
   if ! bash "$COMPONENT_VERIFIER" verify \
       --root "$PACKAGE_ROOT" \
       --manifest "$COMPONENT_MANIFEST"; then
@@ -1348,7 +1465,16 @@ else
     err "Refusing a client-only install that could strand persistent remote domains"
     exit 1
   }
-  install_process_family "$BIN" "$MUX_BIN"
+  GUARDIAN_BIN="$PACKAGE_ROOT/frankenterm-pty-guardian"
+  if [ ! -x "$GUARDIAN_BIN" ]; then
+    GUARDIAN_BIN=$(find "$PACKAGE_ROOT" -maxdepth 3 -type f -name "frankenterm-pty-guardian" -perm -111 2>/dev/null | head -n 1)
+  fi
+  [ -x "$GUARDIAN_BIN" ] || {
+    err "frankenterm-pty-guardian binary not found in tarball"
+    err "Refusing an incomplete install that cannot preserve PTY ownership across mux handoff"
+    exit 1
+  }
+  install_process_family "$BIN" "$MUX_BIN" "$GUARDIAN_BIN"
 fi
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1394,6 +1520,7 @@ if [ "$QUIET" -eq 0 ]; then
   summary_lines+=("")
   summary_lines+=("Binary:   $DEST/ft")
   summary_lines+=("Mux:      $DEST/frankenterm-mux-server")
+  summary_lines+=("Guardian: $DEST/frankenterm-pty-guardian")
   summary_lines+=("Version:  $RESOLVED_VERSION")
   if [ -n "${TARGET:-}" ]; then
     summary_lines+=("Platform: ${OS}/${ARCH} ($TARGET)")
@@ -1416,6 +1543,7 @@ if [ "$QUIET" -eq 0 ]; then
   summary_lines+=("Uninstall:")
   summary_lines+=("  rm $DEST/ft")
   summary_lines+=("  rm $DEST/frankenterm-mux-server")
+  summary_lines+=("  rm $DEST/frankenterm-pty-guardian")
   if [ "$WITH_FONT" -eq 1 ]; then
     # Select the right font path based on the platform we installed for —
     # don't concatenate Linux + macOS paths together.

@@ -3,7 +3,8 @@ set -euo pipefail
 
 # create-macos-bundle.sh — Build FrankenTerm.app bundle from source
 #
-# Builds frankenterm-gui, frankenterm-mux-server, and ft binaries, then
+# Builds frankenterm-gui, frankenterm-mux-server, frankenterm-pty-guardian,
+# and ft binaries, then
 # packages them into a macOS .app bundle with the FrankenTerm icon and
 # Info.plist.
 #
@@ -30,7 +31,7 @@ SKIP_BUILD=false
 OUTPUT_DIR="$PROJECT_ROOT"
 TARGET_TRIPLE="${FT_ATOMIC_BUILD_TARGET:-}"
 BUILD_PROFILE="release-interactive"
-FEATURE_CONTRACT="application-family-gui-ft-mux-server-default-features-v1"
+FEATURE_CONTRACT="application-family-gui-ft-mux-server-pty-guardian-default-features-v1"
 BROWSER_RUNTIME_ROOT=""
 BROWSER_RUNTIME_MANIFEST=""
 
@@ -198,7 +199,7 @@ if [[ -n "${FT_ATOMIC_BUILD_IDENTITY:-}" && "$FT_ATOMIC_BUILD_IDENTITY" != "$EXP
     echo "Error: supplied atomic build identity does not match this source/build contract"
     echo "Expected: $EXPECTED_BUILD_ID"
     echo "Supplied: $FT_ATOMIC_BUILD_IDENTITY"
-    echo "Rebuild GUI, ft, and mux-server together from this exact source snapshot."
+    echo "Rebuild GUI, ft, mux-server, and PTY guardian together from this exact source snapshot."
     exit 1
 fi
 FT_ATOMIC_BUILD_IDENTITY="$EXPECTED_BUILD_ID"
@@ -290,6 +291,7 @@ run_rch_bundle_build() {
             cargo build --locked --profile "$BUILD_PROFILE" --target "$TARGET_TRIPLE" \
             --bin frankenterm-gui \
             --bin frankenterm-mux-server \
+            --bin frankenterm-pty-guardian \
             --bin ft \
             --manifest-path Cargo.toml
     )
@@ -303,7 +305,7 @@ build_remote_bundle_with_diagnostics() {
     # RCH deliberately rejects arbitrary `sh -lc` prerequisite probes
     # (RCH-E301). The exact fail-closed Cargo build is both the authoritative
     # prerequisite check and artifact producer: native build scripts diagnose
-    # missing metadata, while success proves all three processes linked.
+    # missing metadata, while success proves all four processes linked.
     if run_rch_bundle_build > >(tee -a "$preflight_log") 2> >(tee -a "$preflight_log" >&2); then
         return 0
     fi
@@ -365,7 +367,7 @@ if [ "$SKIP_BUILD" = false ]; then
         echo "Error: no reachable RCH workers detected; refusing local cargo fallback"
         exit 1
     fi
-    echo "Building frankenterm-gui, frankenterm-mux-server, and bundled ft via rch ($BUILD_PROFILE, panic=unwind)..."
+    echo "Building frankenterm-gui, frankenterm-mux-server, PTY guardian, and bundled ft via rch ($BUILD_PROFILE, panic=unwind)..."
     if ! build_remote_bundle_with_diagnostics; then
         exit 1
     fi
@@ -375,6 +377,7 @@ fi
 BINARY_DIR="$CARGO_TARGET_DIR/$TARGET_TRIPLE/$BUILD_PROFILE"
 GUI_BINARY="$BINARY_DIR/frankenterm-gui"
 MUX_SERVER_BINARY="$BINARY_DIR/frankenterm-mux-server"
+GUARDIAN_BINARY="$BINARY_DIR/frankenterm-pty-guardian"
 FT_BINARY="$BINARY_DIR/ft"
 
 if [ ! -f "$GUI_BINARY" ]; then
@@ -384,6 +387,11 @@ if [ ! -f "$GUI_BINARY" ]; then
 fi
 if [ ! -f "$MUX_SERVER_BINARY" ]; then
     echo "Error: frankenterm-mux-server binary not found at $MUX_SERVER_BINARY"
+    echo "Run without --skip-build, or set CARGO_TARGET_DIR."
+    exit 1
+fi
+if [ ! -f "$GUARDIAN_BINARY" ]; then
+    echo "Error: frankenterm-pty-guardian binary not found at $GUARDIAN_BINARY"
     echo "Run without --skip-build, or set CARGO_TARGET_DIR."
     exit 1
 fi
@@ -469,6 +477,9 @@ cp "$GUI_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-gui"
 
 echo "Installing frankenterm-mux-server..."
 cp "$MUX_SERVER_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-mux-server"
+
+echo "Installing frankenterm-pty-guardian..."
+cp "$GUARDIAN_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-pty-guardian"
 
 echo "Installing ft CLI..."
 cp "$FT_BINARY" "$APP_BUNDLE/Contents/MacOS/ft"
@@ -594,6 +605,7 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --feature-contract "$FEATURE_CONTRACT" \
     --entry executable:gui:Contents/MacOS/frankenterm-gui:frankenterm-gui \
     --entry executable:mux-server:Contents/MacOS/frankenterm-mux-server:frankenterm-mux-server \
+    --entry executable:pty-guardian:Contents/MacOS/frankenterm-pty-guardian:frankenterm-pty-guardian \
     --entry executable:cli:Contents/MacOS/ft:ft \
     --entry config:default-toml:Contents/Resources/frankenterm.toml \
     --entry config:default-lua:Contents/Resources/frankenterm.lua \
@@ -649,6 +661,7 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --contract browser.component.source-manifest-path="$BROWSER_SOURCE_MANIFEST_BUNDLE_PATH" \
     --contract panic.gui=unwind \
     --contract panic.mux-server=unwind \
+    --contract panic.pty-guardian=unwind \
     --contract panic.bundled-cli=unwind
 
 bash "$ATOMIC_MANIFEST_TOOL" verify \

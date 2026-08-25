@@ -4,7 +4,8 @@
 use clap::{Args, Parser, Subcommand};
 #[cfg(unix)]
 use frankenterm_pty_guardian::{
-    GuardianClient, GuardianService, GuardianServiceConfig, ProvisionTokenOutcome,
+    AtomicComponentIdentityError, GuardianClient, GuardianService, GuardianServiceConfig,
+    ProvisionTokenOutcome, guardian_atomic_component_marker, guardian_runtime_build_identity,
     provision_guardian_token,
 };
 #[cfg(unix)]
@@ -16,7 +17,8 @@ use std::time::Duration;
 #[derive(Debug, Parser)]
 #[command(
     name = "frankenterm-pty-guardian",
-    about = "Opt-in standalone owner of FrankenTerm native PTYs"
+    about = "Opt-in standalone owner of FrankenTerm native PTYs",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -85,6 +87,7 @@ struct ServeArgs {
 
 #[cfg(unix)]
 fn main() -> anyhow::Result<()> {
+    retain_guardian_atomic_component_identity()?;
     let args = Cli::parse();
     match args.command {
         Command::Serve(args) => {
@@ -129,8 +132,30 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn retain_guardian_atomic_component_identity() -> anyhow::Result<()> {
+    let runtime_identity = match guardian_runtime_build_identity() {
+        Ok(identity) => Some(identity),
+        Err(AtomicComponentIdentityError::UnsealedDevelopmentBuild) => None,
+        Err(error) => return Err(error.into()),
+    };
+    std::hint::black_box(guardian_atomic_component_marker());
+    std::hint::black_box(runtime_identity);
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn main() {
+    let runtime_identity = match frankenterm_pty_guardian::guardian_runtime_build_identity() {
+        Ok(identity) => Some(identity),
+        Err(AtomicComponentIdentityError::UnsealedDevelopmentBuild) => None,
+        Err(error) => {
+            eprintln!("invalid embedded guardian atomic component identity: {error}");
+            std::process::exit(2);
+        }
+    };
+    std::hint::black_box(frankenterm_pty_guardian::guardian_atomic_component_marker());
+    std::hint::black_box(runtime_identity);
     eprintln!("frankenterm-pty-guardian is supported only on Unix");
     std::process::exit(2);
 }
@@ -138,6 +163,7 @@ fn main() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
 
     #[test]
     fn command_surface_requires_explicit_lifecycle_transaction() {
@@ -190,5 +216,22 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(provision.command, Command::ProvisionToken(_)));
+    }
+
+    #[test]
+    fn version_probe_is_non_mutating_and_uses_the_package_version() {
+        let error = Cli::try_parse_from(["frankenterm-pty-guardian", "--version"])
+            .expect_err("--version must terminate parsing before command execution");
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        let rendered = error.to_string();
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+        assert!(!rendered.contains("--socket-path"));
+        assert!(!rendered.contains("--token-path"));
+    }
+
+    #[test]
+    fn binary_startup_retains_and_validates_the_component_identity() {
+        retain_guardian_atomic_component_identity().unwrap();
+        assert!(guardian_atomic_component_marker().contains(":frankenterm-pty-guardian:"));
     }
 }

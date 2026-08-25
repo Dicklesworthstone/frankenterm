@@ -11,6 +11,7 @@ readme = "../../README.md"
 keywords = ["terminal", "frankenterm", "pty", "multiplexer"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
+build = "build.rs"
 
 [[bin]]
 name = "frankenterm-pty-guardian"
@@ -22,8 +23,12 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+frankenterm-build-identity.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+
+[build-dependencies]
+frankenterm-build-identity.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 getrandom.workspace = true
