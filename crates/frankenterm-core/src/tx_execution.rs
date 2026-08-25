@@ -7145,6 +7145,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn contract_lock_rejects_symlinked_ancestor_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let sub_dir = dir.path().join("sub");
+        let external_sub = external.path().join("external_sub");
+        std::fs::create_dir(&external_sub).unwrap();
+        let target_path = external_sub.join("tx.json");
+        let contract = make_test_contract(1);
+        write_authoritative_contract(&target_path, &contract);
+        symlink(&external_sub, &sub_dir).unwrap();
+
+        let contract_path = sub_dir.join("tx.json");
+        let err = acquire_tx_contract_lock(dir.path(), &contract_path).unwrap_err();
+        assert_eq!(err.kind(), TxContractStoreErrorKind::Lock);
+        assert!(err.to_string().contains("without following symlinks"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn atomic_save_preserves_authoritative_file_mode() {
         use std::os::unix::fs::PermissionsExt;
 

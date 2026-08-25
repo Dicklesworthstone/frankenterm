@@ -6513,6 +6513,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn key_lock_rejects_symbolic_link_lock_file() {
+        let anchor = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let key_hash = key
+            .as_str()
+            .strip_prefix("txk:v2:")
+            .expect("key prefix");
+        let lock_dir = anchor.path().join(KEY_LOCK_DIR_NAME);
+        let lock_path = lock_dir.join(format!("{key_hash}.lock"));
+        let target_path = anchor.path().join("unrelated-target");
+        std::fs::write(&target_path, b"unrelated target").unwrap();
+        std::os::unix::fs::symlink(&target_path, &lock_path).unwrap();
+
+        let err = store.acquire_durable_key_lock(&key).unwrap_err();
+        assert!(matches!(err, IdempotencyError::LedgerPersist { .. }));
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"unrelated target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_lock_rejects_multi_link_lock_file() {
+        let anchor = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let key_hash = key
+            .as_str()
+            .strip_prefix("txk:v2:")
+            .expect("key prefix");
+        let lock_dir = anchor.path().join(KEY_LOCK_DIR_NAME);
+        let lock_path = lock_dir.join(format!("{key_hash}.lock"));
+        std::fs::write(&lock_path, b"").unwrap();
+        let second_link = anchor.path().join("extra.link");
+        std::fs::hard_link(&lock_path, &second_link).unwrap();
+
+        let err = store.acquire_durable_key_lock(&key).unwrap_err();
+        assert!(matches!(err, IdempotencyError::LedgerPersist { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ledger_replace_rejects_single_link_regular_substitution_after_locked_read() {
         let anchor = tempfile::tempdir().expect("create durable store directory");
         let plan = make_plan(1);
