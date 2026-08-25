@@ -3043,15 +3043,11 @@ fn socket_path_identity_at(
         .map_err(|error| {
             GuardianServiceError::io("socket-metadata-at", std::io::Error::from(error))
         })?;
-    let mode = u32::try_from(metadata.st_mode).map_err(|_| {
-        GuardianServiceError::FilesystemSecurity("guardian socket mode is not representable")
-    })?;
+    let mode = u32::from(metadata.st_mode);
     let owner = u32::try_from(metadata.st_uid).map_err(|_| {
         GuardianServiceError::FilesystemSecurity("guardian socket owner is not representable")
     })?;
-    let links = u64::try_from(metadata.st_nlink).map_err(|_| {
-        GuardianServiceError::FilesystemSecurity("guardian socket link count is not representable")
-    })?;
+    let links = u64::from(metadata.st_nlink);
     if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::Socket
         || owner != geteuid().as_raw()
         || mode & 0o777 != 0o600
