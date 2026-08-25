@@ -12348,6 +12348,326 @@ mod tests {
         .unwrap()
     }
 
+    async fn capture_checkpoint_scrollback_artifact_fixture(
+        db_path: Arc<String>,
+        contents: &[&str],
+    ) -> SnapshotResult {
+        install_checkpoint_scrollback_artifact_fixture(db_path.as_str(), 1, contents);
+        SnapshotEngine::new(db_path, SnapshotConfig::default())
+            .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Manual)
+            .await
+            .unwrap()
+    }
+
+    fn write_private_checkpoint_artifact_test_file(path: &Path, bytes: &[u8]) {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.mode(0o600);
+        }
+        let mut file = options.open(path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_scrollback_artifact_roundtrip_retry_and_false_capabilities() {
+        run_async_test(async {
+            let (db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["alpha\n", "beta\n", "gamma\n"],
+            )
+            .await;
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let directory = tempfile::TempDir::new().unwrap();
+            let leaf = checkpoint_scrollback_artifact_file_name(
+                snapshot.checkpoint_at,
+                snapshot.checkpoint_id,
+                &snapshot.state_hash,
+            )
+            .unwrap();
+            let path = directory.path().join(leaf);
+
+            let first = write_checkpoint_scrollback_artifact(
+                db_path.as_str(),
+                snapshot.checkpoint_id,
+                &path,
+                limits,
+            )
+            .unwrap();
+            let first_bytes = std::fs::read(&path).unwrap();
+            let second = write_checkpoint_scrollback_artifact(
+                db_path.as_str(),
+                snapshot.checkpoint_id,
+                &path,
+                limits,
+            )
+            .unwrap();
+            assert_eq!(first, second, "a lost reply retry must converge exactly");
+            assert_eq!(std::fs::read(&path).unwrap(), first_bytes);
+            assert_eq!(first.created_at_epoch_ms, snapshot.checkpoint_at);
+            assert_eq!(first.complete_pane_count, 1);
+
+            let artifact: CheckpointScrollbackArtifact =
+                serde_json::from_slice(&first_bytes).unwrap();
+            assert_eq!(artifact.payload.capabilities, CheckpointScrollbackCapabilities::V1);
+            assert!(!artifact.payload.capabilities.executable_restore_image);
+            assert!(!artifact.payload.capabilities.terminal_parser_state);
+            assert!(!artifact.payload.capabilities.pty_descriptor_state);
+            assert!(!artifact.payload.capabilities.process_state);
+            assert!(!artifact.payload.capabilities.running_process_continuity);
+            assert!(!artifact.payload.capabilities.live_mux_mutation);
+
+            drop(db_file);
+            let offline = verify_checkpoint_scrollback_artifact(&path, limits).unwrap();
+            assert_eq!(offline.artifact_sha256, first.artifact_sha256);
+            assert_eq!(offline.checkpoint_state_hash, snapshot.state_hash);
+            let inventory =
+                inventory_checkpoint_scrollback_artifacts(directory.path(), limits).unwrap();
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(inventory[0].artifact_sha256, first.artifact_sha256);
+        });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_publication_recovers_staging_and_rename_lost_reply() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["first\n", "second\n", "third\n"],
+            )
+            .await;
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let bytes = build_checkpoint_scrollback_artifact_fixture_bytes(
+                db_path.as_str(),
+                snapshot.checkpoint_id,
+                limits,
+            );
+
+            let residues = [
+                Vec::new(),
+                bytes[..bytes.len() / 2].to_vec(),
+                bytes.clone(),
+            ];
+            for residue in residues {
+                let directory = tempfile::TempDir::new().unwrap();
+                let path = directory
+                    .path()
+                    .join(format!("fixture{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
+                let staging_name = checkpoint_artifact_staging_name(
+                    path.file_name().unwrap().as_ref(),
+                    &checkpoint_artifact_sha256(&bytes),
+                );
+                let staging_path = directory.path().join(&staging_name);
+                write_private_checkpoint_artifact_test_file(&staging_path, &residue);
+
+                assert_eq!(
+                    publish_checkpoint_artifact_bytes(&path, &bytes).unwrap(),
+                    CheckpointArtifactPublicationOutcome::Published
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert!(
+                    !staging_path.exists(),
+                    "the one deterministic staging inode must become the target"
+                );
+            }
+
+            let lost_reply_directory = tempfile::TempDir::new().unwrap();
+            let lost_reply_path = lost_reply_directory
+                .path()
+                .join(format!("lost-reply{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
+            let interrupted = publish_checkpoint_artifact_bytes_with_fault(
+                &lost_reply_path,
+                &bytes,
+                CheckpointArtifactPublicationFault::AfterRenameBeforeDirectorySync,
+            )
+            .expect_err("the planted crash window must return before parent fsync");
+            assert!(matches!(
+                interrupted,
+                CheckpointScrollbackArtifactError::Io(ref error)
+                    if error.kind() == std::io::ErrorKind::Interrupted
+            ));
+            assert_eq!(std::fs::read(&lost_reply_path).unwrap(), bytes);
+
+            let receipt = write_checkpoint_scrollback_artifact(
+                db_path.as_str(),
+                snapshot.checkpoint_id,
+                &lost_reply_path,
+                limits,
+            )
+            .unwrap();
+            assert_eq!(receipt.artifact_sha256, checkpoint_artifact_sha256(&bytes));
+            assert_eq!(receipt.checkpoint_id, snapshot.checkpoint_id);
+            assert_eq!(
+                publish_checkpoint_artifact_bytes(&lost_reply_path, &bytes).unwrap(),
+                CheckpointArtifactPublicationOutcome::AlreadyApplied
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_scrollback_read_rejects_same_size_mtime_restored_mutation() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["one\n", "two\n", "three\n"],
+            )
+            .await;
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let bytes = build_checkpoint_scrollback_artifact_fixture_bytes(
+                db_path.as_str(),
+                snapshot.checkpoint_id,
+                limits,
+            );
+            let directory = tempfile::TempDir::new().unwrap();
+            let leaf = format!("mutation{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}");
+            let path = directory.path().join(&leaf);
+            publish_checkpoint_artifact_bytes(&path, &bytes).unwrap();
+            let parent = open_checkpoint_artifact_directory_nofollow(directory.path()).unwrap();
+            let before_metadata = std::fs::metadata(&path).unwrap();
+            let before_snapshot =
+                CheckpointArtifactFileSnapshot::capture_std(&before_metadata).unwrap();
+            let original_modified = before_metadata.modified().unwrap();
+            let mut changed_bytes = bytes.clone();
+            changed_bytes[0] ^= 1;
+
+            let error = read_checkpoint_artifact_from_parent_bounded_with_hook(
+                &parent,
+                Path::new(&leaf),
+                limits.max_artifact_bytes,
+                false,
+                || {
+                    std::thread::sleep(Duration::from_millis(5));
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap();
+                    file.seek(SeekFrom::Start(0)).unwrap();
+                    file.write_all(&changed_bytes).unwrap();
+                    file.sync_all().unwrap();
+                    file.set_times(
+                        std::fs::FileTimes::new().set_modified(original_modified),
+                    )
+                    .unwrap();
+                },
+            )
+            .expect_err("ctime must expose same-size mutation with restored mtime");
+            assert!(matches!(
+                error,
+                CheckpointScrollbackArtifactError::InvalidArtifact(ref message)
+                    if message.contains("changed while it was read")
+            ));
+            let after_metadata = std::fs::metadata(&path).unwrap();
+            let after_snapshot =
+                CheckpointArtifactFileSnapshot::capture_std(&after_metadata).unwrap();
+            assert_eq!(before_snapshot.byte_len, after_snapshot.byte_len);
+            assert_eq!(before_snapshot.modified, after_snapshot.modified);
+            assert_ne!(
+                (before_metadata.ctime(), before_metadata.ctime_nsec()),
+                (after_metadata.ctime(), after_metadata.ctime_nsec())
+            );
+            assert_ne!(before_snapshot, after_snapshot);
+            assert!(matches!(
+                publish_checkpoint_artifact_bytes(&path, &bytes),
+                Err(CheckpointScrollbackArtifactError::AlreadyExists)
+            ));
+        });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_verifier_rejects_mutations_and_resource_overruns() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["alpha\n", "beta\n", "gamma\n"],
+            )
+            .await;
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let bytes = build_checkpoint_scrollback_artifact_fixture_bytes(
+                db_path.as_str(),
+                snapshot.checkpoint_id,
+                limits,
+            );
+            let artifact: CheckpointScrollbackArtifact = serde_json::from_slice(&bytes).unwrap();
+
+            let mut content_mutation = artifact.clone();
+            content_mutation.payload.scrollback[0].segments[0].content = "omega\n".to_string();
+            content_mutation.payload_sha256 = hash_checkpoint_artifact_json(
+                &content_mutation.payload,
+                limits.max_artifact_bytes,
+            )
+            .unwrap();
+            let mutated_bytes =
+                serialize_checkpoint_artifact(&content_mutation, limits.max_artifact_bytes)
+                    .unwrap();
+            let mutated_directory = tempfile::TempDir::new().unwrap();
+            let mutated_path = mutated_directory
+                .path()
+                .join(format!("content-mutation{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
+            publish_checkpoint_artifact_bytes(&mutated_path, &mutated_bytes).unwrap();
+            assert!(matches!(
+                verify_checkpoint_scrollback_artifact(&mutated_path, limits),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
+
+            let mut capability_mutation = artifact;
+            capability_mutation.payload.capabilities.process_state = true;
+            capability_mutation.payload_sha256 = hash_checkpoint_artifact_json(
+                &capability_mutation.payload,
+                limits.max_artifact_bytes,
+            )
+            .unwrap();
+            let capability_bytes =
+                serialize_checkpoint_artifact(&capability_mutation, limits.max_artifact_bytes)
+                    .unwrap();
+            let capability_directory = tempfile::TempDir::new().unwrap();
+            let capability_path = capability_directory
+                .path()
+                .join(format!("capability-mutation{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
+            publish_checkpoint_artifact_bytes(&capability_path, &capability_bytes).unwrap();
+            assert!(matches!(
+                verify_checkpoint_scrollback_artifact(&capability_path, limits),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
+
+            let mut source_limits = limits;
+            source_limits.max_segments_per_pane = 2;
+            source_limits.max_total_segments = 2;
+            assert!(matches!(
+                build_checkpoint_scrollback_payload(
+                    db_path.as_str(),
+                    snapshot.checkpoint_id,
+                    source_limits,
+                ),
+                Err(CheckpointScrollbackArtifactError::ResourceLimit(_))
+            ));
+
+            let bounded_directory = tempfile::TempDir::new().unwrap();
+            let bounded_path = bounded_directory
+                .path()
+                .join(format!("bounded{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
+            publish_checkpoint_artifact_bytes(&bounded_path, &bytes).unwrap();
+            let mut verifier_limits = limits;
+            verifier_limits.max_artifact_bytes =
+                u64::try_from(bytes.len().saturating_sub(1)).unwrap();
+            verifier_limits.max_content_bytes = verifier_limits.max_artifact_bytes;
+            assert!(matches!(
+                verify_checkpoint_scrollback_artifact(&bounded_path, verifier_limits),
+                Err(CheckpointScrollbackArtifactError::ResourceLimit(_))
+            ));
+        });
+    }
+
     fn prepare_test_snapshot(
         topology_json: &str,
         panes: &[PaneStateSnapshot],

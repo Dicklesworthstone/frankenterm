@@ -3581,6 +3581,7 @@ dependencies = [
  "openssl-sys",
  "predicates",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
