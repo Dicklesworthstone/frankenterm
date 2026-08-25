@@ -11,7 +11,9 @@ use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputSegmentIdentity,
 };
 use crate::guardian_protocol::{
-    GuardianCheckpointChunkDelivery, GuardianCheckpointScopeV1,
+    GuardianCheckpointChunkDelivery, GuardianCheckpointDisposition,
+    GuardianCheckpointPolicyExpiryReceiptV1, GuardianCheckpointReceipt,
+    GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1,
     GuardianCheckpointStageChunkDeliveryV1, GuardianCheckpointStageKindV1,
     GuardianCheckpointStageRequestV1,
 };
@@ -62,6 +64,7 @@ const CHECKPOINT_ORDERED_CHUNK_SET_IDENTITY_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-phase-a-chunk-set.v1\0";
 const CHECKPOINT_STAGE_RECORD_MAGIC: [u8; 8] = *b"FTGCPA03";
 const CHECKPOINT_STAGE_INNER_TRAILER_MAGIC: [u8; 8] = *b"FTGCPI01";
+const CHECKPOINT_FINALIZER_TRAILER_MAGIC: [u8; 8] = *b"FTGCFN01";
 
 /// Version of the encrypted Phase-A checkpoint staging-record format.
 ///
@@ -79,6 +82,12 @@ pub const GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES: u32 = 336;
 pub const GUARDIAN_CHECKPOINT_BEGIN_REQUEST_BYTES: u32 = 336;
 /// Exact canonical final-manifest bytes: Seal request plus two digests.
 pub const GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES: u32 = 400;
+/// Exact encrypted ACK finalizer bytes: canonical ACK request plus the
+/// mutation-sequenced catalog-adoption receipt identity.
+pub const GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES: u32 = 392;
+/// Exact encrypted policy-expiry finalizer bytes: canonical Query request plus
+/// the nonconstructible retention-policy receipt identity.
+pub const GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES: u32 = 376;
 /// Capture generation reserved for a pre-spawn Genesis checkpoint.
 pub const GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION: u64 = 1;
 
@@ -88,6 +97,10 @@ const CHECKPOINT_STAGE_NONCE_BYTES: usize = 24;
 const CHECKPOINT_STAGE_AEAD_TAG_BYTES: usize = 16;
 const CHECKPOINT_STAGE_INNER_TRAILER_BYTES: usize = 48;
 const CHECKPOINT_STAGE_INNER_TRAILER_VERSION: u32 = 1;
+const CHECKPOINT_FINALIZER_TRAILER_VERSION: u32 = 1;
+const CHECKPOINT_FINALIZER_TRAILER_BYTES: usize = 40;
+const CHECKPOINT_FINALIZER_KIND_ACK: u8 = 1;
+const CHECKPOINT_FINALIZER_KIND_EXPIRED: u8 = 2;
 const CHECKPOINT_STAGE_MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const CHECKPOINT_STAGE_MAX_CHUNKS: u32 = 1_024;
 
@@ -956,6 +969,25 @@ pub struct GuardianCheckpointValidatedManifestAuthorityV1 {
 }
 
 impl GuardianCheckpointValidatedManifestAuthorityV1 {
+    /// Convert the guardian protocol's authenticated current-lease Seal permit
+    /// into manifest authority for this exact immutable stage binding.
+    ///
+    /// The returned request is the same owned request that was enclosed by the
+    /// permit. Returning it beside the authority preserves the store's existing
+    /// nonduplicable Seal assembly path without exposing any raw-authority
+    /// constructor.
+    pub fn from_guardian_runtime_seal_permit(
+        binding: &GuardianCheckpointStageBindingV1,
+        permit: GuardianCheckpointRuntimeSealPermitV1,
+    ) -> Result<(Self, GuardianCheckpointStageRequestV1), GuardianCheckpointCipherError> {
+        let (request, mux_incarnation) = permit.into_parts();
+        if mux_incarnation.is_nil() {
+            return Err(GuardianCheckpointCipherError::InvalidSealRequest);
+        }
+        binding.validate_seal_request(&request)?;
+        Ok((Self { binding: *binding }, request))
+    }
+
     /// Mint publication authority only when this descriptor exactly matches
     /// the payload, parser watermark, segment, and synchronized receipt already
     /// sealed inside one nonconstructible live capture acknowledgement.
@@ -2119,32 +2151,118 @@ impl GuardianCheckpointCipher {
         }
     }
 
-    /// Seal the unique ACK finalizer for one authenticated durable completion.
+    /// Seal the unique ACK finalizer for one authenticated durable completion
+    /// only after the mutation-sequenced Checkpoint operation has committed
+    /// the exact artifact and output-boundary identities into the catalog.
     pub fn seal_ack_finalizer(
         &self,
         receipt: &GuardianCheckpointDurableCompletionReceiptV1,
         ack_request: &GuardianCheckpointStageRequestV1,
+        adoption_receipt: GuardianCheckpointReceipt,
     ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
         let (context, canonical_ack, plaintext_digest) =
-            checkpoint_ack_finalizer_parts(receipt, ack_request)?;
+            checkpoint_ack_finalizer_parts(receipt, ack_request, adoption_receipt)?;
         self.seal_exact_payload(context, canonical_ack.as_slice(), &plaintext_digest)
     }
 
-    /// Authenticate an existing ACK finalizer for the same exact completion.
+    /// Authenticate a recovered ACK finalizer for the same exact completion.
+    ///
+    /// The AEAD-protected trailer proves that only this cipher's
+    /// committed-adoption sealing seam could have created the record.  Query
+    /// deliberately does not need to reacquire the historical protocol
+    /// receipt after restart.
     pub fn inspect_ack_finalizer(
         &self,
         receipt: &GuardianCheckpointDurableCompletionReceiptV1,
         ack_request: &GuardianCheckpointStageRequestV1,
         record: &GuardianEncryptedCheckpointStageRecordV1,
     ) -> Result<(), GuardianCheckpointCipherError> {
-        let (context, canonical_ack, _) = checkpoint_ack_finalizer_parts(receipt, ack_request)?;
-        let opened = self.open_exact_payload(
-            &context,
-            record,
-            u32::try_from(canonical_ack.len())
-                .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?,
+        let (context, canonical_request) = checkpoint_finalizer_request_parts(
+            receipt,
+            ack_request,
+            GuardianCheckpointStageKindV1::Ack,
         )?;
+        let opened =
+            self.open_exact_payload(&context, record, GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES)?;
+        checkpoint_inspect_finalizer_payload(
+            &opened,
+            &canonical_request,
+            CHECKPOINT_FINALIZER_KIND_ACK,
+        )
+        .map(|_| ())
+    }
+
+    /// Reconcile an ACK retry against the exact committed adoption receipt
+    /// whose identity was encrypted into the immutable finalizer.
+    pub fn inspect_ack_finalizer_with_adoption(
+        &self,
+        receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+        ack_request: &GuardianCheckpointStageRequestV1,
+        adoption_receipt: GuardianCheckpointReceipt,
+        record: &GuardianEncryptedCheckpointStageRecordV1,
+    ) -> Result<(), GuardianCheckpointCipherError> {
+        let (context, canonical_ack, _) =
+            checkpoint_ack_finalizer_parts(receipt, ack_request, adoption_receipt)?;
+        let opened =
+            self.open_exact_payload(&context, record, GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES)?;
         if checkpoint_stage_bytes_match(&opened, &canonical_ack) {
+            Ok(())
+        } else {
+            Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
+        }
+    }
+
+    /// Seal the sole policy-expiry finalizer for one completion.  The expiry
+    /// receipt has no production constructor from raw request or clock data;
+    /// it must come from the durable retention transaction.
+    pub fn seal_expiry_finalizer(
+        &self,
+        receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+        query_request: &GuardianCheckpointStageRequestV1,
+        expiry_receipt: GuardianCheckpointPolicyExpiryReceiptV1,
+    ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
+        let (context, canonical_expiry, plaintext_digest) =
+            checkpoint_expiry_finalizer_parts(receipt, query_request, &expiry_receipt)?;
+        self.seal_exact_payload(context, canonical_expiry.as_slice(), &plaintext_digest)
+    }
+
+    /// Authenticate a recovered policy-expiry finalizer without recreating
+    /// the historical retention decision.
+    pub fn inspect_expiry_finalizer(
+        &self,
+        receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+        query_request: &GuardianCheckpointStageRequestV1,
+        record: &GuardianEncryptedCheckpointStageRecordV1,
+    ) -> Result<(), GuardianCheckpointCipherError> {
+        let (context, canonical_request) = checkpoint_finalizer_request_parts(
+            receipt,
+            query_request,
+            GuardianCheckpointStageKindV1::Query,
+        )?;
+        let opened =
+            self.open_exact_payload(&context, record, GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES)?;
+        checkpoint_inspect_finalizer_payload(
+            &opened,
+            &canonical_request,
+            CHECKPOINT_FINALIZER_KIND_EXPIRED,
+        )
+        .map(|_| ())
+    }
+
+    /// Reconcile a policy-expiry retry against the exact retained policy
+    /// decision whose identity is encrypted into the finalizer.
+    pub fn inspect_expiry_finalizer_with_policy(
+        &self,
+        receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+        query_request: &GuardianCheckpointStageRequestV1,
+        expiry_receipt: &GuardianCheckpointPolicyExpiryReceiptV1,
+        record: &GuardianEncryptedCheckpointStageRecordV1,
+    ) -> Result<(), GuardianCheckpointCipherError> {
+        let (context, canonical_expiry, _) =
+            checkpoint_expiry_finalizer_parts(receipt, query_request, expiry_receipt)?;
+        let opened =
+            self.open_exact_payload(&context, record, GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES)?;
+        if checkpoint_stage_bytes_match(&opened, &canonical_expiry) {
             Ok(())
         } else {
             Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
@@ -2601,6 +2719,7 @@ fn checkpoint_zeroizing_copy(
 fn checkpoint_ack_finalizer_parts(
     receipt: &GuardianCheckpointDurableCompletionReceiptV1,
     ack_request: &GuardianCheckpointStageRequestV1,
+    adoption_receipt: GuardianCheckpointReceipt,
 ) -> Result<
     (
         GuardianCheckpointStageRecordContextV1,
@@ -2609,32 +2728,154 @@ fn checkpoint_ack_finalizer_parts(
     ),
     GuardianCheckpointCipherError,
 > {
-    if ack_request.kind() != GuardianCheckpointStageKindV1::Ack
-        || ack_request.upload_id() != receipt.upload_id
-        || ack_request.completion_id() != Some(receipt.publication_id)
+    let (context, canonical_request) = checkpoint_finalizer_request_parts(
+        receipt,
+        ack_request,
+        GuardianCheckpointStageKindV1::Ack,
+    )?;
+    let GuardianCheckpointStageScopeKindV1::Pane {
+        pane_id,
+        generation,
+    } = receipt.binding.scope.kind
+    else {
+        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+    };
+    let adoption_intent = adoption_receipt.intent();
+    if adoption_receipt.disposition() != GuardianCheckpointDisposition::Committed
+        || adoption_receipt.pane_id() != pane_id
+        || adoption_receipt.generation() != generation
+        || adoption_receipt.sequence() == 0
+        || adoption_receipt.effect_id().is_nil()
+        || adoption_intent.checkpoint_identity().into_bytes()
+            != receipt.binding.checkpoint_identity_digest()?
+        || adoption_intent.output_boundary_identity().into_bytes()
+            != receipt.binding.boundary_identity_digest()?
     {
         return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
     }
-    let descriptor = ack_request
+    let trailer = checkpoint_finalizer_trailer(
+        CHECKPOINT_FINALIZER_KIND_ACK,
+        adoption_receipt.effect_id(),
+        adoption_receipt.sequence(),
+    );
+    let canonical_ack = checkpoint_finalizer_payload(&canonical_request, &trailer)?;
+    let (plaintext_bytes, plaintext_digest) =
+        checkpoint_stage_plaintext_identity(canonical_ack.as_slice())?;
+    if plaintext_bytes != GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES
+        || context.plaintext_bytes() != plaintext_bytes
+    {
+        return Err(GuardianCheckpointCipherError::InvalidSealManifestLength);
+    }
+    Ok((context, canonical_ack, plaintext_digest))
+}
+
+fn checkpoint_expiry_finalizer_parts(
+    receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+    query_request: &GuardianCheckpointStageRequestV1,
+    expiry_receipt: &GuardianCheckpointPolicyExpiryReceiptV1,
+) -> Result<
+    (
+        GuardianCheckpointStageRecordContextV1,
+        Zeroizing<Vec<u8>>,
+        Zeroizing<[u8; 32]>,
+    ),
+    GuardianCheckpointCipherError,
+> {
+    let (context, canonical_request) = checkpoint_finalizer_request_parts(
+        receipt,
+        query_request,
+        GuardianCheckpointStageKindV1::Query,
+    )?;
+    let GuardianCheckpointStageScopeKindV1::Pane {
+        pane_id,
+        generation,
+    } = receipt.binding.scope.kind
+    else {
+        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+    };
+    let expiry_intent = expiry_receipt.intent();
+    if expiry_receipt.pane_id() != pane_id
+        || expiry_receipt.generation() != generation
+        || expiry_receipt.completion_id() != receipt.publication_id
+        || expiry_receipt.expiry_id().is_nil()
+        || expiry_receipt.policy_epoch() == 0
+        || expiry_intent.checkpoint_identity().into_bytes()
+            != receipt.binding.checkpoint_identity_digest()?
+        || expiry_intent.output_boundary_identity().into_bytes()
+            != receipt.binding.boundary_identity_digest()?
+    {
+        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+    }
+    let trailer = checkpoint_finalizer_trailer(
+        CHECKPOINT_FINALIZER_KIND_EXPIRED,
+        expiry_receipt.expiry_id(),
+        expiry_receipt.policy_epoch(),
+    );
+    let canonical_expiry = checkpoint_finalizer_payload(&canonical_request, &trailer)?;
+    let (plaintext_bytes, plaintext_digest) =
+        checkpoint_stage_plaintext_identity(canonical_expiry.as_slice())?;
+    if plaintext_bytes != GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES
+        || context.plaintext_bytes() != plaintext_bytes
+    {
+        return Err(GuardianCheckpointCipherError::InvalidSealManifestLength);
+    }
+    Ok((context, canonical_expiry, plaintext_digest))
+}
+
+fn checkpoint_finalizer_request_parts(
+    receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+    request: &GuardianCheckpointStageRequestV1,
+    expected_kind: GuardianCheckpointStageKindV1,
+) -> Result<
+    (GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>),
+    GuardianCheckpointCipherError,
+> {
+    if request.kind() != expected_kind || request.upload_id() != receipt.upload_id {
+        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+    }
+    match expected_kind {
+        GuardianCheckpointStageKindV1::Ack
+            if request.completion_id() != Some(receipt.publication_id) =>
+        {
+            return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+        }
+        GuardianCheckpointStageKindV1::Query if request.completion_id().is_some() => {
+            return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+        }
+        GuardianCheckpointStageKindV1::Ack | GuardianCheckpointStageKindV1::Query => {}
+        GuardianCheckpointStageKindV1::Begin
+        | GuardianCheckpointStageKindV1::Chunk
+        | GuardianCheckpointStageKindV1::Seal => {
+            return Err(GuardianCheckpointCipherError::InvalidKindAuthority);
+        }
+    }
+    let descriptor = request
         .descriptor()
         .canonical_descriptor()
         .map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)?;
-    let scope = checkpoint_stage_scope_from_protocol(ack_request.scope())?;
+    let scope = checkpoint_stage_scope_from_protocol(request.scope())?;
     let binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
         scope,
         descriptor,
-        ack_request.descriptor().capture_generation(),
+        request.descriptor().capture_generation(),
     )?;
     if binding != receipt.binding {
         return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
     }
-    let canonical_ack = Zeroizing::new(
-        ack_request
+    let canonical_request = Zeroizing::new(
+        request
             .encode()
             .map_err(|_| GuardianCheckpointCipherError::InvalidSealRequest)?,
     );
-    let (plaintext_bytes, plaintext_digest) =
-        checkpoint_stage_plaintext_identity(canonical_ack.as_slice())?;
+    let plaintext_bytes = match expected_kind {
+        GuardianCheckpointStageKindV1::Ack => GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES,
+        GuardianCheckpointStageKindV1::Query => GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES,
+        GuardianCheckpointStageKindV1::Begin
+        | GuardianCheckpointStageKindV1::Chunk
+        | GuardianCheckpointStageKindV1::Seal => {
+            return Err(GuardianCheckpointCipherError::InvalidKindAuthority);
+        }
+    };
     let context = GuardianCheckpointStageRecordContextV1::from_persisted_parts(
         GuardianCheckpointStageRecordKindV1::Finalizer,
         receipt.binding.scope,
@@ -2645,7 +2886,64 @@ fn checkpoint_ack_finalizer_parts(
         None,
         plaintext_bytes,
     )?;
-    Ok((context, canonical_ack, plaintext_digest))
+    Ok((context, canonical_request))
+}
+
+fn checkpoint_finalizer_trailer(kind: u8, authority_id: Uuid, sequence: u64) -> [u8; 40] {
+    let mut trailer = [0_u8; CHECKPOINT_FINALIZER_TRAILER_BYTES];
+    trailer[..8].copy_from_slice(&CHECKPOINT_FINALIZER_TRAILER_MAGIC);
+    trailer[8..12].copy_from_slice(&CHECKPOINT_FINALIZER_TRAILER_VERSION.to_le_bytes());
+    trailer[12] = kind;
+    trailer[16..32].copy_from_slice(authority_id.as_bytes());
+    trailer[32..40].copy_from_slice(&sequence.to_le_bytes());
+    trailer
+}
+
+fn checkpoint_finalizer_payload(
+    canonical_request: &[u8],
+    trailer: &[u8; CHECKPOINT_FINALIZER_TRAILER_BYTES],
+) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError> {
+    let capacity = canonical_request
+        .len()
+        .checked_add(trailer.len())
+        .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?;
+    let mut payload = Zeroizing::new(Vec::new());
+    payload
+        .try_reserve_exact(capacity)
+        .map_err(|_| GuardianCheckpointCipherError::PlaintextAllocationFailed)?;
+    payload.extend_from_slice(canonical_request);
+    payload.extend_from_slice(trailer);
+    Ok(payload)
+}
+
+fn checkpoint_inspect_finalizer_payload(
+    opened: &[u8],
+    canonical_request: &[u8],
+    expected_kind: u8,
+) -> Result<(Uuid, u64), GuardianCheckpointCipherError> {
+    let trailer_offset = canonical_request.len();
+    if opened.len()
+        != trailer_offset
+            .checked_add(CHECKPOINT_FINALIZER_TRAILER_BYTES)
+            .ok_or(GuardianCheckpointCipherError::ArithmeticOverflow)?
+        || !checkpoint_stage_bytes_match(&opened[..trailer_offset], canonical_request)
+    {
+        return Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch);
+    }
+    let trailer = &opened[trailer_offset..];
+    if trailer[..8] != CHECKPOINT_FINALIZER_TRAILER_MAGIC
+        || checkpoint_stage_u32_at(trailer, 8) != CHECKPOINT_FINALIZER_TRAILER_VERSION
+        || trailer[12] != expected_kind
+        || trailer[13..16] != [0; 3]
+    {
+        return Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch);
+    }
+    let authority_id = checkpoint_stage_uuid_at(trailer, 16);
+    let sequence = checkpoint_stage_u64_at(trailer, 32);
+    if authority_id.is_nil() || sequence == 0 {
+        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+    }
+    Ok((authority_id, sequence))
 }
 
 fn checkpoint_canonical_seal_manifest(
@@ -4354,6 +4652,7 @@ mod tests {
 
     const PROTOCOL_DELIVERY_CRITICAL_TYPES: &[&str] = &[
         "GuardianCheckpointStageRequestV1",
+        "GuardianCheckpointRuntimeSealPermitV1",
         "GuardianCheckpointStageChunkDeliveryV1",
         "GuardianCheckpointChunkDelivery",
         "GuardianCheckpointChunkNonDuplicable",
@@ -4939,12 +5238,15 @@ mod tests {
                 (
                     Some("GuardianCheckpointStageChunkDeliveryV1"),
                     "into_validated_parts"
-                ) | (Some("GuardianCheckpointStageRequestV1"), "into_chunk")
+                ) | (Some("GuardianCheckpointRuntimeSealPermitV1"), "into_parts")
+                    | (Some("GuardianCheckpointStageRequestV1"), "into_chunk")
                     | (Some("GuardianCheckpointStageRequestV1"), "encode")
                     | (
                         Some("GuardianCheckpointStageRequestV1"),
                         "into_zeroizing_payload"
                     )
+                    | (Some("GuardianProtocolState"), "preflight_checkpoint_stage")
+                    | (Some("GuardianProtocolState"), "preflight_checkpoint_seal")
             ) {
                 let mut exact = function.clone();
                 exact.attrs.clear();
@@ -5300,6 +5602,14 @@ mod tests {
             ),
             expected_protocol_delivery_struct(
                 r#"
+                    pub struct GuardianCheckpointRuntimeSealPermitV1 {
+                        request: GuardianCheckpointStageRequestV1,
+                        mux_incarnation: Uuid,
+                    }
+                "#,
+            ),
+            expected_protocol_delivery_struct(
+                r#"
                     pub struct GuardianCheckpointChunkDelivery {
                         descriptor: GuardianCheckpointDescriptorV1,
                         offset: u64,
@@ -5339,6 +5649,8 @@ mod tests {
             "GuardianCheckpointStageChunkDeliveryV1:<inherent>",
             "GuardianCheckpointStageRequestV1:std::fmt::Debug",
             "GuardianCheckpointStageRequestV1:<inherent>",
+            "GuardianCheckpointRuntimeSealPermitV1:std::fmt::Debug",
+            "GuardianCheckpointRuntimeSealPermitV1:<inherent>",
             "GuardianCheckpointChunkDelivery:std::fmt::Debug",
             "GuardianCheckpointChunkDelivery:ZeroizeOnDrop",
             "GuardianCheckpointChunkDelivery:Drop",
@@ -5352,6 +5664,36 @@ mod tests {
 
         sort_authority_methods(&mut inventory.methods);
         let mut expected_methods = vec![
+            expected_authority_method(
+                "GuardianProtocolState",
+                "pub",
+                false,
+                "fn preflight_checkpoint_stage(&self, request: &AuthenticatedGuardianRequest) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianProtocolState",
+                "pub",
+                false,
+                "fn preflight_checkpoint_seal(&self, request: &AuthenticatedGuardianRequest) -> Result<GuardianCheckpointRuntimeSealPermitV1, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointRuntimeSealPermitV1",
+                "pub",
+                false,
+                "const fn request(&self) -> &GuardianCheckpointStageRequestV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointRuntimeSealPermitV1",
+                "pub(crate)",
+                false,
+                "fn into_parts(self) -> (GuardianCheckpointStageRequestV1, Uuid)",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointRuntimeSealPermitV1",
+                "private",
+                false,
+                "fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result",
+            ),
             expected_authority_method(
                 "GuardianCheckpointStageChunkDeliveryV1",
                 "private",
@@ -5608,6 +5950,104 @@ mod tests {
         sort_protocol_ownership_methods(&mut inventory.ownership_methods);
         let mut expected_ownership_methods = vec![
             expected_protocol_ownership_method(
+                "GuardianProtocolState",
+                r#"
+                    pub fn preflight_checkpoint_stage(
+                        &self,
+                        request: &AuthenticatedGuardianRequest,
+                    ) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError> {
+                        validate_request_envelope(request)?;
+                        if request.header.guardian_incarnation != self.incarnation {
+                            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+                        }
+                        if request.header.operation != GuardianOperation::CheckpointStage {
+                            return Err(GuardianProtocolError::InvalidOperationScope {
+                                operation: request.header.operation,
+                            });
+                        }
+                        let stage = GuardianCheckpointStageRequestV1::decode(request.payload())?;
+                        let GuardianCheckpointScopeV1::Pane {
+                            pane_id,
+                            generation,
+                        } = stage.scope()
+                        else {
+                            return Err(GuardianProtocolError::InvalidOperationScope {
+                                operation: GuardianOperation::CheckpointStage,
+                            });
+                        };
+                        match self.panes.get(&pane_id) {
+                            Some(GuardianPaneState::LiveClaimed {
+                                generation: live_generation,
+                                mux_incarnation,
+                                pending_input_effect: None,
+                                ..
+                            }) if *live_generation == generation
+                                && *mux_incarnation == request.header.mux_incarnation
+                                && !self
+                                    .indeterminate_checkpoints_by_pane
+                                    .contains_key(&pane_id) =>
+                            {
+                                Ok(stage)
+                            }
+                            Some(GuardianPaneState::LiveClaimed {
+                                generation: live_generation,
+                                mux_incarnation,
+                                pending_input_effect: Some(_),
+                                ..
+                            }) if *live_generation == generation
+                                && *mux_incarnation == request.header.mux_incarnation =>
+                            {
+                                Err(GuardianProtocolError::InputDurabilityPending)
+                            }
+                            Some(GuardianPaneState::LiveClaimed {
+                                generation: live_generation,
+                                mux_incarnation,
+                                pending_input_effect: None,
+                                ..
+                            }) if *live_generation == generation
+                                && *mux_incarnation == request.header.mux_incarnation =>
+                            {
+                                Err(GuardianProtocolError::CheckpointOutcomeIndeterminate)
+                            }
+                            Some(GuardianPaneState::LiveUnclaimed { .. })
+                            | Some(GuardianPaneState::LiveClaimed { .. }) => Err(GuardianProtocolError::StaleLease),
+                            Some(
+                                GuardianPaneState::ExitedUnclaimed { .. }
+                                | GuardianPaneState::ClosedTerminal { .. }
+                                | GuardianPaneState::Quarantined { .. },
+                            ) => Err(GuardianProtocolError::PaneTerminal),
+                            None => Err(GuardianProtocolError::PaneNotFound(pane_id)),
+                        }
+                    }
+                "#,
+            ),
+            expected_protocol_ownership_method(
+                "GuardianProtocolState",
+                r#"
+                    pub fn preflight_checkpoint_seal(
+                        &self,
+                        request: &AuthenticatedGuardianRequest,
+                    ) -> Result<GuardianCheckpointRuntimeSealPermitV1, GuardianProtocolError> {
+                        let stage = self.preflight_checkpoint_stage(request)?;
+                        if stage.kind() != GuardianCheckpointStageKindV1::Seal {
+                            return Err(GuardianProtocolError::InvalidOperationPayload);
+                        }
+                        Ok(GuardianCheckpointRuntimeSealPermitV1 {
+                            request: stage,
+                            mux_incarnation: request.header.mux_incarnation,
+                        })
+                    }
+                "#,
+            ),
+            expected_protocol_ownership_method(
+                "GuardianCheckpointRuntimeSealPermitV1",
+                r#"
+                    pub(crate) fn into_parts(self) -> (GuardianCheckpointStageRequestV1, Uuid) {
+                        (self.request, self.mux_incarnation)
+                    }
+                "#,
+            ),
+            expected_protocol_ownership_method(
                 "GuardianCheckpointStageChunkDeliveryV1",
                 r#"
                     pub fn into_validated_parts(
@@ -5663,9 +6103,7 @@ mod tests {
             expected_protocol_ownership_method(
                 "GuardianCheckpointStageRequestV1",
                 r#"
-                    pub fn into_zeroizing_payload(
-                        self,
-                    ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+                    pub fn into_zeroizing_payload(self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
                         self.validate()?;
                         let capacity = self.encoded_capacity()?;
                         let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
@@ -5676,12 +6114,33 @@ mod tests {
             ),
         ];
         sort_protocol_ownership_methods(&mut expected_ownership_methods);
+        if inventory.ownership_methods != expected_ownership_methods {
+            for (observed, expected) in inventory
+                .ownership_methods
+                .iter()
+                .zip(expected_ownership_methods.iter())
+            {
+                eprintln!(
+                    "protocol ownership method {}::{}: owner_equal={} signature_equal={} block_equal={} attrs_equal={} visibility_equal={}",
+                    observed.0,
+                    observed.1.sig.ident,
+                    observed.0 == expected.0,
+                    observed.1.sig == expected.1.sig,
+                    observed.1.block == expected.1.block,
+                    observed.1.attrs == expected.1.attrs,
+                    observed.1.vis == expected.1.vis,
+                );
+            }
+        }
         assert_eq!(inventory.ownership_methods, expected_ownership_methods);
 
         inventory.return_sites.sort();
         let mut expected_return_sites = vec![
             "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new:pub:production",
+            "GuardianCheckpointRuntimeSealPermitV1@GuardianProtocolState::preflight_checkpoint_seal:pub:production",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::into_chunk:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointRuntimeSealPermitV1::into_parts:pub(crate):production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointRuntimeSealPermitV1::request:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::begin:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode:pub:production",
@@ -5689,6 +6148,7 @@ mod tests {
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::query:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianProtocolState::preflight_checkpoint_stage:pub:production",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -5700,6 +6160,7 @@ mod tests {
         let mut expected_construction_sites = vec![
             "GuardianCheckpointChunkDelivery@<free>::decode_replay_page_body",
             "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new",
+            "GuardianCheckpointRuntimeSealPermitV1@GuardianProtocolState::preflight_checkpoint_seal",
             "GuardianCheckpointChunkNonDuplicable@<free>::decode_replay_page_body",
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointChunkDelivery::new",
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointStageRequestV1::chunk",
@@ -5718,6 +6179,7 @@ mod tests {
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::query",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal",
+            "GuardianCheckpointStageRequestV1@GuardianProtocolState::preflight_checkpoint_stage",
             "GuardianCheckpointStageRequestV1@GuardianReply::require_request_payload",
         ]
         .into_iter()
@@ -5777,18 +6239,14 @@ mod tests {
         assert_eq!(
             inventory.uses,
             vec![
+                expected_use("use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};",),
                 expected_use(
-                    "use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};",
-                ),
-                expected_use(
-                    "use frankenterm_term::{RecoveryTerminalCheckpointV2, terminalstate::checkpoint::TerminalCheckpointLimits};",
+                    "use frankenterm_term::{terminalstate::checkpoint::TerminalCheckpointLimits, RecoveryTerminalCheckpointV2};",
                 ),
                 expected_use("use hmac::{Hmac, KeyInit, Mac};"),
-                expected_use("use portable_pty::{PtySize, cmdbuilder::CommandBuilder};"),
+                expected_use("use portable_pty::{cmdbuilder::CommandBuilder, PtySize};"),
                 expected_use("use sha2::{Digest as _, Sha256};"),
-                expected_use(
-                    "use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};",
-                ),
+                expected_use("use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};",),
                 expected_use("use std::convert::TryFrom;"),
                 expected_use("use std::panic::AssertUnwindSafe;"),
                 expected_use("use thiserror::Error;"),
@@ -5838,20 +6296,60 @@ mod tests {
         assert_eq!(
             inventory.item_macros,
             vec![
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointChunkNonDuplicable: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianWireFrame: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianWireFrame: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayProtectedDigest: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayProtectedDigest: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayRecordDelivery: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayRecordDelivery: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayOutputRecordsDelivery: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayOutputRecordsDelivery: ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: ZeroizeOnDrop);"),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointCatalogAdoptionPermitV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointPolicyExpiryReceiptV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianCheckpointPolicyExpiryReceiptV1: ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointChunkNonDuplicable: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianWireFrame: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianWireFrame: ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianReplayProtectedDigest: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianReplayProtectedDigest: ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointRuntimeSealPermitV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianReplayRecordDelivery: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianReplayRecordDelivery: ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianReplayOutputRecordsDelivery: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianReplayOutputRecordsDelivery: ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: ZeroizeOnDrop);"
+                ),
             ]
         );
         assert_eq!(inventory.unexpected_macros, Vec::<syn::Macro>::new());
@@ -6071,6 +6569,10 @@ mod tests {
     }
 
     fn record_terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+        record_terminal_checkpoint_with(b"checkpoint boundary")
+    }
+
+    fn record_terminal_checkpoint_with(content: &[u8]) -> RecoveryTerminalCheckpointV2 {
         let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 24,
@@ -6086,14 +6588,14 @@ mod tests {
         );
         let mut parser = termwiz::escape::parser::Parser::new();
         let mut actions = Vec::new();
-        parser.parse(b"checkpoint boundary", |action| actions.push(action));
+        parser.parse(content, |action| actions.push(action));
         terminal.perform_actions(actions);
         let ground = parser
             .recovery_ground_boundary()
             .expect("record-backed parser fixture is at recovery ground");
         assert_eq!(
             ground.stream_bytes(),
-            19,
+            u64::try_from(content.len()).expect("fixture content length fits u64"),
             "record-backed parser fixture carries the exact raw byte watermark"
         );
         let checkpoint = terminal
@@ -6104,7 +6606,7 @@ mod tests {
             .expect("capture canonical record-backed terminal fixture");
         assert_eq!(
             checkpoint.parser_stream_bytes(),
-            19,
+            u64::try_from(content.len()).expect("fixture content length fits u64"),
             "record-backed terminal fixture retains the external parser watermark"
         );
         checkpoint
@@ -7058,7 +7560,7 @@ mod tests {
             Err(GuardianCheckpointBoundaryError::TerminalGeometryMismatch)
         );
 
-        let content_splice = terminal_checkpoint_with(24, 80, "guardian-checkpoint-tesz");
+        let content_splice = record_terminal_checkpoint_with(b"checkpoint boundarz");
         assert_eq!(
             content_splice.canonical_payload().len(),
             capture.terminal_checkpoint().canonical_payload().len(),
@@ -7167,6 +7669,7 @@ mod tests {
         cipher: &GuardianCheckpointCipher,
         original_header: [u8; GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES],
         original_ciphertext: &[u8],
+        label: &str,
         mutate: impl FnOnce(&mut [u8; GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES], &mut Vec<u8>),
     ) {
         let mut header = original_header;
@@ -7179,14 +7682,18 @@ mod tests {
         )
         .expect("AAD mutation fixture must remain structurally valid");
         let expected_context = record.context();
-        assert!(matches!(
-            cipher.open(
-                &expected_context,
-                &record,
-                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+        assert!(
+            matches!(
+                cipher.open(
+                    &expected_context,
+                    &record,
+                    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+                ),
+                Err(GuardianCheckpointCipherError::AuthenticationFailed)
             ),
-            Err(GuardianCheckpointCipherError::AuthenticationFailed)
-        ));
+            "authenticated mutation was accepted: {}",
+            label
+        );
     }
 
     fn assert_authenticated_inner_mutation_fails(
@@ -7947,6 +8454,7 @@ mod tests {
             "GuardianCheckpointStageSealIntentV1::from_binding:private:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::bind_seal_operation:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly:pub:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1::context:pub:production",
@@ -8039,6 +8547,12 @@ mod tests {
                 "private",
                 true,
                 "fn issue_for_test(seal_request: GuardianCheckpointStageRequestV1, publication_id: Uuid, candidate_identity: GuardianCheckpointCandidateIdentityV1, ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestAuthorityV1",
+                "pub",
+                false,
+                "fn from_guardian_runtime_seal_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointRuntimeSealPermitV1) -> Result<(Self, GuardianCheckpointStageRequestV1), GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointValidatedManifestAuthorityV1",
@@ -8255,7 +8769,10 @@ mod tests {
         let mut expected_cipher_methods = vec![
             "from_output_cipher:pub:GuardianOutputCipher",
             "inspect_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianEncryptedCheckpointStageRecordV1",
+            "inspect_ack_finalizer_with_adoption:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointReceipt,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_durable_manifest_receipt:pub:GuardianCheckpointStageBindingV1,GuardianCheckpointStageRequestV1,Uuid,GuardianCheckpointCandidateIdentityV1,GuardianCheckpointOrderedChunkSetIdentityV1,GuardianEncryptedCheckpointStageRecordV1",
+            "inspect_expiry_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianEncryptedCheckpointStageRecordV1",
+            "inspect_expiry_finalizer_with_policy:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointPolicyExpiryReceiptV1,GuardianEncryptedCheckpointStageRecordV1",
             "key_id:pub:",
             "open:pub:GuardianCheckpointStageRecordContextV1,GuardianEncryptedCheckpointStageRecordV1,u32",
             "open_exact_payload:private:GuardianCheckpointStageRecordContextV1,GuardianEncryptedCheckpointStageRecordV1,u32",
@@ -8264,8 +8781,9 @@ mod tests {
             "retry_open_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1,GuardianEncryptedCheckpointStageRecordV1",
             "retry_seal_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1",
             "seal:pub:GuardianCheckpointStageSealIntentV1",
-            "seal_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1",
+            "seal_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointReceipt",
             "seal_exact_payload:private:GuardianCheckpointStageRecordContextV1,u8,u8",
+            "seal_expiry_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointPolicyExpiryReceiptV1",
             "seal_manifest:pub:GuardianCheckpointValidatedManifestOperationV1",
             "seal_validated_manifest:private:GuardianCheckpointValidatedManifestOperationV1",
         ]
@@ -8317,13 +8835,37 @@ mod tests {
                 "GuardianCheckpointCipher",
                 "pub",
                 false,
-                "fn seal_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+                "fn seal_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, adoption_receipt: GuardianCheckpointReceipt) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointCipher",
                 "pub",
                 false,
                 "fn inspect_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_ack_finalizer_with_adoption(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, adoption_receipt: GuardianCheckpointReceipt, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_expiry_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, query_request: &GuardianCheckpointStageRequestV1, expiry_receipt: GuardianCheckpointPolicyExpiryReceiptV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_expiry_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, query_request: &GuardianCheckpointStageRequestV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_expiry_finalizer_with_policy(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, query_request: &GuardianCheckpointStageRequestV1, expiry_receipt: &GuardianCheckpointPolicyExpiryReceiptV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointCipher",
@@ -8473,7 +9015,7 @@ mod tests {
                 "GuardianCheckpointCipher",
                 "pub",
                 false,
-                "fn seal_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+                "fn seal_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, adoption_receipt: GuardianCheckpointReceipt) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointCipher",
@@ -8482,10 +9024,46 @@ mod tests {
                 "fn inspect_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_ack_finalizer_with_adoption(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, adoption_receipt: GuardianCheckpointReceipt, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_expiry_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, query_request: &GuardianCheckpointStageRequestV1, expiry_receipt: GuardianCheckpointPolicyExpiryReceiptV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_expiry_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, query_request: &GuardianCheckpointStageRequestV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_expiry_finalizer_with_policy(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, query_request: &GuardianCheckpointStageRequestV1, expiry_receipt: &GuardianCheckpointPolicyExpiryReceiptV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
                 "<free>",
                 "private",
                 false,
-                "fn checkpoint_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>,), GuardianCheckpointCipherError,>",
+                "fn checkpoint_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, adoption_receipt: GuardianCheckpointReceipt) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>,), GuardianCheckpointCipherError,>",
+            ),
+            expected_authority_method(
+                "<free>",
+                "private",
+                false,
+                "fn checkpoint_expiry_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, query_request: &GuardianCheckpointStageRequestV1, expiry_receipt: &GuardianCheckpointPolicyExpiryReceiptV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>,), GuardianCheckpointCipherError,>",
+            ),
+            expected_authority_method(
+                "<free>",
+                "private",
+                false,
+                "fn checkpoint_finalizer_request_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, request: &GuardianCheckpointStageRequestV1, expected_kind: GuardianCheckpointStageKindV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>), GuardianCheckpointCipherError,>",
             ),
             expected_authority_method(
                 "<free>",
@@ -8535,6 +9113,7 @@ mod tests {
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::candidate_metadata:pub:production",
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::chunk:pub:production",
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding:private:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
@@ -8559,6 +9138,7 @@ mod tests {
             "GuardianCheckpointOrderedChunkSetBuilderV1@GuardianCheckpointOrderedChunkSetBuilderV1::new",
             "GuardianCheckpointOrderedChunkSetIdentityV1@GuardianCheckpointOrderedChunkSetBuilderV1::finish",
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
@@ -8579,24 +9159,20 @@ mod tests {
                     "use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputSegmentIdentity};",
                 ),
                 expected_use(
-                    "use crate::guardian_protocol::{GuardianCheckpointChunkDelivery, GuardianCheckpointScopeV1, GuardianCheckpointStageChunkDeliveryV1, GuardianCheckpointStageKindV1, GuardianCheckpointStageRequestV1};",
+                    "use crate::guardian_protocol::{GuardianCheckpointChunkDelivery, GuardianCheckpointDisposition, GuardianCheckpointPolicyExpiryReceiptV1, GuardianCheckpointReceipt, GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1, GuardianCheckpointStageChunkDeliveryV1, GuardianCheckpointStageKindV1, GuardianCheckpointStageRequestV1};",
                 ),
                 expected_use("use crate::pane::Pane;"),
                 expected_use(
                     "use crate::{LiveParserCheckpointControl, LiveParserCheckpointError, PaneRegistrationGeneration, PaneRegistrationOperationLease};",
                 ),
                 expected_use(
-                    "use frankenterm_term::{RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID, RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2, terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2}};",
+                    "use frankenterm_term::{terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2}, RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2, RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID};",
                 ),
                 expected_use("use sha2::{Digest as _, Sha256};"),
                 expected_use("use std::convert::TryFrom;"),
                 expected_use("use std::sync::{Arc, Weak};"),
-                expected_use(
-                    "use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;",
-                ),
-                expected_use(
-                    "use termwiz::escape::{parser::RecoveryGroundBoundary, Action};",
-                ),
+                expected_use("use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;",),
+                expected_use("use termwiz::escape::{parser::RecoveryGroundBoundary, Action};",),
                 expected_use("use thiserror::Error;"),
                 expected_use("use uuid::Uuid;"),
                 expected_use("use zeroize::{Zeroize, Zeroizing};"),
@@ -8637,29 +9213,75 @@ mod tests {
         assert_eq!(
             inventory.item_macros,
             vec![
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointDurableCompletionReceiptV1: zeroize::ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedStageAssemblyV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedManifestAuthorityV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageSealIntentV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedManifestOperationV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointManifestRetryCapabilityV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointManifestSealCapabilitiesV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(LiveParserCaptureAuthority: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(LiveParserCheckpointAck: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);"),
-                expected_item_macro("static_assertions::assert_impl_all!(Sha256: zeroize::ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_impl_all!(Zeroizing<[u8; 32]>: zeroize::ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);"),
-                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::ZeroizeOnDrop);"),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianCheckpointDurableCompletionReceiptV1: zeroize::ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedStageAssemblyV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedManifestAuthorityV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointStageSealIntentV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedManifestOperationV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointManifestRetryCapabilityV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointManifestSealCapabilitiesV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(LiveParserCaptureAuthority: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(LiveParserCheckpointAck: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(Sha256: zeroize::ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(Zeroizing<[u8; 32]>: zeroize::ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::ZeroizeOnDrop);"
+                ),
             ]
         );
         assert_eq!(inventory.modules, Vec::<String>::new());
@@ -9069,12 +9691,30 @@ mod tests {
                 &record,
             )
             .expect("recover the exact durable Seal receipt without publication authority");
+        let adoption_receipt = GuardianCheckpointReceipt::issue_committed_for_test(
+            receipt_pane_id,
+            receipt_generation,
+            1,
+            Uuid::new_v4(),
+            crate::guardian_protocol::GuardianCheckpointIntent::new(
+                receipt_ack_request.descriptor().checkpoint_id(),
+                receipt_ack_request.descriptor().boundary_id(),
+            ),
+        );
         let ack_record = cipher
-            .seal_ack_finalizer(&completion_receipt, &receipt_ack_request)
+            .seal_ack_finalizer(&completion_receipt, &receipt_ack_request, adoption_receipt)
             .expect("seal the unique completion ACK finalizer");
         cipher
             .inspect_ack_finalizer(&completion_receipt, &receipt_ack_request, &ack_record)
             .expect("recover an exact lost ACK reply");
+        cipher
+            .inspect_ack_finalizer_with_adoption(
+                &completion_receipt,
+                &receipt_ack_request,
+                adoption_receipt,
+                &ack_record,
+            )
+            .expect("reconcile the exact catalog-adoption retry");
         let wrong_ack_request = GuardianCheckpointStageRequestV1::ack(
             GuardianCheckpointScopeV1::Pane {
                 pane_id: receipt_pane_id,
@@ -9087,8 +9727,69 @@ mod tests {
         )
         .expect("construct conflicting completion ACK");
         assert!(matches!(
-            cipher.seal_ack_finalizer(&completion_receipt, &wrong_ack_request),
+            cipher.seal_ack_finalizer(&completion_receipt, &wrong_ack_request, adoption_receipt,),
             Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch)
+        ));
+
+        let receipt_query_request = GuardianCheckpointStageRequestV1::query(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id: receipt_pane_id,
+                generation: receipt_generation,
+            },
+            upload_id,
+            receipt_ack_request.descriptor(),
+            receipt_ack_request.chunk_bytes(),
+        )
+        .expect("construct exact completion Query");
+        let expiry_id = Uuid::new_v4();
+        let expiry_intent = crate::guardian_protocol::GuardianCheckpointIntent::new(
+            receipt_ack_request.descriptor().checkpoint_id(),
+            receipt_ack_request.descriptor().boundary_id(),
+        );
+        let expiry_receipt = || {
+            GuardianCheckpointPolicyExpiryReceiptV1::issue_for_test(
+                receipt_pane_id,
+                receipt_generation,
+                publication_id,
+                expiry_intent,
+                expiry_id,
+                7,
+            )
+        };
+        let expiry_record = cipher
+            .seal_expiry_finalizer(
+                &completion_receipt,
+                &receipt_query_request,
+                expiry_receipt(),
+            )
+            .expect("seal the unique policy-expiry finalizer");
+        cipher
+            .inspect_expiry_finalizer(&completion_receipt, &receipt_query_request, &expiry_record)
+            .expect("recover an exact lost expiry reply");
+        cipher
+            .inspect_expiry_finalizer_with_policy(
+                &completion_receipt,
+                &receipt_query_request,
+                &expiry_receipt(),
+                &expiry_record,
+            )
+            .expect("reconcile the exact policy-expiry retry");
+        let conflicting_expiry = GuardianCheckpointPolicyExpiryReceiptV1::issue_for_test(
+            receipt_pane_id,
+            receipt_generation,
+            publication_id,
+            expiry_intent,
+            Uuid::new_v4(),
+            7,
+        );
+        assert!(matches!(
+            cipher.inspect_expiry_finalizer_with_policy(
+                &completion_receipt,
+                &receipt_query_request,
+                &conflicting_expiry,
+                &expiry_record,
+            ),
+            Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
         ));
 
         let (other_descriptor, _, _, other_capture) = record_descriptor();
@@ -9401,7 +10102,6 @@ mod tests {
         assert_eq!(&aad[aad.len() - 32..], &[0; 32]);
 
         for offset in [
-            CONTEXT_KIND_OFFSET,
             CONTEXT_SCOPE_ID_OFFSET,
             CONTEXT_GENERATION_OFFSET,
             CONTEXT_UPLOAD_OFFSET,
@@ -9415,6 +10115,7 @@ mod tests {
                 &cipher,
                 header,
                 record.ciphertext(),
+                &format!("context-offset-{offset}"),
                 |mutated_header, _| mutated_header[offset] ^= 1,
             );
         }
@@ -9423,6 +10124,18 @@ mod tests {
             &cipher,
             header,
             record.ciphertext(),
+            "record-kind",
+            |mutated_header, _| {
+                mutated_header[CONTEXT_KIND_OFFSET] =
+                    GuardianCheckpointStageRecordKindV1::CandidateMetadata as u8;
+            },
+        );
+
+        assert_authenticated_header_mutation_fails(
+            &cipher,
+            header,
+            record.ciphertext(),
+            "scope-kind-transition",
             |mutated_header, _| {
                 mutated_header[CONTEXT_SCOPE_TAG_OFFSET] = 2;
                 mutated_header[CONTEXT_GENERATION_OFFSET..CONTEXT_GENERATION_OFFSET + 8].fill(0);
@@ -9432,6 +10145,7 @@ mod tests {
             &cipher,
             header,
             record.ciphertext(),
+            "plaintext-length",
             |mutated_header, mutated_ciphertext| {
                 let shorter = context
                     .plaintext_bytes()
@@ -9529,12 +10243,14 @@ mod tests {
             &cipher,
             header,
             record.ciphertext(),
+            "nonce",
             |mutated_header, _| mutated_header[24] ^= 1,
         );
         assert_authenticated_header_mutation_fails(
             &cipher,
             header,
             record.ciphertext(),
+            "ciphertext",
             |_, mutated_ciphertext| mutated_ciphertext[0] ^= 1,
         );
 

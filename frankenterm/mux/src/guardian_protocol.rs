@@ -74,7 +74,7 @@ const RESPONSE_PAYLOAD_LENGTH_OFFSET: usize =
 const SPAWN_PAYLOAD_MAGIC: [u8; 4] = *b"GSP1";
 const RESIZE_PAYLOAD_MAGIC: [u8; 4] = *b"GRS1";
 const SIGNAL_PAYLOAD_MAGIC: [u8; 4] = *b"GSG1";
-const INPUT_EFFECT_QUERY_PAYLOAD_MAGIC: [u8; 4] = *b"GIQ1";
+const INPUT_EFFECT_QUERY_PAYLOAD_MAGIC: [u8; 4] = *b"GIQ2";
 const CHECKPOINT_INTENT_PAYLOAD_MAGIC: [u8; 4] = *b"GCP1";
 const CHECKPOINT_RECEIPT_PAYLOAD_MAGIC: [u8; 4] = *b"GCR1";
 const CHECKPOINT_STAGE_PAYLOAD_MAGIC: [u8; 4] = *b"GCS1";
@@ -87,7 +87,7 @@ const REJECTION_PAYLOAD_MAGIC: [u8; 4] = *b"GRE1";
 const SPAWN_PAYLOAD_FIXED_BYTES: usize = 16;
 const RESIZE_PAYLOAD_BYTES: usize = 12;
 const SIGNAL_PAYLOAD_BYTES: usize = 5;
-const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 48;
+const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 64;
 const INPUT_RECEIPT_PAYLOAD_BYTES: usize = 53;
 const INPUT_EFFECT_REPLY_PAYLOAD_BYTES: usize = 21;
 const REJECTION_PAYLOAD_BYTES: usize = 6;
@@ -1160,28 +1160,66 @@ impl GuardianCheckpointEffectIdentity {
     }
 }
 
-/// Nonconstructible pending-publication authority passed only by the protocol
-/// state machine after every fence and capacity check succeeds.
-struct GuardianCheckpointPending {
+/// Nonconstructible catalog-publication authority issued only after the
+/// authenticated Checkpoint operation passes every lease, mutation-sequence,
+/// effect-identity, capacity, and idempotency fence.
+///
+/// The permit is deliberately neither `Clone` nor `Copy`. Its public accessors
+/// expose only the exact content-free identities a guardian catalog must bind;
+/// no caller can construct or retarget one from raw wire fields.
+#[must_use = "checkpoint catalog adoption permits must be consumed by the durable publisher"]
+pub struct GuardianCheckpointCatalogAdoptionPermitV1 {
     identity: GuardianCheckpointEffectIdentity,
 }
 
-impl std::fmt::Debug for GuardianCheckpointPending {
+impl std::fmt::Debug for GuardianCheckpointCatalogAdoptionPermitV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("GuardianCheckpointPending")
+            .debug_struct("GuardianCheckpointCatalogAdoptionPermitV1")
             .field("identity", &self.identity)
             .finish()
     }
 }
 
-impl GuardianCheckpointPending {
+impl GuardianCheckpointCatalogAdoptionPermitV1 {
+    #[must_use]
+    pub const fn pane_id(&self) -> Uuid {
+        self.identity.pane_id
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(&self) -> Uuid {
+        self.identity.mux_incarnation
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.identity.generation
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.identity.sequence
+    }
+
+    #[must_use]
+    pub const fn effect_id(&self) -> Uuid {
+        self.identity.effect_id
+    }
+
+    #[must_use]
+    pub const fn intent(&self) -> GuardianCheckpointIntent {
+        self.identity.intent
+    }
+
     #[must_use]
     #[cfg(test)]
     const fn identity(&self) -> GuardianCheckpointEffectIdentity {
         self.identity
     }
 }
+
+static_assertions::assert_not_impl_any!(GuardianCheckpointCatalogAdoptionPermitV1: Clone, Copy);
 
 /// Authenticated checkpoint receipt. `OutcomeIndeterminate` is terminal for
 /// blind retry and is encoded under a distinct response status.
@@ -1220,6 +1258,28 @@ impl GuardianCheckpointReceipt {
             effect_id: identity.effect_id,
             intent: identity.intent,
             disposition,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_committed_for_test(
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        effect_id: Uuid,
+        intent: GuardianCheckpointIntent,
+    ) -> Self {
+        assert!(!pane_id.is_nil());
+        assert!(generation > 0);
+        assert!(sequence > 0);
+        assert!(!effect_id.is_nil());
+        Self {
+            pane_id,
+            generation,
+            sequence,
+            effect_id,
+            intent,
+            disposition: GuardianCheckpointDisposition::Committed,
         }
     }
 
@@ -1306,6 +1366,106 @@ impl GuardianCheckpointReceipt {
             && self.intent == identity.intent
     }
 }
+
+/// Opaque authorization that one exact sealed checkpoint may be finalized as
+/// expired by guardian retention policy.
+///
+/// Production code cannot construct this value from a clock, UUID, filename,
+/// or artifact-presence observation.  The future durable catalog/retention
+/// transaction is the sole intended issuer after it has fenced the pane,
+/// completion, policy epoch, and retained-recovery generation.  Keeping the
+/// receipt non-duplicable lets that transaction transfer one exact decision to
+/// the checkpoint authority worker without exposing its identity preimage.
+#[must_use = "policy expiry receipts must be consumed by the checkpoint finalizer"]
+pub struct GuardianCheckpointPolicyExpiryReceiptV1 {
+    pane_id: Uuid,
+    generation: u64,
+    completion_id: Uuid,
+    intent: GuardianCheckpointIntent,
+    expiry_id: Uuid,
+    policy_epoch: u64,
+}
+
+impl GuardianCheckpointPolicyExpiryReceiptV1 {
+    #[cfg(test)]
+    pub(crate) fn issue_for_test(
+        pane_id: Uuid,
+        generation: u64,
+        completion_id: Uuid,
+        intent: GuardianCheckpointIntent,
+        expiry_id: Uuid,
+        policy_epoch: u64,
+    ) -> Self {
+        assert!(!pane_id.is_nil());
+        assert!(generation > 0);
+        assert!(!completion_id.is_nil());
+        assert!(!expiry_id.is_nil());
+        assert!(policy_epoch > 0);
+        Self {
+            pane_id,
+            generation,
+            completion_id,
+            intent,
+            expiry_id,
+            policy_epoch,
+        }
+    }
+
+    pub(crate) const fn pane_id(&self) -> Uuid {
+        self.pane_id
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn completion_id(&self) -> Uuid {
+        self.completion_id
+    }
+
+    pub(crate) const fn intent(&self) -> GuardianCheckpointIntent {
+        self.intent
+    }
+
+    pub(crate) const fn expiry_id(&self) -> Uuid {
+        self.expiry_id
+    }
+
+    pub(crate) const fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointPolicyExpiryReceiptV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointPolicyExpiryReceiptV1")
+            .field("pane_id", &self.pane_id)
+            .field("generation", &self.generation)
+            .field("completion_id", &self.completion_id)
+            .field("expiry_id", &self.expiry_id)
+            .field("policy_epoch", &self.policy_epoch)
+            .field("intent", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for GuardianCheckpointPolicyExpiryReceiptV1 {}
+
+impl Drop for GuardianCheckpointPolicyExpiryReceiptV1 {
+    fn drop(&mut self) {
+        self.pane_id = Uuid::nil();
+        self.generation.zeroize();
+        self.completion_id = Uuid::nil();
+        self.intent.checkpoint_identity.0.zeroize();
+        self.intent.output_boundary_identity.0.zeroize();
+        self.expiry_id = Uuid::nil();
+        self.policy_epoch.zeroize();
+    }
+}
+
+static_assertions::assert_not_impl_any!(GuardianCheckpointPolicyExpiryReceiptV1: Clone, Copy);
+static_assertions::assert_impl_all!(GuardianCheckpointPolicyExpiryReceiptV1: ZeroizeOnDrop);
 
 /// Scope of an immutable checkpoint upload. A live pane upload is fenced by
 /// its exact lease generation. A genesis upload is instead bound to the spawn
@@ -1670,6 +1830,45 @@ pub struct GuardianCheckpointStageRequestV1 {
 }
 
 static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);
+
+/// Single-use authority for one cross-process record-backed Seal operation.
+///
+/// The guardian protocol mints this value only after authenticating the
+/// request envelope against the current guardian incarnation, mux
+/// incarnation, pane lease generation, and mutation fences.  The durable
+/// checkpoint store must still validate the exact recovered output-journal
+/// boundary before it can publish a manifest.  Keeping the request inside a
+/// nonconstructible, nonduplicable value prevents callers from upgrading raw
+/// Stage wire bytes into manifest authority.
+pub struct GuardianCheckpointRuntimeSealPermitV1 {
+    request: GuardianCheckpointStageRequestV1,
+    mux_incarnation: Uuid,
+}
+
+static_assertions::assert_not_impl_any!(GuardianCheckpointRuntimeSealPermitV1: Clone, Copy);
+
+impl GuardianCheckpointRuntimeSealPermitV1 {
+    /// Borrow the authenticated request solely to derive its immutable store
+    /// binding before this permit is consumed by the mux authority boundary.
+    #[must_use]
+    pub const fn request(&self) -> &GuardianCheckpointStageRequestV1 {
+        &self.request
+    }
+
+    pub(crate) fn into_parts(self) -> (GuardianCheckpointStageRequestV1, Uuid) {
+        (self.request, self.mux_incarnation)
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointRuntimeSealPermitV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointRuntimeSealPermitV1")
+            .field("request", &"[REDACTED]")
+            .field("mux_incarnation", &self.mux_incarnation)
+            .finish_non_exhaustive()
+    }
+}
 
 impl std::fmt::Debug for GuardianCheckpointStageRequestV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -5589,6 +5788,11 @@ impl GuardianInputEffectIdentity {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianInputEffectQuery {
+    // The caller's mux incarnation lives in the authenticated envelope. This
+    // distinct value binds the queried effect to the mux that originally
+    // submitted it, allowing a successor mux to reconcile a lost reply
+    // without weakening the stored effect identity.
+    origin_mux_incarnation: Uuid,
     sequence: u64,
     input_bytes: u32,
     payload_sha256: [u8; 32],
@@ -5598,6 +5802,7 @@ impl std::fmt::Debug for GuardianInputEffectQuery {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GuardianInputEffectQuery")
+            .field("origin_mux_incarnation", &self.origin_mux_incarnation)
             .field("sequence", &self.sequence)
             .field("input_bytes", &self.input_bytes)
             .finish_non_exhaustive()
@@ -5606,17 +5811,20 @@ impl std::fmt::Debug for GuardianInputEffectQuery {
 
 impl GuardianInputEffectQuery {
     pub fn new(
+        origin_mux_incarnation: Uuid,
         sequence: u64,
         input_bytes: u32,
         payload_sha256: [u8; 32],
     ) -> Result<Self, GuardianProtocolError> {
-        if sequence == 0
+        if origin_mux_incarnation.is_nil()
+            || sequence == 0
             || input_bytes == 0
             || usize::try_from(input_bytes).map_or(true, |bytes| bytes > GUARDIAN_MAX_INPUT_BYTES)
         {
             return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         Ok(Self {
+            origin_mux_incarnation,
             sequence,
             input_bytes,
             payload_sha256,
@@ -5627,9 +5835,10 @@ impl GuardianInputEffectQuery {
     pub fn encode(self) -> [u8; INPUT_EFFECT_QUERY_PAYLOAD_BYTES] {
         let mut payload = [0_u8; INPUT_EFFECT_QUERY_PAYLOAD_BYTES];
         payload[..4].copy_from_slice(&INPUT_EFFECT_QUERY_PAYLOAD_MAGIC);
-        payload[4..12].copy_from_slice(&self.sequence.to_be_bytes());
-        payload[12..16].copy_from_slice(&self.input_bytes.to_be_bytes());
-        payload[16..].copy_from_slice(&self.payload_sha256);
+        payload[4..20].copy_from_slice(self.origin_mux_incarnation.as_bytes());
+        payload[20..28].copy_from_slice(&self.sequence.to_be_bytes());
+        payload[28..32].copy_from_slice(&self.input_bytes.to_be_bytes());
+        payload[32..].copy_from_slice(&self.payload_sha256);
         payload
     }
 
@@ -5640,10 +5849,11 @@ impl GuardianInputEffectQuery {
             return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         let mut payload_sha256 = [0_u8; 32];
-        payload_sha256.copy_from_slice(&payload[16..]);
+        payload_sha256.copy_from_slice(&payload[32..]);
         Self::new(
-            read_u64(payload, 4)?,
-            read_u32(payload, 12)?,
+            read_uuid(payload, 4)?,
+            read_u64(payload, 20)?,
+            read_u32(payload, 28)?,
             payload_sha256,
         )
     }
@@ -7651,6 +7861,26 @@ impl GuardianProtocolState {
         }
     }
 
+    /// Upgrade one authenticated, currently leased record-backed Seal request
+    /// into the single-use authority accepted by the durable manifest path.
+    ///
+    /// This deliberately reuses the complete Stage preflight so Genesis, stale
+    /// leases, foreign mux incarnations, pending input, and indeterminate
+    /// checkpoint outcomes stay fenced at one source of truth.
+    pub fn preflight_checkpoint_seal(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianCheckpointRuntimeSealPermitV1, GuardianProtocolError> {
+        let stage = self.preflight_checkpoint_stage(request)?;
+        if stage.kind() != GuardianCheckpointStageKindV1::Seal {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        Ok(GuardianCheckpointRuntimeSealPermitV1 {
+            request: stage,
+            mux_incarnation: request.header.mux_incarnation,
+        })
+    }
+
     /// Fence, execute, and commit one effect-producing request.
     ///
     /// The callback is invoked only for a new effect identity, after authentication,
@@ -7729,16 +7959,17 @@ impl GuardianProtocolState {
     /// boundary are durably committed. Any returned error or recovered panic is
     /// conservatively recorded as `OutcomeIndeterminate`; its value is disposed
     /// inside the audited recoverable-panic boundary and never reaches Debug,
-    /// Display, or the wire. Exact request/effect replays return the retained
-    /// receipt without invoking the callback. A different mutation cannot pass
-    /// the pane fence while an indeterminate publication awaits reconciliation.
-    // Intentionally private until a guardian-service dispatcher owns the
-    // durable publisher and exposes a deliberately typed integration seam.
-    #[allow(dead_code)]
-    fn apply_checkpoint_transactionally<E>(
+    /// Display, or the wire. Exact request/effect replays of a committed
+    /// publication return the retained receipt without invoking the callback.
+    /// An exact replay of an indeterminate publication re-enters the required
+    /// idempotent catalog reconciliation callback; success upgrades every
+    /// alias to `Committed`, while another error leaves the barrier intact. A
+    /// different mutation cannot pass the pane fence while reconciliation is
+    /// pending.
+    pub fn apply_checkpoint_transactionally<E>(
         &mut self,
         request: &AuthenticatedGuardianRequest,
-        publish: impl FnOnce(&GuardianCheckpointPending) -> Result<(), E>,
+        publish: impl FnOnce(GuardianCheckpointCatalogAdoptionPermitV1) -> Result<(), E>,
     ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
         validate_request_envelope(request)?;
         if request.header.guardian_incarnation != self.incarnation {
@@ -7761,23 +7992,50 @@ impl GuardianProtocolState {
         };
 
         if let Some(stored) = self.requests.get(&identity.request_id) {
-            if stored.fingerprint == fingerprint && stored.effect_id == identity.effect_id {
-                return Self::checkpoint_receipt_from_reply(&stored.reply);
+            if stored.fingerprint != fingerprint || stored.effect_id != identity.effect_id {
+                return Err(GuardianProtocolError::RequestIdentityConflict);
             }
-            return Err(GuardianProtocolError::RequestIdentityConflict);
+            let effect_state = self
+                .effects
+                .get(&identity.effect_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-request-effect",
+                ))?
+                .state;
+            return match effect_state {
+                StoredEffectState::Checkpoint {
+                    disposition: GuardianCheckpointDisposition::OutcomeIndeterminate,
+                    identity: stored_identity,
+                } => self.reconcile_checkpoint_publication(stored_identity, publish),
+                StoredEffectState::Checkpoint {
+                    disposition: GuardianCheckpointDisposition::Committed,
+                    ..
+                } => Self::checkpoint_receipt_from_reply(&stored.reply),
+                _ => Err(GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-request-effect-kind",
+                )),
+            };
         }
         if let Some(stored) = self.effects.get(&identity.effect_id) {
             if stored.fingerprint != fingerprint {
                 return Err(GuardianProtocolError::EffectIdentityConflict);
             }
-            let receipt = Self::checkpoint_receipt_from_reply(&stored.reply)?;
-            let disposition_is_pending = stored.state.is_pending();
-            if !matches!(stored.state, StoredEffectState::Checkpoint { .. }) {
-                return Err(GuardianProtocolError::StateInvariantViolation(
-                    "checkpoint-effect-state-kind",
-                ));
-            }
-            if disposition_is_pending
+            let stored_identity = match stored.state {
+                StoredEffectState::Checkpoint {
+                    disposition: GuardianCheckpointDisposition::OutcomeIndeterminate,
+                    identity: stored_identity,
+                } => Some(stored_identity),
+                StoredEffectState::Checkpoint {
+                    disposition: GuardianCheckpointDisposition::Committed,
+                    ..
+                } => None,
+                _ => {
+                    return Err(GuardianProtocolError::StateInvariantViolation(
+                        "checkpoint-effect-state-kind",
+                    ));
+                }
+            };
+            if stored_identity.is_some()
                 && self
                     .effect_request_ids
                     .get(&identity.effect_id)
@@ -7789,6 +8047,16 @@ impl GuardianProtocolState {
                     max_aliases: GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT,
                 });
             }
+            if let Some(stored_identity) = stored_identity {
+                let _ = self.reconcile_checkpoint_publication(stored_identity, publish)?;
+            }
+            let stored = self.effects.get(&identity.effect_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
+                    "checkpoint-effect-after-reconciliation",
+                ),
+            )?;
+            let receipt = Self::checkpoint_receipt_from_reply(&stored.reply)?;
+            let disposition_is_pending = stored.state.is_pending();
             let capacity = self.plan_receipt_capacity(true, false)?;
             self.requests
                 .try_reserve(1)
@@ -7855,10 +8123,10 @@ impl GuardianProtocolState {
             .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
         request_ids.insert(identity.request_id);
 
-        let pending = GuardianCheckpointPending { identity };
+        let permit = GuardianCheckpointCatalogAdoptionPermitV1 { identity };
         let publication = catch_recoverable(
             RecoverablePanicSite::MuxPaneCallback,
-            AssertUnwindSafe(|| publish(&pending)),
+            AssertUnwindSafe(|| publish(permit)),
         );
         let disposition = match publication {
             Ok(Ok(())) => GuardianCheckpointDisposition::Committed,
@@ -7913,7 +8181,6 @@ impl GuardianProtocolState {
     /// Reconcile a previously indeterminate publication as durably committed.
     /// The exact originating request nonce, effect nonce, generation, sequence,
     /// checkpoint digest, and output-boundary digest must all match.
-    #[allow(dead_code)]
     fn mark_checkpoint_committed(
         &mut self,
         identity: GuardianCheckpointEffectIdentity,
@@ -8075,6 +8342,56 @@ impl GuardianProtocolState {
         self.transient_request_order.extend(request_ids);
         self.transient_effect_order.push_back(identity.effect_id);
         Ok(receipt)
+    }
+
+    /// Re-enter the exact idempotent catalog publisher for one retained
+    /// indeterminate checkpoint. The callback must perform the same
+    /// marker-first reconciliation as the initial publication: an existing
+    /// exact marker is success, an absent marker may complete the same
+    /// publication, and any conflict fails closed. A second error or panic
+    /// leaves the original indeterminate receipt and pane barrier untouched.
+    fn reconcile_checkpoint_publication<E>(
+        &mut self,
+        identity: GuardianCheckpointEffectIdentity,
+        publish: impl FnOnce(GuardianCheckpointCatalogAdoptionPermitV1) -> Result<(), E>,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
+        let stored = self
+            .effects
+            .get(&identity.effect_id)
+            .ok_or(GuardianProtocolError::CheckpointIdentityMismatch)?;
+        if !matches!(
+            stored.state,
+            StoredEffectState::Checkpoint {
+                disposition: GuardianCheckpointDisposition::OutcomeIndeterminate,
+                identity: stored_identity,
+            } if stored_identity == identity
+        ) {
+            return Err(GuardianProtocolError::CheckpointIdentityMismatch);
+        }
+        let pending_receipt = Self::checkpoint_receipt_from_reply(&stored.reply)?;
+        if pending_receipt.disposition != GuardianCheckpointDisposition::OutcomeIndeterminate
+            || !pending_receipt.matches_identity(identity)
+        {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "checkpoint-reconciliation-pending-reply",
+            ));
+        }
+
+        let permit = GuardianCheckpointCatalogAdoptionPermitV1 { identity };
+        match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| publish(permit)),
+        ) {
+            Ok(Ok(())) => self.mark_checkpoint_committed(identity),
+            Ok(Err(error)) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| drop(error)),
+                );
+                Ok(pending_receipt)
+            }
+            Err(_) => Ok(pending_receipt),
+        }
     }
 
     /// Reconcile an indeterminate attempt only after the publication owner has
@@ -8678,7 +8995,7 @@ impl GuardianProtocolState {
             Some(stored)
                 if stored.fingerprint.pane_id == pane_id
                     && stored.fingerprint.operation == GuardianOperation::Input
-                    && stored.fingerprint.mux_incarnation == request.header.mux_incarnation
+                    && stored.fingerprint.mux_incarnation == query.origin_mux_incarnation
                     && stored.fingerprint.lease_generation == request.header.lease_generation
                     && stored.fingerprint.lease_sequence == query.sequence
                     && stored.fingerprint.payload_bytes == query.input_bytes
@@ -10186,6 +10503,7 @@ mod tests {
     ) -> [u8; INPUT_EFFECT_QUERY_PAYLOAD_BYTES] {
         assert_eq!(request.header.operation, GuardianOperation::Input);
         GuardianInputEffectQuery::new(
+            request.header.mux_incarnation,
             request.header.lease_sequence,
             u32::try_from(request.payload.len()).expect("fixture input length fits u32"),
             request.header.payload_sha256,
@@ -10460,7 +10778,7 @@ mod tests {
             Err(GuardianProtocolError::InvalidOperationPayload)
         );
 
-        let query = GuardianInputEffectQuery::new(7, 19, [0x3c; 32]).unwrap();
+        let query = GuardianInputEffectQuery::new(id(8), 7, 19, [0x3c; 32]).unwrap();
         assert!(
             !format!("{query:?}").contains(&format!("{:?}", [0x3c; 32])),
             "query diagnostics must not expose a dictionary-testable input digest"
@@ -10470,11 +10788,15 @@ mod tests {
             query
         );
         assert_eq!(
-            GuardianInputEffectQuery::new(0, 19, [0x3c; 32]),
+            GuardianInputEffectQuery::new(id(8), 0, 19, [0x3c; 32]),
             Err(GuardianProtocolError::InvalidOperationPayload)
         );
         assert_eq!(
-            GuardianInputEffectQuery::new(7, 0, [0x3c; 32]),
+            GuardianInputEffectQuery::new(id(8), 7, 0, [0x3c; 32]),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        assert_eq!(
+            GuardianInputEffectQuery::new(Uuid::nil(), 7, 19, [0x3c; 32]),
             Err(GuardianProtocolError::InvalidOperationPayload)
         );
         let mut query_with_trailing_bytes = query.encode().to_vec();
@@ -10612,14 +10934,14 @@ mod tests {
 
         let checkpoint = checkpoint_request(id(1), id(2), id(3), 1, 1, 60, 61, 0x41, 0x52);
         let identity = checkpoint_effect_identity(&checkpoint);
-        let pending = GuardianCheckpointPending { identity };
+        let permit = GuardianCheckpointCatalogAdoptionPermitV1 { identity };
         let receipt = GuardianCheckpointReceipt::from_identity(
             identity,
             GuardianCheckpointDisposition::OutcomeIndeterminate,
         );
         for diagnostic in [
             format!("{identity:?}"),
-            format!("{pending:?}"),
+            format!("{permit:?}"),
             format!("{receipt:?}"),
         ] {
             assert!(!diagnostic.contains(&checkpoint_debug));
@@ -11346,7 +11668,7 @@ mod tests {
         let exact_replay = state
             .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
                 invocations.set(invocations.get() + 1);
-                Ok::<(), &str>(())
+                Err("catalog-still-unavailable")
             })
             .unwrap();
         assert_eq!(exact_replay, receipt);
@@ -11356,11 +11678,11 @@ mod tests {
         let alias_receipt = state
             .apply_checkpoint_transactionally(&authenticated_alias, |_| {
                 invocations.set(invocations.get() + 1);
-                Ok::<(), &str>(())
+                Err("catalog-still-unavailable")
             })
             .unwrap();
         assert_eq!(alias_receipt, receipt);
-        assert_eq!(invocations.get(), 1);
+        assert_eq!(invocations.get(), 3);
 
         for index in 0..(GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT - 2) {
             let mut bounded_alias = copy_request(&checkpoint);
@@ -11370,12 +11692,13 @@ mod tests {
                 state
                     .apply_checkpoint_transactionally(&authenticate(&bounded_alias), |_| {
                         invocations.set(invocations.get() + 1);
-                        Ok::<(), &str>(())
+                        Err("catalog-still-unavailable")
                     })
                     .unwrap(),
                 receipt
             );
         }
+        let attempts_before_capacity_rejection = invocations.get();
         let mut over_alias_ceiling = copy_request(&checkpoint);
         over_alias_ceiling.header.request_id = Uuid::from_u128(0x2000);
         assert_eq!(
@@ -11388,7 +11711,7 @@ mod tests {
                 max_aliases: GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT,
             })
         );
-        assert_eq!(invocations.get(), 1);
+        assert_eq!(invocations.get(), attempts_before_capacity_rejection);
 
         let response = GuardianResponseEnvelope::reply(
             &authenticated_alias,
@@ -11591,11 +11914,18 @@ mod tests {
         );
         assert_eq!(state, before_output_boundary_mismatch);
 
-        let committed = state.mark_checkpoint_committed(identity).unwrap();
+        let attempts_before_reconciliation = invocations.get();
+        let committed = state
+            .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
         assert_eq!(
             committed.disposition(),
             GuardianCheckpointDisposition::Committed
         );
+        assert_eq!(invocations.get(), attempts_before_reconciliation + 1);
         assert_eq!(
             state.mark_checkpoint_committed(identity).unwrap(),
             committed
@@ -11607,7 +11937,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(committed_alias, committed);
-        assert_eq!(invocations.get(), 1);
+        assert_eq!(invocations.get(), attempts_before_reconciliation + 1);
         assert_eq!(
             state.mark_checkpoint_definitely_not_published(identity),
             Err(GuardianProtocolError::CheckpointIdentityMismatch)
@@ -11635,7 +11965,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_panic_and_preflight_failures_are_non_reinvoking_and_rollback_is_exact() {
+    fn checkpoint_panic_reconciliation_and_preflight_rollback_are_exact() {
         let guardian = id(1);
         let mux = id(2);
         let pane = id(3);
@@ -11705,12 +12035,12 @@ mod tests {
             state
                 .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
                     invocations.set(invocations.get() + 1);
-                    Ok::<(), &str>(())
+                    Err("catalog-still-unavailable-after-panic")
                 })
                 .unwrap(),
             indeterminate
         );
-        assert_eq!(invocations.get(), 1);
+        assert_eq!(invocations.get(), 2);
 
         let reverse_index = state
             .effect_request_ids
@@ -11786,7 +12116,7 @@ mod tests {
                 Ok::<(), &str>(())
             })
             .unwrap();
-        assert_eq!(invocations.get(), 2);
+        assert_eq!(invocations.get(), 3);
         assert_eq!(
             committed.disposition(),
             GuardianCheckpointDisposition::Committed
@@ -12643,7 +12973,7 @@ mod tests {
         assert_eq!(state.panes.len(), 1);
 
         let mut conflicting = copy_request(&spawn);
-        conflicting.payload = Zeroizing::new(b"different-command".to_vec());
+        conflicting.payload = spawn_payload("different-command");
         conflicting.header.payload_sha256 = Sha256::digest(&conflicting.payload).into();
         assert_eq!(
             apply_request(&mut state, &conflicting),
@@ -13394,8 +13724,7 @@ mod tests {
 
         let mut exited_state = state.clone();
         exited_state.mark_exited(pane, 0).unwrap();
-        let before_wrong_mux_query = exited_state.clone();
-        let wrong_mux_query = request(
+        let successor_mux_query = request(
             GuardianOperation::QueryInputEffect,
             guardian,
             id(90),
@@ -13407,14 +13736,44 @@ mod tests {
             &input_effect_query_payload(&input),
         );
         assert_eq!(
-            apply_request(&mut exited_state, &wrong_mux_query),
-            Err(GuardianProtocolError::InputDurabilityIdentityMismatch),
-            "a retained disposition remains bound to its authenticated mux incarnation"
+            apply_request(&mut exited_state, &successor_mux_query).unwrap(),
+            GuardianReply::InputEffect {
+                effect_id: effect,
+                state: InputEffectState::DurablePrefix { applied_bytes: 3 },
+            },
+            "a successor mux must be able to reconcile an exact retained effect identity"
         );
-        assert_eq!(exited_state, before_wrong_mux_query);
+
+        let before_wrong_origin_query = exited_state.clone();
+        let wrong_origin_query_payload = GuardianInputEffectQuery::new(
+            id(90),
+            identity.sequence(),
+            identity.input_bytes(),
+            identity.payload_sha256(),
+        )
+        .unwrap()
+        .encode();
+        let wrong_origin_query = request(
+            GuardianOperation::QueryInputEffect,
+            guardian,
+            id(90),
+            id(67),
+            Some(pane),
+            1,
+            0,
+            Some(effect),
+            &wrong_origin_query_payload,
+        );
+        assert_eq!(
+            apply_request(&mut exited_state, &wrong_origin_query),
+            Err(GuardianProtocolError::InputDurabilityIdentityMismatch),
+            "a retained disposition remains bound to its original mux incarnation"
+        );
+        assert_eq!(exited_state, before_wrong_origin_query);
 
         let before_wrong_length_query = state.clone();
         let wrong_length_query_payload = GuardianInputEffectQuery::new(
+            identity.mux_incarnation(),
             identity.sequence(),
             identity.input_bytes() - 1,
             identity.payload_sha256(),
@@ -13656,7 +14015,7 @@ mod tests {
         );
         let mut stale_replay = replay;
         stale_replay.header.request_id = id(46);
-        stale_replay.header.lease_generation = 0;
+        stale_replay.header.lease_generation = 2;
         assert_eq!(
             apply_request(&mut state, &stale_replay),
             Err(GuardianProtocolError::StaleLease)
@@ -14279,6 +14638,42 @@ mod tests {
             state, claimed_state,
             "Stage preflight must remain read-only"
         );
+        assert!(
+            matches!(
+                state.preflight_checkpoint_seal(&authenticate(&stage)),
+                Err(GuardianProtocolError::InvalidOperationPayload)
+            ),
+            "a non-Seal Stage operation cannot mint Seal authority"
+        );
+
+        let seal_payload = GuardianCheckpointStageRequestV1::seal(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id: pane,
+                generation,
+            },
+            id(179),
+            descriptor,
+            1_024,
+        )
+        .unwrap()
+        .into_zeroizing_payload()
+        .unwrap();
+        let seal = request_zeroizing(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(180),
+            Some(pane),
+            generation,
+            0,
+            None,
+            seal_payload,
+        );
+        let permit = state
+            .preflight_checkpoint_seal(&authenticate(&seal))
+            .unwrap();
+        assert_eq!(permit.request().kind(), GuardianCheckpointStageKindV1::Seal);
+        assert!(format!("{permit:?}").contains("[REDACTED]"));
 
         let wrong_mux = pane_checkpoint_stage_request(
             guardian,
@@ -15233,10 +15628,13 @@ mod tests {
         let repaired_page_digest = compute_replay_page_digest(&plaintext_digest_mutation).unwrap();
         plaintext_digest_mutation[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
             .copy_from_slice(&repaired_page_digest.declassify_for_ack());
-        assert!(matches!(
-            GuardianReplayPageDelivery::decode(plaintext_digest_mutation),
-            Err(GuardianProtocolError::InvalidReplyPayload)
-        ), "the per-record commitment must reject plaintext even after the outer page digest is recomputed");
+        assert!(
+            matches!(
+                GuardianReplayPageDelivery::decode(plaintext_digest_mutation),
+                Err(GuardianProtocolError::InvalidReplyPayload)
+            ),
+            "the per-record commitment must reject plaintext even after the outer page digest is recomputed"
+        );
 
         let mut order_mutation = replay_output_page(pane, generation, snapshot_id, snapshot_digest)
             .into_payload()
@@ -15822,7 +16220,7 @@ mod tests {
             "Zeroizing<Vec<u8>>"
         )));
         assert!(source.contains(
-            "pub fn into_zeroizing_payload(\n        self,\n    ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError>"
+            "pub fn into_zeroizing_payload(self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError>"
         ));
         assert!(source.contains(concat!(
             "let mut payload = Zeroizing::new(",

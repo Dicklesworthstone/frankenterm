@@ -20292,40 +20292,26 @@ mod tests {
     }
 
     struct BoundedTestExecutor {
-        receiver: std::sync::mpsc::Receiver<promise::spawn::Runnable>,
+        executor: promise::spawn::SimpleExecutor,
     }
 
     impl BoundedTestExecutor {
         fn new() -> Self {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let low_priority_sender = sender.clone();
-            promise::spawn::set_schedulers(
-                Box::new(move |runnable| {
-                    let _ = sender.send(runnable);
-                }),
-                Box::new(move |runnable| {
-                    let _ = low_priority_sender.send(runnable);
-                }),
-            );
-            Self { receiver }
+            Self {
+                executor: promise::spawn::SimpleExecutor::new(),
+            }
         }
 
         fn run_until(&self, timeout: Duration, mut completed: impl FnMut() -> bool) {
             let started = Instant::now();
             while !completed() {
-                // The promise scheduler is process-global. A worker from an
-                // earlier test may outlive that test and enqueue a harmless
-                // stale runnable after this executor is installed, so "tick
-                // exactly once" does not identify this test's own runnable.
-                let remaining = timeout.saturating_sub(started.elapsed());
                 assert!(
-                    !remaining.is_zero(),
+                    started.elapsed() < timeout,
                     "the bounded test scheduler did not reach its completion condition",
                 );
-                self.receiver
-                    .recv_timeout(remaining)
-                    .expect("the bounded test scheduler should reach its completion condition")
-                    .run();
+                self.executor
+                    .tick()
+                    .expect("bounded test executor remains on its owner thread");
             }
         }
     }

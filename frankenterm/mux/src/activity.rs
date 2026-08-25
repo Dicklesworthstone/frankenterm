@@ -491,16 +491,66 @@ mod tests {
     use crate::MuxNotification;
     use std::sync::atomic::AtomicBool;
 
+    fn install_bounded_scheduler(
+        high_priority: Box<dyn Fn(promise::spawn::Runnable) -> bool + Send + Sync>,
+        low_priority: Box<dyn Fn(promise::spawn::Runnable) -> bool + Send + Sync>,
+    ) {
+        const TASK_CAPACITY: usize = 4_096;
+        const BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+
+        fn wrap(
+            schedule: Box<dyn Fn(promise::spawn::Runnable) -> bool + Send + Sync>,
+        ) -> promise::spawn::MainThreadBoundScheduleFunc {
+            Box::new(move |runnable, admission| {
+                let enqueued_at = std::time::Instant::now();
+                let queued = schedule(runnable);
+                promise::spawn::MainThreadEnqueueReceipt {
+                    queue_id: admission.queue_id,
+                    scheduler_generation: admission.scheduler_generation,
+                    task_ticket: admission.task_ticket,
+                    enqueued_at,
+                    snapshot_after_enqueue: promise::spawn::MainThreadQueueSnapshot::new(
+                        usize::from(queued),
+                        TASK_CAPACITY,
+                        if queued {
+                            admission.estimated_bytes.get()
+                        } else {
+                            0
+                        },
+                        BYTE_CAPACITY,
+                        queued.then_some(enqueued_at),
+                        false,
+                    )
+                    .expect("bounded activity test queue snapshot"),
+                }
+            })
+        }
+
+        let identity = promise::spawn::try_allocate_main_thread_scheduler_identity()
+            .expect("bounded activity test scheduler identity");
+        let limits = promise::spawn::MainThreadAdmissionLimits::new(
+            TASK_CAPACITY,
+            BYTE_CAPACITY,
+            512,
+            8 * 1024 * 1024,
+        )
+        .expect("bounded activity test scheduler limits");
+        promise::spawn::set_bounded_main_thread_scheduler(Arc::new(
+            promise::spawn::MainThreadSchedulerBinding::new(
+                identity,
+                limits,
+                wrap(high_priority),
+                wrap(low_priority),
+            ),
+        ));
+    }
+
     fn capture_scheduler() -> std::sync::mpsc::Receiver<promise::spawn::Runnable> {
         let (sender, receiver) = std::sync::mpsc::channel();
         let low_priority_sender = sender.clone();
-        promise::spawn::set_schedulers(
-            Box::new(move |runnable| {
-                let _ = sender.send(runnable);
-            }),
-            Box::new(move |runnable| {
-                let _ = low_priority_sender.send(runnable);
-            }),
+        install_bounded_scheduler(
+            Box::new(move |runnable| sender.send(runnable).is_ok()),
+            Box::new(move |runnable| low_priority_sender.send(runnable).is_ok()),
         );
         receiver
     }
@@ -840,7 +890,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let attempts = Arc::new(AtomicUsize::new(0));
         let high_attempts = Arc::clone(&attempts);
-        promise::spawn::set_schedulers(
+        install_bounded_scheduler(
             Box::new(move |_runnable| {
                 high_attempts.fetch_add(1, Ordering::SeqCst);
                 panic!("intentional activity prune scheduler panic");
@@ -887,15 +937,19 @@ mod tests {
         let high_attempts = Arc::clone(&attempts);
         let high_depth = Arc::clone(&depth);
         let high_max_depth = Arc::clone(&max_depth);
-        promise::spawn::set_schedulers(
+        install_bounded_scheduler(
             Box::new(move |runnable| {
                 high_attempts.fetch_add(1, Ordering::SeqCst);
                 let current_depth = high_depth.fetch_add(1, Ordering::SeqCst) + 1;
                 high_max_depth.fetch_max(current_depth, Ordering::SeqCst);
                 drop(runnable);
                 high_depth.fetch_sub(1, Ordering::SeqCst);
+                false
             }),
-            Box::new(drop),
+            Box::new(|runnable| {
+                drop(runnable);
+                false
+            }),
         );
 
         drop(Activity::new_for_mux(&mux));
