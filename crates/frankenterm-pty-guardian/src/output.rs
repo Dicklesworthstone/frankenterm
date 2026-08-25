@@ -1324,7 +1324,7 @@ impl GuardianCheckpointStageStore {
                 seal_entry,
                 GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
             )?;
-            inner.cipher.inspect_durable_manifest_receipt(
+            let completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
                 &shape.binding,
                 seal_request,
                 inspection.publication_id,
@@ -1332,7 +1332,189 @@ impl GuardianCheckpointStageStore {
                 ordered_chunk_set_identity,
                 &record,
             )?;
+            if inspection.ack_present {
+                let ack_request = GuardianCheckpointStageRequestV1::ack(
+                    shape.scope,
+                    shape.upload_id,
+                    shape.descriptor,
+                    shape.chunk_bytes,
+                    inspection.publication_id,
+                )?;
+                let ack_entry = census
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.key == shape.key()
+                            && entry.role
+                                == (CheckpointStageFileRole::Ack {
+                                    publication_id: inspection.publication_id,
+                                })
+                    })
+                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                let (_, ack_record, _) = checkpoint_read_record(
+                    inner,
+                    ack_entry,
+                    u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
+                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                )?;
+                inner.cipher.inspect_ack_finalizer(
+                    &completion_receipt,
+                    &ack_request,
+                    &ack_record,
+                )?;
+                return Ok(GuardianCheckpointStageReplyV1::Acked {
+                    upload_id: shape.upload_id,
+                    completion_id: inspection.publication_id,
+                    checkpoint_id: shape.descriptor.checkpoint_id(),
+                    boundary_id: shape.descriptor.boundary_id(),
+                    total_bytes: shape.total_bytes,
+                });
+            }
             Ok(GuardianCheckpointStageReplyV1::Sealed {
+                upload_id: shape.upload_id,
+                completion_id: inspection.publication_id,
+                checkpoint_id: shape.descriptor.checkpoint_id(),
+                boundary_id: shape.descriptor.boundary_id(),
+                total_bytes: shape.total_bytes,
+            })
+        })
+    }
+
+    pub(crate) fn apply_ack(
+        &self,
+        request: GuardianCheckpointStageRequestV1,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianCheckpointStageStoreError> {
+        if request.kind() != GuardianCheckpointStageKindV1::Ack {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let shape = CheckpointStageRequestShape::from_request(&request)?;
+        let requested_completion = request
+            .completion_id()
+            .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+        self.with_exclusive_directory(|inner| {
+            let census = checkpoint_stage_census(inner)?;
+            let inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+            )?
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            if !inspection.seal_present
+                || inspection.next_index != shape.total_chunks
+                || inspection.committed_bytes != shape.total_bytes
+            {
+                return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+            }
+            if requested_completion != inspection.publication_id {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let ordered_chunk_set_identity = inspection
+                .ordered_chunk_set_identity
+                .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+            let payload = checkpoint_assemble_payload(
+                inner,
+                &census,
+                &shape,
+                inspection.publication_id,
+            )?;
+            request.validate_staged_plaintext(payload.as_slice())?;
+            let seal_request = GuardianCheckpointStageRequestV1::seal(
+                shape.scope,
+                shape.upload_id,
+                shape.descriptor,
+                shape.chunk_bytes,
+            )?;
+            let seal_entry = census
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.key == shape.key()
+                        && entry.role
+                            == (CheckpointStageFileRole::Seal {
+                                publication_id: inspection.publication_id,
+                            })
+                })
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let (_, seal_record, _) = checkpoint_read_record(
+                inner,
+                seal_entry,
+                GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+            )?;
+            let completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
+                &shape.binding,
+                seal_request,
+                inspection.publication_id,
+                inspection.candidate_identity,
+                ordered_chunk_set_identity,
+                &seal_record,
+            )?;
+            let ack_path = checkpoint_ack_path(
+                inner,
+                shape.key(),
+                inspection.publication_id,
+            )?;
+            let ack_plaintext_bytes = u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
+                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+            if inspection.ack_present {
+                let ack_entry = census
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.key == shape.key()
+                            && entry.role
+                                == (CheckpointStageFileRole::Ack {
+                                    publication_id: inspection.publication_id,
+                                })
+                    })
+                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                let (_, ack_record, _) =
+                    checkpoint_read_record(inner, ack_entry, ack_plaintext_bytes)?;
+                inner
+                    .cipher
+                    .inspect_ack_finalizer(&completion_receipt, &request, &ack_record)?;
+            } else {
+                let record_bytes = checkpoint_record_bytes_for_plaintext(
+                    CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES,
+                )?;
+                checkpoint_stage_require_capacity(
+                    inner,
+                    &census,
+                    shape.key(),
+                    1,
+                    record_bytes,
+                )?;
+                match checkpoint_create_record_new(inner, &ack_path)? {
+                    CheckpointStageCreateOutcome::Created(file) => {
+                        let record = inner
+                            .cipher
+                            .seal_ack_finalizer(&completion_receipt, &request)?;
+                        checkpoint_write_created_record(inner, &ack_path, file, &record)?;
+                    }
+                    CheckpointStageCreateOutcome::Existing => {
+                        let refreshed = checkpoint_stage_census(inner)?;
+                        let ack_entry = refreshed
+                            .entries
+                            .iter()
+                            .find(|entry| {
+                                entry.key == shape.key()
+                                    && entry.role
+                                        == (CheckpointStageFileRole::Ack {
+                                            publication_id: inspection.publication_id,
+                                        })
+                            })
+                            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                        let (_, ack_record, _) =
+                            checkpoint_read_record(inner, ack_entry, ack_plaintext_bytes)?;
+                        inner.cipher.inspect_ack_finalizer(
+                            &completion_receipt,
+                            &request,
+                            &ack_record,
+                        )?;
+                    }
+                }
+            }
+            Ok(GuardianCheckpointStageReplyV1::Acked {
                 upload_id: shape.upload_id,
                 completion_id: inspection.publication_id,
                 checkpoint_id: shape.descriptor.checkpoint_id(),
@@ -5384,6 +5566,18 @@ mod tests {
             )
         );
         assert_eq!(checkpoint_stage_longest_name_bytes(), 200);
+
+        let ack_name = format!(
+            "{}.publication-{publication_id}.ack{CHECKPOINT_STAGE_FILE_SUFFIX}",
+            key.base_name(),
+        );
+        assert_eq!(
+            checkpoint_parse_stage_name(ack_name.as_bytes()).expect("parse canonical ACK"),
+            (
+                key,
+                CheckpointStageFileRole::Ack { publication_id },
+            )
+        );
 
         let uppercase = chunk_name.replace(
             &pane_id.to_string(),

@@ -8858,6 +8858,28 @@ mod tests {
         let upload_id = Uuid::new_v4();
         let publication_id = Uuid::new_v4();
         let cipher = checkpoint_stage_cipher(0x73);
+        let receipt_begin = record_begin_request(&binding, &capture, upload_id);
+        let (receipt_candidate_identity, receipt_chunk_set_identity) =
+            manifest_component_identities(
+                &receipt_begin,
+                capture.terminal_checkpoint().canonical_payload(),
+            );
+        let receipt_seal_request = record_seal_request(&binding, &capture, upload_id);
+        let (receipt_pane_id, receipt_generation) = binding
+            .scope()
+            .pane_identity()
+            .expect("record completion fixture uses pane scope");
+        let receipt_ack_request = GuardianCheckpointStageRequestV1::ack(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id: receipt_pane_id,
+                generation: receipt_generation,
+            },
+            upload_id,
+            receipt_seal_request.descriptor(),
+            receipt_seal_request.chunk_bytes(),
+            publication_id,
+        )
+        .expect("construct exact completion ACK");
 
         let candidate = GuardianCheckpointStageSealIntentV1::candidate_metadata(
             &binding,
@@ -8919,6 +8941,41 @@ mod tests {
         cipher
             .retry_open_manifest(&retry, &record)
             .expect("adopt only the separately bound exact retry");
+        let completion_receipt = cipher
+            .inspect_durable_manifest_receipt(
+                &binding,
+                receipt_seal_request,
+                publication_id,
+                receipt_candidate_identity,
+                receipt_chunk_set_identity,
+                &record,
+            )
+            .expect("recover the exact durable Seal receipt without publication authority");
+        let ack_record = cipher
+            .seal_ack_finalizer(&completion_receipt, &receipt_ack_request)
+            .expect("seal the unique completion ACK finalizer");
+        cipher
+            .inspect_ack_finalizer(
+                &completion_receipt,
+                &receipt_ack_request,
+                &ack_record,
+            )
+            .expect("recover an exact lost ACK reply");
+        let wrong_ack_request = GuardianCheckpointStageRequestV1::ack(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id: receipt_pane_id,
+                generation: receipt_generation,
+            },
+            upload_id,
+            receipt_ack_request.descriptor(),
+            receipt_ack_request.chunk_bytes(),
+            Uuid::new_v4(),
+        )
+        .expect("construct conflicting completion ACK");
+        assert!(matches!(
+            cipher.seal_ack_finalizer(&completion_receipt, &wrong_ack_request),
+            Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch)
+        ));
 
         let (other_descriptor, _, _, other_capture) = record_descriptor();
         let other_binding = record_stage_binding(other_descriptor, 19);
