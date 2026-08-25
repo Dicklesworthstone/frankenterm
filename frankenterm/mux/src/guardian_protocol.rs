@@ -2101,10 +2101,10 @@ impl GuardianCheckpointStageRequestV1 {
             {
                 return Err(GuardianProtocolError::InvalidOperationPayload);
             }
-        } else if let GuardianCheckpointStageBodyV1::Ack { completion_id } = &self.body
-            && completion_id.is_nil()
-        {
-            return Err(GuardianProtocolError::InvalidOperationPayload);
+        } else if let GuardianCheckpointStageBodyV1::Ack { completion_id } = &self.body {
+            if completion_id.is_nil() {
+                return Err(GuardianProtocolError::InvalidOperationPayload);
+            }
         }
         Ok(())
     }
@@ -14323,6 +14323,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seal.validate_staged_plaintext(canonical), Ok(()));
+        let query = GuardianCheckpointStageRequestV1::query(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+        )
+        .unwrap();
+        let query_wire = query.into_zeroizing_payload().unwrap();
+        let decoded_query = GuardianCheckpointStageRequestV1::decode(&query_wire).unwrap();
+        assert_eq!(decoded_query.kind(), GuardianCheckpointStageKindV1::Query);
+        assert_eq!(decoded_query.completion_id(), None);
+
+        let completion_id = id(72);
+        let ack = GuardianCheckpointStageRequestV1::ack(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+            completion_id,
+        )
+        .unwrap();
+        let mut ack_wire = ack.into_zeroizing_payload().unwrap();
+        let decoded_ack = GuardianCheckpointStageRequestV1::decode(&ack_wire).unwrap();
+        assert_eq!(decoded_ack.kind(), GuardianCheckpointStageKindV1::Ack);
+        assert_eq!(decoded_ack.completion_id(), Some(completion_id));
+        ack_wire[CHECKPOINT_STAGE_COMMON_BYTES..CHECKPOINT_STAGE_ACK_BYTES].fill(0);
+        assert_eq!(
+            GuardianCheckpointStageRequestV1::decode(&ack_wire),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
         let mut same_length_payload_mutation = zeroizing_vec_from_slice(canonical);
         let last = same_length_payload_mutation.len() - 1;
         same_length_payload_mutation[last] ^= 1;
@@ -14641,6 +14671,100 @@ mod tests {
                     completion_id: id(81),
                     checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes([0xa5; 32])
                         .unwrap(),
+                    boundary_id: descriptor.boundary_id(),
+                    total_bytes: descriptor.total_bytes(),
+                }),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+
+        let query_payload = GuardianCheckpointStageRequestV1::query(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+        )
+        .unwrap()
+        .into_zeroizing_payload()
+        .unwrap();
+        let query = authenticate(&request_zeroizing(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(82),
+            Some(pane),
+            generation,
+            0,
+            None,
+            query_payload,
+        ));
+        let acked = GuardianCheckpointStageReplyV1::Acked {
+            upload_id,
+            completion_id: id(81),
+            checkpoint_id: descriptor.checkpoint_id(),
+            boundary_id: descriptor.boundary_id(),
+            total_bytes: descriptor.total_bytes(),
+        };
+        for query_reply in [
+            GuardianCheckpointStageReplyV1::Absent { upload_id },
+            ready,
+            progress,
+            sealed,
+            acked,
+            GuardianCheckpointStageReplyV1::Expired {
+                upload_id,
+                completion_id: id(81),
+                checkpoint_id: descriptor.checkpoint_id(),
+                boundary_id: descriptor.boundary_id(),
+                total_bytes: descriptor.total_bytes(),
+            },
+            GuardianCheckpointStageReplyV1::Quarantined { upload_id },
+        ] {
+            let wire = query_reply.encode().unwrap();
+            assert_eq!(
+                GuardianCheckpointStageReplyV1::decode(&wire),
+                Ok(query_reply)
+            );
+            assert!(GuardianResponseEnvelope::success(
+                &query,
+                &GuardianReply::CheckpointStage(query_reply),
+            )
+            .is_ok());
+        }
+
+        let ack_payload = GuardianCheckpointStageRequestV1::ack(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+            id(81),
+        )
+        .unwrap()
+        .into_zeroizing_payload()
+        .unwrap();
+        let ack = authenticate(&request_zeroizing(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(83),
+            Some(pane),
+            generation,
+            0,
+            None,
+            ack_payload,
+        ));
+        assert!(GuardianResponseEnvelope::success(
+            &ack,
+            &GuardianReply::CheckpointStage(acked),
+        )
+        .is_ok());
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &ack,
+                &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Acked {
+                    upload_id,
+                    completion_id: id(84),
+                    checkpoint_id: descriptor.checkpoint_id(),
                     boundary_id: descriptor.boundary_id(),
                     total_bytes: descriptor.total_bytes(),
                 }),
