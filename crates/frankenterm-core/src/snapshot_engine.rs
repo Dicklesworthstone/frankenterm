@@ -8848,9 +8848,9 @@ fn validate_checkpoint_artifact_file_metadata(
     Ok(handle_snapshot)
 }
 
-fn checkpoint_artifact_staging_name(leaf: &Path, artifact_sha256: &str) -> String {
+fn checkpoint_artifact_staging_name(leaf: &Path) -> String {
     let leaf_digest = checkpoint_artifact_sha256(leaf.as_os_str().as_encoded_bytes());
-    format!(".ft-checkpoint-scrollback-{leaf_digest}-{artifact_sha256}.staging")
+    format!(".ft-checkpoint-scrollback-{leaf_digest}.staging")
 }
 
 fn acquire_checkpoint_artifact_publication_lock(
@@ -9189,8 +9189,7 @@ fn publish_checkpoint_artifact_bytes_with_fault(
         return Ok(CheckpointArtifactPublicationOutcome::AlreadyApplied);
     }
 
-    let artifact_sha256 = checkpoint_artifact_sha256(bytes);
-    let staging_name = checkpoint_artifact_staging_name(&leaf, &artifact_sha256);
+    let staging_name = checkpoint_artifact_staging_name(&leaf);
     let staging = Path::new(&staging_name);
     let file = open_or_rewrite_checkpoint_artifact_staging(&parent, staging, bytes)?;
     match publish_checkpoint_artifact_noreplace(&parent, staging, &leaf) {
@@ -12440,16 +12439,21 @@ mod tests {
                 limits,
             );
 
-            let residues = [Vec::new(), bytes[..bytes.len() / 2].to_vec(), bytes.clone()];
+            let mut conflicting_residue = bytes.clone();
+            conflicting_residue[0] ^= 1;
+            let residues = [
+                Vec::new(),
+                bytes[..bytes.len() / 2].to_vec(),
+                conflicting_residue,
+                bytes.clone(),
+            ];
             for residue in residues {
                 let directory = tempfile::TempDir::new().unwrap();
                 let path = directory
                     .path()
                     .join(format!("fixture{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
-                let staging_name = checkpoint_artifact_staging_name(
-                    Path::new(path.file_name().unwrap()),
-                    &checkpoint_artifact_sha256(&bytes),
-                );
+                let staging_name =
+                    checkpoint_artifact_staging_name(Path::new(path.file_name().unwrap()));
                 let staging_path = directory.path().join(&staging_name);
                 write_private_checkpoint_artifact_test_file(&staging_path, &residue);
 
