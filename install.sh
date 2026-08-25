@@ -595,6 +595,226 @@ finally:
 PY
 }
 
+ensure_exact_staged_tree() {
+  local source="$1" target="$2"
+  python3 - "$source" "$target" <<'PY'
+import os, signal, stat, sys
+
+source_path, target_path = map(os.path.abspath, sys.argv[1:])
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+if not nofollow or not directory:
+    raise SystemExit("descriptor-relative nofollow tree staging is unavailable")
+
+MAX_ENTRIES = 1_000_000
+MAX_NAME_BYTES = 64 * 1024 * 1024
+MAX_BYTES = 16 * 1024 * 1024 * 1024
+MAX_DEPTH = 128
+budget = {"entries": 0, "name_bytes": 0, "bytes": 0, "files": 0}
+fail_after = 0
+if os.environ.get("FT_INSTALL_TEST_ENABLE_FAILPOINTS") == "1":
+    fail_after = int(os.environ.get("FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES", "0"))
+
+def stable(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+def scan_names(fd, label):
+    names = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            encoded = entry.name.encode("utf-8", "surrogateescape")
+            budget["entries"] += 1
+            budget["name_bytes"] += len(encoded)
+            if budget["entries"] > 2 * MAX_ENTRIES or budget["name_bytes"] > 2 * MAX_NAME_BYTES:
+                raise SystemExit(f"{label} tree exceeds its bounded inventory")
+            names.append(entry.name)
+    names.sort(key=lambda value: value.encode("utf-8", "surrogateescape"))
+    return names
+
+def exact_file(source_dir_fd, target_dir_fd, name, source_named):
+    source_fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=source_dir_fd)
+    target_fd = -1
+    try:
+        source_before = os.fstat(source_fd)
+        if (not stat.S_ISREG(source_before.st_mode) or source_before.st_nlink != 1 or
+                stable(source_before) != stable(source_named)):
+            raise SystemExit("app source file changed before materialization")
+        budget["bytes"] += source_before.st_size
+        if budget["bytes"] > MAX_BYTES:
+            raise SystemExit("app tree exceeds its bounded byte inventory")
+        desired_mode = 0o555 if source_before.st_mode & 0o111 else 0o444
+        try:
+            target_fd = os.open(
+                name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                0o600,
+                dir_fd=target_dir_fd,
+            )
+            os.fsync(target_dir_fd)
+        except FileExistsError:
+            target_fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=target_dir_fd)
+        target_before = os.fstat(target_fd)
+        target_named = os.stat(name, dir_fd=target_dir_fd, follow_symlinks=False)
+        target_mode = stat.S_IMODE(target_before.st_mode)
+        if (not stat.S_ISREG(target_before.st_mode) or target_before.st_uid != os.geteuid() or
+                target_before.st_nlink != 1 or target_before.st_dev != target_named.st_dev or
+                target_before.st_ino != target_named.st_ino or
+                target_before.st_size > source_before.st_size or target_mode & 0o7022):
+            raise SystemExit("retained app file is not a safe resumable regular file")
+        remaining = target_before.st_size
+        while remaining:
+            width = min(1024 * 1024, remaining)
+            source_chunk = os.read(source_fd, width)
+            target_chunk = os.read(target_fd, width)
+            if len(source_chunk) != width or target_chunk != source_chunk:
+                raise SystemExit("retained app file is not an exact source prefix")
+            remaining -= width
+        source_after_prefix = os.fstat(source_fd)
+        target_after_prefix = os.fstat(target_fd)
+        if stable(source_before) != stable(source_after_prefix) or stable(target_before) != stable(target_after_prefix):
+            raise SystemExit("app source or target changed during prefix validation")
+        if target_before.st_size < source_before.st_size:
+            os.fchmod(target_fd, 0o600)
+            os.fsync(target_fd)
+            os.close(target_fd)
+            target_fd = os.open(name, os.O_RDWR | nofollow | cloexec, dir_fd=target_dir_fd)
+            reopened = os.fstat(target_fd)
+            if (reopened.st_dev, reopened.st_ino, reopened.st_size) != (
+                    target_before.st_dev, target_before.st_ino, target_before.st_size):
+                raise SystemExit("retained app file changed while reopening")
+            os.lseek(source_fd, target_before.st_size, os.SEEK_SET)
+            os.lseek(target_fd, target_before.st_size, os.SEEK_SET)
+            remaining = source_before.st_size - target_before.st_size
+            while remaining:
+                chunk = os.read(source_fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise SystemExit("app source truncated during prefix completion")
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(target_fd, view)
+                    if written <= 0:
+                        raise SystemExit("app stage write made no progress")
+                    view = view[written:]
+                remaining -= len(chunk)
+            os.fsync(target_fd)
+        target_before_final_read = os.fstat(target_fd)
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        os.lseek(target_fd, 0, os.SEEK_SET)
+        remaining = source_before.st_size
+        while remaining:
+            width = min(1024 * 1024, remaining)
+            source_chunk = os.read(source_fd, width)
+            target_chunk = os.read(target_fd, width)
+            if len(source_chunk) != width or target_chunk != source_chunk:
+                raise SystemExit("completed app file differs from its pinned source")
+            remaining -= width
+        if os.read(target_fd, 1):
+            raise SystemExit("completed app file has an unexpected suffix")
+        source_final = os.fstat(source_fd)
+        target_final = os.fstat(target_fd)
+        named_final = os.stat(name, dir_fd=target_dir_fd, follow_symlinks=False)
+        if (stable(source_before) != stable(source_final) or
+                stable(target_before_final_read) != stable(target_final) or
+                target_final.st_dev != named_final.st_dev or target_final.st_ino != named_final.st_ino or
+                target_final.st_size != source_before.st_size or target_final.st_nlink != 1):
+            raise SystemExit("app file identity changed during exact completion")
+        os.fchmod(target_fd, desired_mode)
+        os.fsync(target_fd)
+        budget["files"] += 1
+        if fail_after and budget["files"] == fail_after:
+            os.kill(os.getpid(), signal.SIGKILL)
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+        os.close(source_fd)
+
+def materialize(source_fd, target_fd, depth):
+    if depth > MAX_DEPTH:
+        raise SystemExit("app tree exceeds its bounded depth")
+    source_before = os.fstat(source_fd)
+    target_before = os.fstat(target_fd)
+    if (not stat.S_ISDIR(source_before.st_mode) or not stat.S_ISDIR(target_before.st_mode) or
+            target_before.st_uid != os.geteuid() or stat.S_IMODE(target_before.st_mode) & 0o7022):
+        raise SystemExit("app tree contains an unsafe directory")
+    os.fchmod(target_fd, 0o700)
+    os.fsync(target_fd)
+    source_names = scan_names(source_fd, "source app")
+    target_names = scan_names(target_fd, "retained app stage")
+    unexpected = set(target_names).difference(source_names)
+    if unexpected:
+        raise SystemExit("retained app stage contains an unexpected entry")
+    target_set = set(target_names)
+    for name in source_names:
+        source_named = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        if stat.S_ISREG(source_named.st_mode):
+            exact_file(source_fd, target_fd, name, source_named)
+        elif stat.S_ISDIR(source_named.st_mode):
+            if name not in target_set:
+                os.mkdir(name, 0o700, dir_fd=target_fd)
+                os.fsync(target_fd)
+            target_named = os.stat(name, dir_fd=target_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(target_named.st_mode) or target_named.st_uid != os.geteuid():
+                raise SystemExit("retained app directory changed type or owner")
+            source_child = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=source_fd)
+            target_child = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=target_fd)
+            try:
+                materialize(source_child, target_child, depth + 1)
+            finally:
+                os.close(target_child)
+                os.close(source_child)
+        elif stat.S_ISLNK(source_named.st_mode):
+            link_target = os.readlink(name, dir_fd=source_fd)
+            if len(os.fsencode(link_target)) > 4096:
+                raise SystemExit("app source symlink target exceeds its bound")
+            if name in target_set:
+                target_named = os.stat(name, dir_fd=target_fd, follow_symlinks=False)
+                if not stat.S_ISLNK(target_named.st_mode) or os.readlink(name, dir_fd=target_fd) != link_target:
+                    raise SystemExit("retained app symlink differs from its source")
+            else:
+                os.symlink(link_target, name, dir_fd=target_fd)
+                os.fsync(target_fd)
+            if stable(source_named) != stable(os.stat(name, dir_fd=source_fd, follow_symlinks=False)):
+                raise SystemExit("app source symlink changed while read")
+        else:
+            raise SystemExit("app source tree contains a special file")
+    source_after = os.fstat(source_fd)
+    if stable(source_before) != stable(source_after):
+        raise SystemExit("app source directory changed during materialization")
+    os.fchmod(target_fd, 0o555)
+    os.fsync(target_fd)
+
+source_fd = os.open(source_path, os.O_RDONLY | directory | nofollow | cloexec)
+parent_path, target_name = os.path.split(target_path)
+parent_fd = os.open(parent_path, os.O_RDONLY | directory | nofollow | cloexec)
+target_fd = -1
+try:
+    parent_metadata = os.fstat(parent_fd)
+    if (not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_uid != os.geteuid() or
+            stat.S_IMODE(parent_metadata.st_mode) & 0o7022):
+        raise SystemExit("app stage parent is not one private owner-controlled directory")
+    try:
+        os.mkdir(target_name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        pass
+    target_fd = os.open(target_name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=parent_fd)
+    target_named = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    target_opened = os.fstat(target_fd)
+    if (not stat.S_ISDIR(target_named.st_mode) or target_named.st_uid != os.geteuid() or
+            target_named.st_dev != target_opened.st_dev or target_named.st_ino != target_opened.st_ino):
+        raise SystemExit("app stage root is not one stable owner-controlled directory")
+    materialize(source_fd, target_fd, 0)
+    os.fsync(parent_fd)
+finally:
+    if target_fd >= 0:
+        os.close(target_fd)
+    os.close(parent_fd)
+    os.close(source_fd)
+PY
+}
+
 validate_installer_stage_inventory() {
   local root="$1" kind="$2"
   python3 - "$root" "$kind" <<'PY'
@@ -1485,44 +1705,17 @@ PY
     warn "Refusing to replace non-directory or symlink app target at $target_app"
     return 0
   fi
-  if [ -e "$staged_app" ] || [ -L "$staged_app" ]; then
-    if ! { [ -d "$staged_app" ] && [ ! -L "$staged_app" ] && \
-        bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
-          --root "$staged_app" --manifest "$retained_manifest" >/dev/null 2>&1; }; then
-      warn "Retained app stage is not the exact requested app generation"
-      return 0
-    fi
-  else
-    if command -v ditto >/dev/null 2>&1; then
-      ditto "$extracted_app" "$staged_app" || return 0
-    else
-      cp -R "$extracted_app" "$staged_app" || return 0
-    fi
+  if { [ -e "$staged_app" ] || [ -L "$staged_app" ]; } && \
+     { [ ! -d "$staged_app" ] || [ -L "$staged_app" ]; }; then
+    warn "Retained app stage is not one resumable directory"
+    return 0
+  fi
+  if ! ensure_exact_staged_tree "$extracted_app" "$staged_app"; then
+    warn "Retained app stage is not an exact resumable prefix of the requested app generation"
+    return 0
   fi
   bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
     --root "$staged_app" --manifest "$retained_manifest" >/dev/null || return 0
-  python3 - "$staged_app" <<'PY'
-import os, stat, sys
-root = sys.argv[1]
-for current, directories, files in os.walk(root, topdown=False, followlinks=False):
-    for name in files:
-        path = os.path.join(current, name)
-        observed = os.lstat(path)
-        if stat.S_ISLNK(observed.st_mode):
-            continue
-        if not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid():
-            raise SystemExit("app stage contains an unsafe file")
-        os.chmod(path, 0o555 if observed.st_mode & 0o111 else 0o444, follow_symlinks=False)
-    for name in directories:
-        path = os.path.join(current, name)
-        observed = os.lstat(path)
-        if stat.S_ISLNK(observed.st_mode):
-            continue
-        if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid():
-            raise SystemExit("app stage contains an unsafe directory")
-        os.chmod(path, 0o555, follow_symlinks=False)
-os.chmod(root, 0o555, follow_symlinks=False)
-PY
   fsync_installer_tree "$staged_app" || return 0
   bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
     --root "$staged_app" --manifest "$retained_manifest" >/dev/null || return 0

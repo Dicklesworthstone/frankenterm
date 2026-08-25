@@ -11488,7 +11488,9 @@ mod tests {
             "outcome": "compensated",
             "tx_id": "tx:test",
             "plan_id": "plan:test",
-            "emitted_at_ms": 1000
+            "emitted_at_ms": 1000,
+            "reason_code": "ok",
+            "decision_path": "test"
         }));
 
         let err = contract.validate().unwrap_err();
@@ -11506,7 +11508,9 @@ mod tests {
             "outcome": "failed",
             "tx_id": "tx:test",
             "plan_id": "plan:test",
-            "emitted_at_ms": 1000
+            "emitted_at_ms": 1000,
+            "reason_code": "ok",
+            "decision_path": "test"
         }));
         contract.receipts.push(serde_json::json!({
             "seq": 2,
@@ -11516,7 +11520,9 @@ mod tests {
             "outcome": "compensated",
             "tx_id": "tx:test",
             "plan_id": "plan:test",
-            "emitted_at_ms": 2000
+            "emitted_at_ms": 2000,
+            "reason_code": "ok",
+            "decision_path": "test"
         }));
 
         let err = contract.validate().unwrap_err();
@@ -11534,7 +11540,9 @@ mod tests {
             "outcome": "committed",
             "tx_id": "tx:test",
             "plan_id": "plan:test",
-            "emitted_at_ms": 1000
+            "emitted_at_ms": 1000,
+            "reason_code": "ok",
+            "decision_path": "test"
         }));
         contract.receipts.push(serde_json::json!({
             "seq": 2,
@@ -11544,7 +11552,9 @@ mod tests {
             "outcome": "compensated",
             "tx_id": "tx:test",
             "plan_id": "plan:test",
-            "emitted_at_ms": 2000
+            "emitted_at_ms": 2000,
+            "reason_code": "ok",
+            "decision_path": "test"
         }));
         contract.receipts.push(serde_json::json!({
             "seq": 3,
@@ -11554,7 +11564,9 @@ mod tests {
             "outcome": "committed",
             "tx_id": "tx:test",
             "plan_id": "plan:test",
-            "emitted_at_ms": 3000
+            "emitted_at_ms": 3000,
+            "reason_code": "ok",
+            "decision_path": "test"
         }));
 
         let err = contract.validate().unwrap_err();

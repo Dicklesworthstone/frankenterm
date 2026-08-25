@@ -12633,7 +12633,74 @@ mod tests {
                 verify_checkpoint_scrollback_artifact(&bounded_path, verifier_limits),
                 Err(CheckpointScrollbackArtifactError::ResourceLimit(_))
             ));
+
+            let excessive_depth = CHECKPOINT_ARTIFACT_JSON_STRUCTURE_LIMITS.max_depth + 1;
+            let nested_json = format!(
+                "{}0{}",
+                "[".repeat(excessive_depth),
+                "]".repeat(excessive_depth)
+            );
+            assert!(matches!(
+                verify_checkpoint_artifact_json_structure(nested_json.as_bytes()),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
         });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_inventory_and_retention_are_bounded_and_prefix_ordered() {
+        let directory = tempfile::TempDir::new().unwrap();
+        write_private_checkpoint_artifact_test_file(&directory.path().join("junk-a"), b"a");
+        write_private_checkpoint_artifact_test_file(&directory.path().join("junk-b"), b"b");
+        let mut one_entry_limits = CheckpointScrollbackArtifactLimits::default();
+        one_entry_limits.max_inventory_entries = 1;
+        assert!(matches!(
+            inventory_checkpoint_scrollback_artifacts(directory.path(), one_entry_limits),
+            Err(CheckpointScrollbackArtifactError::ResourceLimit(_))
+        ));
+
+        let limits = CheckpointScrollbackArtifactLimits::default();
+        let entries = vec![
+            CheckpointScrollbackInventoryEntry {
+                file_name: PathBuf::from("newest"),
+                created_at_epoch_ms: 30,
+                checkpoint_id: 3,
+                artifact_bytes: 10,
+                artifact_sha256: "c".repeat(64),
+            },
+            CheckpointScrollbackInventoryEntry {
+                file_name: PathBuf::from("middle"),
+                created_at_epoch_ms: 20,
+                checkpoint_id: 2,
+                artifact_bytes: 10,
+                artifact_sha256: "b".repeat(64),
+            },
+            CheckpointScrollbackInventoryEntry {
+                file_name: PathBuf::from("oldest"),
+                created_at_epoch_ms: 10,
+                checkpoint_id: 1,
+                artifact_bytes: 1,
+                artifact_sha256: "a".repeat(64),
+            },
+        ];
+        let plan = plan_checkpoint_scrollback_artifact_retention(&entries, 3, 15, limits).unwrap();
+        assert_eq!(plan.retain, vec![PathBuf::from("newest")]);
+        assert_eq!(
+            plan.retire,
+            vec![PathBuf::from("middle"), PathBuf::from("oldest")]
+        );
+        assert_eq!(plan.retained_bytes, 10);
+
+        let mut duplicates = entries;
+        duplicates[2].file_name = duplicates[0].file_name.clone();
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(&duplicates, 3, 100, limits),
+            Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+        ));
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(&duplicates, 3, 100, one_entry_limits),
+            Err(CheckpointScrollbackArtifactError::ResourceLimit(_))
+        ));
     }
 
     fn prepare_test_snapshot(
