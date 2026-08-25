@@ -1,5 +1,27 @@
+# Pinned by DATE, deliberately — do not revert this to a bare `channel = "nightly"`.
+#
+# A floating nightly means an upstream rustc regression lands here with no warning
+# and no reproducible green build. This repository hit it directly: on
+# nightly around 2026-08-22/08-23, `cargo clippy --fix` aborted twice with
+#
+#   delayed bug: unexpected rigid alias in layout_of after normalization
+#   error: could not compile `frankenterm-core` (lib)
+#
+# while `cargo check -p frankenterm-core --lib` succeeded — i.e. the clippy
+# driver ICEd, not the code. The identical signature appeared the same day in
+# toon_rust (an unrelated async opaque type) and charmed_rust (23 instances
+# across russh and tokio), which is what identified it as a toolchain bug rather
+# than a project one. It surfaces on async-heavy code, so a repository can look
+# fine one day and ICE the next purely because the channel moved.
+#
+# nightly-2026-08-20 is known-good across four repositories in that sweep.
+#
+# If you need to move this pin: bump the date, re-run
+# `cargo clippy --workspace --all-targets -- -D warnings` and the full test
+# suite, and update this comment with what you verified. Do not replace it with
+# a bare "nightly".
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-20"
 components = ["rustfmt", "clippy"]
 # Windows cross-check stdlib (ft-iubh9): rustup auto-installs this target on
 # every host that builds the repo — local Macs, CI, and RCH workers alike — so
