@@ -7055,7 +7055,6 @@ mod tests {
     use mio::{Poll, Token};
     use std::fs::hard_link;
     use std::io::{Seek, SeekFrom};
-    use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::time::{Duration, Instant};
 
@@ -8077,19 +8076,18 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_stage_invalid_utf8_prefixed_entry_is_never_ignored()
+    fn checkpoint_stage_malformed_prefixed_entry_is_never_ignored()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
             "ft-guardian-checkpoint-raw-name-",
             OutputSegmentPolicy::production(),
         )?;
         let store = pipeline.checkpoint_stage_store();
-        let mut raw_name = b"checkpoint-invalid-".to_vec();
-        raw_name.push(0xff);
-        let path = store
-            .inner
-            .directory_path
-            .join(OsString::from_vec(raw_name));
+        // The byte parser has a separate invalid-UTF-8 negative control. Use a
+        // representable but malformed prefixed name for the filesystem proof
+        // because APFS rejects non-UTF-8 path components before the store can
+        // inspect them.
+        let path = store.inner.directory_path.join("checkpoint-invalid-name");
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
