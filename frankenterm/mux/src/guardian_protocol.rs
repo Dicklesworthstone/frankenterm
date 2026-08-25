@@ -7605,7 +7605,9 @@ impl GuardianProtocolState {
                 ..
             }) if *live_generation == generation
                 && *mux_incarnation == request.header.mux_incarnation
-                && !self.indeterminate_checkpoints_by_pane.contains_key(&pane_id) =>
+                && !self
+                    .indeterminate_checkpoints_by_pane
+                    .contains_key(&pane_id) =>
             {
                 Ok(stage)
             }
@@ -7630,9 +7632,7 @@ impl GuardianProtocolState {
                 Err(GuardianProtocolError::CheckpointOutcomeIndeterminate)
             }
             Some(GuardianPaneState::LiveUnclaimed { .. })
-            | Some(GuardianPaneState::LiveClaimed { .. }) => {
-                Err(GuardianProtocolError::StaleLease)
-            }
+            | Some(GuardianPaneState::LiveClaimed { .. }) => Err(GuardianProtocolError::StaleLease),
             Some(
                 GuardianPaneState::ExitedUnclaimed { .. }
                 | GuardianPaneState::ClosedTerminal { .. }
@@ -14386,18 +14386,23 @@ mod tests {
 
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
-        apply_request(
-            &mut state,
-            &claim_request(guardian, mux, pane, 0, 165, 166),
-        )
-        .unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 165, 166)).unwrap();
         let claimed_state = state.clone();
         let decoded = state
             .preflight_checkpoint_stage(&authenticate(&stage))
             .unwrap();
         assert_eq!(decoded.kind(), GuardianCheckpointStageKindV1::Begin);
-        assert_eq!(decoded.scope(), GuardianCheckpointScopeV1::Pane { pane_id: pane, generation });
-        assert_eq!(state, claimed_state, "Stage preflight must remain read-only");
+        assert_eq!(
+            decoded.scope(),
+            GuardianCheckpointScopeV1::Pane {
+                pane_id: pane,
+                generation
+            }
+        );
+        assert_eq!(
+            state, claimed_state,
+            "Stage preflight must remain read-only"
+        );
 
         let wrong_mux = pane_checkpoint_stage_request(
             guardian,
@@ -14430,11 +14435,8 @@ mod tests {
         ));
 
         let missing_pane = id(170);
-        let missing_descriptor = record_checkpoint_descriptor(
-            missing_pane,
-            generation,
-            terminal.canonical_payload(),
-        );
+        let missing_descriptor =
+            record_checkpoint_descriptor(missing_pane, generation, terminal.canonical_payload());
         let missing = pane_checkpoint_stage_request(
             guardian,
             mux,
@@ -14461,9 +14463,7 @@ mod tests {
             b"pending",
         ));
         state
-            .apply_input_effect_transactionally(&input, |_| {
-                Ok::<(), std::convert::Infallible>(())
-            })
+            .apply_input_effect_transactionally(&input, |_| Ok::<(), std::convert::Infallible>(()))
             .unwrap();
         assert!(matches!(
             state.preflight_checkpoint_stage(&authenticate(&stage)),
@@ -14471,9 +14471,8 @@ mod tests {
         ));
 
         let mut indeterminate = claimed_state.clone();
-        let checkpoint = checkpoint_request(
-            guardian, mux, pane, generation, 1, 175, 176, 0x71, 0x72,
-        );
+        let checkpoint =
+            checkpoint_request(guardian, mux, pane, generation, 1, 175, 176, 0x71, 0x72);
         let receipt = indeterminate
             .apply_checkpoint_transactionally(&authenticate(&checkpoint), |_| Err::<(), ()>(()))
             .unwrap();
