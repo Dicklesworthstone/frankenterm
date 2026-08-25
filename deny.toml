@@ -54,11 +54,24 @@ deny = [
 ]
 
 # Skip the same banned crate when it appears as a transitive
-# dependency through unavoidable third-party leaves (e.g. tonic,
-# h2, hyper). The structural rule is "first-party crates may not
+# dependency through unavoidable third-party leaves (e.g. fastembed,
+# reqwest, hyper, h2). The structural rule is "first-party crates may not
 # *directly* depend on tokio"; transitive pulls through reputable
 # third-party crates are out of scope for this bead.
-skip-tree = []
+skip-tree = [
+    { name = "fastembed" },
+    { name = "reqwest" },
+    { name = "hyper" },
+    { name = "hyper-util" },
+    { name = "hyper-rustls" },
+    { name = "hyper-tls" },
+    { name = "h2" },
+    { name = "tokio-rustls" },
+    { name = "tokio-native-tls" },
+    { name = "tokio-util" },
+    { name = "tower" },
+    { name = "tower-http" },
+]
 
 [advisories]
 # Bead scope is bans only; advisories audit ships under a separate
@@ -71,9 +84,10 @@ unmaintained = "all"
 ignore = []
 
 [licenses]
-# Licenses audit is also out of scope for ft-i2eni.3. Permissive
-# default keeps the configuration shippable without a workspace-
-# wide license-policy debate that belongs in its own bead.
+# Licenses audit configuration for ft-wv4xd.
+# Permissive default allows standard OSI/permissive licenses plus
+# LGPL-2.1-only (used by xcb-imdkit on X11/XCB for IME).
+# First-party workspace crates use the MIT license with custom OpenAI/Anthropic rider.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -88,11 +102,14 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "BSL-1.0",
-    "OpenSSL",
     "CDLA-Permissive-2.0",
     "WTFPL",
+    "LGPL-2.1-only",
 ]
 confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
 
 [sources]
 # Restrict sources to crates.io + the explicit git repos we vendor
