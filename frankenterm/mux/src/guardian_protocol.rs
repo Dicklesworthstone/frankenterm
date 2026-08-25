@@ -10796,7 +10796,7 @@ fn sealed_atomic_build_identity_from_bytes(
 ) -> Result<SealedAtomicBuildIdentity, GuardianProtocolError> {
     const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = [0_u8; 64];
-    for (index, byte) in bytes.into_iter().enumerate() {
+    for (index, &byte) in bytes.iter().enumerate() {
         encoded[index * 2] = LOWER_HEX[usize::from(byte >> 4)];
         encoded[index * 2 + 1] = LOWER_HEX[usize::from(byte & 0x0f)];
     }
