@@ -8733,47 +8733,196 @@ fn revalidate_checkpoint_artifact_parent(
     Ok(())
 }
 
+/// One complete filesystem observation used to reject mutation during a read.
+///
+/// The Unix fields are the supported macOS/Linux authority: `ctime` cannot be
+/// restored by an unprivileged writer, so a same-size rewrite followed by an
+/// `mtime` restoration still changes this snapshot. Portable targets retain
+/// the strongest stable metadata exposed by `std`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckpointArtifactFileSnapshot {
+    byte_len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    link_count: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl CheckpointArtifactFileSnapshot {
+    fn capture_cap(
+        metadata: &cap_std::fs::Metadata,
+    ) -> Result<Self, CheckpointScrollbackArtifactError> {
+        #[cfg(unix)]
+        use cap_fs_ext::OsMetadataExt as _;
+        #[cfg(unix)]
+        use cap_std::fs::PermissionsExt as _;
+
+        Ok(Self {
+            byte_len: metadata.len(),
+            modified: metadata.modified()?.into_std(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.permissions().mode(),
+            #[cfg(unix)]
+            link_count: metadata.nlink(),
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    fn capture_std(
+        metadata: &std::fs::Metadata,
+    ) -> Result<Self, CheckpointScrollbackArtifactError> {
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        Ok(Self {
+            byte_len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.permissions().mode(),
+            #[cfg(unix)]
+            link_count: metadata.nlink(),
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+}
+
 fn validate_checkpoint_artifact_file_metadata(
     path_metadata: &cap_std::fs::Metadata,
     handle_metadata: &cap_std::fs::Metadata,
     expected_len: Option<u64>,
-) -> Result<(), CheckpointScrollbackArtifactError> {
-    use cap_fs_ext::OsMetadataExt as _;
-
-    if !path_metadata.is_file()
-        || !handle_metadata.is_file()
-        || path_metadata.dev() != handle_metadata.dev()
-        || path_metadata.ino() != handle_metadata.ino()
-        || path_metadata.nlink() != 1
-        || handle_metadata.nlink() != 1
-        || expected_len.is_some_and(|length| handle_metadata.len() != length)
+) -> Result<CheckpointArtifactFileSnapshot, CheckpointScrollbackArtifactError> {
+    if !path_metadata.is_file() || !handle_metadata.is_file() {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact authority is not a regular file".to_string(),
+        ));
+    }
+    let path_snapshot = CheckpointArtifactFileSnapshot::capture_cap(path_metadata)?;
+    let handle_snapshot = CheckpointArtifactFileSnapshot::capture_cap(handle_metadata)?;
+    #[cfg(unix)]
+    let invalid_link_count = path_snapshot.link_count != 1 || handle_snapshot.link_count != 1;
+    #[cfg(not(unix))]
+    let invalid_link_count = false;
+    if path_snapshot != handle_snapshot
+        || invalid_link_count
+        || expected_len.is_some_and(|length| handle_snapshot.byte_len != length)
     {
         return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
             "artifact is not one stable regular file with link count one".to_string(),
         ));
     }
     #[cfg(unix)]
-    {
-        use cap_std::fs::PermissionsExt as _;
-
-        if path_metadata.permissions().mode() & 0o077 != 0
-            || handle_metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
-                "artifact permissions are not private".to_string(),
-            ));
-        }
+    if path_snapshot.mode & 0o077 != 0 {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact permissions are not private".to_string(),
+        ));
     }
-    Ok(())
+    Ok(handle_snapshot)
 }
 
-fn checkpoint_artifact_staging_name(leaf: &Path, attempt: u8) -> String {
+fn checkpoint_artifact_staging_name(leaf: &Path, artifact_sha256: &str) -> String {
     let leaf_digest = checkpoint_artifact_sha256(leaf.to_string_lossy().as_bytes());
     format!(
-        ".ft-checkpoint-scrollback-{}-{}-{attempt}.staging",
-        &leaf_digest[..16],
-        std::process::id()
+        ".ft-checkpoint-scrollback-{}-{artifact_sha256}.staging",
+        &leaf_digest[..16]
     )
+}
+
+fn acquire_checkpoint_artifact_publication_lock(
+    parent: &cap_std::fs::Dir,
+) -> Result<std::fs::File, CheckpointScrollbackArtifactError> {
+    let lock_leaf = Path::new(CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .follow(cap_std::fs::FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    let cap_file = parent.open_with(lock_leaf, &options)?;
+    let handle_metadata = cap_file.metadata()?;
+    let path_metadata = parent.symlink_metadata(lock_leaf)?;
+    let opened_snapshot = validate_checkpoint_artifact_file_metadata(
+        &path_metadata,
+        &handle_metadata,
+        Some(0),
+    )?;
+    let file = cap_file.into_std();
+    if CheckpointArtifactFileSnapshot::capture_std(&file.metadata()?)? != opened_snapshot {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "publication lock changed identity while opening".to_string(),
+        ));
+    }
+
+    let started = Instant::now();
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && started.elapsed() < CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK_TIMEOUT =>
+            {
+                std::thread::sleep(CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK_POLL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(CheckpointScrollbackArtifactError::PublicationBusy);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let locked_snapshot = CheckpointArtifactFileSnapshot::capture_std(&file.metadata()?)?;
+    let locked_path_snapshot = CheckpointArtifactFileSnapshot::capture_cap(
+        &parent.symlink_metadata(lock_leaf)?,
+    )?;
+    if locked_snapshot != opened_snapshot || locked_path_snapshot != locked_snapshot {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "publication lock changed while acquisition was pending".to_string(),
+        ));
+    }
+    file.sync_all()?;
+    sync_checkpoint_artifact_directory(parent)?;
+    Ok(file)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

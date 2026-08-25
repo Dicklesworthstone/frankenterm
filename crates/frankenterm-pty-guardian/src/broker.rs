@@ -488,6 +488,522 @@ enum BrokerSpawnWalInjectedFault {
     BeforeHeadSync,
 }
 
+fn broker_genesis_binding_digest(binding: BrokerGenesisBinding) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankenterm.guardian-broker.genesis-binding.v1\0");
+    hasher.update(binding.mux_incarnation.as_bytes());
+    hasher.update(binding.spawn_effect_id.as_bytes());
+    hasher.update(binding.durable_pane_id.as_bytes());
+    hasher.update(binding.origin_request_id.as_bytes());
+    hasher.update(binding.spawn_payload_bytes.to_le_bytes());
+    hasher.update(binding.spawn_payload_digest);
+    hasher.update(binding.spawning_mux_build_identity_digest);
+    hasher.update(binding.live_guardian_build_identity_digest);
+    hasher.update(binding.rows.to_le_bytes());
+    hasher.update(binding.cols.to_le_bytes());
+    hasher.update(binding.pixel_width.to_le_bytes());
+    hasher.update(binding.pixel_height.to_le_bytes());
+    hasher.update(binding.checkpoint_identity_digest);
+    hasher.update(binding.boundary_identity_digest);
+    hasher.update(binding.upload_id.as_bytes());
+    hasher.finalize().into()
+}
+
+fn broker_spawn_wal_authenticate(
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    bytes: &[u8],
+) -> Result<[u8; BROKER_SPAWN_WAL_MAC_BYTES], BrokerSpawnWalError> {
+    authenticator
+        .authenticate(bytes)
+        .map_err(|_| BrokerSpawnWalError::AuthenticationFailed)
+}
+
+fn broker_spawn_wal_verify(
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    bytes: &[u8],
+    tag: &[u8],
+) -> Result<(), BrokerSpawnWalError> {
+    authenticator
+        .verify(bytes, tag)
+        .map_err(|_| BrokerSpawnWalError::AuthenticationFailed)
+}
+
+fn encode_broker_spawn_file_header(
+    magic: [u8; 8],
+    identity: BrokerSpawnWalIdentityV1,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<[u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES], BrokerSpawnWalError> {
+    identity.validate()?;
+    let mut header = [0_u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES];
+    header[0..8].copy_from_slice(&magic);
+    header[8..12].copy_from_slice(&BROKER_SPAWN_WAL_FORMAT_VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U32.to_le_bytes());
+    header[16..32].copy_from_slice(identity.journal_id.as_bytes());
+    header[32..48].copy_from_slice(identity.broker_lineage_id.as_bytes());
+    header[48..64].copy_from_slice(identity.mux_incarnation.as_bytes());
+    header[64..80].copy_from_slice(identity.durable_pane_id.as_bytes());
+    header[80..96].copy_from_slice(identity.spawn_effect_id.as_bytes());
+    header[96..112].copy_from_slice(identity.origin_request_id.as_bytes());
+    header[112..120].copy_from_slice(&identity.spawn_payload_bytes.to_le_bytes());
+    header[120..128].copy_from_slice(&authenticator.key_id());
+    header[128..160].copy_from_slice(&identity.binding_digest);
+    let tag = broker_spawn_wal_authenticate(
+        authenticator,
+        &header[..BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES],
+    )?;
+    header[160..192].copy_from_slice(&tag);
+    Ok(header)
+}
+
+fn validate_broker_spawn_file_header(
+    header: &[u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
+    magic: [u8; 8],
+    expected: BrokerSpawnWalIdentityV1,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<[u8; BROKER_SPAWN_WAL_MAC_BYTES], BrokerSpawnWalError> {
+    if header[0..8] != magic {
+        return Err(BrokerSpawnWalError::InvalidFileMagic);
+    }
+    let version = read_broker_u32(&header[8..12]);
+    if version != BROKER_SPAWN_WAL_FORMAT_VERSION {
+        return Err(BrokerSpawnWalError::UnsupportedVersion { observed: version });
+    }
+    if read_broker_u32(&header[12..16]) != BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U32 {
+        return Err(BrokerSpawnWalError::InvalidFileHeaderLength);
+    }
+    if header[120..128] != authenticator.key_id() {
+        return Err(BrokerSpawnWalError::KeyIdentityMismatch);
+    }
+    let observed = BrokerSpawnWalIdentityV1 {
+        journal_id: read_broker_uuid(&header[16..32]),
+        broker_lineage_id: read_broker_uuid(&header[32..48]),
+        mux_incarnation: read_broker_uuid(&header[48..64]),
+        durable_pane_id: read_broker_uuid(&header[64..80]),
+        spawn_effect_id: read_broker_uuid(&header[80..96]),
+        origin_request_id: read_broker_uuid(&header[96..112]),
+        spawn_payload_bytes: read_broker_u64(&header[112..120]),
+        binding_digest: read_broker_array_32(&header[128..160]),
+    };
+    observed.validate()?;
+    if observed != expected {
+        return Err(BrokerSpawnWalError::IdentityMismatch);
+    }
+    broker_spawn_wal_verify(
+        authenticator,
+        &header[..BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES],
+        &header[160..192],
+    )?;
+    Ok(read_broker_array_32(&header[160..192]))
+}
+
+fn encode_broker_spawn_wal_record(
+    header_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    sequence: u64,
+    phase: BrokerSpawnWalPhaseV1,
+    operation_id: Uuid,
+    attempt_id: Uuid,
+    child_identity: Option<BrokerKernelChildIdentityV1>,
+    previous_record_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+) -> Result<[u8; BROKER_SPAWN_WAL_RECORD_BYTES], BrokerSpawnWalError> {
+    validate_broker_spawn_record_fields(
+        phase,
+        operation_id,
+        attempt_id,
+        child_identity,
+    )?;
+    let mut record = [0_u8; BROKER_SPAWN_WAL_RECORD_BYTES];
+    record[0..8].copy_from_slice(&BROKER_SPAWN_WAL_RECORD_MAGIC);
+    record[8..12].copy_from_slice(&BROKER_SPAWN_WAL_RECORD_BYTES_U32.to_le_bytes());
+    record[12] = phase.to_wire();
+    record[16..24].copy_from_slice(&sequence.to_le_bytes());
+    record[24..40].copy_from_slice(operation_id.as_bytes());
+    record[40..56].copy_from_slice(attempt_id.as_bytes());
+    if let Some(child_identity) = child_identity {
+        record[56..72].copy_from_slice(child_identity.broker_child_nonce.as_bytes());
+        record[72..76].copy_from_slice(&child_identity.process_id.to_le_bytes());
+        record[80..112].copy_from_slice(&child_identity.kernel_start_identity_digest);
+    }
+    record[112..144].copy_from_slice(&previous_record_mac);
+    let mut authenticated = [0_u8;
+        BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES];
+    authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&header_mac);
+    authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
+        .copy_from_slice(&record[..BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES]);
+    let tag = broker_spawn_wal_authenticate(authenticator, &authenticated)?;
+    record[144..176].copy_from_slice(&tag);
+    Ok(record)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_broker_spawn_wal_record(
+    record: &[u8; BROKER_SPAWN_WAL_RECORD_BYTES],
+    header_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    expected_sequence: u64,
+    expected_previous_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    previous: Option<BrokerSpawnWalRecordState>,
+) -> Result<BrokerSpawnWalRecordState, BrokerSpawnWalError> {
+    if record[0..8] != BROKER_SPAWN_WAL_RECORD_MAGIC
+        || read_broker_u32(&record[8..12]) != BROKER_SPAWN_WAL_RECORD_BYTES_U32
+    {
+        return Err(BrokerSpawnWalError::InvalidRecordFraming);
+    }
+    if record[13..16].iter().any(|byte| *byte != 0)
+        || record[76..80].iter().any(|byte| *byte != 0)
+    {
+        return Err(BrokerSpawnWalError::NonCanonicalRecord);
+    }
+    let sequence = read_broker_u64(&record[16..24]);
+    if sequence != expected_sequence {
+        return Err(BrokerSpawnWalError::SequenceMismatch);
+    }
+    if record[112..144] != expected_previous_mac {
+        return Err(BrokerSpawnWalError::RecordChainMismatch);
+    }
+    let mut authenticated = [0_u8;
+        BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES];
+    authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&header_mac);
+    authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
+        .copy_from_slice(&record[..BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES]);
+    broker_spawn_wal_verify(authenticator, &authenticated, &record[144..176])?;
+
+    let phase = BrokerSpawnWalPhaseV1::from_wire(record[12])?;
+    let operation_id = read_broker_uuid(&record[24..40]);
+    let attempt_id = read_broker_uuid(&record[40..56]);
+    let process_id = read_broker_u32(&record[72..76]);
+    let broker_child_nonce = read_broker_uuid(&record[56..72]);
+    let kernel_start_identity_digest = read_broker_array_32(&record[80..112]);
+    let child_identity = if process_id == 0
+        && broker_child_nonce.is_nil()
+        && kernel_start_identity_digest == [0; 32]
+    {
+        None
+    } else {
+        Some(BrokerKernelChildIdentityV1 {
+            process_id,
+            broker_child_nonce,
+            kernel_start_identity_digest,
+        })
+    };
+    validate_broker_spawn_record_fields(
+        phase,
+        operation_id,
+        attempt_id,
+        child_identity,
+    )?;
+    validate_broker_spawn_record_transition(previous, phase, attempt_id, child_identity)?;
+    let record_mac = read_broker_array_32(&record[144..176]);
+    Ok(BrokerSpawnWalRecordState {
+        phase,
+        operation_id,
+        attempt_id,
+        child_identity,
+        receipt: BrokerSpawnWalReceiptV1 {
+            sequence,
+            phase,
+            committed_wal_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+                + (sequence + 1) * BROKER_SPAWN_WAL_RECORD_BYTES_U64,
+            committed_head_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            record_mac,
+            head_mac: [0; BROKER_SPAWN_WAL_MAC_BYTES],
+        },
+    })
+}
+
+fn encode_broker_spawn_head_record(
+    head_header_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    sequence: u64,
+    wal_record_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    previous_head_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+) -> Result<[u8; BROKER_SPAWN_HEAD_RECORD_BYTES], BrokerSpawnWalError> {
+    let mut record = [0_u8; BROKER_SPAWN_HEAD_RECORD_BYTES];
+    record[0..8].copy_from_slice(&BROKER_SPAWN_HEAD_RECORD_MAGIC);
+    record[8..12].copy_from_slice(&BROKER_SPAWN_HEAD_RECORD_BYTES_U32.to_le_bytes());
+    record[16..24].copy_from_slice(&sequence.to_le_bytes());
+    record[24..56].copy_from_slice(&wal_record_mac);
+    record[56..88].copy_from_slice(&previous_head_mac);
+    let mut authenticated = [0_u8;
+        BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES];
+    authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&head_header_mac);
+    authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
+        .copy_from_slice(&record[..BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES]);
+    let tag = broker_spawn_wal_authenticate(authenticator, &authenticated)?;
+    record[88..120].copy_from_slice(&tag);
+    Ok(record)
+}
+
+fn decode_broker_spawn_head_record(
+    record: &[u8; BROKER_SPAWN_HEAD_RECORD_BYTES],
+    head_header_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    expected_sequence: u64,
+    expected_wal_record_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    expected_previous_head_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+) -> Result<[u8; BROKER_SPAWN_WAL_MAC_BYTES], BrokerSpawnWalError> {
+    if record[0..8] != BROKER_SPAWN_HEAD_RECORD_MAGIC
+        || read_broker_u32(&record[8..12]) != BROKER_SPAWN_HEAD_RECORD_BYTES_U32
+    {
+        return Err(BrokerSpawnWalError::InvalidRecordFraming);
+    }
+    if record[12..16].iter().any(|byte| *byte != 0)
+        || read_broker_u64(&record[16..24]) != expected_sequence
+        || record[24..56] != expected_wal_record_mac
+        || record[56..88] != expected_previous_head_mac
+    {
+        return Err(BrokerSpawnWalError::HeadAnchorMismatch);
+    }
+    let mut authenticated = [0_u8;
+        BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES];
+    authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&head_header_mac);
+    authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
+        .copy_from_slice(&record[..BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES]);
+    broker_spawn_wal_verify(authenticator, &authenticated, &record[88..120])?;
+    Ok(read_broker_array_32(&record[88..120]))
+}
+
+fn validate_broker_spawn_record_fields(
+    phase: BrokerSpawnWalPhaseV1,
+    operation_id: Uuid,
+    attempt_id: Uuid,
+    child_identity: Option<BrokerKernelChildIdentityV1>,
+) -> Result<(), BrokerSpawnWalError> {
+    if operation_id.is_nil() {
+        return Err(BrokerSpawnWalError::NonCanonicalRecord);
+    }
+    match phase {
+        BrokerSpawnWalPhaseV1::Intent
+            if attempt_id.is_nil() && child_identity.is_none() => {}
+        BrokerSpawnWalPhaseV1::Attempted
+            if !attempt_id.is_nil()
+                && operation_id == attempt_id
+                && child_identity.is_none() => {}
+        BrokerSpawnWalPhaseV1::SpawnObserved | BrokerSpawnWalPhaseV1::ReplyAcknowledged
+            if !attempt_id.is_nil() && child_identity.is_some() =>
+        {
+            child_identity
+                .expect("checked child identity")
+                .validate()?;
+        }
+        _ => return Err(BrokerSpawnWalError::NonCanonicalRecord),
+    }
+    Ok(())
+}
+
+fn validate_broker_spawn_record_transition(
+    previous: Option<BrokerSpawnWalRecordState>,
+    phase: BrokerSpawnWalPhaseV1,
+    attempt_id: Uuid,
+    child_identity: Option<BrokerKernelChildIdentityV1>,
+) -> Result<(), BrokerSpawnWalError> {
+    match (previous, phase) {
+        (None, BrokerSpawnWalPhaseV1::Intent) => Ok(()),
+        (Some(previous), BrokerSpawnWalPhaseV1::Attempted)
+            if previous.phase == BrokerSpawnWalPhaseV1::Intent =>
+        {
+            Ok(())
+        }
+        (Some(previous), BrokerSpawnWalPhaseV1::SpawnObserved)
+            if previous.phase == BrokerSpawnWalPhaseV1::Attempted
+                && previous.attempt_id == attempt_id =>
+        {
+            Ok(())
+        }
+        (Some(previous), BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+            if previous.phase == BrokerSpawnWalPhaseV1::SpawnObserved
+                && previous.attempt_id == attempt_id
+                && previous.child_identity == child_identity =>
+        {
+            Ok(())
+        }
+        _ => Err(BrokerSpawnWalError::InvalidTransition),
+    }
+}
+
+fn read_broker_u32(bytes: &[u8]) -> u32 {
+    let mut value = [0_u8; 4];
+    value.copy_from_slice(bytes);
+    u32::from_le_bytes(value)
+}
+
+fn read_broker_u64(bytes: &[u8]) -> u64 {
+    let mut value = [0_u8; 8];
+    value.copy_from_slice(bytes);
+    u64::from_le_bytes(value)
+}
+
+fn read_broker_uuid(bytes: &[u8]) -> Uuid {
+    let mut value = [0_u8; 16];
+    value.copy_from_slice(bytes);
+    Uuid::from_bytes(value)
+}
+
+fn read_broker_array_32(bytes: &[u8]) -> [u8; 32] {
+    let mut value = [0_u8; 32];
+    value.copy_from_slice(bytes);
+    value
+}
+
+fn scan_broker_spawn_wal(
+    wal: &mut File,
+    identity: BrokerSpawnWalIdentityV1,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<(
+    [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    BrokerSpawnWalScan,
+), BrokerSpawnWalError> {
+    let metadata = wal.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(BrokerSpawnWalError::NotRegularFile);
+    }
+    let physical_bytes = metadata.len();
+    if physical_bytes < BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 {
+        return Err(BrokerSpawnWalError::TornFileHeader);
+    }
+    let maximum_physical_bytes = BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+        .checked_add(
+            BROKER_SPAWN_WAL_MAX_RECORDS
+                .checked_mul(BROKER_SPAWN_WAL_RECORD_BYTES_U64)
+                .ok_or(BrokerSpawnWalError::CapacityExhausted)?,
+        )
+        .and_then(|bytes| bytes.checked_add(BROKER_SPAWN_WAL_RECORD_BYTES_U64 - 1))
+        .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+    if physical_bytes > maximum_physical_bytes {
+        return Err(BrokerSpawnWalError::CapacityExhausted);
+    }
+    wal.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES];
+    wal.read_exact(&mut header)?;
+    let header_mac = validate_broker_spawn_file_header(
+        &header,
+        BROKER_SPAWN_WAL_FILE_MAGIC,
+        identity,
+        authenticator,
+    )?;
+    let record_region = physical_bytes - BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64;
+    let complete_records = record_region / BROKER_SPAWN_WAL_RECORD_BYTES_U64;
+    if complete_records > BROKER_SPAWN_WAL_MAX_RECORDS {
+        return Err(BrokerSpawnWalError::CapacityExhausted);
+    }
+    let trailing_bytes = record_region % BROKER_SPAWN_WAL_RECORD_BYTES_U64;
+    let capacity = usize::try_from(complete_records)
+        .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(capacity)
+        .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+    let mut previous_mac = header_mac;
+    let mut previous = None;
+    for sequence in 0..complete_records {
+        let mut record = [0_u8; BROKER_SPAWN_WAL_RECORD_BYTES];
+        wal.read_exact(&mut record)?;
+        let decoded = decode_broker_spawn_wal_record(
+            &record,
+            header_mac,
+            authenticator,
+            sequence,
+            previous_mac,
+            previous,
+        )?;
+        previous_mac = decoded.receipt.record_mac;
+        previous = Some(decoded);
+        records.push(decoded);
+    }
+    Ok((
+        header_mac,
+        BrokerSpawnWalScan {
+            committed_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+                + complete_records * BROKER_SPAWN_WAL_RECORD_BYTES_U64,
+            trailing_bytes,
+            records,
+        },
+    ))
+}
+
+fn scan_broker_spawn_head(
+    head: &mut File,
+    identity: BrokerSpawnWalIdentityV1,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    wal_records: &[BrokerSpawnWalRecordState],
+) -> Result<(
+    [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    BrokerSpawnHeadScan,
+), BrokerSpawnWalError> {
+    let metadata = head.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(BrokerSpawnWalError::NotRegularFile);
+    }
+    let physical_bytes = metadata.len();
+    if physical_bytes < BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 {
+        return Err(BrokerSpawnWalError::TornFileHeader);
+    }
+    let maximum_physical_bytes = BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+        .checked_add(
+            BROKER_SPAWN_WAL_MAX_RECORDS
+                .checked_mul(BROKER_SPAWN_HEAD_RECORD_BYTES_U64)
+                .ok_or(BrokerSpawnWalError::CapacityExhausted)?,
+        )
+        .and_then(|bytes| bytes.checked_add(BROKER_SPAWN_HEAD_RECORD_BYTES_U64 - 1))
+        .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+    if physical_bytes > maximum_physical_bytes {
+        return Err(BrokerSpawnWalError::CapacityExhausted);
+    }
+    head.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES];
+    head.read_exact(&mut header)?;
+    let head_header_mac = validate_broker_spawn_file_header(
+        &header,
+        BROKER_SPAWN_HEAD_FILE_MAGIC,
+        identity,
+        authenticator,
+    )?;
+    let record_region = physical_bytes - BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64;
+    let complete_records = record_region / BROKER_SPAWN_HEAD_RECORD_BYTES_U64;
+    if complete_records > BROKER_SPAWN_WAL_MAX_RECORDS
+        || complete_records
+            > u64::try_from(wal_records.len()).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?
+    {
+        return Err(BrokerSpawnWalError::HeadAnchorMismatch);
+    }
+    let trailing_bytes = record_region % BROKER_SPAWN_HEAD_RECORD_BYTES_U64;
+    let capacity = usize::try_from(complete_records)
+        .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+    let mut record_macs = Vec::new();
+    record_macs
+        .try_reserve_exact(capacity)
+        .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+    let mut previous_head_mac = head_header_mac;
+    for sequence in 0..complete_records {
+        let index = usize::try_from(sequence).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        let wal_record = wal_records
+            .get(index)
+            .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
+        let mut record = [0_u8; BROKER_SPAWN_HEAD_RECORD_BYTES];
+        head.read_exact(&mut record)?;
+        let head_mac = decode_broker_spawn_head_record(
+            &record,
+            head_header_mac,
+            authenticator,
+            sequence,
+            wal_record.receipt.record_mac,
+            previous_head_mac,
+        )?;
+        previous_head_mac = head_mac;
+        record_macs.push(head_mac);
+    }
+    Ok((
+        head_header_mac,
+        BrokerSpawnHeadScan {
+            committed_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+                + complete_records * BROKER_SPAWN_HEAD_RECORD_BYTES_U64,
+            trailing_bytes,
+            record_macs,
+            terminal_head_mac: previous_head_mac,
+        },
+    ))
+}
+
 /// Hard per-pane limits checked before the broker allocates a PTY.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BrokerResourceLimitsV1 {
