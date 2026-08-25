@@ -19,7 +19,7 @@
 //! See `wa-29k1` bead for the full design.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -8572,6 +8572,593 @@ fn validate_checkpoint_scrollback_payload(
         ));
     }
     Ok(())
+}
+
+fn checkpoint_artifact_path_contains_parent(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn create_checkpoint_artifact_private_directory(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::DirBuilderExt as _;
+
+        let mut builder = cap_std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        parent.create_dir_with(name, &builder)
+    }
+    #[cfg(not(unix))]
+    {
+        parent.create_dir(name)
+    }
+}
+
+fn sync_checkpoint_artifact_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        directory.open(".")?.into_std().sync_all()
+    }
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
+fn ensure_checkpoint_artifact_directory_nofollow(
+    path: &Path,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+
+    if checkpoint_artifact_path_contains_parent(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact directory contains a parent component",
+        ));
+    }
+    let Some(leaf) = path.file_name() else {
+        let base = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        return cap_std::fs::Dir::open_ambient_dir(base, cap_std::ambient_authority());
+    };
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = ensure_checkpoint_artifact_directory_nofollow(parent_path)?;
+    let leaf = Path::new(leaf);
+    let created = match create_checkpoint_artifact_private_directory(&parent, leaf) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error),
+    };
+    let directory = parent.open_dir_nofollow(leaf)?;
+    if created {
+        sync_checkpoint_artifact_directory(&parent)?;
+    }
+    Ok(directory)
+}
+
+fn open_checkpoint_artifact_directory_nofollow(
+    path: &Path,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+
+    if checkpoint_artifact_path_contains_parent(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact directory contains a parent component",
+        ));
+    }
+    let Some(leaf) = path.file_name() else {
+        let base = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        return cap_std::fs::Dir::open_ambient_dir(base, cap_std::ambient_authority());
+    };
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = open_checkpoint_artifact_directory_nofollow(parent_path)?;
+    parent.open_dir_nofollow(Path::new(leaf))
+}
+
+fn checkpoint_artifact_parent_and_leaf(
+    path: &Path,
+    create_parent: bool,
+) -> Result<(cap_std::fs::Dir, PathBuf, PathBuf), CheckpointScrollbackArtifactError> {
+    if checkpoint_artifact_path_contains_parent(path) {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact path contains a parent component".to_string(),
+        ));
+    }
+    let leaf = path
+        .file_name()
+        .filter(|leaf| !leaf.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CheckpointScrollbackArtifactError::InvalidArtifact(
+                "artifact path has no leaf name".to_string(),
+            )
+        })?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let parent = if create_parent {
+        ensure_checkpoint_artifact_directory_nofollow(&parent_path)?
+    } else {
+        open_checkpoint_artifact_directory_nofollow(&parent_path)?
+    };
+    Ok((parent, leaf, parent_path))
+}
+
+fn revalidate_checkpoint_artifact_parent(
+    parent_path: &Path,
+    pinned: &cap_std::fs::Dir,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    use cap_fs_ext::OsMetadataExt as _;
+
+    let pinned_metadata = pinned.dir_metadata()?;
+    let reopened = open_checkpoint_artifact_directory_nofollow(parent_path)?;
+    let reopened_metadata = reopened.dir_metadata()?;
+    if !pinned_metadata.is_dir()
+        || !reopened_metadata.is_dir()
+        || pinned_metadata.dev() != reopened_metadata.dev()
+        || pinned_metadata.ino() != reopened_metadata.ino()
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact parent directory changed identity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_artifact_file_metadata(
+    path_metadata: &cap_std::fs::Metadata,
+    handle_metadata: &cap_std::fs::Metadata,
+    expected_len: Option<u64>,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    use cap_fs_ext::OsMetadataExt as _;
+
+    if !path_metadata.is_file()
+        || !handle_metadata.is_file()
+        || path_metadata.dev() != handle_metadata.dev()
+        || path_metadata.ino() != handle_metadata.ino()
+        || path_metadata.nlink() != 1
+        || handle_metadata.nlink() != 1
+        || expected_len.is_some_and(|length| handle_metadata.len() != length)
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact is not one stable regular file with link count one".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt as _;
+
+        if path_metadata.permissions().mode() & 0o077 != 0
+            || handle_metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "artifact permissions are not private".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_artifact_staging_name(leaf: &Path, attempt: u8) -> String {
+    let leaf_digest = checkpoint_artifact_sha256(leaf.to_string_lossy().as_bytes());
+    format!(
+        ".ft-checkpoint-scrollback-{}-{}-{attempt}.staging",
+        &leaf_digest[..16],
+        std::process::id()
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_checkpoint_artifact_noreplace(
+    parent: &cap_std::fs::Dir,
+    staging: &Path,
+    target: &Path,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    let parent_file = parent.open(".")?.into_std();
+    match renameat_with(
+        &parent_file,
+        staging,
+        &parent_file,
+        target,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::EXIST => {
+            Err(CheckpointScrollbackArtifactError::AlreadyExists)
+        }
+        Err(error) => Err(CheckpointScrollbackArtifactError::Io(
+            std::io::Error::from_raw_os_error(error.raw_os_error()),
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn publish_checkpoint_artifact_noreplace(
+    parent: &cap_std::fs::Dir,
+    staging: &Path,
+    target: &Path,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    if parent.symlink_metadata(target).is_ok() {
+        return Err(CheckpointScrollbackArtifactError::AlreadyExists);
+    }
+    parent.rename(staging, parent, target).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            CheckpointScrollbackArtifactError::AlreadyExists
+        } else {
+            CheckpointScrollbackArtifactError::Io(error)
+        }
+    })
+}
+
+fn publish_checkpoint_artifact_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, true)?;
+    if parent.symlink_metadata(&leaf).is_ok() {
+        return Err(CheckpointScrollbackArtifactError::AlreadyExists);
+    }
+    let expected_len = u64::try_from(bytes.len()).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact length does not fit u64".to_string(),
+        )
+    })?;
+    for attempt in 0..CHECKPOINT_SCROLLBACK_MAX_STAGING_ATTEMPTS {
+        let staging_name = checkpoint_artifact_staging_name(&leaf, attempt);
+        let staging = Path::new(&staging_name);
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(cap_std::fs::FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+
+            options.mode(0o600);
+        }
+        let mut file = match parent.open_with(staging, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let handle_metadata = file.metadata()?;
+        let path_metadata = parent.symlink_metadata(staging)?;
+        validate_checkpoint_artifact_file_metadata(
+            &path_metadata,
+            &handle_metadata,
+            Some(expected_len),
+        )?;
+        publish_checkpoint_artifact_noreplace(&parent, staging, &leaf)?;
+        sync_checkpoint_artifact_directory(&parent)?;
+        revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+        let target_metadata = parent.symlink_metadata(&leaf)?;
+        let handle_metadata_after = file.metadata()?;
+        validate_checkpoint_artifact_file_metadata(
+            &target_metadata,
+            &handle_metadata_after,
+            Some(expected_len),
+        )?;
+        return Ok(());
+    }
+    Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+        "all {CHECKPOINT_SCROLLBACK_MAX_STAGING_ATTEMPTS} bounded staging names are occupied"
+    )))
+}
+
+fn read_checkpoint_artifact_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>, CheckpointScrollbackArtifactError> {
+    use cap_fs_ext::OsMetadataExt as _;
+
+    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, false)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(cap_std::fs::FollowSymlinks::No);
+    let mut file = parent.open_with(&leaf, &options)?;
+    let before = file.metadata()?;
+    let path_before = parent.symlink_metadata(&leaf)?;
+    validate_checkpoint_artifact_file_metadata(&path_before, &before, None)?;
+    if before.len() > max_bytes {
+        return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+            "artifact has {} bytes, verifier limit {max_bytes}",
+            before.len()
+        )));
+    }
+    let capacity = usize::try_from(before.len()).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact length does not fit this platform".to_string(),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        CheckpointScrollbackArtifactError::ResourceLimit(format!(
+            "bounded artifact allocation failed: {error}"
+        ))
+    })?;
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact grew beyond the verifier limit during read".to_string(),
+        ));
+    }
+    let after = file.metadata()?;
+    let path_after = parent.symlink_metadata(&leaf)?;
+    validate_checkpoint_artifact_file_metadata(
+        &path_after,
+        &after,
+        Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+    )?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact changed while it was read".to_string(),
+        ));
+    }
+    revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+    Ok(bytes)
+}
+
+/// Construct, atomically publish, reread, and independently verify one artifact.
+///
+/// The source database is observed through one pinned read-only SQLite
+/// transaction. The final path is never overwritten: bytes are synchronized in
+/// a private sibling staging file and published with a no-replace rename before
+/// the parent directory is synchronized.
+pub fn write_checkpoint_scrollback_artifact(
+    db_path: &str,
+    checkpoint_id: i64,
+    output_path: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
+    let limits = limits.validate()?;
+    let payload = build_checkpoint_scrollback_payload(db_path, checkpoint_id, limits)?;
+    let payload_sha256 = hash_checkpoint_artifact_json(&payload, limits.max_artifact_bytes)?;
+    let artifact = CheckpointScrollbackArtifact {
+        schema: CHECKPOINT_SCROLLBACK_ARTIFACT_SCHEMA.to_string(),
+        publication_state: "complete".to_string(),
+        payload_sha256: payload_sha256.clone(),
+        payload,
+    };
+    let bytes = serialize_checkpoint_artifact(&artifact, limits.max_artifact_bytes)?;
+    publish_checkpoint_artifact_bytes(output_path, &bytes)?;
+    let mut receipt = verify_checkpoint_scrollback_artifact(output_path, limits)?;
+    if receipt.payload_sha256 != payload_sha256
+        || receipt.artifact_sha256 != checkpoint_artifact_sha256(&bytes)
+        || receipt.checkpoint_id != checkpoint_id
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "published artifact reread differs from the constructed source".to_string(),
+        ));
+    }
+    receipt.durability = "file_and_parent_directory_synced_then_offline_verified";
+    Ok(receipt)
+}
+
+/// Verify a private artifact without opening the source database or touching a mux.
+pub fn verify_checkpoint_scrollback_artifact(
+    path: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
+    let limits = limits.validate()?;
+    let bytes = read_checkpoint_artifact_bounded(path, limits.max_artifact_bytes)?;
+    verify_checkpoint_artifact_json_structure(&bytes)?;
+    let artifact: CheckpointScrollbackArtifact = serde_json::from_slice(&bytes)?;
+    let canonical = serialize_checkpoint_artifact(&artifact, limits.max_artifact_bytes)?;
+    if canonical != bytes {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact is not the one canonical pretty JSON encoding".to_string(),
+        ));
+    }
+    if artifact.schema != CHECKPOINT_SCROLLBACK_ARTIFACT_SCHEMA
+        || artifact.publication_state != "complete"
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact schema or publication state is unsupported".to_string(),
+        ));
+    }
+    let payload_sha256 =
+        hash_checkpoint_artifact_json(&artifact.payload, limits.max_artifact_bytes)?;
+    if artifact.payload_sha256 != payload_sha256 {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact payload checksum mismatch".to_string(),
+        ));
+    }
+    validate_checkpoint_scrollback_payload(&artifact.payload, limits)?;
+    Ok(CheckpointScrollbackArtifactReceipt {
+        schema: artifact.schema,
+        checkpoint_id: artifact.payload.checkpoint.checkpoint_id,
+        checkpoint_state_hash: artifact.payload.checkpoint.state_hash.clone(),
+        created_at_epoch_ms: artifact.payload.created_at_epoch_ms,
+        payload_sha256,
+        artifact_sha256: checkpoint_artifact_sha256(&bytes),
+        artifact_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        pane_count: artifact.payload.summary.pane_count,
+        segment_count: artifact.payload.summary.segment_count,
+        content_bytes: artifact.payload.summary.content_bytes,
+        complete_pane_count: artifact.payload.summary.complete_pane_count,
+        durability: "private_regular_file_verified_offline",
+    })
+}
+
+/// Derive the canonical production leaf name for a verified checkpoint identity.
+pub fn checkpoint_scrollback_artifact_file_name(
+    checkpoint_at: u64,
+    checkpoint_id: i64,
+    state_hash: &str,
+) -> Result<String, CheckpointScrollbackArtifactError> {
+    let digest = state_hash.strip_prefix(SNAPSHOT_WITNESS_PREFIX).ok_or_else(|| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint state hash is not a v2 snapshot witness".to_string(),
+        )
+    })?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || checkpoint_id < 0
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint identity cannot form a canonical artifact name".to_string(),
+        ));
+    }
+    Ok(format!(
+        "checkpoint-{checkpoint_at}-{checkpoint_id}-{}{}",
+        &digest[..16],
+        CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX
+    ))
+}
+
+/// Inventory and independently verify a bounded dedicated artifact directory.
+///
+/// Every directory entry consumes the inventory budget, including unrelated or
+/// retained staging names, so junk cannot make enumeration unbounded. Only
+/// canonical-suffix files are interpreted as published artifacts; any such
+/// file that fails verification makes the inventory fail closed.
+pub fn inventory_checkpoint_scrollback_artifacts(
+    directory: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<Vec<CheckpointScrollbackInventoryEntry>, CheckpointScrollbackArtifactError> {
+    let limits = limits.validate()?;
+    let pinned = open_checkpoint_artifact_directory_nofollow(directory)?;
+    let pinned_metadata = pinned.dir_metadata()?;
+    if !pinned_metadata.is_dir() {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact inventory root is not a directory".to_string(),
+        ));
+    }
+    let mut observed_entries = 0_usize;
+    let mut artifacts = Vec::new();
+    for entry in pinned.entries()? {
+        let entry = entry?;
+        observed_entries = observed_entries.checked_add(1).ok_or_else(|| {
+            CheckpointScrollbackArtifactError::ResourceLimit(
+                "artifact inventory entry count overflow".to_string(),
+            )
+        })?;
+        if observed_entries > limits.max_inventory_entries {
+            return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+                "artifact directory exceeds the {} entry inventory limit",
+                limits.max_inventory_entries
+            )));
+        }
+        let file_name = entry.file_name();
+        let Some(file_name_utf8) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name_utf8.ends_with(CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX) {
+            continue;
+        }
+        let path = directory.join(&file_name);
+        let receipt = verify_checkpoint_scrollback_artifact(&path, limits)?;
+        artifacts.push(CheckpointScrollbackInventoryEntry {
+            file_name: PathBuf::from(file_name),
+            created_at_epoch_ms: receipt.created_at_epoch_ms,
+            checkpoint_id: receipt.checkpoint_id,
+            artifact_bytes: receipt.artifact_bytes,
+            artifact_sha256: receipt.artifact_sha256,
+        });
+    }
+    revalidate_checkpoint_artifact_parent(directory, &pinned)?;
+    artifacts.sort_unstable_by(|left, right| {
+        right
+            .created_at_epoch_ms
+            .cmp(&left.created_at_epoch_ms)
+            .then_with(|| right.checkpoint_id.cmp(&left.checkpoint_id))
+            .then_with(|| left.file_name.cmp(&right.file_name))
+    });
+    Ok(artifacts)
+}
+
+/// Build a bounded, side-effect-free newest-first retention plan.
+///
+/// Once the newest prefix would exceed either the count or byte budget, that
+/// entry and every older entry are marked for retirement. Applying deletion is
+/// intentionally a separate production wiring step so planning can be audited
+/// before any artifact is removed.
+pub fn plan_checkpoint_scrollback_artifact_retention(
+    entries: &[CheckpointScrollbackInventoryEntry],
+    retention_count: usize,
+    max_retained_bytes: u64,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackRetentionPlan, CheckpointScrollbackArtifactError> {
+    let limits = limits.validate()?;
+    if entries.len() > limits.max_inventory_entries {
+        return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+            "retention input has {} entries, limit {}",
+            entries.len(), limits.max_inventory_entries
+        )));
+    }
+    let mut sorted = entries.to_vec();
+    sorted.sort_unstable_by(|left, right| {
+        right
+            .created_at_epoch_ms
+            .cmp(&left.created_at_epoch_ms)
+            .then_with(|| right.checkpoint_id.cmp(&left.checkpoint_id))
+            .then_with(|| left.file_name.cmp(&right.file_name))
+    });
+    let mut names = HashSet::with_capacity(sorted.len());
+    if sorted
+        .iter()
+        .any(|entry| !names.insert(entry.file_name.clone()))
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "retention inventory contains duplicate leaf names".to_string(),
+        ));
+    }
+
+    let mut retain = Vec::new();
+    let mut retire = Vec::new();
+    let mut retained_bytes = 0_u64;
+    let mut newest_prefix_open = true;
+    for entry in sorted {
+        let next_bytes = retained_bytes.checked_add(entry.artifact_bytes);
+        let retain_entry = newest_prefix_open
+            && retain.len() < retention_count
+            && next_bytes.is_some_and(|bytes| bytes <= max_retained_bytes);
+        if retain_entry {
+            retained_bytes = next_bytes.expect("checked by retain predicate");
+            retain.push(entry.file_name);
+        } else {
+            newest_prefix_open = false;
+            retire.push(entry.file_name);
+        }
+    }
+    Ok(CheckpointScrollbackRetentionPlan {
+        retain,
+        retire,
+        retained_bytes,
+    })
 }
 
 #[cfg(test)]
