@@ -3710,9 +3710,8 @@ mod tests {
             .with_sync_every_appends(1);
         let path = config.bin_path();
         let mut writer = MmapScrollback::open(config).unwrap();
-        writer.append(RecordKind::Text, b"first").unwrap();
-        writer.append(RecordKind::Text, b"second").unwrap();
-        writer.flush_pending_redaction().unwrap();
+        append_test_payload(&mut writer, RecordKind::Text, b"first");
+        append_test_payload(&mut writer, RecordKind::Osc, b"second");
         writer.sync().unwrap();
         drop(writer);
 
