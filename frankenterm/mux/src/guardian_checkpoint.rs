@@ -5756,6 +5756,10 @@ mod tests {
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointChunkDelivery::new",
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointStageRequestV1::decode",
+            "GuardianCheckpointChunkNonDuplicable@GuardianReplayOutputRecordsDelivery::new",
+            "GuardianCheckpointChunkNonDuplicable@GuardianReplayProtectedDigest::zeroed",
+            "GuardianCheckpointChunkNonDuplicable@GuardianReplayRecordDelivery::new",
+            "GuardianCheckpointChunkNonDuplicable@GuardianWireFrame::with_capacity",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::decode",
             "GuardianCheckpointStageRequestV1@<free>::validate_request_envelope",
@@ -5782,6 +5786,34 @@ mod tests {
                 "private",
                 "Chunk:<unnamed:0>",
                 "GuardianCheckpointStageChunkDeliveryV1",
+            ),
+            expected_protocol_delivery_storage(
+                "struct",
+                "GuardianReplayOutputRecordsDelivery",
+                "pub",
+                "_nonduplicable",
+                "GuardianCheckpointChunkNonDuplicable",
+            ),
+            expected_protocol_delivery_storage(
+                "struct",
+                "GuardianReplayProtectedDigest",
+                "private",
+                "_nonduplicable",
+                "GuardianCheckpointChunkNonDuplicable",
+            ),
+            expected_protocol_delivery_storage(
+                "struct",
+                "GuardianReplayRecordDelivery",
+                "pub",
+                "_nonduplicable",
+                "GuardianCheckpointChunkNonDuplicable",
+            ),
+            expected_protocol_delivery_storage(
+                "struct",
+                "GuardianWireFrame",
+                "pub",
+                "_nonduplicable",
+                "GuardianCheckpointChunkNonDuplicable",
             ),
             expected_protocol_delivery_storage(
                 "enum",
@@ -5830,13 +5862,20 @@ mod tests {
         );
         assert_eq!(
             inventory.impl_associated_types,
-            vec![(
-                "AuthenticatedGuardianRequest".to_owned(),
-                syn::parse_str::<syn::ImplItemType>(
-                    "type Target = GuardianRequestEnvelope;"
-                )
-                .expect("parse frozen guardian protocol associated type"),
-            )]
+            vec![
+                (
+                    "AuthenticatedGuardianRequest".to_owned(),
+                    syn::parse_str::<syn::ImplItemType>(
+                        "type Target = GuardianRequestEnvelope;"
+                    )
+                    .expect("parse frozen authenticated request associated type"),
+                ),
+                (
+                    "GuardianWireFrame".to_owned(),
+                    syn::parse_str::<syn::ImplItemType>("type Target = [u8];")
+                        .expect("parse frozen guardian wire associated type"),
+                ),
+            ]
         );
         assert_eq!(
             inventory.trait_associated_types,
@@ -5850,7 +5889,25 @@ mod tests {
         );
         assert_eq!(inventory.conditional_surfaces, Vec::<String>::new());
         assert_eq!(inventory.out_of_line_modules, Vec::<String>::new());
-        assert_eq!(inventory.item_macros, Vec::<syn::Macro>::new());
+        assert_eq!(
+            inventory.item_macros,
+            vec![
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointChunkNonDuplicable: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianWireFrame: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianWireFrame: ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayProtectedDigest: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayProtectedDigest: ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayRecordDelivery: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayRecordDelivery: ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianReplayOutputRecordsDelivery: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianReplayOutputRecordsDelivery: ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: ZeroizeOnDrop);"),
+            ]
+        );
         assert_eq!(inventory.unexpected_macros, Vec::<syn::Macro>::new());
         inventory.projection_sites.sort();
         let mut expected_projection_sites = vec![
@@ -5859,6 +5916,8 @@ mod tests {
             "<free>::validate_request_envelope",
             "<free>::validate_response_envelope",
             "AuthenticatedGuardianRequest::deref",
+            "GuardianWireFrame::deref",
+            "GuardianWireFrame::deref_mut",
         ]
         .into_iter()
         .map(str::to_owned)

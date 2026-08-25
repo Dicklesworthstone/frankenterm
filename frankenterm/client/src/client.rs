@@ -9969,6 +9969,9 @@ impl Client {
         Self {
             sender,
             local_domain_id,
+            // Mirror the production constructor: a client with no local domain
+            // starts authorized, one bound to a local domain does not.
+            domain_reconnect_authorized: Arc::new(AtomicBool::new(local_domain_id.is_none())),
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             rpc_transport,
@@ -10004,6 +10007,9 @@ impl Client {
             Self {
                 sender,
                 local_domain_id,
+                // Mirror the production constructor: a client with no local
+                // domain starts authorized, one bound to a local domain does not.
+                domain_reconnect_authorized: Arc::new(AtomicBool::new(local_domain_id.is_none())),
                 incarnation: Arc::new(ClientIncarnation),
                 connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
                 rpc_transport,
@@ -10465,8 +10471,13 @@ mod tests {
             // the in-flight generation before it can publish a new wake.
             drop_started.wait();
             let (reset_done_tx, reset_done_rx) = std::sync::mpsc::sync_channel(1);
-            scope.spawn(|| {
-                fallback.reset();
+            // `reset_done_tx` is created inside the scope body, so it cannot be
+            // borrowed by a scoped thread that must outlive that body; move it
+            // in. `fallback` is still used after the scope, so clone the Arc
+            // rather than moving the original.
+            let fallback_for_reset = Arc::clone(&fallback);
+            scope.spawn(move || {
+                fallback_for_reset.reset();
                 let _ = reset_done_tx.send(());
             });
             let reset_completed_while_drop_was_blocked = reset_done_rx
