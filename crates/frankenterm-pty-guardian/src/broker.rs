@@ -722,6 +722,7 @@ pub struct BrokerPaneStatusV1 {
     pub completed_successor_handoffs: u32,
     pub output_sequence: u64,
     pub output_terminal_reason: Option<BrokerOutputTerminalReasonV1>,
+    pub output_child_exit_observed: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -866,6 +867,9 @@ impl BrokerAdoptedPaneV1 {
                 completed_successor_handoffs: self.completed_successor_handoffs,
                 output_sequence: self.next_output_sequence,
                 output_terminal_reason: self.output_terminal.map(|state| state.reason),
+                output_child_exit_observed: self
+                    .output_terminal
+                    .and_then(|state| state.child_exit_observed),
             },
             BrokerLeaseState::AwaitingSuccessor {
                 next_generation, ..
@@ -881,6 +885,9 @@ impl BrokerAdoptedPaneV1 {
                 completed_successor_handoffs: self.completed_successor_handoffs,
                 output_sequence: self.next_output_sequence,
                 output_terminal_reason: self.output_terminal.map(|state| state.reason),
+                output_child_exit_observed: self
+                    .output_terminal
+                    .and_then(|state| state.child_exit_observed),
             },
             BrokerLeaseState::Quarantined { reason, .. } => BrokerPaneStatusV1 {
                 broker_incarnation: self.broker_incarnation,
@@ -894,6 +901,9 @@ impl BrokerAdoptedPaneV1 {
                 completed_successor_handoffs: self.completed_successor_handoffs,
                 output_sequence: self.next_output_sequence,
                 output_terminal_reason: self.output_terminal.map(|state| state.reason),
+                output_child_exit_observed: self
+                    .output_terminal
+                    .and_then(|state| state.child_exit_observed),
             },
             BrokerLeaseState::FinalTerminalEof { generation, .. } => BrokerPaneStatusV1 {
                 broker_incarnation: self.broker_incarnation,
@@ -907,6 +917,9 @@ impl BrokerAdoptedPaneV1 {
                 completed_successor_handoffs: self.completed_successor_handoffs,
                 output_sequence: self.next_output_sequence,
                 output_terminal_reason: self.output_terminal.map(|state| state.reason),
+                output_child_exit_observed: self
+                    .output_terminal
+                    .and_then(|state| state.child_exit_observed),
             },
             BrokerLeaseState::FinalTerminalEofPending { generation, .. } => BrokerPaneStatusV1 {
                 broker_incarnation: self.broker_incarnation,
@@ -920,6 +933,9 @@ impl BrokerAdoptedPaneV1 {
                 completed_successor_handoffs: self.completed_successor_handoffs,
                 output_sequence: self.next_output_sequence,
                 output_terminal_reason: self.output_terminal.map(|state| state.reason),
+                output_child_exit_observed: self
+                    .output_terminal
+                    .and_then(|state| state.child_exit_observed),
             },
         }
     }
@@ -1197,7 +1213,11 @@ impl BrokerAdoptedPaneV1 {
             u64::try_from(max_bytes).map_err(|_| BrokerError::ProxyCapacityExhausted)?;
         let bytes_read_u64 = available.min(requested);
         if bytes_read_u64 == 0 {
-            return Err(BrokerError::ProxyWouldBlock);
+            return Err(if self.output_terminal.is_some() {
+                BrokerError::ProxyOutputTerminalDrained
+            } else {
+                BrokerError::ProxyWouldBlock
+            });
         }
         let bytes_read =
             usize::try_from(bytes_read_u64).map_err(|_| BrokerError::ProxyCapacityExhausted)?;
@@ -1696,6 +1716,8 @@ pub enum BrokerError {
     ProxyEffectIndeterminate,
     #[error("broker proxy read has no bytes ready")]
     ProxyWouldBlock,
+    #[error("broker PTY output is terminal and every retained byte was acknowledged")]
+    ProxyOutputTerminalDrained,
     #[error("broker proxy read failed")]
     ProxyReadFailed,
     #[error("broker output buffer is full; child backpressure is active")]
@@ -1722,7 +1744,7 @@ pub enum BrokerError {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Read as _;
+    use std::io::Read;
     use std::os::fd::{AsFd, BorrowedFd};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2039,6 +2061,12 @@ mod tests {
                 },
             )
             .expect("admit resize before rotation");
+        let stale_read = pane
+            .admit_proxy_read(&attachment, 1)
+            .expect("admit read before rotation");
+        let stale_ack = pane
+            .admit_proxy_output_ack(&attachment, pane.buffer_start_sequence)
+            .expect("admit output acknowledgement before rotation");
 
         let eof = BrokerAuthenticatedControlEofV1::from_authenticated_transport_close(
             attachment.identity(),
@@ -2057,6 +2085,16 @@ mod tests {
             pane.execute_proxy_resize(stale_resize),
             Err(BrokerError::StaleProxyLease),
             "queued predecessor resize crossed the generation fence"
+        );
+        assert_eq!(
+            pane.execute_proxy_read(stale_read, &mut [0_u8; 1]),
+            Err(BrokerError::StaleProxyLease),
+            "queued predecessor read crossed the generation fence"
+        );
+        assert_eq!(
+            pane.execute_proxy_output_ack(stale_ack),
+            Err(BrokerError::StaleProxyLease),
+            "queued predecessor output acknowledgement crossed the generation fence"
         );
         assert_eq!(pane.resource_usage().broker_pty_descriptors, 3);
         assert_eq!(pane.resource_usage().live_guardian_leases, 0);
@@ -2329,6 +2367,12 @@ mod tests {
         pane.execute_proxy_output_ack(ack)
             .expect("commit replayed delivery acknowledgement");
         assert_eq!(pane.resource_usage().buffered_output_bytes, 0);
+        let ack_retry = pane
+            .admit_proxy_output_ack(&attachment, retry.output_sequence_end)
+            .expect("admit lost acknowledgement reply retry");
+        pane.execute_proxy_output_ack(ack_retry)
+            .expect("acknowledgement retry is idempotent");
+        assert_eq!(pane.resource_usage().buffered_output_bytes, 0);
 
         while pane.status().output_sequence < 16 {
             let receipt = pump_until_drained(&mut pane);
@@ -2380,7 +2424,7 @@ mod tests {
                     .expect("prepare terminal-read pane");
             let BrokerAdoptionV1 {
                 mut pane,
-                attachment: _,
+                attachment,
             } = commit_for_test(prepared, control, binding).expect("commit terminal-read pane");
             let reads = Arc::new(AtomicUsize::new(0));
             pane.proxy_reader = Some(Box::new(TerminalTestReader {
@@ -2408,6 +2452,17 @@ mod tests {
             assert_eq!(repeated.reason, expected_reason);
             assert!(!repeated.newly_observed);
             assert_eq!(reads.load(Ordering::Acquire), 1);
+            assert_eq!(
+                pane.status().output_child_exit_observed,
+                repeated.child_exit_observed
+            );
+            let read = pane
+                .admit_proxy_read(&attachment, 1)
+                .expect("admit terminal output query");
+            assert_eq!(
+                pane.execute_proxy_read(read, &mut [0_u8; 1]),
+                Err(BrokerError::ProxyOutputTerminalDrained)
+            );
             pane.terminate_and_wait_for_test();
         }
     }

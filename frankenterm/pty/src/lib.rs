@@ -38,7 +38,7 @@
 //! ```
 //!
 use anyhow::Error;
-use downcast_rs::{Downcast, impl_downcast};
+use downcast_rs::{impl_downcast, Downcast};
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 // TryFrom is not in the edition-2018 prelude; its only use is the #[cfg(unix)]
@@ -283,10 +283,11 @@ impl From<std::process::ExitStatus> for ExitStatus {
             }
         }
 
-        let code = status
-            .code()
-            .map(|c| c as u32)
-            .unwrap_or_else(|| if status.success() { 0 } else { 1 });
+        let code =
+            status
+                .code()
+                .map(|c| c as u32)
+                .unwrap_or_else(|| if status.success() { 0 } else { 1 });
 
         ExitStatus { code, signal: None }
     }

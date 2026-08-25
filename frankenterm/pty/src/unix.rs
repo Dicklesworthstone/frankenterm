@@ -520,7 +520,7 @@ impl MasterPty for UnixMasterPty {
         let mut fd = PtyFd(self.fd.try_clone()?);
         let bytes = prepare_terminal_eof(&fd)?;
         let attempt = self.writer_authority.begin_terminal_eof()?;
-        deliver_terminal_eof(&mut fd.0, bytes, attempt)
+        Ok(deliver_terminal_eof(&mut fd.0, bytes, attempt)?)
     }
 
     fn as_raw_fd(&self) -> Option<RawFd> {
@@ -655,7 +655,6 @@ fn terminal_eof_byte(termios: &libc::termios, disabled: libc::cc_t) -> Result<u8
 mod tests {
     use super::*;
     use std::io::ErrorKind;
-    use std::io::Read as _;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -675,7 +674,7 @@ mod tests {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err(error) => panic!("PTY read failed: {error}"),
+                Err(error) => panic!("PTY read failed: {}", error),
             }
         }
         panic!(
@@ -807,11 +806,13 @@ mod tests {
         assert!(output.contains("bytes:"));
         assert!(
             output.contains("10"),
-            "legacy newline byte missing: {output:?}"
+            "legacy newline byte missing: {:?}",
+            output
         );
         assert!(
             output.contains(&eot.to_string()),
-            "legacy VEOF byte missing: {output:?}"
+            "legacy VEOF byte missing: {:?}",
+            output
         );
         assert!(child.wait().expect("wait for raw-mode reader").success());
     }
@@ -888,5 +889,60 @@ mod tests {
                 .kind(),
             ErrorKind::Unsupported
         );
+    }
+
+    #[test]
+    fn terminal_eof_precondition_failures_leave_authority_open_for_safe_retry() {
+        let (master, slave) = openpty(PtySize::default()).expect("open noncanonical test PTY");
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(master.fd.0.as_raw_fd(), &mut original) },
+            0
+        );
+        let mut noncanonical = original;
+        noncanonical.c_lflag &= !libc::ICANON;
+        assert_eq!(
+            unsafe { libc::tcsetattr(master.fd.0.as_raw_fd(), libc::TCSANOW, &noncanonical) },
+            0
+        );
+        assert!(master.send_terminal_eof().is_err());
+        assert_eq!(
+            master.writer_authority.state.load(Ordering::Acquire),
+            WRITER_AUTHORITY_OPEN
+        );
+        assert_eq!(
+            unsafe { libc::tcsetattr(master.fd.0.as_raw_fd(), libc::TCSANOW, &original) },
+            0
+        );
+        assert!(master.send_terminal_eof().is_ok());
+        drop(slave);
+
+        let (master, slave) = openpty(PtySize::default()).expect("open disabled-VEOF test PTY");
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(master.fd.0.as_raw_fd(), &mut original) },
+            0
+        );
+        let disabled = fpathconf(master.fd.as_fd(), PathconfVar::_POSIX_VDISABLE)
+            .expect("query disabled VEOF value")
+            .expect("platform defines disabled VEOF value");
+        let disabled: libc::cc_t = disabled.try_into().expect("disabled VEOF fits cc_t");
+        let mut disabled_veof = original;
+        disabled_veof.c_cc[libc::VEOF] = disabled;
+        assert_eq!(
+            unsafe { libc::tcsetattr(master.fd.0.as_raw_fd(), libc::TCSANOW, &disabled_veof) },
+            0
+        );
+        assert!(master.send_terminal_eof().is_err());
+        assert_eq!(
+            master.writer_authority.state.load(Ordering::Acquire),
+            WRITER_AUTHORITY_OPEN
+        );
+        assert_eq!(
+            unsafe { libc::tcsetattr(master.fd.0.as_raw_fd(), libc::TCSANOW, &original) },
+            0
+        );
+        assert!(master.send_terminal_eof().is_ok());
+        drop(slave);
     }
 }

@@ -2512,16 +2512,15 @@ fn checkpoint_catalog_parse_path(
     let (canonical_name, staged) = name
         .strip_suffix(CHECKPOINT_CATALOG_STAGING_SUFFIX)
         .map_or((name, false), |canonical| (canonical, true));
-    let (body, role) = if let Some(body) =
-        canonical_name.strip_suffix(CHECKPOINT_CATALOG_CANDIDATE_SUFFIX)
-    {
-        (body, CheckpointCatalogPathRole::Candidate)
-    } else {
-        (
-            canonical_name.strip_suffix(CHECKPOINT_CATALOG_MARKER_SUFFIX)?,
-            CheckpointCatalogPathRole::Marker,
-        )
-    };
+    let (body, role) =
+        if let Some(body) = canonical_name.strip_suffix(CHECKPOINT_CATALOG_CANDIDATE_SUFFIX) {
+            (body, CheckpointCatalogPathRole::Candidate)
+        } else {
+            (
+                canonical_name.strip_suffix(CHECKPOINT_CATALOG_MARKER_SUFFIX)?,
+                CheckpointCatalogPathRole::Marker,
+            )
+        };
     let body = body.strip_prefix(CHECKPOINT_CATALOG_FILE_PREFIX)?;
     let (scope_text, generation_and_candidate) = body.split_once(".generation-")?;
     let (generation_text, candidate_text) = generation_and_candidate.split_once(".candidate-")?;
@@ -7083,9 +7082,7 @@ fn checkpoint_catalog_scan(
             }
             CheckpointCatalogPathKind::Staging(role) => {
                 let maximum = match role {
-                    CheckpointCatalogPathRole::Candidate => {
-                        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES
-                    }
+                    CheckpointCatalogPathRole::Candidate => CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
                     CheckpointCatalogPathRole::Marker => {
                         u64::try_from(CHECKPOINT_CATALOG_MARKER_BYTES)
                             .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
@@ -7493,10 +7490,7 @@ fn checkpoint_catalog_publish_file(
     match open_private_file_at(&inner.directory, &inner.directory_path, path, false) {
         Ok(mut existing) => {
             let before = existing.metadata().map_err(|error| {
-                GuardianCheckpointStageStoreError::io(
-                    "checkpoint-catalog-existing-metadata",
-                    error,
-                )
+                GuardianCheckpointStageStoreError::io("checkpoint-catalog-existing-metadata", error)
             })?;
             validate_private_file_metadata(&before, Some(expected_len))?;
             checkpoint_catalog_verify_file_prefix(
@@ -7506,26 +7500,33 @@ fn checkpoint_catalog_publish_file(
                 "checkpoint-catalog-existing-read",
             )?;
             let identity = FileIdentity::capture(&before, Some(expected_len));
-            existing.sync_all().map_err(|error| {
-                GuardianCheckpointStageStoreError::io(sync_site, error)
+            existing
+                .sync_all()
+                .map_err(|error| GuardianCheckpointStageStoreError::io(sync_site, error))?;
+            inner.directory.sync_all().map_err(|error| {
+                GuardianCheckpointStageStoreError::io(
+                    "checkpoint-catalog-existing-directory-sync",
+                    error,
+                )
             })?;
+            inner
+                .persistence
+                .validate(&inner.directory)
+                .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
             validate_file_identity_at(&inner.directory, &inner.directory_path, path, identity)?;
             return Ok(identity);
         }
-        Err(GuardianOutputError::Io { source, .. })
-            if source.kind() == ErrorKind::NotFound => {}
+        Err(GuardianOutputError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
 
     let staging_path = checkpoint_catalog_staging_path(inner, path)?;
-    let mut file = match create_private_file_new_at(
-        &inner.directory,
-        &inner.directory_path,
-        &staging_path,
-    ) {
-        Ok(file) => file,
-        Err(GuardianOutputError::Io { source, .. })
-            if source.kind() == ErrorKind::AlreadyExists => {
+    let mut file =
+        match create_private_file_new_at(&inner.directory, &inner.directory_path, &staging_path) {
+            Ok(file) => file,
+            Err(GuardianOutputError::Io { source, .. })
+                if source.kind() == ErrorKind::AlreadyExists =>
+            {
                 open_private_file_at(
                     &inner.directory,
                     &inner.directory_path,
@@ -7533,8 +7534,8 @@ fn checkpoint_catalog_publish_file(
                     false,
                 )?
             }
-        Err(error) => return Err(error.into()),
-    };
+            Err(error) => return Err(error.into()),
+        };
     let before = file.metadata().map_err(|error| {
         GuardianCheckpointStageStoreError::io("checkpoint-catalog-staging-metadata", error)
     })?;
@@ -7542,7 +7543,13 @@ fn checkpoint_catalog_publish_file(
     if before.len() > expected_len {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let staging_identity = FileIdentity::capture(&before, Some(expected_len));
+    let staging_identity = FileIdentity::capture(&before, None);
+    validate_file_identity_at(
+        &inner.directory,
+        &inner.directory_path,
+        &staging_path,
+        FileIdentity::capture(&before, Some(before.len())),
+    )?;
     let observed_len = checkpoint_catalog_verify_file_prefix(
         &mut file,
         bytes,
@@ -7550,10 +7557,7 @@ fn checkpoint_catalog_publish_file(
         "checkpoint-catalog-staging-prefix-read",
     )?;
     let after_prefix = file.metadata().map_err(|error| {
-        GuardianCheckpointStageStoreError::io(
-            "checkpoint-catalog-staging-prefix-metadata",
-            error,
-        )
+        GuardianCheckpointStageStoreError::io("checkpoint-catalog-staging-prefix-metadata", error)
     })?;
     if !staging_identity.matches(&after_prefix) || after_prefix.len() != before.len() {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
@@ -7590,13 +7594,11 @@ fn checkpoint_catalog_publish_file(
     )?;
     let staging_name = output_child_name(&inner.directory_path, &staging_path)?;
     let canonical_name = output_child_name(&inner.directory_path, path)?;
-    checkpoint_catalog_publish_noreplace(&inner.directory, staging_name, canonical_name)
-        .map_err(|error| {
-            GuardianCheckpointStageStoreError::io(
-                "checkpoint-catalog-atomic-publication",
-                error,
-            )
-        })?;
+    checkpoint_catalog_publish_noreplace(&inner.directory, staging_name, canonical_name).map_err(
+        |error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-catalog-atomic-publication", error)
+        },
+    )?;
     inner.directory.sync_all().map_err(|error| {
         GuardianCheckpointStageStoreError::io(
             "checkpoint-catalog-publication-directory-sync",
@@ -7665,9 +7667,7 @@ fn checkpoint_catalog_staging_role(
     }
     let canonical = checkpoint_catalog_path(inner, identity, staged.role)?;
     let expected_staging = checkpoint_catalog_staging_path(inner, &canonical)?;
-    if staged.path != expected_staging
-        || staged.file_identity.expected_len != Some(staged.bytes)
-    {
+    if staged.path != expected_staging || staged.file_identity.expected_len != Some(staged.bytes) {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     validate_file_identity_at(
@@ -7704,15 +7704,13 @@ fn checkpoint_catalog_genesis_added_resources(
             let bytes = candidate_bytes
                 .checked_add(marker_bytes)
                 .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
-            (2, bytes)
+            (2_usize, bytes)
         }
-        CheckpointCatalogGenesisCandidatePlan::Reuse(_) => (1, marker_bytes),
+        CheckpointCatalogGenesisCandidatePlan::Reuse(_) => (1_usize, marker_bytes),
     };
     if let Some(staged) = staged {
         let expected_role = match plan {
-            CheckpointCatalogGenesisCandidatePlan::Create => {
-                CheckpointCatalogPathRole::Candidate
-            }
+            CheckpointCatalogGenesisCandidatePlan::Create => CheckpointCatalogPathRole::Candidate,
             CheckpointCatalogGenesisCandidatePlan::Reuse(_) => CheckpointCatalogPathRole::Marker,
         };
         let expected_bytes = match expected_role {
@@ -8087,8 +8085,7 @@ fn checkpoint_catalog_publish_sealed_stage(
         "checkpoint-catalog-candidate-write",
         "checkpoint-catalog-candidate-sync",
     )?;
-    let marker_path =
-        checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Marker)?;
+    let marker_path = checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Marker)?;
     let marker_file_identity = checkpoint_catalog_publish_file(
         inner,
         &marker_path,
@@ -8688,10 +8685,223 @@ mod tests {
                 CheckpointCatalogPathRole::Marker => CHECKPOINT_CATALOG_MARKER_SUFFIX,
             };
             let name = format!("{}{suffix}", checkpoint_catalog_base_name(identity));
-            assert_eq!(checkpoint_catalog_parse_path(&name), Some((identity, role)));
+            assert_eq!(
+                checkpoint_catalog_parse_path(&name),
+                Some((identity, CheckpointCatalogPathKind::Canonical(role)))
+            );
+            let staging = format!("{name}{CHECKPOINT_CATALOG_STAGING_SUFFIX}");
+            assert_eq!(
+                checkpoint_catalog_parse_path(&staging),
+                Some((identity, CheckpointCatalogPathKind::Staging(role)))
+            );
             assert!(checkpoint_catalog_parse_path(&name.to_uppercase()).is_none());
+            assert!(checkpoint_catalog_parse_path(&staging.to_uppercase()).is_none());
         }
         assert!(checkpoint_catalog_longest_name_bytes() <= 255);
+    }
+
+    #[test]
+    fn checkpoint_catalog_publication_resumes_torn_staging_prefix_and_lost_reply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = b"complete-checkpoint-catalog-publication";
+        for (case, prefix_bytes) in [0_usize, 7, expected.len()].into_iter().enumerate() {
+            let case_id = u128::try_from(case)?;
+            let directory_prefix = format!("ft-guardian-catalog-stage-resume-{case}-");
+            let (_directory, _poll, pipeline) =
+                pipeline_with_policy(&directory_prefix, OutputSegmentPolicy::production())?;
+            let store = pipeline.checkpoint_stage_store();
+            let scope = CheckpointCatalogScope::Pane {
+                pane_id: Uuid::from_u128(0xc300 + case_id),
+            };
+            let identity = CheckpointCatalogIdentity {
+                scope,
+                generation: 1,
+                candidate_id: Uuid::from_u128(0xc400 + case_id),
+            };
+            let canonical = checkpoint_catalog_path(
+                &store.inner,
+                identity,
+                CheckpointCatalogPathRole::Candidate,
+            )?;
+            let staging = checkpoint_catalog_staging_path(&store.inner, &canonical)?;
+            let mut torn = create_private_file_new_at(
+                &store.inner.directory,
+                &store.inner.directory_path,
+                &staging,
+            )?;
+            torn.write_all(&expected[..prefix_bytes])?;
+            torn.sync_all()?;
+            store.inner.directory.sync_all()?;
+
+            let before = checkpoint_catalog_scan(&store.inner, scope)?;
+            assert!(before.published.is_empty());
+            assert!(before.unpublished_candidates.is_empty());
+            assert!(matches!(
+                std::fs::symlink_metadata(&canonical),
+                Err(error) if error.kind() == ErrorKind::NotFound
+            ));
+            assert_eq!(before.staged_files.len(), 1);
+            assert_eq!(before.staged_files[0].identity, identity);
+            assert_eq!(
+                before.staged_files[0].role,
+                CheckpointCatalogPathRole::Candidate
+            );
+            assert_eq!(before.staged_files[0].bytes, u64::try_from(prefix_bytes)?);
+
+            let first = checkpoint_catalog_publish_file(
+                &store.inner,
+                &canonical,
+                expected,
+                "checkpoint-catalog-test-resume-write",
+                "checkpoint-catalog-test-resume-sync",
+            )?;
+            assert_eq!(std::fs::read(&canonical)?, expected);
+            assert!(matches!(
+                std::fs::symlink_metadata(&staging),
+                Err(error) if error.kind() == ErrorKind::NotFound
+            ));
+
+            let recovered_lost_reply = checkpoint_catalog_publish_file(
+                &store.inner,
+                &canonical,
+                expected,
+                "checkpoint-catalog-test-lost-reply-write",
+                "checkpoint-catalog-test-lost-reply-sync",
+            )?;
+            assert_eq!(recovered_lost_reply, first);
+            assert_eq!(std::fs::read(&canonical)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_publication_quarantines_non_prefix_staging_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-stage-corrupt-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let identity = CheckpointCatalogIdentity {
+            scope: CheckpointCatalogScope::Pane {
+                pane_id: Uuid::from_u128(0xc501),
+            },
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xc502),
+        };
+        let canonical =
+            checkpoint_catalog_path(&store.inner, identity, CheckpointCatalogPathRole::Candidate)?;
+        let staging = checkpoint_catalog_staging_path(&store.inner, &canonical)?;
+        let mut corrupt = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &staging,
+        )?;
+        corrupt.write_all(b"wrong-prefix")?;
+        corrupt.sync_all()?;
+        store.inner.directory.sync_all()?;
+
+        assert!(matches!(
+            checkpoint_catalog_publish_file(
+                &store.inner,
+                &canonical,
+                b"right-prefix-and-complete-payload",
+                "checkpoint-catalog-test-corrupt-write",
+                "checkpoint-catalog-test-corrupt-sync",
+            ),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        assert_eq!(std::fs::read(&staging)?, b"wrong-prefix");
+        assert!(matches!(
+            std::fs::symlink_metadata(&canonical),
+            Err(error) if error.kind() == ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_publication_recovers_post_rename_pre_directory_sync_cut()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-post-rename-cut-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let identity = CheckpointCatalogIdentity {
+            scope: CheckpointCatalogScope::Pane {
+                pane_id: Uuid::from_u128(0xc551),
+            },
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xc552),
+        };
+        let canonical =
+            checkpoint_catalog_path(&store.inner, identity, CheckpointCatalogPathRole::Candidate)?;
+        let staging = checkpoint_catalog_staging_path(&store.inner, &canonical)?;
+        let expected = b"synced-staging-before-atomic-rename";
+        let mut file = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &staging,
+        )?;
+        file.write_all(expected)?;
+        file.sync_all()?;
+        let staged_metadata = file.metadata()?;
+        let staged_identity =
+            FileIdentity::capture(&staged_metadata, Some(u64::try_from(expected.len())?));
+        checkpoint_catalog_publish_noreplace(
+            &store.inner.directory,
+            output_child_name(&store.inner.directory_path, &staging)?,
+            output_child_name(&store.inner.directory_path, &canonical)?,
+        )?;
+
+        let recovered = checkpoint_catalog_publish_file(
+            &store.inner,
+            &canonical,
+            expected,
+            "checkpoint-catalog-test-post-rename-write",
+            "checkpoint-catalog-test-post-rename-sync",
+        )?;
+        assert_eq!(recovered, staged_identity);
+        assert_eq!(std::fs::read(&canonical)?, expected);
+        assert!(matches!(
+            std::fs::symlink_metadata(&staging),
+            Err(error) if error.kind() == ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_scan_rejects_and_retains_torn_canonical_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-canonical-torn-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let scope = CheckpointCatalogScope::Pane {
+            pane_id: Uuid::from_u128(0xc601),
+        };
+        let identity = CheckpointCatalogIdentity {
+            scope,
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xc602),
+        };
+        let canonical =
+            checkpoint_catalog_path(&store.inner, identity, CheckpointCatalogPathRole::Candidate)?;
+        let torn = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &canonical,
+        )?;
+        torn.sync_all()?;
+        store.inner.directory.sync_all()?;
+
+        assert!(matches!(
+            checkpoint_catalog_scan(&store.inner, scope),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        assert_eq!(std::fs::symlink_metadata(&canonical)?.len(), 0);
+        Ok(())
     }
 
     #[test]
