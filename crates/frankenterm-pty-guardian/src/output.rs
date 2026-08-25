@@ -225,8 +225,6 @@ pub(crate) enum GuardianCheckpointStageStoreError {
     CandidateAbsent,
     #[error("guardian checkpoint staging origin authority does not match its scope")]
     OriginAuthorityMismatch,
-    #[error("guardian checkpoint staging publication authority is unavailable")]
-    PublicationAuthorityUnavailable,
 }
 
 impl GuardianCheckpointStageStoreError {
@@ -235,9 +233,8 @@ impl GuardianCheckpointStageStoreError {
     }
 }
 
-// Phase A constructs the durable store but deliberately does not route wire
-// requests into it until the runtime supplies the non-forgeable authority
-// boundary required by final publication.
+// The store accepts final publication only when the runtime supplies the
+// independent non-forgeable live-capture or Genesis authority.
 #[allow(dead_code)]
 pub(crate) enum GuardianCheckpointOriginAuthority<'a> {
     /// A nonconstructible live-capture authority plus independent recovery of
@@ -1552,10 +1549,6 @@ fn checkpoint_chunk_path(
     )
 }
 
-#[allow(
-    dead_code,
-    reason = "seal publication remains fail-closed until durable publication authority is wired"
-)]
 fn checkpoint_seal_path(
     inner: &GuardianCheckpointStageStoreInner,
     key: CheckpointStageUploadKey,
