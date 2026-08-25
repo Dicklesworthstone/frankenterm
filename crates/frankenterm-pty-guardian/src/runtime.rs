@@ -151,6 +151,7 @@ impl OutputRearmCursor {
 }
 
 const INPUT_WORKER_QUEUE_CAPACITY: usize = 1;
+const CHECKPOINT_WORKER_QUEUE_CAPACITY: usize = 1;
 
 /// Exact transport authority retained across one delayed input transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,6 +195,62 @@ pub(crate) enum GuardianRuntimeInputCompletionState {
     Ready(GuardianRuntimeInputCompletion),
     Empty,
     Disconnected,
+}
+
+/// Exact transport authority retained across one delayed checkpoint staging
+/// operation. Generation fences connection-token recycling; request identity
+/// fences a late completion from being routed to another request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GuardianCheckpointRoute {
+    pub(crate) connection_token: Token,
+    pub(crate) connection_generation: u64,
+    pub(crate) request_id: Uuid,
+}
+
+impl GuardianCheckpointRoute {
+    pub(crate) fn new(
+        connection_token: Token,
+        connection_generation: u64,
+        request_id: Uuid,
+    ) -> Option<Self> {
+        (connection_generation != 0 && !request_id.is_nil()).then_some(Self {
+            connection_token,
+            connection_generation,
+            request_id,
+        })
+    }
+}
+
+pub(crate) enum GuardianCheckpointSubmission {
+    Pending,
+    Respond(GuardianResponseEnvelope),
+    CloseRetryably,
+}
+
+pub(crate) struct GuardianRuntimeCheckpointCompletion {
+    pub(crate) route: GuardianCheckpointRoute,
+    pub(crate) response: Option<GuardianResponseEnvelope>,
+}
+
+pub(crate) enum GuardianRuntimeCheckpointCompletionState {
+    Ready(GuardianRuntimeCheckpointCompletion),
+    Empty,
+    Disconnected,
+}
+
+/// Content-free marker returned when the audited checkpoint-storage worker
+/// boundary recovers a panic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuardianCheckpointWorkerPanic;
+
+fn catch_guardian_checkpoint_worker_panic<R>(
+    operation: impl FnOnce() -> R,
+) -> Result<R, GuardianCheckpointWorkerPanic> {
+    catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        AssertUnwindSafe(operation),
+    )
+    .map_err(|_| GuardianCheckpointWorkerPanic)
 }
 
 /// Owned authenticated request whose plaintext is wiped on every exit path.
