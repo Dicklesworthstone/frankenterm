@@ -5496,21 +5496,65 @@ impl std::fmt::Display for HotReloadResult {
     }
 }
 
-/// Resolve the config path that was loaded (if any).
+/// Resolve the configuration file path according to the canonical precedence:
+/// 1. Explicit path (e.g. CLI `--config <path>`)
+/// 2. Workspace-local configuration via `FT_WORKSPACE` (`$FT_WORKSPACE/.ft/config.toml`, `$FT_WORKSPACE/.ft/ft.toml`, `$FT_WORKSPACE/ft.toml`)
+/// 3. Current working directory (`./.ft/config.toml`, `./.ft/ft.toml`, `./ft.toml`)
+/// 4. Platform user configuration (`$XDG_CONFIG_HOME/ft/ft.toml` or `~/.config/ft/ft.toml`)
 #[must_use]
 pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    let workspace_env = std::env::var("FT_WORKSPACE").ok();
+    resolve_config_path_from(explicit, workspace_env.as_deref())
+}
+
+/// Resolve the configuration file path using an explicit workspace environment string.
+#[must_use]
+pub fn resolve_config_path_from(
+    explicit: Option<&Path>,
+    workspace_env: Option<&str>,
+) -> Option<PathBuf> {
     if let Some(path) = explicit {
         return Some(path.to_path_buf());
     }
 
-    let cwd_config = std::path::Path::new("ft.toml");
+    // 1. Check FT_WORKSPACE if provided
+    if let Some(workspace) = workspace_env {
+        let ws_path = PathBuf::from(workspace);
+        let candidate = ws_path.join(".ft").join("config.toml");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        let candidate = ws_path.join(".ft").join("ft.toml");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        let candidate = ws_path.join("ft.toml");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // 2. Check current working directory workspace / local config
+    let cwd_ft_config = Path::new(".ft").join("config.toml");
+    if cwd_ft_config.exists() {
+        return Some(cwd_ft_config);
+    }
+    let cwd_ft_toml = Path::new(".ft").join("ft.toml");
+    if cwd_ft_toml.exists() {
+        return Some(cwd_ft_toml);
+    }
+    let cwd_config = Path::new("ft.toml");
     if cwd_config.exists() {
         return Some(cwd_config.to_path_buf());
     }
 
-    let config_dir = dirs_config_path();
-    if let Some(dir) = config_dir {
+    // 3. Check platform user config directory
+    if let Some(dir) = dirs_config_path() {
         let config_path = dir.join("ft.toml");
+        if config_path.exists() {
+            return Some(config_path);
+        }
+        let config_path = dir.join("config.toml");
         if config_path.exists() {
             return Some(config_path);
         }
@@ -5529,9 +5573,11 @@ impl Config {
     /// Load validated configuration from default locations.
     ///
     /// Search order:
-    /// 1. ./ft.toml (current directory)
-    /// 2. $XDG_CONFIG_HOME/ft/ft.toml or ~/.config/ft/ft.toml
-    /// 3. Default values
+    /// 1. Explicit path
+    /// 2. $FT_WORKSPACE/.ft/config.toml (or ft.toml)
+    /// 3. ./.ft/config.toml (or ./ft.toml)
+    /// 4. $XDG_CONFIG_HOME/ft/ft.toml or ~/.config/ft/ft.toml
+    /// 5. Default values
     pub fn load() -> crate::Result<Self> {
         let mut config = Self::load_unvalidated()?;
         config.normalize_paths();
@@ -5545,19 +5591,8 @@ impl Config {
     /// enough to report or edit it. Runtime callers should use [`Self::load`]
     /// or [`Self::load_with_overrides`].
     pub fn load_unvalidated() -> crate::Result<Self> {
-        // Check current directory first
-        let cwd_config = std::path::Path::new("ft.toml");
-        if cwd_config.exists() {
-            return Self::load_from_unvalidated(cwd_config);
-        }
-
-        // Check XDG config directory
-        let config_dir = dirs_config_path();
-        if let Some(ref dir) = config_dir {
-            let config_path = dir.join("ft.toml");
-            if config_path.exists() {
-                return Self::load_from_unvalidated(&config_path);
-            }
+        if let Some(config_path) = resolve_config_path(None) {
+            return Self::load_from_unvalidated(&config_path);
         }
 
         // Return defaults
@@ -10934,5 +10969,37 @@ block_alt_screen = true
         let s = both.to_string();
         assert!(s.contains("Forbidden"));
         assert!(s.contains("Hot-reloadable"));
+    }
+
+    #[test]
+    fn resolve_config_path_explicit_precedence() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let explicit = temp.path().join("explicit.toml");
+        std::fs::write(&explicit, "[general]\nlog_level = \"error\"\n").unwrap();
+
+        let resolved = resolve_config_path_from(Some(&explicit), Some("/other/workspace"));
+        assert_eq!(resolved, Some(explicit));
+    }
+
+    #[test]
+    fn resolve_config_path_workspace_discovers_dot_ft_config_toml() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ft_dir = temp.path().join(".ft");
+        std::fs::create_dir_all(&ft_dir).unwrap();
+        let config_toml = ft_dir.join("config.toml");
+        std::fs::write(&config_toml, "[general]\nlog_level = \"debug\"\n").unwrap();
+
+        let resolved = resolve_config_path_from(None, temp.path().to_str());
+        assert_eq!(resolved, Some(config_toml));
+    }
+
+    #[test]
+    fn resolve_config_path_workspace_discovers_ft_toml() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ft_toml = temp.path().join("ft.toml");
+        std::fs::write(&ft_toml, "[general]\nlog_level = \"trace\"\n").unwrap();
+
+        let resolved = resolve_config_path_from(None, temp.path().to_str());
+        assert_eq!(resolved, Some(ft_toml));
     }
 }

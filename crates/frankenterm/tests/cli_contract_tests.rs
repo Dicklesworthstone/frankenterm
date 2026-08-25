@@ -4547,3 +4547,24 @@ fn contract_agent_detection_feature_matches_cfg() {
         );
     }
 }
+
+// =============================================================================
+// Feature Contract: FT_WORKSPACE config.toml discovery
+// =============================================================================
+
+#[test]
+fn contract_ft_workspace_config_toml_is_discovered() {
+    let temp = TempDir::new().expect("temp dir");
+    let ft_dir = temp.path().join(".ft");
+    std::fs::create_dir_all(&ft_dir).expect("create .ft dir");
+    let config_file = ft_dir.join("config.toml");
+    std::fs::write(&config_file, "[general]\nlog_level = \"warn\"\n").expect("write config");
+
+    let resolved = frankenterm_core::config::resolve_config_path_from(None, temp.path().to_str());
+    assert_eq!(
+        resolved,
+        Some(config_file),
+        "FT_WORKSPACE/.ft/config.toml must be discovered by resolve_config_path"
+    );
+}
+
