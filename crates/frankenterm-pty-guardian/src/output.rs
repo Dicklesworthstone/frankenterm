@@ -557,7 +557,7 @@ struct CheckpointCatalogMetadata {
 /// runtime consume the same authority when it finally opens the PTY.
 #[must_use = "Genesis admission authority must be consumed by the Spawn runtime"]
 #[allow(dead_code)] // Consumed by the immediately following runtime-wiring tranche.
-pub(crate) struct GuardianPublishedGenesisAdmissionPermitV1 {
+pub struct GuardianPublishedGenesisAdmissionPermitV1 {
     reservation_identity: GuardianGenesisReservationIdentityV1,
     catalog_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
 }
@@ -6097,8 +6097,11 @@ fn checkpoint_catalog_genesis_metadata_matches_reservation(
         && metadata.identity.candidate_id == checkpoint_catalog_genesis_candidate_id(reservation)
         && metadata.predecessor.is_none()
         && metadata.upload_id == reservation.upload_id
-        && metadata.checkpoint_id == reservation.checkpoint_identity_digest
-        && metadata.boundary_id == reservation.boundary_identity_digest
+        && (metadata.checkpoint_id, metadata.boundary_id)
+            == (
+                reservation.checkpoint_identity_digest,
+                reservation.boundary_identity_digest,
+            )
         && metadata.capture_generation == 1
         && metadata.rows == u32::from(reservation.rows)
         && metadata.cols == u32::from(reservation.cols)
@@ -8576,7 +8579,7 @@ mod tests {
         }
         impl<T: ?Sized> AmbiguousIfClone<()> for T {}
         struct ImplementsClone;
-        impl<T: ?Sized + Clone> AmbiguousIfClone<ImplementsClone> for T {}
+        impl<T: Clone> AmbiguousIfClone<ImplementsClone> for T {}
 
         let _ = <GuardianPublishedGenesisAdmissionPermitV1 as AmbiguousIfClone<_>>::probe;
     }

@@ -8,10 +8,10 @@
 use std::process::Command;
 
 use frankenterm_build_identity::{
-    AtomicComponentRole, emit_cargo_atomic_component_marker,
+    AtomicComponentIdentityError, AtomicComponentRole, emit_cargo_atomic_component_marker,
 };
 
-fn main() {
+fn main() -> Result<(), AtomicComponentIdentityError> {
     // Treat SOURCE_DATE_EPOCH="" (exported but empty) the same as unset. The spec requires a
     // non-negative integer; an empty string is not one, and honoring it would produce a
     // meaningless `built: epoch:` line and silently suppress the git-dirty check.
@@ -95,14 +95,14 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=FT_TARGET={target}");
 
-    emit_cargo_atomic_component_marker(AtomicComponentRole::Ft)
-        .unwrap_or_else(|error| panic!("cannot embed ft atomic component identity: {error}"));
+    emit_cargo_atomic_component_marker(AtomicComponentRole::Ft)?;
 
     // Rerun triggers
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    Ok(())
 }
 
 /// Format a unix epoch (seconds since 1970-01-01 UTC) as `YYYY-MM-DDTHH:MM:SSZ`.
