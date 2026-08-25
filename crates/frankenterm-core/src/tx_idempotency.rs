@@ -919,8 +919,7 @@ impl TxExecutionLedger {
                 }
                 if cert.compensated_step_ids.is_empty() {
                     return Err(
-                        "RolledBack disposition requires non-empty compensated steps"
-                            .to_string(),
+                        "RolledBack disposition requires non-empty compensated steps".to_string(),
                     );
                 }
                 if cert.completed_step_ids != cert.compensated_step_ids {
@@ -9274,10 +9273,7 @@ mod tests {
 
         let json = serde_json::to_string(&ledger).unwrap();
         let deserialized: TxExecutionLedger = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            deserialized.terminal_certificate(),
-            Some(cert)
-        );
+        assert_eq!(deserialized.terminal_certificate(), Some(cert));
 
         let ctx = ResumeContext::from_ledger(&deserialized, &plan);
         assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
@@ -9399,7 +9395,10 @@ mod tests {
             .unwrap()
             .remove("terminal_certificate");
         let err = serde_json::from_value::<TxExecutionLedger>(json_val).unwrap_err();
-        assert!(err.to_string().contains("lacks a terminal disposition certificate"));
+        assert!(
+            err.to_string()
+                .contains("lacks a terminal disposition certificate")
+        );
 
         // 2. Deserialization fails if certificate execution_id is forged
         let mut json_val: serde_json::Value = serde_json::to_value(&ledger).unwrap();

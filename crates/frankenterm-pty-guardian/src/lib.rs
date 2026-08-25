@@ -42,8 +42,8 @@ pub const fn guardian_atomic_component_marker() -> &'static str {
 /// Validate the embedded guardian marker while preserving explicit development
 /// state. `UnsealedDevelopment` is never interchangeable with a runtime build
 /// authority.
-pub fn guardian_embedded_build_identity(
-) -> Result<AtomicBuildIdentity, AtomicComponentIdentityError> {
+pub fn guardian_embedded_build_identity()
+-> Result<AtomicBuildIdentity, AtomicComponentIdentityError> {
     parse_atomic_component_marker(
         GUARDIAN_ATOMIC_COMPONENT_MARKER,
         AtomicComponentRole::FrankenTermPtyGuardian,
@@ -56,8 +56,8 @@ pub fn guardian_embedded_build_identity(
 /// [`AtomicComponentIdentityError::UnsealedDevelopmentBuild`]. The function
 /// never synthesizes authority from the package version, executable path,
 /// inode, process ID, or a runtime environment variable.
-pub fn guardian_runtime_build_identity(
-) -> Result<SealedAtomicBuildIdentity, AtomicComponentIdentityError> {
+pub fn guardian_runtime_build_identity()
+-> Result<SealedAtomicBuildIdentity, AtomicComponentIdentityError> {
     parse_sealed_atomic_component_marker(
         GUARDIAN_ATOMIC_COMPONENT_MARKER,
         AtomicComponentRole::FrankenTermPtyGuardian,
