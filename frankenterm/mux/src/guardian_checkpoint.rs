@@ -5387,6 +5387,8 @@ mod tests {
                         Begin,
                         Chunk(GuardianCheckpointStageChunkDeliveryV1),
                         Seal,
+                        Query,
+                        Ack { completion_id: Uuid },
                     }
                 "#,
             )
@@ -5473,6 +5475,18 @@ mod tests {
             ),
             expected_authority_method(
                 "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn query(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn ack(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32, completion_id: Uuid) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
                 "private",
                 false,
                 "fn new(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32, body: GuardianCheckpointStageBodyV1) -> Result<Self, GuardianProtocolError>",
@@ -5536,6 +5550,12 @@ mod tests {
                 "pub",
                 false,
                 "const fn chunk_position(&self) -> Option<(u32, u64)>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn completion_id(&self) -> Option<Uuid>",
             ),
             expected_authority_method(
                 "GuardianCheckpointStageRequestV1",
@@ -5666,7 +5686,9 @@ mod tests {
                         match self.body {
                             GuardianCheckpointStageBodyV1::Chunk(chunk) => Ok(chunk),
                             GuardianCheckpointStageBodyV1::Begin
-                            | GuardianCheckpointStageBodyV1::Seal => {
+                            | GuardianCheckpointStageBodyV1::Seal
+                            | GuardianCheckpointStageBodyV1::Query
+                            | GuardianCheckpointStageBodyV1::Ack { .. } => {
                                 Err(GuardianProtocolError::InvalidOperationPayload)
                             }
                         }
@@ -5713,9 +5735,11 @@ mod tests {
             "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new:pub:production",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::into_chunk:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::begin:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::new:private:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::query:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal:pub:production",
         ]
         .into_iter()
@@ -5735,10 +5759,12 @@ mod tests {
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::decode",
             "GuardianCheckpointStageRequestV1@<free>::validate_request_envelope",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::begin",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::new",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::query",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal",
             "GuardianCheckpointStageRequestV1@GuardianReply::require_request_payload",
         ]
