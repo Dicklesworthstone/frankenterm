@@ -12869,7 +12869,8 @@ mod tests {
                 if let Some(ref fail_step) = self.fail_precondition_step {
                     if gate.step_id.0 == *fail_step {
                         gate.preconditions_satisfied = false;
-                        gate.precondition_reason_code = Some("precondition_target_dead".to_string());
+                        gate.precondition_reason_code =
+                            Some("precondition_target_dead".to_string());
                     }
                 }
             }
@@ -12940,13 +12941,30 @@ mod tests {
 
         assert_eq!(result.final_state, MissionTxState::Compensated);
         assert_eq!(result.outcome, TxOutcome::Compensated);
-        assert_eq!(*dispatched_compensations.borrow(), vec!["step-0".to_string()]);
+        assert_eq!(
+            *dispatched_compensations.borrow(),
+            vec!["step-0".to_string()]
+        );
 
         // Verify reconstructed commit receipts for step-0, and skipped for step-1 & step-2
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-0", "committed"));
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-1", "skipped"));
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-2", "skipped"));
-        assert!(latest_tx_receipt_matches(&contract, "compensate", "step-0", "compensated"));
+        assert!(latest_tx_receipt_matches(
+            &contract,
+            "commit",
+            "step-0",
+            "committed"
+        ));
+        assert!(latest_tx_receipt_matches(
+            &contract, "commit", "step-1", "skipped"
+        ));
+        assert!(latest_tx_receipt_matches(
+            &contract, "commit", "step-2", "skipped"
+        ));
+        assert!(latest_tx_receipt_matches(
+            &contract,
+            "compensate",
+            "step-0",
+            "compensated"
+        ));
 
         // Verify no duplicate receipts for step-0 commit
         let commit_receipts_step_0 = contract
@@ -12957,7 +12975,10 @@ mod tests {
                     && r.get("step_id").and_then(serde_json::Value::as_str) == Some("step-0")
             })
             .count();
-        assert_eq!(commit_receipts_step_0, 1, "must not have duplicate commit receipts for step-0");
+        assert_eq!(
+            commit_receipts_step_0, 1,
+            "must not have duplicate commit receipts for step-0"
+        );
 
         Ok(())
     }
@@ -12999,16 +13020,32 @@ mod tests {
 
         assert_eq!(result.final_state, MissionTxState::Compensated);
         assert_eq!(result.outcome, TxOutcome::Compensated);
-        assert_eq!(*dispatched_compensations.borrow(), vec!["step-0".to_string()]);
+        assert_eq!(
+            *dispatched_compensations.borrow(),
+            vec!["step-0".to_string()]
+        );
 
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-0", "committed"));
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-1", "skipped"));
-        assert!(latest_tx_receipt_matches(&contract, "compensate", "step-0", "compensated"));
+        assert!(latest_tx_receipt_matches(
+            &contract,
+            "commit",
+            "step-0",
+            "committed"
+        ));
+        assert!(latest_tx_receipt_matches(
+            &contract, "commit", "step-1", "skipped"
+        ));
+        assert!(latest_tx_receipt_matches(
+            &contract,
+            "compensate",
+            "step-0",
+            "compensated"
+        ));
         Ok(())
     }
 
     #[test]
-    fn mixed_recovery_reconstructs_proven_receipts_under_failed_precondition() -> Result<(), String> {
+    fn mixed_recovery_reconstructs_proven_receipts_under_failed_precondition() -> Result<(), String>
+    {
         let mut contract = make_test_contract(2);
         let (_store_dir, mut store) = durable_store();
         let compiled_plan = compiled_plan_from_contract(&contract);
@@ -13044,16 +13081,32 @@ mod tests {
 
         assert_eq!(result.final_state, MissionTxState::Compensated);
         assert_eq!(result.outcome, TxOutcome::Compensated);
-        assert_eq!(*dispatched_compensations.borrow(), vec!["step-0".to_string()]);
+        assert_eq!(
+            *dispatched_compensations.borrow(),
+            vec!["step-0".to_string()]
+        );
 
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-0", "committed"));
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-1", "skipped"));
-        assert!(latest_tx_receipt_matches(&contract, "compensate", "step-0", "compensated"));
+        assert!(latest_tx_receipt_matches(
+            &contract,
+            "commit",
+            "step-0",
+            "committed"
+        ));
+        assert!(latest_tx_receipt_matches(
+            &contract, "commit", "step-1", "skipped"
+        ));
+        assert!(latest_tx_receipt_matches(
+            &contract,
+            "compensate",
+            "step-0",
+            "compensated"
+        ));
         Ok(())
     }
 
     #[test]
-    fn mixed_recovery_without_auto_compensate_fails_closed_in_committing_state() -> Result<(), String> {
+    fn mixed_recovery_without_auto_compensate_fails_closed_in_committing_state()
+    -> Result<(), String> {
         let mut contract = make_test_contract(2);
         let (_store_dir, mut store) = durable_store();
         let compiled_plan = compiled_plan_from_contract(&contract);
@@ -13084,16 +13137,28 @@ mod tests {
 
         let err = engine
             .execute_with_store(&mut contract, &mut store, 6_000)
-            .expect_err("must fail closed when auto-compensate is false and uncommitted steps exist");
+            .expect_err(
+                "must fail closed when auto-compensate is false and uncommitted steps exist",
+            );
 
         assert!(matches!(err, TxExecutionError::CommitPhase(_)));
-        assert!(err.to_string().contains("automatic compensation is disabled"));
+        assert!(
+            err.to_string()
+                .contains("automatic compensation is disabled")
+        );
         assert!(dispatched_compensations.borrow().is_empty());
 
         assert_eq!(contract.lifecycle_state, MissionTxState::Committing);
         assert_eq!(contract.outcome, TxOutcome::Pending);
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-0", "committed"));
-        assert!(latest_tx_receipt_matches(&contract, "commit", "step-1", "skipped"));
+        assert!(latest_tx_receipt_matches(
+            &contract,
+            "commit",
+            "step-0",
+            "committed"
+        ));
+        assert!(latest_tx_receipt_matches(
+            &contract, "commit", "step-1", "skipped"
+        ));
         Ok(())
     }
 }

@@ -899,7 +899,10 @@ mod tests {
         ];
         let report = rank_attribution_candidates(&samples);
         assert_eq!(report.claim_id, "robot.p95");
-        assert_ne!(report.candidates, [] as [crate::causal_attribution::AttributionCandidate; 0]);
+        assert_ne!(
+            report.candidates,
+            [] as [crate::causal_attribution::AttributionCandidate; 0]
+        );
         assert!(matches!(report.decision, GateDecision::Continue { .. }));
     }
 

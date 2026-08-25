@@ -1127,7 +1127,10 @@ mod tests {
 
         // Complete probation
         reg.complete_probation("conn-1", 3000).unwrap();
-        assert_eq!(reg.probationary_components(), [] as [std::string::String; 0]);
+        assert_eq!(
+            reg.probationary_components(),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(reg.get("conn-1").unwrap().state, QuarantineState::Clear);
     }
 

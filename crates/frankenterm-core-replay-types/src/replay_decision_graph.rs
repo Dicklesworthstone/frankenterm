@@ -686,7 +686,10 @@ mod tests {
         let graph = DecisionGraph::from_decisions(&[]);
         assert_eq!(graph.node_count(), 0);
         assert_eq!(graph.edge_count(), 0);
-        assert_eq!(graph.roots(), [] as [&crate::replay_decision_graph::DecisionNode; 0]);
+        assert_eq!(
+            graph.roots(),
+            [] as [&crate::replay_decision_graph::DecisionNode; 0]
+        );
         assert!(graph.is_dag());
     }
 
@@ -927,7 +930,10 @@ mod tests {
     fn causal_chain_root_empty() {
         let graph = DecisionGraph::from_decisions(&sample_events());
         let chain = graph.causal_chain(0);
-        assert_eq!(chain, [] as [&crate::replay_decision_graph::DecisionNode; 0]);
+        assert_eq!(
+            chain,
+            [] as [&crate::replay_decision_graph::DecisionNode; 0]
+        );
     }
 
     // ── Effects of leaf ────────────────────────────────────────────────
@@ -956,7 +962,10 @@ mod tests {
             .iter()
             .filter(|e| e.edge_type == EdgeType::TriggeredBy)
             .collect();
-        assert_ne!(triggered, [] as [&crate::replay_decision_graph::CausalEdge; 0]);
+        assert_ne!(
+            triggered,
+            [] as [&crate::replay_decision_graph::CausalEdge; 0]
+        );
         // 0->1, 1->2, 3->4 should all be triggered.
         let pairs: Vec<(u64, u64)> = triggered.iter().map(|e| (e.from_node, e.to_node)).collect();
         assert!(pairs.contains(&(0, 1)));

@@ -2565,7 +2565,10 @@ mod tests {
                 .reason_codes
                 .contains(&ResourcePlacementReasonCode::NumaMemoryTierExhausted)
         );
-        assert_eq!(receipt.to_placements, [] as [crate::resource_admission::ResourceTopologyPlacementTarget; 0]);
+        assert_eq!(
+            receipt.to_placements,
+            [] as [crate::resource_admission::ResourceTopologyPlacementTarget; 0]
+        );
     }
 
     #[test]

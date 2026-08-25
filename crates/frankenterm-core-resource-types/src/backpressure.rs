@@ -2187,6 +2187,9 @@ mod tests {
 
         let transition_event = &artifact.events[2];
         assert_eq!(transition_event.timestamp_ms, 3011);
-        assert_ne!(transition_event.evidence, [] as [crate::backpressure::BackpressureTimelineEvidence; 0]);
+        assert_ne!(
+            transition_event.evidence,
+            [] as [crate::backpressure::BackpressureTimelineEvidence; 0]
+        );
     }
 }

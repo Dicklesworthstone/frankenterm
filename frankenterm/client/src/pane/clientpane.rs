@@ -756,8 +756,10 @@ impl ReliableInputQueue {
                     ReliablePaneWriteFailure::DomainDetached.message(),
                 ));
             }
-            let remaining_bytes = RELIABLE_INPUT_QUEUE_BYTE_CAPACITY.saturating_sub(state.pending_bytes);
-            let payload_budget = remaining_bytes.saturating_sub(RELIABLE_PANE_WRITE_ENTRY_OVERHEAD_BYTES);
+            let remaining_bytes =
+                RELIABLE_INPUT_QUEUE_BYTE_CAPACITY.saturating_sub(state.pending_bytes);
+            let payload_budget =
+                remaining_bytes.saturating_sub(RELIABLE_PANE_WRITE_ENTRY_OVERHEAD_BYTES);
             if state.pending.len() >= RELIABLE_INPUT_QUEUE_CAPACITY || payload_budget == 0 {
                 drop(state);
                 notify_pane_write_failure(

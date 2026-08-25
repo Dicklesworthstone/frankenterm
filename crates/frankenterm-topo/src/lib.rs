@@ -1815,7 +1815,10 @@ mod tests {
         let report = decision_report(&declarations, &source_files, &[]);
 
         assert!(!report.passed);
-        assert_eq!(report.records[0].production_callers, [] as [DecisionApiCaller; 0]);
+        assert_eq!(
+            report.records[0].production_callers,
+            [] as [DecisionApiCaller; 0]
+        );
         assert_eq!(report.records[0].status, DecisionApiWiringStatus::Deadwire);
     }
 
@@ -1965,7 +1968,10 @@ mod tests {
                 beta1: 0
             }]
         );
-        assert_eq!(persistence_diagram(&image).features, [] as [PersistenceFeature; 0]);
+        assert_eq!(
+            persistence_diagram(&image).features,
+            [] as [PersistenceFeature; 0]
+        );
     }
 
     #[test]
