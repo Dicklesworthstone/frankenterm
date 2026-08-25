@@ -101950,6 +101950,172 @@ log_level = "debug"
         assert_eq!(ambient_status.code(), Some(73));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn atomic_path_exchange_lost_reply_reconciles_without_toggling_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create exchange reconciliation fixture");
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make transition parent private");
+        let stage = fixture.path().join("stage");
+        let target = fixture.path().join("target");
+        std::fs::write(&stage, b"new-generation").expect("write staged generation");
+        std::fs::write(&target, b"old-generation").expect("write target generation");
+        for path in [&stage, &target] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
+                .expect("seal transition member");
+        }
+        let stage_id = inspect_atomic_path_content_id(fixture.path(), "stage")
+            .expect("hash staged generation");
+        let target_id = inspect_atomic_path_content_id(fixture.path(), "target")
+            .expect("hash target generation");
+        let transaction_id = "0123456789abcdef0123456789abcdef";
+
+        let error = run_atomic_path_transition_with_post_effect_sync(
+            fixture.path(),
+            "stage",
+            "target",
+            transaction_id,
+            &stage_id,
+            &target_id,
+            AtomicPathTransitionOperation::Exchange,
+            |_| Err(std::io::Error::other("planted lost reply after exchange")),
+        )
+        .expect_err("post-effect durability failure must withhold acknowledgement");
+        assert!(format!("{error:#}").contains("planted lost reply after exchange"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-generation");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"old-generation");
+
+        let recovered = run_atomic_path_transition(
+            fixture.path(),
+            "stage",
+            "target",
+            transaction_id,
+            &stage_id,
+            &target_id,
+            AtomicPathTransitionOperation::Exchange,
+        )
+        .expect("same transaction reconciles exact post-effect authority");
+        assert_eq!(recovered, AtomicPathTransitionOutcome::AlreadyApplied);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-generation");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"old-generation");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn atomic_path_exchange_serializes_same_transaction_callers() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create concurrent exchange fixture");
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make transition parent private");
+        let stage = fixture.path().join("stage");
+        let target = fixture.path().join("target");
+        std::fs::write(&stage, b"new-generation").expect("write staged generation");
+        std::fs::write(&target, b"old-generation").expect("write target generation");
+        for path in [&stage, &target] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
+                .expect("seal transition member");
+        }
+        let stage_id = inspect_atomic_path_content_id(fixture.path(), "stage")
+            .expect("hash staged generation");
+        let target_id = inspect_atomic_path_content_id(fixture.path(), "target")
+            .expect("hash target generation");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let parent = fixture.path().to_path_buf();
+            let stage_id = stage_id.clone();
+            let target_id = target_id.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                run_atomic_path_transition(
+                    &parent,
+                    "stage",
+                    "target",
+                    "fedcba9876543210fedcba9876543210",
+                    &stage_id,
+                    &target_id,
+                    AtomicPathTransitionOperation::Exchange,
+                )
+            }));
+        }
+        barrier.wait();
+        let mut outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("exchange worker did not panic").unwrap())
+            .collect::<Vec<_>>();
+        outcomes.sort_by_key(|outcome| match outcome {
+            AtomicPathTransitionOutcome::Applied => 0,
+            AtomicPathTransitionOutcome::AlreadyApplied => 1,
+        });
+        assert_eq!(
+            outcomes,
+            vec![
+                AtomicPathTransitionOutcome::Applied,
+                AtomicPathTransitionOutcome::AlreadyApplied,
+            ]
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-generation");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"old-generation");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn atomic_path_exchange_serializes_distinct_transactions_on_one_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create cross-transaction exchange fixture");
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make transition parent private");
+        let stage = fixture.path().join("stage");
+        let target = fixture.path().join("target");
+        std::fs::write(&stage, b"new-generation").expect("write staged generation");
+        std::fs::write(&target, b"old-generation").expect("write target generation");
+        for path in [&stage, &target] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
+                .expect("seal transition member");
+        }
+        let stage_id = inspect_atomic_path_content_id(fixture.path(), "stage")
+            .expect("hash staged generation");
+        let target_id = inspect_atomic_path_content_id(fixture.path(), "target")
+            .expect("hash target generation");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for transaction_id in [
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222",
+        ] {
+            let parent = fixture.path().to_path_buf();
+            let stage_id = stage_id.clone();
+            let target_id = target_id.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                run_atomic_path_transition(
+                    &parent,
+                    "stage",
+                    "target",
+                    transaction_id,
+                    &stage_id,
+                    &target_id,
+                    AtomicPathTransitionOperation::Exchange,
+                )
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("exchange worker did not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-generation");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"old-generation");
+    }
+
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn remote_generation_rejects_v2_pair_inventory_without_guardian() {

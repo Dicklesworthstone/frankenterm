@@ -6607,6 +6607,900 @@ fn cleanup_authoritatively_sync(
     })
 }
 
+// =============================================================================
+// Verified checkpoint + durable scrollback artifacts
+// =============================================================================
+
+/// Frozen schema identifier for an offline checkpoint/scrollback artifact.
+pub const CHECKPOINT_SCROLLBACK_ARTIFACT_SCHEMA: &str =
+    "frankenterm.checkpoint-scrollback-artifact.v1";
+
+/// Canonical suffix used by the bounded artifact inventory.
+pub const CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX: &str = ".ft-checkpoint-scrollback.json";
+
+/// Hard ceiling for one artifact, independent of caller-provided limits.
+pub const CHECKPOINT_SCROLLBACK_ARTIFACT_HARD_MAX_BYTES: u64 = 384 * 1024 * 1024;
+/// Hard ceiling for exported segment content across one artifact.
+pub const CHECKPOINT_SCROLLBACK_CONTENT_HARD_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Hard ceiling for durable output rows across one artifact.
+pub const CHECKPOINT_SCROLLBACK_HARD_MAX_SEGMENTS: usize = 1_000_000;
+/// Hard ceiling for explicit capture-gap rows across one artifact.
+pub const CHECKPOINT_SCROLLBACK_HARD_MAX_GAPS: usize = 262_144;
+/// Maximum byte length admitted for one redaction catalog identity.
+const CHECKPOINT_SCROLLBACK_MAX_CATALOG_VERSION_BYTES: usize = 256;
+/// Maximum byte length admitted for one explicit capture-gap reason.
+const CHECKPOINT_SCROLLBACK_MAX_GAP_REASON_BYTES: usize = 16 * 1024;
+/// Maximum number of retained publication residues tried for one target name.
+const CHECKPOINT_SCROLLBACK_MAX_STAGING_ATTEMPTS: u8 = 32;
+
+/// Resource contract used by production and offline artifact paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackArtifactLimits {
+    /// Maximum checkpoint panes admitted to the artifact.
+    pub max_panes: usize,
+    /// Maximum durable output rows admitted for any one pane.
+    pub max_segments_per_pane: usize,
+    /// Maximum durable output rows admitted across the artifact.
+    pub max_total_segments: usize,
+    /// Maximum explicit capture-gap rows admitted for any one pane.
+    pub max_gaps_per_pane: usize,
+    /// Maximum explicit capture-gap rows admitted across the artifact.
+    pub max_total_gaps: usize,
+    /// Maximum UTF-8 content bytes admitted across all output rows.
+    pub max_content_bytes: u64,
+    /// Maximum canonical JSON artifact bytes admitted on write or read.
+    pub max_artifact_bytes: u64,
+    /// Maximum directory entries admitted by one inventory operation.
+    pub max_inventory_entries: usize,
+}
+
+impl Default for CheckpointScrollbackArtifactLimits {
+    fn default() -> Self {
+        Self {
+            max_panes: MAX_TOPOLOGY_PANES,
+            max_segments_per_pane: 250_000,
+            max_total_segments: CHECKPOINT_SCROLLBACK_HARD_MAX_SEGMENTS,
+            max_gaps_per_pane: 65_536,
+            max_total_gaps: CHECKPOINT_SCROLLBACK_HARD_MAX_GAPS,
+            max_content_bytes: CHECKPOINT_SCROLLBACK_CONTENT_HARD_MAX_BYTES,
+            max_artifact_bytes: CHECKPOINT_SCROLLBACK_ARTIFACT_HARD_MAX_BYTES,
+            max_inventory_entries: 4_096,
+        }
+    }
+}
+
+impl CheckpointScrollbackArtifactLimits {
+    fn validate(self) -> Result<Self, CheckpointScrollbackArtifactError> {
+        let nonzero = [
+            ("max_panes", self.max_panes),
+            ("max_segments_per_pane", self.max_segments_per_pane),
+            ("max_total_segments", self.max_total_segments),
+            ("max_gaps_per_pane", self.max_gaps_per_pane),
+            ("max_total_gaps", self.max_total_gaps),
+            ("max_inventory_entries", self.max_inventory_entries),
+        ];
+        if let Some((field, _)) = nonzero.into_iter().find(|(_, value)| *value == 0) {
+            return Err(CheckpointScrollbackArtifactError::InvalidLimits(format!(
+                "{field} must be non-zero"
+            )));
+        }
+        if self.max_content_bytes == 0 || self.max_artifact_bytes == 0 {
+            return Err(CheckpointScrollbackArtifactError::InvalidLimits(
+                "byte limits must be non-zero".to_string(),
+            ));
+        }
+        if self.max_panes > MAX_TOPOLOGY_PANES {
+            return Err(CheckpointScrollbackArtifactError::InvalidLimits(format!(
+                "max_panes exceeds the topology ceiling of {MAX_TOPOLOGY_PANES}"
+            )));
+        }
+        if self.max_segments_per_pane > CHECKPOINT_SCROLLBACK_HARD_MAX_SEGMENTS
+            || self.max_total_segments > CHECKPOINT_SCROLLBACK_HARD_MAX_SEGMENTS
+            || self.max_segments_per_pane > self.max_total_segments
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidLimits(
+                "segment limits exceed the hard ceiling or conflict".to_string(),
+            ));
+        }
+        if self.max_gaps_per_pane > CHECKPOINT_SCROLLBACK_HARD_MAX_GAPS
+            || self.max_total_gaps > CHECKPOINT_SCROLLBACK_HARD_MAX_GAPS
+            || self.max_gaps_per_pane > self.max_total_gaps
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidLimits(
+                "gap limits exceed the hard ceiling or conflict".to_string(),
+            ));
+        }
+        if self.max_content_bytes > CHECKPOINT_SCROLLBACK_CONTENT_HARD_MAX_BYTES
+            || self.max_artifact_bytes > CHECKPOINT_SCROLLBACK_ARTIFACT_HARD_MAX_BYTES
+            || self.max_content_bytes > self.max_artifact_bytes
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidLimits(
+                "artifact byte limits exceed the hard ceiling or conflict".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn admits(&self, embedded: &Self) -> bool {
+        embedded.max_panes <= self.max_panes
+            && embedded.max_segments_per_pane <= self.max_segments_per_pane
+            && embedded.max_total_segments <= self.max_total_segments
+            && embedded.max_gaps_per_pane <= self.max_gaps_per_pane
+            && embedded.max_total_gaps <= self.max_total_gaps
+            && embedded.max_content_bytes <= self.max_content_bytes
+            && embedded.max_artifact_bytes <= self.max_artifact_bytes
+            && embedded.max_inventory_entries <= self.max_inventory_entries
+    }
+}
+
+/// Errors from artifact construction, publication, inventory, and verification.
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointScrollbackArtifactError {
+    /// A caller supplied a contradictory or excessive resource contract.
+    #[error("invalid checkpoint scrollback artifact limits: {0}")]
+    InvalidLimits(String),
+    /// SQLite authority could not be read consistently.
+    #[error("checkpoint scrollback database observation failed: {0}")]
+    Database(#[from] rusqlite::Error),
+    /// The selected checkpoint was absent or did not carry verified v2 authority.
+    #[error("checkpoint scrollback source is not a verified snapshot: {0}")]
+    Checkpoint(String),
+    /// A source or artifact exceeded a declared resource bound.
+    #[error("checkpoint scrollback resource limit exceeded: {0}")]
+    ResourceLimit(String),
+    /// Persisted source bytes were not a fixed point under the active redactor.
+    #[error("checkpoint scrollback source is not a current redaction fixed point")]
+    RedactionNotFixedPoint,
+    /// A filesystem operation failed.
+    #[error("checkpoint scrollback filesystem operation failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// JSON serialization or decoding failed.
+    #[error("checkpoint scrollback JSON operation failed: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Offline semantic verification rejected the artifact.
+    #[error("invalid checkpoint scrollback artifact: {0}")]
+    InvalidArtifact(String),
+    /// No-clobber publication found an existing conflicting target.
+    #[error("checkpoint scrollback target already exists")]
+    AlreadyExists,
+}
+
+/// Exact source columns required to recompute a v2 checkpoint witness offline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackPaneProjection {
+    /// Pane identifier stored in `mux_pane_state`.
+    pub pane_id: u64,
+    /// Captured working directory.
+    pub cwd: Option<String>,
+    /// Captured foreground command.
+    pub command: Option<String>,
+    /// Canonical curated environment JSON.
+    pub env_json: Option<String>,
+    /// Canonical terminal-state JSON.
+    pub terminal_state_json: String,
+    /// Canonical agent metadata JSON.
+    pub agent_metadata_json: Option<String>,
+    /// Highest output segment visible to the checkpoint.
+    pub scrollback_checkpoint_seq: Option<u64>,
+    /// Timestamp of the checkpoint's latest retained output.
+    pub last_output_at: Option<u64>,
+}
+
+/// Exact verified snapshot identity and projection embedded in the artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackCheckpoint {
+    /// SQLite checkpoint row ID.
+    pub checkpoint_id: i64,
+    /// Parent mux session identity.
+    pub session_id: String,
+    /// Checkpoint timestamp in epoch milliseconds.
+    pub checkpoint_at: u64,
+    /// Snapshot trigger/type persisted with the checkpoint.
+    pub checkpoint_type: String,
+    /// Frozen role; v1 accepts only `snapshot`.
+    pub checkpoint_role: String,
+    /// Recomputed `snp2:` witness over this exact embedded projection.
+    pub state_hash: String,
+    /// Optional exact checkpoint metadata JSON.
+    pub metadata_json: Option<String>,
+    /// Exact topology JSON covered by `state_hash`.
+    pub topology_json: String,
+    /// SHA-256 of the exact topology JSON bytes.
+    pub topology_sha256: String,
+    /// Declared and embedded pane count.
+    pub pane_count: usize,
+    /// Historical checkpoint payload byte estimate.
+    pub total_bytes: usize,
+    /// Exact persisted pane projections, sorted by pane ID.
+    pub panes: Vec<CheckpointScrollbackPaneProjection>,
+}
+
+/// One durable output row retained in a pane prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackSegment {
+    /// Per-pane monotonic output sequence.
+    pub seq: u64,
+    /// Capture timestamp in epoch milliseconds.
+    pub captured_at: u64,
+    /// Redaction catalog stamped on the source row, or `None` for legacy rows.
+    pub redaction_catalog_version: Option<String>,
+    /// Exact UTF-8 byte count of `content`.
+    pub content_bytes: usize,
+    /// SHA-256 of the exact exported content bytes.
+    pub content_sha256: String,
+    /// Exact already-redacted durable content.
+    pub content: String,
+}
+
+/// An inclusive sequence interval absent from the retained prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackSequenceGap {
+    /// First missing sequence.
+    pub first_missing_seq: u64,
+    /// Last missing sequence.
+    pub last_missing_seq: u64,
+}
+
+/// Explicit capture-loss evidence retained in `output_gaps`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackCaptureGap {
+    /// Last known sequence before the loss boundary.
+    pub seq_before: u64,
+    /// First known sequence after the loss boundary.
+    pub seq_after: u64,
+    /// Bounded persisted cause.
+    pub reason: String,
+    /// Gap detection timestamp in epoch milliseconds.
+    pub detected_at: u64,
+}
+
+/// One checkpoint pane's exact retained output prefix and continuity evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackPanePrefix {
+    /// Pane identifier; must match the corresponding checkpoint projection.
+    pub pane_id: u64,
+    /// Checkpoint-owned inclusive sequence ceiling.
+    pub checkpoint_seq: Option<u64>,
+    /// First retained sequence at or below the checkpoint ceiling.
+    pub first_seq: Option<u64>,
+    /// Last retained sequence at or below the checkpoint ceiling.
+    pub last_seq: Option<u64>,
+    /// Exact number of embedded durable rows.
+    pub segment_count: usize,
+    /// Exact UTF-8 bytes across embedded segment content.
+    pub content_bytes: u64,
+    /// Missing retained sequence intervals, including retention floor/suffix loss.
+    pub sequence_gaps: Vec<CheckpointScrollbackSequenceGap>,
+    /// Explicit capture-loss rows visible no later than the checkpoint.
+    pub capture_gaps: Vec<CheckpointScrollbackCaptureGap>,
+    /// Whether the retained sequence set starts at zero when output exists.
+    pub starts_at_zero: bool,
+    /// Whether the retained sequence set reaches the checkpoint ceiling.
+    pub reaches_checkpoint: bool,
+    /// Whether every sequence through the checkpoint ceiling is present.
+    pub sequence_contiguous: bool,
+    /// True only when no explicit capture-gap evidence intersects the prefix.
+    pub no_capture_gaps: bool,
+    /// True only for a zero-based, contiguous, ceiling-reaching prefix with no capture gaps.
+    pub complete: bool,
+    /// Sorted unique source redaction-catalog identities.
+    pub redaction_catalog_versions: Vec<String>,
+    /// Must remain true after an independent current-catalog fixed-point pass.
+    pub redaction_fixed_point: bool,
+    /// Domain-separated SHA-256 over every prefix field except this digest.
+    pub prefix_sha256: String,
+    /// Exact durable rows in ascending sequence order.
+    pub segments: Vec<CheckpointScrollbackSegment>,
+}
+
+/// Explicitly conservative capability claims for the offline artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackCapabilities {
+    /// Artifact contains bounded forensic scrollback text.
+    pub forensic_scrollback_export: bool,
+    /// Artifact can be verified without the source database.
+    pub offline_verification: bool,
+    /// Artifact carries checkpoint topology metadata.
+    pub checkpoint_topology: bool,
+    /// Artifact is not an executable restore image.
+    pub executable_restore_image: bool,
+    /// Artifact does not preserve terminal parser/render state.
+    pub terminal_parser_state: bool,
+    /// Artifact does not preserve PTY descriptors or kernel queues.
+    pub pty_descriptor_state: bool,
+    /// Artifact does not preserve process memory or kernel process state.
+    pub process_state: bool,
+    /// Artifact does not preserve running-process continuity.
+    pub running_process_continuity: bool,
+    /// Artifact verification and import perform no live mux mutation.
+    pub live_mux_mutation: bool,
+}
+
+impl CheckpointScrollbackCapabilities {
+    const V1: Self = Self {
+        forensic_scrollback_export: true,
+        offline_verification: true,
+        checkpoint_topology: true,
+        executable_restore_image: false,
+        terminal_parser_state: false,
+        pty_descriptor_state: false,
+        process_state: false,
+        running_process_continuity: false,
+        live_mux_mutation: false,
+    };
+}
+
+/// Aggregate counters cross-checked by the offline verifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackSummary {
+    /// Number of checkpoint panes and prefix records.
+    pub pane_count: usize,
+    /// Total durable output rows embedded.
+    pub segment_count: usize,
+    /// Total explicit capture-gap rows embedded.
+    pub capture_gap_count: usize,
+    /// Exact UTF-8 bytes across all embedded content.
+    pub content_bytes: u64,
+    /// Number of panes with complete retained history through their checkpoint ceiling.
+    pub complete_pane_count: usize,
+    /// Number of panes with explicitly incomplete history.
+    pub incomplete_pane_count: usize,
+}
+
+/// Canonical v1 payload bound by the envelope checksum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackPayload {
+    /// Frozen integer schema version.
+    pub schema_version: u32,
+    /// Artifact construction timestamp in epoch milliseconds.
+    pub created_at_epoch_ms: u64,
+    /// Current redaction catalog used for fixed-point verification.
+    pub redaction_catalog_version: String,
+    /// Resource contract embedded by the producer.
+    pub limits: CheckpointScrollbackArtifactLimits,
+    /// Conservative capability matrix.
+    pub capabilities: CheckpointScrollbackCapabilities,
+    /// Exact verified checkpoint projection.
+    pub checkpoint: CheckpointScrollbackCheckpoint,
+    /// Exact per-pane durable prefixes, sorted by pane ID.
+    pub scrollback: Vec<CheckpointScrollbackPanePrefix>,
+    /// Cross-checked aggregate counters.
+    pub summary: CheckpointScrollbackSummary,
+}
+
+/// Canonical outer envelope for no-clobber publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointScrollbackArtifact {
+    /// Frozen schema identity.
+    pub schema: String,
+    /// Only `complete` is published in the canonical namespace.
+    pub publication_state: String,
+    /// SHA-256 of compact canonical payload JSON.
+    pub payload_sha256: String,
+    /// Bounded verified payload.
+    pub payload: CheckpointScrollbackPayload,
+}
+
+/// Receipt returned after independent reread and offline verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointScrollbackArtifactReceipt {
+    /// Verified artifact schema.
+    pub schema: String,
+    /// Exact checkpoint row identity.
+    pub checkpoint_id: i64,
+    /// Exact checkpoint state witness.
+    pub checkpoint_state_hash: String,
+    /// Exact compact payload digest.
+    pub payload_sha256: String,
+    /// Exact published-file digest.
+    pub artifact_sha256: String,
+    /// Exact published-file size.
+    pub artifact_bytes: u64,
+    /// Embedded pane count.
+    pub pane_count: usize,
+    /// Embedded segment count.
+    pub segment_count: usize,
+    /// Embedded content bytes.
+    pub content_bytes: u64,
+    /// Number of panes whose retained prefix is complete.
+    pub complete_pane_count: usize,
+    /// Publication durability claim.
+    pub durability: &'static str,
+}
+
+/// One verified entry returned by a bounded artifact-directory inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointScrollbackInventoryEntry {
+    /// Leaf path relative to the inventoried directory.
+    pub file_name: PathBuf,
+    /// Artifact creation timestamp.
+    pub created_at_epoch_ms: u64,
+    /// Verified checkpoint row ID.
+    pub checkpoint_id: i64,
+    /// Verified artifact bytes.
+    pub artifact_bytes: u64,
+    /// Verified artifact SHA-256.
+    pub artifact_sha256: String,
+}
+
+/// Side-effect-free retention selection for a bounded artifact inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointScrollbackRetentionPlan {
+    /// Newest verified entries retained by count and byte budget.
+    pub retain: Vec<PathBuf>,
+    /// Oldest verified entries eligible for later explicit deletion.
+    pub retire: Vec<PathBuf>,
+    /// Exact bytes retained by the plan.
+    pub retained_bytes: u64,
+}
+
+struct BoundedCheckpointArtifactWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedCheckpointArtifactWriter {
+    fn new(limit: u64) -> Result<Self, CheckpointScrollbackArtifactError> {
+        let limit = usize::try_from(limit).map_err(|_| {
+            CheckpointScrollbackArtifactError::InvalidLimits(
+                "artifact byte limit does not fit this platform".to_string(),
+            )
+        })?;
+        Ok(Self {
+            bytes: Vec::new(),
+            limit,
+        })
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedCheckpointArtifactWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("artifact byte count overflow"))?;
+        if next > self.limit {
+            return Err(std::io::Error::other(format!(
+                "artifact exceeds the {} byte limit",
+                self.limit
+            )));
+        }
+        self.bytes.try_reserve(buffer.len()).map_err(|error| {
+            std::io::Error::other(format!("bounded artifact allocation failed: {error}"))
+        })?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct CheckpointArtifactHashWriter {
+    hasher: sha2::Sha256,
+    bytes: u64,
+    limit: u64,
+}
+
+impl CheckpointArtifactHashWriter {
+    fn new(limit: u64) -> Self {
+        use sha2::Digest as _;
+
+        Self {
+            hasher: sha2::Sha256::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn finish(self) -> String {
+        use sha2::Digest as _;
+
+        hex::encode(self.hasher.finalize())
+    }
+}
+
+impl Write for CheckpointArtifactHashWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+
+        let length = u64::try_from(buffer.len())
+            .map_err(|_| std::io::Error::other("hash input length overflow"))?;
+        let next = self
+            .bytes
+            .checked_add(length)
+            .ok_or_else(|| std::io::Error::other("hash input byte count overflow"))?;
+        if next > self.limit {
+            return Err(std::io::Error::other(format!(
+                "hash input exceeds the {} byte limit",
+                self.limit
+            )));
+        }
+        self.hasher.update(buffer);
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn checkpoint_artifact_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn hash_checkpoint_artifact_json(
+    value: &impl Serialize,
+    limit: u64,
+) -> Result<String, CheckpointScrollbackArtifactError> {
+    let mut writer = CheckpointArtifactHashWriter::new(limit);
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.finish())
+}
+
+fn serialize_checkpoint_artifact(
+    artifact: &CheckpointScrollbackArtifact,
+    limit: u64,
+) -> Result<Vec<u8>, CheckpointScrollbackArtifactError> {
+    let mut writer = BoundedCheckpointArtifactWriter::new(limit.saturating_sub(1))?;
+    serde_json::to_writer_pretty(&mut writer, artifact)?;
+    writer.write_all(b"\n")?;
+    Ok(writer.into_inner())
+}
+
+fn require_checkpoint_redaction_fixed_point(
+    redactor: &crate::redactor::Redactor,
+    value: &str,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    if redactor.redact(value) == value {
+        Ok(())
+    } else {
+        Err(CheckpointScrollbackArtifactError::RedactionNotFixedPoint)
+    }
+}
+
+fn require_checkpoint_projection_redaction_fixed_point(
+    checkpoint: &CheckpointScrollbackCheckpoint,
+    redactor: &crate::redactor::Redactor,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    for value in [
+        Some(checkpoint.session_id.as_str()),
+        Some(checkpoint.checkpoint_type.as_str()),
+        checkpoint.metadata_json.as_deref(),
+        Some(checkpoint.topology_json.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        require_checkpoint_redaction_fixed_point(redactor, value)?;
+    }
+    for pane in &checkpoint.panes {
+        for value in [
+            pane.cwd.as_deref(),
+            pane.command.as_deref(),
+            pane.env_json.as_deref(),
+            Some(pane.terminal_state_json.as_str()),
+            pane.agent_metadata_json.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            require_checkpoint_redaction_fixed_point(redactor, value)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct CheckpointScrollbackPrefixDigest<'a> {
+    pane_id: u64,
+    checkpoint_seq: Option<u64>,
+    first_seq: Option<u64>,
+    last_seq: Option<u64>,
+    segment_count: usize,
+    content_bytes: u64,
+    sequence_gaps: &'a [CheckpointScrollbackSequenceGap],
+    capture_gaps: &'a [CheckpointScrollbackCaptureGap],
+    starts_at_zero: bool,
+    reaches_checkpoint: bool,
+    sequence_contiguous: bool,
+    no_capture_gaps: bool,
+    complete: bool,
+    redaction_catalog_versions: &'a [String],
+    redaction_fixed_point: bool,
+    segments: &'a [CheckpointScrollbackSegment],
+}
+
+fn checkpoint_scrollback_prefix_sha256(
+    prefix: &CheckpointScrollbackPanePrefix,
+) -> Result<String, CheckpointScrollbackArtifactError> {
+    hash_checkpoint_artifact_json(
+        &CheckpointScrollbackPrefixDigest {
+            pane_id: prefix.pane_id,
+            checkpoint_seq: prefix.checkpoint_seq,
+            first_seq: prefix.first_seq,
+            last_seq: prefix.last_seq,
+            segment_count: prefix.segment_count,
+            content_bytes: prefix.content_bytes,
+            sequence_gaps: &prefix.sequence_gaps,
+            capture_gaps: &prefix.capture_gaps,
+            starts_at_zero: prefix.starts_at_zero,
+            reaches_checkpoint: prefix.reaches_checkpoint,
+            sequence_contiguous: prefix.sequence_contiguous,
+            no_capture_gaps: prefix.no_capture_gaps,
+            complete: prefix.complete,
+            redaction_catalog_versions: &prefix.redaction_catalog_versions,
+            redaction_fixed_point: prefix.redaction_fixed_point,
+            segments: &prefix.segments,
+        },
+        CHECKPOINT_SCROLLBACK_ARTIFACT_HARD_MAX_BYTES,
+    )
+}
+
+fn persisted_pane_from_artifact(
+    pane: &CheckpointScrollbackPaneProjection,
+) -> Result<PersistedPaneState, CheckpointScrollbackArtifactError> {
+    Ok(PersistedPaneState {
+        pane_id: i64::try_from(pane.pane_id).map_err(|_| {
+            CheckpointScrollbackArtifactError::InvalidArtifact(
+                "pane ID exceeds SQLite integer range".to_string(),
+            )
+        })?,
+        cwd: pane.cwd.clone(),
+        command: pane.command.clone(),
+        env_json: pane.env_json.clone(),
+        terminal_state_json: pane.terminal_state_json.clone(),
+        agent_metadata_json: pane.agent_metadata_json.clone(),
+        scrollback_checkpoint_seq: pane
+            .scrollback_checkpoint_seq
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    CheckpointScrollbackArtifactError::InvalidArtifact(
+                        "scrollback sequence exceeds SQLite integer range".to_string(),
+                    )
+                })
+            })
+            .transpose()?,
+        last_output_at: pane
+            .last_output_at
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    CheckpointScrollbackArtifactError::InvalidArtifact(
+                        "last output timestamp exceeds SQLite integer range".to_string(),
+                    )
+                })
+            })
+            .transpose()?,
+    })
+}
+
+fn artifact_pane_from_persisted(
+    pane: PersistedPaneState,
+) -> Result<CheckpointScrollbackPaneProjection, CheckpointScrollbackArtifactError> {
+    Ok(CheckpointScrollbackPaneProjection {
+        pane_id: u64::try_from(pane.pane_id).map_err(|_| {
+            CheckpointScrollbackArtifactError::Checkpoint(
+                "checkpoint pane ID is negative".to_string(),
+            )
+        })?,
+        cwd: pane.cwd,
+        command: pane.command,
+        env_json: pane.env_json,
+        terminal_state_json: pane.terminal_state_json,
+        agent_metadata_json: pane.agent_metadata_json,
+        scrollback_checkpoint_seq: pane
+            .scrollback_checkpoint_seq
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    CheckpointScrollbackArtifactError::Checkpoint(
+                        "checkpoint scrollback sequence is negative".to_string(),
+                    )
+                })
+            })
+            .transpose()?,
+        last_output_at: pane
+            .last_output_at
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    CheckpointScrollbackArtifactError::Checkpoint(
+                        "checkpoint output timestamp is negative".to_string(),
+                    )
+                })
+            })
+            .transpose()?,
+    })
+}
+
+fn load_checkpoint_persisted_panes_for_artifact(
+    conn: &Connection,
+    checkpoint_id: i64,
+    expected_panes: usize,
+) -> Result<Vec<PersistedPaneState>, CheckpointScrollbackArtifactError> {
+    let row_limit = expected_panes.checked_add(1).ok_or_else(|| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "checkpoint pane row limit overflows usize".to_string(),
+        )
+    })?;
+    let mut statement = conn.prepare(
+        "SELECT pane_id, cwd, command, env_json, terminal_state_json,
+                agent_metadata_json, scrollback_checkpoint_seq, last_output_at
+         FROM mux_pane_state
+         WHERE checkpoint_id = ?1
+           AND typeof(pane_id) = 'integer' AND pane_id >= 0
+           AND typeof(terminal_state_json) = 'text'
+           AND (cwd IS NULL OR typeof(cwd) = 'text')
+           AND (command IS NULL OR typeof(command) = 'text')
+           AND (env_json IS NULL OR typeof(env_json) = 'text')
+           AND (agent_metadata_json IS NULL OR typeof(agent_metadata_json) = 'text')
+           AND (scrollback_checkpoint_seq IS NULL OR
+                (typeof(scrollback_checkpoint_seq) = 'integer' AND scrollback_checkpoint_seq >= 0))
+           AND (last_output_at IS NULL OR
+                (typeof(last_output_at) = 'integer' AND last_output_at >= 0))
+           AND COALESCE(length(CAST(cwd AS BLOB)), 0)
+             + COALESCE(length(CAST(command AS BLOB)), 0)
+             + COALESCE(length(CAST(env_json AS BLOB)), 0)
+             + length(CAST(terminal_state_json AS BLOB))
+             + COALESCE(length(CAST(agent_metadata_json AS BLOB)), 0) <= ?2
+         ORDER BY pane_id ASC, id ASC
+         LIMIT ?3",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        checkpoint_id,
+        i64::try_from(MAX_PERSISTED_PANE_TEXT_BYTES).unwrap_or(i64::MAX),
+        i64::try_from(row_limit).unwrap_or(i64::MAX),
+    ])?;
+    let mut panes = Vec::with_capacity(expected_panes);
+    while let Some(row) = rows.next()? {
+        if panes.len() == expected_panes {
+            return Err(CheckpointScrollbackArtifactError::Checkpoint(
+                "checkpoint contains more pane rows than declared".to_string(),
+            ));
+        }
+        panes.push(PersistedPaneState {
+            pane_id: row.get(0)?,
+            cwd: row.get(1)?,
+            command: row.get(2)?,
+            env_json: row.get(3)?,
+            terminal_state_json: row.get(4)?,
+            agent_metadata_json: row.get(5)?,
+            scrollback_checkpoint_seq: row.get(6)?,
+            last_output_at: row.get(7)?,
+        });
+    }
+    if panes.len() != expected_panes {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(format!(
+            "checkpoint declares {expected_panes} panes but {} bounded rows were readable",
+            panes.len()
+        )));
+    }
+    Ok(panes)
+}
+
+fn load_verified_checkpoint_for_artifact(
+    conn: &Connection,
+    checkpoint_id: i64,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackCheckpoint, CheckpointScrollbackArtifactError> {
+    let checkpoint = crate::session_restore::load_checkpoint_by_id_from_conn(conn, checkpoint_id)
+        .map_err(|error| CheckpointScrollbackArtifactError::Checkpoint(error.to_string()))?
+        .ok_or_else(|| {
+            CheckpointScrollbackArtifactError::Checkpoint(
+                "selected checkpoint does not exist".to_string(),
+            )
+        })?;
+    if checkpoint.checkpoint_role != crate::session_restore::CheckpointRole::Snapshot
+        || checkpoint.verification != crate::session_restore::CheckpointVerification::VerifiedV2
+        || !checkpoint.state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX)
+    {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(
+            "selected row is not a verified v2 snapshot".to_string(),
+        ));
+    }
+    if checkpoint.pane_count > limits.max_panes {
+        return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+            "checkpoint has {} panes, limit {}",
+            checkpoint.pane_count, limits.max_panes
+        )));
+    }
+    let topology_json = checkpoint.topology_json.clone().ok_or_else(|| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "verified snapshot has no topology".to_string(),
+        )
+    })?;
+    let topology = TopologySnapshot::from_json(&topology_json)
+        .map_err(|error| CheckpointScrollbackArtifactError::Checkpoint(error.to_string()))?;
+    let persisted_panes =
+        load_checkpoint_persisted_panes_for_artifact(conn, checkpoint_id, checkpoint.pane_count)?;
+    let checkpoint_at = i64::try_from(checkpoint.checkpoint_at).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint timestamp exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let pane_count = i64::try_from(checkpoint.pane_count).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint pane count exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let total_bytes = i64::try_from(checkpoint.total_bytes).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint byte count exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let recomputed = checkpoint_witness(
+        CHECKPOINT_ROLE_SNAPSHOT,
+        &checkpoint.session_id,
+        checkpoint.checkpoint_id,
+        checkpoint_at,
+        &checkpoint.checkpoint_type,
+        pane_count,
+        total_bytes,
+        checkpoint.metadata_json(),
+        Some(&topology_json),
+        &persisted_panes,
+    )
+    .map_err(|error| CheckpointScrollbackArtifactError::Checkpoint(error.to_string()))?;
+    if recomputed != checkpoint.state_hash {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint witness changed during artifact projection".to_string(),
+        ));
+    }
+    let persisted_pane_ids = persisted_panes
+        .iter()
+        .map(|pane| u64::try_from(pane.pane_id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            CheckpointScrollbackArtifactError::Checkpoint(
+                "checkpoint contains a negative pane ID".to_string(),
+            )
+        })?;
+    if topology.pane_count() != checkpoint.pane_count
+        || topology.pane_ids() != persisted_pane_ids
+    {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint topology and pane projection disagree".to_string(),
+        ));
+    }
+
+    let panes = persisted_panes
+        .into_iter()
+        .map(artifact_pane_from_persisted)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CheckpointScrollbackCheckpoint {
+        checkpoint_id: checkpoint.checkpoint_id,
+        session_id: checkpoint.session_id,
+        checkpoint_at: checkpoint.checkpoint_at,
+        checkpoint_type: checkpoint.checkpoint_type,
+        checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
+        state_hash: checkpoint.state_hash,
+        metadata_json: checkpoint.metadata_json().map(str::to_owned),
+        topology_sha256: checkpoint_artifact_sha256(topology_json.as_bytes()),
+        topology_json,
+        pane_count: checkpoint.pane_count,
+        total_bytes: checkpoint.total_bytes,
+        panes,
+    })
+}
+
 #[cfg(test)]
 fn cleanup_sync(
     db_path: &str,
