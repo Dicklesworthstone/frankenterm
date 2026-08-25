@@ -1239,6 +1239,97 @@ impl GuardianCheckpointStageStore {
         })
     }
 
+    pub(crate) fn apply_query(
+        &self,
+        request: GuardianCheckpointStageRequestV1,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianCheckpointStageStoreError> {
+        if request.kind() != GuardianCheckpointStageKindV1::Query {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let shape = CheckpointStageRequestShape::from_request(&request)?;
+        self.with_exclusive_directory(|inner| {
+            let census = checkpoint_stage_census(inner)?;
+            if !census.entries.iter().any(|entry| entry.key == shape.key()) {
+                return Ok(GuardianCheckpointStageReplyV1::Absent {
+                    upload_id: shape.upload_id,
+                });
+            }
+            let inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+            )?
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            if !inspection.seal_present {
+                if inspection.next_index == 0 {
+                    return Ok(GuardianCheckpointStageReplyV1::Ready {
+                        upload_id: shape.upload_id,
+                        next_index: 0,
+                        committed_bytes: 0,
+                    });
+                }
+                return Ok(GuardianCheckpointStageReplyV1::Progress {
+                    upload_id: shape.upload_id,
+                    next_index: inspection.next_index,
+                    committed_bytes: inspection.committed_bytes,
+                });
+            }
+            if inspection.next_index != shape.total_chunks
+                || inspection.committed_bytes != shape.total_bytes
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            let ordered_chunk_set_identity = inspection
+                .ordered_chunk_set_identity
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let payload = checkpoint_assemble_payload(
+                inner,
+                &census,
+                &shape,
+                inspection.publication_id,
+            )?;
+            request.validate_staged_plaintext(payload.as_slice())?;
+            let seal_request = GuardianCheckpointStageRequestV1::seal(
+                shape.scope,
+                shape.upload_id,
+                shape.descriptor,
+                shape.chunk_bytes,
+            )?;
+            let seal_entry = census
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.key == shape.key()
+                        && entry.role
+                            == (CheckpointStageFileRole::Seal {
+                                publication_id: inspection.publication_id,
+                            })
+                })
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let (_, record, _) = checkpoint_read_record(
+                inner,
+                seal_entry,
+                GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+            )?;
+            inner.cipher.inspect_durable_manifest_receipt(
+                &shape.binding,
+                seal_request,
+                inspection.publication_id,
+                inspection.candidate_identity,
+                ordered_chunk_set_identity,
+                &record,
+            )?;
+            Ok(GuardianCheckpointStageReplyV1::Sealed {
+                upload_id: shape.upload_id,
+                completion_id: inspection.publication_id,
+                checkpoint_id: shape.descriptor.checkpoint_id(),
+                boundary_id: shape.descriptor.boundary_id(),
+                total_bytes: shape.total_bytes,
+            })
+        })
+    }
+
     pub(crate) fn apply_seal(
         &self,
         request: GuardianCheckpointStageRequestV1,
@@ -5151,7 +5242,12 @@ mod tests {
             (GuardianCheckpointStageKindV1::Chunk, Some((_, bytes))) => 48_usize
                 .checked_add(bytes.len())
                 .ok_or(GuardianProtocolError::PayloadTooLarge)?,
-            (GuardianCheckpointStageKindV1::Begin | GuardianCheckpointStageKindV1::Seal, None) => 0,
+            (
+                GuardianCheckpointStageKindV1::Begin
+                | GuardianCheckpointStageKindV1::Seal
+                | GuardianCheckpointStageKindV1::Query,
+                None,
+            ) => 0,
             _ => return Err(GuardianProtocolError::InvalidOperationPayload),
         };
         let wire_bytes = CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
@@ -5161,11 +5257,15 @@ mod tests {
             Zeroizing::new(Vec::with_capacity(wire_bytes));
         wire.resize(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES, 0);
         wire[..4].copy_from_slice(b"GCS1");
-        wire[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        wire[4..6].copy_from_slice(&2_u16.to_be_bytes());
         wire[6] = match kind {
             GuardianCheckpointStageKindV1::Begin => 1,
             GuardianCheckpointStageKindV1::Chunk => 2,
             GuardianCheckpointStageKindV1::Seal => 3,
+            GuardianCheckpointStageKindV1::Query => 4,
+            GuardianCheckpointStageKindV1::Ack => {
+                return Err(GuardianProtocolError::InvalidOperationPayload);
+            }
         };
         wire[8] = 2;
         wire[16..32].copy_from_slice(spawn_effect_id.as_bytes());
@@ -5198,7 +5298,12 @@ mod tests {
                 );
                 wire.extend_from_slice(bytes);
             }
-            (GuardianCheckpointStageKindV1::Begin | GuardianCheckpointStageKindV1::Seal, None) => {}
+            (
+                GuardianCheckpointStageKindV1::Begin
+                | GuardianCheckpointStageKindV1::Seal
+                | GuardianCheckpointStageKindV1::Query,
+                None,
+            ) => {}
             _ => unreachable!("checkpoint Stage shape was validated before allocation"),
         }
         debug_assert_eq!(wire.len(), wire_bytes);
@@ -5428,8 +5533,36 @@ mod tests {
             chunk_bytes,
             None,
         )?;
+        let absent_query = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Query,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            None,
+        )?;
+        assert_eq!(
+            store.apply_query(absent_query)?,
+            GuardianCheckpointStageReplyV1::Absent { upload_id }
+        );
         assert_eq!(
             store.apply_begin(&begin)?,
+            GuardianCheckpointStageReplyV1::Ready {
+                upload_id,
+                next_index: 0,
+                committed_bytes: 0,
+            }
+        );
+        let ready_query = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Query,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            None,
+        )?;
+        assert_eq!(
+            store.apply_query(ready_query)?,
             GuardianCheckpointStageReplyV1::Ready {
                 upload_id,
                 next_index: 0,
@@ -5524,6 +5657,22 @@ mod tests {
         assert_eq!(
             store.apply_begin(&begin)?,
             GuardianCheckpointStageReplyV1::Ready {
+                upload_id,
+                next_index: total_chunks,
+                committed_bytes: u64::try_from(payload.len())?,
+            }
+        );
+        let completed_upload_query = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Query,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            None,
+        )?;
+        assert_eq!(
+            store.apply_query(completed_upload_query)?,
+            GuardianCheckpointStageReplyV1::Progress {
                 upload_id,
                 next_index: total_chunks,
                 committed_bytes: u64::try_from(payload.len())?,

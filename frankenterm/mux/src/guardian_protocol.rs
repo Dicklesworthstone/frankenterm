@@ -14349,10 +14349,10 @@ mod tests {
         assert_eq!(decoded_ack.kind(), GuardianCheckpointStageKindV1::Ack);
         assert_eq!(decoded_ack.completion_id(), Some(completion_id));
         ack_wire[CHECKPOINT_STAGE_COMMON_BYTES..CHECKPOINT_STAGE_ACK_BYTES].fill(0);
-        assert_eq!(
+        assert!(matches!(
             GuardianCheckpointStageRequestV1::decode(&ack_wire),
             Err(GuardianProtocolError::InvalidReplyPayload)
-        );
+        ));
         let mut same_length_payload_mutation = zeroizing_vec_from_slice(canonical);
         let last = same_length_payload_mutation.len() - 1;
         same_length_payload_mutation[last] ^= 1;

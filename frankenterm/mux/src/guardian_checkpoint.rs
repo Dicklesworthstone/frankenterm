@@ -2010,6 +2010,71 @@ impl GuardianCheckpointCipher {
         self.open_validated_manifest(&retry.operation, record)
     }
 
+    /// Authenticate one already-durable Seal completion without minting any
+    /// publication authority.
+    ///
+    /// This recovery-only seam reconstructs the exact canonical manifest from
+    /// an authenticated Stage request and the opaque identities obtained by
+    /// opening its candidate and complete ordered chunk set. It can inspect an
+    /// existing encrypted record, but cannot create or retry-create one. That
+    /// asymmetry lets `Query` recover a lost Seal reply after process restart
+    /// without treating a filename, ciphertext digest, or caller UUID as
+    /// publication authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inspect_durable_manifest_receipt(
+        &self,
+        binding: &GuardianCheckpointStageBindingV1,
+        seal_request: GuardianCheckpointStageRequestV1,
+        publication_id: Uuid,
+        candidate_identity: GuardianCheckpointCandidateIdentityV1,
+        ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1,
+        record: &GuardianEncryptedCheckpointStageRecordV1,
+    ) -> Result<(), GuardianCheckpointCipherError> {
+        binding.validate_seal_request(&seal_request)?;
+        if publication_id.is_nil()
+            || candidate_identity.is_zero()
+            || ordered_chunk_set_identity.is_zero()
+        {
+            return Err(GuardianCheckpointCipherError::InvalidManifestComponentDigest);
+        }
+        let encoded_request = Zeroizing::new(
+            seal_request
+                .encode()
+                .map_err(|_| GuardianCheckpointCipherError::InvalidSealRequest)?,
+        );
+        if encoded_request.len()
+            != usize::try_from(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
+                .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?
+        {
+            return Err(GuardianCheckpointCipherError::InvalidSealRequest);
+        }
+        let canonical_manifest = checkpoint_canonical_seal_manifest(
+            &encoded_request,
+            &candidate_identity,
+            &ordered_chunk_set_identity,
+        )?;
+        let expected_context = GuardianCheckpointStageRecordContextV1::from_persisted_parts(
+            GuardianCheckpointStageRecordKindV1::SealManifest,
+            binding.scope,
+            seal_request.upload_id(),
+            binding.boundary_identity_digest()?,
+            binding.checkpoint_identity_digest()?,
+            publication_id,
+            None,
+            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+        )?;
+        let opened = self.open_exact_payload(
+            &expected_context,
+            record,
+            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+        )?;
+        if checkpoint_stage_bytes_match(&opened, &canonical_manifest) {
+            Ok(())
+        } else {
+            Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch)
+        }
+    }
+
     fn open_validated_manifest(
         &self,
         operation: &GuardianCheckpointValidatedManifestOperationV1,
