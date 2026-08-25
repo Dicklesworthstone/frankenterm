@@ -14678,6 +14678,100 @@ mod tests {
             Err(GuardianProtocolError::ResponseRequestMismatch)
         );
 
+        let query_payload = GuardianCheckpointStageRequestV1::query(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+        )
+        .unwrap()
+        .into_zeroizing_payload()
+        .unwrap();
+        let query = authenticate(&request_zeroizing(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(82),
+            Some(pane),
+            generation,
+            0,
+            None,
+            query_payload,
+        ));
+        let acked = GuardianCheckpointStageReplyV1::Acked {
+            upload_id,
+            completion_id: id(81),
+            checkpoint_id: descriptor.checkpoint_id(),
+            boundary_id: descriptor.boundary_id(),
+            total_bytes: descriptor.total_bytes(),
+        };
+        for query_reply in [
+            GuardianCheckpointStageReplyV1::Absent { upload_id },
+            ready,
+            progress,
+            sealed,
+            acked,
+            GuardianCheckpointStageReplyV1::Expired {
+                upload_id,
+                completion_id: id(81),
+                checkpoint_id: descriptor.checkpoint_id(),
+                boundary_id: descriptor.boundary_id(),
+                total_bytes: descriptor.total_bytes(),
+            },
+            GuardianCheckpointStageReplyV1::Quarantined { upload_id },
+        ] {
+            let wire = query_reply.encode().unwrap();
+            assert_eq!(
+                GuardianCheckpointStageReplyV1::decode(&wire),
+                Ok(query_reply)
+            );
+            assert!(GuardianResponseEnvelope::success(
+                &query,
+                &GuardianReply::CheckpointStage(query_reply),
+            )
+            .is_ok());
+        }
+
+        let ack_payload = GuardianCheckpointStageRequestV1::ack(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+            id(81),
+        )
+        .unwrap()
+        .into_zeroizing_payload()
+        .unwrap();
+        let ack = authenticate(&request_zeroizing(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            id(83),
+            Some(pane),
+            generation,
+            0,
+            None,
+            ack_payload,
+        ));
+        assert!(GuardianResponseEnvelope::success(
+            &ack,
+            &GuardianReply::CheckpointStage(acked),
+        )
+        .is_ok());
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &ack,
+                &GuardianReply::CheckpointStage(GuardianCheckpointStageReplyV1::Acked {
+                    upload_id,
+                    completion_id: id(84),
+                    checkpoint_id: descriptor.checkpoint_id(),
+                    boundary_id: descriptor.boundary_id(),
+                    total_bytes: descriptor.total_bytes(),
+                }),
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+
         let mut noncanonical_ready = ready_wire;
         noncanonical_ready[7] = 1;
         assert_eq!(
