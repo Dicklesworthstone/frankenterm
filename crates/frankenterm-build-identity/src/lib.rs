@@ -230,6 +230,114 @@ impl fmt::Display for AtomicComponentIdentityError {
 
 impl Error for AtomicComponentIdentityError {}
 
+/// Fully validated fields borrowed from one exact-role v1 component marker.
+///
+/// The target, profile, and version are descriptive build metadata. Only a
+/// [`SealedAtomicBuildIdentity`] returned by [`Self::require_sealed`] is build
+/// authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ParsedAtomicComponentMarker<'a> {
+    build_identity: AtomicBuildIdentity,
+    role: AtomicComponentRole,
+    target: &'a str,
+    profile: &'a str,
+    version: &'a str,
+}
+
+impl<'a> ParsedAtomicComponentMarker<'a> {
+    /// Preserve the explicit sealed-versus-development identity state.
+    #[must_use]
+    pub const fn build_identity(self) -> AtomicBuildIdentity {
+        self.build_identity
+    }
+
+    /// Return the validated process role.
+    #[must_use]
+    pub const fn role(self) -> AtomicComponentRole {
+        self.role
+    }
+
+    /// Return the validated target triple metadata.
+    #[must_use]
+    pub const fn target(self) -> &'a str {
+        self.target
+    }
+
+    /// Return the validated Cargo profile metadata.
+    #[must_use]
+    pub const fn profile(self) -> &'a str {
+        self.profile
+    }
+
+    /// Return the validated package-version metadata.
+    #[must_use]
+    pub const fn version(self) -> &'a str {
+        self.version
+    }
+
+    /// Require sealed build authority while retaining all validated metadata.
+    pub const fn require_sealed(
+        self,
+    ) -> Result<ParsedSealedAtomicComponentMarker<'a>, AtomicComponentIdentityError> {
+        let build_identity = match self.build_identity.require_sealed() {
+            Ok(identity) => identity,
+            Err(error) => return Err(error),
+        };
+        Ok(ParsedSealedAtomicComponentMarker {
+            build_identity,
+            role: self.role,
+            target: self.target,
+            profile: self.profile,
+            version: self.version,
+        })
+    }
+}
+
+/// Fully validated fields borrowed from one exact-role sealed v1 marker.
+///
+/// Construction is private so this type can only exist after canonical
+/// lowercase-hex decoding and exact role validation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ParsedSealedAtomicComponentMarker<'a> {
+    build_identity: SealedAtomicBuildIdentity,
+    role: AtomicComponentRole,
+    target: &'a str,
+    profile: &'a str,
+    version: &'a str,
+}
+
+impl<'a> ParsedSealedAtomicComponentMarker<'a> {
+    /// Return the decoded 32-byte build authority.
+    #[must_use]
+    pub const fn build_identity(self) -> SealedAtomicBuildIdentity {
+        self.build_identity
+    }
+
+    /// Return the validated process role.
+    #[must_use]
+    pub const fn role(self) -> AtomicComponentRole {
+        self.role
+    }
+
+    /// Return the validated target triple metadata.
+    #[must_use]
+    pub const fn target(self) -> &'a str {
+        self.target
+    }
+
+    /// Return the validated Cargo profile metadata.
+    #[must_use]
+    pub const fn profile(self) -> &'a str {
+        self.profile
+    }
+
+    /// Return the validated package-version metadata.
+    #[must_use]
+    pub const fn version(self) -> &'a str {
+        self.version
+    }
+}
+
 /// Construct one canonical v1 marker without reading process environment.
 pub fn atomic_component_marker(
     build_identity: AtomicBuildIdentity,
@@ -252,6 +360,17 @@ pub fn parse_atomic_component_marker(
     marker: &str,
     expected_role: AtomicComponentRole,
 ) -> Result<AtomicBuildIdentity, AtomicComponentIdentityError> {
+    Ok(parse_atomic_component_marker_details(marker, expected_role)?.build_identity())
+}
+
+/// Parse every validated field from one marker for an exact process role.
+///
+/// Callers that serialize a release manifest should use this API instead of
+/// reparsing the marker grammar themselves.
+pub fn parse_atomic_component_marker_details<'a>(
+    marker: &'a str,
+    expected_role: AtomicComponentRole,
+) -> Result<ParsedAtomicComponentMarker<'a>, AtomicComponentIdentityError> {
     let payload = marker
         .strip_prefix(ATOMIC_COMPONENT_MARKER_PREFIX)
         .and_then(|value| value.strip_suffix(';'))
@@ -286,7 +405,13 @@ pub fn parse_atomic_component_marker(
     validate_marker_token(target, AtomicComponentMarkerField::Target)?;
     validate_marker_token(profile, AtomicComponentMarkerField::Profile)?;
     validate_marker_token(version, AtomicComponentMarkerField::Version)?;
-    AtomicBuildIdentity::from_marker_value(build_identity)
+    Ok(ParsedAtomicComponentMarker {
+        build_identity: AtomicBuildIdentity::from_marker_value(build_identity)?,
+        role: actual_role,
+        target,
+        profile,
+        version,
+    })
 }
 
 /// Parse one exact-role marker and require a decoded 32-byte sealed identity.
@@ -294,7 +419,16 @@ pub fn parse_sealed_atomic_component_marker(
     marker: &str,
     expected_role: AtomicComponentRole,
 ) -> Result<SealedAtomicBuildIdentity, AtomicComponentIdentityError> {
-    parse_atomic_component_marker(marker, expected_role)?.require_sealed()
+    Ok(parse_sealed_atomic_component_marker_details(marker, expected_role)?.build_identity())
+}
+
+/// Parse every validated field from one exact-role marker and require sealed
+/// build authority.
+pub fn parse_sealed_atomic_component_marker_details<'a>(
+    marker: &'a str,
+    expected_role: AtomicComponentRole,
+) -> Result<ParsedSealedAtomicComponentMarker<'a>, AtomicComponentIdentityError> {
+    parse_atomic_component_marker_details(marker, expected_role)?.require_sealed()
 }
 
 /// Build and emit the Cargo environment marker for one process role.
@@ -307,7 +441,9 @@ pub fn emit_cargo_atomic_component_marker(
     role: AtomicComponentRole,
 ) -> Result<String, AtomicComponentIdentityError> {
     let build_identity = match std::env::var("FT_ATOMIC_BUILD_IDENTITY") {
-        Ok(value) => AtomicBuildIdentity::Sealed(SealedAtomicBuildIdentity::from_lower_hex(&value)?),
+        Ok(value) => {
+            AtomicBuildIdentity::Sealed(SealedAtomicBuildIdentity::from_lower_hex(&value)?)
+        }
         Err(std::env::VarError::NotPresent) => AtomicBuildIdentity::UnsealedDevelopment,
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(AtomicComponentIdentityError::EnvironmentNotUnicode(
@@ -372,12 +508,11 @@ const fn decode_lower_hex_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
-    const SEALED_HEX: &str =
-        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const SEALED_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     const SEALED_BYTES: [u8; 32] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
-        0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
-        0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
     ];
 
     #[test]
@@ -436,11 +571,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            parse_atomic_component_marker(
-                &marker,
-                AtomicComponentRole::FrankenTermPtyGuardian
-            )
-            .unwrap(),
+            parse_atomic_component_marker(&marker, AtomicComponentRole::FrankenTermPtyGuardian)
+                .unwrap(),
             AtomicBuildIdentity::UnsealedDevelopment
         );
         assert_eq!(
@@ -450,6 +582,37 @@ mod tests {
             ),
             Err(AtomicComponentIdentityError::UnsealedDevelopmentBuild)
         );
+    }
+
+    #[test]
+    fn sealed_marker_details_bind_every_manifest_field() {
+        let valid = format!(
+            "FT_ATOMIC_COMPONENT_IDENTITY_V1:{SEALED_HEX}:frankenterm-pty-guardian:aarch64-apple-darwin:release-interactive:0.15.1;"
+        );
+        let parsed = parse_sealed_atomic_component_marker_details(
+            &valid,
+            AtomicComponentRole::FrankenTermPtyGuardian,
+        )
+        .unwrap();
+        assert_eq!(parsed.build_identity().to_string(), SEALED_HEX);
+        assert_eq!(parsed.role(), AtomicComponentRole::FrankenTermPtyGuardian);
+        assert_eq!(parsed.target(), "aarch64-apple-darwin");
+        assert_eq!(parsed.profile(), "release-interactive");
+        assert_eq!(parsed.version(), "0.15.1");
+
+        for (from, to) in [
+            ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu"),
+            ("release-interactive", "release-perf"),
+            ("0.15.1", "0.15.2"),
+        ] {
+            let mutation = valid.replacen(from, to, 1);
+            let mutated = parse_sealed_atomic_component_marker_details(
+                &mutation,
+                AtomicComponentRole::FrankenTermPtyGuardian,
+            )
+            .unwrap();
+            assert_ne!(mutated, parsed, "metadata mutation {from:?} was not bound");
+        }
     }
 
     #[test]
@@ -499,14 +662,15 @@ mod tests {
 
     #[test]
     fn uppercase_short_long_and_explicit_unsealed_values_are_not_sealed_ids() {
-        for invalid in [
-            &SEALED_HEX.to_uppercase(),
-            &SEALED_HEX[..63],
-            &format!("{SEALED_HEX}0"),
-            UNSEALED_BUILD_ID,
-        ] {
+        let invalid = [
+            SEALED_HEX.to_uppercase(),
+            SEALED_HEX[..63].to_owned(),
+            format!("{SEALED_HEX}0"),
+            UNSEALED_BUILD_ID.to_owned(),
+        ];
+        for invalid in invalid {
             assert_eq!(
-                SealedAtomicBuildIdentity::from_lower_hex(invalid),
+                SealedAtomicBuildIdentity::from_lower_hex(&invalid),
                 Err(AtomicComponentIdentityError::InvalidBuildIdentity),
                 "accepted invalid sealed identity {invalid:?}"
             );

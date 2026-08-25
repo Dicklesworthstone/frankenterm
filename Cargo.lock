@@ -3568,6 +3568,7 @@ dependencies = [
  "fancy-regex 0.18.0",
  "filedescriptor 0.8.3",
  "frankenterm-alloc",
+ "frankenterm-build-identity",
  "frankenterm-client",
  "frankenterm-core",
  "frankenterm-core-replay",
@@ -3627,6 +3628,10 @@ dependencies = [
  "thiserror 2.0.20",
  "uuid",
 ]
+
+[[package]]
+name = "frankenterm-build-identity"
+version = "0.15.1"
 
 [[package]]
 name = "frankenterm-cell"
@@ -4211,6 +4216,7 @@ dependencies = [
  "frankenterm-alloc",
  "frankenterm-bidi",
  "frankenterm-blob-leases",
+ "frankenterm-build-identity",
  "frankenterm-client",
  "frankenterm-core",
  "frankenterm-dynamic",
@@ -4306,6 +4312,7 @@ dependencies = [
  "config",
  "frankenterm-alloc",
  "frankenterm-blob-leases",
+ "frankenterm-build-identity",
  "frankenterm-gui-subcommands",
  "frankenterm-mux-server-impl",
  "frankenterm-sigpipe",
@@ -4392,6 +4399,7 @@ version = "0.15.1"
 dependencies = [
  "anyhow",
  "clap",
+ "frankenterm-build-identity",
  "frankenterm-sigpipe",
  "frankenterm-term",
  "getrandom 0.4.3",

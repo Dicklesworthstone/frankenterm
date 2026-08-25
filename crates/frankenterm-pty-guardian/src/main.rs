@@ -2,11 +2,11 @@
 
 #[cfg(unix)]
 use clap::{Args, Parser, Subcommand};
+use frankenterm_pty_guardian::AtomicComponentIdentityError;
 #[cfg(unix)]
 use frankenterm_pty_guardian::{
-    AtomicComponentIdentityError, GuardianClient, GuardianService, GuardianServiceConfig,
-    ProvisionTokenOutcome, guardian_atomic_component_marker, guardian_runtime_build_identity,
-    provision_guardian_token,
+    GuardianClient, GuardianService, GuardianServiceConfig, ProvisionTokenOutcome,
+    guardian_atomic_component_marker, guardian_runtime_build_identity, provision_guardian_token,
 };
 #[cfg(unix)]
 use std::path::PathBuf;
