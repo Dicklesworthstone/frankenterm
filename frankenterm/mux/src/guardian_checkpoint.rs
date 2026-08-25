@@ -5284,6 +5284,18 @@ mod tests {
             ),
             expected_authority_method(
                 "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn query(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn ack(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32, completion_id: Uuid) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
                 "private",
                 false,
                 "fn new(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32, body: GuardianCheckpointStageBodyV1) -> Result<Self, GuardianProtocolError>",
@@ -5347,6 +5359,12 @@ mod tests {
                 "pub",
                 false,
                 "const fn chunk_position(&self) -> Option<(u32, u64)>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn completion_id(&self) -> Option<Uuid>",
             ),
             expected_authority_method(
                 "GuardianCheckpointStageRequestV1",
