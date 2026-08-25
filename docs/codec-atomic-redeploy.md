@@ -163,7 +163,7 @@ When both the maximum and minimum advance, use the maintenance window:
      --transaction-id "$TRANSACTION_ID"
    ```
 
-   Setup downloads and verifies the exact release pair, copies both components
+   Setup downloads and verifies the exact release triplet, copies all three components
    into one private destination-filesystem stage, synchronizes their bytes and
    manifest, and publishes one immutable content-derived generation. The stable
    caller transaction ID binds the exact component hashes, generation identity,
