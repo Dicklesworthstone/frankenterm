@@ -1435,6 +1435,83 @@ fn checkpoint_chunk_digest_matches(observed: &[u8], expected: &[u8]) -> bool {
 /// production attributes that ordinary unit-test assertions cannot observe.
 struct GuardianCheckpointChunkNonDuplicable;
 
+// These tripwires are production items rather than test-only assertions. A
+// cfg-gated Clone/Copy implementation would otherwise make a single-use
+// plaintext capability duplicable in the shipped guardian while its unit
+// tests remained green.
+static_assertions::assert_not_impl_any!(GuardianCheckpointChunkNonDuplicable: Clone, Copy);
+
+/// Wipe-on-drop ownership for a digest derived from replay plaintext.
+///
+/// The digest is intentionally non-cloneable even though its bytes have a
+/// fixed size. Wire emission is the sole declassification boundary: callers
+/// cannot borrow the backing array and silently retain another raw copy.
+struct GuardianReplayProtectedDigest {
+    bytes: Zeroizing<[u8; 32]>,
+    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+}
+
+impl GuardianReplayProtectedDigest {
+    fn zeroed() -> Self {
+        Self {
+            bytes: Zeroizing::new([0; 32]),
+            _nonduplicable: GuardianCheckpointChunkNonDuplicable,
+        }
+    }
+
+    fn from_wire(bytes: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if bytes.len() != 32 {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let mut digest = Self::zeroed();
+        digest.bytes.copy_from_slice(bytes);
+        Ok(digest)
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        checkpoint_chunk_digest_matches(self.bytes.as_slice(), other.bytes.as_slice())
+    }
+
+    fn matches_wire(&self, other: &[u8]) -> bool {
+        checkpoint_chunk_digest_matches(self.bytes.as_slice(), other)
+    }
+
+    fn is_zero(&self) -> bool {
+        self.bytes.iter().all(|byte| *byte == 0)
+    }
+
+    /// Deliberately release one digest copy into an authenticated wire owner.
+    fn declassify_into_wire(&self, wire: &mut Vec<u8>) {
+        wire.extend_from_slice(self.bytes.as_slice());
+    }
+
+    /// Deliberately release one digest copy for the replay acknowledgement.
+    fn declassify_for_ack(&self) -> [u8; 32] {
+        let mut digest = [0; 32];
+        digest.copy_from_slice(self.bytes.as_slice());
+        digest
+    }
+}
+
+impl ZeroizeOnDrop for GuardianReplayProtectedDigest {}
+
+impl Drop for GuardianReplayProtectedDigest {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl PartialEq for GuardianReplayProtectedDigest {
+    fn eq(&self, other: &Self) -> bool {
+        self.matches(other)
+    }
+}
+
+impl Eq for GuardianReplayProtectedDigest {}
+
+static_assertions::assert_not_impl_any!(GuardianReplayProtectedDigest: Clone, Copy);
+static_assertions::assert_impl_all!(GuardianReplayProtectedDigest: ZeroizeOnDrop);
+
 /// Single-use ownership for a validated staging chunk. The digest and bytes
 /// stay in zeroizing storage until the store consumes this capability; neither
 /// value has a copy-returning accessor.
@@ -1474,21 +1551,24 @@ impl GuardianCheckpointStageChunkDeliveryV1 {
         (self.index, self.offset)
     }
 
-    #[must_use]
-    pub fn chunk_digest(&self) -> &[u8; 32] {
-        &self.chunk_digest
-    }
-
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-
-    #[must_use]
-    pub fn into_bytes(mut self) -> Zeroizing<Vec<u8>> {
+    /// Revalidate the authenticated digest and consume the only plaintext
+    /// capability in one operation. No borrowed plaintext or digest accessor
+    /// exists, so a caller cannot copy the bytes and mint two deliveries before
+    /// the durable store takes ownership.
+    pub fn into_validated_parts(
+        mut self,
+    ) -> Result<((u32, u64), Zeroizing<Vec<u8>>), GuardianProtocolError> {
+        let observed_digest = zeroizing_sha256_digest(self.bytes.as_slice());
+        if !checkpoint_chunk_digest_matches(
+            observed_digest.as_slice(),
+            self.chunk_digest.as_slice(),
+        ) {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let position = (self.index, self.offset);
         // Taking the byte owner lets `self` drop here, wiping the authenticated
         // digest before the plaintext allocation continues into durable store.
-        std::mem::take(&mut self.bytes)
+        Ok((position, std::mem::take(&mut self.bytes)))
     }
 }
 
@@ -3427,8 +3507,9 @@ pub enum GuardianReplayDeliveryError {
 /// observable only by consuming the capability into a bounded writer.
 pub struct GuardianReplayRecordDelivery {
     metadata: GuardianReplayRecordMetadataV1,
-    plaintext_digest: [u8; 32],
+    plaintext_digest: GuardianReplayProtectedDigest,
     plaintext: Zeroizing<Vec<u8>>,
+    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
 }
 
 impl std::fmt::Debug for GuardianReplayRecordDelivery {
@@ -3455,6 +3536,7 @@ impl GuardianReplayRecordDelivery {
             metadata,
             plaintext_digest,
             plaintext,
+            _nonduplicable: GuardianCheckpointChunkNonDuplicable,
         })
     }
 
@@ -3471,8 +3553,8 @@ impl GuardianReplayRecordDelivery {
         if max_payload_bytes == 0
             || self.metadata.payload_bytes > max_payload_bytes
             || usize::try_from(self.metadata.payload_bytes).ok() != Some(self.plaintext.len())
-            || replay_record_plaintext_digest(self.metadata, self.plaintext.as_slice())?
-                != self.plaintext_digest
+            || !replay_record_plaintext_digest(self.metadata, self.plaintext.as_slice())?
+                .matches(&self.plaintext_digest)
         {
             return Err(GuardianProtocolError::InvalidReplyPayload.into());
         }
@@ -3483,10 +3565,15 @@ impl GuardianReplayRecordDelivery {
     }
 }
 
+impl ZeroizeOnDrop for GuardianReplayRecordDelivery {}
+
+static_assertions::assert_not_impl_any!(GuardianReplayRecordDelivery: Clone, Copy);
+static_assertions::assert_impl_all!(GuardianReplayRecordDelivery: ZeroizeOnDrop);
+
 fn replay_record_plaintext_digest(
     metadata: GuardianReplayRecordMetadataV1,
     plaintext: &[u8],
-) -> Result<[u8; 32], GuardianProtocolError> {
+) -> Result<GuardianReplayProtectedDigest, GuardianProtocolError> {
     if usize::try_from(metadata.payload_bytes).ok() != Some(plaintext.len()) {
         return Err(GuardianProtocolError::InvalidReplyPayload);
     }
@@ -3497,7 +3584,10 @@ fn replay_record_plaintext_digest(
     hasher.update(metadata.sequence.to_le_bytes());
     hasher.update(u64::from(metadata.payload_bytes).to_le_bytes());
     hasher.update(plaintext);
-    Ok(hasher.finalize().into())
+    let mut digest = GuardianReplayProtectedDigest::zeroed();
+    let output: &mut sha2::digest::Output<Sha256> = (&mut *digest.bytes).into();
+    hasher.finalize_into(output);
+    Ok(digest)
 }
 
 pub struct GuardianReplayOutputRecordsDelivery {
@@ -3505,6 +3595,7 @@ pub struct GuardianReplayOutputRecordsDelivery {
     previous_record_digest: [u8; 32],
     records: Vec<GuardianReplayRecordDelivery>,
     plaintext_bytes: u32,
+    _nonduplicable: GuardianCheckpointChunkNonDuplicable,
 }
 
 impl std::fmt::Debug for GuardianReplayOutputRecordsDelivery {
@@ -3531,6 +3622,7 @@ impl GuardianReplayOutputRecordsDelivery {
             previous_record_digest,
             records,
             plaintext_bytes,
+            _nonduplicable: GuardianCheckpointChunkNonDuplicable,
         })
     }
 
@@ -3554,10 +3646,15 @@ impl GuardianReplayOutputRecordsDelivery {
         self.plaintext_bytes
     }
 
-    pub fn into_records(self) -> Vec<GuardianReplayRecordDelivery> {
-        self.records
+    pub fn into_records(mut self) -> Vec<GuardianReplayRecordDelivery> {
+        std::mem::take(&mut self.records)
     }
 }
+
+impl ZeroizeOnDrop for GuardianReplayOutputRecordsDelivery {}
+
+static_assertions::assert_not_impl_any!(GuardianReplayOutputRecordsDelivery: Clone, Copy);
+static_assertions::assert_impl_all!(GuardianReplayOutputRecordsDelivery: ZeroizeOnDrop);
 
 fn validate_replay_records(
     first_sequence: u64,
@@ -3578,8 +3675,8 @@ fn validate_replay_records(
         let metadata = record.metadata;
         metadata.validate()?;
         if usize::try_from(metadata.payload_bytes).ok() != Some(record.plaintext.len())
-            || replay_record_plaintext_digest(metadata, record.plaintext.as_slice())?
-                != record.plaintext_digest
+            || !replay_record_plaintext_digest(metadata, record.plaintext.as_slice())?
+                .matches(&record.plaintext_digest)
         {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
@@ -3935,7 +4032,7 @@ impl GuardianReplayPageBodyDelivery {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct GuardianReplayPageHeaderV1 {
     pane_id: Uuid,
     generation: u64,
@@ -3943,7 +4040,7 @@ pub struct GuardianReplayPageHeaderV1 {
     snapshot_digest: [u8; 32],
     incoming_cursor_digest: [u8; 32],
     page_index: u32,
-    page_digest: [u8; 32],
+    page_digest: GuardianReplayProtectedDigest,
     next_cursor: Option<GuardianReplayCursorV1>,
 }
 
@@ -3962,42 +4059,45 @@ impl std::fmt::Debug for GuardianReplayPageHeaderV1 {
 
 impl GuardianReplayPageHeaderV1 {
     #[must_use]
-    pub const fn pane_id(self) -> Uuid {
+    pub const fn pane_id(&self) -> Uuid {
         self.pane_id
     }
 
     #[must_use]
-    pub const fn generation(self) -> u64 {
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 
     #[must_use]
-    pub const fn snapshot_id(self) -> Uuid {
+    pub const fn snapshot_id(&self) -> Uuid {
         self.snapshot_id
     }
 
     #[must_use]
-    pub const fn snapshot_digest(self) -> [u8; 32] {
+    pub const fn snapshot_digest(&self) -> [u8; 32] {
         self.snapshot_digest
     }
 
     #[must_use]
-    pub const fn incoming_cursor_digest(self) -> [u8; 32] {
+    pub const fn incoming_cursor_digest(&self) -> [u8; 32] {
         self.incoming_cursor_digest
     }
 
     #[must_use]
-    pub const fn page_index(self) -> u32 {
+    pub const fn page_index(&self) -> u32 {
         self.page_index
     }
 
     #[must_use]
-    pub const fn page_digest(self) -> [u8; 32] {
-        self.page_digest
+    /// Explicitly declassify the authenticated page commitment for the wire
+    /// acknowledgement. This is the only public raw-copy boundary.
+    #[must_use]
+    pub fn declassify_page_digest_for_ack(&self) -> [u8; 32] {
+        self.page_digest.declassify_for_ack()
     }
 
     #[must_use]
-    pub const fn next_cursor(self) -> Option<GuardianReplayCursorV1> {
+    pub const fn next_cursor(&self) -> Option<GuardianReplayCursorV1> {
         self.next_cursor
     }
 }
@@ -4040,13 +4140,14 @@ impl GuardianReplayPageDelivery {
                 snapshot_digest,
                 incoming_cursor_digest,
                 page_index,
-                page_digest: [0; 32],
+                page_digest: GuardianReplayProtectedDigest::zeroed(),
                 next_cursor,
             },
             body,
         };
         page.validate_shape()?;
-        let encoded = page.encode_with_page_digest([0; 32])?;
+        let zero_digest = GuardianReplayProtectedDigest::zeroed();
+        let encoded = page.encode_with_page_digest(&zero_digest)?;
         page.header.page_digest = compute_replay_page_digest(&encoded)?;
         Ok(page)
     }
@@ -4067,8 +4168,8 @@ impl GuardianReplayPageDelivery {
 
     fn into_payload(self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
         self.validate_shape()?;
-        let payload = self.encode_with_page_digest(self.header.page_digest)?;
-        if compute_replay_page_digest(&payload)? != self.header.page_digest {
+        let payload = self.encode_with_page_digest(&self.header.page_digest)?;
+        if !compute_replay_page_digest(&payload)?.matches(&self.header.page_digest) {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
         Ok(payload)
@@ -4076,7 +4177,7 @@ impl GuardianReplayPageDelivery {
 
     fn encode_with_page_digest(
         &self,
-        page_digest: [u8; 32],
+        page_digest: &GuardianReplayProtectedDigest,
     ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
         self.body.validate()?;
         let body_bytes = self.encode_body()?;
@@ -4098,7 +4199,7 @@ impl GuardianReplayPageDelivery {
         payload.extend_from_slice(&self.header.incoming_cursor_digest);
         payload.extend_from_slice(&self.header.page_index.to_be_bytes());
         payload.extend_from_slice(&[0; 4]);
-        payload.extend_from_slice(&page_digest);
+        page_digest.declassify_into_wire(&mut payload);
         payload.extend_from_slice(
             &u32::try_from(body_bytes.len())
                 .map_err(|_| GuardianProtocolError::PayloadTooLarge)?
@@ -4119,14 +4220,33 @@ impl GuardianReplayPageDelivery {
     }
 
     fn encode_body(&self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
-        let mut body = Zeroizing::new(Vec::new());
+        let body_capacity = match &self.body {
+            GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
+                REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES
+                    .checked_add(chunk.bytes.len())
+                    .ok_or(GuardianProtocolError::PayloadTooLarge)?
+            }
+            GuardianReplayPageBodyDelivery::OutputRecords(records) => {
+                REPLAY_OUTPUT_RECORD_FIXED_BYTES
+                    .checked_mul(records.records.len())
+                    .and_then(|fixed| fixed.checked_add(REPLAY_OUTPUT_RECORDS_HEADER_BYTES))
+                    .and_then(|fixed| {
+                        fixed.checked_add(
+                            usize::try_from(records.plaintext_bytes).ok()?,
+                        )
+                    })
+                    .ok_or(GuardianProtocolError::PayloadTooLarge)?
+            }
+            GuardianReplayPageBodyDelivery::Complete { .. } => REPLAY_COMPLETE_BYTES,
+            GuardianReplayPageBodyDelivery::Gap { .. } => REPLAY_GAP_BYTES,
+            GuardianReplayPageBodyDelivery::Compacted { .. } => REPLAY_COMPACTED_BYTES,
+            GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => {
+                REPLAY_SNAPSHOT_EXPIRED_BYTES
+            }
+        };
+        let mut body = Zeroizing::new(Vec::with_capacity(body_capacity));
         match &self.body {
             GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
-                let capacity = REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES
-                    .checked_add(chunk.bytes.len())
-                    .ok_or(GuardianProtocolError::PayloadTooLarge)?;
-                body.try_reserve_exact(capacity)
-                    .map_err(|_| GuardianProtocolError::PayloadTooLarge)?;
                 body.extend_from_slice(&chunk.descriptor.encode());
                 body.extend_from_slice(&chunk.offset.to_be_bytes());
                 body.extend_from_slice(chunk.chunk_digest.as_slice());
@@ -4167,7 +4287,7 @@ impl GuardianReplayPageDelivery {
                     body.extend_from_slice(&metadata.cumulative_plaintext_bytes.to_be_bytes());
                     body.extend_from_slice(&metadata.committed_log_bytes.to_be_bytes());
                     body.extend_from_slice(&metadata.record_digest);
-                    body.extend_from_slice(&record.plaintext_digest);
+                    record.plaintext_digest.declassify_into_wire(&mut body);
                     body.extend_from_slice(record.plaintext.as_slice());
                 }
             }
@@ -4209,6 +4329,11 @@ impl GuardianReplayPageDelivery {
                 push_uuid(&mut body, *snapshot_id);
             }
         }
+        if body.len() != body_capacity {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "replay-page-body-encoded-size",
+            ));
+        }
         Ok(body)
     }
 
@@ -4240,9 +4365,8 @@ impl GuardianReplayPageDelivery {
         snapshot_digest.copy_from_slice(&payload[48..80]);
         let mut incoming_cursor_digest = [0; 32];
         incoming_cursor_digest.copy_from_slice(&payload[80..112]);
-        let mut page_digest = [0; 32];
-        page_digest.copy_from_slice(&payload[120..152]);
-        if digest_is_zero(page_digest) || compute_replay_page_digest(&payload)? != page_digest {
+        let page_digest = GuardianReplayProtectedDigest::from_wire(&payload[120..152])?;
+        if page_digest.is_zero() || !compute_replay_page_digest(&payload)?.matches(&page_digest) {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
         let body = decode_replay_page_body(payload[6], &payload[REPLAY_PAGE_HEADER_BYTES..])?;
@@ -4651,8 +4775,8 @@ fn decode_replay_page_body(
                     .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
                 let mut record_digest = [0; 32];
                 record_digest.copy_from_slice(&fixed[136..168]);
-                let mut plaintext_digest = [0; 32];
-                plaintext_digest.copy_from_slice(&fixed[168..200]);
+                let plaintext_digest =
+                    GuardianReplayProtectedDigest::from_wire(&fixed[168..200])?;
                 let metadata = GuardianReplayRecordMetadataV1::new(
                     read_required_uuid(fixed, 0)?,
                     read_u64(fixed, 16)?,
@@ -4667,7 +4791,7 @@ fn decode_replay_page_body(
                     metadata,
                     zeroizing_vec_from_slice(plaintext),
                 )?;
-                if record.plaintext_digest != plaintext_digest {
+                if !record.plaintext_digest.matches(&plaintext_digest) {
                     return Err(GuardianProtocolError::InvalidReplyPayload);
                 }
                 records.push(record);
@@ -4739,7 +4863,9 @@ fn decode_replay_page_body(
     Ok(body)
 }
 
-fn compute_replay_page_digest(payload: &[u8]) -> Result<[u8; 32], GuardianProtocolError> {
+fn compute_replay_page_digest(
+    payload: &[u8],
+) -> Result<GuardianReplayProtectedDigest, GuardianProtocolError> {
     if payload.len() < REPLAY_PAGE_HEADER_BYTES {
         return Err(GuardianProtocolError::InvalidReplyPayload);
     }
@@ -4748,7 +4874,10 @@ fn compute_replay_page_digest(payload: &[u8]) -> Result<[u8; 32], GuardianProtoc
     hasher.update(&payload[..REPLAY_PAGE_DIGEST_OFFSET]);
     hasher.update([0; 32]);
     hasher.update(&payload[REPLAY_PAGE_DIGEST_END..]);
-    Ok(hasher.finalize().into())
+    let mut digest = GuardianReplayProtectedDigest::zeroed();
+    let output: &mut sha2::digest::Output<Sha256> = (&mut *digest.bytes).into();
+    hasher.finalize_into(output);
+    Ok(digest)
 }
 
 struct GuardianBoundedPayloadBuffer {
@@ -9325,7 +9454,11 @@ mod tests {
     #[derive(Debug)]
     struct ProtocolCheckpointConfig;
 
-    impl TerminalConfiguration for ProtocolCheckpointConfig {}
+    impl TerminalConfiguration for ProtocolCheckpointConfig {
+        fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+            frankenterm_term::color::ColorPalette::default()
+        }
+    }
 
     fn id(byte: u8) -> Uuid {
         Uuid::from_bytes([byte; 16])
@@ -10008,7 +10141,8 @@ mod tests {
             GuardianOperation::Close,
             GuardianOperation::RetireLease,
         ]
-        .into_iter()
+        .iter()
+        .copied()
         .enumerate()
         {
             let request_id = Uuid::from_u128(0x100 + index as u128);
@@ -12898,7 +13032,14 @@ mod tests {
         let response = GuardianResponseEnvelope::success(&authenticated_input, &partial).unwrap();
         let encoded = encode_guardian_response(&secret(), &response).unwrap();
         let decoded = decode_guardian_response(&secret(), &encoded).unwrap();
-        assert_eq!(decoded.success_reply(&authenticated_input).unwrap(), partial);
+        assert_eq!(
+            decoded
+                .correlate(authenticated_input.header())
+                .unwrap()
+                .success_reply(&authenticated_input)
+                .unwrap(),
+            partial
+        );
         let mut same_length_splice = encoded;
         let applied_offset = FRAME_LENGTH_BYTES + RESPONSE_FRAME_HEADER_BYTES + 49;
         same_length_splice[applied_offset..applied_offset + 4]

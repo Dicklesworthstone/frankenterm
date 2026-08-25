@@ -36,7 +36,7 @@ use mux::guardian_output_journal::{
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES,
-    GUARDIAN_MAX_CHECKPOINT_CHUNKS, GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+    GUARDIAN_MAX_CHECKPOINT_CHUNKS,
     GuardianCheckpointDescriptorV1, GuardianCheckpointScopeV1, GuardianCheckpointStageKindV1,
     GuardianCheckpointStageReplyV1, GuardianCheckpointStageRequestV1,
     GuardianEffectTransactionError, GuardianProtocolError, GuardianProtocolState, GuardianReply,
@@ -1160,12 +1160,9 @@ impl GuardianCheckpointStageStore {
         }
         let shape = CheckpointStageRequestShape::from_request(&request)?;
         let chunk = request.into_chunk()?;
-        let (index, offset) = chunk.position();
-        let observed_digest = checkpoint_zeroizing_sha256_digest(chunk.bytes());
-        if !checkpoint_bytes_match(observed_digest.as_slice(), chunk.chunk_digest()) {
-            return Err(GuardianCheckpointStageStoreError::Conflict);
-        }
-        let bytes = chunk.into_bytes();
+        let ((index, offset), bytes) = chunk
+            .into_validated_parts()
+            .map_err(GuardianCheckpointStageStoreError::Protocol)?;
         self.with_exclusive_directory(|inner| {
             let mut census = checkpoint_stage_census(inner)?;
             let mut inspection = checkpoint_inspect_upload(
@@ -1492,6 +1489,10 @@ fn checkpoint_chunk_path(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "seal publication remains fail-closed until durable publication authority is wired"
+)]
 fn checkpoint_seal_path(
     inner: &GuardianCheckpointStageStoreInner,
     key: CheckpointStageUploadKey,
@@ -4838,6 +4839,7 @@ fn open_private_directory_at(_parent: &File, _name: &OsStr) -> std::io::Result<F
     ))
 }
 
+#[cfg(test)]
 fn sync_directory(path: &Path) -> Result<(), GuardianOutputError> {
     open_directory_no_follow(path)?
         .sync_all()
@@ -4927,7 +4929,7 @@ mod tests {
     use std::fs::hard_link;
     use std::io::{Seek, SeekFrom};
     use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt, symlink};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::time::{Duration, Instant};
 
     fn zeroizing_test_bytes(bytes: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -5074,10 +5076,19 @@ mod tests {
         checkpoint_hasher.update(terminal_digest);
         let checkpoint_digest: [u8; 32] = checkpoint_hasher.finalize().into();
 
-        let mut wire: Zeroizing<Vec<u8>> = Zeroizing::new(vec![
-            0_u8;
-            CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
-        ]);
+        let trailing_bytes = match (kind, chunk) {
+            (GuardianCheckpointStageKindV1::Chunk, Some((_, bytes))) => 48_usize
+                .checked_add(bytes.len())
+                .ok_or(GuardianProtocolError::PayloadTooLarge)?,
+            (GuardianCheckpointStageKindV1::Begin | GuardianCheckpointStageKindV1::Seal, None) => 0,
+            _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+        };
+        let wire_bytes = CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
+            .checked_add(trailing_bytes)
+            .ok_or(GuardianProtocolError::PayloadTooLarge)?;
+        let mut wire: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity(wire_bytes));
+        wire.resize(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES, 0);
         wire[..4].copy_from_slice(b"GCS1");
         wire[4..6].copy_from_slice(&1_u16.to_be_bytes());
         wire[6] = match kind {
@@ -5117,8 +5128,9 @@ mod tests {
                 wire.extend_from_slice(bytes);
             }
             (GuardianCheckpointStageKindV1::Begin | GuardianCheckpointStageKindV1::Seal, None) => {}
-            _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+            _ => unreachable!("checkpoint Stage shape was validated before allocation"),
         }
+        debug_assert_eq!(wire.len(), wire_bytes);
         GuardianCheckpointStageRequestV1::decode(&wire)
     }
 

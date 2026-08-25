@@ -3154,8 +3154,7 @@ fn require_same_object(left: &Metadata, right: &Metadata) -> Result<(), Guardian
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::Digest as _;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     fn authority(connection: usize, request: u128, effect: u128) -> GuardedStopAuthority {
         GuardedStopAuthority {

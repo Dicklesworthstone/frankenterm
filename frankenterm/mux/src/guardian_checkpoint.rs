@@ -3833,7 +3833,7 @@ mod tests {
             if attribute.path().segments.len() != 1
                 || !INERT_ATTRIBUTES.contains(&name.as_str())
             {
-                self.unexpected_attributes.push(name);
+                self.unexpected_attributes.push(name.clone());
             }
             if name == "derive" {
                 const EXPECTED_DERIVES: &[&str] =
@@ -5777,7 +5777,11 @@ mod tests {
     #[derive(Debug)]
     struct CheckpointTerminalConfig;
 
-    impl TerminalConfiguration for CheckpointTerminalConfig {}
+    impl TerminalConfiguration for CheckpointTerminalConfig {
+        fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+            frankenterm_term::color::ColorPalette::default()
+        }
+    }
 
     fn terminal_checkpoint_with(
         rows: usize,

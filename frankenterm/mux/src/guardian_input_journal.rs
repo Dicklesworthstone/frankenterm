@@ -1896,8 +1896,6 @@ fn read_u64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::TryFrom as _;
-    use std::io::Write as _;
 
     fn pane() -> Uuid {
         Uuid::from_bytes([0x41; 16])
