@@ -103814,6 +103814,56 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
     }
 
     #[test]
+    fn atomic_component_manifest_rejects_all_zero_build_identity() {
+        let fixture = tempfile::tempdir().expect("create zero-identity fixture");
+        let package = fixture.path().join("package");
+        std::fs::create_dir(&package).expect("create package root");
+        std::fs::write(package.join("payload"), b"sealed payload").expect("write package payload");
+        let manifest = fixture.path().join("manifest.json");
+        let verifier = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/atomic-component-manifest.sh");
+        let output = std::process::Command::new("bash")
+            .arg(verifier)
+            .arg("generate")
+            .arg("--root")
+            .arg(&package)
+            .arg("--source-root")
+            .arg(&package)
+            .arg("--output")
+            .arg(&manifest)
+            .arg("--build-id")
+            .arg("0".repeat(64))
+            .arg("--source-revision")
+            .arg("1".repeat(40))
+            .arg("--version")
+            .arg("0.15.2")
+            .arg("--target")
+            .arg("x86_64-unknown-linux-gnu")
+            .arg("--profile")
+            .arg("release-interactive")
+            .arg("--feature-contract")
+            .arg("process-family-ft-mux-server-pty-guardian-default-features-v1")
+            .arg("--entry")
+            .arg("metadata:test:payload")
+            .output()
+            .expect("execute atomic manifest generator");
+        assert!(!output.status.success(), "zero identity must fail closed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("all-zero sentinel"),
+            "unexpected error: {stderr}"
+        );
+        assert!(
+            !manifest.exists(),
+            "rejected identity must not mint a manifest"
+        );
+
+        let installer = include_str!("../../../install.sh");
+        assert!(installer.contains("identity[\"build_id\"] == \"0\" * 64"));
+        assert!(installer.contains("build == \"0\" * 64"));
+    }
+
+    #[test]
     fn structured_uservar_name_detection() {
         // New ft_ prefix
         assert!(is_structured_uservar_name("ft_event"));

@@ -748,6 +748,13 @@ def validate_build_id(value: str) -> str:
             actual=value,
             remedy="derive it with atomic-component-manifest.sh derive-build-id",
         )
+    if value == "0" * 64:
+        fail(
+            "invalid_build_id",
+            "build identity must not be the all-zero sentinel",
+            actual=value,
+            remedy="derive it with atomic-component-manifest.sh derive-build-id",
+        )
     return value
 
 

@@ -616,6 +616,8 @@ identity = manifest["identity"]
 keys = ("build_id", "source_revision", "version", "target", "profile", "feature_contract")
 if set(identity) != set(keys) or any(not isinstance(identity[key], str) for key in keys):
     raise SystemExit("invalid component identity")
+if not re.fullmatch(r"[0-9a-f]{64}", identity["build_id"]) or identity["build_id"] == "0" * 64:
+    raise SystemExit("invalid or sentinel component build identity")
 if not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest.get("manifest_id", "")):
     raise SystemExit("invalid manifest identity")
 executables = {
@@ -846,6 +848,8 @@ for role in roles:
     if prefix_count != 1 or len(found) != 1:
         raise SystemExit("legacy component must contain exactly one raw atomic marker")
     build, found_role, target, profile, version = (item.decode() for item in found[0])
+    if build == "0" * 64:
+        raise SystemExit("legacy component uses the forbidden all-zero build identity")
     if found_role != role:
         raise SystemExit("legacy component marker role mismatch")
     normalized = (build, target, profile, version)
@@ -957,6 +961,7 @@ install_process_family() {
     }
   metadata=$(process_family_manifest_metadata "$manifest_source" triplet) || return 1
   IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract <<<"$metadata"
+  [ -n "$profile" ] || return 1
   generation_id="${manifest_id#sha256:}"
 
   mkdir -p "$managed" "$generations" || return 1
@@ -1462,7 +1467,7 @@ install_macos_app() {
   local app_url dest tmp_app_tar extraction_root extracted_app app_manifest
   local target_app staged_app app_metadata standalone_metadata app_manifest_id app_id
   local app_build app_source app_version app_target app_profile app_features
-  local family_manifest_id family_build family_source family_version family_target family_profile family_features
+  local _family_manifest_id family_build family_source family_version family_target family_profile family_features
   local stage_id target_id txid operation retained_manifest manifest_store manifest_stage
   app_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${APP_ASSET}"
 
@@ -2047,6 +2052,7 @@ LOCK_READY_FILE="/tmp/ft-install-lock-ready-$$"
 umask 077
 mkfifo "$LOCK_CONTROL_FIFO" || { err "Cannot create installer lock control FIFO"; exit 1; }
 exec 9<> "$LOCK_CONTROL_FIFO"
+# shellcheck disable=SC2094 # fd 9 deliberately holds the FIFO open while the child blocks on fd 3.
 python3 - "$LOCK_FILE" "$LOCK_READY_FILE" "$LOCK_CONTROL_FIFO" 3<"$LOCK_CONTROL_FIFO" 9>&- <<'PY' &
 import fcntl, os, stat, sys
 
