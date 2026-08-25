@@ -6188,9 +6188,18 @@ mod tests {
             "guardian-checkpoint-test",
             Box::new(Vec::<u8>::new()),
         );
-        terminal.advance_bytes(b"checkpoint boundary");
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut actions = Vec::new();
+        parser.parse(b"checkpoint boundary", |action| actions.push(action));
+        terminal.perform_actions(actions);
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("record-backed parser fixture is at recovery ground");
         terminal
-            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .capture_recovery_checkpoint_at_external_parser_ground(
+                ground,
+                TerminalCheckpointLimits::default(),
+            )
             .expect("capture canonical record-backed terminal fixture")
     }
 
