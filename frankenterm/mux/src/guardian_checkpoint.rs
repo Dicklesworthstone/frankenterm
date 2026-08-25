@@ -3618,6 +3618,7 @@ mod tests {
 
     const AUTHORITY_CRITICAL_TYPES: &[&str] = &[
         "GuardianCheckpointGenesisSpawnPermitV1",
+        "GuardianCheckpointDurableCompletionReceiptV1",
         "GuardianCheckpointCandidateIdentityV1",
         "GuardianCheckpointOrderedChunkSetIdentityV1",
         "GuardianCheckpointOrderedChunkSetBuilderV1",
@@ -7645,6 +7646,9 @@ mod tests {
         assert!(std::mem::needs_drop::<
             GuardianCheckpointValidatedStageAssemblyV1
         >());
+        assert!(std::mem::needs_drop::<
+            GuardianCheckpointDurableCompletionReceiptV1
+        >());
         assert!(!std::mem::needs_drop::<
             GuardianCheckpointStageRecordContextV1
         >());
@@ -7671,6 +7675,10 @@ mod tests {
         inventory.fields.sort();
         let mut expected_fields = vec![
             "GuardianCheckpointCandidateIdentityV1:digest:private",
+            "GuardianCheckpointDurableCompletionReceiptV1:_private:private",
+            "GuardianCheckpointDurableCompletionReceiptV1:binding:private",
+            "GuardianCheckpointDurableCompletionReceiptV1:publication_id:private",
+            "GuardianCheckpointDurableCompletionReceiptV1:upload_id:private",
             "GuardianCheckpointGenesisSpawnPermitV1:_private:private",
             "GuardianCheckpointGenesisSpawnPermitV1:spawn_effect_id:private",
             "GuardianCheckpointManifestRetryCapabilityV1:operation:private",
@@ -7716,6 +7724,26 @@ mod tests {
                 "GuardianCheckpointCandidateIdentityV1",
                 "digest",
                 "Zeroizing<[u8; 32]>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointDurableCompletionReceiptV1",
+                "_private",
+                "()",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointDurableCompletionReceiptV1",
+                "binding",
+                "GuardianCheckpointStageBindingV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointDurableCompletionReceiptV1",
+                "publication_id",
+                "Uuid",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointDurableCompletionReceiptV1",
+                "upload_id",
+                "Uuid",
             ),
             expected_authority_field(
                 "GuardianCheckpointGenesisSpawnPermitV1",
@@ -7883,6 +7911,7 @@ mod tests {
             "GuardianCheckpointCandidateIdentityV1:Debug",
             "GuardianCheckpointCandidateIdentityV1:Eq",
             "GuardianCheckpointCandidateIdentityV1:PartialEq",
+            "GuardianCheckpointDurableCompletionReceiptV1:Debug",
             "GuardianCheckpointGenesisSpawnPermitV1:<inherent>",
             "GuardianCheckpointGenesisSpawnPermitV1:Debug",
             "GuardianCheckpointManifestRetryCapabilityV1:<inherent>",
@@ -8218,6 +8247,8 @@ mod tests {
         inventory.cipher_methods.sort();
         let mut expected_cipher_methods = vec![
             "from_output_cipher:pub:GuardianOutputCipher",
+            "inspect_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianEncryptedCheckpointStageRecordV1",
+            "inspect_durable_manifest_receipt:pub:GuardianCheckpointStageBindingV1,GuardianCheckpointStageRequestV1,Uuid,GuardianCheckpointCandidateIdentityV1,GuardianCheckpointOrderedChunkSetIdentityV1,GuardianEncryptedCheckpointStageRecordV1",
             "key_id:pub:",
             "open:pub:GuardianCheckpointStageRecordContextV1,GuardianEncryptedCheckpointStageRecordV1,u32",
             "open_exact_payload:private:GuardianCheckpointStageRecordContextV1,GuardianEncryptedCheckpointStageRecordV1,u32",
@@ -8226,6 +8257,7 @@ mod tests {
             "retry_open_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1,GuardianEncryptedCheckpointStageRecordV1",
             "retry_seal_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1",
             "seal:pub:GuardianCheckpointStageSealIntentV1",
+            "seal_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1",
             "seal_exact_payload:private:GuardianCheckpointStageRecordContextV1,u8,u8",
             "seal_manifest:pub:GuardianCheckpointValidatedManifestOperationV1",
             "seal_validated_manifest:private:GuardianCheckpointValidatedManifestOperationV1",
@@ -8267,6 +8299,24 @@ mod tests {
                 "pub",
                 false,
                 "fn retry_seal_manifest(&self, retry: &GuardianCheckpointManifestRetryCapabilityV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_durable_manifest_receipt(&self, binding: &GuardianCheckpointStageBindingV1, seal_request: GuardianCheckpointStageRequestV1, publication_id: Uuid, candidate_identity: GuardianCheckpointCandidateIdentityV1, ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<GuardianCheckpointDurableCompletionReceiptV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointCipher",
@@ -8321,6 +8371,7 @@ mod tests {
         let mut expected_authority_signatures = expected_method_surfaces.clone();
         for owner in [
             "GuardianCheckpointCandidateIdentityV1",
+            "GuardianCheckpointDurableCompletionReceiptV1",
             "GuardianCheckpointGenesisSpawnPermitV1",
             "GuardianCheckpointManifestRetryCapabilityV1",
             "GuardianCheckpointManifestSealCapabilitiesV1",
@@ -8400,6 +8451,30 @@ mod tests {
                 "fn open_validated_manifest(&self, operation: &GuardianCheckpointValidatedManifestOperationV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_durable_manifest_receipt(&self, binding: &GuardianCheckpointStageBindingV1, seal_request: GuardianCheckpointStageRequestV1, publication_id: Uuid, candidate_identity: GuardianCheckpointCandidateIdentityV1, ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<GuardianCheckpointDurableCompletionReceiptV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_ack_finalizer(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "<free>",
+                "private",
+                false,
+                "fn checkpoint_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
                 "<free>",
                 "private",
                 false,
@@ -8421,6 +8496,7 @@ mod tests {
         inventory.return_sites.sort();
         let mut expected_return_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext:pub:production",
+            "GuardianCheckpointDurableCompletionReceiptV1@GuardianCheckpointCipher::inspect_durable_manifest_receipt:pub:production",
             "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue_for_test:private:test",
             "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
             "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointValidatedManifestAuthorityV1::bind_seal_operation:pub:production",
@@ -8448,6 +8524,7 @@ mod tests {
         inventory.construction_sites.sort();
         let mut expected_construction_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext",
+            "GuardianCheckpointDurableCompletionReceiptV1@GuardianCheckpointCipher::inspect_durable_manifest_receipt",
             "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue_for_test",
             "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
             "GuardianCheckpointManifestSealCapabilitiesV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
@@ -8523,6 +8600,7 @@ mod tests {
             inventory.item_macros,
             vec![
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);"),
