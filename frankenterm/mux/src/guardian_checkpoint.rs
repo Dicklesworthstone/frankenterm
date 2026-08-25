@@ -6174,6 +6174,26 @@ mod tests {
         terminal_checkpoint_with(24, 80, "guardian-checkpoint-test")
     }
 
+    fn record_terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(CheckpointTerminalConfig),
+            "FrankenTerm",
+            "guardian-checkpoint-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(b"checkpoint boundary");
+        terminal
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .expect("capture canonical record-backed terminal fixture")
+    }
+
     fn live_capture(
         registration_wire_identity: [u8; 16],
         pane: Uuid,
@@ -6201,7 +6221,13 @@ mod tests {
     ) {
         let pane = Uuid::new_v4();
         let (segment, output) = synchronized_output(pane);
-        let capture = live_capture([1; 16], pane, segment, output, terminal_checkpoint());
+        let capture = live_capture(
+            [1; 16],
+            pane,
+            segment,
+            output,
+            record_terminal_checkpoint(),
+        );
         let descriptor = GuardianCheckpointArtifactDescriptorV1::from_live_capture(&capture)
             .expect("construct record descriptor");
         (descriptor, segment, output, capture)
