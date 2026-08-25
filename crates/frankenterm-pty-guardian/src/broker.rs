@@ -2069,7 +2069,6 @@ mod tests {
         let eof = BrokerAuthenticatedControlEofV1::from_authenticated_transport_close(
             attachment.identity(),
         );
-        let _detached_attachment = attachment;
         assert_eq!(
             pane.observe_authenticated_control_eof(eof),
             Ok(BrokerControlEofOutcomeV1::AwaitingSuccessor { next_generation: 1 })
@@ -2157,7 +2156,6 @@ mod tests {
         };
         assert_eq!(recovered_attachment.identity(), successor_identity);
         assert_eq!(pane.resource_usage().live_guardian_leases, 1);
-        let _superseded_successor_reply = successor_attachment;
         let successor_attachment = recovered_attachment;
 
         let delayed_predecessor_eof =
@@ -2265,7 +2263,6 @@ mod tests {
         let eof = BrokerAuthenticatedControlEofV1::from_authenticated_transport_close(
             attachment_identity,
         );
-        let _detached_attachment = attachment;
         pane.observe_authenticated_control_eof(eof)
             .expect("observe exact EOF");
 
