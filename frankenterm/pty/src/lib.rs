@@ -38,7 +38,7 @@
 //! ```
 //!
 use anyhow::Error;
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 // TryFrom is not in the edition-2018 prelude; its only use is the #[cfg(unix)]
@@ -113,24 +113,6 @@ pub trait MasterPty: Downcast + Send {
     /// Obtain a readable handle; output from the slave(s) is readable
     /// via this stream.
     fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, Error>;
-    /// Duplicate the master endpoint as an independently owned PTY handle.
-    ///
-    /// This is distinct from [`Self::try_clone_reader`]: the returned handle
-    /// retains the complete master-side authority, including resize and the
-    /// ability to create its own reader and writer.  Native Unix backends use
-    /// a close-on-exec descriptor duplicate, so dropping one handle cannot
-    /// close the PTY while another process-local owner still retains its
-    /// duplicate.
-    ///
-    /// The default is deliberately unsupported.  Backends must opt in only
-    /// when they can prove that the duplicate has independent ownership and
-    /// preserves the same underlying PTY identity.
-    #[cfg(unix)]
-    fn try_clone_master(&self) -> Result<Box<dyn MasterPty + Send>, Error> {
-        Err(anyhow::anyhow!(
-            "this PTY backend does not provide an independently owned master duplicate"
-        ))
-    }
     /// Obtain a non-blocking readable handle suitable for registration with a
     /// Unix readiness poller.
     ///
@@ -147,6 +129,33 @@ pub trait MasterPty: Downcast + Send {
     /// Dropping the writer will send EOF to the slave end.
     /// It is invalid to take the writer more than once.
     fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error>;
+
+    /// Obtain the single byte-silent writer for a broker-owned I/O proxy.
+    ///
+    /// Unlike [`Self::take_writer`], dropping this writer closes only its
+    /// process-local duplicate and never injects terminal input. The broker
+    /// retains this writer across logical guardian handoffs; guardians never
+    /// receive it or the PTY master descriptor.
+    #[cfg(unix)]
+    fn take_writer_for_broker_proxy(&self) -> Result<Box<dyn std::io::Write + Send>, Error> {
+        Err(anyhow::anyhow!(
+            "this PTY backend does not provide byte-silent broker proxy writer authority"
+        ))
+    }
+
+    /// Explicitly attempt to deliver the terminal's final EOF exactly once.
+    ///
+    /// Attachment teardown must never call this operation.  It is reserved for
+    /// the owner retaining the terminal itself after every attachment lease is
+    /// fenced and closed. A backend must permanently fence further writer/EOF
+    /// authority if the kernel accepts only part of the terminal EOF sequence,
+    /// because retrying that indeterminate effect could inject duplicate input.
+    #[cfg(unix)]
+    fn send_terminal_eof(&self) -> Result<(), Error> {
+        Err(anyhow::anyhow!(
+            "this PTY backend does not provide explicit terminal EOF authority"
+        ))
+    }
 
     /// If applicable to the type of the tty, return the local process id
     /// of the process group or session leader
@@ -274,11 +283,10 @@ impl From<std::process::ExitStatus> for ExitStatus {
             }
         }
 
-        let code =
-            status
-                .code()
-                .map(|c| c as u32)
-                .unwrap_or_else(|| if status.success() { 0 } else { 1 });
+        let code = status
+            .code()
+            .map(|c| c as u32)
+            .unwrap_or_else(|| if status.success() { 0 } else { 1 });
 
         ExitStatus { code, signal: None }
     }

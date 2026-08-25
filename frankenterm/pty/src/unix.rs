@@ -3,10 +3,12 @@
 use crate::{
     Child, CommandBuilder, MasterPty, PollablePtyReader, PtyPair, PtySize, PtySystem, SlavePty,
 };
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 use filedescriptor::FileDescriptor;
 use libc::{self, winsize};
+use nix::unistd::{PathconfVar, fpathconf};
 use std::cell::RefCell;
+use std::convert::TryInto as _;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -14,6 +16,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{io, mem, ptr};
 
 pub use std::os::unix::io::RawFd;
@@ -64,6 +68,7 @@ fn openpty(size: PtySize) -> anyhow::Result<(UnixMasterPty, UnixSlavePty)> {
     let master = UnixMasterPty {
         fd: PtyFd(unsafe { FileDescriptor::from_raw_fd(master) }),
         took_writer: RefCell::new(false),
+        writer_authority: Arc::new(UnixWriterAuthority::default()),
         tty_name,
     };
     let slave = UnixSlavePty {
@@ -322,7 +327,119 @@ impl PtyFd {
 struct UnixMasterPty {
     fd: PtyFd,
     took_writer: RefCell<bool>,
+    writer_authority: Arc<UnixWriterAuthority>,
     tty_name: Option<PathBuf>,
+}
+
+struct UnixWriterAuthority {
+    state: AtomicU8,
+}
+
+const WRITER_AUTHORITY_OPEN: u8 = 0;
+const WRITER_AUTHORITY_ACTIVE: u8 = 1;
+const WRITER_AUTHORITY_EOF_IN_PROGRESS: u8 = 2;
+const WRITER_AUTHORITY_EOF_SENT: u8 = 3;
+const WRITER_AUTHORITY_EOF_INDETERMINATE: u8 = 4;
+
+impl Default for UnixWriterAuthority {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(WRITER_AUTHORITY_OPEN),
+        }
+    }
+}
+
+impl UnixWriterAuthority {
+    fn claim(self: &Arc<Self>) -> Result<UnixWriterClaim, Error> {
+        self.state
+            .compare_exchange(
+                WRITER_AUTHORITY_OPEN,
+                WRITER_AUTHORITY_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(writer_authority_error)?;
+        Ok(UnixWriterClaim {
+            authority: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    fn begin_terminal_eof(self: &Arc<Self>) -> Result<UnixTerminalEofAttempt, Error> {
+        self.state
+            .compare_exchange(
+                WRITER_AUTHORITY_OPEN,
+                WRITER_AUTHORITY_EOF_IN_PROGRESS,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(writer_authority_error)?;
+        Ok(UnixTerminalEofAttempt {
+            authority: Arc::clone(self),
+            disposition: UnixTerminalEofDisposition::Reopen,
+        })
+    }
+}
+
+struct UnixWriterClaim {
+    authority: Arc<UnixWriterAuthority>,
+    active: bool,
+}
+
+impl Drop for UnixWriterClaim {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.authority.state.compare_exchange(
+                WRITER_AUTHORITY_ACTIVE,
+                WRITER_AUTHORITY_OPEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UnixTerminalEofDisposition {
+    Reopen,
+    Sent,
+    Indeterminate,
+}
+
+struct UnixTerminalEofAttempt {
+    authority: Arc<UnixWriterAuthority>,
+    disposition: UnixTerminalEofDisposition,
+}
+
+impl UnixTerminalEofAttempt {
+    fn commit_sent(mut self) {
+        self.disposition = UnixTerminalEofDisposition::Sent;
+    }
+
+    fn commit_indeterminate(mut self) {
+        self.disposition = UnixTerminalEofDisposition::Indeterminate;
+    }
+}
+
+impl Drop for UnixTerminalEofAttempt {
+    fn drop(&mut self) {
+        let state = match self.disposition {
+            UnixTerminalEofDisposition::Reopen => WRITER_AUTHORITY_OPEN,
+            UnixTerminalEofDisposition::Sent => WRITER_AUTHORITY_EOF_SENT,
+            UnixTerminalEofDisposition::Indeterminate => WRITER_AUTHORITY_EOF_INDETERMINATE,
+        };
+        self.authority.state.store(state, Ordering::Release);
+    }
+}
+
+fn writer_authority_error(state: u8) -> Error {
+    match state {
+        WRITER_AUTHORITY_EOF_SENT => anyhow::anyhow!("terminal EOF has already been sent"),
+        WRITER_AUTHORITY_EOF_INDETERMINATE => {
+            anyhow::anyhow!("terminal EOF effect is indeterminate")
+        }
+        _ => anyhow::anyhow!("PTY writer authority is already active"),
+    }
 }
 
 /// Represents the slave end of a pty.
@@ -373,14 +490,6 @@ impl MasterPty for UnixMasterPty {
         Ok(Box::new(fd))
     }
 
-    fn try_clone_master(&self) -> Result<Box<dyn MasterPty + Send>, Error> {
-        Ok(Box::new(Self {
-            fd: PtyFd(self.fd.try_clone()?),
-            took_writer: RefCell::new(false),
-            tty_name: self.tty_name.clone(),
-        }))
-    }
-
     fn try_clone_pollable_reader(&self) -> Result<Box<dyn PollablePtyReader>, Error> {
         let mut fd = PtyFd(self.fd.try_clone()?);
         fd.set_non_blocking(true)?;
@@ -391,9 +500,27 @@ impl MasterPty for UnixMasterPty {
         if *self.took_writer.borrow() {
             anyhow::bail!("cannot take writer more than once");
         }
-        *self.took_writer.borrow_mut() = true;
+        let claim = self.writer_authority.claim()?;
         let fd = PtyFd(self.fd.try_clone()?);
-        Ok(Box::new(UnixMasterWriter { fd }))
+        *self.took_writer.borrow_mut() = true;
+        Ok(Box::new(UnixMasterWriter { fd, _claim: claim }))
+    }
+
+    fn take_writer_for_broker_proxy(&self) -> Result<Box<dyn Write + Send>, Error> {
+        if *self.took_writer.borrow() {
+            anyhow::bail!("cannot take writer more than once");
+        }
+        let claim = self.writer_authority.claim()?;
+        let fd = PtyFd(self.fd.try_clone()?);
+        *self.took_writer.borrow_mut() = true;
+        Ok(Box::new(UnixBrokerProxyWriter { fd, _claim: claim }))
+    }
+
+    fn send_terminal_eof(&self) -> Result<(), Error> {
+        let mut fd = PtyFd(self.fd.try_clone()?);
+        let bytes = prepare_terminal_eof(&fd)?;
+        let attempt = self.writer_authority.begin_terminal_eof()?;
+        deliver_terminal_eof(&mut fd.0, bytes, attempt)
     }
 
     fn as_raw_fd(&self) -> Option<RawFd> {
@@ -421,6 +548,7 @@ impl MasterPty for UnixMasterPty {
 /// the Pty is dropped.
 struct UnixMasterWriter {
     fd: PtyFd,
+    _claim: UnixWriterClaim,
 }
 
 impl Drop for UnixMasterWriter {
@@ -446,10 +574,116 @@ impl Write for UnixMasterWriter {
     }
 }
 
+/// Broker-retained proxy writer. Its destructor is intentionally byte-silent;
+/// closing the broker proxy must not become terminal input.
+struct UnixBrokerProxyWriter {
+    fd: PtyFd,
+    _claim: UnixWriterClaim,
+}
+
+impl Write for UnixBrokerProxyWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+        self.fd.write(buf)
+    }
+
+    fn flush(&mut self) -> Result<(), io::Error> {
+        self.fd.flush()
+    }
+}
+
+fn prepare_terminal_eof(fd: &PtyFd) -> Result<[u8; 2], io::Error> {
+    let mut termios: libc::termios = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+    if unsafe { libc::tcgetattr(fd.0.as_raw_fd(), &mut termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let disabled = fpathconf(fd.as_fd(), PathconfVar::_POSIX_VDISABLE)
+        .map_err(io::Error::from)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "VEOF disable value unknown"))?;
+    let disabled: libc::cc_t = disabled.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "VEOF disable value is outside cc_t range",
+        )
+    })?;
+    let eof = terminal_eof_byte(&termios, disabled)?;
+    // EOF is interpreted only after a line boundary in canonical mode.
+    Ok([b'\n', eof])
+}
+
+fn deliver_terminal_eof<W: Write>(
+    writer: &mut W,
+    bytes: [u8; 2],
+    attempt: UnixTerminalEofAttempt,
+) -> Result<(), io::Error> {
+    match writer.write(&bytes) {
+        Ok(2) => {
+            attempt.commit_sent();
+            Ok(())
+        }
+        Ok(_) => {
+            attempt.commit_indeterminate();
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "terminal EOF sequence was only partially accepted",
+            ))
+        }
+        Err(error) => {
+            attempt.commit_indeterminate();
+            Err(error)
+        }
+    }
+}
+
+fn terminal_eof_byte(termios: &libc::termios, disabled: libc::cc_t) -> Result<u8, io::Error> {
+    if termios.c_lflag & libc::ICANON == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "terminal EOF byte has no EOF semantics outside canonical mode",
+        ));
+    }
+    let eof = termios.c_cc[libc::VEOF];
+    if eof == disabled {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "terminal VEOF control character is disabled",
+        ));
+    }
+    Ok(eof)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use std::io::Read as _;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn read_until(reader: &mut dyn PollablePtyReader, needle: &[u8]) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 256];
+        while Instant::now() < deadline {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    output.extend_from_slice(&chunk[..count]);
+                    if output.windows(needle.len()).any(|window| window == needle) {
+                        return output;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("PTY read failed: {error}"),
+            }
+        }
+        panic!(
+            "timed out waiting for {:?}; output was {:?}",
+            String::from_utf8_lossy(needle),
+            String::from_utf8_lossy(&output)
+        );
+    }
 
     #[test]
     fn tty_name_buffer_growth_is_bounded() {
@@ -464,31 +698,195 @@ mod tests {
     }
 
     #[test]
-    fn cloned_master_retains_the_same_pty_after_original_master_drop() {
-        let (master, slave) = openpty(PtySize::default()).expect("open native test PTY");
-        let retained = master
-            .try_clone_master()
-            .expect("duplicate complete master authority");
-        let mut reader = retained
-            .try_clone_reader()
-            .expect("clone reader from retained master");
-
-        drop(master);
+    fn broker_proxy_writer_drop_is_silent_and_terminal_eof_is_explicit_once() {
+        let (broker_master, slave) = openpty(PtySize::default()).expect("open native test PTY");
+        let mut broker_reader = broker_master
+            .try_clone_pollable_reader()
+            .expect("broker proxy reader");
+        let mut broker_writer = broker_master
+            .take_writer_for_broker_proxy()
+            .expect("broker proxy writer");
 
         let mut command = CommandBuilder::new("/bin/sh");
         command.arg("-c");
-        command.arg("printf 'retained-master\\n'");
-        let mut child = slave
-            .spawn_command(command)
-            .expect("spawn child after original master drop");
+        command.arg(concat!(
+            "IFS= read -r first; printf 'first:%s\\n' \"$first\"; ",
+            "IFS= read -r second; printf 'second:%s\\n' \"$second\"; ",
+            "IFS= read -r third; printf 'third:%s\\n' \"$third\""
+        ));
+        let mut child = slave.spawn_command(command).expect("spawn retained child");
         drop(slave);
 
-        let status = child.wait().expect("wait for PTY child");
-        assert!(status.success());
-        let mut output = String::new();
-        reader
-            .read_to_string(&mut output)
-            .expect("drain retained PTY master");
-        assert!(output.contains("retained-master"));
+        broker_writer.write_all(b"alpha\n").expect("write alpha");
+        broker_writer.flush().expect("flush alpha");
+        let _ = read_until(broker_reader.as_mut(), b"first:alpha");
+
+        // A logical guardian rotation does not touch broker-owned I/O.
+        broker_writer.write_all(b"beta\n").expect("write beta");
+        broker_writer.flush().expect("flush beta");
+        let _ = read_until(broker_reader.as_mut(), b"second:beta");
+        drop(broker_writer);
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            child
+                .try_wait()
+                .expect("poll after byte-silent proxy close")
+                .is_none(),
+            "broker proxy writer drop injected terminal input or EOF"
+        );
+
+        assert!(broker_master.send_terminal_eof().is_ok());
+        assert!(
+            broker_master.send_terminal_eof().is_err(),
+            "terminal EOF authority was reusable"
+        );
+        assert!(child.wait().expect("wait after explicit EOF").success());
+    }
+
+    #[test]
+    fn ordinary_writer_drop_preserves_legacy_newline_and_terminal_eof() {
+        let (master, slave) = openpty(PtySize::default()).expect("open native test PTY");
+        let mut reader = master
+            .try_clone_pollable_reader()
+            .expect("pollable test reader");
+        let mut writer = master.take_writer().expect("ordinary PTY writer");
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg(concat!(
+            "IFS= read -r first; printf 'first:%s\\n' \"$first\"; ",
+            "IFS= read -r drop_line; printf 'drop-line:%s\\n' \"$drop_line\"; ",
+            "if IFS= read -r final; then printf 'unexpected:%s\\n' \"$final\"; ",
+            "else printf 'drop-eof\\n'; fi"
+        ));
+        let mut child = slave.spawn_command(command).expect("spawn test child");
+        drop(slave);
+
+        writer.write_all(b"alpha\n").expect("write alpha");
+        let _ = read_until(reader.as_mut(), b"first:alpha");
+        drop(writer);
+
+        let output = read_until(reader.as_mut(), b"drop-eof");
+        assert!(
+            output
+                .windows(b"drop-line:".len())
+                .any(|window| window == b"drop-line:")
+        );
+        assert!(child.wait().expect("wait after writer drop").success());
+    }
+
+    #[test]
+    fn ordinary_writer_drop_keeps_historical_raw_mode_byte_delivery() {
+        let (master, slave) = openpty(PtySize::default()).expect("open native test PTY");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.fd.0.as_raw_fd(), &mut termios) },
+            0
+        );
+        unsafe { libc::cfmakeraw(&mut termios) };
+        let eot = termios.c_cc[libc::VEOF];
+        assert_ne!(eot, 0, "test terminal unexpectedly disables VEOF");
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave.fd.0.as_raw_fd(), libc::TCSANOW, &termios) },
+            0
+        );
+
+        let mut reader = master
+            .try_clone_pollable_reader()
+            .expect("pollable raw-mode reader");
+        let writer = master.take_writer().expect("ordinary raw-mode writer");
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("bytes=$(od -An -t u1 -N 2); printf 'bytes:%s:end\\n' \"$bytes\"");
+        let mut child = slave.spawn_command(command).expect("spawn raw-mode reader");
+        drop(slave);
+
+        drop(writer);
+        let output = read_until(reader.as_mut(), b":end");
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("bytes:"));
+        assert!(
+            output.contains("10"),
+            "legacy newline byte missing: {output:?}"
+        );
+        assert!(
+            output.contains(&eot.to_string()),
+            "legacy VEOF byte missing: {output:?}"
+        );
+        assert!(child.wait().expect("wait for raw-mode reader").success());
+    }
+
+    #[test]
+    fn failed_terminal_eof_attempt_reopens_authority_for_retry() {
+        let authority = Arc::new(UnixWriterAuthority::default());
+        let attempt = authority
+            .begin_terminal_eof()
+            .expect("begin first EOF attempt");
+        drop(attempt);
+        let claim = authority.claim().expect("failed attempt must reopen state");
+        drop(claim);
+
+        let attempt = authority
+            .begin_terminal_eof()
+            .expect("begin successful EOF attempt");
+        attempt.commit_sent();
+        assert!(
+            authority.claim().is_err(),
+            "committed terminal EOF allowed another writer"
+        );
+    }
+
+    struct ShortTerminalEofWriter(usize);
+
+    impl Write for ShortTerminalEofWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(self.0.min(bytes.len()))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn partial_or_zero_terminal_eof_write_is_indeterminate_and_not_retried() {
+        for accepted in [0, 1] {
+            let authority = Arc::new(UnixWriterAuthority::default());
+            let attempt = authority
+                .begin_terminal_eof()
+                .expect("begin terminal EOF attempt");
+            let error =
+                deliver_terminal_eof(&mut ShortTerminalEofWriter(accepted), [b'\n', 4], attempt)
+                    .expect_err("short terminal EOF write must fail closed");
+            assert_eq!(error.kind(), ErrorKind::WriteZero);
+            assert_eq!(
+                authority.state.load(Ordering::Acquire),
+                WRITER_AUTHORITY_EOF_INDETERMINATE
+            );
+            assert!(authority.begin_terminal_eof().is_err());
+            assert!(authority.claim().is_err());
+        }
+    }
+
+    #[test]
+    fn disabled_veof_and_noncanonical_mode_reject_terminal_eof_semantics() {
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        termios.c_lflag = libc::ICANON;
+        termios.c_cc[libc::VEOF] = 0;
+        assert_eq!(
+            terminal_eof_byte(&termios, 0)
+                .expect_err("disabled VEOF must fail")
+                .kind(),
+            ErrorKind::Unsupported
+        );
+
+        termios.c_cc[libc::VEOF] = 4;
+        termios.c_lflag &= !libc::ICANON;
+        assert_eq!(
+            terminal_eof_byte(&termios, 0)
+                .expect_err("noncanonical VEOF must fail")
+                .kind(),
+            ErrorKind::Unsupported
+        );
     }
 }

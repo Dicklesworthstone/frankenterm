@@ -65,6 +65,8 @@ pub fn guardian_runtime_build_identity()
 }
 
 #[cfg(unix)]
+pub mod broker;
+#[cfg(unix)]
 pub(crate) mod output;
 #[cfg(unix)]
 pub mod runtime;
