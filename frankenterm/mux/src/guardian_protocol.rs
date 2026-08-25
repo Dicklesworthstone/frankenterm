@@ -12157,6 +12157,100 @@ mod tests {
     }
 
     #[test]
+    fn recovered_durable_spawn_fence_blocks_legacy_spawn_after_protocol_restart() {
+        let original_guardian = id(1);
+        let recovered_guardian = id(9);
+        let mux = id(2);
+        let pane = id(3);
+        let mut original = GuardianProtocolState::new(original_guardian).unwrap();
+        let original_spawn = authenticate(&spawn_request(original_guardian, mux, pane));
+        let terminal = terminal_checkpoint();
+        let begin = authenticate(&genesis_begin_request(
+            original_guardian,
+            mux,
+            id(71),
+            id(5),
+            id(72),
+            &terminal,
+        ));
+        let mux_authority = mux_genesis_authority(&original, mux, 0x51);
+        let live_authority = live_genesis_authority(&original, 0x52);
+        let identity = original
+            .reserve_genesis_spawn(
+                &original_spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                Some(&live_authority),
+            )
+            .unwrap()
+            .into_reservation_identity();
+        let fence = GuardianDurableSpawnFenceV1::new(
+            identity.mux_incarnation(),
+            identity.spawn_effect_id(),
+            identity.durable_pane_id(),
+            identity.origin_request_id(),
+            identity.spawn_payload_bytes(),
+            identity.spawn_payload_digest(),
+        )
+        .unwrap();
+
+        // Simulate a guardian restart: all ordinary request/effect/reservation
+        // maps are empty and only the authenticated broker WAL projection is
+        // installed before traffic.
+        let mut recovered = GuardianProtocolState::new(recovered_guardian).unwrap();
+        assert_eq!(
+            recovered.install_durable_spawn_fence(fence).unwrap(),
+            GuardianDurableSpawnFenceInstallV1::Installed
+        );
+        assert_eq!(
+            recovered.install_durable_spawn_fence(fence).unwrap(),
+            GuardianDurableSpawnFenceInstallV1::AlreadyPresent
+        );
+        assert!(recovered.requests.is_empty());
+        assert!(recovered.effects.is_empty());
+        assert!(recovered.genesis_reservations_by_request.is_empty());
+
+        let replay = authenticate(&spawn_request(recovered_guardian, mux, pane));
+        let callback_calls = std::cell::Cell::new(0_u8);
+        let result = recovered.apply_effect_transactionally(&replay, |_| {
+            callback_calls.set(callback_calls.get() + 1);
+            GuardianEffectOutcome::<()>::Applied
+        });
+        assert!(matches!(
+            result,
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            ))
+        ));
+        assert_eq!(callback_calls.get(), 0);
+        assert!(recovered.panes.is_empty());
+
+        // Same-length payload mutation keeps every UUID stable but must be a
+        // request-identity conflict, still before callback admission.
+        let mutation = authenticate(&spawn_request_for_command(
+            recovered_guardian,
+            mux,
+            pane,
+            "bounded-commane",
+            pty_size(24, 80),
+        ));
+        let result = recovered.apply_effect_transactionally(&mutation, |_| {
+            callback_calls.set(callback_calls.get() + 1);
+            GuardianEffectOutcome::<()>::Applied
+        });
+        assert!(matches!(
+            result,
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::RequestIdentityConflict
+            ))
+        ));
+        assert_eq!(callback_calls.get(), 0);
+        assert!(recovered.panes.is_empty());
+    }
+
+    #[test]
     fn genesis_reservation_fails_closed_on_absent_or_mismatched_authority() {
         let guardian = id(1);
         let mux = id(2);
