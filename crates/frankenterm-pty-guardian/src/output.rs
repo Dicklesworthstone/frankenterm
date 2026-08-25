@@ -2147,6 +2147,87 @@ impl GuardianCheckpointStageStore {
         })
     }
 
+    /// Consume the exact authenticated Spawn reservation, publish its already
+    /// sealed Genesis upload, and return PTY-admission authority only after a
+    /// candidate + marker directory sync and a complete catalog rescan.
+    pub(crate) fn publish_genesis_catalog_admission(
+        &self,
+        permit: GuardianCheckpointGenesisSpawnPermitV1,
+    ) -> Result<GuardianPublishedGenesisAdmissionPermitV1, GuardianCheckpointStageStoreError> {
+        let reservation_identity = permit.into_reservation_identity();
+        let reservation = CheckpointCatalogGenesisReservationBinding::from(&reservation_identity);
+        let catalog_candidate_checksum = self.with_exclusive_directory(|inner| {
+            let census = checkpoint_stage_census(inner)?;
+            let expected_scope = CheckpointStagePathScope::Genesis {
+                spawn_effect_id: reservation.spawn_effect_id,
+            };
+            let expected_key = CheckpointStageUploadKey {
+                scope: expected_scope,
+                upload_id: reservation.upload_id,
+            };
+            let mut selected = None;
+            for entry in census.entries.iter().filter(|entry| {
+                entry.key == expected_key && entry.role == CheckpointStageFileRole::Candidate
+            }) {
+                let (_, plaintext) = checkpoint_open_record(
+                    inner,
+                    entry,
+                    u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                )?;
+                let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
+                if begin.kind() != GuardianCheckpointStageKindV1::Begin {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+                let shape = CheckpointStageRequestShape::from_request(&begin)?;
+                if shape.key() != entry.key {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+                if shape.descriptor.capture_generation() != 1
+                    || shape.descriptor.checkpoint_id().into_bytes()
+                        != reservation.checkpoint_identity_digest
+                    || shape.descriptor.boundary_id().into_bytes()
+                        != reservation.boundary_identity_digest
+                    || shape.descriptor.rows() != u32::from(reservation.rows)
+                    || shape.descriptor.cols() != u32::from(reservation.cols)
+                {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+                let inspection = checkpoint_inspect_upload(
+                    inner,
+                    &census,
+                    &shape,
+                    CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+                )?
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                if !inspection.seal_present
+                    || inspection.ack_present
+                    || inspection.expiry_present
+                    || inspection.next_index != shape.total_chunks
+                    || inspection.committed_bytes != shape.total_bytes
+                {
+                    return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+                }
+                if selected.is_some() {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+                selected = Some(GuardianCheckpointStageRequestV1::seal(
+                    shape.scope,
+                    shape.upload_id,
+                    shape.descriptor,
+                    shape.chunk_bytes,
+                )?);
+            }
+            let request = selected.ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            checkpoint_catalog_publish_genesis_stage(inner, &request, reservation)
+                .map(|member| member.candidate_checksum)
+        })?;
+        Ok(GuardianPublishedGenesisAdmissionPermitV1 {
+            reservation_identity,
+            catalog_candidate_checksum,
+        })
+    }
+
     /// Select only a checksum-bound published member with current replay
     /// semantics. Directory entry timestamps are deliberately never read.
     #[allow(dead_code)]
@@ -7099,6 +7180,100 @@ fn checkpoint_catalog_candidate_from_sealed_stage(
             genesis_process_family_build_identity_digest: [0; 32],
             genesis_pixel_width: 0,
             genesis_pixel_height: 0,
+        },
+        records,
+        checksum: [0; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    };
+    checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
+    Ok(candidate)
+}
+
+fn checkpoint_catalog_validate_genesis_reservation(
+    reservation: CheckpointCatalogGenesisReservationBinding,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    if reservation.mux_incarnation.is_nil()
+        || reservation.spawn_effect_id.is_nil()
+        || reservation.durable_pane_id.is_nil()
+        || reservation.origin_request_id.is_nil()
+        || reservation.spawn_payload_bytes == 0
+        || reservation.spawn_payload_digest == [0; 32]
+        || reservation.process_family_build_identity_digest == [0; 32]
+        || reservation.rows == 0
+        || reservation.cols == 0
+        || reservation.checkpoint_identity_digest == [0; 32]
+        || reservation.boundary_identity_digest == [0; 32]
+        || reservation.upload_id.is_nil()
+    {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    Ok(())
+}
+
+fn checkpoint_catalog_candidate_from_genesis_stage(
+    inner: &GuardianCheckpointStageStoreInner,
+    request: &GuardianCheckpointStageRequestV1,
+    identity: CheckpointCatalogIdentity,
+    reservation: CheckpointCatalogGenesisReservationBinding,
+) -> Result<CheckpointCatalogCandidate, GuardianCheckpointStageStoreError> {
+    checkpoint_catalog_validate_genesis_reservation(reservation)?;
+    if request.kind() != GuardianCheckpointStageKindV1::Seal {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let shape = CheckpointStageRequestShape::from_request(request)?;
+    let expected_scope = CheckpointCatalogScope::Genesis {
+        spawn_effect_id: reservation.spawn_effect_id,
+    };
+    if identity.scope != expected_scope
+        || identity.generation != 1
+        || identity.candidate_id != checkpoint_catalog_genesis_candidate_id(reservation)
+        || CheckpointCatalogScope::from_stage_scope(shape.path_scope) != expected_scope
+        || shape.upload_id != reservation.upload_id
+        || shape.descriptor.capture_generation() != 1
+        || shape.descriptor.checkpoint_id().into_bytes()
+            != reservation.checkpoint_identity_digest
+        || shape.descriptor.boundary_id().into_bytes() != reservation.boundary_identity_digest
+        || shape.descriptor.rows() != u32::from(reservation.rows)
+        || shape.descriptor.cols() != u32::from(reservation.cols)
+    {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let census = checkpoint_stage_census(inner)?;
+    let inspection = checkpoint_inspect_upload(
+        inner,
+        &census,
+        &shape,
+        CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+    )?
+    .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    let payload = checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)?;
+    shape.descriptor.validate_canonical_payload(&payload)?;
+    let records = checkpoint_catalog_stage_records(inner, &census, &shape, &inspection)?;
+    let candidate = CheckpointCatalogCandidate {
+        metadata: CheckpointCatalogMetadata {
+            identity,
+            predecessor: None,
+            upload_id: shape.upload_id,
+            completion_id: inspection.publication_id,
+            checkpoint_id: shape.descriptor.checkpoint_id().into_bytes(),
+            boundary_id: shape.descriptor.boundary_id().into_bytes(),
+            terminal_payload_digest: shape.descriptor.terminal_payload_digest(),
+            total_bytes: shape.total_bytes,
+            chunk_count: shape.total_chunks,
+            capture_generation: shape.descriptor.capture_generation(),
+            replay_semantics_id: shape.descriptor.replay_semantics_id(),
+            rows: shape.descriptor.rows(),
+            cols: shape.descriptor.cols(),
+            adoption_mux_incarnation: reservation.mux_incarnation,
+            adoption_effect_id: reservation.spawn_effect_id,
+            adoption_sequence: 0,
+            genesis_durable_pane_id: reservation.durable_pane_id,
+            genesis_origin_request_id: reservation.origin_request_id,
+            genesis_spawn_payload_bytes: reservation.spawn_payload_bytes,
+            genesis_spawn_payload_digest: reservation.spawn_payload_digest,
+            genesis_process_family_build_identity_digest: reservation
+                .process_family_build_identity_digest,
+            genesis_pixel_width: reservation.pixel_width,
+            genesis_pixel_height: reservation.pixel_height,
         },
         records,
         checksum: [0; OUTPUT_MANIFEST_CHECKSUM_BYTES],
