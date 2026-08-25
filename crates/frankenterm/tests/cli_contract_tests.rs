@@ -4567,4 +4567,3 @@ fn contract_ft_workspace_config_toml_is_discovered() {
         "FT_WORKSPACE/.ft/config.toml must be discovered by resolve_config_path"
     );
 }
-

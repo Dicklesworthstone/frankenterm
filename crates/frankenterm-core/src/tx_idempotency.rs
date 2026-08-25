@@ -6520,7 +6520,10 @@ mod tests {
             .expect("open durable store");
         let key = make_key("test-plan", &plan.steps[0].id);
         let key_hash = key.as_str().strip_prefix("txk:v2:").expect("key prefix");
-        let lock_dir = anchor.path().join(KEY_LOCK_DIR_NAME);
+        let lock_dir = anchor
+            .path()
+            .join(TX_LEDGER_DIR_NAME)
+            .join(KEY_LOCK_DIR_NAME);
         let lock_path = lock_dir.join(format!("{key_hash}.lock"));
         let target_path = anchor.path().join("unrelated-target");
         std::fs::write(&target_path, b"unrelated target").unwrap();
@@ -6540,7 +6543,10 @@ mod tests {
             .expect("open durable store");
         let key = make_key("test-plan", &plan.steps[0].id);
         let key_hash = key.as_str().strip_prefix("txk:v2:").expect("key prefix");
-        let lock_dir = anchor.path().join(KEY_LOCK_DIR_NAME);
+        let lock_dir = anchor
+            .path()
+            .join(TX_LEDGER_DIR_NAME)
+            .join(KEY_LOCK_DIR_NAME);
         let lock_path = lock_dir.join(format!("{key_hash}.lock"));
         std::fs::write(&lock_path, b"").unwrap();
         let second_link = anchor.path().join("extra.link");

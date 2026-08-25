@@ -7159,7 +7159,9 @@ mod tests {
         symlink(&external_sub, &sub_dir).unwrap();
 
         let contract_path = sub_dir.join("tx.json");
-        let err = acquire_tx_contract_lock(dir.path(), &contract_path).err().unwrap();
+        let err = acquire_tx_contract_lock(dir.path(), &contract_path)
+            .err()
+            .unwrap();
         assert_eq!(err.kind(), TxContractStoreErrorKind::Lock);
         assert!(err.to_string().contains("without following symlinks"));
     }
