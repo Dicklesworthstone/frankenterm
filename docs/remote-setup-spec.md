@@ -9,7 +9,7 @@ A guided, idempotent, non-destructive workflow to bootstrap a remote host for co
   service without rewriting or starting it through an unproved shell transaction
 - enable linger so the mux survives logout
 - optionally install the exact-build `ft` + `frankenterm-mux-server` process
-  family on the remote
+  family on the remote (e.g. `cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm`)
 
 The source also contains the systemd contract for the independent
 `frankenterm-pty-guardian` and the future one-way mux start gate. Guardian

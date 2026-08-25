@@ -341,7 +341,7 @@ restore_preserved_component() {
   fi
 }
 
-install_process_family() {
+retired_sequential_install_process_family() {
   local ft_source="$1"
   local mux_source="$2"
   local guardian_source="$3"
@@ -577,6 +577,464 @@ install_process_family() {
   fi
 }
 
+process_family_manifest_metadata() {
+  local manifest="$1"
+  local family_kind="${2:-triplet}"
+  python3 - "$manifest" "$family_kind" <<'PY'
+import json, os, re, stat, sys
+
+path, family_kind = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 4 * 1024 * 1024:
+        raise SystemExit("unsafe component manifest")
+    payload = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        payload += chunk
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+    ):
+        raise SystemExit("component manifest changed while read")
+finally:
+    os.close(fd)
+manifest = json.loads(payload)
+identity = manifest["identity"]
+keys = ("build_id", "source_revision", "version", "target", "profile", "feature_contract")
+if set(identity) != set(keys) or any(not isinstance(identity[key], str) for key in keys):
+    raise SystemExit("invalid component identity")
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest.get("manifest_id", "")):
+    raise SystemExit("invalid manifest identity")
+executables = {
+    (record.get("role"), record.get("component"), record.get("path"))
+    for record in manifest.get("files", [])
+    if record.get("kind") == "executable"
+}
+expected = {
+    ("cli", "ft", "ft"),
+    ("mux-server", "frankenterm-mux-server", "frankenterm-mux-server"),
+    ("pty-guardian", "frankenterm-pty-guardian", "frankenterm-pty-guardian"),
+}
+if family_kind == "app":
+    expected = {
+        ("gui", "frankenterm-gui", "Contents/MacOS/frankenterm-gui"),
+        ("cli", "ft", "Contents/MacOS/ft"),
+        ("mux-server", "frankenterm-mux-server", "Contents/MacOS/frankenterm-mux-server"),
+        ("pty-guardian", "frankenterm-pty-guardian", "Contents/MacOS/frankenterm-pty-guardian"),
+    }
+if executables != expected:
+    raise SystemExit("component manifest has the wrong exact executable role inventory")
+print("\t".join([manifest["manifest_id"], *(identity[key] for key in keys)]))
+PY
+}
+
+fsync_installer_tree() {
+  local root="$1"
+  python3 - "$root" <<'PY'
+import os, stat, sys
+
+root = os.path.abspath(sys.argv[1])
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+if not nofollow or not directory:
+    raise SystemExit("descriptor-relative nofollow fsync is unavailable")
+root_fd = os.open(root, os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0))
+entries = 0
+def sync_dir(fd, depth=0):
+    global entries
+    if depth > 128:
+        raise SystemExit("installer tree exceeds depth bound")
+    for name in sorted(os.listdir(fd)):
+        entries += 1
+        if entries > 1_000_000:
+            raise SystemExit("installer tree exceeds entry bound")
+        observed = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISLNK(observed.st_mode):
+            continue
+        if stat.S_ISDIR(observed.st_mode):
+            child = os.open(name, os.O_RDONLY | directory | nofollow, dir_fd=fd)
+            try:
+                sync_dir(child, depth + 1)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(observed.st_mode):
+            child = os.open(name, os.O_RDONLY | nofollow, dir_fd=fd)
+            try:
+                os.fsync(child)
+            finally:
+                os.close(child)
+        else:
+            raise SystemExit("installer tree contains a special file")
+    os.fsync(fd)
+try:
+    sync_dir(root_fd)
+finally:
+    os.close(root_fd)
+parent_fd = os.open(os.path.dirname(root), os.O_RDONLY | directory | nofollow)
+try:
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
+atomic_transition_txid() {
+  python3 - "$1" <<'PY'
+import hashlib, sys
+print(hashlib.sha256(("frankenterm.install.atomic-transition.v3\0" + sys.argv[1]).encode()).hexdigest()[:32])
+PY
+}
+
+atomic_path_content_id() {
+  local helper="$1" parent="$2" name="$3" output prefix
+  output=$("$helper" setup __atomic-path-content-id --parent "$parent" --name "$name") || return 1
+  prefix="FT_ATOMIC_PATH_CONTENT_ID_V1="
+  [[ "$output" == "$prefix"* ]] && [[ "$output" != *$'\n'* ]] || return 1
+  output="${output#"$prefix"}"
+  [[ "$output" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$output"
+}
+
+atomic_path_transition() {
+  local helper="$1" parent="$2" stage="$3" target="$4" txid="$5"
+  local stage_id="$6" target_id="$7" operation="$8" output prefix
+  output=$("$helper" setup __atomic-path-transition \
+    --parent "$parent" --stage-name "$stage" --target-name "$target" \
+    --transaction-id "$txid" --stage-content-id "$stage_id" \
+    --target-content-id "$target_id" --operation "$operation") || return 1
+  prefix="FT_ATOMIC_PATH_TRANSITION_V3=${txid}:${operation}:${stage}:${target}:"
+  [ "$output" = "${prefix}applied" ] || [ "$output" = "${prefix}already-applied" ]
+}
+
+installer_failpoint() {
+  local point="$1"
+  if [ "${FT_INSTALL_TEST_ENABLE_FAILPOINTS:-0}" = 1 ] && \
+     [ "${FT_INSTALL_TEST_FAILPOINT:-}" = "$point" ]; then
+    kill -KILL "$$"
+  fi
+}
+
+legacy_process_family_manifest() {
+  local root="$1" output="$2"
+  python3 - "$root" "$output" <<'PY'
+import hashlib, json, os, re, stat, sys
+
+root, output = sys.argv[1:]
+roles = ("ft", "frankenterm-mux-server", "frankenterm-pty-guardian")
+marker = re.compile(rb"FT_ATOMIC_COMPONENT_IDENTITY_V1:([0-9a-f]{64}):([A-Za-z0-9._+-]+):([A-Za-z0-9._+-]+):([A-Za-z0-9._+-]+):([A-Za-z0-9._+-]+);")
+records, identity = [], None
+for role in roles:
+    path = os.path.join(root, role)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 1024 * 1024 * 1024:
+            raise SystemExit("unsafe legacy process-family member")
+        data = b""
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            data += chunk
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise SystemExit("legacy process-family member changed while read")
+    finally:
+        os.close(fd)
+    found = marker.findall(data)
+    if data.count(b"FT_ATOMIC_COMPONENT_IDENTITY_V1:") != 1 or len(found) != 1:
+        raise SystemExit("legacy component must contain exactly one raw atomic marker")
+    build, found_role, target, profile, version = (item.decode() for item in found[0])
+    if found_role != role:
+        raise SystemExit("legacy component marker role mismatch")
+    normalized = (build, target, profile, version)
+    if identity is None:
+        identity = normalized
+    elif identity != normalized:
+        raise SystemExit("legacy process family is mixed")
+    records.append({"bytes": len(data), "path": role, "sha256": hashlib.sha256(data).hexdigest()})
+manifest = {
+    "files": records,
+    "identity": {"build_id": identity[0], "target": identity[1], "profile": identity[2], "version": identity[3]},
+    "schema_version": "frankenterm.legacy-process-family.v1",
+}
+encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+manifest["manifest_id"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+payload = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if output != "-":
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o444)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+print(manifest["manifest_id"])
+PY
+}
+
+verify_canonical_generation() {
+  local generation="$1" expected_version="${2:-}" metadata manifest_id build_id source_revision
+  local version target profile feature_contract verifier manifest
+  verifier="$generation/verify-components.sh"
+  manifest="$generation/process-family.component-manifest.json"
+  [ -f "$verifier" ] && [ ! -L "$verifier" ] && [ -x "$verifier" ] || return 1
+  [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 1
+  bash "$verifier" verify --root "$generation" --manifest "$manifest" >/dev/null || return 1
+  metadata=$(process_family_manifest_metadata "$manifest" triplet) || return 1
+  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract <<<"$metadata"
+  [ "$(basename "$generation")" = "${manifest_id#sha256:}" ] || return 1
+  if [ -n "$expected_version" ]; then
+    [ "$version" = "${expected_version#v}" ] || [ "$version" = "$expected_version" ] || return 1
+  fi
+  "$generation/ft" --version >/dev/null 2>&1 || return 1
+  "$generation/frankenterm-mux-server" --version >/dev/null 2>&1 || return 1
+  "$generation/frankenterm-pty-guardian" --version >/dev/null 2>&1 || return 1
+}
+
+stable_entrypoint_is_managed() {
+  local name="$1"
+  [ -L "$DEST/$name" ] && \
+    [ "$(readlink "$DEST/$name")" = ".frankenterm-process-family/current/$name" ]
+}
+
+ensure_staged_symlink() {
+  local target="$1" path="$2"
+  if [ -L "$path" ]; then
+    [ "$(readlink "$path")" = "$target" ]
+  elif [ -e "$path" ]; then
+    return 1
+  else
+    ln -s "$target" "$path"
+  fi
+}
+
+publish_stable_entrypoint() {
+  local helper="$1" name="$2" mode="$3" selected_generation="$4"
+  local txid stage stage_id target_id operation
+  if stable_entrypoint_is_managed "$name"; then
+    cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  txid=$(atomic_transition_txid "entrypoint:$DEST:$name:$selected_generation") || return 1
+  stage=".ft-entrypoint-${name}-${txid}"
+  ensure_staged_symlink ".frankenterm-process-family/current/$name" "$DEST/$stage" || return 1
+  stage_id=$(atomic_path_content_id "$helper" "$DEST" "$stage") || return 1
+  if [ "$mode" = missing ]; then
+    target_id=missing
+    operation=publish-noreplace
+  else
+    [ -f "$DEST/$name" ] && [ ! -L "$DEST/$name" ] || return 1
+    cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
+    target_id=$(atomic_path_content_id "$helper" "$DEST" "$name") || return 1
+    operation=exchange
+  fi
+  atomic_path_transition "$helper" "$DEST" "$stage" "$name" "$txid" \
+    "$stage_id" "$target_id" "$operation"
+}
+
+install_process_family() {
+  local ft_source="$1" mux_source="$2" guardian_source="$3"
+  local manifest_source="$4" verifier_source="$5"
+  local managed="$DEST/.frankenterm-process-family"
+  local generations="$DEST/.frankenterm-process-family/generations"
+  local metadata manifest_id build_id source_revision version target profile feature_contract
+  local generation_id generation stage stage_name helper="$ft_source" stage_id txid
+
+  command -v python3 >/dev/null 2>&1 || {
+    err "python3 is required for crash-atomic installation"
+    return 1
+  }
+  for source in "$ft_source" "$mux_source" "$guardian_source" "$manifest_source" "$verifier_source"; do
+    [ -f "$source" ] && [ ! -L "$source" ] || {
+      err "Unsafe process-family source: $source"
+      return 1
+    }
+  done
+  bash "$verifier_source" verify --root "$(dirname "$manifest_source")" \
+    --manifest "$manifest_source" >/dev/null || {
+      err "Atomic source family failed verification"
+      return 1
+    }
+  metadata=$(process_family_manifest_metadata "$manifest_source" triplet) || return 1
+  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract <<<"$metadata"
+  generation_id="${manifest_id#sha256:}"
+
+  mkdir -p "$managed" "$generations" || return 1
+  chmod 0700 "$managed" "$generations" || return 1
+  generation="$generations/$generation_id"
+  if [ -e "$generation" ] || [ -L "$generation" ]; then
+    [ -d "$generation" ] && [ ! -L "$generation" ] && \
+      verify_canonical_generation "$generation" "$version" || return 1
+  else
+    stage_name=".generation-${generation_id}.installing-$$"
+    stage="$generations/$stage_name"
+    [ ! -e "$stage" ] && [ ! -L "$stage" ] || return 1
+    mkdir -m 0700 "$stage" || return 1
+    install -m 0555 "$ft_source" "$stage/ft" || return 1
+    install -m 0555 "$mux_source" "$stage/frankenterm-mux-server" || return 1
+    install -m 0555 "$guardian_source" "$stage/frankenterm-pty-guardian" || return 1
+    install -m 0555 "$verifier_source" "$stage/verify-components.sh" || return 1
+    install -m 0444 "$manifest_source" "$stage/process-family.component-manifest.json" || return 1
+    bash "$stage/verify-components.sh" verify --root "$stage" \
+      --manifest "$stage/process-family.component-manifest.json" >/dev/null || return 1
+    "$stage/ft" --version >/dev/null 2>&1 || return 1
+    "$stage/frankenterm-mux-server" --version >/dev/null 2>&1 || return 1
+    "$stage/frankenterm-pty-guardian" --version >/dev/null 2>&1 || return 1
+    chmod 0555 "$stage" || return 1
+    fsync_installer_tree "$stage" || return 1
+    stage_id=$(atomic_path_content_id "$helper" "$generations" "$stage_name") || return 1
+    txid=$(atomic_transition_txid "generation:$DEST:$generation_id") || return 1
+    atomic_path_transition "$helper" "$generations" "$stage_name" "$generation_id" \
+      "$txid" "$stage_id" missing publish-noreplace || return 1
+    verify_canonical_generation "$generation" "$version" || return 1
+  fi
+  installer_failpoint after-generation-publish
+
+  local current_target="" selected_generation="" initial_install=0 legacy_migration=0
+  local direct_count=0 missing_count=0 managed_count=0 name
+  if [ -L "$managed/current" ]; then
+    current_target=$(readlink "$managed/current")
+    [[ "$current_target" =~ ^generations/([0-9a-f]{64}|legacy-[0-9a-f]{64})$ ]] || return 1
+    selected_generation="$managed/$current_target"
+    [ -d "$selected_generation" ] && [ ! -L "$selected_generation" ] || return 1
+    if [[ "$current_target" =~ ^generations/[0-9a-f]{64}$ ]]; then
+      verify_canonical_generation "$selected_generation" || return 1
+    else
+      [ -f "$selected_generation/legacy-family.json" ] || return 1
+      [ "$(legacy_process_family_manifest "$selected_generation" -)" = \
+        "sha256:${current_target##*legacy-}" ] || return 1
+    fi
+  elif [ -e "$managed/current" ]; then
+    return 1
+  fi
+  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+    if stable_entrypoint_is_managed "$name"; then
+      managed_count=$((managed_count + 1))
+    elif [ -f "$DEST/$name" ] && [ ! -L "$DEST/$name" ]; then
+      direct_count=$((direct_count + 1))
+    elif [ ! -e "$DEST/$name" ] && [ ! -L "$DEST/$name" ]; then
+      missing_count=$((missing_count + 1))
+    else
+      err "Unsafe or unmanaged stable entrypoint: $DEST/$name"
+      return 1
+    fi
+  done
+
+  if [ "$direct_count" -eq 0 ] && [ "$missing_count" -gt 0 ] && \
+     [ $((managed_count + missing_count)) -eq 3 ]; then
+    initial_install=1
+    if [ -z "$current_target" ]; then
+      [ "$missing_count" -eq 3 ] || return 1
+      selected_generation="$generation"
+      stage_name=".current-$generation_id"
+      ensure_staged_symlink "generations/$generation_id" "$managed/$stage_name" || return 1
+      stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
+      txid=$(atomic_transition_txid "selector-initial:$DEST:$generation_id") || return 1
+      atomic_path_transition "$helper" "$managed" "$stage_name" current "$txid" \
+        "$stage_id" missing publish-noreplace || return 1
+      current_target="generations/$generation_id"
+      installer_failpoint after-initial-selector
+    elif [[ ! "$current_target" =~ ^generations/[0-9a-f]{64}$ ]]; then
+      return 1
+    fi
+  elif [ "$missing_count" -ne 0 ]; then
+    err "Incomplete process-family entrypoint inventory; refusing incoherent migration"
+    return 1
+  elif [ "$direct_count" -gt 0 ]; then
+    legacy_migration=1
+    if [ -z "$current_target" ]; then
+      [ "$direct_count" -eq 3 ] && [ "$managed_count" -eq 0 ] || return 1
+      local legacy_proof="$TMP/legacy-family-proof"
+      local legacy_manifest="$TMP/legacy-family.json"
+      local legacy_manifest_id legacy_id legacy_stage_name legacy_stage
+      mkdir -m 0700 "$legacy_proof" || return 1
+      for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        install -m 0555 "$DEST/$name" "$legacy_proof/$name" || return 1
+      done
+      legacy_manifest_id=$(legacy_process_family_manifest "$legacy_proof" "$legacy_manifest") || return 1
+      legacy_id="legacy-${legacy_manifest_id#sha256:}"
+      selected_generation="$generations/$legacy_id"
+      if [ -e "$selected_generation" ] || [ -L "$selected_generation" ]; then
+        [ -d "$selected_generation" ] && [ ! -L "$selected_generation" ] || return 1
+        [ "$(legacy_process_family_manifest "$selected_generation" -)" = "$legacy_manifest_id" ] || return 1
+      else
+        legacy_stage_name=".${legacy_id}.installing-$$"
+        legacy_stage="$generations/$legacy_stage_name"
+        mkdir -m 0700 "$legacy_stage" || return 1
+        for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+          install -m 0555 "$legacy_proof/$name" "$legacy_stage/$name" || return 1
+        done
+        install -m 0444 "$legacy_manifest" "$legacy_stage/legacy-family.json" || return 1
+        chmod 0555 "$legacy_stage" || return 1
+        fsync_installer_tree "$legacy_stage" || return 1
+        stage_id=$(atomic_path_content_id "$helper" "$generations" "$legacy_stage_name") || return 1
+        txid=$(atomic_transition_txid "legacy-generation:$DEST:$legacy_id") || return 1
+        atomic_path_transition "$helper" "$generations" "$legacy_stage_name" "$legacy_id" \
+          "$txid" "$stage_id" missing publish-noreplace || return 1
+      fi
+      stage_name=".current-$legacy_id"
+      ensure_staged_symlink "generations/$legacy_id" "$managed/$stage_name" || return 1
+      stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
+      txid=$(atomic_transition_txid "selector-legacy:$DEST:$legacy_id") || return 1
+      atomic_path_transition "$helper" "$managed" "$stage_name" current "$txid" \
+        "$stage_id" missing publish-noreplace || return 1
+      current_target="generations/$legacy_id"
+      installer_failpoint after-legacy-selector
+    elif [[ ! "$current_target" =~ ^generations/legacy-[0-9a-f]{64}$ ]]; then
+      return 1
+    fi
+  elif [ "$managed_count" -ne 3 ] || [ -z "$current_target" ]; then
+    return 1
+  fi
+
+  if [ "$initial_install" -eq 1 ]; then
+    publish_stable_entrypoint "$helper" frankenterm-mux-server missing "$selected_generation" || return 1
+    installer_failpoint after-mux-entrypoint
+    publish_stable_entrypoint "$helper" frankenterm-pty-guardian missing "$selected_generation" || return 1
+    installer_failpoint after-guardian-entrypoint
+    publish_stable_entrypoint "$helper" ft missing "$selected_generation" || return 1
+    installer_failpoint after-ft-entrypoint
+  elif [ "$legacy_migration" -eq 1 ]; then
+    publish_stable_entrypoint "$helper" frankenterm-mux-server legacy "$selected_generation" || return 1
+    installer_failpoint after-mux-entrypoint
+    publish_stable_entrypoint "$helper" frankenterm-pty-guardian legacy "$selected_generation" || return 1
+    installer_failpoint after-guardian-entrypoint
+    publish_stable_entrypoint "$helper" ft legacy "$selected_generation" || return 1
+    installer_failpoint after-ft-entrypoint
+  fi
+
+  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+    stable_entrypoint_is_managed "$name" || return 1
+  done
+  installer_failpoint before-selector-switch
+  if [ "$current_target" != "generations/$generation_id" ]; then
+    stage_name=".current-${generation_id}-switch"
+    ensure_staged_symlink "generations/$generation_id" "$managed/$stage_name" || return 1
+    stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
+    local current_id
+    current_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
+    txid=$(atomic_transition_txid "selector-switch:$DEST:$current_target:$generation_id") || return 1
+    atomic_path_transition "$helper" "$managed" "$stage_name" current "$txid" \
+      "$stage_id" "$current_id" exchange || return 1
+    current_target="generations/$generation_id"
+  fi
+  installer_failpoint after-selector-switch
+  verify_canonical_generation "$managed/$current_target" "$version" || return 1
+  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+    stable_entrypoint_is_managed "$name" || return 1
+    cmp "$DEST/$name" "$managed/$current_target/$name" >/dev/null 2>&1 || return 1
+  done
+  ok "Installed atomic process-family generation $generation_id"
+  info "Previous generations and displaced entrypoints were retained for recovery"
+}
+
 check_write_permissions() {
   if [ ! -d "$DEST" ]; then
     if ! mkdir -p "$DEST" 2>/dev/null; then
@@ -622,7 +1080,7 @@ preflight_checks() {
   check_network
 }
 
-check_installed_version() {
+retired_unmanifested_check_installed_version() {
   local target_ver="$1"
   # Fail closed before invoking any installed component or entering a
   # pipeline.  A missing pipeline utility must not be discovered only after one
@@ -630,7 +1088,6 @@ check_installed_version() {
   command -v head >/dev/null 2>&1 || return 1
   command -v grep >/dev/null 2>&1 || return 1
   command -v sed >/dev/null 2>&1 || return 1
-  command -v sort >/dev/null 2>&1 || return 1
   command -v awk >/dev/null 2>&1 || return 1
   [ -f "$DEST/ft" ] && [ ! -L "$DEST/ft" ] && [ -x "$DEST/ft" ] || return 1
   [ -f "$DEST/frankenterm-mux-server" ] && \
@@ -658,15 +1115,15 @@ check_installed_version() {
   # binary exposes one sealed marker and those markers differ solely by role.
   ft_identity=$(LC_ALL=C grep -aoE \
     'FT_ATOMIC_COMPONENT_IDENTITY_V1:[0-9a-f]{64}:ft:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*;' \
-    "$DEST/ft" 2>/dev/null | sed 's/:ft:/:ROLE:/' | sort -u || true)
+    "$DEST/ft" 2>/dev/null | sed 's/:ft:/:ROLE:/' || true)
   mux_identity=$(LC_ALL=C grep -aoE \
     'FT_ATOMIC_COMPONENT_IDENTITY_V1:[0-9a-f]{64}:frankenterm-mux-server:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*;' \
     "$DEST/frankenterm-mux-server" 2>/dev/null | \
-    sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u || true)
+    sed 's/:frankenterm-mux-server:/:ROLE:/' || true)
   guardian_identity=$(LC_ALL=C grep -aoE \
     'FT_ATOMIC_COMPONENT_IDENTITY_V1:[0-9a-f]{64}:frankenterm-pty-guardian:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*;' \
     "$DEST/frankenterm-pty-guardian" 2>/dev/null | \
-    sed 's/:frankenterm-pty-guardian:/:ROLE:/' | sort -u || true)
+    sed 's/:frankenterm-pty-guardian:/:ROLE:/' || true)
   [ -n "$ft_identity" ] || return 1
   [ -n "$mux_identity" ] || return 1
   [ -n "$guardian_identity" ] || return 1
@@ -683,6 +1140,29 @@ check_installed_version() {
   identity_profile_version="${ft_identity##*:ROLE:}"
   identity_profile_version="${identity_profile_version#*:}"
   [ "$identity_profile_version" = "release-interactive:${stripped};" ]
+}
+
+check_installed_version() {
+  local target_ver="$1"
+  local managed="$DEST/.frankenterm-process-family" current_before current_after generation
+  local metadata manifest_id build_id source_revision version target profile feature_contract
+  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+    stable_entrypoint_is_managed "$name" || return 1
+  done
+  [ -L "$managed/current" ] || return 1
+  current_before=$(readlink "$managed/current") || return 1
+  [[ "$current_before" =~ ^generations/[0-9a-f]{64}$ ]] || return 1
+  generation="$managed/$current_before"
+  verify_canonical_generation "$generation" "$target_ver" || return 1
+  metadata=$(process_family_manifest_metadata \
+    "$generation/process-family.component-manifest.json" triplet) || return 1
+  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract <<<"$metadata"
+  [ "${manifest_id#sha256:}" = "${current_before#generations/}" ] || return 1
+  "$generation/ft" --version >/dev/null 2>&1 || return 1
+  "$generation/frankenterm-mux-server" --version >/dev/null 2>&1 || return 1
+  "$generation/frankenterm-pty-guardian" --version >/dev/null 2>&1 || return 1
+  current_after=$(readlink "$managed/current") || return 1
+  [ "$current_after" = "$current_before" ]
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1138,7 +1618,8 @@ build_from_source() {
   if ! mkdir "$proof_root" \
       || ! install -m 0755 "$bin" "$proof_root/ft" \
       || ! install -m 0755 "$mux_bin" "$proof_root/frankenterm-mux-server" \
-      || ! install -m 0755 "$guardian_bin" "$proof_root/frankenterm-pty-guardian"; then
+      || ! install -m 0755 "$guardian_bin" "$proof_root/frankenterm-pty-guardian" \
+      || ! install -m 0755 "$atomic_tool" "$proof_root/verify-components.sh"; then
     err "Failed to stage the source-built process family for identity proof."
     exit 1
   fi
@@ -1155,6 +1636,8 @@ build_from_source() {
       --entry executable:cli:ft:ft \
       --entry executable:mux-server:frankenterm-mux-server:frankenterm-mux-server \
       --entry executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian \
+      --entry verifier:offline-verifier:verify-components.sh \
+      --source-match verify-components.sh=scripts/atomic-component-manifest.sh \
       || ! bash "$atomic_tool" verify \
       --root "$proof_root" \
       --manifest "$proof_manifest"; then
@@ -1165,7 +1648,9 @@ build_from_source() {
   install_process_family \
     "$proof_root/ft" \
     "$proof_root/frankenterm-mux-server" \
-    "$proof_root/frankenterm-pty-guardian"
+    "$proof_root/frankenterm-pty-guardian" \
+    "$proof_manifest" \
+    "$proof_root/verify-components.sh"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1474,7 +1959,8 @@ else
     err "Refusing an incomplete install that cannot preserve PTY ownership across mux handoff"
     exit 1
   }
-  install_process_family "$BIN" "$MUX_BIN" "$GUARDIAN_BIN"
+  install_process_family "$BIN" "$MUX_BIN" "$GUARDIAN_BIN" \
+    "$COMPONENT_MANIFEST" "$COMPONENT_VERIFIER"
 fi
 
 # ───────────────────────────────────────────────────────────────────────────

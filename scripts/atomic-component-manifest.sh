@@ -409,28 +409,40 @@ class AnchoredRoot:
             digest = hashlib.sha256()
             length = 0
             carry = b""
-            marker_records: dict[tuple[str, str, str, str, str], dict[str, str]] = {}
+            marker_records: list[dict[str, str]] = []
+            marker_prefix_count = 0
             retained = bytearray() if before.st_size <= MAX_MANIFEST_BYTES else None
             while True:
                 chunk = os.read(fd, 1024 * 1024)
                 if not chunk:
                     break
+                previous_length = length
                 digest.update(chunk)
                 length += len(chunk)
                 if retained is not None:
                     retained.extend(chunk)
                 if scan_markers:
                     payload = carry + chunk
+                    payload_offset = previous_length - len(carry)
+                    prefix_offset = 0
+                    while True:
+                        prefix_offset = payload.find(MARKER_PREFIX, prefix_offset)
+                        if prefix_offset < 0:
+                            break
+                        absolute_end = payload_offset + prefix_offset + len(MARKER_PREFIX)
+                        if absolute_end > previous_length:
+                            marker_prefix_count += 1
+                            if marker_prefix_count > 1:
+                                fail(
+                                    "duplicate_component_identity_marker",
+                                    f"component {relative} contains more than one raw atomic identity marker",
+                                    path=relative,
+                                )
+                        prefix_offset += 1
                     for match in MARKER_RE.finditer(payload):
-                        decoded = decode_marker(match)
-                        key = (
-                            decoded["build_id"],
-                            decoded["component"],
-                            decoded["target"],
-                            decoded["profile"],
-                            decoded["version"],
-                        )
-                        marker_records[key] = decoded
+                        absolute_end = payload_offset + match.end()
+                        if absolute_end > previous_length:
+                            marker_records.append(decode_marker(match))
                     carry = payload[-2048:]
             after = os.fstat(fd)
             if stable_stat_identity(before) != stable_stat_identity(after) or length != before.st_size:
@@ -444,7 +456,7 @@ class AnchoredRoot:
                 sha256=digest.hexdigest(),
                 length=length,
                 executable=bool(before.st_mode & 0o111),
-                markers=tuple(marker_records[key] for key in sorted(marker_records)),
+                markers=tuple(marker_records),
                 payload=bytes(retained) if retained is not None else None,
                 identity=stable_stat_identity(before),
             )
