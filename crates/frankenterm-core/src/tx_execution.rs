@@ -2073,6 +2073,211 @@ where
     }
 }
 
+// ── Storage Adapter (ft-2j3vo) ──────────────────────────────────────────────
+
+/// Storage adapter trait for `StepAction::StoreData` execution and compensation (ft-2j3vo).
+///
+/// Implementations provide observable, atomic, and idempotent key-value mutation
+/// for transaction steps.
+pub trait TxStorageAdapter: Send + Sync {
+    /// Store a JSON value under `key`. Overwrites any existing value at `key`.
+    fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String>;
+
+    /// Retrieve the JSON value stored under `key`, if present.
+    fn get_data(&self, key: &str) -> Result<Option<serde_json::Value>, String>;
+
+    /// Delete the value stored under `key`. Returns `Ok(true)` if deleted, `Ok(false)` if not found.
+    fn delete_data(&self, key: &str) -> Result<bool, String>;
+
+    /// Check if `key` exists in the storage backend.
+    fn has_data(&self, key: &str) -> Result<bool, String> {
+        self.get_data(key).map(|v| v.is_some())
+    }
+}
+
+impl<T: TxStorageAdapter + ?Sized> TxStorageAdapter for std::sync::Arc<T> {
+    fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
+        (**self).store_data(key, value)
+    }
+
+    fn get_data(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        (**self).get_data(key)
+    }
+
+    fn delete_data(&self, key: &str) -> Result<bool, String> {
+        (**self).delete_data(key)
+    }
+
+    fn has_data(&self, key: &str) -> Result<bool, String> {
+        (**self).has_data(key)
+    }
+}
+
+/// In-memory storage adapter for `StepAction::StoreData` execution (ft-2j3vo).
+/// Thread-safe and suitable for in-process testing and ephemeral transactions.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryTxStorageAdapter {
+    entries:
+        std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>>,
+}
+
+impl InMemoryTxStorageAdapter {
+    /// Create a new empty in-memory storage adapter.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retrieve a snapshot clone of all stored key-value pairs.
+    #[must_use]
+    pub fn snapshot(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.entries.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Check the number of stored keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Check if the store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clear all stored entries.
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.entries.write() {
+            guard.clear();
+        }
+    }
+}
+
+impl TxStorageAdapter for InMemoryTxStorageAdapter {
+    fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
+        let mut guard = self
+            .entries
+            .write()
+            .map_err(|e| format!("in-memory storage lock poisoned: {e}"))?;
+        guard.insert(key.to_string(), value.clone());
+        Ok(())
+    }
+
+    fn get_data(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        let guard = self
+            .entries
+            .read()
+            .map_err(|e| format!("in-memory storage lock poisoned: {e}"))?;
+        Ok(guard.get(key).cloned())
+    }
+
+    fn delete_data(&self, key: &str) -> Result<bool, String> {
+        let mut guard = self
+            .entries
+            .write()
+            .map_err(|e| format!("in-memory storage lock poisoned: {e}"))?;
+        Ok(guard.remove(key).is_some())
+    }
+}
+
+/// Durable directory-backed JSON file storage adapter for `StepAction::StoreData` (ft-2j3vo).
+/// Writes are atomic (write to temp file, fsync, atomic rename).
+#[derive(Debug, Clone)]
+pub struct FileTxStorageAdapter {
+    dir: std::path::PathBuf,
+}
+
+impl FileTxStorageAdapter {
+    /// Create or open a directory-backed storage adapter at `dir`.
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    /// Path to the storage directory.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    fn validate_key(key: &str) -> Result<(), String> {
+        if key.is_empty() {
+            return Err("storage key cannot be empty".to_string());
+        }
+        if key.contains('/')
+            || key.contains('\\')
+            || key.contains('\0')
+            || key.starts_with('.')
+            || key == ".."
+        {
+            return Err(format!(
+                "invalid storage key '{key}': illegal characters or path traversal"
+            ));
+        }
+        Ok(())
+    }
+
+    fn key_path(&self, key: &str) -> std::path::PathBuf {
+        self.dir.join(format!("{key}.json"))
+    }
+}
+
+impl TxStorageAdapter for FileTxStorageAdapter {
+    fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
+        Self::validate_key(key)?;
+        let target = self.key_path(key);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp = self
+            .dir
+            .join(format!(".tmp_{}_{}_{}", key, std::process::id(), nanos));
+        let bytes = serde_json::to_vec_pretty(value)
+            .map_err(|e| format!("failed to serialize JSON value for '{key}': {e}"))?;
+
+        {
+            let mut f = std::fs::File::create(&temp)
+                .map_err(|e| format!("failed to create temp file for '{key}': {e}"))?;
+            use std::io::Write;
+            f.write_all(&bytes)
+                .map_err(|e| format!("failed to write data for '{key}': {e}"))?;
+            f.sync_all()
+                .map_err(|e| format!("failed to fsync temp file for '{key}': {e}"))?;
+        }
+
+        std::fs::rename(&temp, &target)
+            .map_err(|e| format!("failed to atomically commit file for '{key}': {e}"))?;
+        Ok(())
+    }
+
+    fn get_data(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        Self::validate_key(key)?;
+        let target = self.key_path(key);
+        if !target.exists() {
+            return Ok(None);
+        }
+        let f = std::fs::File::open(&target)
+            .map_err(|e| format!("failed to open file for '{key}': {e}"))?;
+        let value = serde_json::from_reader(f)
+            .map_err(|e| format!("failed to deserialize JSON value for '{key}': {e}"))?;
+        Ok(Some(value))
+    }
+
+    fn delete_data(&self, key: &str) -> Result<bool, String> {
+        Self::validate_key(key)?;
+        let target = self.key_path(key);
+        if !target.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_file(&target)
+            .map_err(|e| format!("failed to remove file for '{key}': {e}"))?;
+        Ok(true)
+    }
+}
+
 // ── Pane Step Executor ──────────────────────────────────────────────────────
 
 /// Configuration for `PaneStepExecutor` timeout and backpressure behavior.
@@ -2117,6 +2322,10 @@ pub struct PaneStepExecutor<P, A, T> {
     /// than the legacy pane-text-polling mock that aliased the signal key into
     /// the search pattern.
     external_signals: Option<std::sync::Arc<crate::workflows::ExternalSignalRegistry>>,
+    /// Optional storage adapter for `StepAction::StoreData` (ft-2j3vo).
+    /// Without one, StoreData returns an explicit unsupported error (`store_data_unwired`)
+    /// and fails closed.
+    storage_adapter: Option<std::sync::Arc<dyn TxStorageAdapter>>,
 }
 
 impl<P, A, T> PaneStepExecutor<P, A, T> {
@@ -2140,6 +2349,7 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
             config: PaneStepExecutorConfig::default(),
             fleet_controller: None,
             external_signals: None,
+            storage_adapter: None,
         }
     }
 
@@ -2170,6 +2380,13 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
         registry: std::sync::Arc<crate::workflows::ExternalSignalRegistry>,
     ) -> Self {
         self.external_signals = Some(registry);
+        self
+    }
+
+    /// Attach a storage adapter for `StepAction::StoreData` (ft-2j3vo).
+    #[must_use]
+    pub fn with_storage_adapter(mut self, adapter: std::sync::Arc<dyn TxStorageAdapter>) -> Self {
+        self.storage_adapter = Some(adapter);
         self
     }
 }
@@ -2219,6 +2436,7 @@ fn execute_step_action(
     action: &crate::plan::StepAction,
     timeout_ms: Option<u64>,
     external_signals: Option<&crate::workflows::ExternalSignalRegistry>,
+    storage_adapter: Option<&(dyn TxStorageAdapter + 'static)>,
 ) -> (bool, String, Option<String>) {
     let _ = timeout_ms; // Step-level timeout is already embedded in WaitFor's poll loop.
     // For SendText, the backend's own timeouts apply.
@@ -2393,14 +2611,26 @@ fn execute_step_action(
                 }
             }
         }
-        crate::plan::StepAction::StoreData { .. } => (
-            false,
-            "store_data_unwired".to_string(),
-            Some(
-                "FTX_STORE_DATA_UNWIRED: StoreData requires a durable storage adapter; no value was stored"
-                    .to_string(),
-            ),
-        ),
+        crate::plan::StepAction::StoreData { key, value } => {
+            let Some(storage) = storage_adapter else {
+                return (
+                    false,
+                    "store_data_unwired".to_string(),
+                    Some(
+                        "FTX_STORE_DATA_UNWIRED: StoreData requires a durable storage adapter; wire one via PaneStepExecutor::with_storage_adapter(adapter)"
+                            .to_string(),
+                    ),
+                );
+            };
+            match storage.store_data(key, value) {
+                Ok(()) => (true, "store_data_succeeded".to_string(), None),
+                Err(e) => (
+                    false,
+                    "store_data_failed".to_string(),
+                    Some(format!("FTX_STORE_DATA_FAILED: {e}")),
+                ),
+            }
+        }
         crate::plan::StepAction::AcquireLock { .. } => (
             false,
             "acquire_lock_unwired".to_string(),
@@ -2444,11 +2674,45 @@ fn execute_step_action(
             "unsupported_action".to_string(),
             Some("FTX_UNSUPPORTED: NestedPlan".to_string()),
         ),
-        crate::plan::StepAction::Custom { action_type, .. } => (
-            false,
-            "unsupported_action".to_string(),
-            Some(format!("FTX_UNSUPPORTED: Custom({action_type})")),
-        ),
+        crate::plan::StepAction::Custom {
+            action_type,
+            payload,
+        } => {
+            if action_type == "delete_data" || action_type == "delete_store_data" {
+                let Some(storage) = storage_adapter else {
+                    return (
+                        false,
+                        "delete_data_unwired".to_string(),
+                        Some(
+                            "FTX_DELETE_DATA_UNWIRED: delete_data requires a durable storage adapter; wire one via PaneStepExecutor::with_storage_adapter(adapter)"
+                                .to_string(),
+                        ),
+                    );
+                };
+                let key = payload.get("key").and_then(|k| k.as_str()).unwrap_or("");
+                if key.is_empty() {
+                    return (
+                        false,
+                        "delete_data_invalid_key".to_string(),
+                        Some("FTX_DELETE_DATA_INVALID_KEY: missing or empty 'key' in payload".to_string()),
+                    );
+                }
+                match storage.delete_data(key) {
+                    Ok(_) => (true, "delete_data_succeeded".to_string(), None),
+                    Err(e) => (
+                        false,
+                        "delete_data_failed".to_string(),
+                        Some(format!("FTX_DELETE_DATA_FAILED: {e}")),
+                    ),
+                }
+            } else {
+                (
+                    false,
+                    "unsupported_action".to_string(),
+                    Some(format!("FTX_UNSUPPORTED: Custom({action_type})")),
+                )
+            }
+        }
     }
 }
 
@@ -2597,6 +2861,7 @@ where
                 &step.action,
                 step_timeout,
                 self.external_signals.as_deref(),
+                self.storage_adapter.as_deref(),
             );
 
             tracing::info!(
@@ -2673,6 +2938,7 @@ where
                     action,
                     step_timeout,
                     self.external_signals.as_deref(),
+                    self.storage_adapter.as_deref(),
                 );
 
                 TxCompensationStepInput {
@@ -11233,7 +11499,7 @@ mod tests {
         ];
 
         for (action, expected_reason, expected_error) in cases {
-            let result = execute_step_action(&mock, &action, None, None);
+            let result = execute_step_action(&mock, &action, None, None, None);
             assert!(!result.0, "{expected_reason} must fail closed");
             assert_eq!(result.1, expected_reason);
             assert!(
@@ -12069,6 +12335,7 @@ mod tests {
             },
             None,
             None,
+            None,
         );
         assert!(!result.0, "external wait must fail without a registry");
         assert_eq!(result.1, "wait_for_external_unsupported");
@@ -12096,6 +12363,7 @@ mod tests {
             },
             None,
             Some(registry.as_ref()),
+            None,
         );
         let elapsed = start.elapsed();
         assert!(result.0, "pre-fired signal must satisfy: {:?}", result);
@@ -12127,6 +12395,7 @@ mod tests {
             },
             None,
             Some(registry.as_ref()),
+            None,
         );
         let elapsed = start.elapsed();
         assert!(result.0, "late signal must satisfy: {:?}", result);
@@ -12156,6 +12425,7 @@ mod tests {
             },
             None,
             Some(registry.as_ref()),
+            None,
         );
         let elapsed = start.elapsed();
         assert!(!result.0, "no signal must time out");
@@ -12195,11 +12465,360 @@ mod tests {
             },
             None,
             Some(registry.as_ref()),
+            None,
         );
         assert!(result.0, "external wait must succeed without a target pane");
         assert_ne!(
             result.1, "wait_for_no_pane",
             "external wait must not fall through to pane-text path"
         );
+    }
+
+    // ── StoreData storage adapter and durability tests (ft-2j3vo) ──────
+
+    #[test]
+    fn store_data_without_adapter_fails_closed() {
+        let mock = Arc::new(MockWezterm::new());
+        let executor = make_pane_executor(mock as WeztermHandle);
+        let contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "test_key".to_string(),
+                value: serde_json::json!({"foo": "bar"}),
+            },
+        )]);
+
+        let results = executor.execute_steps(&contract, None, 1000);
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].success,
+            "StoreData without adapter must fail closed"
+        );
+        assert_eq!(results[0].reason_code, "store_data_unwired");
+        assert!(
+            results[0]
+                .error_code
+                .as_deref()
+                .unwrap_or("")
+                .contains("FTX_STORE_DATA_UNWIRED"),
+            "Error code must indicate unwired storage adapter"
+        );
+    }
+
+    #[test]
+    fn store_data_in_memory_adapter_stores_and_observes_value() {
+        let mock = Arc::new(MockWezterm::new());
+        let storage = Arc::new(InMemoryTxStorageAdapter::new());
+        let executor = make_pane_executor(mock as WeztermHandle)
+            .with_storage_adapter(Arc::clone(&storage) as Arc<dyn TxStorageAdapter>);
+
+        let payload = serde_json::json!({
+            "service": "postgres",
+            "port": 5432,
+            "replica_count": 3,
+            "tags": ["db", "primary"]
+        });
+
+        let contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "service.postgres".to_string(),
+                value: payload.clone(),
+            },
+        )]);
+
+        let results = executor.execute_steps(&contract, None, 1000);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].success,
+            "StoreData with adapter must succeed: {:?}",
+            results[0]
+        );
+        assert_eq!(results[0].reason_code, "store_data_succeeded");
+
+        // Verify stored value is observable and exact
+        let stored = storage.get_data("service.postgres").unwrap();
+        assert_eq!(stored, Some(payload));
+        assert!(storage.has_data("service.postgres").unwrap());
+        assert_eq!(storage.len(), 1);
+    }
+
+    #[test]
+    fn store_data_in_memory_adapter_idempotent_retry_overwrites() {
+        let mock = Arc::new(MockWezterm::new());
+        let storage = Arc::new(InMemoryTxStorageAdapter::new());
+        let executor = make_pane_executor(mock as WeztermHandle)
+            .with_storage_adapter(Arc::clone(&storage) as Arc<dyn TxStorageAdapter>);
+
+        let v1 = serde_json::json!({"version": 1});
+        let v2 = serde_json::json!({"version": 2});
+
+        let contract1 = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "app.version".to_string(),
+                value: v1.clone(),
+            },
+        )]);
+
+        let r1 = executor.execute_steps(&contract1, None, 1000);
+        assert!(r1[0].success);
+        assert_eq!(storage.get_data("app.version").unwrap(), Some(v1));
+
+        let contract2 = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "app.version".to_string(),
+                value: v2.clone(),
+            },
+        )]);
+
+        let r2 = executor.execute_steps(&contract2, None, 1000);
+        assert!(r2[0].success);
+        assert_eq!(storage.get_data("app.version").unwrap(), Some(v2));
+    }
+
+    #[test]
+    fn store_data_file_adapter_atomic_durability() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let storage =
+            Arc::new(FileTxStorageAdapter::new(temp_dir.path()).expect("create file adapter"));
+        let mock = Arc::new(MockWezterm::new());
+        let executor = make_pane_executor(mock as WeztermHandle)
+            .with_storage_adapter(Arc::clone(&storage) as Arc<dyn TxStorageAdapter>);
+
+        let val = serde_json::json!({
+            "tx_id": "tx-12345",
+            "status": "committed",
+            "timestamp": 1720000000
+        });
+
+        let contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "tx_record_12345".to_string(),
+                value: val.clone(),
+            },
+        )]);
+
+        let results = executor.execute_steps(&contract, None, 1000);
+        assert!(results[0].success);
+
+        // Verify observable via adapter
+        assert_eq!(
+            storage.get_data("tx_record_12345").unwrap(),
+            Some(val.clone())
+        );
+
+        // Verify directly on disk as a committed JSON file
+        let file_path = temp_dir.path().join("tx_record_12345.json");
+        assert!(file_path.exists(), "Target file must exist on disk");
+        let disk_bytes = std::fs::read(&file_path).unwrap();
+        let disk_val: serde_json::Value = serde_json::from_slice(&disk_bytes).unwrap();
+        assert_eq!(disk_val, val);
+
+        // Verify no lingering temp files in directory
+        let entries = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec!["tx_record_12345.json".to_string()]);
+    }
+
+    #[test]
+    fn store_data_file_adapter_invalid_keys_rejected() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let storage =
+            Arc::new(FileTxStorageAdapter::new(temp_dir.path()).expect("create file adapter"));
+        let mock = Arc::new(MockWezterm::new());
+        let executor = make_pane_executor(mock as WeztermHandle)
+            .with_storage_adapter(Arc::clone(&storage) as Arc<dyn TxStorageAdapter>);
+
+        let invalid_keys = vec!["", "../secret", "path/to/key", "foo\\bar", ".hidden", ".."];
+
+        for key in invalid_keys {
+            let contract = make_pane_contract(vec![(
+                "s1".to_string(),
+                StepAction::StoreData {
+                    key: key.to_string(),
+                    value: serde_json::json!("data"),
+                },
+            )]);
+
+            let results = executor.execute_steps(&contract, None, 1000);
+            assert!(!results[0].success, "Invalid key '{key}' must fail closed");
+            assert_eq!(results[0].reason_code, "store_data_failed");
+        }
+    }
+
+    #[test]
+    fn store_data_compensation_restores_previous_state() {
+        let mock = Arc::new(MockWezterm::new());
+        let storage = Arc::new(InMemoryTxStorageAdapter::new());
+        // Seed initial state
+        storage
+            .store_data("cluster_mode", &serde_json::json!("standalone"))
+            .unwrap();
+
+        let executor = make_pane_executor(mock as WeztermHandle)
+            .with_storage_adapter(Arc::clone(&storage) as Arc<dyn TxStorageAdapter>);
+
+        let contract = make_pane_contract_with_compensations(
+            vec![
+                (
+                    "s1".to_string(),
+                    StepAction::StoreData {
+                        key: "cluster_mode".to_string(),
+                        value: serde_json::json!("replicated"),
+                    },
+                ),
+                (
+                    "s2".to_string(),
+                    StepAction::SendText {
+                        pane_id: 999, // Non-existent pane to trigger failure
+                        text: "invalid".to_string(),
+                        paste_mode: None,
+                    },
+                ),
+            ],
+            vec![(
+                "s1".to_string(),
+                StepAction::StoreData {
+                    key: "cluster_mode".to_string(),
+                    value: serde_json::json!("standalone"),
+                },
+            )],
+        );
+
+        // Execute commit phase (s1 succeeds, s2 fails)
+        let commit_inputs = executor.execute_steps(&contract, None, 1000);
+        assert!(commit_inputs[0].success);
+        assert!(!commit_inputs[1].success);
+
+        // While committed, value was mutated
+        assert_eq!(
+            storage.get_data("cluster_mode").unwrap(),
+            Some(serde_json::json!("replicated"))
+        );
+
+        let commit_report = crate::plan::TxCommitReport {
+            tx_id: TxId("tx-1".to_string()),
+            plan_id: TxPlanId("plan-1".to_string()),
+            outcome: crate::plan::TxCommitOutcome::PartialFailure,
+            step_results: vec![
+                crate::plan::TxCommitStepResult {
+                    step_id: TxStepId("s1".to_string()),
+                    ordinal: 0,
+                    outcome: crate::plan::TxCommitStepOutcome::Committed {
+                        reason_code: "store_data_succeeded".to_string(),
+                    },
+                    decision_path: "test".to_string(),
+                    completed_at_ms: 1000,
+                },
+                crate::plan::TxCommitStepResult {
+                    step_id: TxStepId("s2".to_string()),
+                    ordinal: 1,
+                    outcome: crate::plan::TxCommitStepOutcome::Failed {
+                        reason_code: "send_text_failed".to_string(),
+                    },
+                    decision_path: "test".to_string(),
+                    completed_at_ms: 1000,
+                },
+            ],
+            failure_boundary: Some("s2".to_string()),
+            committed_count: 1,
+            failed_count: 1,
+            skipped_count: 0,
+            decision_path: "test".to_string(),
+            reason_code: "test".to_string(),
+            error_code: None,
+            completed_at_ms: 1500,
+            receipts: Vec::new(),
+        };
+
+        // Execute compensation phase
+        let comp_inputs = executor.execute_compensations(&contract, &commit_report, None, 2000);
+        assert_eq!(comp_inputs.len(), 1);
+        assert!(comp_inputs[0].success, "Compensation must succeed");
+
+        // Stored value is restored back to standalone
+        assert_eq!(
+            storage.get_data("cluster_mode").unwrap(),
+            Some(serde_json::json!("standalone"))
+        );
+    }
+
+    #[test]
+    fn store_data_compensation_with_delete_data_removes_key() {
+        let mock = Arc::new(MockWezterm::new());
+        let storage = Arc::new(InMemoryTxStorageAdapter::new());
+        let executor = make_pane_executor(mock as WeztermHandle)
+            .with_storage_adapter(Arc::clone(&storage) as Arc<dyn TxStorageAdapter>);
+
+        let contract = make_pane_contract_with_compensations(
+            vec![
+                (
+                    "s1".to_string(),
+                    StepAction::StoreData {
+                        key: "ephemeral_lease".to_string(),
+                        value: serde_json::json!({"holder": "agent-1"}),
+                    },
+                ),
+                (
+                    "s2".to_string(),
+                    StepAction::SendText {
+                        pane_id: 999,
+                        text: "fail".to_string(),
+                        paste_mode: None,
+                    },
+                ),
+            ],
+            vec![(
+                "s1".to_string(),
+                StepAction::Custom {
+                    action_type: "delete_data".to_string(),
+                    payload: serde_json::json!({"key": "ephemeral_lease"}),
+                },
+            )],
+        );
+
+        let commit_inputs = executor.execute_steps(&contract, None, 1000);
+        assert!(commit_inputs[0].success);
+        assert!(!commit_inputs[1].success);
+
+        assert!(storage.has_data("ephemeral_lease").unwrap());
+
+        let commit_report = crate::plan::TxCommitReport {
+            tx_id: TxId("tx-1".to_string()),
+            plan_id: TxPlanId("plan-1".to_string()),
+            outcome: crate::plan::TxCommitOutcome::PartialFailure,
+            step_results: vec![crate::plan::TxCommitStepResult {
+                step_id: TxStepId("s1".to_string()),
+                ordinal: 0,
+                outcome: crate::plan::TxCommitStepOutcome::Committed {
+                    reason_code: "store_data_succeeded".to_string(),
+                },
+                decision_path: "test".to_string(),
+                completed_at_ms: 1000,
+            }],
+            failure_boundary: Some("s2".to_string()),
+            committed_count: 1,
+            failed_count: 1,
+            skipped_count: 0,
+            decision_path: "test".to_string(),
+            reason_code: "test".to_string(),
+            error_code: None,
+            completed_at_ms: 1500,
+            receipts: Vec::new(),
+        };
+
+        let comp_inputs = executor.execute_compensations(&contract, &commit_report, None, 2000);
+        assert_eq!(comp_inputs.len(), 1);
+        assert!(comp_inputs[0].success);
+        assert_eq!(comp_inputs[0].reason_code, "delete_data_succeeded");
+
+        // Key must now be deleted
+        assert!(!storage.has_data("ephemeral_lease").unwrap());
+        assert_eq!(storage.get_data("ephemeral_lease").unwrap(), None);
     }
 }

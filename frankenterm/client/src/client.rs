@@ -1278,12 +1278,12 @@ impl RpcProtocolAuthority {
         // activation. Spell the assigned legacy ranges exactly: a future PDU
         // placed in one of the historical numeric gaps must remain dormant by
         // default instead of inheriting authority from a broad `<=` cutoff.
-        // Above the legacy surface, only the fenced-topology trio and the
+        // Above the legacy surface, only the fenced-topology trio, the
         // explicitly coordinated reliable-input request/reply and sampled
-        // paste request are active.
+        // paste request, and the reliable-pane-write request/reply are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=99
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=101
         )
     }
 
@@ -3447,9 +3447,9 @@ impl ClientDispatchAuthority {
         Self {
             target,
             client_incarnation,
-            connection_generation,
+            connection_generation: Arc::clone(&connection_generation),
             rpc_transport,
-            generation: INITIAL_CONNECTION_GENERATION,
+            generation: connection_generation.load(AtomicOrdering::Acquire),
         }
     }
 
@@ -12267,7 +12267,7 @@ mod tests {
         expected.push(20);
         expected.extend(22..=78);
         expected.extend(81..=83);
-        expected.extend(96..=99);
+        expected.extend(96..=101);
 
         let actual = Pdu::all_wire_specs()
             .iter()
@@ -17048,16 +17048,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reliable_pane_write_round_trips_real_reader() {
-        let _wd = hang_watchdog(12, "remote pane write RPC round-trip", 96);
+        let _wd = hang_watchdog(15, "remote pane write RPC round-trip", 96);
 
-        let socket_path = unique_handshake_socket_path();
-        let listener = UnixListener::bind(&socket_path).expect("bind local UDS mux server");
+        let (client_stream, mut server_stream) =
+            UnixStream::pair().expect("create pane-write socket pair");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound pane-write server reads");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("bound pane-write server writes");
+
         let server = std::thread::Builder::new()
             .name("ft-pane-write-server".to_string())
             .spawn(move || -> anyhow::Result<()> {
-                let (mut stream, _addr) = listener.accept().context("accept mux client")?;
                 loop {
-                    let decoded = Pdu::decode(&mut stream).context("server decode client PDU")?;
+                    let decoded =
+                        Pdu::decode(&mut server_stream).context("server decode client PDU")?;
                     let (response, done) = match decoded.pdu {
                         Pdu::GetCodecVersion(_) => (
                             Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
@@ -17084,9 +17091,9 @@ mod tests {
                         other => panic!("unexpected client PDU: {}", other.pdu_name()),
                     };
                     response
-                        .encode(&mut stream, decoded.serial)
+                        .encode(&mut server_stream, decoded.serial)
                         .context("server encode response PDU")?;
-                    stream.flush().context("server flush response PDU")?;
+                    Write::flush(&mut server_stream).context("server flush response PDU")?;
                     if done {
                         break;
                     }
@@ -17095,19 +17102,16 @@ mod tests {
             })
             .expect("spawn pane-write UDS server");
 
-        let mut ui = ConnectionUI::new_headless();
-        let unix_domain = UnixDomain {
+        let ui = ConnectionUI::new_headless();
+        let client_domain_config = ClientDomainConfig::Unix(UnixDomain {
             name: "ft-pane-write".to_string(),
-            socket_path: Some(socket_path),
             no_serve_automatically: true,
             read_timeout: Duration::from_secs(5),
             write_timeout: Duration::from_secs(5),
             ..Default::default()
-        };
-        let mut reconnectable = Reconnectable::new(ClientDomainConfig::Unix(unix_domain), None);
-        reconnectable
-            .connect(true, &mut ui, true)
-            .expect("connect to local UDS server");
+        });
+        let mut reconnectable =
+            Reconnectable::new(client_domain_config.clone(), Some(Box::new(client_stream)));
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();

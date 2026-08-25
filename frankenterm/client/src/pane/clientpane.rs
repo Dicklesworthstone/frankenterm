@@ -4019,12 +4019,12 @@ mod tests {
     const SUCCESSOR_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
         RenderConnectionIdentity::new(
             TopologyStreamId::from_bytes([0x79; 16]),
-            MuxSessionIncarnation::from_bytes([0x9b; 16]),
+            TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
         );
     const ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
         RenderConnectionIdentity::new(
             TopologyStreamId::from_bytes([0x7a; 16]),
-            MuxSessionIncarnation::from_bytes([0x9b; 16]),
+            TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
         );
     const SERVER_RESTART_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
         RenderConnectionIdentity::new(
