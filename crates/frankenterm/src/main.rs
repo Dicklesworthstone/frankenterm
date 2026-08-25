@@ -103826,11 +103826,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
     }
 
     #[cfg(unix)]
-    fn write_installer_atomic_helper_fixture(
-        path: &Path,
-        build_id: &str,
-        target: &str,
-    ) {
+    fn write_installer_atomic_helper_fixture(path: &Path, build_id: &str, target: &str) {
         use std::os::unix::fs::PermissionsExt as _;
 
         let mut source = format!(
@@ -104014,12 +104010,7 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             if failpoint.is_empty() { "0" } else { "1" },
             shell_single_quote(failpoint),
             shell_single_quote(&family.root.join("ft").to_string_lossy()),
-            shell_single_quote(
-                &family
-                    .root
-                    .join("frankenterm-mux-server")
-                    .to_string_lossy()
-            ),
+            shell_single_quote(&family.root.join("frankenterm-mux-server").to_string_lossy()),
             shell_single_quote(
                 &family
                     .root
@@ -104055,7 +104046,10 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
                 assert!(!path.exists(), "first-install link must remain dangling");
             }
             assert!(
-                std::process::Command::new(&path).arg("--version").status().is_err(),
+                std::process::Command::new(&path)
+                    .arg("--version")
+                    .status()
+                    .is_err(),
                 "partial first-install namespace unexpectedly executed {name}"
             );
         }
@@ -104099,11 +104093,7 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
     }
 
     #[cfg(unix)]
-    fn create_installer_test_app(
-        root: &Path,
-        build_id: &str,
-        target: &str,
-    ) -> InstallerTestApp {
+    fn create_installer_test_app(root: &Path, build_id: &str, target: &str) -> InstallerTestApp {
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -104170,10 +104160,9 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             "app manifest generation failed: {}",
             String::from_utf8_lossy(&generated.stderr)
         );
-        let manifest_value: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&manifest).expect("read generated app manifest"),
-        )
-        .expect("parse generated app manifest");
+        let manifest_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).expect("read generated app manifest"))
+                .expect("parse generated app manifest");
         let app_id = manifest_value["manifest_id"]
             .as_str()
             .and_then(|value| value.strip_prefix("sha256:"))
@@ -104587,6 +104576,335 @@ esac
                 assert!(installer_residue_count(&destination) <= 4);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_staged_file_resumes_only_zero_or_exact_prefix_residue() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create staged-file recovery fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let source = fixture.path().join("source");
+        let expected = b"one exact resumable staged file\n";
+        std::fs::write(&source, expected).expect("write staged-file source");
+        let parent = fixture.path().join("stage");
+        std::fs::create_dir(&parent).expect("create staged-file parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make staged-file parent private");
+        let run = |target: &Path| {
+            let script = format!(
+                "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nensure_exact_staged_file {} {} 0555\n",
+                shell_single_quote(&installer.to_string_lossy()),
+                shell_single_quote(&source.to_string_lossy()),
+                shell_single_quote(&target.to_string_lossy()),
+            );
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("execute staged-file materializer")
+        };
+
+        for (name, prefix_len, mode) in [
+            ("zero", 0usize, 0o600),
+            ("prefix", expected.len() / 2, 0o555),
+        ] {
+            let target = parent.join(name);
+            std::fs::write(&target, &expected[..prefix_len]).expect("plant resumable prefix");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+                .expect("set resumable prefix mode");
+            let resumed = run(&target);
+            assert!(
+                resumed.status.success(),
+                "{name} prefix did not resume: {}",
+                String::from_utf8_lossy(&resumed.stderr)
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), expected);
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                0o555
+            );
+        }
+
+        let conflict = parent.join("conflict");
+        let conflicting_bytes = vec![b'x'; expected.len()];
+        std::fs::write(&conflict, &conflicting_bytes).expect("plant conflicting full stage");
+        std::fs::set_permissions(&conflict, std::fs::Permissions::from_mode(0o555))
+            .expect("seal conflicting full stage");
+        let rejected = run(&conflict);
+        assert!(!rejected.status.success());
+        assert_eq!(std::fs::read(&conflict).unwrap(), conflicting_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_app_failpoints_and_partial_tree_retries_preserve_one_live_bundle() {
+        use std::os::unix::fs::{ExitStatusExt as _, PermissionsExt as _};
+
+        let fixture = tempfile::tempdir().expect("create app failpoint fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let build_id = "c".repeat(64);
+        let target = "aarch64-apple-darwin";
+        let family = create_installer_test_family(
+            &fixture.path().join("standalone-family"),
+            &build_id,
+            target,
+            "application-family-gui-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let destination = fixture.path().join("bin");
+        std::fs::create_dir(&destination).expect("create standalone app-test destination");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make standalone app-test destination private");
+        let installed = run_installer_family_function(
+            &installer,
+            &family,
+            &destination,
+            &fixture.path().join("standalone-install-scratch"),
+            None,
+        );
+        assert!(
+            installed.status.success(),
+            "standalone app-test family failed to install: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let app = create_installer_test_app(
+            &fixture.path().join("app-release"),
+            &build_id,
+            target,
+        );
+        let fake_tools = fixture.path().join("fake-app-tools");
+        write_installer_fake_download_tools(&fake_tools);
+
+        let verify_live = |app_destination: &Path| {
+            let retained_manifest = app_destination
+                .join(".frankenterm-app-manifests")
+                .join(format!("{}.json", app.app_id));
+            let verified = std::process::Command::new("bash")
+                .arg(&family.verifier)
+                .arg("verify")
+                .arg("--root")
+                .arg(app_destination.join("FrankenTerm.app"))
+                .arg("--manifest")
+                .arg(retained_manifest)
+                .output()
+                .expect("verify installed app fixture");
+            assert!(
+                verified.status.success(),
+                "installed app did not match retained manifest: {}",
+                String::from_utf8_lossy(&verified.stderr)
+            );
+        };
+        let plant_old = |app_destination: &Path| {
+            std::fs::create_dir_all(app_destination.join("FrankenTerm.app"))
+                .expect("plant prior app directory");
+            std::fs::write(
+                app_destination.join("FrankenTerm.app/old-generation.txt"),
+                b"retained old app generation\n",
+            )
+            .expect("plant prior app bytes");
+        };
+
+        for (index, (failpoint, switched)) in [
+            ("before-app-selector-switch", false),
+            ("after-app-selector-switch", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let app_destination = fixture.path().join(format!("app-{index}-{failpoint}"));
+            std::fs::create_dir(&app_destination).expect("create app failpoint destination");
+            std::fs::set_permissions(
+                &app_destination,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .expect("make app failpoint destination private");
+            plant_old(&app_destination);
+            let interrupted = run_installer_app_function(
+                &installer,
+                &family,
+                &destination,
+                &app,
+                &app_destination,
+                &fixture.path().join(format!("app-{index}-interrupted")),
+                &fake_tools,
+                Some(failpoint),
+                None,
+            );
+            assert_eq!(
+                interrupted.status.signal(),
+                Some(9),
+                "app failpoint {failpoint} did not kill at its boundary: {}",
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            if switched {
+                verify_live(&app_destination);
+                assert!(
+                    app_destination
+                        .join(format!(
+                            ".FrankenTerm.app.installing-{}/old-generation.txt",
+                            app.app_id
+                        ))
+                        .is_file(),
+                    "atomic app exchange did not retain the old bundle"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(app_destination.join("FrankenTerm.app/old-generation.txt"))
+                        .unwrap(),
+                    b"retained old app generation\n"
+                );
+            }
+            let replay = run_installer_app_function(
+                &installer,
+                &family,
+                &destination,
+                &app,
+                &app_destination,
+                &fixture.path().join(format!("app-{index}-retry")),
+                &fake_tools,
+                None,
+                None,
+            );
+            assert!(
+                replay.status.success(),
+                "app retry after {failpoint} failed: {}",
+                String::from_utf8_lossy(&replay.stderr)
+            );
+            verify_live(&app_destination);
+        }
+
+        let mid_tree_destination = fixture.path().join("app-mid-tree");
+        std::fs::create_dir(&mid_tree_destination).expect("create mid-tree app destination");
+        std::fs::set_permissions(
+            &mid_tree_destination,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make mid-tree app destination private");
+        plant_old(&mid_tree_destination);
+        let interrupted = run_installer_app_function(
+            &installer,
+            &family,
+            &destination,
+            &app,
+            &mid_tree_destination,
+            &fixture.path().join("app-mid-tree-interrupted"),
+            &fake_tools,
+            None,
+            Some(1),
+        );
+        assert_eq!(
+            interrupted.status.signal(),
+            Some(9),
+            "mid-tree materialization failpoint did not kill the installer: {}",
+            String::from_utf8_lossy(&interrupted.stderr)
+        );
+        assert!(
+            mid_tree_destination
+                .join(format!(".FrankenTerm.app.installing-{}", app.app_id))
+                .is_dir()
+        );
+        assert!(
+            mid_tree_destination
+                .join("FrankenTerm.app/old-generation.txt")
+                .is_file(),
+            "mid-tree crash changed the live app before the atomic exchange"
+        );
+        let replay = run_installer_app_function(
+            &installer,
+            &family,
+            &destination,
+            &app,
+            &mid_tree_destination,
+            &fixture.path().join("app-mid-tree-retry"),
+            &fake_tools,
+            None,
+            None,
+        );
+        assert!(
+            replay.status.success(),
+            "mid-tree app retry failed: {}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        verify_live(&mid_tree_destination);
+
+        let source_ft = std::fs::read(app.app_root.join("Contents/MacOS/ft"))
+            .expect("read source app ft fixture");
+        for (index, prefix_len) in [0usize, source_ft.len() / 2].into_iter().enumerate() {
+            let app_destination = fixture.path().join(format!("app-prefix-{index}"));
+            std::fs::create_dir(&app_destination).expect("create app prefix destination");
+            std::fs::set_permissions(
+                &app_destination,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .expect("make app prefix destination private");
+            plant_old(&app_destination);
+            let prefix_path = app_destination.join(format!(
+                ".FrankenTerm.app.installing-{}/Contents/MacOS/ft",
+                app.app_id
+            ));
+            std::fs::create_dir_all(prefix_path.parent().unwrap())
+                .expect("create partial app tree directories");
+            std::fs::write(&prefix_path, &source_ft[..prefix_len])
+                .expect("plant exact app file prefix");
+            std::fs::set_permissions(&prefix_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set resumable app prefix mode");
+            let replay = run_installer_app_function(
+                &installer,
+                &family,
+                &destination,
+                &app,
+                &app_destination,
+                &fixture.path().join(format!("app-prefix-{index}-retry")),
+                &fake_tools,
+                None,
+                None,
+            );
+            assert!(
+                replay.status.success(),
+                "app prefix retry failed: {}",
+                String::from_utf8_lossy(&replay.stderr)
+            );
+            verify_live(&app_destination);
+        }
+
+        let conflict_destination = fixture.path().join("app-conflict");
+        std::fs::create_dir(&conflict_destination).expect("create app conflict destination");
+        std::fs::set_permissions(
+            &conflict_destination,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make app conflict destination private");
+        plant_old(&conflict_destination);
+        let conflict_path = conflict_destination.join(format!(
+            ".FrankenTerm.app.installing-{}/Contents/MacOS/ft",
+            app.app_id
+        ));
+        std::fs::create_dir_all(conflict_path.parent().unwrap())
+            .expect("create conflicting app tree directories");
+        let mut conflicting = source_ft.clone();
+        conflicting[0] ^= 0xff;
+        std::fs::write(&conflict_path, &conflicting).expect("plant conflicting app bytes");
+        std::fs::set_permissions(&conflict_path, std::fs::Permissions::from_mode(0o555))
+            .expect("seal conflicting app bytes");
+        let rejected = run_installer_app_function(
+            &installer,
+            &family,
+            &destination,
+            &app,
+            &conflict_destination,
+            &fixture.path().join("app-conflict-retry"),
+            &fake_tools,
+            None,
+            None,
+        );
+        assert!(rejected.status.success(), "app installer warns and skips safely");
+        assert_eq!(
+            std::fs::read(conflict_destination.join("FrankenTerm.app/old-generation.txt"))
+                .unwrap(),
+            b"retained old app generation\n"
+        );
+        assert_eq!(std::fs::read(&conflict_path).unwrap(), conflicting);
     }
 
     #[cfg(unix)]
