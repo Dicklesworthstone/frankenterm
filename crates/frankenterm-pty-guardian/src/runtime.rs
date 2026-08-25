@@ -2482,6 +2482,57 @@ mod tests {
     }
 
     #[test]
+    fn production_checkpoint_worker_is_bounded_wipes_and_keeps_publication_disabled() {
+        let source = include_str!("runtime.rs");
+        let worker_source = source
+            .split("fn checkpoint_worker(")
+            .nth(1)
+            .and_then(|source| source.split("fn execute_checkpoint_job").next())
+            .expect("checkpoint_worker production body is present");
+        let worker_boundary = |needle: &str| {
+            worker_source
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing checkpoint-worker boundary: {needle}"))
+        };
+        let worker_boundaries = [
+            worker_boundary("catch_guardian_checkpoint_worker_panic"),
+            worker_boundary("job.request.zeroize_payload();"),
+            worker_boundary("let completion = CheckpointWorkerCompletion"),
+            worker_boundary("completions.send(completion)"),
+        ];
+        assert!(worker_boundaries.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let execution_source = source
+            .split("fn execute_checkpoint_job")
+            .nth(1)
+            .and_then(|source| source.split("fn input_worker").next())
+            .expect("execute_checkpoint_job production body is present");
+        assert!(execution_source.contains("preflight_checkpoint_stage"));
+        assert!(execution_source.contains("store.apply_begin(&stage)"));
+        assert!(execution_source.contains("store.apply_chunk(stage)"));
+        assert!(execution_source.contains("store.apply_query(stage)"));
+        assert!(!execution_source.contains("store.apply_seal"));
+        assert!(!execution_source.contains("store.apply_ack"));
+        assert!(
+            execution_source.contains(
+                "GuardianCheckpointStageKindV1::Seal | GuardianCheckpointStageKindV1::Ack"
+            )
+        );
+
+        let pipeline_source = source
+            .split("impl GuardianCheckpointPipeline")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("impl Drop for GuardianCheckpointPipeline")
+                    .next()
+            })
+            .expect("checkpoint pipeline production body is present");
+        assert!(pipeline_source.contains("sync_channel(CHECKPOINT_WORKER_QUEUE_CAPACITY)"));
+        assert_eq!(CHECKPOINT_WORKER_QUEUE_CAPACITY, 1);
+    }
+
+    #[test]
     fn saturated_input_pipeline_returns_an_owned_wipe_on_drop_request() {
         fn take_job(
             runtime: &mut GuardianRuntime,

@@ -3309,6 +3309,33 @@ mod tests {
     }
 
     #[test]
+    fn delayed_checkpoint_completion_cannot_route_to_a_recycled_connection_token() {
+        let original = GuardianCheckpointRoute::new(Token(7), 11, Uuid::from_u128(12)).unwrap();
+        let recycled = GuardianCheckpointRoute::new(Token(7), 12, Uuid::from_u128(12)).unwrap();
+        let aliased_request =
+            GuardianCheckpointRoute::new(Token(7), 11, Uuid::from_u128(13)).unwrap();
+
+        assert!(pending_checkpoint_route_matches(
+            11,
+            Some(original),
+            original
+        ));
+        assert!(!pending_checkpoint_route_matches(
+            12,
+            Some(recycled),
+            original,
+        ));
+        assert!(!pending_checkpoint_route_matches(
+            11,
+            Some(aliased_request),
+            original,
+        ));
+        assert!(!pending_checkpoint_route_matches(11, None, original));
+        assert!(GuardianCheckpointRoute::new(Token(7), 0, Uuid::from_u128(12)).is_none());
+        assert!(GuardianCheckpointRoute::new(Token(7), 11, Uuid::nil()).is_none());
+    }
+
+    #[test]
     fn lifecycle_epochs_order_delayed_hello_and_exact_recycled_membership() {
         let mux_incarnation = Uuid::from_u128(201);
         let other_mux = Uuid::from_u128(202);
@@ -3561,6 +3588,9 @@ mod tests {
         let handle_input_completions = poll_once_source
             .find("self.handle_input_completions();")
             .expect("input authority restoration is wired into poll_once");
+        let handle_checkpoint_completions = poll_once_source
+            .find("self.handle_checkpoint_completions();")
+            .expect("checkpoint authority restoration is wired into poll_once");
         let accept_batch = poll_once_source
             .find("self.accept_connections()?;")
             .expect("listener accept batch is wired into poll_once");
@@ -3593,7 +3623,9 @@ mod tests {
             service_source.contains(".observe_disconnect(identity, connection.mux_incarnation)")
         );
         assert!(accept_batch < connection_event_loop);
+        assert!(handle_input_completions < handle_checkpoint_completions);
         assert!(authentication_expiry > handle_input_completions);
+        assert!(authentication_expiry > handle_checkpoint_completions);
         assert!(retirement_replay > authentication_expiry);
         assert_eq!(
             poll_once_source
