@@ -67,8 +67,8 @@ fn stress_200_panes_full_lifecycle_no_leak() {
     // Acceptance: zero residual state
     assert!(registry.is_empty());
     assert_eq!(registry.count(), 0);
-    assert!(registry.snapshot().is_empty());
-    assert!(registry.stats_snapshot().is_empty());
+    assert_eq!(registry.snapshot(), [] as [frankenterm_alloc::PaneArena; 0]);
+    assert_eq!(registry.stats_snapshot(), [] as [frankenterm_alloc::PaneArenaSnapshot; 0]);
 }
 
 /// 10 rounds of create-all/destroy-all at 200-pane scale.

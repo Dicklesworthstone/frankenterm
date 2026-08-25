@@ -1968,7 +1968,7 @@ mod tests {
         let result = r.redact_bytes_with_evidence(b"");
         assert!(result.evidence.redactor_applied());
         assert!(!result.evidence.made_changes());
-        assert!(result.bytes.is_empty());
+        assert_eq!(result.bytes, [] as [u8; 0]);
         assert_eq!(result.evidence, BytesRedactionEvidence::default());
     }
 
@@ -1979,7 +1979,7 @@ mod tests {
         let mut streaming = StreamingRedactor::new();
 
         let first = streaming.redact_chunk(&secret[..split]);
-        assert!(first.bytes.is_empty());
+        assert_eq!(first.bytes, [] as [u8; 0]);
         assert_eq!(first.evidence.original_input_bytes, 0);
         assert_eq!(first.evidence.redacted_output_bytes, 0);
         assert_eq!(first.evidence.replacement_count, 0);
@@ -2054,7 +2054,7 @@ mod tests {
             Redactor::new().redact(&input)
         );
         assert_eq!(streaming.pending_bytes(), 0);
-        assert!(streaming.finish().bytes.is_empty());
+        assert_eq!(streaming.finish().bytes, [] as [u8; 0]);
     }
 
     #[test]
@@ -2491,7 +2491,7 @@ mod tests {
     fn streaming_redactor_emits_prefix_and_keeps_bounded_tail() {
         let mut streaming = StreamingRedactor::new().with_tail_bytes(8);
         let first = streaming.redact_chunk(b"plain text with no secret");
-        assert!(!first.bytes.is_empty());
+        assert_ne!(first.bytes, [] as [u8; 0]);
         // Retention here is anchor-driven ("secret" = 6 bytes), so it stays
         // under 8 even though the effective scan window is now floored to
         // `STREAMING_ANCHOR_TAIL_FLOOR`.

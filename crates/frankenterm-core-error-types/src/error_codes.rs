@@ -1444,7 +1444,7 @@ mod tests {
     fn format_plain_is_nonempty() {
         for def in ERROR_CATALOG.values() {
             let formatted = def.format_plain();
-            assert!(!formatted.is_empty());
+            assert_ne!(formatted, "");
             assert!(formatted.contains(def.code));
             assert!(formatted.contains(def.title));
         }

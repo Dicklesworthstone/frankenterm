@@ -1486,7 +1486,7 @@ mod tests {
         let m = default_manager();
 
         assert!(!m.is_pane_paused(1));
-        assert!(m.paused_pane_ids().is_empty());
+        assert_eq!(m.paused_pane_ids(), [] as [u64; 0]);
 
         m.pause_pane(1);
         m.pause_pane(3);
@@ -1500,7 +1500,7 @@ mod tests {
         assert!(m.is_pane_paused(3));
 
         m.resume_all_panes();
-        assert!(m.paused_pane_ids().is_empty());
+        assert_eq!(m.paused_pane_ids(), [] as [u64; 0]);
     }
 
     #[test]
@@ -1832,7 +1832,7 @@ mod tests {
     fn resume_nonexistent_pane_is_no_op() {
         let m = default_manager();
         m.resume_pane(42); // should not panic
-        assert!(m.paused_pane_ids().is_empty());
+        assert_eq!(m.paused_pane_ids(), [] as [u64; 0]);
     }
 
     #[test]
@@ -1876,7 +1876,7 @@ mod tests {
         let d = depths(10, 1024, 100, 10_000);
         let snap = m.snapshot(&d);
         assert_eq!(snap.tier, BackpressureTier::Green);
-        assert!(snap.paused_panes.is_empty());
+        assert_eq!(snap.paused_panes, [] as [u64; 0]);
         assert_eq!(snap.transitions, 0);
         assert!(snap.timestamp_epoch_ms > 0);
     }
@@ -2187,6 +2187,6 @@ mod tests {
 
         let transition_event = &artifact.events[2];
         assert_eq!(transition_event.timestamp_ms, 3011);
-        assert!(!transition_event.evidence.is_empty());
+        assert_ne!(transition_event.evidence, [] as [crate::backpressure::BackpressureTimelineEvidence; 0]);
     }
 }

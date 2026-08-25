@@ -1705,7 +1705,7 @@ mod tests {
         assert!(plan.report_only);
         assert!(!plan.mutates);
         assert!(!plan.hides_safety_critical_blockers);
-        assert!(plan.signals.is_empty());
+        assert_eq!(plan.signals, [] as [CognitiveLoadSignal; 0]);
         assert!(has_cognitive_action(
             &plan,
             CognitiveLoadSheddingAction::Continue
@@ -1815,7 +1815,7 @@ mod tests {
         let report = decision_report(&declarations, &source_files, &[]);
 
         assert!(!report.passed);
-        assert!(report.records[0].production_callers.is_empty());
+        assert_eq!(report.records[0].production_callers, [] as [DecisionApiCaller; 0]);
         assert_eq!(report.records[0].status, DecisionApiWiringStatus::Deadwire);
     }
 
@@ -1965,7 +1965,7 @@ mod tests {
                 beta1: 0
             }]
         );
-        assert!(persistence_diagram(&image).features.is_empty());
+        assert_eq!(persistence_diagram(&image).features, [] as [PersistenceFeature; 0]);
     }
 
     #[test]

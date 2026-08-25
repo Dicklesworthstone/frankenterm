@@ -485,7 +485,7 @@ mod tests {
         let released = registry.release(17).expect("pane arena should exist");
         assert_eq!(released, arena);
         assert!(registry.stats(17).is_none());
-        assert!(registry.stats_snapshot().is_empty());
+        assert_eq!(registry.stats_snapshot(), [] as [PaneArenaSnapshot; 0]);
     }
 
     #[test]

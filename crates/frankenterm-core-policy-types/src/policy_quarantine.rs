@@ -1127,7 +1127,7 @@ mod tests {
 
         // Complete probation
         reg.complete_probation("conn-1", 3000).unwrap();
-        assert!(reg.probationary_components().is_empty());
+        assert_eq!(reg.probationary_components(), [] as [std::string::String; 0]);
         assert_eq!(reg.get("conn-1").unwrap().state, QuarantineState::Clear);
     }
 
@@ -1232,7 +1232,7 @@ mod tests {
         .unwrap();
 
         let expired = reg.expire_quarantines(4999);
-        assert!(expired.is_empty());
+        assert_eq!(expired, [] as [std::string::String; 0]);
 
         let expired = reg.expire_quarantines(5000);
         assert_eq!(expired, vec!["c1"]);
@@ -1353,7 +1353,7 @@ mod tests {
         .unwrap();
 
         let expired = reg.expire_quarantines(u64::MAX);
-        assert!(expired.is_empty());
+        assert_eq!(expired, [] as [std::string::String; 0]);
         assert!(reg.is_quarantined("c1"));
     }
 
@@ -1632,7 +1632,7 @@ mod tests {
     #[test]
     fn default_registry() {
         let reg = QuarantineRegistry::default();
-        assert!(reg.active_quarantines().is_empty());
+        assert_eq!(reg.active_quarantines(), [] as [std::string::String; 0]);
         assert!(reg.kill_switch().allows_new_workflows());
     }
 

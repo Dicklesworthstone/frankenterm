@@ -704,8 +704,8 @@ mod tests {
         assert_eq!(entry.sequence, 0);
         assert_eq!(entry.kind, AuditEntryKind::PolicyDecision);
         assert_eq!(entry.previous_hash, "");
-        assert!(!entry.content_hash.is_empty());
-        assert!(!entry.chain_hash.is_empty());
+        assert_ne!(entry.content_hash, "");
+        assert_ne!(entry.chain_hash, "");
         assert_eq!(chain.len(), 1);
     }
 
@@ -1233,7 +1233,7 @@ mod tests {
         ];
         for case in cases {
             let s = case.to_string();
-            assert!(!s.is_empty());
+            assert_ne!(s, "");
             assert!(s.contains("audit chain"), "msg: {s}");
         }
     }
