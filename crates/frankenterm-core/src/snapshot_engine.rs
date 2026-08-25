@@ -7475,14 +7475,15 @@ fn load_verified_checkpoint_for_artifact(
                 "checkpoint contains a negative pane ID".to_string(),
             )
         })?;
-    if topology.pane_count() != checkpoint.pane_count
-        || topology.pane_ids() != persisted_pane_ids
-    {
+    let mut topology_pane_ids = topology.pane_ids();
+    topology_pane_ids.sort_unstable();
+    if topology.pane_count() != checkpoint.pane_count || topology_pane_ids != persisted_pane_ids {
         return Err(CheckpointScrollbackArtifactError::Checkpoint(
             "checkpoint topology and pane projection disagree".to_string(),
         ));
     }
 
+    let metadata_json = checkpoint.metadata_json().map(str::to_owned);
     let panes = persisted_panes
         .into_iter()
         .map(artifact_pane_from_persisted)
@@ -7494,7 +7495,7 @@ fn load_verified_checkpoint_for_artifact(
         checkpoint_type: checkpoint.checkpoint_type,
         checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
         state_hash: checkpoint.state_hash,
-        metadata_json: checkpoint.metadata_json().map(str::to_owned),
+        metadata_json,
         topology_sha256: checkpoint_artifact_sha256(topology_json.as_bytes()),
         topology_json,
         pane_count: checkpoint.pane_count,
@@ -8240,6 +8241,336 @@ fn verify_checkpoint_artifact_json_structure(
         ))
     })?;
     deserializer.end()?;
+    Ok(())
+}
+
+fn validate_checkpoint_scrollback_checkpoint(
+    checkpoint: &CheckpointScrollbackCheckpoint,
+    limits: CheckpointScrollbackArtifactLimits,
+    redactor: &crate::redactor::Redactor,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    if checkpoint.checkpoint_id < 0
+        || checkpoint.checkpoint_role != CHECKPOINT_ROLE_SNAPSHOT
+        || !checkpoint.state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX)
+        || checkpoint.pane_count != checkpoint.panes.len()
+        || checkpoint.pane_count > limits.max_panes
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint identity, role, or pane count is invalid".to_string(),
+        ));
+    }
+    if checkpoint.topology_sha256 != checkpoint_artifact_sha256(checkpoint.topology_json.as_bytes())
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint topology checksum mismatch".to_string(),
+        ));
+    }
+    let topology = TopologySnapshot::from_json(&checkpoint.topology_json).map_err(|error| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(format!(
+            "checkpoint topology is invalid: {error}"
+        ))
+    })?;
+    let mut prior_pane_id = None;
+    for pane in &checkpoint.panes {
+        if prior_pane_id.is_some_and(|previous| previous >= pane.pane_id) {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "checkpoint panes are not a unique ascending set".to_string(),
+            ));
+        }
+        prior_pane_id = Some(pane.pane_id);
+    }
+    let pane_ids = checkpoint
+        .panes
+        .iter()
+        .map(|pane| pane.pane_id)
+        .collect::<Vec<_>>();
+    let mut topology_pane_ids = topology.pane_ids();
+    topology_pane_ids.sort_unstable();
+    if topology.pane_count() != checkpoint.pane_count || topology_pane_ids != pane_ids {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint topology and pane projection disagree".to_string(),
+        ));
+    }
+    let persisted_panes = checkpoint
+        .panes
+        .iter()
+        .map(persisted_pane_from_artifact)
+        .collect::<Result<Vec<_>, _>>()?;
+    let checkpoint_at = i64::try_from(checkpoint.checkpoint_at).map_err(|_| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint timestamp exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let pane_count = i64::try_from(checkpoint.pane_count).map_err(|_| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint pane count exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let total_bytes = i64::try_from(checkpoint.total_bytes).map_err(|_| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint byte count exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let recomputed = checkpoint_witness(
+        CHECKPOINT_ROLE_SNAPSHOT,
+        &checkpoint.session_id,
+        checkpoint.checkpoint_id,
+        checkpoint_at,
+        &checkpoint.checkpoint_type,
+        pane_count,
+        total_bytes,
+        checkpoint.metadata_json.as_deref(),
+        Some(&checkpoint.topology_json),
+        &persisted_panes,
+    )
+    .map_err(|error| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(format!(
+            "checkpoint witness cannot be recomputed: {error}"
+        ))
+    })?;
+    if recomputed != checkpoint.state_hash {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint witness mismatch".to_string(),
+        ));
+    }
+    require_checkpoint_projection_redaction_fixed_point(checkpoint, redactor).map_err(|error| {
+        match error {
+            CheckpointScrollbackArtifactError::RedactionNotFixedPoint => {
+                CheckpointScrollbackArtifactError::InvalidArtifact(
+                    "checkpoint projection is not a current redaction fixed point".to_string(),
+                )
+            }
+            other => other,
+        }
+    })
+}
+
+fn validate_checkpoint_scrollback_prefix(
+    prefix: &CheckpointScrollbackPanePrefix,
+    checkpoint_pane: &CheckpointScrollbackPaneProjection,
+    checkpoint_at: u64,
+    limits: CheckpointScrollbackArtifactLimits,
+    redactor: &crate::redactor::Redactor,
+) -> Result<(usize, usize, u64), CheckpointScrollbackArtifactError> {
+    if prefix.pane_id != checkpoint_pane.pane_id
+        || prefix.checkpoint_seq != checkpoint_pane.scrollback_checkpoint_seq
+        || !prefix.redaction_fixed_point
+        || prefix.segment_count != prefix.segments.len()
+        || prefix.segment_count > limits.max_segments_per_pane
+        || prefix.capture_gaps.len() > limits.max_gaps_per_pane
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "pane prefix identity, counts, or redaction claim is invalid".to_string(),
+        ));
+    }
+    let mut observed_content_bytes = 0_u64;
+    let mut prior_seq = None;
+    let mut observed_catalogs = std::collections::BTreeSet::new();
+    for segment in &prefix.segments {
+        if prior_seq.is_some_and(|previous| previous >= segment.seq)
+            || prefix
+                .checkpoint_seq
+                .is_some_and(|checkpoint_seq| segment.seq > checkpoint_seq)
+            || prefix.checkpoint_seq.is_none()
+            || segment.captured_at > checkpoint_at
+            || segment.content_bytes != segment.content.len()
+            || segment.content_sha256 != checkpoint_artifact_sha256(segment.content.as_bytes())
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "pane prefix segment metadata or ordering is invalid".to_string(),
+            ));
+        }
+        require_checkpoint_redaction_fixed_point(redactor, &segment.content).map_err(|_| {
+            CheckpointScrollbackArtifactError::InvalidArtifact(
+                "pane prefix content is not a current redaction fixed point".to_string(),
+            )
+        })?;
+        if let Some(version) = segment.redaction_catalog_version.as_deref() {
+            if version.len() > CHECKPOINT_SCROLLBACK_MAX_CATALOG_VERSION_BYTES {
+                return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                    "segment redaction catalog identity is oversized".to_string(),
+                ));
+            }
+            require_checkpoint_redaction_fixed_point(redactor, version).map_err(|_| {
+                CheckpointScrollbackArtifactError::InvalidArtifact(
+                    "segment redaction catalog identity is not a fixed point".to_string(),
+                )
+            })?;
+            observed_catalogs.insert(version.to_string());
+        }
+        observed_content_bytes = checked_artifact_u64_add(
+            observed_content_bytes,
+            u64::try_from(segment.content_bytes).map_err(|_| {
+                CheckpointScrollbackArtifactError::InvalidArtifact(
+                    "segment content length does not fit u64".to_string(),
+                )
+            })?,
+            "verified pane content bytes",
+        )?;
+        prior_seq = Some(segment.seq);
+    }
+    if observed_content_bytes != prefix.content_bytes
+        || observed_content_bytes > limits.max_content_bytes
+        || prefix.first_seq != prefix.segments.first().map(|segment| segment.seq)
+        || prefix.last_seq != prefix.segments.last().map(|segment| segment.seq)
+        || prefix.redaction_catalog_versions
+            != observed_catalogs.into_iter().collect::<Vec<_>>()
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "pane prefix aggregate does not match its segments".to_string(),
+        ));
+    }
+    let expected_sequence_gaps =
+        compute_checkpoint_sequence_gaps(prefix.checkpoint_seq, &prefix.segments).map_err(
+            |error| CheckpointScrollbackArtifactError::InvalidArtifact(error.to_string()),
+        )?;
+    if prefix.sequence_gaps != expected_sequence_gaps {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "pane prefix sequence-gap evidence is not canonical".to_string(),
+        ));
+    }
+    let mut prior_capture_gap = None;
+    for gap in &prefix.capture_gaps {
+        let order = (gap.seq_before, gap.seq_after, gap.detected_at);
+        if gap.seq_after <= gap.seq_before
+            || prefix
+                .checkpoint_seq
+                .is_none_or(|checkpoint_seq| gap.seq_after > checkpoint_seq)
+            || gap.detected_at > checkpoint_at
+            || gap.reason.len() > CHECKPOINT_SCROLLBACK_MAX_GAP_REASON_BYTES
+            || prior_capture_gap.is_some_and(|previous| previous > order)
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "pane prefix capture-gap evidence is invalid or out of order".to_string(),
+            ));
+        }
+        require_checkpoint_redaction_fixed_point(redactor, &gap.reason).map_err(|_| {
+            CheckpointScrollbackArtifactError::InvalidArtifact(
+                "capture-gap reason is not a current redaction fixed point".to_string(),
+            )
+        })?;
+        prior_capture_gap = Some(order);
+    }
+    let starts_at_zero = match prefix.checkpoint_seq {
+        None => prefix.segments.is_empty(),
+        Some(_) => prefix.first_seq == Some(0),
+    };
+    let reaches_checkpoint = match prefix.checkpoint_seq {
+        None => prefix.segments.is_empty(),
+        Some(checkpoint_seq) => prefix.last_seq == Some(checkpoint_seq),
+    };
+    let sequence_contiguous = prefix.sequence_gaps.is_empty();
+    let no_capture_gaps = prefix.capture_gaps.is_empty();
+    let complete = starts_at_zero
+        && reaches_checkpoint
+        && sequence_contiguous
+        && no_capture_gaps;
+    if prefix.starts_at_zero != starts_at_zero
+        || prefix.reaches_checkpoint != reaches_checkpoint
+        || prefix.sequence_contiguous != sequence_contiguous
+        || prefix.no_capture_gaps != no_capture_gaps
+        || prefix.complete != complete
+        || prefix.prefix_sha256 != checkpoint_scrollback_prefix_sha256(prefix)?
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "pane prefix completeness or checksum evidence is invalid".to_string(),
+        ));
+    }
+    Ok((prefix.segment_count, prefix.capture_gaps.len(), prefix.content_bytes))
+}
+
+fn validate_checkpoint_scrollback_payload(
+    payload: &CheckpointScrollbackPayload,
+    caller_limits: CheckpointScrollbackArtifactLimits,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    let caller_limits = caller_limits.validate()?;
+    let embedded_limits = payload.limits.validate().map_err(|error| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(error.to_string())
+    })?;
+    if !caller_limits.admits(&embedded_limits) {
+        return Err(CheckpointScrollbackArtifactError::ResourceLimit(
+            "embedded producer limits exceed verifier limits".to_string(),
+        ));
+    }
+    if payload.schema_version != 1
+        || payload.capabilities != CheckpointScrollbackCapabilities::V1
+        || payload.redaction_catalog_version.len() > CHECKPOINT_SCROLLBACK_MAX_CATALOG_VERSION_BYTES
+        || payload.redaction_catalog_version.is_empty()
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "payload schema, capabilities, or redaction catalog is invalid".to_string(),
+        ));
+    }
+    let redactor = crate::redactor::Redactor::new();
+    require_checkpoint_redaction_fixed_point(&redactor, &payload.redaction_catalog_version)
+        .map_err(|_| {
+            CheckpointScrollbackArtifactError::InvalidArtifact(
+                "payload redaction catalog identity is not a fixed point".to_string(),
+            )
+        })?;
+    validate_checkpoint_scrollback_checkpoint(&payload.checkpoint, embedded_limits, &redactor)?;
+    if payload.scrollback.len() != payload.checkpoint.panes.len() {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "scrollback pane inventory does not match the checkpoint".to_string(),
+        ));
+    }
+    let mut total_segments = 0_usize;
+    let mut total_gaps = 0_usize;
+    let mut total_content_bytes = 0_u64;
+    let mut complete_pane_count = 0_usize;
+    for (prefix, checkpoint_pane) in payload
+        .scrollback
+        .iter()
+        .zip(payload.checkpoint.panes.iter())
+    {
+        let (segments, gaps, bytes) = validate_checkpoint_scrollback_prefix(
+            prefix,
+            checkpoint_pane,
+            payload.checkpoint.checkpoint_at,
+            embedded_limits,
+            &redactor,
+        )?;
+        total_segments = checked_artifact_usize_add(
+            total_segments,
+            segments,
+            "verified artifact segment count",
+        )?;
+        total_gaps = checked_artifact_usize_add(
+            total_gaps,
+            gaps,
+            "verified artifact capture-gap count",
+        )?;
+        total_content_bytes = checked_artifact_u64_add(
+            total_content_bytes,
+            bytes,
+            "verified artifact content bytes",
+        )?;
+        if prefix.complete {
+            complete_pane_count = checked_artifact_usize_add(
+                complete_pane_count,
+                1,
+                "verified complete pane count",
+            )?;
+        }
+    }
+    let pane_count = payload.checkpoint.panes.len();
+    if total_segments > embedded_limits.max_total_segments
+        || total_gaps > embedded_limits.max_total_gaps
+        || total_content_bytes > embedded_limits.max_content_bytes
+        || payload.summary
+            != (CheckpointScrollbackSummary {
+                pane_count,
+                segment_count: total_segments,
+                capture_gap_count: total_gaps,
+                content_bytes: total_content_bytes,
+                complete_pane_count,
+                incomplete_pane_count: pane_count.saturating_sub(complete_pane_count),
+            })
+    {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "payload summary or total resource accounting is invalid".to_string(),
+        ));
+    }
     Ok(())
 }
 

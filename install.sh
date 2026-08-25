@@ -511,14 +511,14 @@ PY
 atomic_transition_txid() {
   python3 - "$1" <<'PY'
 import hashlib, sys
-print(hashlib.sha256(("frankenterm.install.atomic-transition.v3\0" + sys.argv[1]).encode()).hexdigest()[:32])
+print(hashlib.sha256(("frankenterm.install.atomic-transition.v4\0" + sys.argv[1]).encode()).hexdigest()[:32])
 PY
 }
 
 atomic_path_content_id() {
   local helper="$1" parent="$2" name="$3" output prefix
   output=$("$helper" setup __atomic-path-content-id --parent "$parent" --name "$name") || return 1
-  prefix="FT_ATOMIC_PATH_CONTENT_ID_V1="
+  prefix="FT_ATOMIC_PATH_CONTENT_ID_V2="
   [[ "$output" == "$prefix"* ]] && [[ "$output" != *$'\n'* ]] || return 1
   output="${output#"$prefix"}"
   [[ "$output" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
@@ -532,7 +532,7 @@ atomic_path_transition() {
     --parent "$parent" --stage-name "$stage" --target-name "$target" \
     --transaction-id "$txid" --stage-content-id "$stage_id" \
     --target-content-id "$target_id" --operation "$operation") || return 1
-  prefix="FT_ATOMIC_PATH_TRANSITION_V3=${txid}:${operation}:${stage}:${target}:"
+  prefix="FT_ATOMIC_PATH_TRANSITION_V4=${txid}:${operation}:${stage}:${target}:"
   [ "$output" = "${prefix}applied" ] || [ "$output" = "${prefix}already-applied" ]
 }
 

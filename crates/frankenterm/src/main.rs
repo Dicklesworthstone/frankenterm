@@ -6644,89 +6644,108 @@ where
         bytes.len() <= 64 * 1024,
         "atomic transition artifact exceeds its canonical byte bound"
     );
-    let (retained_count, retained_bytes) = atomic_path_transition_artifact_inventory(parent)?;
+    let temporary_name = format!("{name}.pending");
     anyhow::ensure!(
-        retained_count < ATOMIC_PATH_TRANSITION_MAX_ARTIFACTS
+        temporary_name.len() <= 255
+            && temporary_name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+            }),
+        "transition artifact temp name is not one bounded path component"
+    );
+    let temporary_exists = match parent.symlink_metadata(&temporary_name) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).context("cannot inspect deterministic transition artifact temp")
+        }
+    };
+    let (retained_count, retained_bytes) = atomic_path_transition_artifact_inventory(parent)?;
+    let additional_artifacts = u64::from(!temporary_exists);
+    anyhow::ensure!(
+        retained_count
+            .checked_add(additional_artifacts)
+            .is_some_and(|count| count <= ATOMIC_PATH_TRANSITION_MAX_ARTIFACTS)
             && retained_bytes
                 .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
                 .is_some_and(|total| total <= ATOMIC_PATH_TRANSITION_MAX_ARTIFACT_BYTES),
         "atomic transition journal cannot retain another artifact"
     );
 
-    for attempt in 0_u8..32 {
-        let temporary_name = format!("{name}.pending-{}-{attempt}", std::process::id());
-        anyhow::ensure!(
-            temporary_name.len() <= 255
-                && temporary_name.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-                }),
-            "transition artifact temp name is not one bounded path component"
-        );
-        let mut options = cap_std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No)
-            .mode(0o600);
-        let mut file = match parent.open_with(&temporary_name, &options) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("cannot create temporary atomic transition artifact {temporary_name}")
-                });
-            }
-        };
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        let metadata = file.metadata()?;
-        let path_metadata = parent.symlink_metadata(&temporary_name)?;
-        anyhow::ensure!(
-            metadata.is_file()
-                && path_metadata.is_file()
-                && metadata.dev() == path_metadata.dev()
-                && metadata.ino() == path_metadata.ino()
-                && metadata.nlink() == 1
-                && metadata.uid() == nix::unistd::geteuid().as_raw()
-                && metadata.permissions().mode() & 0o7777 == 0o600
-                && metadata.len() == u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            "temporary atomic transition artifact {temporary_name} has unsafe metadata"
-        );
-        match renameat_with(
-            parent_file,
-            &temporary_name,
-            parent_file,
-            name,
-            RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => {
-                parent_file.sync_all()?;
-                let (_, published_bytes) = read_atomic_path_transition_json::<T>(parent, name)?
-                    .context("published atomic transition artifact is unavailable")?;
-                anyhow::ensure!(
-                    published_bytes == bytes,
-                    "published atomic transition artifact differs from its durable temp bytes"
-                );
-                return Ok(bytes);
-            }
-            Err(error) if error == rustix::io::Errno::EXIST => {
-                parent_file.sync_all()?;
-                let (_, published_bytes) = read_atomic_path_transition_json::<T>(parent, name)?
-                    .context("concurrently published atomic transition artifact is unavailable")?;
-                anyhow::ensure!(
-                    published_bytes == bytes,
-                    "atomic transition artifact name is bound to conflicting canonical bytes"
-                );
-                return Ok(bytes);
-            }
-            Err(error) => {
-                return Err(std::io::Error::from(error))
-                    .with_context(|| format!("cannot publish atomic transition artifact {name}"));
-            }
-        }
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .follow(FollowSymlinks::No)
+        .mode(0o600);
+    if !temporary_exists {
+        options.create_new(true);
     }
-    anyhow::bail!("atomic transition temporary artifact namespace is exhausted")
+    let mut file = parent.open_with(&temporary_name, &options).with_context(|| {
+        format!("cannot open deterministic atomic transition artifact {temporary_name}")
+    })?;
+    let metadata_before = file.metadata()?;
+    let path_before = parent.symlink_metadata(&temporary_name)?;
+    anyhow::ensure!(
+        metadata_before.is_file()
+            && path_before.is_file()
+            && metadata_before.dev() == path_before.dev()
+            && metadata_before.ino() == path_before.ino()
+            && metadata_before.nlink() == 1
+            && metadata_before.uid() == nix::unistd::geteuid().as_raw()
+            && metadata_before.permissions().mode() & 0o7777 == 0o600
+            && metadata_before.len() <= 64 * 1024,
+        "deterministic atomic transition artifact {temporary_name} has unsafe metadata"
+    );
+    // This pathname belongs solely to the exact claim/ack name and is guarded
+    // by the parent-domain execution lock. Rewriting a truncated prefix makes
+    // every pre-rename crash retry converge on one inode instead of leaking a
+    // new PID-scoped temp until the journal cap is exhausted.
+    file.set_len(0)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    let metadata = file.metadata()?;
+    let path_metadata = parent.symlink_metadata(&temporary_name)?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && path_metadata.is_file()
+            && metadata.dev() == path_metadata.dev()
+            && metadata.ino() == path_metadata.ino()
+            && metadata.nlink() == 1
+            && metadata.uid() == nix::unistd::geteuid().as_raw()
+            && metadata.permissions().mode() & 0o7777 == 0o600
+            && metadata.len() == u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        "deterministic atomic transition artifact {temporary_name} has unsafe metadata"
+    );
+    match renameat_with(
+        parent_file,
+        &temporary_name,
+        parent_file,
+        name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            parent_file.sync_all()?;
+            let (_, published_bytes) = read_atomic_path_transition_json::<T>(parent, name)?
+                .context("published atomic transition artifact is unavailable")?;
+            anyhow::ensure!(
+                published_bytes == bytes,
+                "published atomic transition artifact differs from its durable temp bytes"
+            );
+            Ok(bytes)
+        }
+        Err(error) if error == rustix::io::Errno::EXIST => {
+            parent_file.sync_all()?;
+            let (_, published_bytes) = read_atomic_path_transition_json::<T>(parent, name)?
+                .context("concurrently published atomic transition artifact is unavailable")?;
+            anyhow::ensure!(
+                published_bytes == bytes,
+                "atomic transition artifact name is bound to conflicting canonical bytes"
+            );
+            Ok(bytes)
+        }
+        Err(error) => Err(std::io::Error::from(error))
+            .with_context(|| format!("cannot publish atomic transition artifact {name}")),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -7130,7 +7149,7 @@ where
         read_atomic_path_transition_json::<AtomicPathTransitionClaim>(&parent_dir, &claim_name)?;
     let (claim, claim_bytes) = if let Some((claim, bytes)) = stored_claim {
         anyhow::ensure!(
-            claim.schema_version == "frankenterm.atomic-path-transition-claim.v3"
+            claim.schema_version == "frankenterm.atomic-path-transition-claim.v4"
                 && claim.transaction_id == transaction_id
                 && claim.parent_device == parent_opened.dev()
                 && claim.parent_inode == parent_opened.ino()
@@ -7186,7 +7205,7 @@ where
             }
         }
         let claim = AtomicPathTransitionClaim {
-            schema_version: "frankenterm.atomic-path-transition-claim.v3".to_string(),
+            schema_version: "frankenterm.atomic-path-transition-claim.v4".to_string(),
             transaction_id: transaction_id.to_string(),
             parent_device: parent_opened.dev(),
             parent_inode: parent_opened.ino(),
@@ -7206,7 +7225,7 @@ where
 
     let validate_ack = |ack: &AtomicPathTransitionAck| -> anyhow::Result<()> {
         anyhow::ensure!(
-            ack.schema_version == "frankenterm.atomic-path-transition-ack.v3"
+            ack.schema_version == "frankenterm.atomic-path-transition-ack.v4"
                 && ack.transaction_id == transaction_id
                 && ack.claim_sha256 == claim_sha256
                 && ack.outcome == "applied",
@@ -7284,7 +7303,7 @@ where
     );
 
     let ack = AtomicPathTransitionAck {
-        schema_version: "frankenterm.atomic-path-transition-ack.v3".to_string(),
+        schema_version: "frankenterm.atomic-path-transition-ack.v4".to_string(),
         transaction_id: transaction_id.to_string(),
         claim_sha256,
         outcome: "applied".to_string(),
@@ -63327,7 +63346,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             operation,
                         )?;
                         println!(
-                            "FT_ATOMIC_PATH_TRANSITION_V3={}:{}:{}:{}:{}",
+                            "FT_ATOMIC_PATH_TRANSITION_V4={}:{}:{}:{}:{}",
                             transaction_id,
                             operation.as_str(),
                             stage_name,
@@ -63337,7 +63356,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     }
                     SetupCommands::AtomicPathContentId { parent, name } => {
                         let content_id = inspect_atomic_path_content_id(&parent, &name)?;
-                        println!("FT_ATOMIC_PATH_CONTENT_ID_V1={content_id}");
+                        println!("FT_ATOMIC_PATH_CONTENT_ID_V2={content_id}");
                     }
                     SetupCommands::Config => {
                         use frankenterm_core::setup;
