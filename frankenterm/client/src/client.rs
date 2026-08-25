@@ -6618,7 +6618,7 @@ impl BoundedPollCadence {
 #[cfg(any(windows, test))]
 fn next_bounded_poll_backoff(backoff: &AtomicU8) -> Duration {
     let exponent = backoff
-        .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+        .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
             Some(current.saturating_add(1).min(6))
         })
         .unwrap_or(6)

@@ -4163,6 +4163,7 @@ mod tests {
         assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(enabled.clone())));
         assert!(!domain.connect_automatically());
     }
+    #[test]
     fn rejected_remote_workspace_update_deterministically_resyncs() {
         let resyncs = Arc::new(AtomicUsize::new(0));
         let resyncs_for_call = Arc::clone(&resyncs);

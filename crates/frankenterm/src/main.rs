@@ -102035,6 +102035,95 @@ log_level = "debug"
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn atomic_path_journal_resumes_one_truncated_deterministic_temp() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create journal resume fixture");
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make journal parent private");
+        let transaction_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let name = format!(".ft-atomic-transition-{transaction_id}.ack.json");
+        let temporary_name = format!("{name}.pending");
+        std::fs::write(fixture.path().join(&temporary_name), b"{\"schema")
+            .expect("plant truncated deterministic temp");
+        std::fs::set_permissions(
+            fixture.path().join(&temporary_name),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("set deterministic temp mode");
+        let parent_file = std::fs::File::open(fixture.path()).expect("open journal parent");
+        let parent = cap_std::fs::Dir::from_std_file(
+            parent_file.try_clone().expect("clone journal parent"),
+        );
+        let ack = AtomicPathTransitionAck {
+            schema_version: "frankenterm.atomic-path-transition-ack.v4".to_string(),
+            transaction_id: transaction_id.to_string(),
+            claim_sha256: "b".repeat(64),
+            outcome: "applied".to_string(),
+        };
+        let expected = atomic_path_transition_json(&ack).expect("serialize expected ack");
+        let published = write_atomic_path_transition_json(&parent, &parent_file, &name, &ack)
+            .expect("resume truncated deterministic journal temp");
+        assert_eq!(published, expected);
+        assert_eq!(std::fs::read(fixture.path().join(&name)).unwrap(), expected);
+        assert!(!fixture.path().join(&temporary_name).exists());
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn atomic_path_metadata_detects_same_inode_same_length_rewrite() {
+        use std::io::{Seek as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create metadata mutation fixture");
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make mutation parent private");
+        let path = fixture.path().join("member");
+        std::fs::write(&path, b"same-length-content").expect("write mutation fixture");
+        let mut writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("pin owner file for planted rewrite");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("seal mutation fixture");
+        let parent = cap_std::fs::Dir::from_std_file(
+            std::fs::File::open(fixture.path()).expect("open mutation parent"),
+        );
+        let before = AtomicPathObjectMetadata::from_cap_metadata(
+            &parent
+                .symlink_metadata("member")
+                .expect("capture metadata before rewrite"),
+        )
+        .expect("normalize metadata before rewrite");
+        writable
+            .seek(std::io::SeekFrom::Start(0))
+            .expect("seek mutation fixture");
+        writable
+            .write_all(b"same-length-content")
+            .expect("rewrite same bytes at same length");
+        writable.sync_all().expect("sync planted rewrite");
+        let after = AtomicPathObjectMetadata::from_cap_metadata(
+            &parent
+                .symlink_metadata("member")
+                .expect("capture metadata after rewrite"),
+        )
+        .expect("normalize metadata after rewrite");
+        assert_eq!(before.device, after.device);
+        assert_eq!(before.inode, after.inode);
+        assert_eq!(before.byte_len, after.byte_len);
+        assert!(
+            before.modified_seconds != after.modified_seconds
+                || before.modified_nanoseconds != after.modified_nanoseconds
+                || before.changed_seconds != after.changed_seconds
+                || before.changed_nanoseconds != after.changed_nanoseconds,
+            "mtime/ctime fence must detect an in-place same-inode same-length rewrite"
+        );
+        assert_ne!(before, after);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn atomic_path_exchange_serializes_same_transaction_callers() {
         use std::os::unix::fs::PermissionsExt as _;
 
