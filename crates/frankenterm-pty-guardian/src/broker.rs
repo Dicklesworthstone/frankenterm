@@ -3281,7 +3281,8 @@ pub enum BrokerError {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Read;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek as _, Write as _};
     use std::os::fd::{AsFd, BorrowedFd};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3376,6 +3377,88 @@ mod tests {
             catalog_candidate_checksum: [0x71; BROKER_CATALOG_CHECKSUM_BYTES],
         };
         prepared.commit_with_proof(control, &proof)
+    }
+
+    fn wal_authenticator(byte: u8) -> GuardianBrokerSpawnWalAuthenticatorV1 {
+        mux::guardian_protocol::GuardianSecret::from_bytes([byte; 32])
+            .expect("nonzero guardian test secret")
+            .broker_spawn_wal_authenticator()
+            .expect("derive broker WAL authenticator")
+    }
+
+    fn wal_identity(binding: BrokerGenesisBinding) -> BrokerSpawnWalIdentityV1 {
+        BrokerSpawnWalIdentityV1::from_binding(id(900), id(901), binding)
+            .expect("valid broker WAL identity")
+    }
+
+    fn open_new_test_file(path: &std::path::Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create exclusive test file")
+    }
+
+    fn open_existing_test_file(path: &std::path::Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open existing test file")
+    }
+
+    fn create_test_spawn_journal(
+        directory: &std::path::Path,
+        identity: BrokerSpawnWalIdentityV1,
+        authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> (BrokerSpawnJournalV1, std::path::PathBuf, std::path::PathBuf) {
+        let wal_path = directory.join("spawn.wal");
+        let head_path = directory.join("spawn.head");
+        let wal = open_new_test_file(&wal_path);
+        let head = open_new_test_file(&head_path);
+        let mut journal = BrokerSpawnJournalV1::create(wal, head, identity, authenticator)
+            .expect("create broker Spawn WAL");
+        let parent = File::open(directory).expect("open test parent directory");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate broker Spawn WAL directory entries");
+        (journal, wal_path, head_path)
+    }
+
+    fn reopen_test_spawn_journal(
+        wal_path: &std::path::Path,
+        head_path: &std::path::Path,
+        identity: BrokerSpawnWalIdentityV1,
+        authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> BrokerSpawnJournalV1 {
+        BrokerSpawnJournalV1::open(
+            open_existing_test_file(wal_path),
+            open_existing_test_file(head_path),
+            identity,
+            authenticator,
+        )
+        .expect("reopen authenticated broker Spawn WAL")
+    }
+
+    fn revalidate_recovered_test_journal(
+        journal: &BrokerSpawnJournalV1,
+    ) -> BrokerSpawnWalFilesystemRevalidationV1 {
+        BrokerSpawnWalFilesystemRevalidationV1::from_revalidated_filesystem(
+            journal.identity(),
+            journal.wal.metadata().expect("WAL metadata").len(),
+            journal.head.metadata().expect("head metadata").len(),
+        )
+        .expect("test filesystem revalidation")
+    }
+
+    fn test_kernel_child(process_id: u32) -> BrokerKernelChildIdentityV1 {
+        BrokerKernelChildIdentityV1 {
+            process_id,
+            broker_child_nonce: id(u128::from(process_id) + 1_000),
+            kernel_start_identity_digest: [u8::try_from(process_id % 251 + 1)
+                .expect("bounded digest byte"); 32],
+        }
     }
 
     fn proxy_write(
@@ -3997,6 +4080,289 @@ mod tests {
             );
             pane.terminate_and_wait_for_test();
         }
+    }
+
+    #[test]
+    fn durable_spawn_wal_query_ack_lifecycle_never_reinvokes_effect() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(71), id(72), id(73), id(74), 0x51, 0x52);
+        let payload = command_payload("true", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let identity = wal_identity(binding);
+        let authenticator = wal_authenticator(0x81);
+        let (mut journal, wal_path, head_path) =
+            create_test_spawn_journal(temp.path(), identity, authenticator.clone());
+
+        let intent = journal
+            .append_intent_and_sync()
+            .expect("synchronize Spawn intent");
+        assert_eq!(intent.phase(), BrokerSpawnWalPhaseV1::Intent);
+        assert_eq!(
+            journal.append_intent_and_sync().expect("replay intent"),
+            intent,
+            "an exact Intent retry appended another record"
+        );
+
+        let attempt_id = id(902);
+        let permit = match journal
+            .begin_spawn_attempt_and_sync(attempt_id)
+            .expect("synchronize Spawn Attempt")
+        {
+            BrokerSpawnAttemptAdmissionV1::Authorized(permit) => permit,
+            BrokerSpawnAttemptAdmissionV1::Reconciled(_) => {
+                panic!("first Attempt did not yield one-shot authority")
+            }
+        };
+        let effect_invocations = AtomicUsize::new(0);
+        let child_identity = test_kernel_child(12_345);
+        let execution = permit.invoke_once(|| {
+            effect_invocations.fetch_add(1, Ordering::AcqRel);
+            Ok::<_, ()>(("retained-child-handle", child_identity))
+        });
+        let (retained, observation) = match execution {
+            BrokerSpawnAttemptExecutionV1::EffectSucceeded { value, observation } => {
+                (value, observation)
+            }
+            BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate { .. } => {
+                panic!("valid child identity became indeterminate")
+            }
+        };
+        assert_eq!(retained, "retained-child-handle");
+        assert_eq!(effect_invocations.load(Ordering::Acquire), 1);
+
+        match journal
+            .begin_spawn_attempt_and_sync(attempt_id)
+            .expect("recover lost Attempt reply")
+        {
+            BrokerSpawnAttemptAdmissionV1::Reconciled(status) => {
+                assert_eq!(status.phase, Some(BrokerSpawnWalPhaseV1::Attempted));
+                assert!(status.spawn_outcome_is_indeterminate());
+            }
+            BrokerSpawnAttemptAdmissionV1::Authorized(_) => {
+                panic!("lost Attempt reply minted a second callback permit")
+            }
+        }
+        assert_eq!(effect_invocations.load(Ordering::Acquire), 1);
+
+        let observed = journal
+            .append_spawn_observed_and_sync(observation)
+            .expect("synchronize exact child observation");
+        assert_eq!(observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
+        let query = journal.status();
+        assert_eq!(query.child_identity, Some(child_identity));
+        assert!(query.fences_legacy_spawn());
+        assert!(!query.spawn_outcome_is_indeterminate());
+        match journal
+            .begin_spawn_attempt_and_sync(attempt_id)
+            .expect("query observed Spawn")
+        {
+            BrokerSpawnAttemptAdmissionV1::Reconciled(status) => {
+                assert_eq!(status.child_identity, Some(child_identity));
+            }
+            BrokerSpawnAttemptAdmissionV1::Authorized(_) => {
+                panic!("observed Spawn query minted a second callback permit")
+            }
+        }
+
+        let ack_id = id(903);
+        let acknowledged = journal
+            .acknowledge_spawn_reply_and_sync(ack_id, child_identity)
+            .expect("synchronize Spawn reply acknowledgement");
+        assert_eq!(
+            acknowledged.phase(),
+            BrokerSpawnWalPhaseV1::ReplyAcknowledged
+        );
+        assert_eq!(
+            journal
+                .acknowledge_spawn_reply_and_sync(ack_id, child_identity)
+                .expect("recover lost acknowledgement reply"),
+            acknowledged,
+            "exact acknowledgement retry appended a second record"
+        );
+        assert_eq!(journal.status().committed_records, 4);
+        drop(journal);
+
+        let mut recovered =
+            reopen_test_spawn_journal(&wal_path, &head_path, identity, authenticator);
+        let recovered_status = recovered.status();
+        assert_eq!(
+            recovered_status.phase,
+            Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+        );
+        assert_eq!(recovered_status.reply_ack_id, Some(ack_id));
+        assert_eq!(recovered_status.child_identity, Some(child_identity));
+        assert!(recovered_status.append_authority_withheld);
+        let revalidation = revalidate_recovered_test_journal(&recovered);
+        recovered
+            .reconcile_recovered_head_and_activate(revalidation)
+            .expect("activate exact recovered WAL/head pair");
+        assert!(!recovered.status().append_authority_withheld);
+    }
+
+    #[test]
+    fn wal_ahead_of_head_crash_cut_reconciles_without_second_spawn_permit() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(81), id(82), id(83), id(84), 0x61, 0x62);
+        let payload = command_payload("true", &sentinel);
+        let identity = wal_identity(binding_for(&payload, &auth));
+        let authenticator = wal_authenticator(0x82);
+        let (mut journal, wal_path, head_path) =
+            create_test_spawn_journal(temp.path(), identity, authenticator.clone());
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        assert!(journal.is_poisoned());
+        drop(journal);
+
+        let mut recovered =
+            reopen_test_spawn_journal(&wal_path, &head_path, identity, authenticator);
+        let pending = recovered.status();
+        assert_eq!(pending.phase, Some(BrokerSpawnWalPhaseV1::Intent));
+        assert!(pending.head_reconciliation_required);
+        assert!(pending.append_authority_withheld);
+        assert!(matches!(
+            recovered.begin_spawn_attempt_and_sync(id(904)),
+            Err(BrokerSpawnWalError::RecoveryAuthorityUnavailable)
+        ));
+        let revalidation = revalidate_recovered_test_journal(&recovered);
+        recovered
+            .reconcile_recovered_head_and_activate(revalidation)
+            .expect("publish missing local head anchor");
+        assert!(!recovered.status().head_reconciliation_required);
+
+        let permit = match recovered
+            .begin_spawn_attempt_and_sync(id(904))
+            .expect("one Attempt after reconciled Intent")
+        {
+            BrokerSpawnAttemptAdmissionV1::Authorized(permit) => permit,
+            BrokerSpawnAttemptAdmissionV1::Reconciled(_) => {
+                panic!("unattempted recovered Intent lost its one callback authority")
+            }
+        };
+        let calls = AtomicUsize::new(0);
+        let execution = permit.invoke_once(|| {
+            calls.fetch_add(1, Ordering::AcqRel);
+            Err::<((), BrokerKernelChildIdentityV1), _>("ambiguous spawn callback")
+        });
+        assert!(matches!(
+            execution,
+            BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate {
+                retained_value: None
+            }
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        match recovered
+            .begin_spawn_attempt_and_sync(id(904))
+            .expect("query ambiguous Attempt")
+        {
+            BrokerSpawnAttemptAdmissionV1::Reconciled(status) => {
+                assert!(status.spawn_outcome_is_indeterminate());
+            }
+            BrokerSpawnAttemptAdmissionV1::Authorized(_) => {
+                panic!("ambiguous Spawn callback was authorized twice")
+            }
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn spawn_wal_prewrite_retry_torn_tail_key_rotation_and_head_rollback_fail_closed() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(91), id(92), id(93), id(94), 0x71, 0x72);
+        let payload = command_payload("true", &sentinel);
+        let identity = wal_identity(binding_for(&payload, &auth));
+        let authenticator = wal_authenticator(0x83);
+        let (mut journal, wal_path, head_path) =
+            create_test_spawn_journal(temp.path(), identity, authenticator.clone());
+
+        journal.inject_fault(BrokerSpawnWalInjectedFault::BeforeWalWrite);
+        assert!(matches!(
+            journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        assert!(!journal.is_poisoned());
+        journal
+            .append_intent_and_sync()
+            .expect("retry before any WAL write");
+        let _permit = match journal
+            .begin_spawn_attempt_and_sync(id(905))
+            .expect("synchronize second lifecycle record")
+        {
+            BrokerSpawnAttemptAdmissionV1::Authorized(permit) => permit,
+            BrokerSpawnAttemptAdmissionV1::Reconciled(_) => panic!("first Attempt reconciled"),
+        };
+        drop(journal);
+
+        assert!(matches!(
+            BrokerSpawnJournalV1::open(
+                open_existing_test_file(&wal_path),
+                open_existing_test_file(&head_path),
+                identity,
+                wal_authenticator(0x84),
+            ),
+            Err(BrokerSpawnWalError::KeyIdentityMismatch)
+        ));
+
+        // A head rollback by two complete authenticated records is not a valid
+        // writer crash cut. Recovery rejects it rather than inferring that the
+        // Spawn effect was never attempted.
+        open_existing_test_file(&head_path)
+            .set_len(BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64)
+            .expect("truncate temporary rollback fixture");
+        assert!(matches!(
+            BrokerSpawnJournalV1::open(
+                open_existing_test_file(&wal_path),
+                open_existing_test_file(&head_path),
+                identity,
+                authenticator.clone(),
+            ),
+            Err(BrokerSpawnWalError::HeadReconciliationGap)
+        ));
+
+        // Restore a separate exact fixture and append an incomplete physical
+        // tail. Recovery reports and seals it without truncating evidence.
+        let torn_dir = temp.path().join("torn");
+        fs::create_dir(&torn_dir).expect("create torn fixture directory");
+        let (mut torn, torn_wal_path, torn_head_path) =
+            create_test_spawn_journal(&torn_dir, identity, authenticator.clone());
+        torn.append_intent_and_sync()
+            .expect("commit torn fixture prefix");
+        drop(torn);
+        let mut external = OpenOptions::new()
+            .append(true)
+            .open(&torn_wal_path)
+            .expect("open torn WAL fixture");
+        external
+            .write_all(&BROKER_SPAWN_WAL_RECORD_MAGIC[..3])
+            .expect("append incomplete tail");
+        external.sync_all().expect("sync incomplete tail");
+        drop(external);
+        let mut recovered =
+            reopen_test_spawn_journal(&torn_wal_path, &torn_head_path, identity, authenticator);
+        assert_eq!(
+            recovered.status().tail,
+            BrokerSpawnWalTailV1::Incomplete {
+                wal_trailing_bytes: 3,
+                head_trailing_bytes: 0,
+            }
+        );
+        let revalidation = revalidate_recovered_test_journal(&recovered);
+        assert!(matches!(
+            recovered.reconcile_recovered_head_and_activate(revalidation),
+            Err(BrokerSpawnWalError::IncompleteTail)
+        ));
+        assert_eq!(
+            fs::metadata(&torn_wal_path)
+                .expect("torn WAL metadata")
+                .len(),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 + BROKER_SPAWN_WAL_RECORD_BYTES_U64 + 3,
+            "recovery truncated preserved crash evidence"
+        );
     }
 
     #[test]
