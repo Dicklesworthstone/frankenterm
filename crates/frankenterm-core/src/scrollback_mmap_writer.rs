@@ -55,9 +55,8 @@ const V2_RECORD_DIGEST_BYTES: usize = 32;
 const V2_STATE_HASH_DOMAIN: &[u8] = b"frankenterm.scrollback.v2.state\0";
 const V2_RECORD_HASH_DOMAIN: &[u8] = b"frankenterm.scrollback.v2.record\0";
 
-const _: () = assert!(
-    V2_STATE_SLOTS_OFFSET + V2_STATE_SLOT_SIZE * V2_STATE_SLOT_COUNT <= HEADER_SIZE
-);
+const _: () =
+    assert!(V2_STATE_SLOTS_OFFSET + V2_STATE_SLOT_SIZE * V2_STATE_SLOT_COUNT <= HEADER_SIZE);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct V2RingState {
@@ -208,9 +207,7 @@ impl LinearRecordTerminalReason {
             Self::RecordPayloadPastDeclaredCursor => "record_payload_past_declared_cursor",
             Self::PhysicalRecordPayloadTruncated => "physical_record_payload_truncated",
             Self::LegacyWrappedOrderUnknown => "legacy_wrapped_order_unknown",
-            Self::LegacyWriteAccountingInconsistent => {
-                "legacy_write_accounting_inconsistent"
-            }
+            Self::LegacyWriteAccountingInconsistent => "legacy_write_accounting_inconsistent",
             Self::V2NewerStateInvalid => "v2_newer_state_invalid",
         }
     }
@@ -414,34 +411,32 @@ impl MmapScrollback {
                 reason: "writer scrollback directory must name one concrete final leaf",
             });
         }
-        let base_directory = ensure_directory_tree_nofollow(&config.base_dir).map_err(|source| {
-            MmapScrollbackError::CreateDir {
-                path: config.base_dir.clone(),
-                source,
-            }
-        })?;
+        let base_directory =
+            ensure_directory_tree_nofollow(&config.base_dir).map_err(|source| {
+                MmapScrollbackError::CreateDir {
+                    path: config.base_dir.clone(),
+                    source,
+                }
+            })?;
         secure_writer_directory(&base_directory, &config.base_dir)?;
-        let base_directory_identity = metadata_identity(&base_directory.dir_metadata().map_err(
-            |source| MmapScrollbackError::Metadata {
-                path: config.base_dir.clone(),
-                source,
-            },
-        )?);
+        let base_directory_identity =
+            metadata_identity(&base_directory.dir_metadata().map_err(|source| {
+                MmapScrollbackError::Metadata {
+                    path: config.base_dir.clone(),
+                    source,
+                }
+            })?);
 
         let path = config.bin_path();
         let lock_path = config.lock_path();
         let expected_pane_uuid = pane_uuid_bytes(&config.pane_uuid);
-        let lock_leaf = lock_path
-            .file_name()
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                MmapScrollbackError::UnsafeReadSource {
-                    path: lock_path.clone(),
-                    reason: "writer lock has no file name",
-                }
-            })?;
-        let opened_lock =
-            open_writer_file(&base_directory, &lock_leaf, &lock_path)?;
+        let lock_leaf = lock_path.file_name().map(PathBuf::from).ok_or_else(|| {
+            MmapScrollbackError::UnsafeReadSource {
+                path: lock_path.clone(),
+                reason: "writer lock has no file name",
+            }
+        })?;
+        let opened_lock = open_writer_file(&base_directory, &lock_leaf, &lock_path)?;
         let lock_file = opened_lock.file;
         match lock_file.try_lock_exclusive() {
             Ok(()) => {}
@@ -465,21 +460,15 @@ impl MmapScrollback {
             &lock_file,
             opened_lock.identity,
         )?;
-        revalidate_writer_directory(
-            &base_directory,
-            &config.base_dir,
-            base_directory_identity,
-        )?;
+        revalidate_writer_directory(&base_directory, &config.base_dir, base_directory_identity)?;
 
-        let data_leaf = path
-            .file_name()
-            .map(PathBuf::from)
-            .ok_or_else(|| MmapScrollbackError::UnsafeReadSource {
+        let data_leaf = path.file_name().map(PathBuf::from).ok_or_else(|| {
+            MmapScrollbackError::UnsafeReadSource {
                 path: path.clone(),
                 reason: "writer data file has no file name",
-            })?;
-        let opened_data =
-            open_writer_file(&base_directory, &data_leaf, &path)?;
+            }
+        })?;
+        let opened_data = open_writer_file(&base_directory, &data_leaf, &path)?;
         let mut file = opened_data.file;
         revalidate_writer_file(
             &base_directory,
@@ -510,11 +499,7 @@ impl MmapScrollback {
             &file,
             opened_data.identity,
         )?;
-        revalidate_writer_directory(
-            &base_directory,
-            &config.base_dir,
-            base_directory_identity,
-        )?;
+        revalidate_writer_directory(&base_directory, &config.base_dir, base_directory_identity)?;
         let metadata_len = file
             .metadata()
             .map_err(|source| MmapScrollbackError::Metadata {
@@ -581,9 +566,7 @@ impl MmapScrollback {
                 });
             }
             if decoded.flags.bits() & V2_RING_FLAG == 0 {
-                return Err(MmapScrollbackError::LegacyV1ReadOnly {
-                    path: path.clone(),
-                });
+                return Err(MmapScrollbackError::LegacyV1ReadOnly { path: path.clone() });
             }
             let loaded = load_v2_writer_state(&mut file, &path, &bytes, decoded, cap_bytes)?;
             decoded.write_cursor_bytes = u64::from(loaded.state.tail);
@@ -635,11 +618,7 @@ impl MmapScrollback {
             &writer.lock_file,
             opened_lock.identity,
         )?;
-        revalidate_writer_directory(
-            &base_directory,
-            &config.base_dir,
-            base_directory_identity,
-        )?;
+        revalidate_writer_directory(&base_directory, &config.base_dir, base_directory_identity)?;
         Ok(writer)
     }
 
@@ -740,20 +719,18 @@ impl MmapScrollback {
                 path: self.path.clone(),
                 reason: "v2 state epoch exhausted",
             })?;
-        prepared_state
-            .record_count
-            .checked_add(1)
-            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+        prepared_state.record_count.checked_add(1).ok_or_else(|| {
+            MmapScrollbackError::V2Integrity {
                 path: self.path.clone(),
                 reason: "v2 record count overflow",
-            })?;
-        prepared_state
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| MmapScrollbackError::V2Integrity {
+            }
+        })?;
+        prepared_state.next_sequence.checked_add(1).ok_or_else(|| {
+            MmapScrollbackError::V2Integrity {
                 path: self.path.clone(),
                 reason: "v2 record sequence exhausted",
-            })?;
+            }
+        })?;
         let planned_end = u64::from(prepared_state.tail)
             .checked_add(total_len)
             .ok_or_else(|| MmapScrollbackError::V2Integrity {
@@ -836,20 +813,21 @@ impl MmapScrollback {
         if committed_state.record_count == 0 {
             committed_state.head = committed_state.tail;
         }
-        committed_state.record_count = committed_state
-            .record_count
-            .checked_add(1)
-            .ok_or_else(|| MmapScrollbackError::V2Integrity {
-                path: self.path.clone(),
-                reason: "v2 record count overflow",
+        committed_state.record_count =
+            committed_state.record_count.checked_add(1).ok_or_else(|| {
+                MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 record count overflow",
+                }
             })?;
-        committed_state.next_sequence = committed_state
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| MmapScrollbackError::V2Integrity {
-                path: self.path.clone(),
-                reason: "v2 record sequence exhausted",
-            })?;
+        committed_state.next_sequence =
+            committed_state
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 record sequence exhausted",
+                })?;
         let end_cursor = start_cursor + total_len;
         if end_cursor == self.header.capacity_bytes {
             committed_state.tail = 0;
@@ -859,19 +837,19 @@ impl MmapScrollback {
                     reason: "v2 capacity does not fit ring offsets",
                 }
             })?;
-            committed_state.generation = committed_state.generation.checked_add(1).ok_or_else(
-                || MmapScrollbackError::V2Integrity {
-                    path: self.path.clone(),
-                    reason: "v2 ring generation exhausted",
-                },
-            )?;
+            committed_state.generation =
+                committed_state.generation.checked_add(1).ok_or_else(|| {
+                    MmapScrollbackError::V2Integrity {
+                        path: self.path.clone(),
+                        reason: "v2 ring generation exhausted",
+                    }
+                })?;
         } else {
-            committed_state.tail = u32::try_from(end_cursor).map_err(|_| {
-                MmapScrollbackError::V2Integrity {
+            committed_state.tail =
+                u32::try_from(end_cursor).map_err(|_| MmapScrollbackError::V2Integrity {
                     path: self.path.clone(),
                     reason: "v2 tail does not fit ring offset",
-                }
-            })?;
+                })?;
         }
 
         let committed_used_bytes = prepared_used_bytes.checked_add(total_len).ok_or_else(|| {
@@ -1042,12 +1020,13 @@ impl MmapScrollback {
             });
         }
         let mut next = self.v2_state;
-        next.slot_epoch = next.slot_epoch.checked_add(1).ok_or_else(|| {
-            MmapScrollbackError::V2Integrity {
-                path: self.path.clone(),
-                reason: "v2 state epoch exhausted",
-            }
-        })?;
+        next.slot_epoch =
+            next.slot_epoch
+                .checked_add(1)
+                .ok_or_else(|| MmapScrollbackError::V2Integrity {
+                    path: self.path.clone(),
+                    reason: "v2 state epoch exhausted",
+                })?;
         let next_slot = if self.state_slot_dirty {
             self.active_state_slot
         } else {
@@ -1112,12 +1091,11 @@ impl MmapScrollback {
         total_len: u64,
     ) -> Result<(V2RingState, u64, bool), MmapScrollbackError> {
         let capacity = self.header.capacity_bytes;
-        let capacity_u32 = u32::try_from(capacity).map_err(|_| {
-            MmapScrollbackError::V2Integrity {
+        let capacity_u32 =
+            u32::try_from(capacity).map_err(|_| MmapScrollbackError::V2Integrity {
                 path: self.path.clone(),
                 reason: "v2 capacity does not fit ring offsets",
-            }
-        })?;
+            })?;
         let mut state = self.v2_state;
         let mut used_bytes = self.used_bytes;
         let mut evicted = false;
@@ -1130,9 +1108,7 @@ impl MmapScrollback {
             return Ok((state, used_bytes, false));
         }
 
-        while usize::try_from(state.record_count).unwrap_or(usize::MAX)
-            >= HARD_MAX_LINEAR_RECORDS
-        {
+        while usize::try_from(state.record_count).unwrap_or(usize::MAX) >= HARD_MAX_LINEAR_RECORDS {
             self.evict_oldest_from_plan(&mut state, &mut used_bytes)?;
             evicted = true;
         }
@@ -1212,12 +1188,12 @@ impl MmapScrollback {
             self.header.capacity_bytes,
         )?;
         let record_end = u64::from(state.head) + u64::from(meta.total_len);
-        *used_bytes = used_bytes.checked_sub(u64::from(meta.total_len)).ok_or_else(|| {
-            MmapScrollbackError::V2Integrity {
+        *used_bytes = used_bytes
+            .checked_sub(u64::from(meta.total_len))
+            .ok_or_else(|| MmapScrollbackError::V2Integrity {
                 path: self.path.clone(),
                 reason: "v2 used-byte accounting underflow",
-            }
-        })?;
+            })?;
         state.record_count -= 1;
         if state.record_count == 0 {
             state.head = state.tail;
@@ -1240,12 +1216,11 @@ impl MmapScrollback {
         } else if record_end == self.header.capacity_bytes {
             state.head = 0;
         } else {
-            state.head = u32::try_from(record_end).map_err(|_| {
-                MmapScrollbackError::V2Integrity {
+            state.head =
+                u32::try_from(record_end).map_err(|_| MmapScrollbackError::V2Integrity {
                     path: self.path.clone(),
                     reason: "v2 head does not fit ring offset",
-                }
-            })?;
+                })?;
         }
         Ok(())
     }
@@ -1303,8 +1278,7 @@ fn encode_v2_state_slot(
     slot[32..40].copy_from_slice(&state.generation.to_le_bytes());
     slot[40..48].copy_from_slice(&state.next_sequence.to_le_bytes());
     let checksum = v2_state_checksum(base_header, &slot[..V2_STATE_CHECKSUM_OFFSET]);
-    slot[V2_STATE_CHECKSUM_OFFSET
-        ..V2_STATE_CHECKSUM_OFFSET + V2_STATE_CHECKSUM_BYTES]
+    slot[V2_STATE_CHECKSUM_OFFSET..V2_STATE_CHECKSUM_OFFSET + V2_STATE_CHECKSUM_BYTES]
         .copy_from_slice(&checksum);
     slot
 }
@@ -1325,10 +1299,7 @@ fn v2_state_checksum(
     checksum
 }
 
-fn observe_v2_state_slot(
-    base_header: &[u8; HEADER_SIZE],
-    slot_index: usize,
-) -> V2SlotObservation {
+fn observe_v2_state_slot(base_header: &[u8; HEADER_SIZE], slot_index: usize) -> V2SlotObservation {
     let offset = V2_STATE_SLOTS_OFFSET + slot_index * V2_STATE_SLOT_SIZE;
     let slot = &base_header[offset..offset + V2_STATE_SLOT_SIZE];
     if slot.iter().all(|byte| *byte == 0) {
@@ -1341,8 +1312,7 @@ fn observe_v2_state_slot(
         return V2SlotObservation::Invalid;
     }
     let expected = v2_state_checksum(base_header, &slot[..V2_STATE_CHECKSUM_OFFSET]);
-    if slot[V2_STATE_CHECKSUM_OFFSET
-        ..V2_STATE_CHECKSUM_OFFSET + V2_STATE_CHECKSUM_BYTES]
+    if slot[V2_STATE_CHECKSUM_OFFSET..V2_STATE_CHECKSUM_OFFSET + V2_STATE_CHECKSUM_BYTES]
         != expected
     {
         return V2SlotObservation::Invalid;
@@ -1358,9 +1328,7 @@ fn observe_v2_state_slot(
     })
 }
 
-fn v2_slot_candidates(
-    header_bytes: &[u8; HEADER_SIZE],
-) -> (Vec<(V2RingState, usize)>, bool) {
+fn v2_slot_candidates(header_bytes: &[u8; HEADER_SIZE]) -> (Vec<(V2RingState, usize)>, bool) {
     let mut candidates = Vec::with_capacity(V2_STATE_SLOT_COUNT);
     let mut saw_invalid = false;
     for slot_index in 0..V2_STATE_SLOT_COUNT {
@@ -1474,12 +1442,11 @@ fn read_v2_record_verified(
             reason: "v2 record payload crosses the ring boundary",
         });
     }
-    let record_kind = RecordKind::from_u8(bytes[8]).ok_or_else(|| {
-        MmapScrollbackError::V2Integrity {
+    let record_kind =
+        RecordKind::from_u8(bytes[8]).ok_or_else(|| MmapScrollbackError::V2Integrity {
             path: path.to_path_buf(),
             reason: "v2 record kind is unknown",
-        }
-    })?;
+        })?;
     let generation = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
     let sequence = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
     let mut payload = vec![0u8; payload_len as usize];
@@ -1496,8 +1463,7 @@ fn read_v2_record_verified(
         sequence,
         &payload,
     );
-    if bytes[V2_RECORD_DIGEST_OFFSET..V2_RECORD_DIGEST_OFFSET + V2_RECORD_DIGEST_BYTES]
-        != expected
+    if bytes[V2_RECORD_DIGEST_OFFSET..V2_RECORD_DIGEST_OFFSET + V2_RECORD_DIGEST_BYTES] != expected
     {
         return Err(MmapScrollbackError::V2Integrity {
             path: path.to_path_buf(),
@@ -1508,11 +1474,9 @@ fn read_v2_record_verified(
         record_kind,
         payload,
         V2RecordMeta {
-            total_len: u32::try_from(total_len).map_err(|_| {
-                MmapScrollbackError::V2Integrity {
-                    path: path.to_path_buf(),
-                    reason: "v2 record length does not fit its format",
-                }
+            total_len: u32::try_from(total_len).map_err(|_| MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "v2 record length does not fit its format",
             })?,
             payload_len,
             generation,
@@ -1544,11 +1508,9 @@ fn validate_v2_state_shape(
     state: V2RingState,
     capacity_bytes: u64,
 ) -> Result<(), MmapScrollbackError> {
-    let capacity = u32::try_from(capacity_bytes).map_err(|_| {
-        MmapScrollbackError::V2Integrity {
-            path: path.to_path_buf(),
-            reason: "v2 capacity does not fit ring offsets",
-        }
+    let capacity = u32::try_from(capacity_bytes).map_err(|_| MmapScrollbackError::V2Integrity {
+        path: path.to_path_buf(),
+        reason: "v2 capacity does not fit ring offsets",
     })?;
     if state.head >= capacity || state.tail >= capacity || state.wrap_at > capacity {
         return Err(MmapScrollbackError::V2Integrity {
@@ -1780,33 +1742,33 @@ pub fn read_linear_records(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = open_directory_tree_nofollow(parent_path).map_err(|source| {
-        MmapScrollbackError::Open {
+    let parent =
+        open_directory_tree_nofollow(parent_path).map_err(|source| MmapScrollbackError::Open {
             path: parent_path.to_path_buf(),
             source,
-        }
-    })?;
-    let parent_metadata = parent.dir_metadata().map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: parent_path.to_path_buf(),
-            source,
-        }
-    })?;
+        })?;
+    let parent_metadata =
+        parent
+            .dir_metadata()
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: parent_path.to_path_buf(),
+                source,
+            })?;
     validate_private_cap_directory(&parent_metadata, parent_path)?;
     let parent_identity = metadata_identity(&parent_metadata);
     let records = read_linear_records_in_directory(&parent, Path::new(leaf), path, limits)?;
-    let reopened = open_directory_tree_nofollow(parent_path).map_err(|source| {
-        MmapScrollbackError::Open {
+    let reopened =
+        open_directory_tree_nofollow(parent_path).map_err(|source| MmapScrollbackError::Open {
             path: parent_path.to_path_buf(),
             source,
-        }
-    })?;
-    let reopened_metadata = reopened.dir_metadata().map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: parent_path.to_path_buf(),
-            source,
-        }
-    })?;
+        })?;
+    let reopened_metadata =
+        reopened
+            .dir_metadata()
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: parent_path.to_path_buf(),
+                source,
+            })?;
     validate_private_cap_directory(&reopened_metadata, parent_path)?;
     let reopened_identity = metadata_identity(&reopened_metadata);
     if parent_identity != reopened_identity {
@@ -1844,25 +1806,27 @@ where
             reason: "scrollback leaf is not one path component",
         });
     }
-    let directory_metadata = directory.dir_metadata().map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: display_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-            source,
-        }
-    })?;
+    let directory_metadata =
+        directory
+            .dir_metadata()
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: display_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf(),
+                source,
+            })?;
     validate_private_cap_directory(
         &directory_metadata,
         display_path.parent().unwrap_or_else(|| Path::new(".")),
     )?;
-    let path_metadata_before = directory.symlink_metadata(leaf).map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: display_path.to_path_buf(),
-            source,
-        }
-    })?;
+    let path_metadata_before =
+        directory
+            .symlink_metadata(leaf)
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: display_path.to_path_buf(),
+                source,
+            })?;
     validate_private_cap_file(&path_metadata_before, display_path)?;
     validate_owner_against_directory(&path_metadata_before, &directory_metadata, display_path)?;
     if path_metadata_before.len() > limits.max_file_bytes {
@@ -1883,12 +1847,12 @@ where
             source,
         })?
         .into_std();
-    let handle_metadata_before = file.metadata().map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: display_path.to_path_buf(),
-            source,
-        }
-    })?;
+    let handle_metadata_before =
+        file.metadata()
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: display_path.to_path_buf(),
+                source,
+            })?;
     validate_private_std_file(&handle_metadata_before, display_path)?;
     validate_same_owner(&path_metadata_before, &handle_metadata_before, display_path)?;
     if metadata_identity(&path_metadata_before) != metadata_identity(&handle_metadata_before) {
@@ -1915,18 +1879,19 @@ where
         limits,
     )?;
 
-    let handle_metadata_after = file.metadata().map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: display_path.to_path_buf(),
-            source,
-        }
-    })?;
-    let path_metadata_after = directory.symlink_metadata(leaf).map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: display_path.to_path_buf(),
-            source,
-        }
-    })?;
+    let handle_metadata_after =
+        file.metadata()
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: display_path.to_path_buf(),
+                source,
+            })?;
+    let path_metadata_after =
+        directory
+            .symlink_metadata(leaf)
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: display_path.to_path_buf(),
+                source,
+            })?;
     validate_private_std_file(&handle_metadata_after, display_path)?;
     validate_private_cap_file(&path_metadata_after, display_path)?;
     validate_owner_against_directory(&path_metadata_after, &directory_metadata, display_path)?;
@@ -2007,8 +1972,7 @@ fn read_linear_records_from_file(
                     let completeness = if rejected_newer_state {
                         LinearRecordCompleteness::Incomplete {
                             decoded_cursor_bytes: u64::from(state.tail),
-                            declared_cursor_bytes: rejected_tail
-                                .unwrap_or(header.capacity_bytes),
+                            declared_cursor_bytes: rejected_tail.unwrap_or(header.capacity_bytes),
                             reason: LinearRecordTerminalReason::V2NewerStateInvalid,
                         }
                     } else {
@@ -2032,10 +1996,12 @@ fn read_linear_records_from_file(
                 }
             }
         }
-        return Err(last_error.unwrap_or_else(|| MmapScrollbackError::V2Integrity {
-            path: path.to_path_buf(),
-            reason: "no v2 state slot references a valid retained interval",
-        }));
+        return Err(
+            last_error.unwrap_or_else(|| MmapScrollbackError::V2Integrity {
+                path: path.to_path_buf(),
+                reason: "no v2 state slot references a valid retained interval",
+            }),
+        );
     }
     // The header's write_cursor/capacity are themselves on-disk values that may
     // be corrupt or stale — this recovery path exists precisely because a crash
@@ -2143,9 +2109,8 @@ fn read_linear_records_from_file(
         LinearRecordCompleteness::Incomplete {
             decoded_cursor_bytes: cursor,
             declared_cursor_bytes: header.write_cursor_bytes,
-            reason: terminal_reason.unwrap_or(
-                LinearRecordTerminalReason::DeclaredTailTooShortForHeader,
-            ),
+            reason: terminal_reason
+                .unwrap_or(LinearRecordTerminalReason::DeclaredTailTooShortForHeader),
         }
     } else if header.total_bytes_written > header.write_cursor_bytes {
         LinearRecordCompleteness::Incomplete {
@@ -2283,14 +2248,13 @@ fn validate_effective_uid_std_directory(
     Ok(())
 }
 
-fn secure_writer_directory(
-    directory: &CapDir,
-    path: &Path,
-) -> Result<(), MmapScrollbackError> {
-    let before = directory.dir_metadata().map_err(|source| MmapScrollbackError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn secure_writer_directory(directory: &CapDir, path: &Path) -> Result<(), MmapScrollbackError> {
+    let before = directory
+        .dir_metadata()
+        .map_err(|source| MmapScrollbackError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
     validate_effective_uid_cap_directory(&before, path)?;
     let handle = directory
         .try_clone()
@@ -2299,10 +2263,12 @@ fn secure_writer_directory(
             source,
         })?
         .into_std_file();
-    let handle_before = handle.metadata().map_err(|source| MmapScrollbackError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let handle_before = handle
+        .metadata()
+        .map_err(|source| MmapScrollbackError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
     validate_effective_uid_std_directory(&handle_before, path)?;
     let identity = metadata_identity(&before);
     if metadata_identity(&handle_before) != identity {
@@ -2326,7 +2292,8 @@ fn secure_writer_directory(
             0o700 => {}
             0o755 => {
                 use std::os::unix::fs::PermissionsExt as _;
-                if let Err(_source) = handle.set_permissions(std::fs::Permissions::from_mode(0o700)) {
+                if let Err(_source) = handle.set_permissions(std::fs::Permissions::from_mode(0o700))
+                {
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                         .map_err(|source| MmapScrollbackError::Permissions {
                             path: path.to_path_buf(),
@@ -2352,14 +2319,18 @@ fn secure_writer_directory(
         }
     }
 
-    let after = directory.dir_metadata().map_err(|source| MmapScrollbackError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let handle_after = handle.metadata().map_err(|source| MmapScrollbackError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let after = directory
+        .dir_metadata()
+        .map_err(|source| MmapScrollbackError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let handle_after = handle
+        .metadata()
+        .map_err(|source| MmapScrollbackError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
     validate_private_cap_directory(&after, path)?;
     validate_effective_uid_std_directory(&handle_after, path)?;
     #[cfg(unix)]
@@ -2375,10 +2346,11 @@ fn secure_writer_directory(
             reason: "scrollback directory identity changed during permission migration",
         });
     }
-    let reopened = open_directory_tree_nofollow(path).map_err(|source| MmapScrollbackError::Open {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let reopened =
+        open_directory_tree_nofollow(path).map_err(|source| MmapScrollbackError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let reopened_metadata =
         reopened
             .dir_metadata()
@@ -2409,10 +2381,11 @@ fn revalidate_writer_directory(
                 source,
             })?;
     validate_private_cap_directory(&pinned_metadata, path)?;
-    let reopened = open_directory_tree_nofollow(path).map_err(|source| MmapScrollbackError::Open {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let reopened =
+        open_directory_tree_nofollow(path).map_err(|source| MmapScrollbackError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let named_metadata =
         reopened
             .dir_metadata()
@@ -2440,23 +2413,27 @@ fn revalidate_writer_file(
     expected_identity: LinearRecordSourceIdentity,
 ) -> Result<(), MmapScrollbackError> {
     let directory_path = display_path.parent().unwrap_or_else(|| Path::new("."));
-    let directory_metadata = directory.dir_metadata().map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: directory_path.to_path_buf(),
-            source,
-        }
-    })?;
+    let directory_metadata =
+        directory
+            .dir_metadata()
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: directory_path.to_path_buf(),
+                source,
+            })?;
     validate_private_cap_directory(&directory_metadata, directory_path)?;
-    let path_metadata = directory.symlink_metadata(leaf).map_err(|source| {
-        MmapScrollbackError::Metadata {
+    let path_metadata =
+        directory
+            .symlink_metadata(leaf)
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: display_path.to_path_buf(),
+                source,
+            })?;
+    let handle_metadata = file
+        .metadata()
+        .map_err(|source| MmapScrollbackError::Metadata {
             path: display_path.to_path_buf(),
             source,
-        }
-    })?;
-    let handle_metadata = file.metadata().map_err(|source| MmapScrollbackError::Metadata {
-        path: display_path.to_path_buf(),
-        source,
-    })?;
+        })?;
     validate_private_cap_file(&path_metadata, display_path)?;
     validate_private_std_file(&handle_metadata, display_path)?;
     validate_owner_against_directory(&path_metadata, &directory_metadata, display_path)?;
@@ -2634,10 +2611,7 @@ fn sync_directory_for_publication(
     directory: &CapDir,
     expected_identity: LinearRecordSourceIdentity,
 ) -> std::io::Result<()> {
-    if let Err(err) = directory
-        .open(".")
-        .and_then(|handle| handle.sync_all())
-    {
+    if let Err(err) = directory.open(".").and_then(|handle| handle.sync_all()) {
         if !matches!(err.raw_os_error(), Some(9 | 22 | 95)) {
             return Err(err);
         }
@@ -2677,10 +2651,7 @@ pub enum MmapScrollbackError {
         observed: u64,
     },
     #[error("unsafe legacy scrollback read source {path}: {reason}")]
-    UnsafeReadSource {
-        path: PathBuf,
-        reason: &'static str,
-    },
+    UnsafeReadSource { path: PathBuf, reason: &'static str },
     #[error(
         "existing scrollback file {path} does not match configured capacity {configured_capacity_bytes}: expected {expected_file_bytes} physical bytes, found {actual_file_bytes}; evidence was left untouched"
     )]
@@ -2701,10 +2672,7 @@ pub enum MmapScrollbackError {
     )]
     WriterPoisoned { path: PathBuf },
     #[error("v2 scrollback integrity failure for {path}: {reason}")]
-    V2Integrity {
-        path: PathBuf,
-        reason: &'static str,
-    },
+    V2Integrity { path: PathBuf, reason: &'static str },
     #[error("failed to create scrollback mmap directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -2789,12 +2757,9 @@ fn open_writer_file(
     leaf: &Path,
     display_path: &Path,
 ) -> Result<OpenedWriterFile, MmapScrollbackError> {
-    open_writer_file_with_sync(
-        directory,
-        leaf,
-        display_path,
-        &mut |parent, identity| sync_directory_for_publication(parent, identity),
-    )
+    open_writer_file_with_sync(directory, leaf, display_path, &mut |parent, identity| {
+        sync_directory_for_publication(parent, identity)
+    })
 }
 
 fn open_writer_file_with_sync<F>(
@@ -2807,12 +2772,13 @@ where
     F: FnMut(&CapDir, LinearRecordSourceIdentity) -> std::io::Result<()>,
 {
     let directory_path = display_path.parent().unwrap_or_else(|| Path::new("."));
-    let directory_metadata = directory.dir_metadata().map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: directory_path.to_path_buf(),
-            source,
-        }
-    })?;
+    let directory_metadata =
+        directory
+            .dir_metadata()
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: directory_path.to_path_buf(),
+                source,
+            })?;
     validate_private_cap_directory(&directory_metadata, directory_path)?;
     let directory_identity = metadata_identity(&directory_metadata);
     let publication_required = match directory.symlink_metadata(leaf) {
@@ -2845,16 +2811,19 @@ where
             source,
         })?
         .into_std();
-    let path_metadata = directory.symlink_metadata(leaf).map_err(|source| {
-        MmapScrollbackError::Metadata {
+    let path_metadata =
+        directory
+            .symlink_metadata(leaf)
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: display_path.to_path_buf(),
+                source,
+            })?;
+    let handle_metadata = file
+        .metadata()
+        .map_err(|source| MmapScrollbackError::Metadata {
             path: display_path.to_path_buf(),
             source,
-        }
-    })?;
-    let handle_metadata = file.metadata().map_err(|source| MmapScrollbackError::Metadata {
-        path: display_path.to_path_buf(),
-        source,
-    })?;
+        })?;
     validate_cap_file_shape(&path_metadata, display_path)?;
     validate_std_file_shape(&handle_metadata, display_path)?;
     validate_owner_against_directory(&path_metadata, &directory_metadata, display_path)?;
@@ -2887,10 +2856,11 @@ where
                         mode: 0o600,
                         source,
                     })?;
-                file.sync_all().map_err(|source| MmapScrollbackError::Sync {
-                    path: display_path.to_path_buf(),
-                    source,
-                })?;
+                file.sync_all()
+                    .map_err(|source| MmapScrollbackError::Sync {
+                        path: display_path.to_path_buf(),
+                        source,
+                    })?;
             }
             _ => {
                 return Err(MmapScrollbackError::UnsafeReadSource {
@@ -2901,12 +2871,13 @@ where
         }
     }
 
-    let path_metadata_after = directory.symlink_metadata(leaf).map_err(|source| {
-        MmapScrollbackError::Metadata {
-            path: display_path.to_path_buf(),
-            source,
-        }
-    })?;
+    let path_metadata_after =
+        directory
+            .symlink_metadata(leaf)
+            .map_err(|source| MmapScrollbackError::Metadata {
+                path: display_path.to_path_buf(),
+                source,
+            })?;
     let handle_metadata_after =
         file.metadata()
             .map_err(|source| MmapScrollbackError::Metadata {
@@ -2926,29 +2897,30 @@ where
         });
     }
     if publication_required {
-        file.sync_all().map_err(|source| MmapScrollbackError::Sync {
-            path: display_path.to_path_buf(),
-            source,
-        })?;
-        sync_parent(directory, directory_identity).map_err(|source| {
-            MmapScrollbackError::Sync {
-                path: directory_path.to_path_buf(),
-                source,
-            }
-        })?;
-        let directory_metadata_after = directory.dir_metadata().map_err(|source| {
-            MmapScrollbackError::Metadata {
-                path: directory_path.to_path_buf(),
-                source,
-            }
-        })?;
-        validate_private_cap_directory(&directory_metadata_after, directory_path)?;
-        let published_path_metadata = directory.symlink_metadata(leaf).map_err(|source| {
-            MmapScrollbackError::Metadata {
+        file.sync_all()
+            .map_err(|source| MmapScrollbackError::Sync {
                 path: display_path.to_path_buf(),
                 source,
-            }
+            })?;
+        sync_parent(directory, directory_identity).map_err(|source| MmapScrollbackError::Sync {
+            path: directory_path.to_path_buf(),
+            source,
         })?;
+        let directory_metadata_after =
+            directory
+                .dir_metadata()
+                .map_err(|source| MmapScrollbackError::Metadata {
+                    path: directory_path.to_path_buf(),
+                    source,
+                })?;
+        validate_private_cap_directory(&directory_metadata_after, directory_path)?;
+        let published_path_metadata =
+            directory
+                .symlink_metadata(leaf)
+                .map_err(|source| MmapScrollbackError::Metadata {
+                    path: display_path.to_path_buf(),
+                    source,
+                })?;
         let published_handle_metadata =
             file.metadata()
                 .map_err(|source| MmapScrollbackError::Metadata {
@@ -3101,8 +3073,7 @@ mod tests {
     fn changed_v2_state_slots(before: &[u8], after: &[u8]) -> Vec<usize> {
         (0..V2_STATE_SLOT_COUNT)
             .filter(|slot_index| {
-                v2_state_slot_bytes(before, *slot_index)
-                    != v2_state_slot_bytes(after, *slot_index)
+                v2_state_slot_bytes(before, *slot_index) != v2_state_slot_bytes(after, *slot_index)
             })
             .collect()
     }
@@ -3216,8 +3187,7 @@ mod tests {
         bytes.extend_from_slice(&rec2.encode());
         write_private(&path, &bytes);
 
-        let snapshot =
-            read_linear_records(&path, test_read_limits()).expect("salvage prefix");
+        let snapshot = read_linear_records(&path, test_read_limits()).expect("salvage prefix");
         assert_eq!(
             snapshot.records.len(),
             1,
@@ -3289,7 +3259,11 @@ mod tests {
             0o700
         );
         assert_eq!(
-            std::fs::metadata(writer.path()).unwrap().permissions().mode() & 0o7777,
+            std::fs::metadata(writer.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
             0o600
         );
         assert_eq!(
@@ -3308,12 +3282,14 @@ mod tests {
         let dir = test_dir("reject-world-writable-directory");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let config =
-            MmapScrollbackConfig::new(&dir, "unsafe-directory-mode").with_cap_bytes(4096);
+        let config = MmapScrollbackConfig::new(&dir, "unsafe-directory-mode").with_cap_bytes(4096);
 
         let error = MmapScrollback::open(config.clone()).unwrap_err();
 
-        assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
+        assert!(matches!(
+            error,
+            MmapScrollbackError::UnsafeReadSource { .. }
+        ));
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
             0o777
@@ -3340,7 +3316,10 @@ mod tests {
             MmapScrollback::open(lock_config.clone()),
             Err(MmapScrollbackError::UnsafeReadSource { .. })
         ));
-        assert_eq!(std::fs::read(lock_config.lock_path()).unwrap(), b"lock-content");
+        assert_eq!(
+            std::fs::read(lock_config.lock_path()).unwrap(),
+            b"lock-content"
+        );
         assert_eq!(
             std::fs::metadata(lock_config.lock_path())
                 .unwrap()
@@ -3365,7 +3344,10 @@ mod tests {
             MmapScrollback::open(data_config.clone()),
             Err(MmapScrollbackError::UnsafeReadSource { .. })
         ));
-        assert_eq!(std::fs::read(data_config.bin_path()).unwrap(), b"data-content");
+        assert_eq!(
+            std::fs::read(data_config.bin_path()).unwrap(),
+            b"data-content"
+        );
         assert_eq!(
             std::fs::metadata(data_config.bin_path())
                 .unwrap()
@@ -3399,7 +3381,10 @@ mod tests {
             Ok(())
         };
         ensure_directory_tree_nofollow_with_sync(&nested, &mut repeat_sync_parent).unwrap();
-        assert_eq!(repeat_sync_count, 0, "existing names need no republish sync");
+        assert_eq!(
+            repeat_sync_count, 0,
+            "existing names need no republish sync"
+        );
     }
 
     #[test]
@@ -3415,13 +3400,8 @@ mod tests {
             sync_directory_for_publication(parent, identity)
         };
 
-        let file = open_writer_file_with_sync(
-            &directory,
-            leaf,
-            &display_path,
-            &mut sync_parent,
-        )
-        .expect("create and durably publish writer leaf");
+        let file = open_writer_file_with_sync(&directory, leaf, &display_path, &mut sync_parent)
+            .expect("create and durably publish writer leaf");
         drop(file);
 
         assert!(display_path.is_file());
@@ -3433,13 +3413,8 @@ mod tests {
             Ok(())
         };
         drop(
-            open_writer_file_with_sync(
-                &directory,
-                leaf,
-                &display_path,
-                &mut repeat_sync_parent,
-            )
-            .unwrap(),
+            open_writer_file_with_sync(&directory, leaf, &display_path, &mut repeat_sync_parent)
+                .unwrap(),
         );
         assert_eq!(
             repeat_sync_count, 0,
@@ -3470,13 +3445,19 @@ mod tests {
 
     #[test]
     fn writer_refuses_a_broad_directory_without_a_concrete_leaf() {
-        for broad_path in [PathBuf::from("."), PathBuf::from(std::path::MAIN_SEPARATOR_STR)] {
+        for broad_path in [
+            PathBuf::from("."),
+            PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+        ] {
             let error = MmapScrollback::open(
                 MmapScrollbackConfig::new(broad_path.clone(), "broad-directory")
                     .with_cap_bytes(4096),
             )
             .unwrap_err();
-            assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
+            assert!(matches!(
+                error,
+                MmapScrollbackError::UnsafeReadSource { .. }
+            ));
         }
     }
 
@@ -3494,7 +3475,10 @@ mod tests {
 
         let error = validate_cap_directory_for_uid(&metadata, &dir, foreign_uid).unwrap_err();
 
-        assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
+        assert!(matches!(
+            error,
+            MmapScrollbackError::UnsafeReadSource { .. }
+        ));
     }
 
     #[cfg(unix)]
@@ -3865,7 +3849,10 @@ mod tests {
         ));
 
         let private_path = MmapScrollbackConfig::new(&dir, "nonprivate-reader").bin_path();
-        write_private(&private_path, &ScrollbackHeader::new([7; 32], 4096, 0).encode());
+        write_private(
+            &private_path,
+            &ScrollbackHeader::new([7; 32], 4096, 0).encode(),
+        );
         std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             read_linear_records(&private_path, test_read_limits()),
@@ -3874,11 +3861,13 @@ mod tests {
 
         let linked_parent = dir.with_extension("linked-parent");
         symlink(&dir, &linked_parent).unwrap();
-        assert!(read_linear_records(
-            &linked_parent.join(private_path.file_name().unwrap()),
-            test_read_limits(),
-        )
-        .is_err());
+        assert!(
+            read_linear_records(
+                &linked_parent.join(private_path.file_name().unwrap()),
+                test_read_limits(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3914,8 +3903,7 @@ mod tests {
     fn writer_rejects_existing_filename_header_identity_mismatch() {
         let dir = test_dir("writer-header-identity-mismatch");
         create_private_dir(&dir);
-        let config =
-            MmapScrollbackConfig::new(&dir, "configured-pane").with_cap_bytes(4096);
+        let config = MmapScrollbackConfig::new(&dir, "configured-pane").with_cap_bytes(4096);
         let mismatched = ScrollbackHeader::new([0x7f; 32], 4096, 0).encode();
         write_private(&config.bin_path(), &mismatched);
         std::fs::OpenOptions::new()
@@ -3928,7 +3916,10 @@ mod tests {
 
         let error = MmapScrollback::open(config.clone()).unwrap_err();
 
-        assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
+        assert!(matches!(
+            error,
+            MmapScrollbackError::UnsafeReadSource { .. }
+        ));
         assert_eq!(std::fs::read(config.bin_path()).unwrap(), before);
     }
 
@@ -3936,8 +3927,7 @@ mod tests {
     fn writer_rejects_preexisting_short_leaf_without_changing_one_byte() {
         let dir = test_dir("short-evidence-preserved");
         create_private_dir(&dir);
-        let config =
-            MmapScrollbackConfig::new(&dir, "short-evidence").with_cap_bytes(4096);
+        let config = MmapScrollbackConfig::new(&dir, "short-evidence").with_cap_bytes(4096);
         write_private(&config.bin_path(), b"immutable forensic prefix");
         let before = std::fs::read(config.bin_path()).unwrap();
 
@@ -3953,8 +3943,7 @@ mod tests {
     #[test]
     fn writer_rejects_capacity_mismatch_without_resizing_or_reinitializing() {
         let dir = test_dir("capacity-evidence-preserved");
-        let original =
-            MmapScrollbackConfig::new(&dir, "capacity-evidence").with_cap_bytes(4096);
+        let original = MmapScrollbackConfig::new(&dir, "capacity-evidence").with_cap_bytes(4096);
         let mut writer = MmapScrollback::open(original.clone()).unwrap();
         append_test_payload(&mut writer, RecordKind::Text, b"durable evidence");
         writer.sync().unwrap();
@@ -3988,7 +3977,10 @@ mod tests {
 
         let error = MmapScrollback::open(config.clone()).unwrap_err();
 
-        assert!(matches!(error, MmapScrollbackError::LegacyV1ReadOnly { .. }));
+        assert!(matches!(
+            error,
+            MmapScrollbackError::LegacyV1ReadOnly { .. }
+        ));
         assert_eq!(std::fs::read(config.bin_path()).unwrap(), before);
     }
 
@@ -4074,9 +4066,18 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
-        assert_eq!(std::fs::read(saved_lock).unwrap(), b"original lock evidence");
-        assert_eq!(std::fs::read(lock_path).unwrap(), b"replacement lock evidence");
+        assert!(matches!(
+            error,
+            MmapScrollbackError::UnsafeReadSource { .. }
+        ));
+        assert_eq!(
+            std::fs::read(saved_lock).unwrap(),
+            b"original lock evidence"
+        );
+        assert_eq!(
+            std::fs::read(lock_path).unwrap(),
+            b"replacement lock evidence"
+        );
         assert!(!config.bin_path().exists());
     }
 
@@ -4185,7 +4186,10 @@ mod tests {
         let mut writer = MmapScrollback::open(config).unwrap();
         let pending_canary = b"sk-ant-api03-debug-secr";
         let report = writer.append(RecordKind::Text, pending_canary).unwrap();
-        assert_eq!(report.payload_bytes, 0, "canary must remain in the redactor tail");
+        assert_eq!(
+            report.payload_bytes, 0,
+            "canary must remain in the redactor tail"
+        );
 
         let writer_debug = format!("{writer:?}");
         assert!(writer_debug.contains("pending_redaction_bytes"));
@@ -4211,8 +4215,8 @@ mod tests {
     #[test]
     fn replacing_sidecar_after_open_cannot_admit_a_second_writer_to_the_data_inode() {
         let dir = test_dir("replace-sidecar-after-open");
-        let config = MmapScrollbackConfig::new(&dir, "replace-sidecar-after-open")
-            .with_cap_bytes(4096);
+        let config =
+            MmapScrollbackConfig::new(&dir, "replace-sidecar-after-open").with_cap_bytes(4096);
         let first = MmapScrollback::open(config.clone()).unwrap();
         let before_data = std::fs::read(config.bin_path()).unwrap();
         let saved_lock = dir.join("saved-original-lock");
@@ -4254,7 +4258,11 @@ mod tests {
         writer.sync().unwrap();
         let generation_one = std::fs::read(&path).unwrap();
 
-        for payload in [b"volatile-one".as_slice(), b"volatile-two", b"volatile-three"] {
+        for payload in [
+            b"volatile-one".as_slice(),
+            b"volatile-two",
+            b"volatile-three",
+        ] {
             let report = append_test_payload(&mut writer, RecordKind::Osc, payload);
             assert!(!report.synced);
         }
@@ -4273,9 +4281,8 @@ mod tests {
         // exact prior synced generation, even though three epochs were skipped.
         let dirty_slot = second_dirty_slots[0];
         let mut crash_image = generation_two_dirty;
-        let checksum_byte = V2_STATE_SLOTS_OFFSET
-            + dirty_slot * V2_STATE_SLOT_SIZE
-            + V2_STATE_CHECKSUM_OFFSET;
+        let checksum_byte =
+            V2_STATE_SLOTS_OFFSET + dirty_slot * V2_STATE_SLOT_SIZE + V2_STATE_CHECKSUM_OFFSET;
         crash_image[checksum_byte] ^= 0x80;
         write_private(&path, &crash_image);
 
@@ -4436,8 +4443,7 @@ mod tests {
     #[test]
     fn exhausted_authenticated_epoch_fails_before_any_file_mutation() {
         let dir = test_dir("exhausted-state-epoch");
-        let config =
-            MmapScrollbackConfig::new(&dir, "exhausted-state-epoch").with_cap_bytes(4096);
+        let config = MmapScrollbackConfig::new(&dir, "exhausted-state-epoch").with_cap_bytes(4096);
         let path = config.bin_path();
         drop(MmapScrollback::open(config.clone()).unwrap());
 

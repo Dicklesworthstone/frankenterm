@@ -13703,7 +13703,9 @@ mod writer_epoch_transaction_tests {
 
         fn with_transaction_dyn(
             &self,
-            f: &mut dyn FnMut(&mut dyn crate::storage_backend_trait::StorageTransaction) -> std::result::Result<(), BackendError>,
+            f: &mut dyn FnMut(
+                &mut dyn crate::storage_backend_trait::StorageTransaction,
+            ) -> std::result::Result<(), BackendError>,
         ) -> std::result::Result<(), BackendError> {
             self.inner.with_transaction_dyn(f)
         }
@@ -15624,7 +15626,9 @@ mod writer_io_scheduler_tests {
 
         fn with_transaction_dyn(
             &self,
-            f: &mut dyn FnMut(&mut dyn crate::storage_backend_trait::StorageTransaction) -> std::result::Result<(), BackendError>,
+            f: &mut dyn FnMut(
+                &mut dyn crate::storage_backend_trait::StorageTransaction,
+            ) -> std::result::Result<(), BackendError>,
         ) -> std::result::Result<(), BackendError> {
             self.inner.with_transaction_dyn(f)
         }
@@ -15734,7 +15738,9 @@ mod writer_io_scheduler_tests {
 
         fn with_transaction_dyn(
             &self,
-            f: &mut dyn FnMut(&mut dyn crate::storage_backend_trait::StorageTransaction) -> std::result::Result<(), BackendError>,
+            f: &mut dyn FnMut(
+                &mut dyn crate::storage_backend_trait::StorageTransaction,
+            ) -> std::result::Result<(), BackendError>,
         ) -> std::result::Result<(), BackendError> {
             self.note_call("with_transaction");
             self.inner.with_transaction_dyn(f)
@@ -16538,7 +16544,9 @@ mod writer_io_scheduler_tests {
 
         fn with_transaction_dyn(
             &self,
-            f: &mut dyn FnMut(&mut dyn crate::storage_backend_trait::StorageTransaction) -> std::result::Result<(), BackendError>,
+            f: &mut dyn FnMut(
+                &mut dyn crate::storage_backend_trait::StorageTransaction,
+            ) -> std::result::Result<(), BackendError>,
         ) -> std::result::Result<(), BackendError> {
             self.inner.with_transaction_dyn(f)
         }

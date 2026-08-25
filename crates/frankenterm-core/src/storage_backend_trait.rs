@@ -775,7 +775,10 @@ impl std::fmt::Display for BackendError {
                 write!(f, "storage backend transaction boundary lost")
             }
             Self::TransactionCallbackInvokedMoreThanOnce => {
-                write!(f, "storage backend transaction callback invoked more than once")
+                write!(
+                    f,
+                    "storage backend transaction callback invoked more than once"
+                )
             }
             Self::Schema(s) => write!(f, "storage backend schema: {s}"),
             Self::Other(s) => write!(f, "storage backend: {s}"),
@@ -996,10 +999,7 @@ impl RusqliteTransactionHandle<'_> {
         Ok(())
     }
 
-    fn observe_boundary<T>(
-        &mut self,
-        result: Result<T, BackendError>,
-    ) -> Result<T, BackendError> {
+    fn observe_boundary<T>(&mut self, result: Result<T, BackendError>) -> Result<T, BackendError> {
         if self.conn.is_autocommit() {
             self.boundary_lost = true;
             if result.is_ok() {
@@ -1313,9 +1313,10 @@ impl StorageTransaction for MockTransactionHandle<'_> {
         sql: &str,
         params: &[&str],
     ) -> Result<Option<Vec<String>>, BackendError> {
-        self.state
-            .queries
-            .push((sql.to_string(), params.iter().map(|s| (*s).to_string()).collect()));
+        self.state.queries.push((
+            sql.to_string(),
+            params.iter().map(|s| (*s).to_string()).collect(),
+        ));
         Ok(self.state.row_responses.pop_front().flatten())
     }
 
@@ -1324,9 +1325,10 @@ impl StorageTransaction for MockTransactionHandle<'_> {
         sql: &str,
         params: &[&str],
     ) -> Result<Vec<Vec<String>>, BackendError> {
-        self.state
-            .queries
-            .push((sql.to_string(), params.iter().map(|s| (*s).to_string()).collect()));
+        self.state.queries.push((
+            sql.to_string(),
+            params.iter().map(|s| (*s).to_string()).collect(),
+        ));
         Ok(self.state.map_responses.pop_front().unwrap_or_default())
     }
 
@@ -1804,9 +1806,8 @@ impl RusqliteBackend {
         // control uses uncached `Connection::execute`; catching here guarantees
         // the phase reset and symmetric cache flush before any unexpected
         // unwind can release the connection mutex.
-        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            conn.execute(sql, [])
-        }));
+        let execution =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn.execute(sql, [])));
         drop(phase);
         conn.flush_prepared_statement_cache();
         match execution {
@@ -1817,10 +1818,7 @@ impl RusqliteBackend {
         }
     }
 
-    fn reinstall_owned_authorizer(
-        &self,
-        conn: &rusqlite::Connection,
-    ) -> Result<(), BackendError> {
+    fn reinstall_owned_authorizer(&self, conn: &rusqlite::Connection) -> Result<(), BackendError> {
         install_rusqlite_backend_authorizer(
             conn,
             Arc::clone(&self.authorizer_phase),
@@ -1853,8 +1851,7 @@ impl RusqliteBackend {
         F: FnOnce(&rusqlite::Connection) -> R,
     {
         let conn = self.conn_guard()?;
-        let callback_result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&conn)));
+        let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&conn)));
         let reinstall_result = self.reinstall_owned_authorizer(&conn);
         if callback_result.is_err() && !conn.is_autocommit() {
             let rollback_result = self.rollback_callback_transaction(&conn);
@@ -2049,17 +2046,16 @@ impl StorageBackend for RusqliteBackend {
         // The connection mutex excludes concurrent prepares across both the
         // cache flush and gate transition.
         guard.flush_prepared_statement_cache();
-        let callback_phase =
-            match AuthorizerPhaseReset::enter(
-                self.authorizer_phase.as_ref(),
-                AUTHORIZER_PHASE_CALLBACK,
-            ) {
-                Ok(phase) => phase,
-                Err(error) => {
-                    self.quarantine();
-                    return Err(error);
-                }
-            };
+        let callback_phase = match AuthorizerPhaseReset::enter(
+            self.authorizer_phase.as_ref(),
+            AUTHORIZER_PHASE_CALLBACK,
+        ) {
+            Ok(phase) => phase,
+            Err(error) => {
+                self.quarantine();
+                return Err(error);
+            }
+        };
         let mut tx_handle = RusqliteTransactionHandle {
             conn: &mut guard,
             boundary_lost: false,
@@ -2673,8 +2669,10 @@ mod tests {
     #[test]
     fn test_backend_loan_restores_original_connection_after_panic() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE preserved (value INTEGER); INSERT INTO preserved VALUES (7);")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE preserved (value INTEGER); INSERT INTO preserved VALUES (7);",
+        )
+        .unwrap();
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = with_test_storage_backend(&mut conn, |backend| -> crate::error::Result<()> {
@@ -2705,8 +2703,10 @@ mod tests {
     #[test]
     fn test_backend_loan_rejects_success_with_a_leaked_transaction() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE preserved (value INTEGER); INSERT INTO preserved VALUES (7);")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE preserved (value INTEGER); INSERT INTO preserved VALUES (7);",
+        )
+        .unwrap();
 
         let result = with_test_storage_backend(&mut conn, |backend| -> crate::error::Result<()> {
             backend.execute("BEGIN").unwrap();
@@ -2716,9 +2716,11 @@ mod tests {
             Ok(())
         });
         let error = result.expect_err("successful callback must not hide an open transaction");
-        assert!(error
-            .to_string()
-            .contains("returned success with an open transaction"));
+        assert!(
+            error
+                .to_string()
+                .contains("returned success with an open transaction")
+        );
         assert!(conn.is_autocommit());
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM preserved", [], |row| row.get(0))
@@ -2791,10 +2793,7 @@ mod tests {
             self.inner.execute_batch(sql)
         }
 
-        fn set_busy_timeout(
-            &self,
-            timeout: std::time::Duration,
-        ) -> Result<(), BackendError> {
+        fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<(), BackendError> {
             self.inner.set_busy_timeout(timeout)
         }
 
@@ -3106,14 +3105,20 @@ mod tests {
                 "`{control_sql}` must fail at the authorizer, not for an incidental semantic reason: {message}"
             );
             assert_eq!(
-                backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+                backend
+                    .query_scalar("SELECT COUNT(*) FROM t")
+                    .unwrap()
+                    .as_deref(),
                 Some("0"),
                 "a denied `{control_sql}` must roll back writes that preceded it"
             );
 
             backend.execute("INSERT INTO t VALUES (3)").unwrap();
             assert_eq!(
-                backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+                backend
+                    .query_scalar("SELECT COUNT(*) FROM t")
+                    .unwrap()
+                    .as_deref(),
                 Some("1"),
                 "ordinary SQL must remain usable after denying `{control_sql}`"
             );
@@ -3178,7 +3183,10 @@ mod tests {
         });
         assert!(matches!(callback_result, Err(BackendError::Query(_))));
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("0"),
             "the caller policy must be delegated to inside the callback and roll back prior writes"
         );
@@ -3187,7 +3195,10 @@ mod tests {
         let deletion = backend.execute("DELETE FROM t");
         assert!(matches!(deletion, Err(BackendError::Query(_))));
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("1"),
             "scoped transaction setup must not erase the caller's authorizer"
         );
@@ -3205,7 +3216,10 @@ mod tests {
         });
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
 
-        assert!(matches!(backend.execute("BEGIN"), Err(BackendError::Query(_))));
+        assert!(matches!(
+            backend.execute("BEGIN"),
+            Err(BackendError::Query(_))
+        ));
         assert_eq!(
             backend.transaction_state().unwrap(),
             BackendTransactionState::Autocommit,
@@ -3219,7 +3233,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("1"),
             "backend-owned BEGIN and COMMIT must remain available to the scoped transaction"
         );
@@ -3230,7 +3247,10 @@ mod tests {
         });
         assert!(matches!(callback_error, Err(BackendError::Other(_))));
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("1"),
             "backend-owned ROLLBACK must remain available after a callback error"
         );
@@ -3247,11 +3267,17 @@ mod tests {
             Some("panic under transaction-denying caller policy")
         );
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("1"),
             "backend-owned ROLLBACK must remain available before panic resume"
         );
-        assert!(matches!(backend.execute("BEGIN"), Err(BackendError::Query(_))));
+        assert!(matches!(
+            backend.execute("BEGIN"),
+            Err(BackendError::Query(_))
+        ));
         assert_eq!(
             backend.transaction_state().unwrap(),
             BackendTransactionState::Autocommit,
@@ -3310,7 +3336,10 @@ mod tests {
         });
         assert!(matches!(result, Err(BackendError::Query(_))));
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("0"),
             "a raw loan must not disable the authorizer fence for a later callback"
         );
@@ -3340,7 +3369,10 @@ mod tests {
         });
         assert!(matches!(result, Err(BackendError::Query(_))));
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("0"),
             "panic cleanup must reinstall the fence before resuming the payload"
         );
@@ -3367,7 +3399,10 @@ mod tests {
             BackendTransactionState::Autocommit
         );
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("0"),
             "panic cleanup must roll back a raw-loan transaction before reuse"
         );
@@ -3424,15 +3459,16 @@ mod tests {
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
 
         let result = backend.with_transaction(|tx| {
-            tx.execute_batch(
-                "INSERT INTO t VALUES (1); ROLLBACK; INSERT INTO t VALUES (2);",
-            )?;
+            tx.execute_batch("INSERT INTO t VALUES (1); ROLLBACK; INSERT INTO t VALUES (2);")?;
             Ok(())
         });
 
         assert!(matches!(result, Err(BackendError::Query(_))));
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("0"),
             "the batch prefix must be rolled back and its suffix must never reach autocommit"
         );
@@ -3459,7 +3495,10 @@ mod tests {
 
         assert!(matches!(result, Err(BackendError::Query(_))));
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("0")
         );
     }
@@ -3485,12 +3524,12 @@ mod tests {
             Ok(())
         });
 
-        assert!(matches!(
-            result,
-            Err(BackendError::TransactionBoundaryLost)
-        ));
+        assert!(matches!(result, Err(BackendError::TransactionBoundaryLost)));
         assert_eq!(
-            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap().as_deref(),
+            backend
+                .query_scalar("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .as_deref(),
             Some("1"),
             "SQLite's automatic rollback must discard the earlier callback write"
         );
@@ -3584,10 +3623,7 @@ mod tests {
             Err(BackendError::TxPoisoned)
         ));
         assert!(matches!(
-            backend.execute_many(
-                "INSERT INTO t VALUES (?1)",
-                &[vec![ToSqlValue::Integer(2)]],
-            ),
+            backend.execute_many("INSERT INTO t VALUES (?1)", &[vec![ToSqlValue::Integer(2)]],),
             Err(BackendError::TxPoisoned)
         ));
         assert!(matches!(
@@ -3698,28 +3734,28 @@ mod tests {
         let (child_result_sender, child_result_receiver) = std::sync::mpsc::sync_channel(1);
         let mut child_handle = None;
         let transaction_result = backend.with_transaction(|tx| {
-                tx.execute("INSERT INTO t VALUES (1, 'tx_step1')")?;
-                let child = std::thread::spawn(move || {
-                    let result = child_backend.execute("INSERT INTO t VALUES (100, 'child')");
-                    let _ = child_result_sender.send(result);
-                });
-                child_handle = Some(child);
-                match child_result_receiver.recv_timeout(std::time::Duration::from_secs(5)) {
-                    Ok(Err(BackendError::TransactionBusy)) => {}
-                    Ok(other) => {
-                        return Err(BackendError::Other(format!(
-                            "joined child returned an unexpected result: {other:?}"
-                        )));
-                    }
-                    Err(_) => {
-                        return Err(BackendError::Other(
-                            "joined child blocked on the transaction-owned connection".into(),
-                        ));
-                    }
-                }
-                tx.execute("INSERT INTO t VALUES (2, 'tx_step2')")?;
-                Ok(())
+            tx.execute("INSERT INTO t VALUES (1, 'tx_step1')")?;
+            let child = std::thread::spawn(move || {
+                let result = child_backend.execute("INSERT INTO t VALUES (100, 'child')");
+                let _ = child_result_sender.send(result);
             });
+            child_handle = Some(child);
+            match child_result_receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Err(BackendError::TransactionBusy)) => {}
+                Ok(other) => {
+                    return Err(BackendError::Other(format!(
+                        "joined child returned an unexpected result: {other:?}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(BackendError::Other(
+                        "joined child blocked on the transaction-owned connection".into(),
+                    ));
+                }
+            }
+            tx.execute("INSERT INTO t VALUES (2, 'tx_step2')")?;
+            Ok(())
+        });
         child_handle
             .expect("transaction must spawn its child")
             .join()

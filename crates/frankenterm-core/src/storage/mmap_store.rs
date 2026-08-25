@@ -144,12 +144,10 @@ const PANE_BASE_SEQ_JOURNAL_PREFIX: &str = "FTSEQ1:";
 const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const PANE_BASE_SEQ_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(not(test))]
-const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 =
-    PANE_BASE_SEQ_JOURNAL_MAX_BYTES / 4 * 3;
+const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = PANE_BASE_SEQ_JOURNAL_MAX_BYTES / 4 * 3;
 #[cfg(test)]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = 512;
 const GF_PRIM: u32 = 0x11d;
-
 
 /// An immutable, bounded view of one pane log at a stable filesystem identity.
 ///
@@ -870,9 +868,7 @@ impl PaneFile {
         let mut record = Vec::new();
         let mut total_bytes = 0u64;
         loop {
-            let bytes_read = (&mut reader)
-                .take(129)
-                .read_until(b'\n', &mut record)?;
+            let bytes_read = (&mut reader).take(129).read_until(b'\n', &mut record)?;
             if bytes_read == 0 {
                 break;
             }
@@ -901,12 +897,11 @@ impl PaneFile {
                             "malformed base sequence journal record".to_string(),
                         )
                     })?;
-                let value = std::str::from_utf8(value).map_err(|error| {
-                    MmapStoreError::InvalidPaneLogHeader(error.to_string())
-                })?;
-                let value = value.parse::<u64>().map_err(|error| {
-                    MmapStoreError::InvalidPaneLogHeader(error.to_string())
-                })?;
+                let value = std::str::from_utf8(value)
+                    .map_err(|error| MmapStoreError::InvalidPaneLogHeader(error.to_string()))?;
+                let value = value
+                    .parse::<u64>()
+                    .map_err(|error| MmapStoreError::InvalidPaneLogHeader(error.to_string()))?;
                 if latest.is_some_and(|previous| value < previous) {
                     return Err(MmapStoreError::InvalidPaneLogHeader(
                         "base sequence journal is not monotonic".to_string(),
@@ -978,12 +973,11 @@ impl PaneFile {
                                 "missing newline-terminated base sequence".to_string(),
                             )
                         })?;
-                    let value = std::str::from_utf8(value).map_err(|error| {
-                        MmapStoreError::InvalidPaneLogHeader(error.to_string())
-                    })?;
-                    base_seq = value.parse::<u64>().map_err(|error| {
-                        MmapStoreError::InvalidPaneLogHeader(error.to_string())
-                    })?;
+                    let value = std::str::from_utf8(value)
+                        .map_err(|error| MmapStoreError::InvalidPaneLogHeader(error.to_string()))?;
+                    base_seq = value
+                        .parse::<u64>()
+                        .map_err(|error| MmapStoreError::InvalidPaneLogHeader(error.to_string()))?;
                     data_start = next_cursor;
                 } else if pane_header_candidate {
                     return Err(MmapStoreError::InvalidPaneLogHeader(
@@ -1027,8 +1021,7 @@ impl PaneFile {
             options.custom_flags(libc::O_NOFOLLOW);
         }
         let file = options.open(path)?;
-        let (offsets, committed_len, _base_seq, _data_start) =
-            Self::scan_offsets_and_base(&file)?;
+        let (offsets, committed_len, _base_seq, _data_start) = Self::scan_offsets_and_base(&file)?;
         Ok((offsets, committed_len))
     }
 
@@ -1099,7 +1092,11 @@ impl PaneFile {
     }
 
     fn append_line(&mut self, line: &str) -> Result<u64, MmapStoreError> {
-        if line.as_bytes().iter().any(|byte| matches!(byte, b'\n' | b'\r')) {
+        if line
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'\n' | b'\r'))
+        {
             return Err(MmapStoreError::InvalidLineRecord);
         }
         let record_bytes = u64::try_from(line.len())
@@ -1371,9 +1368,7 @@ impl PaneFile {
                 invalid_shards.join("; ")
             )));
         }
-        shards.sort_by_key(|shard| {
-            (shard.original_len, shard.payload_crc32, shard.bytes.len())
-        });
+        shards.sort_by_key(|shard| (shard.original_len, shard.payload_crc32, shard.bytes.len()));
         let mut first_decode_error = None;
         let mut start = 0usize;
         while start < shards.len() {
@@ -1401,12 +1396,12 @@ impl PaneFile {
             }
             start = end;
         }
-        Err(first_decode_error.unwrap_or_else(|| {
-            MmapStoreError::InsufficientErasureShards {
+        Err(
+            first_decode_error.unwrap_or_else(|| MmapStoreError::InsufficientErasureShards {
                 have: shards.len(),
                 need: COLD_ERASURE_DATA_SHARDS,
-            }
-        }))
+            }),
+        )
     }
 
     fn stale_prefix_bytes(&self) -> u64 {
@@ -1477,11 +1472,7 @@ impl PaneFile {
             .collect::<Result<Vec<_>, _>>()?;
         let compacted_file = {
             let mut options = OpenOptions::new();
-            options
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .append(true);
+            options.create_new(true).read(true).write(true).append(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
@@ -1668,13 +1659,13 @@ impl SqliteFallbackStore {
             [pane_id_i64],
             |row| row.get(0),
         )?;
-        let next_seq = u64::try_from(next_seq_i64)
-            .map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        let next_seq =
+            u64::try_from(next_seq_i64).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
         let following_seq = next_seq
             .checked_add(1)
             .ok_or(MmapStoreError::NumericOverflow("seq"))?;
-        let following_seq_i64 = i64::try_from(following_seq)
-            .map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        let following_seq_i64 =
+            i64::try_from(following_seq).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
         transaction.execute(
             "INSERT INTO mmap_scrollback_lines (pane_id, seq, content) VALUES (?1, ?2, ?3)",
             params![pane_id_i64, next_seq_i64, line],
@@ -1798,8 +1789,7 @@ impl SqliteFallbackStore {
                 [pane_id_i64],
                 |row| row.get(0),
             )?;
-            return u64::try_from(next_seq_i64)
-                .map_err(|_| MmapStoreError::NumericOverflow("seq"));
+            return u64::try_from(next_seq_i64).map_err(|_| MmapStoreError::NumericOverflow("seq"));
         }
         let max_seq: Option<i64> = self.conn.query_row(
             "SELECT MAX(seq) FROM mmap_scrollback_lines WHERE pane_id = ?1",
@@ -2007,9 +1997,10 @@ pub fn read_pane_snapshot(
             bytes.pop();
         }
         record_bytes = record_bytes
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| {
-                MmapStoreError::NumericOverflow("pane_snapshot_record_bytes")
-            })?)
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| MmapStoreError::NumericOverflow("pane_snapshot_record_bytes"))?,
+            )
             .ok_or(MmapStoreError::NumericOverflow(
                 "pane_snapshot_record_bytes",
             ))?;
@@ -2262,8 +2253,8 @@ impl MmapScrollbackStore {
             return Err(MmapStoreError::StagedPaneVerificationFailed);
         }
         for (sequence, expected) in expected_records.iter().enumerate() {
-            let sequence = u64::try_from(sequence)
-                .map_err(|_| MmapStoreError::NumericOverflow("sequence"))?;
+            let sequence =
+                u64::try_from(sequence).map_err(|_| MmapStoreError::NumericOverflow("sequence"))?;
             if pane.line_at(sequence)?.as_deref() != Some(expected.as_str()) {
                 return Err(MmapStoreError::StagedPaneVerificationFailed);
             }
@@ -2318,10 +2309,7 @@ impl MmapScrollbackStore {
             .as_ref()
             .ok_or(MmapStoreError::UnknownPane(pane_id))?;
         let lines = sqlite.tail_lines(pane_id, n)?;
-        if lines.is_empty()
-            && sqlite.line_count(pane_id)? == 0
-            && !sqlite.is_authority(pane_id)?
-        {
+        if lines.is_empty() && sqlite.line_count(pane_id)? == 0 && !sqlite.is_authority(pane_id)? {
             return Err(MmapStoreError::UnknownPane(pane_id));
         }
         Ok(lines)
@@ -2351,7 +2339,11 @@ impl MmapScrollbackStore {
     }
 
     pub fn append_line(&mut self, pane_id: PaneId, line: &str) -> Result<u64, MmapStoreError> {
-        if line.as_bytes().iter().any(|byte| matches!(byte, b'\n' | b'\r')) {
+        if line
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'\n' | b'\r'))
+        {
             return Err(MmapStoreError::InvalidLineRecord);
         }
         let record_bytes = u64::try_from(line.len())
@@ -2661,9 +2653,10 @@ impl MmapScrollbackStore {
             return Some(PaneStorageMode::Mmap);
         }
         self.sqlite_fallback.as_ref().and_then(|sqlite| {
-            sqlite.should_become_authority(pane_id).ok().and_then(|authority| {
-                authority.then_some(PaneStorageMode::SqliteFallback)
-            })
+            sqlite
+                .should_become_authority(pane_id)
+                .ok()
+                .and_then(|authority| authority.then_some(PaneStorageMode::SqliteFallback))
         })
     }
 }
@@ -3074,9 +3067,7 @@ mod tests {
                 store.prune_before(1, oldest).unwrap();
             }
             assert!(
-                std::fs::metadata(dir.path().join("1.seq"))
-                    .unwrap()
-                    .len()
+                std::fs::metadata(dir.path().join("1.seq")).unwrap().len()
                     < PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES,
                 "journal-pressure compaction must collapse sequence history"
             );
@@ -3086,10 +3077,7 @@ mod tests {
         reopened.ensure_pane(1).unwrap();
         assert_eq!(reopened.oldest_seq(1), Some(89));
         assert_eq!(reopened.line_count(1), 11);
-        assert_eq!(
-            reopened.line_at(1, 89).unwrap().as_deref(),
-            Some("line-89")
-        );
+        assert_eq!(reopened.line_at(1, 89).unwrap().as_deref(), Some("line-89"));
     }
 
     #[test]
@@ -3109,7 +3097,10 @@ mod tests {
         let error = store
             .prune_before(1, 1)
             .expect_err("journal capacity must fail before logical authority advances");
-        assert!(matches!(error, MmapStoreError::PaneSequenceJournalFull { .. }));
+        assert!(matches!(
+            error,
+            MmapStoreError::PaneSequenceJournalFull { .. }
+        ));
         assert_eq!(store.oldest_seq(1), Some(0));
         assert_eq!(store.line_count(1), 2);
     }
@@ -3163,11 +3154,7 @@ mod tests {
 
         // Simulate the crash-leftover temp of an interrupted compaction.
         let unowned_target = dir.path().join("unowned-legacy-staging-target");
-        std::fs::write(
-            &unowned_target,
-            b"GARBAGE-FROM-INTERRUPTED-COMPACTION\n",
-        )
-        .unwrap();
+        std::fs::write(&unowned_target, b"GARBAGE-FROM-INTERRUPTED-COMPACTION\n").unwrap();
         std::fs::hard_link(&unowned_target, dir.path().join("1.log.compact.tmp")).unwrap();
 
         assert!(store.compact_pane_if_stale(1, 1).unwrap());
@@ -3296,7 +3283,9 @@ mod tests {
     fn rs_recovery_skips_one_corrupt_shard_when_quorum_remains() {
         let dir = temp_dir();
         let mut store = rs_store(dir.path());
-        store.append_line(1, "quorum-survives-one-corrupt-shard").unwrap();
+        store
+            .append_line(1, "quorum-survives-one-corrupt-shard")
+            .unwrap();
         assert!(store.refresh_pane_erasure_shards(1).unwrap());
         let raw = std::fs::read(dir.path().join("1.log")).unwrap();
         let first_sidecar = erasure_sidecar_paths(dir.path(), 1)
@@ -3449,12 +3438,7 @@ mod tests {
         assert_eq!(empty.committed_bytes(), 0);
 
         let error = store
-            .stage_versioned_pane_replacement(
-                (1_u64 << 63) | 80,
-                &["four".to_string()],
-                1,
-                4,
-            )
+            .stage_versioned_pane_replacement((1_u64 << 63) | 80, &["four".to_string()], 1, 4)
             .expect_err("record delimiter participates in committed-byte bound");
         assert!(matches!(
             error,
@@ -3774,7 +3758,10 @@ mod tests {
             assert_eq!(store.oldest_seq(1), None);
             assert_eq!(store.next_seq(1).unwrap(), 4);
             assert!(store.compact_pane_if_stale(1, 1).unwrap());
-            assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), b"\0FTMMAP1:4\n");
+            assert_eq!(
+                std::fs::read(dir.path().join("1.log")).unwrap(),
+                b"\0FTMMAP1:4\n"
+            );
         }
 
         let mut reopened = file_only_store(dir.path());
@@ -3854,11 +3841,7 @@ mod tests {
             Err(MmapStoreError::InvalidPaneLogHeader(_))
         ));
 
-        std::fs::write(
-            dir.path().join("3.log"),
-            b"line-0\nline-1\nline-2\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("3.log"), b"line-0\nline-1\nline-2\n").unwrap();
         std::fs::write(dir.path().join("3.seq"), b"FTSEQ1:2\nFTSEQ1:1\n").unwrap();
         assert!(matches!(
             PaneFile::open(dir.path(), 3),
@@ -3886,10 +3869,7 @@ mod tests {
         std::fs::write(&sequence_target, b"FTSEQ1:0\n").unwrap();
         symlink(&sequence_target, dir.path().join("42.seq")).unwrap();
         assert!(PaneFile::open(dir.path(), 42).is_err());
-        assert_eq!(
-            std::fs::read(&sequence_target).unwrap(),
-            b"FTSEQ1:0\n"
-        );
+        assert_eq!(std::fs::read(&sequence_target).unwrap(), b"FTSEQ1:0\n");
     }
 
     // --- SQLite-only fallback store ---
@@ -4092,11 +4072,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
 
             std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            std::fs::set_permissions(
-                &sequence_path,
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .unwrap();
+            std::fs::set_permissions(&sequence_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
         }
 
         let snapshot = read_pane_snapshot(dir.path(), 9, 3, 1024, 1024).unwrap();

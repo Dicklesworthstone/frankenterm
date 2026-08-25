@@ -271,15 +271,9 @@ pub struct LegacyDiscardReceipt {
 #[derive(Debug, thiserror::Error)]
 pub enum LegacyRecoveryDiscardError {
     #[error("legacy scrollback candidate {path} in state {state} is not discardable")]
-    Ineligible {
-        path: PathBuf,
-        state: &'static str,
-    },
+    Ineligible { path: PathBuf, state: &'static str },
     #[error("legacy scrollback candidate {path} cannot be discarded safely: {reason}")]
-    Unsafe {
-        path: PathBuf,
-        reason: &'static str,
-    },
+    Unsafe { path: PathBuf, reason: &'static str },
     #[error("legacy scrollback discard {phase} failed for {path}: {source}")]
     Io {
         path: PathBuf,
@@ -343,51 +337,62 @@ impl OrphanCandidate {
         &self,
         limits: LegacyRecoveryLimits,
     ) -> Result<LinearRecordSnapshot, MmapScrollbackError> {
-        let limits = limits.validate().map_err(|_| MmapScrollbackError::InvalidReadLimit {
-            limit_name: "legacy_recovery_envelope",
-        })?;
+        let limits = limits
+            .validate()
+            .map_err(|_| MmapScrollbackError::InvalidReadLimit {
+                limit_name: "legacy_recovery_envelope",
+            })?;
         if !matches!(&self.state, OrphanState::Orphaned) {
             return Err(MmapScrollbackError::UnsafeReadSource {
                 path: self.path.clone(),
                 reason: "candidate is not an orphan",
             });
         }
-        let directory = self.directory.as_ref().ok_or_else(|| {
-            MmapScrollbackError::UnsafeReadSource {
+        let directory =
+            self.directory
+                .as_ref()
+                .ok_or_else(|| MmapScrollbackError::UnsafeReadSource {
+                    path: self.path.clone(),
+                    reason: "candidate has no pinned directory",
+                })?;
+        let leaf = self
+            .leaf
+            .as_ref()
+            .ok_or_else(|| MmapScrollbackError::UnsafeReadSource {
                 path: self.path.clone(),
-                reason: "candidate has no pinned directory",
-            }
-        })?;
-        let leaf = self.leaf.as_ref().ok_or_else(|| MmapScrollbackError::UnsafeReadSource {
-            path: self.path.clone(),
-            reason: "candidate has no pinned leaf",
-        })?;
-        let lease = self.recovery_lease.as_ref().ok_or_else(|| {
-            MmapScrollbackError::UnsafeReadSource {
-                path: self.path.clone(),
-                reason: "candidate has no held recovery lease",
-            }
-        })?;
-        let expected_identity = self.data_identity.ok_or_else(|| {
-            MmapScrollbackError::UnsafeReadSource {
-                path: self.path.clone(),
-                reason: "candidate has no classified data identity",
-            }
-        })?;
+                reason: "candidate has no pinned leaf",
+            })?;
+        let lease =
+            self.recovery_lease
+                .as_ref()
+                .ok_or_else(|| MmapScrollbackError::UnsafeReadSource {
+                    path: self.path.clone(),
+                    reason: "candidate has no held recovery lease",
+                })?;
+        let expected_identity =
+            self.data_identity
+                .ok_or_else(|| MmapScrollbackError::UnsafeReadSource {
+                    path: self.path.clone(),
+                    reason: "candidate has no classified data identity",
+                })?;
         if directory.display_path.join(leaf) != self.path {
             return Err(MmapScrollbackError::UnsafeReadSource {
                 path: self.path.clone(),
                 reason: "candidate display path no longer matches its pinned data capability",
             });
         }
-        directory.revalidate().map_err(|_| MmapScrollbackError::UnsafeReadSource {
-            path: self.path.clone(),
-            reason: "pinned scrollback directory changed identity",
-        })?;
-        lease.revalidate().map_err(|_| MmapScrollbackError::UnsafeReadSource {
-            path: self.path.clone(),
-            reason: "recovery lock changed identity",
-        })?;
+        directory
+            .revalidate()
+            .map_err(|_| MmapScrollbackError::UnsafeReadSource {
+                path: self.path.clone(),
+                reason: "pinned scrollback directory changed identity",
+            })?;
+        lease
+            .revalidate()
+            .map_err(|_| MmapScrollbackError::UnsafeReadSource {
+                path: self.path.clone(),
+                reason: "recovery lock changed identity",
+            })?;
         let snapshot = read_linear_records_in_directory(
             &directory.directory,
             leaf,
@@ -403,14 +408,18 @@ impl OrphanCandidate {
                 reason: "filename/header identity changed during recovery",
             });
         }
-        lease.revalidate().map_err(|_| MmapScrollbackError::UnsafeReadSource {
-            path: self.path.clone(),
-            reason: "recovery lock changed identity after read",
-        })?;
-        directory.revalidate().map_err(|_| MmapScrollbackError::UnsafeReadSource {
-            path: self.path.clone(),
-            reason: "pinned scrollback directory changed identity after read",
-        })?;
+        lease
+            .revalidate()
+            .map_err(|_| MmapScrollbackError::UnsafeReadSource {
+                path: self.path.clone(),
+                reason: "recovery lock changed identity after read",
+            })?;
+        directory
+            .revalidate()
+            .map_err(|_| MmapScrollbackError::UnsafeReadSource {
+                path: self.path.clone(),
+                reason: "pinned scrollback directory changed identity after read",
+            })?;
         Ok(snapshot)
     }
 
@@ -428,14 +437,18 @@ impl OrphanCandidate {
         }
 
         let path = self.path;
-        let directory = self.directory.ok_or_else(|| LegacyRecoveryDiscardError::Unsafe {
-            path: path.clone(),
-            reason: "candidate has no pinned directory",
-        })?;
-        let leaf = self.leaf.ok_or_else(|| LegacyRecoveryDiscardError::Unsafe {
-            path: path.clone(),
-            reason: "candidate has no pinned data leaf",
-        })?;
+        let directory = self
+            .directory
+            .ok_or_else(|| LegacyRecoveryDiscardError::Unsafe {
+                path: path.clone(),
+                reason: "candidate has no pinned directory",
+            })?;
+        let leaf = self
+            .leaf
+            .ok_or_else(|| LegacyRecoveryDiscardError::Unsafe {
+                path: path.clone(),
+                reason: "candidate has no pinned data leaf",
+            })?;
         let lease = self
             .recovery_lease
             .ok_or_else(|| LegacyRecoveryDiscardError::Unsafe {
@@ -515,13 +528,14 @@ impl OrphanCandidate {
                 source,
             })?
             .into_std();
-        let handle_metadata = data_file.metadata().map_err(|source| {
-            LegacyRecoveryDiscardError::Io {
-                path: path.clone(),
-                phase: "data descriptor metadata",
-                source,
-            }
-        })?;
+        let handle_metadata =
+            data_file
+                .metadata()
+                .map_err(|source| LegacyRecoveryDiscardError::Io {
+                    path: path.clone(),
+                    phase: "data descriptor metadata",
+                    source,
+                })?;
         validate_private_pair(&path_metadata, &handle_metadata).map_err(|source| {
             LegacyRecoveryDiscardError::Io {
                 path: path.clone(),
@@ -553,14 +567,15 @@ impl OrphanCandidate {
                 phase: "final lease revalidation",
                 source,
             })?;
-        let final_path_metadata = directory
-            .directory
-            .symlink_metadata(&leaf)
-            .map_err(|source| LegacyRecoveryDiscardError::Io {
-                path: path.clone(),
-                phase: "final data metadata",
-                source,
-            })?;
+        let final_path_metadata =
+            directory
+                .directory
+                .symlink_metadata(&leaf)
+                .map_err(|source| LegacyRecoveryDiscardError::Io {
+                    path: path.clone(),
+                    phase: "final data metadata",
+                    source,
+                })?;
         validate_candidate_metadata(&final_path_metadata, &directory_metadata).map_err(
             |reason| LegacyRecoveryDiscardError::Unsafe {
                 path: path.clone(),
@@ -574,14 +589,13 @@ impl OrphanCandidate {
             });
         }
 
-        directory
-            .directory
-            .remove_file(&leaf)
-            .map_err(|source| LegacyRecoveryDiscardError::Io {
+        directory.directory.remove_file(&leaf).map_err(|source| {
+            LegacyRecoveryDiscardError::Io {
                 path: path.clone(),
                 phase: "data unlink",
                 source,
-            })?;
+            }
+        })?;
         match directory.directory.symlink_metadata(&leaf) {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(source) => {
@@ -598,13 +612,14 @@ impl OrphanCandidate {
                 });
             }
         }
-        let handle_metadata_after = data_file.metadata().map_err(|source| {
-            LegacyRecoveryDiscardError::Io {
-                path: path.clone(),
-                phase: "post-unlink descriptor metadata",
-                source,
-            }
-        })?;
+        let handle_metadata_after =
+            data_file
+                .metadata()
+                .map_err(|source| LegacyRecoveryDiscardError::Io {
+                    path: path.clone(),
+                    phase: "post-unlink descriptor metadata",
+                    source,
+                })?;
         if metadata_identity(&handle_metadata_after) != expected_identity {
             return Err(LegacyRecoveryDiscardError::Unsafe {
                 path,
@@ -794,13 +809,14 @@ impl MmapReplayPlan {
                     observed: limits.max_records as u64 + 1,
                 });
             }
-            plan.records_read = plan.records_read.checked_add(1).ok_or(
-                MmapReplayPlanError::LimitExceeded {
-                    limit_name: "records",
-                    limit: limits.max_records as u64,
-                    observed: u64::MAX,
-                },
-            )?;
+            plan.records_read =
+                plan.records_read
+                    .checked_add(1)
+                    .ok_or(MmapReplayPlanError::LimitExceeded {
+                        limit_name: "records",
+                        limit: limits.max_records as u64,
+                        observed: u64::MAX,
+                    })?;
             plan.bytes_read = plan.bytes_read.checked_add(payload_bytes).ok_or(
                 MmapReplayPlanError::LimitExceeded {
                     limit_name: "payload_bytes",
@@ -1203,8 +1219,8 @@ fn row_from_candidate(
                 pane_uuid_short_from_header,
             );
             let bytes_written = header.map(|header| header.total_bytes_written);
-            let last_msync_age_ms = header
-                .and_then(|header| now_epoch_ms.checked_sub(header.last_msync_at_epoch_ms));
+            let last_msync_age_ms =
+                header.and_then(|header| now_epoch_ms.checked_sub(header.last_msync_at_epoch_ms));
             let accessibility_label = format_accessibility_label(
                 &pane_uuid_short,
                 OrphanPickerBadge::Locked,
@@ -1255,9 +1271,10 @@ fn row_from_candidate(
             })
         }
         OrphanState::Unsafe => {
-            let reason = candidate
-                .unsafe_reason
-                .map_or_else(|| "unknown".to_string(), |reason| reason.as_str().to_string());
+            let reason = candidate.unsafe_reason.map_or_else(
+                || "unknown".to_string(),
+                |reason| reason.as_str().to_string(),
+            );
             let pane_uuid_short = pane_uuid_short_from_path(&candidate.path);
             let accessibility_label = format_accessibility_label(
                 &pane_uuid_short,
@@ -1317,7 +1334,8 @@ fn format_accessibility_label(
             corrupt_reason.unwrap_or("unknown")
         ),
         OrphanPickerBadge::Locked => {
-            let bytes = bytes_written.map_or_else(|| "unknown".to_string(), |value| value.to_string());
+            let bytes =
+                bytes_written.map_or_else(|| "unknown".to_string(), |value| value.to_string());
             let age = last_msync_age_ms
                 .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms"));
             format!(
@@ -1339,9 +1357,7 @@ fn metadata_identity(metadata: &impl cap_fs_ext::MetadataExt) -> LinearRecordSou
     }
 }
 
-fn validate_private_directory_metadata(
-    metadata: &cap_std::fs::Metadata,
-) -> std::io::Result<()> {
+fn validate_private_directory_metadata(metadata: &cap_std::fs::Metadata) -> std::io::Result<()> {
     if !metadata.is_dir() {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
@@ -1560,9 +1576,8 @@ fn acquire_recovery_lease(lock_path: &Path) -> std::io::Result<LockProbeOutcome>
     let lock_file = directory.open_with(&lock_leaf, &options)?.into_std();
     let path_metadata = directory.symlink_metadata(&lock_leaf)?;
     let handle_metadata = lock_file.metadata()?;
-    validate_candidate_metadata(&path_metadata, &directory_metadata).map_err(|_| {
-        std::io::Error::new(ErrorKind::InvalidData, "recovery lock is not private")
-    })?;
+    validate_candidate_metadata(&path_metadata, &directory_metadata)
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "recovery lock is not private"))?;
     validate_private_pair(&path_metadata, &handle_metadata)?;
     let lock_identity = metadata_identity(&handle_metadata);
     if metadata_identity(&path_metadata) != lock_identity {
@@ -1622,10 +1637,12 @@ pub fn scan_orphans(
     let directory = Arc::new(PinnedScrollbackDirectory::open(scrollback_dir)?);
     let mut out = Vec::new();
     let mut leaves = Vec::new();
-    let total_leaf_limit = limits
-        .max_directory_entries
-        .checked_mul(2)
-        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "legacy scrollback directory entry limit overflows"))?;
+    let total_leaf_limit = limits.max_directory_entries.checked_mul(2).ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "legacy scrollback directory entry limit overflows",
+        )
+    })?;
     for entry in directory.directory.entries()? {
         if leaves.len() >= total_leaf_limit {
             return Err(std::io::Error::new(
@@ -1934,7 +1951,9 @@ fn read_header_in_directory(
 
     let mut bytes = [0u8; HEADER_SIZE];
     let decoded = if file.read_exact(&mut bytes).is_err() {
-        let actual = usize::try_from(opened.len()).unwrap_or(usize::MAX).min(HEADER_SIZE);
+        let actual = usize::try_from(opened.len())
+            .unwrap_or(usize::MAX)
+            .min(HEADER_SIZE);
         Err(HeaderDecodeError::Truncated {
             expected: HEADER_SIZE,
             actual,
@@ -2524,13 +2543,19 @@ mod tests {
         fs::hard_link(&hardlinked, dir.join("hardlink-copy")).unwrap();
         let candidate = classify_path(&hardlinked, &AlwaysOrphaned, recovery_limits());
         assert_eq!(candidate.state, OrphanState::Unsafe);
-        assert_eq!(candidate.unsafe_reason(), Some(OrphanUnsafeReason::HardLinked));
+        assert_eq!(
+            candidate.unsafe_reason(),
+            Some(OrphanUnsafeReason::HardLinked)
+        );
 
         let nonprivate = write_valid_scrollback(&dir, 0x42);
         fs::set_permissions(&nonprivate, fs::Permissions::from_mode(0o644)).unwrap();
         let candidate = classify_path(&nonprivate, &AlwaysOrphaned, recovery_limits());
         assert_eq!(candidate.state, OrphanState::Unsafe);
-        assert_eq!(candidate.unsafe_reason(), Some(OrphanUnsafeReason::NotPrivate));
+        assert_eq!(
+            candidate.unsafe_reason(),
+            Some(OrphanUnsafeReason::NotPrivate)
+        );
 
         let mismatched = write_valid_scrollback(&dir, 0x43);
         let mismatched_name = dir.join(format!("{}.bin", "44".repeat(32)));
@@ -2565,7 +2590,10 @@ mod tests {
         let candidate = classify_path(&path, &AlwaysOrphaned, limits);
 
         assert_eq!(candidate.state, OrphanState::Unsafe);
-        assert_eq!(candidate.unsafe_reason(), Some(OrphanUnsafeReason::Oversized));
+        assert_eq!(
+            candidate.unsafe_reason(),
+            Some(OrphanUnsafeReason::Oversized)
+        );
     }
 
     #[test]
@@ -2612,7 +2640,10 @@ mod tests {
 
         let error = candidate.read_records(recovery_limits()).unwrap_err();
 
-        assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
+        assert!(matches!(
+            error,
+            MmapScrollbackError::UnsafeReadSource { .. }
+        ));
         assert!(path.exists(), "replacement must remain untouched");
     }
 
@@ -2689,7 +2720,10 @@ mod tests {
         let error = candidate.discard().unwrap_err();
 
         assert!(matches!(error, LegacyRecoveryDiscardError::Unsafe { .. }));
-        assert!(path.is_file(), "the pinned data capability must remain intact");
+        assert!(
+            path.is_file(),
+            "the pinned data capability must remain intact"
+        );
         assert!(!claimed_path.exists());
     }
 
@@ -2716,7 +2750,9 @@ mod tests {
             .unwrap();
         assert_eq!(candidate.state, OrphanState::Corrupt);
 
-        let receipt = candidate.discard().expect("discard leased corrupt identity");
+        let receipt = candidate
+            .discard()
+            .expect("discard leased corrupt identity");
 
         assert_eq!(receipt.data_path, path);
         assert!(!path.exists());
@@ -2731,7 +2767,10 @@ mod tests {
 
         let error = candidate.read_records(recovery_limits()).unwrap_err();
 
-        assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
+        assert!(matches!(
+            error,
+            MmapScrollbackError::UnsafeReadSource { .. }
+        ));
     }
 
     #[cfg(unix)]
@@ -2752,7 +2791,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(candidate.state, OrphanState::Unsafe);
-        assert_eq!(candidate.unsafe_reason(), Some(OrphanUnsafeReason::UnsafeLock));
+        assert_eq!(
+            candidate.unsafe_reason(),
+            Some(OrphanUnsafeReason::UnsafeLock)
+        );
     }
 
     #[cfg(unix)]
@@ -2765,7 +2807,10 @@ mod tests {
         fs::set_permissions(&nonprivate_lock, fs::Permissions::from_mode(0o644)).unwrap();
         let candidate = classify_path(&nonprivate_data, &FlockLockProbe, recovery_limits());
         assert_eq!(candidate.state, OrphanState::Unsafe);
-        assert_eq!(candidate.unsafe_reason(), Some(OrphanUnsafeReason::UnsafeLock));
+        assert_eq!(
+            candidate.unsafe_reason(),
+            Some(OrphanUnsafeReason::UnsafeLock)
+        );
 
         let hardlinked_data = write_valid_scrollback(&dir, 0x65);
         let hardlinked_lock = hardlinked_data.with_extension("bin.lock");
@@ -2773,7 +2818,10 @@ mod tests {
         fs::hard_link(&hardlinked_lock, dir.join("lock-hardlink-copy")).unwrap();
         let candidate = classify_path(&hardlinked_data, &FlockLockProbe, recovery_limits());
         assert_eq!(candidate.state, OrphanState::Unsafe);
-        assert_eq!(candidate.unsafe_reason(), Some(OrphanUnsafeReason::UnsafeLock));
+        assert_eq!(
+            candidate.unsafe_reason(),
+            Some(OrphanUnsafeReason::UnsafeLock)
+        );
     }
 
     #[cfg(unix)]
@@ -2867,12 +2915,9 @@ mod tests {
             reason: crate::scrollback_mmap_writer::LinearRecordTerminalReason::PhysicalRecordPayloadTruncated,
         };
 
-        let plan = MmapReplayPlan::from_snapshot(
-            snapshot,
-            DEFAULT_REPLAY_CHUNK_BYTES,
-            recovery_limits(),
-        )
-        .unwrap();
+        let plan =
+            MmapReplayPlan::from_snapshot(snapshot, DEFAULT_REPLAY_CHUNK_BYTES, recovery_limits())
+                .unwrap();
 
         assert_eq!(plan.status(), MmapReplayStatus::Partial);
         assert!(matches!(

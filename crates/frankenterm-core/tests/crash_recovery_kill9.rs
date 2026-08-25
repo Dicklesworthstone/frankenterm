@@ -259,12 +259,7 @@ fn invariant_3_bounded_loss_surfaces_recoverable_tail() {
 
     // Scanner classifies as Orphaned — the in-flight tail does not
     // poison the header.
-    let out = scan_orphans(
-        &dir,
-        &AlwaysOrphaned,
-        LegacyRecoveryLimits::DEFAULT,
-    )
-    .unwrap();
+    let out = scan_orphans(&dir, &AlwaysOrphaned, LegacyRecoveryLimits::DEFAULT).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].state, OrphanState::Orphaned);
     assert!(out[0].header_ok().is_some());

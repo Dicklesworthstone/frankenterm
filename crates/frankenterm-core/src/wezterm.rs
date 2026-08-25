@@ -1128,10 +1128,7 @@ const MAX_CLI_ERROR_OUTPUT_BYTES: usize = 8 * 1024;
 
 #[cfg(any(test, all(feature = "vendored", unix)))]
 fn append_mux_text_line_bounded(out: &mut String, line: &str, cap: usize) -> Result<()> {
-    let next_len = out
-        .len()
-        .saturating_add(line.len())
-        .saturating_add(1);
+    let next_len = out.len().saturating_add(line.len()).saturating_add(1);
     if next_len > cap {
         return Err(WeztermError::OutputTooLarge {
             command: "mux get-text".to_string(),

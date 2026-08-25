@@ -85,11 +85,7 @@ fn locked_candidate(
 }
 
 fn corrupt_candidate(label: impl AsRef<str>, err: HeaderDecodeError) -> OrphanCandidate {
-    OrphanCandidate::for_picker(
-        path_for(label),
-        OrphanState::Corrupt,
-        Some(Err(err)),
-    )
+    OrphanCandidate::for_picker(path_for(label), OrphanState::Corrupt, Some(Err(err)))
 }
 
 fn wrong_shape_candidate(label: impl AsRef<str>) -> OrphanCandidate {
