@@ -5510,7 +5510,9 @@ mod tests {
                         match self.body {
                             GuardianCheckpointStageBodyV1::Chunk(chunk) => Ok(chunk),
                             GuardianCheckpointStageBodyV1::Begin
-                            | GuardianCheckpointStageBodyV1::Seal => {
+                            | GuardianCheckpointStageBodyV1::Seal
+                            | GuardianCheckpointStageBodyV1::Query
+                            | GuardianCheckpointStageBodyV1::Ack { .. } => {
                                 Err(GuardianProtocolError::InvalidOperationPayload)
                             }
                         }
@@ -5560,6 +5562,8 @@ mod tests {
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::new:private:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::query:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal:pub:production",
         ]
         .into_iter()
@@ -5583,6 +5587,8 @@ mod tests {
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::new",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::query",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal",
             "GuardianCheckpointStageRequestV1@GuardianReply::require_request_payload",
         ]
