@@ -12855,15 +12855,21 @@ mod tests {
             for gate in &mut gates {
                 if let Some(ref req_step) = self.require_approval_step {
                     if gate.step_id.0 == *req_step {
-                        gate.approval_required = true;
-                        gate.approval_granted = false;
+                        gate.required_approval = Some(crate::plan::TxPrepareApprovalRequirement {
+                            workspace_id: "ws-1".to_string(),
+                            action_kind: "send_text".to_string(),
+                            pane_id: gate.pane_id,
+                            action_fingerprint: "fp-1".to_string(),
+                            reason_code: Some("approval_required_for_test".to_string()),
+                        });
+                        gate.approval_satisfied = false;
                         gate.approval_reason_code = Some("approval_required_for_test".to_string());
                     }
                 }
                 if let Some(ref fail_step) = self.fail_precondition_step {
                     if gate.step_id.0 == *fail_step {
-                        gate.preconditions_passed = false;
-                        gate.preconditions_reason_code = Some("precondition_target_dead".to_string());
+                        gate.preconditions_satisfied = false;
+                        gate.precondition_reason_code = Some("precondition_target_dead".to_string());
                     }
                 }
             }
@@ -12922,18 +12928,14 @@ mod tests {
             executor,
             TxExecutionConfig {
                 auto_compensate: true,
+                kill_switch: MissionKillSwitchLevel::HardStop,
                 ..TxExecutionConfig::default()
             },
         );
 
-        // Replay with KillSwitch on (Active)
+        // Replay with KillSwitch on (HardStop)
         let result = engine
-            .execute_with_store_and_kill_switch(
-                &mut contract,
-                &mut store,
-                MissionKillSwitchLevel::Active,
-                6_000,
-            )
+            .execute_with_store(&mut contract, &mut store, 6_000)
             .map_err(|err| err.to_string())?;
 
         assert_eq!(result.final_state, MissionTxState::Compensated);
@@ -13075,17 +13077,13 @@ mod tests {
             executor,
             TxExecutionConfig {
                 auto_compensate: false,
+                kill_switch: MissionKillSwitchLevel::HardStop,
                 ..TxExecutionConfig::default()
             },
         );
 
         let err = engine
-            .execute_with_store_and_kill_switch(
-                &mut contract,
-                &mut store,
-                MissionKillSwitchLevel::Active,
-                6_000,
-            )
+            .execute_with_store(&mut contract, &mut store, 6_000)
             .expect_err("must fail closed when auto-compensate is false and uncommitted steps exist");
 
         assert!(matches!(err, TxExecutionError::CommitPhase(_)));
