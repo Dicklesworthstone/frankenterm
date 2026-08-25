@@ -7739,6 +7739,79 @@ struct ReceiptCapacityPlan {
     effect_ids: Vec<Uuid>,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct GuardianGenesisReservationRecordV1 {
+    mux_incarnation: Uuid,
+    spawn_effect_id: Uuid,
+    durable_pane_id: Uuid,
+    origin_request_id: Uuid,
+    spawn_payload_bytes: u64,
+    spawn_payload_digest: [u8; 32],
+    spawning_mux_build_identity_digest: [u8; 32],
+    live_guardian_build_identity_digest: [u8; 32],
+    rows: u16,
+    cols: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+    checkpoint_identity_digest: [u8; 32],
+    boundary_identity_digest: [u8; 32],
+    upload_id: Uuid,
+}
+
+impl GuardianGenesisReservationRecordV1 {
+    fn from_identity(identity: &GuardianGenesisReservationIdentityV1) -> Self {
+        Self {
+            mux_incarnation: identity.mux_incarnation(),
+            spawn_effect_id: identity.spawn_effect_id(),
+            durable_pane_id: identity.durable_pane_id(),
+            origin_request_id: identity.origin_request_id(),
+            spawn_payload_bytes: identity.spawn_payload_bytes(),
+            spawn_payload_digest: identity.spawn_payload_digest(),
+            spawning_mux_build_identity_digest: identity.spawning_mux_build_identity_digest(),
+            live_guardian_build_identity_digest: identity.live_guardian_build_identity_digest(),
+            rows: identity.rows(),
+            cols: identity.cols(),
+            pixel_width: identity.pixel_width(),
+            pixel_height: identity.pixel_height(),
+            checkpoint_identity_digest: identity.checkpoint_identity_digest(),
+            boundary_identity_digest: identity.boundary_identity_digest(),
+            upload_id: identity.upload_id(),
+        }
+    }
+
+    fn matches_authenticated_spawn(&self, request: &AuthenticatedGuardianRequest) -> bool {
+        self.mux_incarnation == request.header.mux_incarnation
+            && self.spawn_effect_id == request.header.effect_id.unwrap_or(Uuid::nil())
+            && self.durable_pane_id == request.header.pane_id.unwrap_or(Uuid::nil())
+            && self.origin_request_id == request.header.request_id
+            && self.spawn_payload_bytes == u64::from(request.authenticated_payload_bytes())
+            && self.spawn_payload_digest == request.header.payload_sha256
+    }
+}
+
+impl std::fmt::Debug for GuardianGenesisReservationRecordV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianGenesisReservationRecordV1")
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("spawn_effect_id", &self.spawn_effect_id)
+            .field("durable_pane_id", &self.durable_pane_id)
+            .field("origin_request_id", &self.origin_request_id)
+            .field("spawn_payload_bytes", &self.spawn_payload_bytes)
+            .field("spawn_payload_digest", &"[REDACTED]")
+            .field("spawning_mux_build_identity_digest", &"[REDACTED]")
+            .field("live_guardian_build_identity_digest", &"[REDACTED]")
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("pixel_width", &self.pixel_width)
+            .field("pixel_height", &self.pixel_height)
+            .field("checkpoint_identity_digest", &"[REDACTED]")
+            .field("boundary_identity_digest", &"[REDACTED]")
+            .field("upload_id", &self.upload_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 #[cfg_attr(test, derive(Clone, Eq, PartialEq))]
 pub struct GuardianProtocolState {
@@ -7759,6 +7832,9 @@ pub struct GuardianProtocolState {
     transient_effect_order: VecDeque<Uuid>,
     protected_spawn_requests: HashSet<Uuid>,
     protected_spawn_effects: HashSet<Uuid>,
+    genesis_reservations_by_request: HashMap<Uuid, GuardianGenesisReservationRecordV1>,
+    genesis_reservation_effects: HashMap<Uuid, Uuid>,
+    genesis_reservation_panes: HashMap<Uuid, Uuid>,
     receipt_capacity: usize,
 }
 
@@ -7779,6 +7855,9 @@ impl GuardianProtocolState {
             transient_effect_order: VecDeque::new(),
             protected_spawn_requests: HashSet::new(),
             protected_spawn_effects: HashSet::new(),
+            genesis_reservations_by_request: HashMap::new(),
+            genesis_reservation_effects: HashMap::new(),
+            genesis_reservation_panes: HashMap::new(),
             receipt_capacity: GUARDIAN_MAX_EFFECT_RECEIPTS,
         })
     }
@@ -7799,6 +7878,189 @@ impl GuardianProtocolState {
     #[must_use]
     pub const fn incarnation(&self) -> Uuid {
         self.incarnation
+    }
+
+    /// Bind one authenticated, build-bearing `Hello` to this guardian state.
+    ///
+    /// The mux incarnation and build identity are decoded exclusively from
+    /// the authenticated request. Legacy empty `Hello` and explicit unsealed
+    /// development identities remain valid for ordinary discovery but fail
+    /// closed here.
+    pub fn authenticate_mux_connection_for_genesis(
+        &self,
+        hello: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianProtocolError> {
+        validate_request_envelope(hello)?;
+        if hello.header.operation != GuardianOperation::Hello {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: hello.header.operation,
+            });
+        }
+        if hello.payload().is_empty() {
+            return Err(GuardianProtocolError::GenesisAuthorityUnavailable);
+        }
+        let mux_build_identity =
+            GuardianHelloBuildIdentityV1::decode(hello.payload())?.require_sealed()?;
+        Ok(GuardianAuthenticatedMuxConnectionAuthorityV1 {
+            guardian_incarnation: self.incarnation,
+            mux_incarnation: hello.header.mux_incarnation,
+            hello_request_id: hello.header.request_id,
+            mux_build_identity,
+        })
+    }
+
+    /// Derive the running guardian's Genesis authority from this compilation.
+    ///
+    /// An absent, malformed, zero, or explicitly unsealed build identity is a
+    /// terminal authority failure. No caller-supplied bytes enter this path.
+    pub fn live_build_authority_for_genesis(
+        &self,
+    ) -> Result<GuardianLiveBuildAuthorityV1, GuardianProtocolError> {
+        let guardian_build_identity = compiled_atomic_build_identity()?
+            .require_sealed()
+            .map_err(|_| GuardianProtocolError::GenesisBuildIdentityUnavailable)?;
+        if guardian_build_identity
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(GuardianProtocolError::GenesisBuildIdentityUnavailable);
+        }
+        Ok(GuardianLiveBuildAuthorityV1 {
+            guardian_incarnation: self.incarnation,
+            guardian_build_identity,
+        })
+    }
+
+    /// Issue the one-shot permit for a fully authenticated pre-Spawn Genesis
+    /// reservation without executing Spawn.
+    ///
+    /// Every identity is derived from either the authenticated Spawn, its
+    /// authenticated Genesis `Begin`, the authenticated connection/successor
+    /// authority, or the running guardian's sealed build authority. This
+    /// method retains a permanent one-shot fence before returning the linear
+    /// permit. There is intentionally no companion production method that can
+    /// consume the permit and launch a child yet.
+    pub fn reserve_genesis_spawn(
+        &mut self,
+        spawn_request: &AuthenticatedGuardianRequest,
+        genesis_begin_request: &AuthenticatedGuardianRequest,
+        mux_authority: Option<GuardianGenesisMuxAuthorityV1<'_>>,
+        live_guardian_authority: Option<&GuardianLiveBuildAuthorityV1>,
+    ) -> Result<GuardianCheckpointGenesisSpawnPermitV1, GuardianProtocolError> {
+        validate_request_envelope(spawn_request)?;
+        validate_request_envelope(genesis_begin_request)?;
+        if spawn_request.header.guardian_incarnation != self.incarnation
+            || genesis_begin_request.header.guardian_incarnation != self.incarnation
+        {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+        }
+        if spawn_request.header.operation != GuardianOperation::Spawn {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: spawn_request.header.operation,
+            });
+        }
+        if genesis_begin_request.header.operation != GuardianOperation::CheckpointStage {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: genesis_begin_request.header.operation,
+            });
+        }
+
+        let mux_authority =
+            mux_authority.ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?;
+        let live_guardian_authority = live_guardian_authority
+            .ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?;
+        let (authority_mux_incarnation, mux_build_identity) =
+            mux_authority.validated_parts(self.incarnation)?;
+        if live_guardian_authority.guardian_incarnation != self.incarnation
+            || live_guardian_authority
+                .guardian_build_identity
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+        {
+            return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+        }
+        if authority_mux_incarnation != spawn_request.header.mux_incarnation
+            || authority_mux_incarnation != genesis_begin_request.header.mux_incarnation
+        {
+            return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+        }
+
+        let spawn_effect_id = spawn_request.header.effect_id.ok_or(
+            GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Spawn,
+            },
+        )?;
+        let durable_pane_id = spawn_request.header.pane_id.ok_or(
+            GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Spawn,
+            },
+        )?;
+        let spawn_payload = GuardianSpawnPayload::decode(spawn_request.payload())?;
+        let size = spawn_payload.size();
+        let genesis_begin = GuardianCheckpointStageRequestV1::decode(
+            genesis_begin_request.payload(),
+        )?;
+        if genesis_begin.kind() != GuardianCheckpointStageKindV1::Begin
+            || genesis_begin.scope()
+                != (GuardianCheckpointScopeV1::Genesis { spawn_effect_id })
+        {
+            return Err(GuardianProtocolError::InvalidGenesisReservation);
+        }
+        let descriptor = genesis_begin.descriptor();
+        if descriptor.rows() != u32::from(size.rows)
+            || descriptor.cols() != u32::from(size.cols)
+        {
+            return Err(GuardianProtocolError::InvalidGenesisReservation);
+        }
+
+        let identity = GuardianGenesisReservationIdentityV1::from_authenticated_spawn(
+            authority_mux_incarnation,
+            spawn_effect_id,
+            durable_pane_id,
+            spawn_request.header.request_id,
+            u64::from(spawn_request.authenticated_payload_bytes()),
+            spawn_request.header.payload_sha256,
+            mux_build_identity.into_bytes(),
+            live_guardian_authority.guardian_build_identity.into_bytes(),
+            size.rows,
+            size.cols,
+            size.pixel_width,
+            size.pixel_height,
+            genesis_begin.checkpoint_id().into_bytes(),
+            genesis_begin.boundary_id().into_bytes(),
+            genesis_begin.upload_id(),
+        )
+        .map_err(|_| GuardianProtocolError::InvalidGenesisReservation)?;
+        let record = GuardianGenesisReservationRecordV1::from_identity(&identity);
+        self.preflight_genesis_reservation_identity(&record)?;
+
+        self.genesis_reservations_by_request
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.genesis_reservation_effects
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.genesis_reservation_panes
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+
+        let permit = GuardianCheckpointGenesisSpawnPermitV1::issue(identity)
+            .map_err(|_| GuardianProtocolError::InvalidGenesisReservation)?;
+        let previous_request = self
+            .genesis_reservations_by_request
+            .insert(record.origin_request_id, record.clone());
+        let previous_effect = self
+            .genesis_reservation_effects
+            .insert(record.spawn_effect_id, record.origin_request_id);
+        let previous_pane = self
+            .genesis_reservation_panes
+            .insert(record.durable_pane_id, record.origin_request_id);
+        debug_assert!(previous_request.is_none());
+        debug_assert!(previous_effect.is_none());
+        debug_assert!(previous_pane.is_none());
+        Ok(permit)
     }
 
     #[must_use]

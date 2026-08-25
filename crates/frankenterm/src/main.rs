@@ -6152,7 +6152,7 @@ enum SetupCommands {
         #[arg(long, requires = "ft_path")]
         guardian_path: Option<PathBuf>,
 
-        /// Install both components from an immutable release tag
+        /// Install all three process-family components from an immutable release tag
         #[arg(long)]
         ft_version: Option<String>,
 
@@ -81743,7 +81743,7 @@ where
         Ok(authority) => authority,
         Err(observation_error) => {
             let receipt = format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={transaction_id}:indeterminate:{generation_id}\n"
             );
             ledger.record_indeterminate(
                 selector_before,
@@ -81759,7 +81759,7 @@ where
         .and_then(|()| revalidate_remote_generations_binding(root, generations, effective_uid))
     {
         let receipt = format!(
-            "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
+            "FT_REMOTE_UPGRADE_TRANSACTION_V2={transaction_id}:indeterminate:{generation_id}\n"
         );
         ledger.record_indeterminate(
             selector_before,
@@ -81782,7 +81782,7 @@ where
             ));
         }
         let receipt = format!(
-            "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
+            "FT_REMOTE_UPGRADE_TRANSACTION_V2={transaction_id}:indeterminate:{generation_id}\n"
         );
         ledger.record_indeterminate(selector_before, selector_after, receipt)?;
         return Err(error.context(
@@ -81811,7 +81811,7 @@ where
         return Ok(receipt);
     }
     let receipt = format!(
-        "FT_REMOTE_UPGRADE_TRANSACTION_V1={transaction_id}:indeterminate:{generation_id}\n"
+        "FT_REMOTE_UPGRADE_TRANSACTION_V2={transaction_id}:indeterminate:{generation_id}\n"
     );
     ledger.record_indeterminate(selector_before, selector_after, receipt)?;
     anyhow::bail!(
@@ -81934,7 +81934,7 @@ fn publish_remote_process_family_generation(
                 )?;
                 if &selector_now != latest.selector_after() {
                     let indeterminate_receipt = format!(
-                        "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                        "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:indeterminate:{}\n",
                         request.transaction_id, generation_id
                     );
                     ledger.record_indeterminate(
@@ -82030,7 +82030,7 @@ fn publish_remote_process_family_generation(
                     Ok(authority) => authority,
                     Err(observation_error) => {
                         let receipt = format!(
-                            "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                            "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:indeterminate:{}\n",
                             request.transaction_id, generation_id
                         );
                         ledger.record_indeterminate(
@@ -82070,7 +82070,7 @@ fn publish_remote_process_family_generation(
                 }
                 if &selector_now != latest.selector_before() {
                     let receipt = format!(
-                        "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                        "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:indeterminate:{}\n",
                         request.transaction_id, generation_id
                     );
                     ledger.record_indeterminate(
@@ -82250,7 +82250,7 @@ fn publish_remote_process_family_generation(
             Ok(authority) => authority,
             Err(observation_error) => {
                 let indeterminate_receipt = format!(
-                    "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                    "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:indeterminate:{}\n",
                     request.transaction_id, generation_id
                 );
                 ledger.record_indeterminate(
@@ -82265,7 +82265,7 @@ fn publish_remote_process_family_generation(
         };
         if selector_after_publication != selector_before {
             let indeterminate_receipt = format!(
-                "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:indeterminate:{}\n",
+                "FT_REMOTE_UPGRADE_TRANSACTION_V2={}:indeterminate:{}\n",
                 request.transaction_id, generation_id
             );
             ledger.record_indeterminate(
@@ -82989,6 +82989,8 @@ fn local_process_family_publish_command(
     let ft_sha256 = &process_family.ft.sha256;
     let mux_bytes = process_family.mux_server.byte_len;
     let mux_sha256 = &process_family.mux_server.sha256;
+    let guardian_bytes = process_family.guardian.byte_len;
+    let guardian_sha256 = &process_family.guardian.sha256;
     let prelude = format!(
         r#"set -eu
 verify_component() {{
@@ -83022,11 +83024,14 @@ flock -n 9 || {{
 }}
 ft_stage="$bin/ft.installing-{suffix}"
 mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
+guardian_stage="$bin/frankenterm-pty-guardian.installing-{suffix}"
 verify_component "$ft_stage" "{ft_bytes}" "{ft_sha256}"
 verify_component "$mux_stage" "{mux_bytes}" "{mux_sha256}"
-chmod 0755 "$ft_stage" "$mux_stage"
+verify_component "$guardian_stage" "{guardian_bytes}" "{guardian_sha256}"
+chmod 0755 "$ft_stage" "$mux_stage" "$guardian_stage"
 "$ft_stage" --version >/dev/null
-"$mux_stage" --version >/dev/null"#
+"$mux_stage" --version >/dev/null
+"$guardian_stage" --version >/dev/null"#
     );
 
     if active_mux {
@@ -83411,37 +83416,39 @@ where
         options.install_ft,
         options.ft_path,
         options.mux_server_path,
+        options.guardian_path,
         options.ft_version,
     ) {
-        (false, None, None, None) => None,
-        (false, _, _, _) => {
+        (false, None, None, None, None) => None,
+        (false, _, _, _, _) => {
             anyhow::bail!(
                 "component source flags require --install-ft so the matched process family is explicit"
             );
         }
-        (true, Some(ft_path), Some(mux_server_path), None) => {
-            Some(validate_local_process_family(ft_path, mux_server_path)?)
+        (true, Some(ft_path), Some(mux_server_path), Some(guardian_path), None) => {
+            Some(validate_local_process_family(
+                ft_path,
+                mux_server_path,
+                guardian_path,
+            )?)
         }
-        (true, None, None, Some(tag)) => {
+        (true, None, None, None, Some(tag)) => {
             validate_remote_release_tag(tag)?;
             None
         }
-        (true, Some(_), None, None) => {
-            anyhow::bail!("--ft-path requires --mux-server-path from the exact same build");
-        }
-        (true, None, Some(_), None) => {
-            anyhow::bail!("--mux-server-path requires --ft-path from the exact same build");
-        }
-        (true, None, None, None) => {
+        (true, None, None, None, None) => {
             anyhow::bail!(
-                "--install-ft requires either both --ft-path and --mux-server-path, or --ft-version <release-tag>"
+                "--install-ft requires either --ft-path, --mux-server-path, and --guardian-path together, or --ft-version <release-tag>"
             );
         }
-        (true, _, _, Some(_)) => {
+        (true, _, _, _, Some(_)) => {
             anyhow::bail!(
-                "choose exactly one component source: local --ft-path/--mux-server-path or --ft-version"
+                "choose exactly one component source: local --ft-path/--mux-server-path/--guardian-path or --ft-version"
             );
         }
+        (true, _, _, _, None) => anyhow::bail!(
+            "local process-family installation requires --ft-path, --mux-server-path, and --guardian-path from the exact same sealed build"
+        ),
     };
     if let Some(transaction_id) = options.transaction_id {
         validate_remote_generation_transaction_id(transaction_id)?;
@@ -83742,7 +83749,7 @@ fi"#,
         }
     }
 
-    // Step 4: Publish the exact client/server process family as one immutable
+    // Step 4: Publish the exact CLI/mux/guardian process family as one immutable
     // same-filesystem generation before resolving the service path. A live mux
     // leaves the generation pending; the point-in-time ownership observation
     // is not a lifetime lease and therefore cannot authorize replacement.
@@ -83759,8 +83766,11 @@ fi"#,
                 true,
             )?;
 
-            if let (Some(ft_path), Some(mux_server_path)) =
-                (options.ft_path, options.mux_server_path)
+            if let (Some(ft_path), Some(mux_server_path), Some(guardian_path)) = (
+                options.ft_path,
+                options.mux_server_path,
+                options.guardian_path,
+            )
             {
                 let process_family = local_process_family.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -83785,6 +83795,14 @@ fi"#,
                     staging_suffix,
                     timeout,
                     &process_family.mux_server,
+                )?;
+                copy_remote_component(
+                    host,
+                    guardian_path,
+                    "frankenterm-pty-guardian",
+                    staging_suffix,
+                    timeout,
+                    &process_family.guardian,
                 )?;
                 let publish_command = uploaded_process_family_generation_command(
                     staging_suffix,
@@ -83857,16 +83875,20 @@ fi"#,
                 println!("  component transaction id: {staging_suffix}");
             }
             println!(
-                "  ✓ matching ft and mux-server bytes are in one immutable pending generation; current was not switched without a cross-launcher lease"
+                "  ✓ matching ft, mux-server, and PTY-guardian bytes are in one immutable pending generation; current was not switched without a cross-launcher lease"
             );
-        } else if let (Some(ft_path), Some(mux_server_path)) =
-            (options.ft_path, options.mux_server_path)
+        } else if let (Some(ft_path), Some(mux_server_path), Some(guardian_path)) = (
+            options.ft_path,
+            options.mux_server_path,
+            options.guardian_path,
+        )
         {
             println!(
                 "• Would publish an immutable pending FrankenTerm generation via identity-fenced SSH upload; activation requires a cross-launcher lease"
             );
             println!("  ft: {}", ft_path.display());
             println!("  mux-server: {}", mux_server_path.display());
+            println!("  PTY guardian: {}", guardian_path.display());
         } else if let Some(tag) = options.ft_version {
             println!(
                 "• Would download, verify, and publish release {tag} as a pending process family; activation requires a cross-launcher lease"
@@ -84030,7 +84052,9 @@ fi"#;
         if apply_changes { "apply" } else { "dry-run" }
     );
     if options.install_ft {
-        println!("  Components: ft + frankenterm-mux-server (same release identity)");
+        println!(
+            "  Components: ft + frankenterm-mux-server + frankenterm-pty-guardian (same sealed release identity)"
+        );
         println!("  Activation: {activation_summary}");
         if let (Some(transaction_id), Some(publication)) = (
             options.transaction_id,
