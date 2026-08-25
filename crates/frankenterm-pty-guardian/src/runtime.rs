@@ -2195,6 +2195,31 @@ mod tests {
         )
     }
 
+    fn authenticated_checkpoint_stage_request(
+        request_id: Uuid,
+        pane_id: Uuid,
+        payload: &[u8],
+    ) -> AuthenticatedGuardianRequest {
+        let payload = payload.to_vec();
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::CheckpointStage,
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                request_id,
+                Some(pane_id),
+                1,
+                0,
+                None,
+                &payload,
+            ),
+            payload,
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
     fn authenticated_claim_request(
         request_id: Uuid,
         pane_id: Uuid,
@@ -2421,6 +2446,26 @@ mod tests {
         }
     }
 
+    fn wait_for_checkpoint_completion(
+        runtime: &mut GuardianRuntime,
+    ) -> GuardianRuntimeCheckpointCompletion {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match runtime.try_checkpoint_completion() {
+                GuardianRuntimeCheckpointCompletionState::Ready(completion) => return completion,
+                GuardianRuntimeCheckpointCompletionState::Empty if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                GuardianRuntimeCheckpointCompletionState::Empty => {
+                    panic!("guardian checkpoint completion timed out");
+                }
+                GuardianRuntimeCheckpointCompletionState::Disconnected => {
+                    panic!("guardian checkpoint worker disconnected");
+                }
+            }
+        }
+    }
+
     fn assert_worker_request_wiped_before_completion(probe: &InputRequestWipeProbe) {
         assert!(
             probe.explicit_wipe.load(Ordering::SeqCst),
@@ -2530,6 +2575,53 @@ mod tests {
             .expect("checkpoint pipeline production body is present");
         assert!(pipeline_source.contains("sync_channel(CHECKPOINT_WORKER_QUEUE_CAPACITY)"));
         assert_eq!(CHECKPOINT_WORKER_QUEUE_CAPACITY, 1);
+    }
+
+    #[test]
+    fn checkpoint_worker_preflight_rejects_malformed_stage_and_restores_protocol_authority() {
+        let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
+        let before = runtime.counters();
+        let request_id = Uuid::from_u128(181);
+        let request = authenticated_checkpoint_stage_request(
+            request_id,
+            Uuid::from_u128(182),
+            b"not-a-canonical-stage-request",
+        );
+        let route = GuardianCheckpointRoute::new(Token(9), 7, request_id).unwrap();
+
+        assert!(matches!(
+            runtime.submit_checkpoint(request, route),
+            GuardianCheckpointSubmission::Pending
+        ));
+        assert!(
+            runtime.protocol.is_none(),
+            "the Mio side must not retain a second protocol authority"
+        );
+
+        let completion = wait_for_checkpoint_completion(&mut runtime);
+        assert_eq!(completion.route, route);
+        assert_eq!(
+            completion
+                .response
+                .expect("typed preflight rejection")
+                .header()
+                .status,
+            GuardianResponseStatus::Rejected
+        );
+        assert!(
+            runtime.protocol.is_some(),
+            "completion must restore protocol authority before routing"
+        );
+        let mut expected = before;
+        expected.checkpoint_transactions_submitted = before
+            .checkpoint_transactions_submitted
+            .checked_add(1)
+            .unwrap();
+        expected.checkpoint_transactions_completed = before
+            .checkpoint_transactions_completed
+            .checked_add(1)
+            .unwrap();
+        assert_eq!(runtime.counters(), expected);
     }
 
     #[test]
