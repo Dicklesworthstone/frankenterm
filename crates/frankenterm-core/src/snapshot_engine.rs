@@ -7501,6 +7501,479 @@ fn load_verified_checkpoint_for_artifact(
     })
 }
 
+fn checked_artifact_u64_add(
+    left: u64,
+    right: u64,
+    label: &'static str,
+) -> Result<u64, CheckpointScrollbackArtifactError> {
+    left.checked_add(right).ok_or_else(|| {
+        CheckpointScrollbackArtifactError::ResourceLimit(format!("{label} overflow"))
+    })
+}
+
+fn checked_artifact_usize_add(
+    left: usize,
+    right: usize,
+    label: &'static str,
+) -> Result<usize, CheckpointScrollbackArtifactError> {
+    left.checked_add(right).ok_or_else(|| {
+        CheckpointScrollbackArtifactError::ResourceLimit(format!("{label} overflow"))
+    })
+}
+
+fn compute_checkpoint_sequence_gaps(
+    checkpoint_seq: Option<u64>,
+    segments: &[CheckpointScrollbackSegment],
+) -> Result<Vec<CheckpointScrollbackSequenceGap>, CheckpointScrollbackArtifactError> {
+    let Some(checkpoint_seq) = checkpoint_seq else {
+        if segments.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint with no scrollback ceiling selected durable output rows".to_string(),
+        ));
+    };
+    let mut gaps = Vec::new();
+    let mut expected = 0_u64;
+    for segment in segments {
+        if segment.seq > checkpoint_seq {
+            return Err(CheckpointScrollbackArtifactError::Checkpoint(
+                "durable output row exceeds the checkpoint ceiling".to_string(),
+            ));
+        }
+        if segment.seq < expected {
+            return Err(CheckpointScrollbackArtifactError::Checkpoint(
+                "durable output sequence is duplicate or out of order".to_string(),
+            ));
+        }
+        if segment.seq > expected {
+            gaps.push(CheckpointScrollbackSequenceGap {
+                first_missing_seq: expected,
+                last_missing_seq: segment.seq.saturating_sub(1),
+            });
+        }
+        expected = segment.seq.checked_add(1).ok_or_else(|| {
+            CheckpointScrollbackArtifactError::Checkpoint(
+                "durable output sequence cannot advance".to_string(),
+            )
+        })?;
+    }
+    if expected <= checkpoint_seq {
+        gaps.push(CheckpointScrollbackSequenceGap {
+            first_missing_seq: expected,
+            last_missing_seq: checkpoint_seq,
+        });
+    }
+    Ok(gaps)
+}
+
+fn load_checkpoint_capture_gaps(
+    conn: &Connection,
+    pane_id: u64,
+    checkpoint_seq: Option<u64>,
+    checkpoint_at: u64,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<Vec<CheckpointScrollbackCaptureGap>, CheckpointScrollbackArtifactError> {
+    let Some(checkpoint_seq) = checkpoint_seq else {
+        return Ok(Vec::new());
+    };
+    let pane_id = i64::try_from(pane_id).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "pane ID exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let checkpoint_seq = i64::try_from(checkpoint_seq).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint sequence exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let checkpoint_at = i64::try_from(checkpoint_at).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint timestamp exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let invalid_rows: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM output_gaps
+         WHERE pane_id = ?1
+           AND (typeof(seq_before) != 'integer' OR seq_before < 0
+             OR typeof(seq_after) != 'integer' OR seq_after <= seq_before
+             OR typeof(reason) != 'text'
+             OR length(CAST(reason AS BLOB)) > ?2
+             OR typeof(detected_at) != 'integer' OR detected_at < 0)",
+        rusqlite::params![
+            pane_id,
+            i64::try_from(CHECKPOINT_SCROLLBACK_MAX_GAP_REASON_BYTES).unwrap_or(i64::MAX),
+        ],
+        |row| row.get(0),
+    )?;
+    if invalid_rows != 0 {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(
+            "output_gaps contains malformed rows for a checkpoint pane".to_string(),
+        ));
+    }
+    let relevant_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM output_gaps
+         WHERE pane_id = ?1 AND seq_after <= ?2 AND detected_at <= ?3",
+        rusqlite::params![pane_id, checkpoint_seq, checkpoint_at],
+        |row| row.get(0),
+    )?;
+    let relevant_count = usize::try_from(relevant_count).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "capture-gap count is negative or out of range".to_string(),
+        )
+    })?;
+    if relevant_count > limits.max_gaps_per_pane {
+        return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+            "pane capture-gap count {relevant_count} exceeds {}",
+            limits.max_gaps_per_pane
+        )));
+    }
+    let row_limit = relevant_count.checked_add(1).ok_or_else(|| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "capture-gap row limit overflow".to_string(),
+        )
+    })?;
+    let mut statement = conn.prepare(
+        "SELECT seq_before, seq_after, reason, detected_at
+         FROM output_gaps
+         WHERE pane_id = ?1 AND seq_after <= ?2 AND detected_at <= ?3
+         ORDER BY seq_before ASC, seq_after ASC, id ASC
+         LIMIT ?4",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        pane_id,
+        checkpoint_seq,
+        checkpoint_at,
+        i64::try_from(row_limit).unwrap_or(i64::MAX),
+    ])?;
+    let mut gaps = Vec::with_capacity(relevant_count);
+    while let Some(row) = rows.next()? {
+        if gaps.len() == relevant_count {
+            return Err(CheckpointScrollbackArtifactError::Checkpoint(
+                "capture-gap inventory changed inside a pinned read transaction".to_string(),
+            ));
+        }
+        let seq_before: i64 = row.get(0)?;
+        let seq_after: i64 = row.get(1)?;
+        let reason: String = row.get(2)?;
+        let detected_at: i64 = row.get(3)?;
+        gaps.push(CheckpointScrollbackCaptureGap {
+            seq_before: u64::try_from(seq_before).map_err(|_| {
+                CheckpointScrollbackArtifactError::Checkpoint(
+                    "capture gap has a negative lower sequence".to_string(),
+                )
+            })?,
+            seq_after: u64::try_from(seq_after).map_err(|_| {
+                CheckpointScrollbackArtifactError::Checkpoint(
+                    "capture gap has a negative upper sequence".to_string(),
+                )
+            })?,
+            reason,
+            detected_at: u64::try_from(detected_at).map_err(|_| {
+                CheckpointScrollbackArtifactError::Checkpoint(
+                    "capture gap has a negative timestamp".to_string(),
+                )
+            })?,
+        });
+    }
+    if gaps.len() != relevant_count {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(
+            "capture-gap count disagrees with its bounded rows".to_string(),
+        ));
+    }
+    Ok(gaps)
+}
+
+fn load_checkpoint_scrollback_prefix(
+    conn: &Connection,
+    pane: &CheckpointScrollbackPaneProjection,
+    checkpoint_at: u64,
+    limits: CheckpointScrollbackArtifactLimits,
+    redactor: &crate::redactor::Redactor,
+) -> Result<CheckpointScrollbackPanePrefix, CheckpointScrollbackArtifactError> {
+    let pane_id = i64::try_from(pane.pane_id).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "pane ID exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let Some(checkpoint_seq) = pane.scrollback_checkpoint_seq else {
+        let mut prefix = CheckpointScrollbackPanePrefix {
+            pane_id: pane.pane_id,
+            checkpoint_seq: None,
+            first_seq: None,
+            last_seq: None,
+            segment_count: 0,
+            content_bytes: 0,
+            sequence_gaps: Vec::new(),
+            capture_gaps: Vec::new(),
+            starts_at_zero: true,
+            reaches_checkpoint: true,
+            sequence_contiguous: true,
+            no_capture_gaps: true,
+            complete: true,
+            redaction_catalog_versions: Vec::new(),
+            redaction_fixed_point: true,
+            prefix_sha256: String::new(),
+            segments: Vec::new(),
+        };
+        prefix.prefix_sha256 = checkpoint_scrollback_prefix_sha256(&prefix)?;
+        return Ok(prefix);
+    };
+    let checkpoint_seq_sql = i64::try_from(checkpoint_seq).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint sequence exceeds SQLite integer range".to_string(),
+        )
+    })?;
+    let (row_count, content_bytes, invalid_rows): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(length(CAST(content AS BLOB))), 0),
+                COALESCE(SUM(CASE
+                    WHEN typeof(seq) != 'integer' OR seq < 0
+                      OR typeof(content) != 'text'
+                      OR typeof(captured_at) != 'integer' OR captured_at < 0
+                      OR (redaction_catalog_version IS NOT NULL AND
+                          (typeof(redaction_catalog_version) != 'text' OR
+                           length(CAST(redaction_catalog_version AS BLOB)) > ?3))
+                    THEN 1 ELSE 0 END), 0)
+         FROM output_segments
+         WHERE pane_id = ?1 AND seq <= ?2",
+        rusqlite::params![
+            pane_id,
+            checkpoint_seq_sql,
+            i64::try_from(CHECKPOINT_SCROLLBACK_MAX_CATALOG_VERSION_BYTES).unwrap_or(i64::MAX),
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if invalid_rows != 0 {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(
+            "output_segments contains malformed rows inside the checkpoint prefix".to_string(),
+        ));
+    }
+    let row_count = usize::try_from(row_count).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "output segment count is negative or out of range".to_string(),
+        )
+    })?;
+    let content_bytes = u64::try_from(content_bytes).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "output content byte count is negative or out of range".to_string(),
+        )
+    })?;
+    if row_count > limits.max_segments_per_pane {
+        return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+            "pane {} has {row_count} output rows through its checkpoint, limit {}",
+            pane.pane_id, limits.max_segments_per_pane
+        )));
+    }
+    if content_bytes > limits.max_content_bytes {
+        return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+            "pane {} has {content_bytes} content bytes through its checkpoint, limit {}",
+            pane.pane_id, limits.max_content_bytes
+        )));
+    }
+    let row_limit = row_count.checked_add(1).ok_or_else(|| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "output segment row limit overflow".to_string(),
+        )
+    })?;
+    let mut statement = conn.prepare(
+        "SELECT seq, content, captured_at, redaction_catalog_version
+         FROM output_segments
+         WHERE pane_id = ?1 AND seq <= ?2
+         ORDER BY seq ASC, id ASC
+         LIMIT ?3",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        pane_id,
+        checkpoint_seq_sql,
+        i64::try_from(row_limit).unwrap_or(i64::MAX),
+    ])?;
+    let mut segments = Vec::with_capacity(row_count);
+    let mut observed_content_bytes = 0_u64;
+    let mut catalogs = std::collections::BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        if segments.len() == row_count {
+            return Err(CheckpointScrollbackArtifactError::Checkpoint(
+                "output segment inventory changed inside a pinned read transaction".to_string(),
+            ));
+        }
+        let seq: i64 = row.get(0)?;
+        let content: String = row.get(1)?;
+        let captured_at: i64 = row.get(2)?;
+        let redaction_catalog_version: Option<String> = row.get(3)?;
+        require_checkpoint_redaction_fixed_point(redactor, &content)?;
+        if let Some(version) = redaction_catalog_version.as_deref() {
+            require_checkpoint_redaction_fixed_point(redactor, version)?;
+            catalogs.insert(version.to_string());
+        }
+        let content_len = content.len();
+        observed_content_bytes = checked_artifact_u64_add(
+            observed_content_bytes,
+            u64::try_from(content_len).map_err(|_| {
+                CheckpointScrollbackArtifactError::ResourceLimit(
+                    "segment content length does not fit u64".to_string(),
+                )
+            })?,
+            "pane content byte count",
+        )?;
+        segments.push(CheckpointScrollbackSegment {
+            seq: u64::try_from(seq).map_err(|_| {
+                CheckpointScrollbackArtifactError::Checkpoint(
+                    "output segment has a negative sequence".to_string(),
+                )
+            })?,
+            captured_at: u64::try_from(captured_at).map_err(|_| {
+                CheckpointScrollbackArtifactError::Checkpoint(
+                    "output segment has a negative timestamp".to_string(),
+                )
+            })?,
+            redaction_catalog_version,
+            content_bytes: content_len,
+            content_sha256: checkpoint_artifact_sha256(content.as_bytes()),
+            content,
+        });
+    }
+    if segments.len() != row_count || observed_content_bytes != content_bytes {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(
+            "output segment aggregate disagrees with its bounded rows".to_string(),
+        ));
+    }
+    let sequence_gaps =
+        compute_checkpoint_sequence_gaps(Some(checkpoint_seq), &segments)?;
+    let capture_gaps = load_checkpoint_capture_gaps(
+        conn,
+        pane.pane_id,
+        Some(checkpoint_seq),
+        checkpoint_at,
+        limits,
+    )?;
+    for gap in &capture_gaps {
+        require_checkpoint_redaction_fixed_point(redactor, &gap.reason)?;
+    }
+    let first_seq = segments.first().map(|segment| segment.seq);
+    let last_seq = segments.last().map(|segment| segment.seq);
+    let starts_at_zero = first_seq == Some(0);
+    let reaches_checkpoint = last_seq == Some(checkpoint_seq);
+    let sequence_contiguous = sequence_gaps.is_empty();
+    let no_capture_gaps = capture_gaps.is_empty();
+    let complete = starts_at_zero
+        && reaches_checkpoint
+        && sequence_contiguous
+        && no_capture_gaps;
+    let mut prefix = CheckpointScrollbackPanePrefix {
+        pane_id: pane.pane_id,
+        checkpoint_seq: Some(checkpoint_seq),
+        first_seq,
+        last_seq,
+        segment_count: segments.len(),
+        content_bytes,
+        sequence_gaps,
+        capture_gaps,
+        starts_at_zero,
+        reaches_checkpoint,
+        sequence_contiguous,
+        no_capture_gaps,
+        complete,
+        redaction_catalog_versions: catalogs.into_iter().collect(),
+        redaction_fixed_point: true,
+        prefix_sha256: String::new(),
+        segments,
+    };
+    prefix.prefix_sha256 = checkpoint_scrollback_prefix_sha256(&prefix)?;
+    Ok(prefix)
+}
+
+fn build_checkpoint_scrollback_payload(
+    db_path: &str,
+    checkpoint_id: i64,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackPayload, CheckpointScrollbackArtifactError> {
+    let limits = limits.validate()?;
+    let conn = open_snapshot_query_conn(db_path)?;
+    let transaction = conn.unchecked_transaction()?;
+    let checkpoint =
+        load_verified_checkpoint_for_artifact(&transaction, checkpoint_id, limits)?;
+    let redactor = crate::redactor::Redactor::new();
+    require_checkpoint_projection_redaction_fixed_point(&checkpoint, &redactor)?;
+
+    let mut scrollback = Vec::with_capacity(checkpoint.panes.len());
+    let mut total_segments = 0_usize;
+    let mut total_gaps = 0_usize;
+    let mut total_content_bytes = 0_u64;
+    let mut complete_pane_count = 0_usize;
+    for pane in &checkpoint.panes {
+        let prefix = load_checkpoint_scrollback_prefix(
+            &transaction,
+            pane,
+            checkpoint.checkpoint_at,
+            limits,
+            &redactor,
+        )?;
+        total_segments = checked_artifact_usize_add(
+            total_segments,
+            prefix.segment_count,
+            "artifact segment count",
+        )?;
+        total_gaps = checked_artifact_usize_add(
+            total_gaps,
+            prefix.capture_gaps.len(),
+            "artifact capture-gap count",
+        )?;
+        total_content_bytes = checked_artifact_u64_add(
+            total_content_bytes,
+            prefix.content_bytes,
+            "artifact content byte count",
+        )?;
+        if total_segments > limits.max_total_segments {
+            return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+                "artifact segment count {total_segments} exceeds {}",
+                limits.max_total_segments
+            )));
+        }
+        if total_gaps > limits.max_total_gaps {
+            return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+                "artifact capture-gap count {total_gaps} exceeds {}",
+                limits.max_total_gaps
+            )));
+        }
+        if total_content_bytes > limits.max_content_bytes {
+            return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
+                "artifact content byte count {total_content_bytes} exceeds {}",
+                limits.max_content_bytes
+            )));
+        }
+        if prefix.complete {
+            complete_pane_count = checked_artifact_usize_add(
+                complete_pane_count,
+                1,
+                "complete pane count",
+            )?;
+        }
+        scrollback.push(prefix);
+    }
+    transaction.commit()?;
+    let pane_count = checkpoint.panes.len();
+    Ok(CheckpointScrollbackPayload {
+        schema_version: 1,
+        created_at_epoch_ms: epoch_ms(),
+        redaction_catalog_version: crate::redact_backfill::current_catalog_version().to_string(),
+        limits,
+        capabilities: CheckpointScrollbackCapabilities::V1,
+        checkpoint,
+        scrollback,
+        summary: CheckpointScrollbackSummary {
+            pane_count,
+            segment_count: total_segments,
+            capture_gap_count: total_gaps,
+            content_bytes: total_content_bytes,
+            complete_pane_count,
+            incomplete_pane_count: pane_count.saturating_sub(complete_pane_count),
+        },
+    })
+}
+
 #[cfg(test)]
 fn cleanup_sync(
     db_path: &str,

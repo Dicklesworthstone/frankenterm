@@ -103733,6 +103733,13 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(
             mux_entry < guardian_entry && guardian_entry < ft_entry && ft_entry < selector_switch
         );
+        let initial_selector = active
+            .find("installer_failpoint before-initial-selector")
+            .expect("first-install selector boundary");
+        assert!(ft_entry < initial_selector);
+        assert!(active.contains("[ ! -e \"$DEST/$name\" ] || return 1"));
+        assert!(active.contains("fsync_installer_directory \"$DEST\""));
+        assert!(active.contains("A first-install retry may encounter an exact managed link"));
         assert!(active.contains(
             "verify_canonical_generation \"$generation\" \"$version\" \"$verifier_source\""
         ));

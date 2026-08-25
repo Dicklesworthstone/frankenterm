@@ -441,6 +441,22 @@ finally:
 PY
 }
 
+fsync_installer_directory() {
+  python3 - "$1" <<'PY'
+import os, stat, sys
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    observed = os.fstat(fd)
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid():
+        raise SystemExit("installer directory fsync authority is unsafe")
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
 ensure_exact_staged_file() {
   local source="$1" target="$2" mode="$3"
   if [ -e "$target" ] || [ -L "$target" ]; then
@@ -654,6 +670,13 @@ publish_stable_entrypoint() {
   local helper="$1" name="$2" mode="$3" selected_generation="$4"
   local txid stage stage_id target_id operation
   if stable_entrypoint_is_managed "$name"; then
+    if [ "$mode" = missing ] && [ ! -e "$DEST/.frankenterm-process-family/current" ] && \
+       [ ! -L "$DEST/.frankenterm-process-family/current" ]; then
+      # A first-install retry may encounter an exact managed link that is
+      # deliberately still dangling. It remains non-executable until the one
+      # selector publication activates the complete triplet.
+      return 0
+    fi
     cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
     return 0
   fi
@@ -775,23 +798,10 @@ install_process_family() {
     fi
   done
 
-  if [ "$direct_count" -eq 0 ] && [ "$missing_count" -gt 0 ] && \
+  if [ "$direct_count" -eq 0 ] && [ -z "$current_target" ] && \
      [ $((managed_count + missing_count)) -eq 3 ]; then
     initial_install=1
-    if [ -z "$current_target" ]; then
-      [ "$missing_count" -eq 3 ] || return 1
-      selected_generation="$generation"
-      stage_name=".current-$generation_id"
-      ensure_staged_symlink "generations/$generation_id" "$managed/$stage_name" || return 1
-      stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
-      txid=$(atomic_transition_txid "selector-initial:$DEST:$generation_id") || return 1
-      atomic_path_transition "$helper" "$managed" "$stage_name" current "$txid" \
-        "$stage_id" missing publish-noreplace || return 1
-      current_target="generations/$generation_id"
-      installer_failpoint after-initial-selector
-    elif [[ ! "$current_target" =~ ^generations/[0-9a-f]{64}$ ]]; then
-      return 1
-    fi
+    selected_generation="$generation"
   elif [ "$missing_count" -ne 0 ]; then
     err "Incomplete process-family entrypoint inventory; refusing incoherent migration"
     return 1
@@ -859,6 +869,20 @@ install_process_family() {
     installer_failpoint after-guardian-entrypoint
     publish_stable_entrypoint "$helper" ft missing "$selected_generation" || return 1
     installer_failpoint after-ft-entrypoint
+    for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+      stable_entrypoint_is_managed "$name" || return 1
+      [ ! -e "$DEST/$name" ] || return 1
+    done
+    fsync_installer_directory "$DEST" || return 1
+    stage_name=".current-$generation_id"
+    ensure_staged_symlink "generations/$generation_id" "$managed/$stage_name" || return 1
+    stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
+    txid=$(atomic_transition_txid "selector-initial:$DEST:$generation_id") || return 1
+    installer_failpoint before-initial-selector
+    atomic_path_transition "$helper" "$managed" "$stage_name" current "$txid" \
+      "$stage_id" missing publish-noreplace || return 1
+    current_target="generations/$generation_id"
+    installer_failpoint after-initial-selector
   elif [ "$legacy_migration" -eq 1 ]; then
     publish_stable_entrypoint "$helper" frankenterm-mux-server legacy "$selected_generation" || return 1
     installer_failpoint after-mux-entrypoint
