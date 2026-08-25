@@ -9038,7 +9038,7 @@ pub fn encode_guardian_request(
         u32::try_from(payload_len).map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
     );
     bytes.extend_from_slice(&request.payload);
-    let tag = Zeroizing::new(secret.mac(&frame)?);
+    let tag = Zeroizing::new(secret.mac(frame.as_ref())?);
     frame.bytes_mut().extend_from_slice(tag.as_slice());
     debug_assert_eq!(frame.len(), total_len);
     Ok(frame)
@@ -9166,7 +9166,7 @@ pub fn encode_guardian_response(
         u32::try_from(payload_len).map_err(|_| GuardianProtocolError::PayloadTooLarge)?,
     );
     bytes.extend_from_slice(&response.payload);
-    let tag = Zeroizing::new(secret.mac(&frame)?);
+    let tag = Zeroizing::new(secret.mac(frame.as_ref())?);
     frame.bytes_mut().extend_from_slice(tag.as_slice());
     debug_assert_eq!(frame.len(), total_len);
     Ok(frame)
@@ -11465,7 +11465,7 @@ mod tests {
                 && !format!("{:?}", original.header).contains(&payload_digest_debug),
             "request diagnostics must not expose a dictionary-testable payload digest"
         );
-        let frame = encode_guardian_request(&secret(), &original).unwrap();
+        let mut frame = encode_guardian_request(&secret(), &original).unwrap();
         assert!(frame.len() <= GUARDIAN_MAX_FRAME_BYTES);
         assert_eq!(
             decode_guardian_request(&secret(), &frame)
@@ -11474,10 +11474,9 @@ mod tests {
             &original
         );
 
-        let mut tampered = frame.clone();
-        tampered[FRAME_LENGTH_BYTES + REQUEST_FRAME_HEADER_BYTES] ^= 0x01;
+        frame[FRAME_LENGTH_BYTES + REQUEST_FRAME_HEADER_BYTES] ^= 0x01;
         assert_eq!(
-            decode_guardian_request(&secret(), &tampered),
+            decode_guardian_request(&secret(), &frame),
             Err(GuardianProtocolError::AuthenticationFailed)
         );
         assert_eq!(
@@ -11580,7 +11579,7 @@ mod tests {
             })
         );
 
-        let mut malformed_length = frame.clone();
+        let mut malformed_length = encode_guardian_response(&secret(), &response).unwrap();
         malformed_length
             [RESPONSE_PAYLOAD_LENGTH_OFFSET..RESPONSE_PAYLOAD_LENGTH_OFFSET + 4]
             .copy_from_slice(&((GUARDIAN_MAX_PAYLOAD_BYTES + 1) as u32).to_be_bytes());
@@ -11953,7 +11952,8 @@ mod tests {
 
         let mut frame = encode_guardian_request(&secret(), &spawn_request(id(1), id(2), id(3)))
             .unwrap();
-        let mut wrong_outer_length = frame.clone();
+        let mut wrong_outer_length =
+            encode_guardian_request(&secret(), &spawn_request(id(1), id(2), id(3))).unwrap();
         wrong_outer_length[..4].copy_from_slice(&0_u32.to_be_bytes());
         assert!(matches!(
             decode_guardian_request(&secret(), &wrong_outer_length),
