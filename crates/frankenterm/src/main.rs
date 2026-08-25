@@ -13,6 +13,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
@@ -101937,7 +101938,10 @@ log_level = "debug"
         std::fs::rename(&named, &retained).expect("retain admitted named entry");
         std::fs::rename(&replacement, &named).expect("substitute hostile named entry");
 
-        run_descriptor_pinned_remote_generation_mux_version(&pinned)
+        run_descriptor_pinned_remote_generation_component_version(
+            &pinned,
+            "frankenterm-mux-server",
+        )
             .expect("descriptor-pinned execution must still run the admitted inode");
         let ambient_status = std::process::Command::new(&named)
             .arg("--version")
