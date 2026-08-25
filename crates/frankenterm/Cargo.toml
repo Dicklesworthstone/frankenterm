@@ -71,6 +71,7 @@ asupersync = { workspace = true, features = ["tls"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "user"] }
+rustix.workspace = true
 
 # [round8 Windows port] openssl-sys reaches the `ft` build transitively via
 # frankenterm-ssh -> libssh-rs (config depends on frankenterm-ssh

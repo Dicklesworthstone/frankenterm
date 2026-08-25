@@ -38,6 +38,8 @@ const CLAIM_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.claim.v2";
 const RECORD_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.record.v2";
 const EFFECT_ID_HASH_DOMAIN: &[u8] = b"frankenterm.remote-upgrade.effect-id.v2";
 const TRANSACTIONS_DIRECTORY: &str = "upgrade-transactions";
+const PENDING_ARTIFACT_PREFIX: &str = ".pending-v2-";
+const QUARANTINED_ARTIFACT_PREFIX: &str = ".quarantine-v2-";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1174,6 +1176,39 @@ fn validate_transaction_census(
     Ok(())
 }
 
+fn is_retained_publication_residue_name(name: &str) -> bool {
+    (name.starts_with(PENDING_ARTIFACT_PREFIX)
+        || name.starts_with(QUARANTINED_ARTIFACT_PREFIX))
+        && name.len() <= 255
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_retained_publication_residue(
+    transaction: &cap_std::fs::Dir,
+    name: &str,
+    effective_uid: u32,
+    expected_device: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_retained_publication_residue_name(name),
+        "remote upgrade transaction contains a malformed retained publication residue"
+    );
+    let metadata = transaction.symlink_metadata(Path::new(name))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_RECORD_BYTES,
+        "remote upgrade retained publication residue is not one bounded regular file"
+    );
+    validate_exact_file(
+        transaction,
+        Path::new(name),
+        metadata.len(),
+        effective_uid,
+        expected_device,
+    )
+}
+
 fn create_or_validate_claim(
     transaction: &cap_std::fs::Dir,
     effective_uid: u32,
@@ -1199,6 +1234,13 @@ fn create_or_validate_claim(
             .map_err(|_| anyhow::anyhow!("upgrade transaction contains a non-UTF-8 entry"))?;
         if name.starts_with("claim-") && name.ends_with(".v1") {
             claims.push(name);
+        } else if is_retained_publication_residue_name(&name) {
+            validate_retained_publication_residue(
+                transaction,
+                &name,
+                effective_uid,
+                expected_device,
+            )?;
         } else {
             non_claim_entries += 1;
         }
@@ -1284,7 +1326,14 @@ fn scan_transaction(
             MAX_TRANSACTION_BYTES
         );
 
-        if name == expected_claim {
+        if is_retained_publication_residue_name(&name) {
+            validate_retained_publication_residue(
+                transaction,
+                &name,
+                effective_uid,
+                expected_device,
+            )?;
+        } else if name == expected_claim {
             anyhow::ensure!(!saw_claim, "upgrade transaction contains duplicate claims");
             validate_exact_file(
                 transaction,

@@ -6201,6 +6201,50 @@ enum SetupCommands {
         transaction_id: String,
     },
 
+    /// Internal helper for one durable, atomic installer namespace transition.
+    #[command(name = "__atomic-path-transition", hide = true)]
+    AtomicPathTransition {
+        /// Existing, non-symlink directory containing both entry names.
+        #[arg(long)]
+        parent: PathBuf,
+
+        /// Transaction-unique staged entry name (one path component).
+        #[arg(long)]
+        stage_name: String,
+
+        /// Stable destination entry name (one path component).
+        #[arg(long)]
+        target_name: String,
+
+        /// Stable 32-lowercase-hex transaction identity.
+        #[arg(long)]
+        transaction_id: String,
+
+        /// Caller-verified content/manifest identity of the staged entry.
+        #[arg(long)]
+        stage_content_id: String,
+
+        /// Caller-verified prior target identity, or `missing` for no-replace.
+        #[arg(long)]
+        target_content_id: String,
+
+        /// Atomic namespace operation to perform.
+        #[arg(long, value_enum)]
+        operation: AtomicPathTransitionOperation,
+    },
+
+    /// Internal helper for descriptor-relative installer object hashing.
+    #[command(name = "__atomic-path-content-id", hide = true)]
+    AtomicPathContentId {
+        /// Existing, non-symlink directory containing the entry.
+        #[arg(long)]
+        parent: PathBuf,
+
+        /// Entry to hash without following its final symlink, if any.
+        #[arg(long)]
+        name: String,
+    },
+
     /// Generate WezTerm config additions
     Config,
 
@@ -6240,6 +6284,954 @@ enum SetupCommands {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AtomicPathTransitionOperation {
+    PublishNoreplace,
+    Exchange,
+}
+
+impl AtomicPathTransitionOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PublishNoreplace => "publish-noreplace",
+            Self::Exchange => "exchange",
+        }
+    }
+}
+
+fn validate_atomic_path_transition_name(value: &str, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty() && value.len() <= 255,
+        "{label} must be one bounded path component"
+    );
+    anyhow::ensure!(
+        value != "."
+            && value != ".."
+            && !value.starts_with(".ft-atomic-transition-")
+            && value
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') }),
+        "{label} is not a canonical installer path component"
+    );
+    Ok(())
+}
+
+fn validate_atomic_path_transition_transaction_id(value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "atomic path transition transaction ID must be 32 lowercase hex characters"
+    );
+    Ok(())
+}
+
+fn validate_atomic_path_content_id(value: &str, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value == "missing"
+            || value.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }),
+        "{label} is not `missing` or one canonical SHA-256 content identity"
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicPathTransitionOutcome {
+    Applied,
+    AlreadyApplied,
+}
+
+impl AtomicPathTransitionOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::AlreadyApplied => "already-applied",
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AtomicPathObjectMetadata {
+    device: u64,
+    inode: u64,
+    object_kind: String,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    hard_link_count: u64,
+    byte_len: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl AtomicPathObjectMetadata {
+    fn from_cap_metadata(metadata: &cap_std::fs::Metadata) -> anyhow::Result<Self> {
+        use cap_std::fs::MetadataExt as _;
+        use cap_std::fs::PermissionsExt as _;
+
+        let file_type = metadata.file_type();
+        let object_kind = if file_type.is_file() {
+            "regular-file"
+        } else if file_type.is_dir() {
+            "directory"
+        } else if file_type.is_symlink() {
+            "symlink"
+        } else {
+            anyhow::bail!(
+                "atomic transition entries must be regular files, directories, or symlinks"
+            );
+        };
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            object_kind: object_kind.to_string(),
+            mode: metadata.permissions().mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            hard_link_count: metadata.nlink(),
+            byte_len: metadata.len(),
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AtomicPathObjectIdentity {
+    metadata: AtomicPathObjectMetadata,
+    content_id: String,
+    fully_sealed: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AtomicPathTransitionClaim {
+    schema_version: String,
+    transaction_id: String,
+    parent_device: u64,
+    parent_inode: u64,
+    operation: String,
+    stage_name: String,
+    target_name: String,
+    stage_content_id: String,
+    target_content_id: String,
+    stage_before: AtomicPathObjectIdentity,
+    target_before: Option<AtomicPathObjectIdentity>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AtomicPathTransitionAck {
+    schema_version: String,
+    transaction_id: String,
+    claim_sha256: String,
+    outcome: String,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_path_transition_json<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ATOMIC_PATH_TRANSITION_ARTIFACT_PREFIX: &str = ".ft-atomic-transition-";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ATOMIC_PATH_TRANSITION_MAX_ARTIFACTS: u64 = 4_096;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ATOMIC_PATH_TRANSITION_MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_path_transition_artifact_inventory(
+    parent: &cap_std::fs::Dir,
+) -> anyhow::Result<(u64, u64)> {
+    use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut count = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in parent.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name
+            .as_os_str()
+            .as_bytes()
+            .starts_with(ATOMIC_PATH_TRANSITION_ARTIFACT_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        let metadata = parent.symlink_metadata(Path::new(&name))?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.uid() == nix::unistd::geteuid().as_raw()
+                && metadata.nlink() == 1
+                && metadata.permissions().mode() & 0o7777 == 0o600
+                && metadata.len() <= 64 * 1024,
+            "atomic transition journal contains an unsafe artifact"
+        );
+        count = count
+            .checked_add(1)
+            .context("atomic transition artifact counter overflowed")?;
+        bytes = bytes
+            .checked_add(metadata.len())
+            .context("atomic transition artifact byte counter overflowed")?;
+    }
+    anyhow::ensure!(
+        count <= ATOMIC_PATH_TRANSITION_MAX_ARTIFACTS
+            && bytes <= ATOMIC_PATH_TRANSITION_MAX_ARTIFACT_BYTES,
+        "atomic transition journal is at its bounded retention limit"
+    );
+    Ok((count, bytes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_atomic_path_transition_json<T>(
+    parent: &cap_std::fs::Dir,
+    name: &str,
+) -> anyhow::Result<Option<(T, Vec<u8>)>>
+where
+    T: serde::de::DeserializeOwned + Serialize,
+{
+    use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::io::Read as _;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = match parent.open_with(name, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open atomic transition artifact {name}"));
+        }
+    };
+    let metadata = file.metadata()?;
+    let path_metadata = parent.symlink_metadata(name)?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && path_metadata.is_file()
+            && metadata.dev() == path_metadata.dev()
+            && metadata.ino() == path_metadata.ino()
+            && metadata.nlink() == 1
+            && metadata.uid() == nix::unistd::geteuid().as_raw()
+            && metadata.permissions().mode() & 0o7777 == 0o600
+            && metadata.len() > 0
+            && metadata.len() <= 64 * 1024,
+        "atomic transition artifact {name} has unsafe metadata"
+    );
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| anyhow::anyhow!("atomic transition artifact length does not fit usize"))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity)?;
+    (&mut file).take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() == capacity,
+        "atomic transition artifact {name} changed length while read"
+    );
+    let value: T = serde_json::from_slice(&bytes)
+        .with_context(|| format!("atomic transition artifact {name} is invalid JSON"))?;
+    anyhow::ensure!(
+        atomic_path_transition_json(&value)? == bytes,
+        "atomic transition artifact {name} is not canonical JSON"
+    );
+    Ok(Some((value, bytes)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_atomic_path_transition_json<T>(
+    parent: &cap_std::fs::Dir,
+    parent_file: &fs::File,
+    name: &str,
+    value: &T,
+) -> anyhow::Result<Vec<u8>>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+{
+    use cap_std::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    use rustix::fs::{RenameFlags, renameat_with};
+    use std::io::Write as _;
+
+    let bytes = atomic_path_transition_json(value)?;
+    anyhow::ensure!(
+        bytes.len() <= 64 * 1024,
+        "atomic transition artifact exceeds its canonical byte bound"
+    );
+    let (retained_count, retained_bytes) = atomic_path_transition_artifact_inventory(parent)?;
+    anyhow::ensure!(
+        retained_count < ATOMIC_PATH_TRANSITION_MAX_ARTIFACTS
+            && retained_bytes
+                .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                .is_some_and(|total| total <= ATOMIC_PATH_TRANSITION_MAX_ARTIFACT_BYTES),
+        "atomic transition journal cannot retain another artifact"
+    );
+
+    for attempt in 0_u8..32 {
+        let temporary_name = format!("{name}.pending-{}-{attempt}", std::process::id());
+        anyhow::ensure!(
+            temporary_name.len() <= 255
+                && temporary_name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                }),
+            "transition artifact temp name is not one bounded path component"
+        );
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No)
+            .mode(0o600);
+        let mut file = match parent.open_with(&temporary_name, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot create temporary atomic transition artifact {temporary_name}")
+                });
+            }
+        };
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let metadata = file.metadata()?;
+        let path_metadata = parent.symlink_metadata(&temporary_name)?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && path_metadata.is_file()
+                && metadata.dev() == path_metadata.dev()
+                && metadata.ino() == path_metadata.ino()
+                && metadata.nlink() == 1
+                && metadata.uid() == nix::unistd::geteuid().as_raw()
+                && metadata.permissions().mode() & 0o7777 == 0o600
+                && metadata.len() == u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            "temporary atomic transition artifact {temporary_name} has unsafe metadata"
+        );
+        match renameat_with(
+            parent_file,
+            &temporary_name,
+            parent_file,
+            name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                parent_file.sync_all()?;
+                let (_, published_bytes) = read_atomic_path_transition_json::<T>(parent, name)?
+                    .context("published atomic transition artifact is unavailable")?;
+                anyhow::ensure!(
+                    published_bytes == bytes,
+                    "published atomic transition artifact differs from its durable temp bytes"
+                );
+                return Ok(bytes);
+            }
+            Err(error) if error == rustix::io::Errno::EXIST => {
+                parent_file.sync_all()?;
+                let (_, published_bytes) = read_atomic_path_transition_json::<T>(parent, name)?
+                    .context("concurrently published atomic transition artifact is unavailable")?;
+                anyhow::ensure!(
+                    published_bytes == bytes,
+                    "atomic transition artifact name is bound to conflicting canonical bytes"
+                );
+                return Ok(bytes);
+            }
+            Err(error) => {
+                return Err(std::io::Error::from(error))
+                    .with_context(|| format!("cannot publish atomic transition artifact {name}"));
+            }
+        }
+    }
+    anyhow::bail!("atomic transition temporary artifact namespace is exhausted")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ATOMIC_PATH_HASH_MAX_ENTRIES: u64 = 1_000_000;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ATOMIC_PATH_HASH_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ATOMIC_PATH_HASH_MAX_DEPTH: usize = 128;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Default)]
+struct AtomicPathHashBudget {
+    entries: u64,
+    bytes: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_path_hash_bounded_bytes(
+    hasher: &mut sha2::Sha256,
+    budget: &mut AtomicPathHashBudget,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    use sha2::Digest as _;
+
+    let byte_len = u64::try_from(bytes.len())
+        .map_err(|_| anyhow::anyhow!("atomic path content length does not fit u64"))?;
+    budget.bytes = budget
+        .bytes
+        .checked_add(byte_len)
+        .context("atomic path content byte counter overflowed")?;
+    anyhow::ensure!(
+        budget.bytes <= ATOMIC_PATH_HASH_MAX_BYTES,
+        "atomic path content exceeds the bounded byte budget"
+    );
+    hasher.update(byte_len.to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_path_hash_metadata(hasher: &mut sha2::Sha256, metadata: &AtomicPathObjectMetadata) {
+    use sha2::Digest as _;
+
+    hasher.update(metadata.object_kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(metadata.mode.to_le_bytes());
+    hasher.update(metadata.uid.to_le_bytes());
+    hasher.update(metadata.gid.to_le_bytes());
+    hasher.update(metadata.hard_link_count.to_le_bytes());
+    hasher.update(metadata.byte_len.to_le_bytes());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_path_hash_node(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    depth: usize,
+    hasher: &mut sha2::Sha256,
+    budget: &mut AtomicPathHashBudget,
+) -> anyhow::Result<(AtomicPathObjectMetadata, bool)> {
+    use cap_fs_ext::DirExt as _;
+    use cap_std::fs::MetadataExt as _;
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    anyhow::ensure!(
+        depth <= ATOMIC_PATH_HASH_MAX_DEPTH,
+        "atomic path content exceeds the bounded directory depth"
+    );
+    budget.entries = budget
+        .entries
+        .checked_add(1)
+        .context("atomic path entry counter overflowed")?;
+    anyhow::ensure!(
+        budget.entries <= ATOMIC_PATH_HASH_MAX_ENTRIES,
+        "atomic path content exceeds the bounded entry budget"
+    );
+
+    let path = Path::new(name);
+    let path_before = parent
+        .symlink_metadata(path)
+        .with_context(|| format!("cannot inspect atomic path entry {:?}", name))?;
+    let metadata_before = AtomicPathObjectMetadata::from_cap_metadata(&path_before)?;
+    anyhow::ensure!(
+        metadata_before.uid == nix::unistd::geteuid().as_raw(),
+        "atomic path entry {:?} is not owned by the effective user",
+        name
+    );
+    if metadata_before.object_kind != "symlink" {
+        anyhow::ensure!(
+            metadata_before.mode & 0o022 == 0,
+            "atomic path entry {:?} is group- or world-writable",
+            name
+        );
+    }
+    if metadata_before.object_kind != "directory" {
+        anyhow::ensure!(
+            metadata_before.hard_link_count == 1,
+            "atomic path non-directory entry {:?} must have exactly one hard link",
+            name
+        );
+    }
+    atomic_path_hash_metadata(hasher, &metadata_before);
+
+    let mut fully_sealed =
+        metadata_before.object_kind == "symlink" || metadata_before.mode & 0o222 == 0;
+    match metadata_before.object_kind.as_str() {
+        "regular-file" => {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let mut file = parent
+                .open_with(path, &options)
+                .with_context(|| format!("cannot open atomic path file {:?}", name))?;
+            let opened = AtomicPathObjectMetadata::from_cap_metadata(&file.metadata()?)?;
+            anyhow::ensure!(
+                opened == metadata_before,
+                "atomic path file {:?} changed while it was opened",
+                name
+            );
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                atomic_path_hash_bounded_bytes(hasher, budget, &buffer[..read])?;
+            }
+            let handle_after = AtomicPathObjectMetadata::from_cap_metadata(&file.metadata()?)?;
+            let path_after =
+                AtomicPathObjectMetadata::from_cap_metadata(&parent.symlink_metadata(path)?)?;
+            anyhow::ensure!(
+                handle_after == metadata_before && path_after == metadata_before,
+                "atomic path file {:?} changed while its bytes were hashed",
+                name
+            );
+        }
+        "symlink" => {
+            let target = parent
+                .read_link(path)
+                .with_context(|| format!("cannot read atomic path symlink {:?}", name))?;
+            atomic_path_hash_bounded_bytes(hasher, budget, target.as_os_str().as_bytes())?;
+            let path_after =
+                AtomicPathObjectMetadata::from_cap_metadata(&parent.symlink_metadata(path)?)?;
+            anyhow::ensure!(
+                path_after == metadata_before,
+                "atomic path symlink {:?} changed while its target was hashed",
+                name
+            );
+        }
+        "directory" => {
+            let directory = parent
+                .open_dir_nofollow(path)
+                .with_context(|| format!("cannot open atomic path directory {:?}", name))?;
+            let opened = AtomicPathObjectMetadata::from_cap_metadata(&directory.dir_metadata()?)?;
+            anyhow::ensure!(
+                opened == metadata_before,
+                "atomic path directory {:?} changed while it was opened",
+                name
+            );
+            let mut names = Vec::new();
+            for entry in directory.entries()? {
+                names.push(entry?.file_name());
+            }
+            names.sort_by(|left, right| {
+                left.as_os_str()
+                    .as_bytes()
+                    .cmp(right.as_os_str().as_bytes())
+            });
+            hasher.update(u64::try_from(names.len()).unwrap_or(u64::MAX).to_le_bytes());
+            for child in names {
+                atomic_path_hash_bounded_bytes(hasher, budget, child.as_os_str().as_bytes())?;
+                let (_, child_sealed) = atomic_path_hash_node(
+                    &directory,
+                    child.as_os_str(),
+                    depth + 1,
+                    hasher,
+                    budget,
+                )?;
+                fully_sealed &= child_sealed;
+            }
+            let handle_after =
+                AtomicPathObjectMetadata::from_cap_metadata(&directory.dir_metadata()?)?;
+            let path_after =
+                AtomicPathObjectMetadata::from_cap_metadata(&parent.symlink_metadata(path)?)?;
+            anyhow::ensure!(
+                handle_after == metadata_before && path_after == metadata_before,
+                "atomic path directory {:?} changed while its tree was hashed",
+                name
+            );
+        }
+        _ => unreachable!("object kind was validated above"),
+    }
+    Ok((metadata_before, fully_sealed))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_path_entry_identity(
+    parent: &cap_std::fs::Dir,
+    name: &str,
+) -> anyhow::Result<Option<AtomicPathObjectIdentity>> {
+    use sha2::Digest as _;
+
+    match parent.symlink_metadata(name) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect atomic transition entry {name}"));
+        }
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"frankenterm.atomic-path-object-content.v1\0");
+    let mut budget = AtomicPathHashBudget::default();
+    let (metadata, fully_sealed) = atomic_path_hash_node(
+        parent,
+        std::ffi::OsStr::new(name),
+        0,
+        &mut hasher,
+        &mut budget,
+    )?;
+    Ok(Some(AtomicPathObjectIdentity {
+        metadata,
+        content_id: format!("sha256:{}", hex::encode(hasher.finalize())),
+        fully_sealed,
+    }))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn inspect_atomic_path_content_id(parent: &Path, name: &str) -> anyhow::Result<String> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt as _;
+
+    validate_atomic_path_transition_name(name, "atomic path content entry name")?;
+    let parent_before = fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        parent_before.file_type().is_dir()
+            && !parent_before.file_type().is_symlink()
+            && parent_before.uid() == nix::unistd::geteuid().as_raw()
+            && parent_before.mode() & 0o022 == 0,
+        "atomic path content parent is not one private owner directory"
+    );
+    let parent_fd = rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let parent_file = fs::File::from(parent_fd);
+    let opened = parent_file.metadata()?;
+    anyhow::ensure!(
+        opened.dev() == parent_before.dev() && opened.ino() == parent_before.ino(),
+        "atomic path content parent changed while it was descriptor-pinned"
+    );
+    let directory = cap_std::fs::Dir::from_std_file(parent_file);
+    atomic_path_entry_identity(&directory, name)?
+        .map(|identity| identity.content_id)
+        .context("atomic path content entry is unavailable")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn inspect_atomic_path_content_id(_parent: &Path, _name: &str) -> anyhow::Result<String> {
+    anyhow::bail!("safe atomic installer path inspection is unsupported on this platform")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_path_transition_is_before(
+    claim: &AtomicPathTransitionClaim,
+    stage: &Option<AtomicPathObjectIdentity>,
+    target: &Option<AtomicPathObjectIdentity>,
+) -> bool {
+    stage.as_ref() == Some(&claim.stage_before) && target == &claim.target_before
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_path_transition_is_after(
+    claim: &AtomicPathTransitionClaim,
+    stage: &Option<AtomicPathObjectIdentity>,
+    target: &Option<AtomicPathObjectIdentity>,
+    operation: AtomicPathTransitionOperation,
+) -> bool {
+    match operation {
+        AtomicPathTransitionOperation::PublishNoreplace => {
+            stage.is_none() && target.as_ref() == Some(&claim.stage_before)
+        }
+        AtomicPathTransitionOperation::Exchange => {
+            stage == &claim.target_before && target.as_ref() == Some(&claim.stage_before)
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_atomic_path_transition_with_post_effect_sync<F>(
+    parent: &Path,
+    stage_name: &str,
+    target_name: &str,
+    transaction_id: &str,
+    stage_content_id: &str,
+    target_content_id: &str,
+    operation: AtomicPathTransitionOperation,
+    post_effect_sync: F,
+) -> anyhow::Result<AtomicPathTransitionOutcome>
+where
+    F: FnOnce(&fs::File) -> std::io::Result<()>,
+{
+    use rustix::fs::{Mode, OFlags, RenameFlags, renameat_with};
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::MetadataExt as _;
+
+    validate_atomic_path_transition_name(stage_name, "staged entry name")?;
+    validate_atomic_path_transition_name(target_name, "target entry name")?;
+    validate_atomic_path_transition_transaction_id(transaction_id)
+        .context("invalid atomic path transition transaction ID")?;
+    validate_atomic_path_content_id(stage_content_id, "staged content identity")?;
+    validate_atomic_path_content_id(target_content_id, "target content identity")?;
+    anyhow::ensure!(
+        stage_name != target_name,
+        "staged and target entry names must differ"
+    );
+    anyhow::ensure!(
+        (operation == AtomicPathTransitionOperation::PublishNoreplace
+            && target_content_id == "missing")
+            || (operation == AtomicPathTransitionOperation::Exchange
+                && target_content_id != "missing"),
+        "target content identity does not match the requested transition operation"
+    );
+
+    let parent_before = fs::symlink_metadata(parent).with_context(|| {
+        format!(
+            "cannot inspect atomic-transition parent {}",
+            parent.display()
+        )
+    })?;
+    anyhow::ensure!(
+        parent_before.file_type().is_dir() && !parent_before.file_type().is_symlink(),
+        "atomic-transition parent must be one non-symlink directory"
+    );
+    anyhow::ensure!(
+        parent_before.uid() == nix::unistd::geteuid().as_raw(),
+        "atomic-transition parent is not owned by the effective user"
+    );
+    anyhow::ensure!(
+        parent_before.mode() & 0o022 == 0,
+        "atomic-transition parent must not be group- or world-writable"
+    );
+
+    let parent_fd = rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)
+    .with_context(|| {
+        format!(
+            "cannot descriptor-pin atomic-transition parent {}",
+            parent.display()
+        )
+    })?;
+    let parent_file = fs::File::from(parent_fd);
+    let parent_opened = parent_file.metadata()?;
+    anyhow::ensure!(
+        parent_opened.dev() == parent_before.dev()
+            && parent_opened.ino() == parent_before.ino()
+            && parent_opened.file_type().is_dir(),
+        "atomic-transition parent changed while its authority descriptor was opened"
+    );
+    let parent_dir = cap_std::fs::Dir::from_std_file(parent_file.try_clone()?);
+
+    let claim_name = format!(".ft-atomic-transition-{transaction_id}.claim.json");
+    let ack_name = format!(".ft-atomic-transition-{transaction_id}.ack.json");
+    let stored_claim =
+        read_atomic_path_transition_json::<AtomicPathTransitionClaim>(&parent_dir, &claim_name)?;
+    let (claim, claim_bytes) = if let Some((claim, bytes)) = stored_claim {
+        anyhow::ensure!(
+            claim.schema_version == "frankenterm.atomic-path-transition-claim.v3"
+                && claim.transaction_id == transaction_id
+                && claim.parent_device == parent_opened.dev()
+                && claim.parent_inode == parent_opened.ino()
+                && claim.operation == operation.as_str()
+                && claim.stage_name == stage_name
+                && claim.target_name == target_name
+                && claim.stage_content_id == stage_content_id
+                && claim.target_content_id == target_content_id
+                && claim.stage_before.content_id == stage_content_id
+                && claim.stage_before.fully_sealed
+                && claim
+                    .target_before
+                    .as_ref()
+                    .map_or(target_content_id == "missing", |target| {
+                        target.content_id == target_content_id
+                    }),
+            "atomic path transition transaction ID is claimed by a different payload"
+        );
+        (claim, bytes)
+    } else {
+        let (artifact_count, artifact_bytes) =
+            atomic_path_transition_artifact_inventory(&parent_dir)?;
+        anyhow::ensure!(
+            artifact_count
+                .checked_add(2)
+                .is_some_and(|count| count <= ATOMIC_PATH_TRANSITION_MAX_ARTIFACTS)
+                && artifact_bytes
+                    .checked_add(2 * 64 * 1024)
+                    .is_some_and(|bytes| bytes <= ATOMIC_PATH_TRANSITION_MAX_ARTIFACT_BYTES),
+            "atomic transition journal lacks bounded capacity for one claim and acknowledgement"
+        );
+        let stage_before = atomic_path_entry_identity(&parent_dir, stage_name)?
+            .context("atomic transition staged entry is unavailable")?;
+        let target_before = atomic_path_entry_identity(&parent_dir, target_name)?;
+        anyhow::ensure!(
+            stage_before.content_id == stage_content_id && stage_before.fully_sealed,
+            "atomic transition staged entry does not match its expected sealed content identity"
+        );
+        match operation {
+            AtomicPathTransitionOperation::PublishNoreplace => {
+                anyhow::ensure!(
+                    target_before.is_none() && target_content_id == "missing",
+                    "atomic no-replace target already exists before claim"
+                );
+            }
+            AtomicPathTransitionOperation::Exchange => {
+                anyhow::ensure!(
+                    target_before
+                        .as_ref()
+                        .is_some_and(|target| target.content_id == target_content_id),
+                    "atomic exchange target does not match its expected content identity"
+                );
+            }
+        }
+        let claim = AtomicPathTransitionClaim {
+            schema_version: "frankenterm.atomic-path-transition-claim.v3".to_string(),
+            transaction_id: transaction_id.to_string(),
+            parent_device: parent_opened.dev(),
+            parent_inode: parent_opened.ino(),
+            operation: operation.as_str().to_string(),
+            stage_name: stage_name.to_string(),
+            target_name: target_name.to_string(),
+            stage_content_id: stage_content_id.to_string(),
+            target_content_id: target_content_id.to_string(),
+            stage_before,
+            target_before,
+        };
+        let bytes =
+            write_atomic_path_transition_json(&parent_dir, &parent_file, &claim_name, &claim)?;
+        (claim, bytes)
+    };
+    let claim_sha256 = hex::encode(Sha256::digest(&claim_bytes));
+
+    let validate_ack = |ack: &AtomicPathTransitionAck| -> anyhow::Result<()> {
+        anyhow::ensure!(
+            ack.schema_version == "frankenterm.atomic-path-transition-ack.v3"
+                && ack.transaction_id == transaction_id
+                && ack.claim_sha256 == claim_sha256
+                && ack.outcome == "applied",
+            "atomic path transition acknowledgement conflicts with its durable claim"
+        );
+        Ok(())
+    };
+    let ack = read_atomic_path_transition_json::<AtomicPathTransitionAck>(&parent_dir, &ack_name)?;
+    let stage_now = atomic_path_entry_identity(&parent_dir, stage_name)?;
+    let target_now = atomic_path_entry_identity(&parent_dir, target_name)?;
+    let is_before = atomic_path_transition_is_before(&claim, &stage_now, &target_now);
+    let is_after = atomic_path_transition_is_after(&claim, &stage_now, &target_now, operation);
+
+    if let Some((ack, _)) = ack {
+        validate_ack(&ack)?;
+        anyhow::ensure!(
+            is_after,
+            "acknowledged atomic path transition no longer has its exact post-effect authority"
+        );
+        parent_file.sync_all()?;
+        return Ok(AtomicPathTransitionOutcome::AlreadyApplied);
+    }
+
+    let performed_effect = if is_after {
+        false
+    } else {
+        anyhow::ensure!(
+            is_before,
+            "atomic path transition authority is neither the claimed before-state nor after-state; outcome is indeterminate"
+        );
+        let stage_revalidated = atomic_path_entry_identity(&parent_dir, stage_name)?;
+        let target_revalidated = atomic_path_entry_identity(&parent_dir, target_name)?;
+        anyhow::ensure!(
+            atomic_path_transition_is_before(&claim, &stage_revalidated, &target_revalidated)
+                && stage_revalidated
+                    .as_ref()
+                    .is_some_and(|stage| stage.fully_sealed),
+            "atomic path transition authority changed immediately before the effect"
+        );
+        let flags = match operation {
+            AtomicPathTransitionOperation::PublishNoreplace => RenameFlags::NOREPLACE,
+            AtomicPathTransitionOperation::Exchange => RenameFlags::EXCHANGE,
+        };
+        renameat_with(&parent_file, stage_name, &parent_file, target_name, flags)
+            .map_err(std::io::Error::from)
+            .with_context(|| {
+                format!(
+                    "atomic {} transition failed for {stage_name} and {target_name}",
+                    operation.as_str()
+                )
+            })?;
+        if std::env::var_os("FT_INSTALL_TEST_ENABLE_FAILPOINTS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("FT_INSTALL_TEST_FAILPOINT").as_deref()
+                == Some(std::ffi::OsStr::new(
+                    "after-atomic-rename-before-parent-fsync",
+                ))
+        {
+            std::process::exit(97);
+        }
+        true
+    };
+
+    post_effect_sync(&parent_file).with_context(|| {
+        format!(
+            "atomic {} transition changed the namespace but parent fsync failed; retry the same transaction ID to reconcile",
+            operation.as_str()
+        )
+    })?;
+    let stage_after = atomic_path_entry_identity(&parent_dir, stage_name)?;
+    let target_after = atomic_path_entry_identity(&parent_dir, target_name)?;
+    anyhow::ensure!(
+        atomic_path_transition_is_after(&claim, &stage_after, &target_after, operation),
+        "atomic path transition did not produce the exact claimed post-effect authority"
+    );
+
+    let ack = AtomicPathTransitionAck {
+        schema_version: "frankenterm.atomic-path-transition-ack.v3".to_string(),
+        transaction_id: transaction_id.to_string(),
+        claim_sha256,
+        outcome: "applied".to_string(),
+    };
+    write_atomic_path_transition_json(&parent_dir, &parent_file, &ack_name, &ack)?;
+    let parent_after = fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        parent_after.dev() == parent_opened.dev()
+            && parent_after.ino() == parent_opened.ino()
+            && parent_after.file_type().is_dir(),
+        "atomic-transition parent pathname changed after the namespace effect"
+    );
+    Ok(if performed_effect {
+        AtomicPathTransitionOutcome::Applied
+    } else {
+        AtomicPathTransitionOutcome::AlreadyApplied
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_atomic_path_transition(
+    parent: &Path,
+    stage_name: &str,
+    target_name: &str,
+    transaction_id: &str,
+    stage_content_id: &str,
+    target_content_id: &str,
+    operation: AtomicPathTransitionOperation,
+) -> anyhow::Result<AtomicPathTransitionOutcome> {
+    run_atomic_path_transition_with_post_effect_sync(
+        parent,
+        stage_name,
+        target_name,
+        transaction_id,
+        stage_content_id,
+        target_content_id,
+        operation,
+        fs::File::sync_all,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn run_atomic_path_transition(
+    _parent: &Path,
+    _stage_name: &str,
+    _target_name: &str,
+    _transaction_id: &str,
+    _stage_content_id: &str,
+    _target_content_id: &str,
+    _operation: AtomicPathTransitionOperation,
+) -> anyhow::Result<AtomicPathTransitionOutcome> {
+    anyhow::bail!("safe atomic installer path transitions are unsupported on this platform")
 }
 
 #[derive(Subcommand)]
@@ -62211,6 +63203,37 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         )?;
                         print!("{}", receipt.canonical_line());
                     }
+                    SetupCommands::AtomicPathTransition {
+                        parent,
+                        stage_name,
+                        target_name,
+                        transaction_id,
+                        stage_content_id,
+                        target_content_id,
+                        operation,
+                    } => {
+                        let outcome = run_atomic_path_transition(
+                            &parent,
+                            &stage_name,
+                            &target_name,
+                            &transaction_id,
+                            &stage_content_id,
+                            &target_content_id,
+                            operation,
+                        )?;
+                        println!(
+                            "FT_ATOMIC_PATH_TRANSITION_V3={}:{}:{}:{}:{}",
+                            transaction_id,
+                            operation.as_str(),
+                            stage_name,
+                            target_name,
+                            outcome.as_str()
+                        );
+                    }
+                    SetupCommands::AtomicPathContentId { parent, name } => {
+                        let content_id = inspect_atomic_path_content_id(&parent, &name)?;
+                        println!("FT_ATOMIC_PATH_CONTENT_ID_V1={content_id}");
+                    }
                     SetupCommands::Config => {
                         use frankenterm_core::setup;
 
@@ -80178,16 +81201,12 @@ fn read_local_component_snapshot(
             profile: marker.profile().to_string(),
             version: marker.version().to_string(),
         };
-        if let Some(existing) = identity.as_ref() {
-            if existing != &parsed {
-                anyhow::bail!(
-                    "component {} contains conflicting atomic identity markers",
-                    path.display()
-                );
-            }
-        } else {
-            identity = Some(parsed);
-        }
+        anyhow::ensure!(
+            identity.is_none(),
+            "component {} contains more than one atomic identity marker",
+            path.display()
+        );
+        identity = Some(parsed);
     }
 
     let identity = identity.ok_or_else(|| {
@@ -80856,6 +81875,54 @@ fn write_remote_generation_component(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn ensure_remote_generation_component(
+    stage: &cap_std::fs::Dir,
+    source_path: &Path,
+    source_snapshot: &LocalComponentSnapshot,
+    component: &RemoteGenerationComponentManifest,
+    expected_role: AtomicComponentRole,
+    effective_uid: u32,
+    stage_device: u64,
+) -> anyhow::Result<()> {
+    match stage.symlink_metadata(&component.filename) {
+        Ok(_) => {
+            verify_remote_generation_file(stage, component, effective_uid, stage_device)
+                .with_context(|| {
+                    format!(
+                        "retained generation stage component {} is not the exact intended byte identity; use a fresh transaction ID (residue is retained)",
+                        component.filename
+                    )
+                })?;
+            let source_after =
+                read_remote_generation_source_snapshot(source_path, expected_role, effective_uid)?;
+            anyhow::ensure!(
+                source_after == *source_snapshot,
+                "generation source {} changed before retained-stage adoption",
+                source_path.display()
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_remote_generation_component(
+                stage,
+                source_path,
+                source_snapshot,
+                component,
+                expected_role,
+                effective_uid,
+                stage_device,
+            )
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot inspect retained generation stage component {}",
+                component.filename
+            )
+        }),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn write_remote_generation_manifest(
     stage: &cap_std::fs::Dir,
     manifest: &RemoteGenerationManifest,
@@ -80888,6 +81955,32 @@ fn write_remote_generation_manifest(
         "generation manifest exact readback differs from the requested canonical manifest"
     );
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn ensure_remote_generation_manifest(
+    stage: &cap_std::fs::Dir,
+    manifest: &RemoteGenerationManifest,
+    effective_uid: u32,
+    stage_device: u64,
+) -> anyhow::Result<()> {
+    match stage.symlink_metadata(REMOTE_GENERATION_MANIFEST_FILE) {
+        Ok(_) => {
+            let persisted = read_remote_generation_manifest(stage, effective_uid, stage_device)
+                .context(
+                    "retained generation stage manifest is invalid; use a fresh transaction ID (residue is retained)",
+                )?;
+            anyhow::ensure!(
+                persisted == *manifest,
+                "retained generation stage manifest conflicts with the exact intended family; use a fresh transaction ID"
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_remote_generation_manifest(stage, manifest, effective_uid, stage_device)
+        }
+        Err(error) => Err(error).context("cannot inspect retained generation stage manifest"),
+    }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -80973,6 +82066,35 @@ fn write_remote_generation_lifetime_lease(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn ensure_remote_generation_lifetime_lease(
+    stage: &cap_std::fs::Dir,
+    lease: &RemoteGenerationLifetimeLeaseManifest,
+    effective_uid: u32,
+    stage_device: u64,
+) -> anyhow::Result<()> {
+    match stage.symlink_metadata(&lease.filename) {
+        Ok(_) => {
+            drop(
+                open_verified_remote_generation_lifetime_lease(
+                    stage,
+                    lease,
+                    effective_uid,
+                    stage_device,
+                )
+                .context(
+                    "retained generation stage lifetime lease is invalid; use a fresh transaction ID (residue is retained)",
+                )?,
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_remote_generation_lifetime_lease(stage, lease, effective_uid, stage_device)
+        }
+        Err(error) => Err(error).context("cannot inspect retained generation stage lifetime lease"),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn remote_generation_directory_inventory(
     directory: &cap_std::fs::Dir,
 ) -> anyhow::Result<BTreeSet<String>> {
@@ -80986,6 +82108,10 @@ fn remote_generation_directory_inventory(
         anyhow::ensure!(
             names.insert(name),
             "generation directory returned a duplicate entry name"
+        );
+        anyhow::ensure!(
+            names.len() <= 5,
+            "generation directory exceeds the exact five-entry inventory bound"
         );
     }
     Ok(names)
@@ -82124,72 +83250,107 @@ fn publish_remote_process_family_generation(
         sync_capability_directory(&generations)?;
     } else {
         let stage_name = format!(".stage-{generation_id}-{effect_transaction_id}");
-        create_private_child_directory(&generations, Path::new(&stage_name)).map_err(|error| {
-            anyhow::anyhow!(
-                "cannot create transaction-unique generation stage (stale stages are never removed): {error}"
-            )
-        })?;
-        sync_capability_directory(&generations)?;
+        let stage_created =
+            match create_private_child_directory(&generations, Path::new(&stage_name)) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "cannot create transaction-unique generation stage (stages are retained): {error}"
+                    ));
+                }
+            };
+        if stage_created {
+            sync_capability_directory(&generations)?;
+        }
         let stage = generations
             .open_dir_nofollow(Path::new(&stage_name))
             .map_err(|error| anyhow::anyhow!("cannot pin generation stage: {error}"))?;
-        stage
-            .open(".")?
-            .set_permissions(cap_std::fs::Permissions::from_mode(
-                REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
-            ))?;
         let generations_device = generations.dir_metadata()?.dev();
-        let stage_device = validate_remote_generation_directory(
-            &generations,
-            Path::new(&stage_name),
-            &stage,
-            REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
-            effective_uid,
-            Some(generations_device),
-            "generation stage",
-        )?;
-        write_remote_generation_component(
-            &stage,
-            request.ft_source,
-            &family.ft,
-            &manifest.ft,
-            AtomicComponentRole::Ft,
-            effective_uid,
-            stage_device,
-        )?;
-        write_remote_generation_component(
-            &stage,
-            request.mux_server_source,
-            &family.mux_server,
-            &manifest.mux_server,
-            AtomicComponentRole::FrankenTermMuxServer,
-            effective_uid,
-            stage_device,
-        )?;
-        write_remote_generation_component(
-            &stage,
-            request.guardian_source,
-            &family.guardian,
-            &manifest.guardian,
-            AtomicComponentRole::FrankenTermPtyGuardian,
-            effective_uid,
-            stage_device,
-        )?;
-        run_verified_remote_generation_mux_version(&stage, &manifest, effective_uid, stage_device)?;
-        write_remote_generation_lifetime_lease(
-            &stage,
-            &manifest.lifetime_lease,
-            effective_uid,
-            stage_device,
-        )?;
-        write_remote_generation_manifest(&stage, &manifest, effective_uid, stage_device)?;
-        sync_capability_directory(&stage)?;
-        stage
-            .open(".")?
-            .set_permissions(cap_std::fs::Permissions::from_mode(
-                REMOTE_GENERATION_DIRECTORY_MODE,
-            ))?;
-        sync_capability_directory(&stage)?;
+        let stage_mode = stage.dir_metadata()?.permissions().mode() & 0o7777;
+        if stage_mode == REMOTE_GENERATION_DIRECTORY_MODE {
+            verify_remote_generation_directory(
+                &generations,
+                &stage_name,
+                false,
+                Some(&manifest),
+                effective_uid,
+            )?;
+        } else {
+            let stage_device = validate_remote_generation_directory(
+                &generations,
+                Path::new(&stage_name),
+                &stage,
+                REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE,
+                effective_uid,
+                Some(generations_device),
+                "generation stage",
+            )?;
+            let expected_stage_names = BTreeSet::from([
+                REMOTE_GENERATION_LIFETIME_LEASE_FILE.to_string(),
+                REMOTE_GENERATION_FT_FILE.to_string(),
+                REMOTE_GENERATION_GUARDIAN_FILE.to_string(),
+                REMOTE_GENERATION_MANIFEST_FILE.to_string(),
+                REMOTE_GENERATION_MUX_FILE.to_string(),
+            ]);
+            let retained_names = remote_generation_directory_inventory(&stage)?;
+            anyhow::ensure!(
+                retained_names.is_subset(&expected_stage_names),
+                "retained generation stage has an unexpected entry; use a fresh transaction ID (residue is retained)"
+            );
+            ensure_remote_generation_component(
+                &stage,
+                request.ft_source,
+                &family.ft,
+                &manifest.ft,
+                AtomicComponentRole::Ft,
+                effective_uid,
+                stage_device,
+            )?;
+            ensure_remote_generation_component(
+                &stage,
+                request.mux_server_source,
+                &family.mux_server,
+                &manifest.mux_server,
+                AtomicComponentRole::FrankenTermMuxServer,
+                effective_uid,
+                stage_device,
+            )?;
+            ensure_remote_generation_component(
+                &stage,
+                request.guardian_source,
+                &family.guardian,
+                &manifest.guardian,
+                AtomicComponentRole::FrankenTermPtyGuardian,
+                effective_uid,
+                stage_device,
+            )?;
+            run_verified_remote_generation_mux_version(
+                &stage,
+                &manifest,
+                effective_uid,
+                stage_device,
+            )?;
+            ensure_remote_generation_lifetime_lease(
+                &stage,
+                &manifest.lifetime_lease,
+                effective_uid,
+                stage_device,
+            )?;
+            ensure_remote_generation_manifest(
+                &stage,
+                &manifest,
+                effective_uid,
+                stage_device,
+            )?;
+            sync_capability_directory(&stage)?;
+            stage
+                .open(".")?
+                .set_permissions(cap_std::fs::Permissions::from_mode(
+                    REMOTE_GENERATION_DIRECTORY_MODE,
+                ))?;
+            sync_capability_directory(&stage)?;
+        }
         verify_remote_generation_directory(
             &generations,
             &stage_name,
@@ -100810,6 +101971,8 @@ log_level = "debug"
             101,
             &"c".repeat(64),
             202,
+            &"d".repeat(64),
+            303,
         )
         .expect("create activation durability claim");
         let mut ledger =
@@ -117379,10 +118542,13 @@ A  docs/new-proof.md\n";
                 root: PathBuf::from("/tmp/process-family"),
                 ft_source: PathBuf::from("/tmp/ft"),
                 mux_server_source: PathBuf::from("/tmp/mux"),
+                guardian_source: PathBuf::from("/tmp/guardian"),
                 expected_ft_sha256: "a".repeat(64),
                 expected_ft_bytes: 1,
                 expected_mux_sha256: "b".repeat(64),
                 expected_mux_bytes: 1,
+                expected_guardian_sha256: "d".repeat(64),
+                expected_guardian_bytes: 1,
                 transaction_id: "c".repeat(32),
             }),
         })));
