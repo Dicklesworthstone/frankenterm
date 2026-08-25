@@ -82317,10 +82317,10 @@ fn run_descriptor_pinned_remote_generation_component_version(
     // has been reaped; no ambient generation pathname is executed.
     let inherited = nix::unistd::dup(executable)
         .map_err(|error| anyhow::anyhow!("cannot duplicate verified {role} descriptor: {error}"))?;
-    let descriptor_flags = FdFlag::from_bits_truncate(
-        fcntl(&inherited, FcntlArg::F_GETFD)
-        .map_err(|error| anyhow::anyhow!("cannot inspect verified {role} descriptor: {error}"))?,
-    );
+    let descriptor_flags =
+        FdFlag::from_bits_truncate(fcntl(&inherited, FcntlArg::F_GETFD).map_err(|error| {
+            anyhow::anyhow!("cannot inspect verified {role} descriptor: {error}")
+        })?);
     anyhow::ensure!(
         !descriptor_flags.contains(FdFlag::FD_CLOEXEC),
         "verified {role} execution descriptor unexpectedly has close-on-exec set"
@@ -82358,16 +82358,9 @@ fn run_verified_remote_generation_component_versions(
     // same handle and its nofollow named entry afterward. A version probe never
     // precedes hash admission and a name substitution cannot redirect exec.
     for component in [&manifest.ft, &manifest.mux_server, &manifest.guardian] {
-        let mut executable = open_verified_remote_generation_file(
-            stage,
-            component,
-            effective_uid,
-            stage_device,
-        )?;
-        run_descriptor_pinned_remote_generation_component_version(
-            &executable,
-            &component.role,
-        )?;
+        let mut executable =
+            open_verified_remote_generation_file(stage, component, effective_uid, stage_device)?;
+        run_descriptor_pinned_remote_generation_component_version(&executable, &component.role)?;
         verify_open_remote_generation_file(
             stage,
             component,
@@ -103529,57 +103522,63 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
     }
 
     #[test]
-    fn top_level_installer_launch_probes_all_three_staged_components_before_backup() {
+    fn top_level_installer_seals_and_switches_one_exact_triplet_generation() {
         let installer = include_str!("../../../install.sh");
-        assert!(installer.contains("Refusing process-family source paths that are symlinks"));
+        let active_start = installer
+            .find("install_process_family() {")
+            .expect("atomic process-family installer");
+        let active_end = installer[active_start..]
+            .find("\n}\n\ncheck_write_permissions()")
+            .map(|offset| active_start + offset)
+            .expect("atomic process-family installer end");
+        let active = &installer[active_start..active_end];
+        let ft_probe = active.find("\"$stage/ft\" --version").expect("ft probe");
+        let mux_probe = active
+            .find("\"$stage/frankenterm-mux-server\" --version")
+            .expect("mux probe");
+        let guardian_probe = active
+            .find("\"$stage/frankenterm-pty-guardian\" --version")
+            .expect("guardian probe");
+        let seal = active.find("chmod 0555 \"$stage\"").expect("stage seal");
+        let publish = active
+            .find("$stage_id\" missing publish-noreplace")
+            .expect("atomic generation publish");
+        assert!(ft_probe < seal && mux_probe < seal && guardian_probe < seal);
+        assert!(seal < publish);
+        assert!(active.contains("stage_name=\".generation-${generation_id}.installing\""));
+        assert!(!active.contains("stage_name=\".generation-${generation_id}.installing-$$\""));
+        assert!(active.contains("validate_installer_stage_inventory \"$stage\" generation"));
+        let mux_entry = active
+            .find("publish_stable_entrypoint \"$helper\" frankenterm-mux-server")
+            .expect("mux entrypoint");
+        let guardian_entry = active
+            .find("publish_stable_entrypoint \"$helper\" frankenterm-pty-guardian")
+            .expect("guardian entrypoint");
+        let ft_entry = active
+            .find("publish_stable_entrypoint \"$helper\" ft")
+            .expect("ft entrypoint");
+        let selector_switch = active
+            .find("\"$stage_id\" \"$current_id\" exchange")
+            .expect("single selector exchange");
         assert!(
-            installer.contains("Refusing to reuse an existing process-family transaction path")
+            mux_entry < guardian_entry && guardian_entry < ft_entry && ft_entry < selector_switch
         );
-        assert!(installer.contains("[ -L \"$ft_target\" ]"));
-        assert!(installer.contains("[ -L \"$mux_target\" ]"));
-        assert!(installer.contains("[ -L \"$guardian_target\" ]"));
-        assert!(installer.contains("[ -L \"$ft_backup_candidate\" ]"));
-        assert!(installer.contains("[ -L \"$mux_backup_candidate\" ]"));
-        assert!(installer.contains("[ -L \"$guardian_backup_candidate\" ]"));
-        assert!(installer.contains("restore_preserved_component()"));
-        assert!(
-            installer
-                .contains("Cannot restore preserved $label because its target path is occupied")
-        );
-        assert!(installer.contains(
-            "Process-family rollback was incomplete; preserved bytes require operator recovery"
+        assert!(active.contains(
+            "verify_canonical_generation \"$generation\" \"$version\" \"$verifier_source\""
         ));
-        assert!(!installer.contains("mv \"$ft_backup\" \"$ft_target\" || true"));
-        assert!(!installer.contains("mv \"$mux_backup\" \"$mux_target\" || true"));
-        assert!(!installer.contains("mv \"$guardian_backup\" \"$guardian_target\" || true"));
-        let ft_probe = installer
-            .find("if ! \"$ft_stage\" --version")
-            .expect("staged ft launch probe");
-        let mux_probe = installer
-            .find("if ! \"$mux_stage\" --version")
-            .expect("staged mux launch probe");
-        let guardian_probe = installer
-            .find("if ! \"$guardian_stage\" --version")
-            .expect("staged guardian launch probe");
-        let first_backup = installer
-            .find("if [ -e \"$ft_target\" ]")
-            .expect("installed ft backup boundary");
-        assert!(ft_probe < first_backup);
-        assert!(mux_probe < first_backup);
-        assert!(guardian_probe < first_backup);
+        assert!(active.contains("Previous generations and displaced entrypoints were retained"));
 
+        assert!(installer.contains("fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"));
+        assert!(installer.contains("The permanent lock inode is never unlinked"));
+        assert!(!installer.contains("if mkdir \"$LOCK_DIR\""));
         let lock_acquired = installer
-            .find("if mkdir \"$LOCK_DIR\"")
-            .expect("installer lock acquisition");
+            .find("LOCKED=1")
+            .expect("kernel installer lock acquisition");
         let installed_version_check = installer
             .find("&& check_installed_version \"$VERSION\"")
-            .expect("sealed installed-version fast path");
+            .expect("installed-version refresh boundary");
         assert!(lock_acquired < installed_version_check);
-        assert!(installer.contains("command -v head >/dev/null 2>&1 || return 1"));
-        assert!(installer.contains("command -v awk >/dev/null 2>&1 || return 1"));
-        assert!(installer.contains("sed 's/:ft:/:ROLE:/' | sort -u"));
-        assert!(installer.contains("sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u"));
-        assert!(installer.contains("sed 's/:frankenterm-pty-guardian:/:ROLE:/' | sort -u"));
+        assert!(!installer.contains("sort -u"));
         assert!(installer.contains("GUARDIAN_BIN=\"$PACKAGE_ROOT/frankenterm-pty-guardian\""));
         assert!(installer.contains("-name \"frankenterm-pty-guardian\" -perm -111"));
         assert!(
@@ -103592,6 +103591,21 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             .find("install_process_family \"$BIN\" \"$MUX_BIN\" \"$GUARDIAN_BIN\"")
             .expect("offline archive triplet installation");
         assert!(offline_verification < offline_install);
+
+        let app_start = installer
+            .find("install_macos_app() {")
+            .expect("macOS app installer");
+        let app = &installer[app_start..];
+        assert!(app.contains("FrankenTerm.app.component-manifest.json"));
+        assert!(app.contains("process_family_manifest_metadata \"$app_manifest\" app"));
+        assert!(app.contains("$app_build\" = \"$family_build"));
+        assert!(
+            app.contains("application-family-gui-ft-mux-server-pty-guardian-default-features-v1")
+        );
+        assert!(app.contains("before-app-selector-switch"));
+        assert!(app.contains("after-app-selector-switch"));
+        assert!(app.contains("$operation\" || return 0"));
+        assert!(!app.contains("move_no_clobber \"$target_app\""));
 
         let source_build_start = installer
             .find("build_from_source() {")
@@ -103649,7 +103663,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
 
     #[cfg(unix)]
     #[test]
-    fn top_level_installer_same_semver_fast_path_requires_exact_sealed_identity() {
+    fn top_level_installer_same_semver_refreshes_without_external_release_authority() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let installer = include_str!("../../../install.sh");
@@ -103662,6 +103676,9 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             .expect("installed-version function end");
         let function_end = function_start + relative_end + 2;
         let function_source = &installer[function_start..function_end];
+        assert!(function_source.contains("cannot authenticate its own verifier"));
+        assert!(function_source.contains("outer-checksum-authenticated release package"));
+        assert!(function_source.contains("return 1"));
 
         let dir = tempfile::tempdir().expect("create installed process-family fixture");
         let ft_path = dir.path().join("ft");
@@ -103703,7 +103720,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             assert_eq!(status.success(), expected_success);
         };
 
-        check(true);
+        check(false);
 
         write_atomic_component_fixture(
             &guardian_path,
@@ -103766,7 +103783,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             "frankenterm-pty-guardian",
             "aarch64-unknown-linux-gnu",
         );
-        check(true);
+        check(false);
 
         write_atomic_component_fixture(&ft_path, &build_id, "ft", "x86_64-unknown-linux-gnu");
         write_atomic_component_fixture(
