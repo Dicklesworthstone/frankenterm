@@ -4260,7 +4260,7 @@ mod pane_registration_handle {
         /// the result, and mint a typed model-installed authority before any
         /// live parser can be activated.
         #[cfg(test)]
-        fn prepare_guardian_output_replay_from_checkpoint(
+        pub(crate) fn prepare_guardian_output_replay_from_checkpoint(
             &self,
             journal: &GuardianOutputJournal,
             boundary: &GuardianCheckpointBoundary,
@@ -20387,7 +20387,11 @@ mod tests {
     #[derive(Debug)]
     struct LiveCheckpointTestConfig;
 
-    impl TerminalConfiguration for LiveCheckpointTestConfig {}
+    impl TerminalConfiguration for LiveCheckpointTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
 
     struct CheckpointPaneState {
         durable_pane_id: [u8; 16],
@@ -21414,7 +21418,7 @@ mod tests {
                         observed += size;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(error) => panic!("backpressure parser read failed: {error}"),
+                    Err(error) => panic!("backpressure parser read failed: {}", error),
                 }
             }
             observed

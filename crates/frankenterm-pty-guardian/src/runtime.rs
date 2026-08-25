@@ -2372,7 +2372,21 @@ mod tests {
     fn borrowed_input_cannot_bypass_owned_worker_submission_or_emit_a_terminal_rejection() {
         let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
         let request = authenticated_input_request();
-        let protocol_before = runtime.protocol.clone();
+        let request_pane_id = request
+            .header()
+            .pane_id
+            .expect("the test input request names a pane");
+        let protocol_incarnation_before = runtime
+            .protocol
+            .as_ref()
+            .expect("runtime starts with protocol authority")
+            .incarnation();
+        let pane_state_before = runtime
+            .protocol
+            .as_ref()
+            .expect("runtime starts with protocol authority")
+            .pane_state(request_pane_id)
+            .cloned();
         let pane_count_before = runtime.panes.len();
         let pty_token_count_before = runtime.pty_tokens.len();
         let buffered_output_before = runtime.buffered_output_bytes;
@@ -2387,7 +2401,15 @@ mod tests {
             .checked_add(1)
             .expect("test rejection counter has headroom");
         assert_eq!(runtime.counters(), expected_counters);
-        assert_eq!(runtime.protocol, protocol_before);
+        let protocol_after = runtime
+            .protocol
+            .as_ref()
+            .expect("borrowed input must not move protocol authority");
+        assert_eq!(protocol_after.incarnation(), protocol_incarnation_before);
+        assert_eq!(
+            protocol_after.pane_state(request_pane_id),
+            pane_state_before.as_ref()
+        );
         assert_eq!(runtime.panes.len(), pane_count_before);
         assert_eq!(runtime.pty_tokens.len(), pty_token_count_before);
         assert_eq!(runtime.buffered_output_bytes, buffered_output_before);
@@ -2862,11 +2884,33 @@ mod tests {
         assert_eq!(runtime.panes.len(), 1);
         assert_eq!(runtime.pty_tokens.len(), 1);
         let next_pty_token_after_first = runtime.next_pty_token;
-        let protocol_after_first = runtime.protocol.clone();
+        let protocol_incarnation_after_first = runtime
+            .protocol
+            .as_ref()
+            .expect("spawn retains protocol authority")
+            .incarnation();
+        let pane_state_after_first = runtime
+            .protocol
+            .as_ref()
+            .expect("spawn retains protocol authority")
+            .pane_state(pane_id)
+            .cloned()
+            .expect("spawn installs pane protocol state");
 
         let replay = runtime.dispatch(&request).expect("exact spawn replay response");
         assert_eq!(replay, first);
-        assert_eq!(runtime.protocol, protocol_after_first);
+        let protocol_after_replay = runtime
+            .protocol
+            .as_ref()
+            .expect("replay retains protocol authority");
+        assert_eq!(
+            protocol_after_replay.incarnation(),
+            protocol_incarnation_after_first
+        );
+        assert_eq!(
+            protocol_after_replay.pane_state(pane_id),
+            Some(&pane_state_after_first)
+        );
         assert_eq!(runtime.panes.len(), 1);
         assert_eq!(runtime.pty_tokens.len(), 1);
         assert_eq!(runtime.next_pty_token, next_pty_token_after_first);
@@ -2886,10 +2930,26 @@ mod tests {
                 GuardianRejectionCode::CapacityExhausted,
             )
         );
-        assert_eq!(runtime.protocol, protocol_after_first);
+        let protocol_after_rejection = runtime
+            .protocol
+            .as_ref()
+            .expect("capacity rejection retains protocol authority");
+        assert_eq!(
+            protocol_after_rejection.incarnation(),
+            protocol_incarnation_after_first
+        );
+        assert_eq!(
+            protocol_after_rejection.pane_state(pane_id),
+            Some(&pane_state_after_first)
+        );
         assert_eq!(runtime.panes.len(), 1);
         assert_eq!(runtime.pty_tokens.len(), 1);
         assert_eq!(runtime.next_pty_token, next_pty_token_after_first);
+
+        let replay_after_rejection = runtime
+            .dispatch(&request)
+            .expect("capacity rejection must not evict the original spawn receipt");
+        assert_eq!(replay_after_rejection, first);
     }
 
     #[test]
