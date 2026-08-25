@@ -734,6 +734,211 @@ impl AuthenticatedGuardianResponse {
     }
 }
 
+/// Optional v1 `Hello` payload that binds the initiating mux build to the
+/// already authenticated connection request.
+///
+/// An empty `Hello` remains sufficient for ordinary protocol discovery, but
+/// cannot authorize Genesis Spawn.  This fixed-width payload deliberately
+/// carries [`AtomicBuildIdentity::UnsealedDevelopment`] as a distinct state so
+/// development clients can still connect while permit issuance fails closed.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianHelloBuildIdentityV1 {
+    build_identity: AtomicBuildIdentity,
+}
+
+impl std::fmt::Debug for GuardianHelloBuildIdentityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianHelloBuildIdentityV1")
+            .field(
+                "build_identity",
+                &match self.build_identity {
+                    AtomicBuildIdentity::UnsealedDevelopment => "unsealed-development",
+                    AtomicBuildIdentity::Sealed(_) => "[SEALED]",
+                },
+            )
+            .finish()
+    }
+}
+
+impl GuardianHelloBuildIdentityV1 {
+    /// Construct the exact identity carried by this compilation.
+    ///
+    /// No runtime path, inode, version string, or caller-provided digest can
+    /// substitute for the build-time identity.  An absent build-time value is
+    /// represented explicitly as unsealed and therefore cannot mint Genesis
+    /// authority.
+    pub fn for_compiled_mux() -> Result<Self, GuardianProtocolError> {
+        Ok(Self {
+            build_identity: compiled_atomic_build_identity()?,
+        })
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = [0_u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES];
+        payload[..4].copy_from_slice(&HELLO_BUILD_IDENTITY_PAYLOAD_MAGIC);
+        match self.build_identity {
+            AtomicBuildIdentity::UnsealedDevelopment => {}
+            AtomicBuildIdentity::Sealed(identity) => {
+                payload[4] = 1;
+                payload[8..].copy_from_slice(identity.as_bytes());
+            }
+        }
+        payload
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != HELLO_BUILD_IDENTITY_PAYLOAD_BYTES
+            || payload.get(..4) != Some(HELLO_BUILD_IDENTITY_PAYLOAD_MAGIC.as_slice())
+            || payload[5..8].iter().any(|byte| *byte != 0)
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let build_identity = match payload[4] {
+            0 if payload[8..].iter().all(|byte| *byte == 0) => {
+                AtomicBuildIdentity::UnsealedDevelopment
+            }
+            1 => AtomicBuildIdentity::Sealed(sealed_atomic_build_identity_from_bytes(
+                payload[8..]
+                    .try_into()
+                    .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
+            )?),
+            _ => return Err(GuardianProtocolError::InvalidOperationPayload),
+        };
+        Ok(Self { build_identity })
+    }
+
+    fn require_sealed(self) -> Result<SealedAtomicBuildIdentity, GuardianProtocolError> {
+        let identity = self
+            .build_identity
+            .require_sealed()
+            .map_err(|_| GuardianProtocolError::GenesisBuildIdentityUnavailable)?;
+        if identity.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(GuardianProtocolError::GenesisBuildIdentityUnavailable);
+        }
+        Ok(identity)
+    }
+
+    #[cfg(test)]
+    const fn from_build_identity_for_test(build_identity: AtomicBuildIdentity) -> Self {
+        Self { build_identity }
+    }
+}
+
+/// Nonduplicable proof that one mux incarnation and sealed build identity were
+/// bound by an authenticated `Hello` request accepted for this guardian.
+///
+/// Private fields prevent a raw UUID or decoded Spawn payload from becoming
+/// connection authority.  The only production constructor is the protocol
+/// state method that consumes an authenticated `Hello` envelope.
+pub struct GuardianAuthenticatedMuxConnectionAuthorityV1 {
+    guardian_incarnation: Uuid,
+    mux_incarnation: Uuid,
+    hello_request_id: Uuid,
+    mux_build_identity: SealedAtomicBuildIdentity,
+}
+
+static_assertions::assert_not_impl_any!(GuardianAuthenticatedMuxConnectionAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
+
+impl std::fmt::Debug for GuardianAuthenticatedMuxConnectionAuthorityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianAuthenticatedMuxConnectionAuthorityV1")
+            .field("guardian_incarnation", &self.guardian_incarnation)
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("hello_request_id", &self.hello_request_id)
+            .field("mux_build_identity", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Nonduplicable proof of the sealed build identity compiled into the running
+/// guardian process family.
+///
+/// This wrapper has no constructor that accepts caller-supplied digest bytes.
+/// Production obtains it only through the protocol state's compiled-build
+/// factory; an unsealed development build is rejected there.
+pub struct GuardianLiveBuildAuthorityV1 {
+    guardian_incarnation: Uuid,
+    guardian_build_identity: SealedAtomicBuildIdentity,
+}
+
+static_assertions::assert_not_impl_any!(GuardianLiveBuildAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
+
+impl std::fmt::Debug for GuardianLiveBuildAuthorityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianLiveBuildAuthorityV1")
+            .field("guardian_incarnation", &self.guardian_incarnation)
+            .field("guardian_build_identity", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reserved authority shape for a future authenticated successor-mux handoff.
+///
+/// There is intentionally no production constructor yet: the handoff protocol
+/// does not currently authenticate a successor build and transfer identifier.
+/// Consequently this variant cannot enable production Spawn prematurely.
+pub struct GuardianSuccessorMuxHandoffAuthorityV1 {
+    guardian_incarnation: Uuid,
+    successor_mux_incarnation: Uuid,
+    handoff_id: Uuid,
+    successor_mux_build_identity: SealedAtomicBuildIdentity,
+}
+
+static_assertions::assert_not_impl_any!(GuardianSuccessorMuxHandoffAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
+
+impl std::fmt::Debug for GuardianSuccessorMuxHandoffAuthorityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianSuccessorMuxHandoffAuthorityV1")
+            .field("guardian_incarnation", &self.guardian_incarnation)
+            .field("successor_mux_incarnation", &self.successor_mux_incarnation)
+            .field("handoff_id", &self.handoff_id)
+            .field("successor_mux_build_identity", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Closed authority sources accepted by Genesis reservation issuance.
+pub enum GuardianGenesisMuxAuthorityV1<'a> {
+    AuthenticatedConnection(&'a GuardianAuthenticatedMuxConnectionAuthorityV1),
+    SuccessorHandoff(&'a GuardianSuccessorMuxHandoffAuthorityV1),
+}
+
+impl GuardianGenesisMuxAuthorityV1<'_> {
+    fn validated_parts(
+        self,
+        guardian_incarnation: Uuid,
+    ) -> Result<(Uuid, SealedAtomicBuildIdentity), GuardianProtocolError> {
+        match self {
+            Self::AuthenticatedConnection(authority) => {
+                if authority.guardian_incarnation != guardian_incarnation
+                    || authority.mux_incarnation.is_nil()
+                    || authority.hello_request_id.is_nil()
+                {
+                    return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+                }
+                Ok((authority.mux_incarnation, authority.mux_build_identity))
+            }
+            Self::SuccessorHandoff(authority) => {
+                if authority.guardian_incarnation != guardian_incarnation
+                    || authority.successor_mux_incarnation.is_nil()
+                    || authority.handoff_id.is_nil()
+                {
+                    return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+                }
+                Ok((
+                    authority.successor_mux_incarnation,
+                    authority.successor_mux_build_identity,
+                ))
+            }
+        }
+    }
+}
+
 #[derive(PartialEq)]
 pub struct GuardianSpawnPayload {
     command: CommandBuilder,
@@ -7273,6 +7478,18 @@ pub enum GuardianProtocolError {
     CheckpointOutcomeIndeterminate,
     #[error("guardian checkpoint acknowledgement does not match the pending publication identity")]
     CheckpointIdentityMismatch,
+    #[error("Genesis Spawn requires authenticated connection or successor-handoff authority")]
+    GenesisAuthorityUnavailable,
+    #[error("Genesis Spawn build identity is absent, invalid, or unsealed")]
+    GenesisBuildIdentityUnavailable,
+    #[error("Genesis Spawn authority does not match the authenticated request identities")]
+    GenesisAuthorityMismatch,
+    #[error("the exact Genesis Spawn reservation has already issued its one-shot permit")]
+    GenesisReservationAlreadyIssued,
+    #[error("Genesis Spawn reservation metadata is invalid or internally inconsistent")]
+    InvalidGenesisReservation,
+    #[error("reserved Genesis Spawn requires durable published-checkpoint admission")]
+    GenesisSpawnRequiresPublishedAdmission,
     #[error("guardian checkpoint Stage chunks require the consuming zeroizing encoder")]
     CheckpointStageChunkRequiresConsumingEncoding,
     #[error("guardian replay responses require the consuming typed delivery API")]
@@ -7339,6 +7556,12 @@ impl GuardianRejectionCode {
             | GuardianProtocolError::InvalidOperationPayload
             | GuardianProtocolError::InvalidCheckpointIntent
             | GuardianProtocolError::CheckpointRequiresTypedTransaction
+            | GuardianProtocolError::GenesisAuthorityUnavailable
+            | GuardianProtocolError::GenesisBuildIdentityUnavailable
+            | GuardianProtocolError::GenesisAuthorityMismatch
+            | GuardianProtocolError::GenesisReservationAlreadyIssued
+            | GuardianProtocolError::InvalidGenesisReservation
+            | GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
             | GuardianProtocolError::CheckpointStageChunkRequiresConsumingEncoding => {
                 Self::InvalidRequest
             }

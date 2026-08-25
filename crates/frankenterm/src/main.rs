@@ -82434,28 +82434,40 @@ emit_receipt() {{
   validate_destination || return 1
   ft_path="$destination/ft"
   mux_path="$destination/frankenterm-mux-server"
+  guardian_path="$destination/frankenterm-pty-guardian"
   test -f "$ft_path" && test ! -L "$ft_path" || return 1
   test -f "$mux_path" && test ! -L "$mux_path" || return 1
+  test -f "$guardian_path" && test ! -L "$guardian_path" || return 1
   test "$(stat -c %u -- "$ft_path")" = "$(id -u)" || return 1
   test "$(stat -c %u -- "$mux_path")" = "$(id -u)" || return 1
+  test "$(stat -c %u -- "$guardian_path")" = "$(id -u)" || return 1
   test "$(stat -c %h -- "$ft_path")" = 1 || return 1
   test "$(stat -c %h -- "$mux_path")" = 1 || return 1
+  test "$(stat -c %h -- "$guardian_path")" = 1 || return 1
   ft_mode=$(stat -c %a -- "$ft_path") || return 1
   mux_mode=$(stat -c %a -- "$mux_path") || return 1
+  guardian_mode=$(stat -c %a -- "$guardian_path") || return 1
   test "$ft_mode" = 500 || test "$ft_mode" = 755 || return 1
   test "$mux_mode" = 500 || test "$mux_mode" = 755 || return 1
+  test "$guardian_mode" = 500 || test "$guardian_mode" = 755 || return 1
   ft_bytes=$(stat -c %s -- "$ft_path") || return 1
   mux_bytes=$(stat -c %s -- "$mux_path") || return 1
+  guardian_bytes=$(stat -c %s -- "$guardian_path") || return 1
   test "$ft_bytes" -gt 0 && test "$ft_bytes" -le {component_max_bytes} || return 1
   test "$mux_bytes" -gt 0 && test "$mux_bytes" -le {component_max_bytes} || return 1
+  test "$guardian_bytes" -gt 0 && test "$guardian_bytes" -le {component_max_bytes} || return 1
   ft_sha256=$(sha256sum -- "$ft_path" | cut -d ' ' -f 1) || return 1
   mux_sha256=$(sha256sum -- "$mux_path" | cut -d ' ' -f 1) || return 1
+  guardian_sha256=$(sha256sum -- "$guardian_path" | cut -d ' ' -f 1) || return 1
   test "${{#ft_sha256}}" = 64 || return 1
   test "${{#mux_sha256}}" = 64 || return 1
+  test "${{#guardian_sha256}}" = 64 || return 1
   case "$ft_sha256" in *[!0-9a-f]*) return 1 ;; esac
   case "$mux_sha256" in *[!0-9a-f]*) return 1 ;; esac
-  printf 'FT_RELEASE_COMPONENT_RECEIPT_V1={tag}:ft:%s:%s:mux:%s:%s\n' \
-    "$ft_bytes" "$ft_sha256" "$mux_bytes" "$mux_sha256"
+  case "$guardian_sha256" in *[!0-9a-f]*) return 1 ;; esac
+  printf 'FT_RELEASE_COMPONENT_RECEIPT_V2={tag}:ft:%s:%s:mux:%s:%s:guardian:%s:%s\n' \
+    "$ft_bytes" "$ft_sha256" "$mux_bytes" "$mux_sha256" \
+    "$guardian_bytes" "$guardian_sha256"
 }}
 destination_existed=0
 if test -e "$destination" || test -L "$destination"; then
@@ -82499,7 +82511,7 @@ fn parse_remote_release_component_receipt(
     expected_tag: &str,
 ) -> anyhow::Result<ProcessFamilyByteReceipt> {
     let expected_tag = validate_remote_release_tag(expected_tag)?;
-    const PREFIX: &str = "FT_RELEASE_COMPONENT_RECEIPT_V1=";
+    const PREFIX: &str = "FT_RELEASE_COMPONENT_RECEIPT_V2=";
     anyhow::ensure!(
         stdout.ends_with('\n') && !stdout.contains('\r'),
         "verified release component receipt output must use an exact final LF terminator"
@@ -82524,10 +82536,14 @@ fn parse_remote_release_component_receipt(
     let mux_role = fields.next();
     let mux_bytes = fields.next();
     let mux_sha256 = fields.next();
+    let guardian_role = fields.next();
+    let guardian_bytes = fields.next();
+    let guardian_sha256 = fields.next();
     anyhow::ensure!(
         tag == Some(expected_tag)
             && ft_role == Some("ft")
             && mux_role == Some("mux")
+            && guardian_role == Some("guardian")
             && fields.next().is_none(),
         "verified release installer returned a malformed or wrong-tag component receipt"
     );
@@ -82563,6 +82579,11 @@ fn parse_remote_release_component_receipt(
             mux_bytes.context("mux component receipt is missing its byte length")?,
             mux_sha256.context("mux component receipt is missing its SHA-256 digest")?,
         )?,
+        guardian: parse_component(
+            "guardian",
+            guardian_bytes.context("guardian component receipt is missing its byte length")?,
+            guardian_sha256.context("guardian component receipt is missing its SHA-256 digest")?,
+        )?,
     })
 }
 
@@ -82575,7 +82596,10 @@ fn copy_remote_component(
     expected: &LocalComponentSnapshot,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        matches!(remote_name, "ft" | "frankenterm-mux-server"),
+        matches!(
+            remote_name,
+            "ft" | "frankenterm-mux-server" | "frankenterm-pty-guardian"
+        ),
         "unsupported remote process-family component name"
     );
     anyhow::ensure!(
@@ -82759,6 +82783,7 @@ printf 'FT_REMOTE_COMPONENT_VERIFIED={remote_name}:%s:%s\n' "$actual_bytes" "$ac
 fn remote_generation_publication_command(
     ft_source: &str,
     mux_source: &str,
+    guardian_source: &str,
     suffix: &str,
     process_family: &ProcessFamilyByteReceipt,
 ) -> anyhow::Result<String> {
@@ -82771,7 +82796,9 @@ fn remote_generation_publication_command(
         "component staging suffix must be 32 lowercase hex characters"
     );
     anyhow::ensure!(
-        [ft_source, mux_source].into_iter().all(|path| {
+        [ft_source, mux_source, guardian_source]
+            .into_iter()
+            .all(|path| {
             path.starts_with("$HOME/")
                 && !path.contains("..")
                 && path.bytes().all(|byte| {
@@ -82813,41 +82840,57 @@ verify_same_inode() {{
 }}
 ft_source="{ft_source}"
 mux_source="{mux_source}"
+guardian_source="{guardian_source}"
 root="$HOME/.local/share/frankenterm/process-family"
 verify_source "$ft_source" "{ft_bytes}" "{ft_sha256}"
 verify_source "$mux_source" "{mux_bytes}" "{mux_sha256}"
+verify_source "$guardian_source" "{guardian_bytes}" "{guardian_sha256}"
 exec 8<"$ft_source"
 exec 9<"$mux_source"
+exec 10<"$guardian_source"
 ft_descriptor=/proc/self/fd/8
 mux_descriptor=/proc/self/fd/9
+guardian_descriptor=/proc/self/fd/10
 verify_descriptor "$ft_descriptor" "{ft_bytes}" "{ft_sha256}"
 verify_descriptor "$mux_descriptor" "{mux_bytes}" "{mux_sha256}"
+verify_descriptor "$guardian_descriptor" "{guardian_bytes}" "{guardian_sha256}"
 verify_source "$ft_source" "{ft_bytes}" "{ft_sha256}"
 verify_source "$mux_source" "{mux_bytes}" "{mux_sha256}"
+verify_source "$guardian_source" "{guardian_bytes}" "{guardian_sha256}"
 verify_same_inode "$ft_descriptor" "$ft_source"
 verify_same_inode "$mux_descriptor" "$mux_source"
-chmod 0500 -- "$ft_descriptor" "$mux_descriptor"
+verify_same_inode "$guardian_descriptor" "$guardian_source"
+chmod 0500 -- "$ft_descriptor" "$mux_descriptor" "$guardian_descriptor"
 test "$(stat -Lc %a -- "$ft_descriptor")" = 500
 test "$(stat -Lc %a -- "$mux_descriptor")" = 500
+test "$(stat -Lc %a -- "$guardian_descriptor")" = 500
 verify_descriptor "$ft_descriptor" "{ft_bytes}" "{ft_sha256}"
 verify_descriptor "$mux_descriptor" "{mux_bytes}" "{mux_sha256}"
+verify_descriptor "$guardian_descriptor" "{guardian_bytes}" "{guardian_sha256}"
 verify_source "$ft_source" "{ft_bytes}" "{ft_sha256}"
 verify_source "$mux_source" "{mux_bytes}" "{mux_sha256}"
+verify_source "$guardian_source" "{guardian_bytes}" "{guardian_sha256}"
 verify_same_inode "$ft_descriptor" "$ft_source"
 verify_same_inode "$mux_descriptor" "$mux_source"
+verify_same_inode "$guardian_descriptor" "$guardian_source"
 exec "$ft_descriptor" setup __publish-remote-generation \
   --root "$root" \
   --ft-source "$ft_source" \
   --mux-server-source "$mux_source" \
+  --guardian-source "$guardian_source" \
   --expected-ft-sha256 "{ft_sha256}" \
   --expected-ft-bytes "{ft_bytes}" \
   --expected-mux-sha256 "{mux_sha256}" \
   --expected-mux-bytes "{mux_bytes}" \
+  --expected-guardian-sha256 "{guardian_sha256}" \
+  --expected-guardian-bytes "{guardian_bytes}" \
   --transaction-id "{suffix}""#,
         ft_bytes = process_family.ft.byte_len,
         ft_sha256 = process_family.ft.sha256,
         mux_bytes = process_family.mux_server.byte_len,
         mux_sha256 = process_family.mux_server.sha256,
+        guardian_bytes = process_family.guardian.byte_len,
+        guardian_sha256 = process_family.guardian.sha256,
     ))
 }
 
@@ -82858,6 +82901,7 @@ fn uploaded_process_family_generation_command(
     remote_generation_publication_command(
         &format!("$HOME/.local/bin/ft.installing-{suffix}"),
         &format!("$HOME/.local/bin/frankenterm-mux-server.installing-{suffix}"),
+        &format!("$HOME/.local/bin/frankenterm-pty-guardian.installing-{suffix}"),
         suffix,
         process_family,
     )
@@ -82872,6 +82916,7 @@ fn remote_release_generation_publication_command(
     remote_generation_publication_command(
         &format!("$HOME/.cache/frankenterm/releases/{tag}-{suffix}/ft"),
         &format!("$HOME/.cache/frankenterm/releases/{tag}-{suffix}/frankenterm-mux-server"),
+        &format!("$HOME/.cache/frankenterm/releases/{tag}-{suffix}/frankenterm-pty-guardian"),
         suffix,
         process_family,
     )
@@ -82880,7 +82925,7 @@ fn remote_release_generation_publication_command(
 fn parse_remote_generation_publication_receipt(
     stdout: &str,
 ) -> anyhow::Result<RemoteGenerationPublicationReceipt> {
-    const PREFIX: &str = "FT_REMOTE_GENERATION_PUBLICATION_V1=";
+    const PREFIX: &str = "FT_REMOTE_GENERATION_PUBLICATION_V2=";
     anyhow::ensure!(
         stdout.ends_with('\n')
             && !stdout.contains('\r')

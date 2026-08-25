@@ -1850,6 +1850,35 @@ mod tests {
     }
 
     #[test]
+    fn guardian_identity_and_length_are_bound_into_claim_hash_and_transaction_authority() {
+        let (_fixture, root, effective_uid) = root_fixture();
+        let baseline = claim('a');
+        let baseline_bytes = baseline.canonical_bytes().expect("serialize baseline claim");
+        let baseline_hash = domain_hash(CLAIM_HASH_DOMAIN, &baseline_bytes);
+        RemoteUpgradeLedger::open(&root, effective_uid, baseline)
+            .expect("persist baseline triplet claim");
+
+        let mut digest_mutation = claim('a');
+        digest_mutation.guardian_sha256 = "e".repeat(64);
+        let mut length_mutation = claim('a');
+        length_mutation.guardian_bytes += 1;
+        for mutation in [digest_mutation, length_mutation] {
+            let mutation_bytes = mutation
+                .canonical_bytes()
+                .expect("serialize guardian-mutated claim");
+            assert_ne!(mutation_bytes, baseline_bytes);
+            assert_ne!(
+                domain_hash(CLAIM_HASH_DOMAIN, &mutation_bytes),
+                baseline_hash
+            );
+            let conflict = RemoteUpgradeLedger::open(&root, effective_uid, mutation)
+                .err()
+                .expect("same transaction must reject guardian mutation");
+            assert!(conflict.to_string().contains("claimed by a different payload"));
+        }
+    }
+
+    #[test]
     fn ordinary_effect_permits_consume_only_against_exact_latest_authority() {
         let (_fixture, root, effective_uid) = root_fixture();
         let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
