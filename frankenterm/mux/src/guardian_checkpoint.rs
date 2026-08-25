@@ -671,7 +671,8 @@ pub struct GuardianGenesisReservationIdentityV1 {
     origin_request_id: Uuid,
     spawn_payload_bytes: u64,
     spawn_payload_digest: [u8; 32],
-    process_family_build_identity_digest: [u8; 32],
+    spawning_mux_build_identity_digest: [u8; 32],
+    live_guardian_build_identity_digest: [u8; 32],
     rows: u16,
     cols: u16,
     pixel_width: u16,
@@ -684,6 +685,10 @@ pub struct GuardianGenesisReservationIdentityV1 {
 impl GuardianGenesisReservationIdentityV1 {
     /// Validate the complete content-free identity extracted from one already
     /// authenticated canonical Spawn request and its reserved Genesis upload.
+    /// The issuer must source the spawning-mux build identity from the
+    /// authenticated connection or successor-handoff authority and the live
+    /// guardian build identity from the running guardian itself. Neither build
+    /// identity may be accepted from the Spawn payload.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_authenticated_spawn(
         mux_incarnation: Uuid,
@@ -692,7 +697,8 @@ impl GuardianGenesisReservationIdentityV1 {
         origin_request_id: Uuid,
         spawn_payload_bytes: u64,
         spawn_payload_digest: [u8; 32],
-        process_family_build_identity_digest: [u8; 32],
+        spawning_mux_build_identity_digest: [u8; 32],
+        live_guardian_build_identity_digest: [u8; 32],
         rows: u16,
         cols: u16,
         pixel_width: u16,
@@ -708,7 +714,8 @@ impl GuardianGenesisReservationIdentityV1 {
             origin_request_id,
             spawn_payload_bytes,
             spawn_payload_digest,
-            process_family_build_identity_digest,
+            spawning_mux_build_identity_digest,
+            live_guardian_build_identity_digest,
             rows,
             cols,
             pixel_width,
@@ -740,9 +747,12 @@ impl GuardianGenesisReservationIdentityV1 {
         if self.spawn_payload_digest == [0; 32] {
             return Err(GuardianCheckpointBoundaryError::ZeroGenesisSpawnPayloadDigest);
         }
-        if self.process_family_build_identity_digest == [0; 32] {
+        if self.spawning_mux_build_identity_digest == [0; 32] {
+            return Err(GuardianCheckpointBoundaryError::ZeroGenesisSpawningMuxBuildIdentityDigest);
+        }
+        if self.live_guardian_build_identity_digest == [0; 32] {
             return Err(
-                GuardianCheckpointBoundaryError::ZeroGenesisProcessFamilyBuildIdentityDigest,
+                GuardianCheckpointBoundaryError::ZeroGenesisLiveGuardianBuildIdentityDigest,
             );
         }
         if self.rows == 0 || self.cols == 0 {
@@ -791,8 +801,13 @@ impl GuardianGenesisReservationIdentityV1 {
     }
 
     #[must_use]
-    pub const fn process_family_build_identity_digest(&self) -> [u8; 32] {
-        self.process_family_build_identity_digest
+    pub const fn spawning_mux_build_identity_digest(&self) -> [u8; 32] {
+        self.spawning_mux_build_identity_digest
+    }
+
+    #[must_use]
+    pub const fn live_guardian_build_identity_digest(&self) -> [u8; 32] {
+        self.live_guardian_build_identity_digest
     }
 
     #[must_use]
@@ -839,8 +854,10 @@ impl PartialEq for GuardianGenesisReservationIdentityV1 {
             && self.origin_request_id == other.origin_request_id
             && self.spawn_payload_bytes == other.spawn_payload_bytes
             && self.spawn_payload_digest == other.spawn_payload_digest
-            && self.process_family_build_identity_digest
-                == other.process_family_build_identity_digest
+            && self.spawning_mux_build_identity_digest
+                == other.spawning_mux_build_identity_digest
+            && self.live_guardian_build_identity_digest
+                == other.live_guardian_build_identity_digest
             && self.rows == other.rows
             && self.cols == other.cols
             && self.pixel_width == other.pixel_width
@@ -863,7 +880,8 @@ impl std::fmt::Debug for GuardianGenesisReservationIdentityV1 {
             .field("origin_request_id", &self.origin_request_id)
             .field("spawn_payload_bytes", &self.spawn_payload_bytes)
             .field("spawn_payload_digest", &"[REDACTED]")
-            .field("process_family_build_identity_digest", &"[REDACTED]")
+            .field("spawning_mux_build_identity_digest", &"[REDACTED]")
+            .field("live_guardian_build_identity_digest", &"[REDACTED]")
             .field("rows", &self.rows)
             .field("cols", &self.cols)
             .field("pixel_width", &self.pixel_width)

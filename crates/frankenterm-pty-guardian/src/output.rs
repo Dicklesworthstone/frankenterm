@@ -104,7 +104,7 @@ const CHECKPOINT_CATALOG_MARKER_SUFFIX: &str = ".ftgccommit";
 const CHECKPOINT_CATALOG_CANDIDATE_MAGIC: [u8; 8] = *b"FTGCC002";
 const CHECKPOINT_CATALOG_MARKER_MAGIC: [u8; 8] = *b"FTGCM002";
 const CHECKPOINT_CATALOG_VERSION: u32 = 2;
-const CHECKPOINT_CATALOG_HEADER_BYTES: usize = 536;
+const CHECKPOINT_CATALOG_HEADER_BYTES: usize = 568;
 const CHECKPOINT_CATALOG_MARKER_BODY_BYTES: usize = 312;
 const CHECKPOINT_CATALOG_MARKER_BYTES: usize =
     CHECKPOINT_CATALOG_MARKER_BODY_BYTES + OUTPUT_MANIFEST_CHECKSUM_BYTES;
@@ -543,7 +543,8 @@ struct CheckpointCatalogMetadata {
     genesis_origin_request_id: Uuid,
     genesis_spawn_payload_bytes: u64,
     genesis_spawn_payload_digest: [u8; 32],
-    genesis_process_family_build_identity_digest: [u8; 32],
+    genesis_spawning_mux_build_identity_digest: [u8; 32],
+    genesis_live_guardian_build_identity_digest: [u8; 32],
     genesis_pixel_width: u16,
     genesis_pixel_height: u16,
 }
@@ -593,7 +594,8 @@ struct CheckpointCatalogGenesisReservationBinding {
     origin_request_id: Uuid,
     spawn_payload_bytes: u64,
     spawn_payload_digest: [u8; 32],
-    process_family_build_identity_digest: [u8; 32],
+    spawning_mux_build_identity_digest: [u8; 32],
+    live_guardian_build_identity_digest: [u8; 32],
     rows: u16,
     cols: u16,
     pixel_width: u16,
@@ -6039,7 +6041,8 @@ impl From<&GuardianGenesisReservationIdentityV1> for CheckpointCatalogGenesisRes
             origin_request_id: identity.origin_request_id(),
             spawn_payload_bytes: identity.spawn_payload_bytes(),
             spawn_payload_digest: identity.spawn_payload_digest(),
-            process_family_build_identity_digest: identity.process_family_build_identity_digest(),
+            spawning_mux_build_identity_digest: identity.spawning_mux_build_identity_digest(),
+            live_guardian_build_identity_digest: identity.live_guardian_build_identity_digest(),
             rows: identity.rows(),
             cols: identity.cols(),
             pixel_width: identity.pixel_width(),
@@ -6062,7 +6065,8 @@ fn checkpoint_catalog_genesis_candidate_id(
     hasher.update(reservation.origin_request_id.as_bytes());
     hasher.update(reservation.spawn_payload_bytes.to_le_bytes());
     hasher.update(reservation.spawn_payload_digest);
-    hasher.update(reservation.process_family_build_identity_digest);
+    hasher.update(reservation.spawning_mux_build_identity_digest);
+    hasher.update(reservation.live_guardian_build_identity_digest);
     hasher.update(reservation.rows.to_le_bytes());
     hasher.update(reservation.cols.to_le_bytes());
     hasher.update(reservation.pixel_width.to_le_bytes());
@@ -6104,8 +6108,10 @@ fn checkpoint_catalog_genesis_metadata_matches_reservation(
         && metadata.genesis_origin_request_id == reservation.origin_request_id
         && metadata.genesis_spawn_payload_bytes == reservation.spawn_payload_bytes
         && metadata.genesis_spawn_payload_digest == reservation.spawn_payload_digest
-        && metadata.genesis_process_family_build_identity_digest
-            == reservation.process_family_build_identity_digest
+        && metadata.genesis_spawning_mux_build_identity_digest
+            == reservation.spawning_mux_build_identity_digest
+        && metadata.genesis_live_guardian_build_identity_digest
+            == reservation.live_guardian_build_identity_digest
         && metadata.genesis_pixel_width == reservation.pixel_width
         && metadata.genesis_pixel_height == reservation.pixel_height
 }
@@ -6147,7 +6153,8 @@ fn checkpoint_catalog_validate_metadata(
                 && metadata.genesis_origin_request_id.is_nil()
                 && metadata.genesis_spawn_payload_bytes == 0
                 && metadata.genesis_spawn_payload_digest == [0; 32]
-                && metadata.genesis_process_family_build_identity_digest == [0; 32]
+                && metadata.genesis_spawning_mux_build_identity_digest == [0; 32]
+                && metadata.genesis_live_guardian_build_identity_digest == [0; 32]
                 && metadata.genesis_pixel_width == 0
                 && metadata.genesis_pixel_height == 0
         }
@@ -6161,7 +6168,8 @@ fn checkpoint_catalog_validate_metadata(
                 && !metadata.genesis_origin_request_id.is_nil()
                 && metadata.genesis_spawn_payload_bytes > 0
                 && metadata.genesis_spawn_payload_digest != [0; 32]
-                && metadata.genesis_process_family_build_identity_digest != [0; 32]
+                && metadata.genesis_spawning_mux_build_identity_digest != [0; 32]
+                && metadata.genesis_live_guardian_build_identity_digest != [0; 32]
                 && u16::try_from(metadata.rows).is_ok()
                 && u16::try_from(metadata.cols).is_ok()
         }
@@ -6263,7 +6271,8 @@ fn checkpoint_catalog_encode_candidate(
     encoded.extend_from_slice(metadata.genesis_origin_request_id.as_bytes());
     encoded.extend_from_slice(&metadata.genesis_spawn_payload_bytes.to_le_bytes());
     encoded.extend_from_slice(&metadata.genesis_spawn_payload_digest);
-    encoded.extend_from_slice(&metadata.genesis_process_family_build_identity_digest);
+    encoded.extend_from_slice(&metadata.genesis_spawning_mux_build_identity_digest);
+    encoded.extend_from_slice(&metadata.genesis_live_guardian_build_identity_digest);
     encoded.extend_from_slice(&metadata.genesis_pixel_width.to_le_bytes());
     encoded.extend_from_slice(&metadata.genesis_pixel_height.to_le_bytes());
     if let Some(predecessor) = metadata.predecessor {
@@ -6351,7 +6360,8 @@ fn checkpoint_catalog_decode_candidate(
     let genesis_origin_request_id = decoder.uuid()?;
     let genesis_spawn_payload_bytes = decoder.u64()?;
     let genesis_spawn_payload_digest = decoder.take::<32>()?;
-    let genesis_process_family_build_identity_digest = decoder.take::<32>()?;
+    let genesis_spawning_mux_build_identity_digest = decoder.take::<32>()?;
+    let genesis_live_guardian_build_identity_digest = decoder.take::<32>()?;
     let genesis_pixel_width = u16::from_le_bytes(decoder.take::<2>()?);
     let genesis_pixel_height = u16::from_le_bytes(decoder.take::<2>()?);
     let predecessor_generation = decoder.u64()?;
@@ -6408,7 +6418,8 @@ fn checkpoint_catalog_decode_candidate(
         genesis_origin_request_id,
         genesis_spawn_payload_bytes,
         genesis_spawn_payload_digest,
-        genesis_process_family_build_identity_digest,
+        genesis_spawning_mux_build_identity_digest,
+        genesis_live_guardian_build_identity_digest,
         genesis_pixel_width,
         genesis_pixel_height,
     };
@@ -7171,7 +7182,8 @@ fn checkpoint_catalog_candidate_from_sealed_stage(
             genesis_origin_request_id: Uuid::nil(),
             genesis_spawn_payload_bytes: 0,
             genesis_spawn_payload_digest: [0; 32],
-            genesis_process_family_build_identity_digest: [0; 32],
+            genesis_spawning_mux_build_identity_digest: [0; 32],
+            genesis_live_guardian_build_identity_digest: [0; 32],
             genesis_pixel_width: 0,
             genesis_pixel_height: 0,
         },
@@ -7191,7 +7203,8 @@ fn checkpoint_catalog_validate_genesis_reservation(
         || reservation.origin_request_id.is_nil()
         || reservation.spawn_payload_bytes == 0
         || reservation.spawn_payload_digest == [0; 32]
-        || reservation.process_family_build_identity_digest == [0; 32]
+        || reservation.spawning_mux_build_identity_digest == [0; 32]
+        || reservation.live_guardian_build_identity_digest == [0; 32]
         || reservation.rows == 0
         || reservation.cols == 0
         || reservation.checkpoint_identity_digest == [0; 32]
@@ -7263,8 +7276,10 @@ fn checkpoint_catalog_candidate_from_genesis_stage(
             genesis_origin_request_id: reservation.origin_request_id,
             genesis_spawn_payload_bytes: reservation.spawn_payload_bytes,
             genesis_spawn_payload_digest: reservation.spawn_payload_digest,
-            genesis_process_family_build_identity_digest: reservation
-                .process_family_build_identity_digest,
+            genesis_spawning_mux_build_identity_digest: reservation
+                .spawning_mux_build_identity_digest,
+            genesis_live_guardian_build_identity_digest: reservation
+                .live_guardian_build_identity_digest,
             genesis_pixel_width: reservation.pixel_width,
             genesis_pixel_height: reservation.pixel_height,
         },
@@ -8359,6 +8374,213 @@ mod tests {
                 "byte {index}"
             );
         }
+    }
+
+    #[test]
+    fn checkpoint_catalog_genesis_marker_rejects_nonzero_sequence_and_wrong_spawn() {
+        let spawn_effect_id = Uuid::from_u128(0xe301);
+        let identity = CheckpointCatalogIdentity {
+            scope: CheckpointCatalogScope::Genesis { spawn_effect_id },
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xe302),
+        };
+        let marker = checkpoint_catalog_test_marker(identity);
+        let encoded = checkpoint_catalog_encode_marker(&marker);
+        assert_eq!(
+            checkpoint_catalog_decode_marker(&encoded).expect("canonical Genesis marker"),
+            marker
+        );
+
+        let mut nonzero_sequence = marker;
+        nonzero_sequence.adoption_sequence = 1;
+        assert!(
+            checkpoint_catalog_decode_marker(&checkpoint_catalog_encode_marker(
+                &nonzero_sequence
+            ))
+            .is_err()
+        );
+        let mut wrong_spawn = marker;
+        wrong_spawn.adoption_effect_id = Uuid::from_u128(0xe303);
+        assert!(
+            checkpoint_catalog_decode_marker(&checkpoint_catalog_encode_marker(&wrong_spawn))
+                .is_err()
+        );
+        let mut second_generation = marker;
+        second_generation.identity.generation = 2;
+        assert!(
+            checkpoint_catalog_decode_marker(&checkpoint_catalog_encode_marker(
+                &second_generation
+            ))
+            .is_err()
+        );
+    }
+
+    fn checkpoint_catalog_test_unpublished_candidate(
+        identity: CheckpointCatalogIdentity,
+        path: PathBuf,
+        inode: u64,
+    ) -> DiscoveredCheckpointCatalogCandidate {
+        DiscoveredCheckpointCatalogCandidate {
+            identity,
+            path,
+            file_identity: FileIdentity {
+                device: 1,
+                inode,
+                mode: 0o100600,
+                owner: geteuid().as_raw(),
+                links: 1,
+                expected_len: Some(100),
+            },
+            bytes: 100,
+            published: false,
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_genesis_candidate_retry_reuses_one_identity_and_adds_only_marker() {
+        let reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        let identity = CheckpointCatalogIdentity {
+            scope: CheckpointCatalogScope::Genesis {
+                spawn_effect_id: reservation.spawn_effect_id,
+            },
+            generation: 1,
+            candidate_id: checkpoint_catalog_genesis_candidate_id(reservation),
+        };
+        let candidate_path = PathBuf::from("deterministic-genesis-candidate");
+        let empty = CheckpointCatalogScan {
+            published: Vec::new(),
+            unpublished_candidates: Vec::new(),
+            relevant_files: 0,
+            relevant_bytes: 0,
+        };
+        let create = checkpoint_catalog_genesis_candidate_plan(&empty, identity, &candidate_path)
+            .expect("empty scope creates its deterministic candidate");
+        assert!(matches!(
+            create,
+            CheckpointCatalogGenesisCandidatePlan::Create
+        ));
+        assert_eq!(
+            checkpoint_catalog_genesis_added_resources(&create, 1_000, 344)
+                .expect("fresh resource delta"),
+            (2, 1_344)
+        );
+
+        let retry = CheckpointCatalogScan {
+            published: Vec::new(),
+            unpublished_candidates: vec![checkpoint_catalog_test_unpublished_candidate(
+                identity,
+                candidate_path.clone(),
+                7,
+            )],
+            relevant_files: 1,
+            relevant_bytes: 1_000,
+        };
+        let reuse = checkpoint_catalog_genesis_candidate_plan(&retry, identity, &candidate_path)
+            .expect("exact candidate-only retry is reusable");
+        assert!(matches!(
+            reuse,
+            CheckpointCatalogGenesisCandidatePlan::Reuse(_)
+        ));
+        assert_eq!(
+            checkpoint_catalog_genesis_added_resources(&reuse, 1_000, 344)
+                .expect("candidate-only resource delta"),
+            (1, 344),
+            "a candidate-only retry may add only the missing marker"
+        );
+        checkpoint_catalog_require_exact_genesis_candidate_bytes(b"exact", b"exact")
+            .expect("exact immutable candidate bytes");
+        assert!(
+            checkpoint_catalog_require_exact_genesis_candidate_bytes(b"corrupt", b"exact")
+                .is_err(),
+            "candidate corruption must fail closed before marker creation"
+        );
+
+        let wrong_identity = CheckpointCatalogIdentity {
+            candidate_id: Uuid::from_u128(0xe401),
+            ..identity
+        };
+        let fork = CheckpointCatalogScan {
+            published: Vec::new(),
+            unpublished_candidates: vec![checkpoint_catalog_test_unpublished_candidate(
+                wrong_identity,
+                PathBuf::from("fork-candidate"),
+                8,
+            )],
+            relevant_files: 1,
+            relevant_bytes: 100,
+        };
+        assert!(
+            checkpoint_catalog_genesis_candidate_plan(&fork, identity, &candidate_path).is_err(),
+            "a reservation scope cannot allocate around a candidate fork"
+        );
+        let duplicate = CheckpointCatalogScan {
+            published: Vec::new(),
+            unpublished_candidates: vec![
+                checkpoint_catalog_test_unpublished_candidate(
+                    identity,
+                    candidate_path.clone(),
+                    9,
+                ),
+                checkpoint_catalog_test_unpublished_candidate(
+                    wrong_identity,
+                    PathBuf::from("second-candidate"),
+                    10,
+                ),
+            ],
+            relevant_files: 2,
+            relevant_bytes: 200,
+        };
+        assert!(
+            checkpoint_catalog_genesis_candidate_plan(&duplicate, identity, &candidate_path)
+                .is_err(),
+            "multiple candidate-only files are a poisoned fork, not a retry surface"
+        );
+    }
+
+    #[test]
+    fn checkpoint_catalog_genesis_scope_cannot_publish_a_second_member() {
+        let reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        let metadata = checkpoint_catalog_test_genesis_metadata(reservation);
+        let file_identity = FileIdentity {
+            device: 1,
+            inode: 1,
+            mode: 0o100600,
+            owner: geteuid().as_raw(),
+            links: 1,
+            expected_len: Some(1),
+        };
+        let first = PublishedCheckpointCatalogMember {
+            metadata,
+            candidate_checksum: [0x71; 32],
+            candidate_path: PathBuf::from("genesis-candidate-one"),
+            candidate_file_identity: file_identity,
+            marker_path: PathBuf::from("genesis-marker-one"),
+            marker_file_identity: file_identity,
+        };
+        let mut second = first.clone();
+        second.metadata.identity.candidate_id = Uuid::from_u128(0xe501);
+        second.metadata.checkpoint_id = [0x72; 32];
+        second.metadata.boundary_id = [0x73; 32];
+        second.candidate_checksum = [0x74; 32];
+        second.candidate_path = PathBuf::from("genesis-candidate-two");
+        second.marker_path = PathBuf::from("genesis-marker-two");
+        assert!(checkpoint_catalog_validate_metadata(&second.metadata).is_ok());
+        assert!(
+            checkpoint_catalog_validate_chain(&mut vec![first, second]).is_err(),
+            "one retained Spawn effect cannot gain a second published Genesis member"
+        );
+    }
+
+    #[test]
+    fn published_genesis_admission_permit_is_not_cloneable() {
+        trait AmbiguousIfClone<Marker> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        struct ImplementsClone;
+        impl<T: ?Sized + Clone> AmbiguousIfClone<ImplementsClone> for T {}
+
+        let _ = <GuardianPublishedGenesisAdmissionPermitV1 as AmbiguousIfClone<_>>::probe;
     }
 
     fn checkpoint_catalog_test_member(
