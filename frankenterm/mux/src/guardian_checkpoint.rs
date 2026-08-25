@@ -6195,6 +6195,11 @@ mod tests {
         let ground = parser
             .recovery_ground_boundary()
             .expect("record-backed parser fixture is at recovery ground");
+        assert_eq!(
+            ground.stream_bytes(),
+            19,
+            "record-backed parser fixture carries the exact raw byte watermark"
+        );
         terminal
             .capture_recovery_checkpoint_at_external_parser_ground(
                 ground,
