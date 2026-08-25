@@ -4676,7 +4676,7 @@ mod tests {
         };
 
         let mut saved_widths = HashMap::new();
-        for entry in ordered_entries.into_iter().rev() {
+        for entry in ordered_entries.iter().rev() {
             saved_widths.insert(entry.0, entry.1);
         }
         let saved_widths = Arc::new(saved_widths);

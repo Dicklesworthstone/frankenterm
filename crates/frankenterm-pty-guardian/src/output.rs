@@ -4867,10 +4867,18 @@ fn open_output_directory(
         .metadata()
         .map_err(|error| GuardianOutputError::io("output-parent-opened-metadata", error))?;
     validate_private_directory_metadata(&parent_opened)?;
-    require_same_identity(&parent_before, &parent_opened, None)?;
+    require_same_directory_identity(
+        &parent_before,
+        &parent_opened,
+        "guardian output parent identity changed while opening its descriptor",
+    )?;
     let parent_after_open = std::fs::symlink_metadata(parent)
         .map_err(|error| GuardianOutputError::io("output-parent-metadata-after-open", error))?;
-    require_same_identity(&parent_opened, &parent_after_open, None)?;
+    require_same_directory_identity(
+        &parent_opened,
+        &parent_after_open,
+        "guardian output parent identity changed after opening its descriptor",
+    )?;
 
     let directory_path = parent.join(OUTPUT_DIRECTORY_NAME);
     match create_private_directory_at(&parent_directory, OsStr::new(OUTPUT_DIRECTORY_NAME)) {
@@ -4896,17 +4904,29 @@ fn open_output_directory(
         .metadata()
         .map_err(|error| GuardianOutputError::io("output-directory-reopened-metadata", error))?;
     validate_private_directory_metadata(&rebound_metadata)?;
-    require_same_identity(&opened_directory, &rebound_metadata, None)?;
+    require_same_directory_identity(
+        &opened_directory,
+        &rebound_metadata,
+        "guardian output directory identity changed while rebinding its descriptor",
+    )?;
     let parent_after = std::fs::symlink_metadata(parent)
         .map_err(|error| GuardianOutputError::io("output-parent-metadata-after", error))?;
-    require_same_identity(&parent_opened, &parent_after, None)?;
+    require_same_directory_identity(
+        &parent_opened,
+        &parent_after,
+        "guardian output parent identity changed while opening its child directory",
+    )?;
     let path_directory = std::fs::symlink_metadata(&directory_path)
         .map_err(|error| GuardianOutputError::io("output-directory-path-metadata", error))?;
-    require_same_identity(&opened_directory, &path_directory, None)?;
+    require_same_directory_identity(
+        &opened_directory,
+        &path_directory,
+        "guardian output directory path no longer names its opened descriptor",
+    )?;
     Ok((
         directory,
         directory_path,
-        FileIdentity::capture(&parent_opened, None),
+        FileIdentity::capture(&parent_after, None),
         FileIdentity::capture(&opened_directory, None),
     ))
 }
@@ -4964,7 +4984,12 @@ fn load_or_create_output_key(
     let opened_after = file
         .metadata()
         .map_err(|error| GuardianOutputError::io("output-key-final-metadata", error))?;
-    require_same_identity(&opened, &opened_after, Some(expected_len))?;
+    require_same_identity(
+        &opened,
+        &opened_after,
+        Some(expected_len),
+        "guardian output key identity changed while opening its contents",
+    )?;
     validate_file_identity_at(
         directory,
         directory_path,
@@ -4991,7 +5016,11 @@ fn validate_output_key_directory_authority(
     let named = std::fs::symlink_metadata(directory_path)
         .map_err(|error| GuardianOutputError::io("output-key-directory-path-metadata", error))?;
     validate_private_directory_metadata(&named)?;
-    require_same_identity(&opened, &named, None)
+    require_same_directory_identity(
+        &opened,
+        &named,
+        "guardian output key directory path no longer names its opened descriptor",
+    )
 }
 
 fn ensure_absent_output_key_has_no_abandoned_ciphertext(
@@ -5006,7 +5035,11 @@ fn ensure_absent_output_key_has_no_abandoned_ciphertext(
     validate_private_directory_metadata(&opened_before)?;
     let named_before = std::fs::symlink_metadata(directory_path)
         .map_err(|error| GuardianOutputError::io("output-key-census-path", error))?;
-    require_same_identity(&opened_before, &named_before, None)?;
+    require_same_directory_identity(
+        &opened_before,
+        &named_before,
+        "guardian output key census began with a replaced directory path",
+    )?;
 
     let stage_name = format!("{OUTPUT_KEY_NAME}.provisioning");
     let readiness_name = format!("{stage_name}.ready");
@@ -5025,8 +5058,16 @@ fn ensure_absent_output_key_has_no_abandoned_ciphertext(
         .map_err(|error| GuardianOutputError::io("output-key-census-directory-after", error))?;
     let named_after = std::fs::symlink_metadata(directory_path)
         .map_err(|error| GuardianOutputError::io("output-key-census-path-after", error))?;
-    require_same_identity(&opened_before, &opened_after, None)?;
-    require_same_identity(&opened_after, &named_after, None)?;
+    require_same_directory_identity(
+        &opened_before,
+        &opened_after,
+        "guardian output key census changed the opened directory identity",
+    )?;
+    require_same_directory_identity(
+        &opened_after,
+        &named_after,
+        "guardian output key census ended with a replaced directory path",
+    )?;
     if !found_non_provisioning_entry {
         return Ok(());
     }
@@ -5289,11 +5330,26 @@ fn require_same_identity(
     left: &Metadata,
     right: &Metadata,
     expected_len: Option<u64>,
+    site: &'static str,
 ) -> Result<(), GuardianOutputError> {
     if !FileIdentity::capture(left, expected_len).matches(right) {
-        return Err(GuardianOutputError::FilesystemAuthority(
-            "guardian output filesystem identity changed during open",
-        ));
+        return Err(GuardianOutputError::FilesystemAuthority(site));
+    }
+    Ok(())
+}
+
+fn require_same_directory_identity(
+    left: &Metadata,
+    right: &Metadata,
+    site: &'static str,
+) -> Result<(), GuardianOutputError> {
+    let identity = FileIdentity::capture(left, None);
+    if identity.device != right.dev()
+        || identity.inode != right.ino()
+        || identity.mode != right.mode()
+        || identity.owner != right.uid()
+    {
+        return Err(GuardianOutputError::FilesystemAuthority(site));
     }
     Ok(())
 }

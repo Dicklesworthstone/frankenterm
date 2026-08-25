@@ -21699,7 +21699,7 @@ mod test {
             error
                 .to_string()
                 .contains("reliable pane write data length exceeds maximum 16384"),
-            "unexpected bounded field error: {error:#}"
+            "unexpected bounded field error: {error}"
         );
 
         for bytes in [0, u32::try_from(MAX_RELIABLE_PANE_WRITE_DATA_BYTES + 1).unwrap()] {
