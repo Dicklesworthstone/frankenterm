@@ -1096,7 +1096,40 @@ impl std::fmt::Debug for GuardianCheckpointDurableCompletionReceiptV1 {
     }
 }
 
+impl zeroize::ZeroizeOnDrop for GuardianCheckpointDurableCompletionReceiptV1 {}
+
+impl Drop for GuardianCheckpointDurableCompletionReceiptV1 {
+    fn drop(&mut self) {
+        match &mut self.binding.scope.kind {
+            GuardianCheckpointStageScopeKindV1::Pane { generation, .. } => generation.zeroize(),
+            GuardianCheckpointStageScopeKindV1::Genesis { .. } => {}
+        }
+        match &mut self.binding.descriptor.origin.kind {
+            GuardianCheckpointOriginKindV1::Genesis { .. } => {}
+            GuardianCheckpointOriginKindV1::Record {
+                output_sequence,
+                output_record_digest,
+                output_committed_log_bytes,
+                journal_cumulative_plaintext_bytes,
+                ..
+            } => {
+                output_sequence.zeroize();
+                output_record_digest.zeroize();
+                output_committed_log_bytes.zeroize();
+                journal_cumulative_plaintext_bytes.zeroize();
+            }
+        }
+        self.binding.descriptor.parser_stream_bytes.zeroize();
+        self.binding.descriptor.replay_identity_digest.zeroize();
+        self.binding.descriptor.rows.zeroize();
+        self.binding.descriptor.cols.zeroize();
+        self.binding.descriptor.terminal_payload_bytes.zeroize();
+        self.binding.descriptor.terminal_payload_digest.zeroize();
+    }
+}
+
 static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);
+static_assertions::assert_impl_all!(GuardianCheckpointDurableCompletionReceiptV1: zeroize::ZeroizeOnDrop);
 
 impl GuardianCheckpointStageRecordKindV1 {
     fn from_wire(value: u8) -> Result<Self, GuardianCheckpointCipherError> {
@@ -7745,6 +7778,7 @@ mod tests {
         assert!(std::mem::needs_drop::<
             GuardianCheckpointDurableCompletionReceiptV1
         >());
+        assert_zeroize_on_drop::<GuardianCheckpointDurableCompletionReceiptV1>();
         assert!(!std::mem::needs_drop::<
             GuardianCheckpointStageRecordContextV1
         >());
@@ -8008,6 +8042,8 @@ mod tests {
             "GuardianCheckpointCandidateIdentityV1:Eq",
             "GuardianCheckpointCandidateIdentityV1:PartialEq",
             "GuardianCheckpointDurableCompletionReceiptV1:Debug",
+            "GuardianCheckpointDurableCompletionReceiptV1:Drop",
+            "GuardianCheckpointDurableCompletionReceiptV1:ZeroizeOnDrop",
             "GuardianCheckpointGenesisSpawnPermitV1:<inherent>",
             "GuardianCheckpointGenesisSpawnPermitV1:Debug",
             "GuardianCheckpointManifestRetryCapabilityV1:<inherent>",
@@ -8499,6 +8535,12 @@ mod tests {
         }
         expected_authority_signatures.extend([
             expected_authority_method(
+                "GuardianCheckpointDurableCompletionReceiptV1",
+                "private",
+                false,
+                "fn drop(&mut self)",
+            ),
+            expected_authority_method(
                 "GuardianCheckpointArtifactDescriptorV1",
                 "pub",
                 false,
@@ -8696,6 +8738,7 @@ mod tests {
             inventory.item_macros,
             vec![
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointDurableCompletionReceiptV1: zeroize::ZeroizeOnDrop);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);"),
                 expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);"),
