@@ -35,3 +35,14 @@ pub use transport::{
     GuardianClient, GuardianClientError, GuardianProbeReport, GuardianService,
     GuardianServiceConfig, GuardianServiceError, ProvisionTokenOutcome, provision_guardian_token,
 };
+
+/// Canonical security-sensitive scratch root for Unix tests.
+///
+/// Test authority must not depend on an inherited `TMPDIR`: remote builders
+/// may point it at a shared, group-writable build directory that production
+/// correctly rejects. Canonicalizing `/tmp` also resolves macOS's `/tmp`
+/// symlink to `/private/tmp` before descriptor-relative validation.
+#[cfg(all(test, unix))]
+fn canonical_test_temp_root() -> std::path::PathBuf {
+    std::fs::canonicalize("/tmp").expect("canonical system test temp root")
+}

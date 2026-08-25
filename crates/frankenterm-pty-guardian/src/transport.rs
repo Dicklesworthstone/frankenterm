@@ -713,7 +713,7 @@ impl GuardianService {
         chmod_socket_at(&socket_parent, socket_name)?;
         validate_pinned_private_parent(&config.socket_path, &socket_parent)?;
         let socket_identity = socket_path_identity_at(&socket_parent, socket_name)?;
-        prove_socket_path_routes_to_listener(&mut listener, &config.socket_path)?;
+        prove_socket_path_routes_to_listener(&listener, &config.socket_path)?;
         let socket_authority = SocketPathAuthority {
             parent: socket_parent,
             socket_path: config.socket_path.clone(),
@@ -855,13 +855,15 @@ impl GuardianService {
             let event = self.ready[index];
             if event.token == LISTENER_TOKEN {
                 continue;
-            } else if event.token == self.output_completion_token {
+            }
+            if event.token == self.output_completion_token {
                 // Drain worker completions only after every connection event
                 // in this readiness batch. A ready authenticated Hello must
                 // publish its lifecycle observation before deferred retirement
                 // can replay from a co-ready input completion.
                 continue;
-            } else if self.runtime.owns_pty_token(event.token) {
+            }
+            if self.runtime.owns_pty_token(event.token) {
                 if event.readable || event.closed {
                     self.runtime.handle_pty_ready(event.token);
                 }
@@ -1067,14 +1069,14 @@ impl GuardianService {
                 Ok(0) => return false,
                 Ok(count) => connection.write_offset += count,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
         }
         loop {
             match connection.stream.flush() {
                 Ok(()) => break,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
                 Err(_) => return false,
             }
@@ -1221,7 +1223,10 @@ impl GuardianService {
                         GuardianInputSubmission::CloseRetryably => FrameProcessing::Close,
                     };
                 }
-                if request.header().operation == GuardianOperation::CheckpointStage {
+                if matches!(
+                    request.header().operation,
+                    GuardianOperation::CheckpointStage | GuardianOperation::Checkpoint
+                ) {
                     let Some(route) = GuardianCheckpointRoute::new(
                         token,
                         connection.generation,
@@ -1357,7 +1362,6 @@ impl GuardianService {
         self.free_connection_tokens.push(token.0);
         if observed.is_err() {
             self.transport_failures = self.transport_failures.saturating_add(1);
-            return;
         }
     }
 
@@ -1453,7 +1457,7 @@ fn monitor_pending_worker_connection(connection: &mut Connection, event: ReadyEv
         match connection.stream.read(&mut probe[..]) {
             Ok(_) => return false,
             Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(_) => return false,
         }
     }
@@ -2098,7 +2102,7 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
             return Ok(ProvisionTokenOutcome::Existing);
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(GuardianServiceError::io("token-absence-check", error)),
+        Err(error) => return Err(nofollow_open_error("token-absence-check", error)),
     }
 
     let stage_path = token_stage_path(path)?;
@@ -2145,7 +2149,7 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             let file = open_private_file_read_at(parent_authority, active_name)
-                .map_err(|error| GuardianServiceError::io("token-raced-active-open", error))?;
+                .map_err(|error| nofollow_open_error("token-raced-active-open", error))?;
             let _ = load_guardian_secret_from_open_file_at(parent_authority, active_name, file)?;
             sync_pinned_private_parent(path, parent_authority)?;
             Ok(ProvisionTokenOutcome::Existing)
@@ -2233,6 +2237,16 @@ fn open_private_file_read_at(_parent: &File, _name: &OsStr) -> std::io::Result<F
     ))
 }
 
+fn nofollow_open_error(site: &'static str, error: std::io::Error) -> GuardianServiceError {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        GuardianServiceError::FilesystemSecurity(
+            "guardian security-sensitive file path must not be a symbolic link",
+        )
+    } else {
+        GuardianServiceError::io(site, error)
+    }
+}
+
 fn token_stage_path(path: &Path) -> Result<PathBuf, GuardianServiceError> {
     let file_name = path
         .file_name()
@@ -2286,10 +2300,8 @@ fn prepare_token_stage(
             match open_private_file_at(parent, stage_name, true) {
                 Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    let file =
-                        open_private_file_at(parent, stage_name, false).map_err(|error| {
-                            GuardianServiceError::io("token-stage-race-open", error)
-                        })?;
+                    let file = open_private_file_at(parent, stage_name, false)
+                        .map_err(|error| nofollow_open_error("token-stage-race-open", error))?;
                     let metadata = file.metadata().map_err(|error| {
                         GuardianServiceError::io("token-stage-race-metadata", error)
                     })?;
@@ -2297,11 +2309,11 @@ fn prepare_token_stage(
                     file
                 }
                 Err(error) => {
-                    return Err(GuardianServiceError::io("token-stage-create", error));
+                    return Err(nofollow_open_error("token-stage-create", error));
                 }
             }
         }
-        Err(error) => return Err(GuardianServiceError::io("token-stage-open", error)),
+        Err(error) => return Err(nofollow_open_error("token-stage-open", error)),
     };
     lock_token_stage(&file).map_err(|error| GuardianServiceError::io("token-stage-lock", error))?;
     let before = file
@@ -2421,7 +2433,7 @@ fn require_descriptor_relative_binding(
     site: &'static str,
 ) -> Result<(), GuardianServiceError> {
     let named = open_private_file_read_at(parent, name)
-        .map_err(|error| GuardianServiceError::io(site, error))?;
+        .map_err(|error| nofollow_open_error(site, error))?;
     let named_metadata = named
         .metadata()
         .map_err(|error| GuardianServiceError::io(site, error))?;
@@ -2566,7 +2578,7 @@ fn validate_published_token_binding(
     match open_private_file_read_at(parent, stage_name) {
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(GuardianServiceError::io(
+            return Err(nofollow_open_error(
                 "token-published-stage-absence-check",
                 error,
             ));
@@ -2590,7 +2602,7 @@ fn validate_published_token_binding(
     }
 
     let mut active = open_private_file_read_at(parent, active_name)
-        .map_err(|error| GuardianServiceError::io("token-published-active-open", error))?;
+        .map_err(|error| nofollow_open_error("token-published-active-open", error))?;
     let active_metadata = active
         .metadata()
         .map_err(|error| GuardianServiceError::io("token-published-active-metadata", error))?;
@@ -2643,16 +2655,16 @@ fn open_token_stage_commit(parent: &File, name: &OsStr) -> Result<File, Guardian
                 Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     open_private_file_at(parent, name, false).map_err(|error| {
-                        GuardianServiceError::io("token-stage-commit-race-open", error)
+                        nofollow_open_error("token-stage-commit-race-open", error)
                     })?
                 }
                 Err(error) => {
-                    return Err(GuardianServiceError::io("token-stage-commit-create", error));
+                    return Err(nofollow_open_error("token-stage-commit-create", error));
                 }
             }
         }
         Err(error) => {
-            return Err(GuardianServiceError::io("token-stage-commit-open", error));
+            return Err(nofollow_open_error("token-stage-commit-open", error));
         }
     };
     lock_token_stage(&file)
@@ -3085,7 +3097,7 @@ fn socket_path_identity_at(
 }
 
 fn prove_socket_path_routes_to_listener(
-    listener: &mut UnixListener,
+    listener: &UnixListener,
     socket_path: &Path,
 ) -> Result<(), GuardianServiceError> {
     let mut challenge = Zeroizing::new([0_u8; GUARDIAN_AUTH_TOKEN_BYTES]);
@@ -3098,7 +3110,7 @@ fn prove_socket_path_routes_to_listener(
     let (mut accepted, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => {
                 return Err(GuardianServiceError::io(
                     "socket-listener-proof-accept",
@@ -3150,7 +3162,7 @@ fn load_guardian_secret(path: &Path) -> Result<GuardianSecret, GuardianServiceEr
             "guardian token path has no file name",
         ))?;
     let file = open_private_file_read_at(&parent, name)
-        .map_err(|error| GuardianServiceError::io("token-open", error))?;
+        .map_err(|error| nofollow_open_error("token-open", error))?;
     let secret = load_guardian_secret_from_open_file_at(&parent, name, file)?;
     validate_pinned_private_parent(path, &parent)?;
     Ok(secret)
@@ -3366,7 +3378,7 @@ mod tests {
         tracker
             .observe_authenticated_hello(delayed_lower_generation, mux_incarnation)
             .expect("processed Hello order, not accept generation, cancels retirement");
-        assert!(tracker.pending_retirements.is_empty());
+        assert_eq!(tracker.pending_retirements.len(), 0);
         assert!(tracker.has_authenticated_membership(mux_incarnation));
 
         tracker
@@ -3415,7 +3427,7 @@ mod tests {
         tracker
             .observe_authenticated_hello(recycled, mux_incarnation)
             .unwrap();
-        assert!(tracker.pending_retirements.is_empty());
+        assert_eq!(tracker.pending_retirements.len(), 0);
         tracker
             .observe_disconnect(recycled, Some(mux_incarnation))
             .unwrap();
@@ -3618,7 +3630,12 @@ mod tests {
         assert!(
             service_source.contains("take_exact_ready_connection(&mut self.connections, event)")
         );
-        assert!(service_source.contains(".observe_authenticated_hello(\n                            connection.identity(token),\n                            mux_incarnation,"));
+        let compact_service_source = service_source.split_whitespace().collect::<String>();
+        assert!(
+            compact_service_source.contains(
+                ".observe_authenticated_hello(connection.identity(token),mux_incarnation)"
+            )
+        );
         assert!(
             service_source.contains(".observe_disconnect(identity, connection.mux_incarnation)")
         );
@@ -3745,7 +3762,7 @@ mod tests {
             frame.as_mut_slice().zeroize();
             request.zeroize_payload();
             assert!(frame.iter().all(|byte| *byte == 0));
-            assert!(request.payload().is_empty());
+            assert_eq!(request.payload().len(), 0);
             let wipe_deadline = Instant::now() + Duration::from_secs(3);
             while (!server_wipe_probe
                 .authenticated_input_wipe
@@ -3835,8 +3852,13 @@ mod tests {
     fn query_payload_survives_until_its_typed_reply_is_validated() {
         let secret = GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap();
         let effect_id = Uuid::from_u128(31);
-        let query =
-            GuardianInputEffectQuery::new(8, 9, Sha256::digest(b"forgotten-input").into()).unwrap();
+        let query = GuardianInputEffectQuery::new(
+            Uuid::from_u128(30),
+            8,
+            9,
+            Sha256::digest(b"forgotten-input").into(),
+        )
+        .unwrap();
         let encoded_query = query.encode();
         let request = GuardianRequestEnvelope::new(
             GuardianRequestHeader::new(
@@ -3890,6 +3912,7 @@ mod tests {
         let request_id = Uuid::from_u128(44);
         let effect_id = Uuid::from_u128(45);
         let query = GuardianInputEffectQuery::new(
+            mux_incarnation,
             12,
             16,
             Sha256::digest(b"input-no-longer-retained").into(),
@@ -4001,7 +4024,7 @@ mod tests {
     ))]
     #[test]
     fn socket_authority_detects_leaf_replacement_after_listener_proof() {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-guardian-socket-authority-")
             .tempdir_in(canonical_temp)
@@ -4012,9 +4035,9 @@ mod tests {
         let parent = open_private_parent(&socket_path).unwrap();
         let name = socket_path.file_name().unwrap();
         require_absent_at(&parent, name).unwrap();
-        let mut listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
         chmod_socket_at(&parent, name).unwrap();
-        prove_socket_path_routes_to_listener(&mut listener, &socket_path).unwrap();
+        prove_socket_path_routes_to_listener(&listener, &socket_path).unwrap();
         let authority = SocketPathAuthority {
             parent,
             socket_path: socket_path.clone(),
@@ -4035,7 +4058,7 @@ mod tests {
 
     #[test]
     fn guardian_paths_reject_writable_non_sticky_ancestor_components() {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-guardian-unsafe-ancestor-")
             .tempdir_in(canonical_temp)
@@ -4054,7 +4077,7 @@ mod tests {
 
     #[test]
     fn provision_token_is_private_durable_idempotent_and_no_follow() {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-guardian-token-")
             .tempdir_in(canonical_temp)
@@ -4120,7 +4143,7 @@ mod tests {
     ))]
     #[test]
     fn token_publication_is_pinned_and_parent_path_replacement_fails_validation() {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-guardian-token-pinned-parent-")
             .tempdir_in(canonical_temp)
@@ -4173,7 +4196,7 @@ mod tests {
     ))]
     #[test]
     fn token_stage_parent_aba_restoration_cannot_publish_a_different_inode() {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-guardian-token-parent-aba-")
             .tempdir_in(canonical_temp)
@@ -4280,7 +4303,7 @@ mod tests {
     ))]
     #[test]
     fn token_stage_leaf_replacement_is_rejected_before_publication() {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-guardian-token-stage-swap-")
             .tempdir_in(canonical_temp)
@@ -4319,7 +4342,7 @@ mod tests {
 
     #[test]
     fn provision_token_resumes_complete_and_partial_crash_stages() {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-guardian-token-crash-stage-")
             .tempdir_in(canonical_temp)
@@ -4403,7 +4426,7 @@ mod tests {
 
     #[test]
     fn provision_token_rejects_malicious_stage_without_activating_it() {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-guardian-token-malicious-stage-")
             .tempdir_in(canonical_temp)

@@ -48,12 +48,20 @@ impl Drop for ReleaseMarker {
     }
 }
 
+fn secure_test_temp_root() -> anyhow::Result<std::path::PathBuf> {
+    // RCH and other build orchestrators may point TMPDIR inside a project or
+    // cache tree whose writable ancestors intentionally fail the guardian's
+    // no-follow filesystem policy. This Unix-only integration test needs the
+    // platform sticky temporary root so it exercises the accepted production
+    // path rather than weakening that policy for an unsafe harness override.
+    Ok(std::fs::canonicalize("/tmp")?)
+}
+
 #[test]
 fn empty_guarded_stop_returns_authenticated_success_before_service_exit() -> anyhow::Result<()> {
-    let canonical_temp = std::fs::canonicalize(std::env::temp_dir())?;
     let directory = tempfile::Builder::new()
         .prefix("frankenterm-pty-guardian-stop-")
-        .tempdir_in(canonical_temp)?
+        .tempdir_in(secure_test_temp_root()?)?
         .keep();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     let socket_path = directory.join("guardian.sock");
@@ -107,10 +115,9 @@ fn empty_guarded_stop_returns_authenticated_success_before_service_exit() -> any
 fn guardian_owned_native_pty_survives_final_mux_connection_drop() -> anyhow::Result<()> {
     // Keep the directory rather than deleting it: repository policy forbids
     // agents and their test helpers from deleting files without permission.
-    let canonical_temp = std::fs::canonicalize(std::env::temp_dir())?;
     let directory = tempfile::Builder::new()
         .prefix("frankenterm-pty-guardian-lifetime-")
-        .tempdir_in(canonical_temp)?
+        .tempdir_in(secure_test_temp_root()?)?
         .keep();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     let socket_path = directory.join("guardian.sock");

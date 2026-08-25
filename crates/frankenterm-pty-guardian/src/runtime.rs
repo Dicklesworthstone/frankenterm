@@ -433,6 +433,7 @@ struct CheckpointJob {
     route: GuardianCheckpointRoute,
     protocol: GuardianProtocolState,
     request: AuthenticatedGuardianRequest,
+    journal: Option<GuardianPaneOutputJournal>,
 }
 
 struct CheckpointWorkerCompletion {
@@ -484,9 +485,7 @@ impl GuardianCheckpointPipeline {
         };
         jobs.try_send(job).map_err(|error| match error {
             TrySendError::Full(job) => CheckpointSubmitError::Saturated(Box::new(job)),
-            TrySendError::Disconnected(job) => {
-                CheckpointSubmitError::Unavailable(Box::new(job))
-            }
+            TrySendError::Disconnected(job) => CheckpointSubmitError::Unavailable(Box::new(job)),
         })
     }
 
@@ -530,7 +529,7 @@ fn checkpoint_worker(
 ) {
     while let Ok(mut job) = jobs.recv() {
         let execution =
-            catch_guardian_checkpoint_worker_panic(|| execute_checkpoint_job(&store, &job));
+            catch_guardian_checkpoint_worker_panic(|| execute_checkpoint_job(&store, &mut job));
         // Response correlation validates against the authenticated request, so
         // build it first. Then wipe plaintext before publishing any completion.
         job.request.zeroize_payload();
@@ -553,6 +552,39 @@ fn checkpoint_worker(
 
 fn execute_checkpoint_job(
     store: &GuardianCheckpointStageStore,
+    job: &mut CheckpointJob,
+) -> Option<GuardianResponseEnvelope> {
+    match job.request.header().operation {
+        GuardianOperation::CheckpointStage => execute_checkpoint_stage_job(store, job),
+        GuardianOperation::Checkpoint => {
+            let receipt = match job
+                .protocol
+                .apply_checkpoint_transactionally(&job.request, |permit| {
+                    store.publish_checkpoint_catalog_adoption(permit)
+                }) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Some(GuardianResponseEnvelope::rejection(
+                        &job.request,
+                        GuardianRejectionCode::from_protocol_error(&error),
+                    ));
+                }
+            };
+            GuardianResponseEnvelope::reply(
+                &job.request,
+                &GuardianReply::CheckpointReceipt(receipt),
+            )
+            .ok()
+        }
+        _ => Some(GuardianResponseEnvelope::rejection(
+            &job.request,
+            GuardianRejectionCode::InvalidRequest,
+        )),
+    }
+}
+
+fn execute_checkpoint_stage_job(
+    store: &GuardianCheckpointStageStore,
     job: &CheckpointJob,
 ) -> Option<GuardianResponseEnvelope> {
     let stage = match job.protocol.preflight_checkpoint_stage(&job.request) {
@@ -568,7 +600,26 @@ fn execute_checkpoint_job(
         GuardianCheckpointStageKindV1::Begin => store.apply_begin(&stage),
         GuardianCheckpointStageKindV1::Chunk => store.apply_chunk(stage),
         GuardianCheckpointStageKindV1::Query => store.apply_query(stage),
-        GuardianCheckpointStageKindV1::Seal | GuardianCheckpointStageKindV1::Ack => {
+        GuardianCheckpointStageKindV1::Seal => {
+            drop(stage);
+            let permit = match job.protocol.preflight_checkpoint_seal(&job.request) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    return Some(GuardianResponseEnvelope::rejection(
+                        &job.request,
+                        GuardianRejectionCode::from_protocol_error(&error),
+                    ));
+                }
+            };
+            let Some(journal) = job.journal.as_ref() else {
+                return Some(GuardianResponseEnvelope::rejection(
+                    &job.request,
+                    GuardianRejectionCode::InvalidRequest,
+                ));
+            };
+            store.apply_runtime_seal(permit, journal)
+        }
+        GuardianCheckpointStageKindV1::Ack => {
             return Some(GuardianResponseEnvelope::rejection(
                 &job.request,
                 GuardianRejectionCode::InvalidRequest,
@@ -1036,15 +1087,19 @@ impl GuardianRuntime {
     }
 
     /// Transfer the one global protocol authority and one owned authenticated
-    /// Stage request to the fixed checkpoint worker. Only Begin, Chunk, and
-    /// Query can reach storage; Seal, Ack, and Genesis remain fail-closed.
+    /// Stage or adoption request to the fixed checkpoint worker. Record-backed
+    /// Seal can reach storage only beside the process-local journal authority
+    /// for its authenticated pane; Checkpoint adoption consumes its typed
+    /// mutation permit on the same worker. Ack and Genesis remain fail-closed.
     pub(crate) fn submit_checkpoint(
         &mut self,
         mut request: AuthenticatedGuardianRequest,
         route: GuardianCheckpointRoute,
     ) -> GuardianCheckpointSubmission {
-        if request.header().operation != GuardianOperation::CheckpointStage
-            || request.header().request_id != route.request_id
+        if !matches!(
+            request.header().operation,
+            GuardianOperation::CheckpointStage | GuardianOperation::Checkpoint
+        ) || request.header().request_id != route.request_id
         {
             let response = GuardianResponseEnvelope::rejection(
                 &request,
@@ -1069,10 +1124,16 @@ impl GuardianRuntime {
             request.zeroize_payload();
             return GuardianCheckpointSubmission::CloseRetryably;
         };
+        let journal = request
+            .header()
+            .pane_id
+            .and_then(|pane_id| self.panes.get(&pane_id))
+            .map(|pane| pane.output.journal.clone());
         let job = CheckpointJob {
             route,
             protocol,
             request,
+            journal,
         };
         match self.checkpoint_pipeline.try_submit(job) {
             Ok(()) => {
@@ -1190,10 +1251,12 @@ impl GuardianRuntime {
                     | None => {}
                 }
                 self.replay_deferred_child_exits();
-                GuardianRuntimeInputCompletionState::Ready(Box::new(GuardianRuntimeInputCompletion {
-                    route: completion.route,
-                    response: completion.response,
-                }))
+                GuardianRuntimeInputCompletionState::Ready(Box::new(
+                    GuardianRuntimeInputCompletion {
+                        route: completion.route,
+                        response: completion.response,
+                    },
+                ))
             }
             GuardianRuntimeInputCompletionStateInternal::Empty => {
                 GuardianRuntimeInputCompletionState::Empty
@@ -1210,9 +1273,10 @@ impl GuardianRuntime {
     }
 
     /// Restore checkpoint-worker-owned protocol authority before yielding the
-    /// exact transport completion. Storage ambiguity closes retryably; because
-    /// final publication is still disabled, a Stage-worker panic cannot mint or
-    /// invalidate live pane authority and the next exact Query remains usable.
+    /// exact transport completion. A worker panic cannot fabricate a terminal
+    /// response: Stage remains recoverable by exact Query, while Checkpoint
+    /// publication retains its indeterminate pane fence until an exact catalog
+    /// replay proves the marker durable.
     pub(crate) fn try_checkpoint_completion(&mut self) -> GuardianRuntimeCheckpointCompletionState {
         match self.checkpoint_pipeline.try_completion() {
             GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion) => {
@@ -1357,7 +1421,7 @@ impl GuardianRuntime {
                     }
                     Ok(count) => break count,
                     Err(error) if error.kind() == ErrorKind::WouldBlock => return,
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     Err(_) => {
                         self.counters.pty_read_failures =
                             self.counters.pty_read_failures.saturating_add(1);
@@ -1676,15 +1740,16 @@ impl GuardianRuntime {
             return;
         };
         panes.retain(|pane_id, pane| {
-            let release = terminal_resources_releasable(
-                pane.exit_observed,
-                pane.pty_eof_observed,
-                pane.output.is_quiescent(),
-                matches!(
+            let release = TerminalResourceReadiness {
+                exit_observed: pane.exit_observed,
+                pty_eof_observed: pane.pty_eof_observed,
+                output_quiescent: pane.output.is_quiescent(),
+                protocol_terminal: matches!(
                     protocol.pane_state(*pane_id),
                     Some(GuardianPaneState::ClosedTerminal { .. })
                 ),
-            );
+            }
+            .all_observed();
             if release {
                 deregister_reader(registry, pane, counters);
                 pty_tokens.remove(&pane.token);
@@ -1940,13 +2005,21 @@ fn round_robin_successor(
     after_cursor.or(wrap)
 }
 
-const fn terminal_resources_releasable(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalResourceReadiness {
     exit_observed: bool,
     pty_eof_observed: bool,
     output_quiescent: bool,
     protocol_terminal: bool,
-) -> bool {
-    exit_observed && pty_eof_observed && output_quiescent && protocol_terminal
+}
+
+impl TerminalResourceReadiness {
+    const fn all_observed(self) -> bool {
+        self.exit_observed
+            && self.pty_eof_observed
+            && self.output_quiescent
+            && self.protocol_terminal
+    }
 }
 
 fn remaining_output_capacity(
@@ -2125,13 +2198,15 @@ mod tests {
         RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
     };
     use mio::{Poll, Waker};
+    use mux::guardian_output_journal::GuardianOutputAppendReceipt;
     use mux::guardian_protocol::{
-        GuardianCheckpointDescriptorV1, GuardianCheckpointScopeV1,
-        GuardianCheckpointStageRequestV1, GuardianRequestEnvelope, GuardianRequestHeader,
-        GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret, decode_guardian_request,
-        encode_guardian_request,
+        GuardianCheckpointDescriptorV1, GuardianCheckpointDisposition, GuardianCheckpointIntent,
+        GuardianCheckpointScopeV1, GuardianCheckpointStageRequestV1, GuardianRequestEnvelope,
+        GuardianRequestHeader, GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret,
+        decode_guardian_request, encode_guardian_request,
     };
     use portable_pty::{CommandBuilder, PtySize};
+    use sha2::{Digest as _, Sha256};
     use std::io;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
@@ -2139,8 +2214,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn runtime_for_input_rejection() -> (std::path::PathBuf, Poll, GuardianRuntime) {
-        let canonical_temp =
-            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("ft-guardian-runtime-input-rejection-")
             .tempdir_in(canonical_temp)
@@ -2217,8 +2291,8 @@ mod tests {
         }
     }
 
-    fn runtime_terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
-        Terminal::new(
+    fn runtime_terminal_checkpoint_with(content: &[u8]) -> RecoveryTerminalCheckpointV2 {
+        let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 24,
                 cols: 80,
@@ -2230,9 +2304,15 @@ mod tests {
             "FrankenTerm",
             "guardian-runtime-test",
             Box::new(Vec::<u8>::new()),
-        )
-        .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
-        .expect("capture canonical runtime checkpoint fixture")
+        );
+        terminal.advance_bytes(content);
+        terminal
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .expect("capture canonical runtime checkpoint fixture")
+    }
+
+    fn runtime_terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+        runtime_terminal_checkpoint_with(&[])
     }
 
     fn authenticated_genesis_checkpoint_stage_request(
@@ -2262,6 +2342,160 @@ mod tests {
                 0,
                 0,
                 Some(spawn_effect_id),
+                &payload,
+            ),
+            payload,
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_checkpoint_stage_request(
+        kind: GuardianCheckpointStageKindV1,
+        pane_id: Uuid,
+        generation: u64,
+        upload_id: Uuid,
+        terminal: &RecoveryTerminalCheckpointV2,
+        receipt: GuardianOutputAppendReceipt,
+        chunk_bytes: u32,
+        chunk: Option<(u32, &[u8])>,
+    ) -> GuardianCheckpointStageRequestV1 {
+        const STAGE_COMMON_BYTES: usize = 336;
+        let canonical_payload = terminal.canonical_payload();
+        let total_bytes = u64::try_from(canonical_payload.len()).expect("fixture length fits u64");
+        let total_chunks = u32::try_from(total_bytes.div_ceil(u64::from(chunk_bytes)))
+            .expect("fixture chunk count fits u32");
+        let parser_stream_bytes = terminal.parser_stream_bytes();
+        let replay_identity = mux::guardian_checkpoint::current_replay_identity_digest();
+
+        let mut terminal_hasher = Sha256::new();
+        terminal_hasher.update(b"frankenterm.guardian-checkpoint-terminal-payload.v1\0");
+        terminal_hasher.update(total_bytes.to_le_bytes());
+        terminal_hasher.update(canonical_payload);
+        let terminal_digest: [u8; 32] = terminal_hasher.finalize().into();
+
+        let mut boundary_hasher = Sha256::new();
+        boundary_hasher.update(b"frankenterm.guardian-checkpoint-output-boundary-identity.v1\0");
+        boundary_hasher.update(2_u32.to_le_bytes());
+        boundary_hasher.update(pane_id.as_bytes());
+        boundary_hasher.update(receipt.segment_id().as_bytes());
+        boundary_hasher.update(receipt.sequence().to_le_bytes());
+        boundary_hasher.update(receipt.record_digest());
+        boundary_hasher.update(receipt.committed_log_bytes().to_le_bytes());
+        boundary_hasher.update(receipt.cumulative_plaintext_bytes().to_le_bytes());
+        let boundary_digest: [u8; 32] = boundary_hasher.finalize().into();
+
+        let mut checkpoint_hasher = Sha256::new();
+        checkpoint_hasher.update(b"frankenterm.guardian-checkpoint-artifact-identity.v1\0");
+        checkpoint_hasher.update(boundary_digest);
+        checkpoint_hasher.update(parser_stream_bytes.to_le_bytes());
+        checkpoint_hasher.update(replay_identity);
+        checkpoint_hasher.update(24_u32.to_le_bytes());
+        checkpoint_hasher.update(80_u32.to_le_bytes());
+        checkpoint_hasher.update(total_bytes.to_le_bytes());
+        checkpoint_hasher.update(terminal_digest);
+        let checkpoint_digest: [u8; 32] = checkpoint_hasher.finalize().into();
+
+        let trailing_bytes = chunk.map_or(0, |(_, bytes)| 48 + bytes.len());
+        let mut wire = Zeroizing::new(Vec::with_capacity(STAGE_COMMON_BYTES + trailing_bytes));
+        wire.resize(STAGE_COMMON_BYTES, 0);
+        wire[..4].copy_from_slice(b"GCS1");
+        wire[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        wire[6] = match kind {
+            GuardianCheckpointStageKindV1::Begin => 1,
+            GuardianCheckpointStageKindV1::Chunk => 2,
+            GuardianCheckpointStageKindV1::Seal => 3,
+            GuardianCheckpointStageKindV1::Query => 4,
+            GuardianCheckpointStageKindV1::Ack => panic!("runtime Seal fixture never stages Ack"),
+        };
+        wire[8] = 1;
+        wire[16..32].copy_from_slice(pane_id.as_bytes());
+        wire[32..40].copy_from_slice(&generation.to_be_bytes());
+        wire[40..56].copy_from_slice(upload_id.as_bytes());
+        wire[56..88].copy_from_slice(&checkpoint_digest);
+        wire[88..120].copy_from_slice(&boundary_digest);
+        wire[120..128].copy_from_slice(&generation.to_be_bytes());
+        wire[128..160].copy_from_slice(&replay_identity);
+        wire[160..164].copy_from_slice(&24_u32.to_be_bytes());
+        wire[164..168].copy_from_slice(&80_u32.to_be_bytes());
+        wire[168..176].copy_from_slice(&total_bytes.to_be_bytes());
+        wire[176..208].copy_from_slice(&terminal_digest);
+        wire[208..224].copy_from_slice(pane_id.as_bytes());
+        wire[224] = 2;
+        wire[248..264].copy_from_slice(receipt.segment_id().as_bytes());
+        wire[264..272].copy_from_slice(&receipt.sequence().to_be_bytes());
+        wire[272..304].copy_from_slice(&receipt.record_digest());
+        wire[304..312].copy_from_slice(&receipt.committed_log_bytes().to_be_bytes());
+        wire[312..320].copy_from_slice(&receipt.cumulative_plaintext_bytes().to_be_bytes());
+        wire[320..328].copy_from_slice(&parser_stream_bytes.to_be_bytes());
+        wire[328..332].copy_from_slice(&chunk_bytes.to_be_bytes());
+        wire[332..336].copy_from_slice(&total_chunks.to_be_bytes());
+        if let Some((index, bytes)) = chunk {
+            let offset = u64::from(index) * u64::from(chunk_bytes);
+            let chunk_digest: [u8; 32] = Sha256::digest(bytes).into();
+            wire.extend_from_slice(&index.to_be_bytes());
+            wire.extend_from_slice(&offset.to_be_bytes());
+            wire.extend_from_slice(&chunk_digest);
+            wire.extend_from_slice(
+                &u32::try_from(bytes.len())
+                    .expect("fixture chunk length fits u32")
+                    .to_be_bytes(),
+            );
+            wire.extend_from_slice(bytes);
+        }
+        GuardianCheckpointStageRequestV1::decode(&wire)
+            .expect("record-backed runtime Stage fixture is canonical")
+    }
+
+    fn authenticated_record_checkpoint_stage_request(
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        stage: GuardianCheckpointStageRequestV1,
+    ) -> AuthenticatedGuardianRequest {
+        let payload = stage
+            .into_zeroizing_payload()
+            .expect("record-backed Stage request encodes");
+        let request = GuardianRequestEnvelope::from_zeroizing_payload(
+            GuardianRequestHeader::new(
+                GuardianOperation::CheckpointStage,
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                request_id,
+                Some(pane_id),
+                generation,
+                0,
+                None,
+                &payload,
+            ),
+            payload,
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
+    fn authenticated_checkpoint_adoption_request(
+        request_id: Uuid,
+        effect_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        intent: GuardianCheckpointIntent,
+    ) -> AuthenticatedGuardianRequest {
+        let payload = intent.encode().to_vec();
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::Checkpoint,
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                request_id,
+                Some(pane_id),
+                generation,
+                sequence,
+                Some(effect_id),
                 &payload,
             ),
             payload,
@@ -2517,6 +2751,56 @@ mod tests {
         }
     }
 
+    fn durable_runtime_output(
+        runtime: &GuardianRuntime,
+        pane_id: Uuid,
+        journal: &GuardianPaneOutputJournal,
+        payload: &[u8],
+    ) -> GuardianOutputAppendReceipt {
+        runtime
+            .output_pipeline
+            .try_submit(pane_id, journal.clone(), Zeroizing::new(payload.to_vec()))
+            .unwrap_or_else(|_| panic!("runtime output fixture was unexpectedly backpressured"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match runtime.output_pipeline.try_completion() {
+                GuardianOutputCompletionState::Ready(completion) => {
+                    return completion
+                        .result
+                        .expect("runtime output fixture commits durably");
+                }
+                GuardianOutputCompletionState::Empty if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                GuardianOutputCompletionState::Empty => {
+                    panic!("runtime output fixture timed out");
+                }
+                GuardianOutputCompletionState::Disconnected => {
+                    panic!("runtime output fixture worker disconnected");
+                }
+            }
+        }
+    }
+
+    fn submit_checkpoint_worker_request(
+        runtime: &mut GuardianRuntime,
+        request: AuthenticatedGuardianRequest,
+        route_token: usize,
+    ) -> GuardianResponseEnvelope {
+        let route =
+            GuardianCheckpointRoute::new(Token(route_token), 1, request.header().request_id)
+                .expect("runtime checkpoint route is valid");
+        assert!(matches!(
+            runtime.submit_checkpoint(request, route),
+            GuardianCheckpointSubmission::Pending
+        ));
+        let completion = wait_for_checkpoint_completion(runtime);
+        assert_eq!(completion.route, route);
+        completion
+            .response
+            .expect("record-backed Stage worker returns an exact response")
+    }
+
     fn assert_worker_request_wiped_before_completion(probe: &InputRequestWipeProbe) {
         assert!(
             probe.explicit_wipe.load(Ordering::SeqCst),
@@ -2578,7 +2862,7 @@ mod tests {
     }
 
     #[test]
-    fn production_checkpoint_worker_is_bounded_wipes_and_keeps_publication_disabled() {
+    fn production_checkpoint_worker_is_bounded_wipes_and_keeps_ack_disabled() {
         let source = include_str!("runtime.rs");
         let worker_source = source
             .split("fn checkpoint_worker(")
@@ -2604,16 +2888,15 @@ mod tests {
             .and_then(|source| source.split("fn input_worker").next())
             .expect("execute_checkpoint_job production body is present");
         assert!(execution_source.contains("preflight_checkpoint_stage"));
+        assert!(execution_source.contains("apply_checkpoint_transactionally"));
+        assert!(execution_source.contains("store.publish_checkpoint_catalog_adoption(permit)"));
         assert!(execution_source.contains("store.apply_begin(&stage)"));
         assert!(execution_source.contains("store.apply_chunk(stage)"));
         assert!(execution_source.contains("store.apply_query(stage)"));
-        assert!(!execution_source.contains("store.apply_seal"));
+        assert!(execution_source.contains("preflight_checkpoint_seal"));
+        assert!(execution_source.contains("store.apply_runtime_seal(permit, journal)"));
         assert!(!execution_source.contains("store.apply_ack"));
-        assert!(
-            execution_source.contains(
-                "GuardianCheckpointStageKindV1::Seal | GuardianCheckpointStageKindV1::Ack"
-            )
-        );
+        assert!(execution_source.contains("GuardianCheckpointStageKindV1::Ack =>"));
 
         let pipeline_source = source
             .split("impl GuardianCheckpointPipeline")
@@ -2669,6 +2952,199 @@ mod tests {
             .checked_add(1)
             .unwrap();
         assert_eq!(runtime.counters(), expected);
+    }
+
+    #[test]
+    fn checkpoint_worker_seals_one_real_record_backed_stage_under_current_lease_authority() {
+        let (directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(Vec::<u8>::new()));
+        let generation = 1;
+        let journal = runtime
+            .panes
+            .get(&pane_id)
+            .expect("claimed runtime pane exists")
+            .output
+            .journal
+            .clone();
+        let output = b"runtime-seal-boundary";
+        let receipt = durable_runtime_output(&runtime, pane_id, &journal, output);
+        let terminal = runtime_terminal_checkpoint_with(output);
+        assert_eq!(
+            terminal.parser_stream_bytes(),
+            receipt.cumulative_plaintext_bytes(),
+            "the parser watermark and durable output boundary must be identical"
+        );
+
+        let upload_id = Uuid::from_u128(0xd001);
+        let chunk_bytes = 1_024_u32;
+        let begin = record_checkpoint_stage_request(
+            GuardianCheckpointStageKindV1::Begin,
+            pane_id,
+            generation,
+            upload_id,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
+        );
+        let adoption_intent =
+            GuardianCheckpointIntent::new(begin.checkpoint_id(), begin.boundary_id());
+        let begin = authenticated_record_checkpoint_stage_request(
+            Uuid::from_u128(0xd002),
+            pane_id,
+            generation,
+            begin,
+        );
+        assert_eq!(
+            submit_checkpoint_worker_request(&mut runtime, begin, 31)
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+
+        for (index, bytes) in terminal
+            .canonical_payload()
+            .chunks(usize::try_from(chunk_bytes).expect("chunk size fits usize"))
+            .enumerate()
+        {
+            let chunk = record_checkpoint_stage_request(
+                GuardianCheckpointStageKindV1::Chunk,
+                pane_id,
+                generation,
+                upload_id,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                Some((u32::try_from(index).expect("chunk index fits u32"), bytes)),
+            );
+            let chunk = authenticated_record_checkpoint_stage_request(
+                Uuid::from_u128(0xd100 + u128::try_from(index).expect("chunk index fits u128")),
+                pane_id,
+                generation,
+                chunk,
+            );
+            assert_eq!(
+                submit_checkpoint_worker_request(&mut runtime, chunk, 32 + index)
+                    .header()
+                    .status,
+                GuardianResponseStatus::Success
+            );
+        }
+
+        let seal = record_checkpoint_stage_request(
+            GuardianCheckpointStageKindV1::Seal,
+            pane_id,
+            generation,
+            upload_id,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
+        );
+        let seal = authenticated_record_checkpoint_stage_request(
+            Uuid::from_u128(0xd003),
+            pane_id,
+            generation,
+            seal,
+        );
+        let sealed = submit_checkpoint_worker_request(&mut runtime, seal, 41);
+        assert_eq!(sealed.header().status, GuardianResponseStatus::Success);
+        assert_eq!(
+            sealed.payload().get(6),
+            Some(&3),
+            "Seal reply kind is Sealed"
+        );
+
+        let query = record_checkpoint_stage_request(
+            GuardianCheckpointStageKindV1::Query,
+            pane_id,
+            generation,
+            upload_id,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
+        );
+        let query = authenticated_record_checkpoint_stage_request(
+            Uuid::from_u128(0xd004),
+            pane_id,
+            generation,
+            query,
+        );
+        let recovered = submit_checkpoint_worker_request(&mut runtime, query, 42);
+        assert_eq!(recovered.header().status, GuardianResponseStatus::Success);
+        assert_eq!(
+            recovered.payload().get(6),
+            Some(&3),
+            "durable Query must recover the same Sealed completion"
+        );
+
+        let adoption_request_id = Uuid::from_u128(0xd005);
+        let adoption_effect_id = Uuid::from_u128(0xd006);
+        let adoption = authenticated_checkpoint_adoption_request(
+            adoption_request_id,
+            adoption_effect_id,
+            pane_id,
+            generation,
+            1,
+            adoption_intent,
+        );
+        let checkpoint_store = runtime.output_pipeline.checkpoint_stage_store();
+        let cut_receipt = runtime
+            .protocol
+            .as_mut()
+            .expect("runtime retains protocol authority before direct cut fixture")
+            .apply_checkpoint_transactionally(&adoption, |permit| {
+                checkpoint_store
+                    .publish_checkpoint_catalog_adoption(permit)
+                    .expect("catalog marker becomes durable before simulated reply cut");
+                Err::<(), &str>("simulated-reply-cut-after-durable-marker")
+            })
+            .expect("post-marker callback error yields a typed indeterminate receipt");
+        assert_eq!(
+            cut_receipt.disposition(),
+            GuardianCheckpointDisposition::OutcomeIndeterminate
+        );
+        let catalog_directory = directory.join("guardian-output-v3");
+        let catalog_files = std::fs::read_dir(&catalog_directory)
+            .expect("read runtime catalog directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("checkpoint-catalog-")
+                    && (name.ends_with(".ftgccandidate") || name.ends_with(".ftgccommit"))
+            })
+            .count();
+        assert_eq!(
+            catalog_files, 2,
+            "one adoption publishes exactly one candidate and one commit marker"
+        );
+
+        let exact_replay = authenticated_checkpoint_adoption_request(
+            adoption_request_id,
+            adoption_effect_id,
+            pane_id,
+            generation,
+            1,
+            adoption_intent,
+        );
+        let replayed = submit_checkpoint_worker_request(&mut runtime, exact_replay, 44);
+        assert_eq!(replayed.header().status, GuardianResponseStatus::Success);
+        let replay_catalog_files = std::fs::read_dir(&catalog_directory)
+            .expect("reread runtime catalog directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("checkpoint-catalog-")
+                    && (name.ends_with(".ftgccandidate") || name.ends_with(".ftgccommit"))
+            })
+            .count();
+        assert_eq!(
+            replay_catalog_files, catalog_files,
+            "an exact Checkpoint replay reconciles the durable marker without republishing"
+        );
     }
 
     #[test]
@@ -3361,11 +3837,43 @@ mod tests {
 
     #[test]
     fn terminal_resource_release_requires_exit_eof_empty_output_and_terminal_protocol() {
-        assert!(terminal_resources_releasable(true, true, true, true));
-        assert!(!terminal_resources_releasable(false, true, true, true));
-        assert!(!terminal_resources_releasable(true, false, true, true));
-        assert!(!terminal_resources_releasable(true, true, false, true));
-        assert!(!terminal_resources_releasable(true, true, true, false));
+        assert!(
+            TerminalResourceReadiness {
+                exit_observed: true,
+                pty_eof_observed: true,
+                output_quiescent: true,
+                protocol_terminal: true,
+            }
+            .all_observed()
+        );
+        for incomplete in [
+            TerminalResourceReadiness {
+                exit_observed: false,
+                pty_eof_observed: true,
+                output_quiescent: true,
+                protocol_terminal: true,
+            },
+            TerminalResourceReadiness {
+                exit_observed: true,
+                pty_eof_observed: false,
+                output_quiescent: true,
+                protocol_terminal: true,
+            },
+            TerminalResourceReadiness {
+                exit_observed: true,
+                pty_eof_observed: true,
+                output_quiescent: false,
+                protocol_terminal: true,
+            },
+            TerminalResourceReadiness {
+                exit_observed: true,
+                pty_eof_observed: true,
+                output_quiescent: true,
+                protocol_terminal: false,
+            },
+        ] {
+            assert!(!incomplete.all_observed());
+        }
     }
 
     #[test]

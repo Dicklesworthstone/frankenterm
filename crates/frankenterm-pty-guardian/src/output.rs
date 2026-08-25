@@ -12,6 +12,7 @@
 use crate::transport::provision_guardian_token_in_pinned_parent;
 use mio::Waker;
 use mux::guardian_checkpoint::{
+    GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES,
     GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES, GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES,
     GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES, GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES,
     GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointBoundaryError,
@@ -35,9 +36,12 @@ use mux::guardian_output_journal::{
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
-    GuardianCheckpointDescriptorV1, GuardianCheckpointScopeV1, GuardianCheckpointStageKindV1,
-    GuardianCheckpointStageReplyV1, GuardianCheckpointStageRequestV1,
-    GuardianEffectTransactionError, GuardianProtocolError, GuardianProtocolState, GuardianReply,
+    GuardianCheckpointCatalogAdoptionPermitV1, GuardianCheckpointDescriptorV1,
+    GuardianCheckpointPolicyExpiryReceiptV1, GuardianCheckpointReceipt,
+    GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1,
+    GuardianCheckpointStageKindV1, GuardianCheckpointStageReplyV1,
+    GuardianCheckpointStageRequestV1, GuardianEffectTransactionError, GuardianProtocolError,
+    GuardianProtocolState, GuardianReply,
 };
 use nix::unistd::{PathconfVar, fpathconf, geteuid};
 use sha2::{Digest as _, Sha256};
@@ -55,7 +59,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
 
-pub(crate) const OUTPUT_RECORD_BYTES: usize = 8 * 1024;
+pub const OUTPUT_RECORD_BYTES: usize = 8 * 1024;
 const OUTPUT_DIRECTORY_NAME: &str = "guardian-output-v3";
 const OUTPUT_KEY_NAME: &str = "journal.key";
 const INPUT_JOURNAL_SUFFIX: &str = "ftgin";
@@ -82,16 +86,45 @@ const CHECKPOINT_STAGE_FILE_PREFIX: &[u8] = b"checkpoint-";
 const CHECKPOINT_STAGE_FILE_SUFFIX: &str = ".ftgcp";
 const CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES: usize = 336;
 const CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES: usize = 400;
-const CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES: usize = 352;
+const CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES: usize = 392;
+const CHECKPOINT_STAGE_EXPIRY_PLAINTEXT_BYTES: usize = 376;
 const CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES: u64 = 296;
 const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize = 1_027;
-const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = 268_740_536;
+const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = 268_740_576;
 // Phase A has no deletion or ACK-backed reclamation. Keep this deliberately
 // finite; whole-fleet activation remains disabled until the catalog layer can
 // retain one proven generation per pane without exhausting this quarantine.
 const CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS: usize = 8;
 const CHECKPOINT_STAGE_MAX_FILES: usize = 8_216;
-const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_924_288;
+const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_924_608;
+const CHECKPOINT_CATALOG_FILE_PREFIX: &str = "checkpoint-catalog-";
+const CHECKPOINT_CATALOG_CANDIDATE_SUFFIX: &str = ".ftgccandidate";
+const CHECKPOINT_CATALOG_MARKER_SUFFIX: &str = ".ftgccommit";
+const CHECKPOINT_CATALOG_CANDIDATE_MAGIC: [u8; 8] = *b"FTGCC001";
+const CHECKPOINT_CATALOG_MARKER_MAGIC: [u8; 8] = *b"FTGCM001";
+const CHECKPOINT_CATALOG_VERSION: u32 = 1;
+const CHECKPOINT_CATALOG_HEADER_BYTES: usize = 424;
+const CHECKPOINT_CATALOG_MARKER_BODY_BYTES: usize = 312;
+const CHECKPOINT_CATALOG_MARKER_BYTES: usize =
+    CHECKPOINT_CATALOG_MARKER_BODY_BYTES + OUTPUT_MANIFEST_CHECKSUM_BYTES;
+const CHECKPOINT_CATALOG_CHECKSUM_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-catalog-candidate.v1\0";
+const CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-catalog-marker.v1\0";
+const CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS: usize = 8;
+// One immutable candidate and marker per retained member, plus one bounded
+// crash candidate per generation. No reclamation is performed in this phase.
+const CHECKPOINT_CATALOG_MAX_RELEVANT_FILES: usize = CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS * 3;
+const CHECKPOINT_CATALOG_PROTOCOL_MAX_CHUNKS: u64 = 1_024;
+const _: () = assert!(GUARDIAN_MAX_CHECKPOINT_CHUNKS == 1_024);
+const CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES: u64 = GUARDIAN_MAX_CHECKPOINT_BYTES
+    + (CHECKPOINT_CATALOG_PROTOCOL_MAX_CHUNKS + 2) * CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES
+    + 336
+    + 400
+    + 424
+    + 32;
+const CHECKPOINT_CATALOG_MAX_RELEVANT_BYTES: u64 =
+    CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES * 16 + 344 * 8;
 
 #[derive(Clone, Copy, Debug)]
 struct GuardianCheckpointStagePolicy {
@@ -155,7 +188,12 @@ impl GuardianCheckpointStagePolicy {
             || u32::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES).ok()
                 != Some(GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)
             || CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES
-                != CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES + 16
+                != usize::try_from(GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES)
+                    .map_err(|_| GuardianOutputError::Allocation)?
+            || CHECKPOINT_STAGE_EXPIRY_PLAINTEXT_BYTES
+                != usize::try_from(GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES)
+                    .map_err(|_| GuardianOutputError::Allocation)?
+            || CHECKPOINT_STAGE_EXPIRY_PLAINTEXT_BYTES > CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES
             || self.max_retained_uploads > CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
             || self.max_stage_files < minimum_files
             || self.max_stage_files > CHECKPOINT_STAGE_MAX_FILES
@@ -171,7 +209,7 @@ impl GuardianCheckpointStagePolicy {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum GuardianOutputError {
+pub enum GuardianOutputError {
     #[error("guardian output path is not absolute and normalized")]
     InvalidPath,
     #[error("guardian output filesystem authority is invalid: {0}")]
@@ -197,7 +235,7 @@ impl GuardianOutputError {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum GuardianCheckpointStageStoreError {
+pub enum GuardianCheckpointStageStoreError {
     #[error("guardian checkpoint staging request is invalid")]
     Protocol(#[from] GuardianProtocolError),
     #[error("guardian checkpoint staging cipher rejected the record")]
@@ -243,7 +281,7 @@ impl GuardianCheckpointStageStoreError {
 // The store accepts final publication only when the runtime supplies the
 // independent non-forgeable live-capture or Genesis authority.
 #[allow(dead_code)]
-pub(crate) enum GuardianCheckpointOriginAuthority<'a> {
+pub enum GuardianCheckpointOriginAuthority<'a> {
     /// A nonconstructible live-capture authority plus independent recovery of
     /// the exact output-journal receipt named by the canonical descriptor.
     /// A wire descriptor or caller-supplied receipt is never sufficient.
@@ -326,6 +364,7 @@ enum CheckpointStageFileRole {
     Chunk { publication_id: Uuid, index: u32 },
     Seal { publication_id: Uuid },
     Ack { publication_id: Uuid },
+    Expired { publication_id: Uuid },
 }
 
 #[derive(Debug)]
@@ -410,6 +449,7 @@ struct CheckpointStageUploadInspection {
     committed_bytes: u64,
     seal_present: bool,
     ack_present: bool,
+    expiry_present: bool,
     candidate_identity: GuardianCheckpointCandidateIdentityV1,
     ordered_chunk_set_identity: Option<GuardianCheckpointOrderedChunkSetIdentityV1>,
 }
@@ -431,6 +471,132 @@ struct GuardianCheckpointStageStoreInner {
     durable_records: Mutex<Vec<FileIdentity>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CheckpointCatalogScope {
+    Pane { pane_id: Uuid },
+    Genesis { spawn_effect_id: Uuid },
+}
+
+impl CheckpointCatalogScope {
+    fn from_stage_scope(scope: CheckpointStagePathScope) -> Self {
+        match scope {
+            CheckpointStagePathScope::Pane { pane_id, .. } => Self::Pane { pane_id },
+            CheckpointStagePathScope::Genesis { spawn_effect_id } => {
+                Self::Genesis { spawn_effect_id }
+            }
+        }
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Pane { .. } => 1,
+            Self::Genesis { .. } => 2,
+        }
+    }
+
+    const fn identity(self) -> Uuid {
+        match self {
+            Self::Pane { pane_id } => pane_id,
+            Self::Genesis { spawn_effect_id } => spawn_effect_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointCatalogPredecessor {
+    generation: u64,
+    candidate_id: Uuid,
+    candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    checkpoint_id: [u8; 32],
+    boundary_id: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointCatalogIdentity {
+    scope: CheckpointCatalogScope,
+    generation: u64,
+    candidate_id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointCatalogMetadata {
+    identity: CheckpointCatalogIdentity,
+    predecessor: Option<CheckpointCatalogPredecessor>,
+    upload_id: Uuid,
+    completion_id: Uuid,
+    checkpoint_id: [u8; 32],
+    boundary_id: [u8; 32],
+    terminal_payload_digest: [u8; 32],
+    total_bytes: u64,
+    chunk_count: u32,
+    capture_generation: u64,
+    replay_semantics_id: [u8; 32],
+    rows: u32,
+    cols: u32,
+    adoption_mux_incarnation: Uuid,
+    adoption_effect_id: Uuid,
+    adoption_sequence: u64,
+}
+
+struct CheckpointCatalogCandidate {
+    metadata: CheckpointCatalogMetadata,
+    records: Vec<GuardianEncryptedCheckpointStageRecordV1>,
+    checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointCatalogMarker {
+    identity: CheckpointCatalogIdentity,
+    predecessor_generation: Option<u64>,
+    predecessor_candidate_id: Uuid,
+    predecessor_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    upload_id: Uuid,
+    completion_id: Uuid,
+    checkpoint_id: [u8; 32],
+    boundary_id: [u8; 32],
+    terminal_payload_digest: [u8; 32],
+    candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    adoption_mux_incarnation: Uuid,
+    adoption_effect_id: Uuid,
+    adoption_sequence: u64,
+}
+
+#[derive(Clone)]
+struct PublishedCheckpointCatalogMember {
+    metadata: CheckpointCatalogMetadata,
+    candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    candidate_path: PathBuf,
+    candidate_file_identity: FileIdentity,
+    marker_path: PathBuf,
+    marker_file_identity: FileIdentity,
+}
+
+struct CheckpointCatalogScan {
+    published: Vec<PublishedCheckpointCatalogMember>,
+    relevant_files: usize,
+    relevant_bytes: u64,
+}
+
+struct DiscoveredCheckpointCatalogCandidate {
+    identity: CheckpointCatalogIdentity,
+    path: PathBuf,
+    file_identity: FileIdentity,
+    bytes: u64,
+    published: bool,
+}
+
+struct DiscoveredCheckpointCatalogMarker {
+    marker: CheckpointCatalogMarker,
+    path: PathBuf,
+    file_identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointCatalogPathRole {
+    Candidate,
+    Marker,
+}
+
 /// Descriptor-relative, synchronously durable Phase-A checkpoint staging.
 ///
 /// These methods perform bounded filesystem and AEAD work and therefore must
@@ -438,7 +604,7 @@ struct GuardianCheckpointStageStoreInner {
 /// loop. Clones share one process-local gate; a directory `flock` coordinates
 /// cooperating guardian processes before deterministic `O_EXCL` publication.
 #[derive(Clone)]
-pub(crate) struct GuardianCheckpointStageStore {
+pub struct GuardianCheckpointStageStore {
     inner: Arc<GuardianCheckpointStageStoreInner>,
 }
 
@@ -942,7 +1108,7 @@ impl PaneJournalAuthority {
 
 /// Process-local append handle for one pane's bounded immutable segment chain.
 #[derive(Clone)]
-pub(crate) struct GuardianPaneOutputJournal {
+pub struct GuardianPaneOutputJournal {
     authority: Arc<Mutex<PaneJournalAuthority>>,
     initial_next_sequence: Option<u64>,
     initial_cumulative_plaintext_bytes: u64,
@@ -1063,7 +1229,9 @@ impl GuardianCheckpointStageStore {
             )
         })?;
         let name_max = checkpoint_stage_name_max(directory)?;
-        if name_max < checkpoint_stage_longest_name_bytes() {
+        if name_max
+            < checkpoint_stage_longest_name_bytes().max(checkpoint_catalog_longest_name_bytes())
+        {
             return Err(GuardianOutputError::FilesystemAuthority(
                 "guardian checkpoint filenames exceed the pinned directory name bound",
             ));
@@ -1229,122 +1397,168 @@ impl GuardianCheckpointStageStore {
         }
         let shape = CheckpointStageRequestShape::from_request(&request)?;
         self.with_exclusive_directory(|inner| {
-            let census = checkpoint_stage_census(inner)?;
-            if !census.entries.iter().any(|entry| entry.key == shape.key()) {
-                return Ok(GuardianCheckpointStageReplyV1::Absent {
-                    upload_id: shape.upload_id,
-                });
-            }
-            let inspection = checkpoint_inspect_upload(
-                inner,
-                &census,
-                &shape,
-                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
-            )?
-            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-            if !inspection.seal_present {
-                if inspection.next_index == 0 {
-                    return Ok(GuardianCheckpointStageReplyV1::Ready {
+            let recovered = (|| {
+                let census = checkpoint_stage_census(inner)?;
+                if !census.entries.iter().any(|entry| entry.key == shape.key()) {
+                    return Ok(GuardianCheckpointStageReplyV1::Absent {
                         upload_id: shape.upload_id,
-                        next_index: 0,
-                        committed_bytes: 0,
                     });
                 }
-                return Ok(GuardianCheckpointStageReplyV1::Progress {
-                    upload_id: shape.upload_id,
-                    next_index: inspection.next_index,
-                    committed_bytes: inspection.committed_bytes,
-                });
-            }
-            if inspection.next_index != shape.total_chunks
-                || inspection.committed_bytes != shape.total_bytes
-            {
-                return Err(GuardianCheckpointStageStoreError::Poisoned);
-            }
-            let ordered_chunk_set_identity = inspection
-                .ordered_chunk_set_identity
+                let inspection = checkpoint_inspect_upload(
+                    inner,
+                    &census,
+                    &shape,
+                    CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+                )?
                 .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-            let payload =
-                checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)?;
-            request.validate_staged_plaintext(payload.as_slice())?;
-            let seal_request = GuardianCheckpointStageRequestV1::seal(
-                shape.scope,
-                shape.upload_id,
-                shape.descriptor,
-                shape.chunk_bytes,
-            )?;
-            let seal_entry = census
-                .entries
-                .iter()
-                .find(|entry| {
-                    entry.key == shape.key()
-                        && entry.role
-                            == (CheckpointStageFileRole::Seal {
-                                publication_id: inspection.publication_id,
-                            })
-                })
-                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-            let (_, record, _) =
-                checkpoint_read_record(inner, seal_entry, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)?;
-            let completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
-                &shape.binding,
-                seal_request,
-                inspection.publication_id,
-                inspection.candidate_identity,
-                ordered_chunk_set_identity,
-                &record,
-            )?;
-            if inspection.ack_present {
-                let ack_request = GuardianCheckpointStageRequestV1::ack(
+                if !inspection.seal_present {
+                    if inspection.next_index == 0 {
+                        return Ok(GuardianCheckpointStageReplyV1::Ready {
+                            upload_id: shape.upload_id,
+                            next_index: 0,
+                            committed_bytes: 0,
+                        });
+                    }
+                    return Ok(GuardianCheckpointStageReplyV1::Progress {
+                        upload_id: shape.upload_id,
+                        next_index: inspection.next_index,
+                        committed_bytes: inspection.committed_bytes,
+                    });
+                }
+                if inspection.next_index != shape.total_chunks
+                    || inspection.committed_bytes != shape.total_bytes
+                {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+                let ordered_chunk_set_identity = inspection
+                    .ordered_chunk_set_identity
+                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                let seal_request = GuardianCheckpointStageRequestV1::seal(
                     shape.scope,
                     shape.upload_id,
                     shape.descriptor,
                     shape.chunk_bytes,
-                    inspection.publication_id,
                 )?;
-                let ack_entry = census
+                let seal_entry = census
                     .entries
                     .iter()
                     .find(|entry| {
                         entry.key == shape.key()
                             && entry.role
-                                == (CheckpointStageFileRole::Ack {
+                                == (CheckpointStageFileRole::Seal {
                                     publication_id: inspection.publication_id,
                                 })
                     })
                     .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-                let (_, ack_record, _) = checkpoint_read_record(
+                let (_, record, _) = checkpoint_read_record(
                     inner,
-                    ack_entry,
-                    u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
-                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                    seal_entry,
+                    GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
                 )?;
-                inner.cipher.inspect_ack_finalizer(
-                    &completion_receipt,
-                    &ack_request,
-                    &ack_record,
+                let completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
+                    &shape.binding,
+                    seal_request,
+                    inspection.publication_id,
+                    inspection.candidate_identity,
+                    ordered_chunk_set_identity,
+                    &record,
                 )?;
-                return Ok(GuardianCheckpointStageReplyV1::Acked {
+                let payload =
+                    checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)?;
+                request.validate_staged_plaintext(payload.as_slice())?;
+                if inspection.ack_present {
+                    let ack_request = GuardianCheckpointStageRequestV1::ack(
+                        shape.scope,
+                        shape.upload_id,
+                        shape.descriptor,
+                        shape.chunk_bytes,
+                        inspection.publication_id,
+                    )?;
+                    let ack_entry = census
+                        .entries
+                        .iter()
+                        .find(|entry| {
+                            entry.key == shape.key()
+                                && entry.role
+                                    == (CheckpointStageFileRole::Ack {
+                                        publication_id: inspection.publication_id,
+                                    })
+                        })
+                        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                    let (_, ack_record, _) = checkpoint_read_record(
+                        inner,
+                        ack_entry,
+                        u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
+                            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                    )?;
+                    inner.cipher.inspect_ack_finalizer(
+                        &completion_receipt,
+                        &ack_request,
+                        &ack_record,
+                    )?;
+                    return Ok(GuardianCheckpointStageReplyV1::Acked {
+                        upload_id: shape.upload_id,
+                        completion_id: inspection.publication_id,
+                        checkpoint_id: shape.descriptor.checkpoint_id(),
+                        boundary_id: shape.descriptor.boundary_id(),
+                        total_bytes: shape.total_bytes,
+                    });
+                }
+                if inspection.expiry_present {
+                    let expiry_entry = census
+                        .entries
+                        .iter()
+                        .find(|entry| {
+                            entry.key == shape.key()
+                                && entry.role
+                                    == (CheckpointStageFileRole::Expired {
+                                        publication_id: inspection.publication_id,
+                                    })
+                        })
+                        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                    let (_, expiry_record, _) = checkpoint_read_record(
+                        inner,
+                        expiry_entry,
+                        u32::try_from(CHECKPOINT_STAGE_EXPIRY_PLAINTEXT_BYTES)
+                            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                    )?;
+                    inner.cipher.inspect_expiry_finalizer(
+                        &completion_receipt,
+                        &request,
+                        &expiry_record,
+                    )?;
+                    return Ok(GuardianCheckpointStageReplyV1::Expired {
+                        upload_id: shape.upload_id,
+                        completion_id: inspection.publication_id,
+                        checkpoint_id: shape.descriptor.checkpoint_id(),
+                        boundary_id: shape.descriptor.boundary_id(),
+                        total_bytes: shape.total_bytes,
+                    });
+                }
+                Ok(GuardianCheckpointStageReplyV1::Sealed {
                     upload_id: shape.upload_id,
                     completion_id: inspection.publication_id,
                     checkpoint_id: shape.descriptor.checkpoint_id(),
                     boundary_id: shape.descriptor.boundary_id(),
                     total_bytes: shape.total_bytes,
-                });
+                })
+            })();
+            match recovered {
+                Err(
+                    GuardianCheckpointStageStoreError::Poisoned
+                    | GuardianCheckpointStageStoreError::Cipher(_),
+                ) => Ok(GuardianCheckpointStageReplyV1::Quarantined {
+                    upload_id: shape.upload_id,
+                }),
+                result => result,
             }
-            Ok(GuardianCheckpointStageReplyV1::Sealed {
-                upload_id: shape.upload_id,
-                completion_id: inspection.publication_id,
-                checkpoint_id: shape.descriptor.checkpoint_id(),
-                boundary_id: shape.descriptor.boundary_id(),
-                total_bytes: shape.total_bytes,
-            })
         })
     }
 
     pub(crate) fn apply_ack(
         &self,
         request: GuardianCheckpointStageRequestV1,
+        adoption_receipt: GuardianCheckpointReceipt,
     ) -> Result<GuardianCheckpointStageReplyV1, GuardianCheckpointStageStoreError> {
         if request.kind() != GuardianCheckpointStageKindV1::Ack {
             return Err(GuardianCheckpointStageStoreError::Conflict);
@@ -1367,6 +1581,9 @@ impl GuardianCheckpointStageStore {
                 || inspection.committed_bytes != shape.total_bytes
             {
                 return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+            }
+            if inspection.expiry_present {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
             }
             if requested_completion != inspection.publication_id {
                 return Err(GuardianCheckpointStageStoreError::Conflict);
@@ -1421,18 +1638,23 @@ impl GuardianCheckpointStageStore {
                     .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
                 let (_, ack_record, _) =
                     checkpoint_read_record(inner, ack_entry, ack_plaintext_bytes)?;
-                inner
-                    .cipher
-                    .inspect_ack_finalizer(&completion_receipt, &request, &ack_record)?;
+                inner.cipher.inspect_ack_finalizer_with_adoption(
+                    &completion_receipt,
+                    &request,
+                    adoption_receipt,
+                    &ack_record,
+                )?;
             } else {
                 let record_bytes =
                     checkpoint_record_bytes_for_plaintext(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)?;
                 checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes)?;
                 match checkpoint_create_record_new(inner, &ack_path)? {
                     CheckpointStageCreateOutcome::Created(file) => {
-                        let record = inner
-                            .cipher
-                            .seal_ack_finalizer(&completion_receipt, &request)?;
+                        let record = inner.cipher.seal_ack_finalizer(
+                            &completion_receipt,
+                            &request,
+                            adoption_receipt,
+                        )?;
                         checkpoint_write_created_record(inner, &ack_path, file, &record)?;
                     }
                     CheckpointStageCreateOutcome::Existing => {
@@ -1450,9 +1672,10 @@ impl GuardianCheckpointStageStore {
                             .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
                         let (_, ack_record, _) =
                             checkpoint_read_record(inner, ack_entry, ack_plaintext_bytes)?;
-                        inner.cipher.inspect_ack_finalizer(
+                        inner.cipher.inspect_ack_finalizer_with_adoption(
                             &completion_receipt,
                             &request,
+                            adoption_receipt,
                             &ack_record,
                         )?;
                     }
@@ -1466,6 +1689,167 @@ impl GuardianCheckpointStageStore {
                 total_bytes: shape.total_bytes,
             })
         })
+    }
+
+    /// Finalize one sealed-but-unadopted completion only under the opaque
+    /// policy receipt issued by the durable retention transaction.  This path
+    /// is intentionally not routed by the production worker until the catalog
+    /// and retained-recovery-generation fences exist.
+    #[allow(dead_code)]
+    pub(crate) fn apply_expiry(
+        &self,
+        request: GuardianCheckpointStageRequestV1,
+        expiry_receipt: GuardianCheckpointPolicyExpiryReceiptV1,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianCheckpointStageStoreError> {
+        if request.kind() != GuardianCheckpointStageKindV1::Query {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let shape = CheckpointStageRequestShape::from_request(&request)?;
+        self.with_exclusive_directory(|inner| {
+            let census = checkpoint_stage_census(inner)?;
+            let inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+            )?
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            if !inspection.seal_present
+                || inspection.next_index != shape.total_chunks
+                || inspection.committed_bytes != shape.total_bytes
+            {
+                return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+            }
+            if inspection.ack_present {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let ordered_chunk_set_identity = inspection
+                .ordered_chunk_set_identity
+                .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+            let payload =
+                checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)?;
+            request.validate_staged_plaintext(payload.as_slice())?;
+            let seal_request = GuardianCheckpointStageRequestV1::seal(
+                shape.scope,
+                shape.upload_id,
+                shape.descriptor,
+                shape.chunk_bytes,
+            )?;
+            let seal_entry = census
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.key == shape.key()
+                        && entry.role
+                            == (CheckpointStageFileRole::Seal {
+                                publication_id: inspection.publication_id,
+                            })
+                })
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let (_, seal_record, _) =
+                checkpoint_read_record(inner, seal_entry, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)?;
+            let completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
+                &shape.binding,
+                seal_request,
+                inspection.publication_id,
+                inspection.candidate_identity,
+                ordered_chunk_set_identity,
+                &seal_record,
+            )?;
+            let expiry_path =
+                checkpoint_expiry_path(inner, shape.key(), inspection.publication_id)?;
+            let expiry_plaintext_bytes = u32::try_from(CHECKPOINT_STAGE_EXPIRY_PLAINTEXT_BYTES)
+                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+            if inspection.expiry_present {
+                let expiry_entry = census
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.key == shape.key()
+                            && entry.role
+                                == (CheckpointStageFileRole::Expired {
+                                    publication_id: inspection.publication_id,
+                                })
+                    })
+                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                let (_, expiry_record, _) =
+                    checkpoint_read_record(inner, expiry_entry, expiry_plaintext_bytes)?;
+                inner.cipher.inspect_expiry_finalizer_with_policy(
+                    &completion_receipt,
+                    &request,
+                    &expiry_receipt,
+                    &expiry_record,
+                )?;
+            } else {
+                let record_bytes =
+                    checkpoint_record_bytes_for_plaintext(CHECKPOINT_STAGE_EXPIRY_PLAINTEXT_BYTES)?;
+                checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes)?;
+                match checkpoint_create_record_new(inner, &expiry_path)? {
+                    CheckpointStageCreateOutcome::Created(file) => {
+                        let record = inner.cipher.seal_expiry_finalizer(
+                            &completion_receipt,
+                            &request,
+                            expiry_receipt,
+                        )?;
+                        checkpoint_write_created_record(inner, &expiry_path, file, &record)?;
+                    }
+                    CheckpointStageCreateOutcome::Existing => {
+                        let refreshed = checkpoint_stage_census(inner)?;
+                        let expiry_entry = refreshed
+                            .entries
+                            .iter()
+                            .find(|entry| {
+                                entry.key == shape.key()
+                                    && entry.role
+                                        == (CheckpointStageFileRole::Expired {
+                                            publication_id: inspection.publication_id,
+                                        })
+                            })
+                            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                        let (_, expiry_record, _) =
+                            checkpoint_read_record(inner, expiry_entry, expiry_plaintext_bytes)?;
+                        inner.cipher.inspect_expiry_finalizer_with_policy(
+                            &completion_receipt,
+                            &request,
+                            &expiry_receipt,
+                            &expiry_record,
+                        )?;
+                    }
+                }
+            }
+            Ok(GuardianCheckpointStageReplyV1::Expired {
+                upload_id: shape.upload_id,
+                completion_id: inspection.publication_id,
+                checkpoint_id: shape.descriptor.checkpoint_id(),
+                boundary_id: shape.descriptor.boundary_id(),
+                total_bytes: shape.total_bytes,
+            })
+        })
+    }
+
+    /// Consume protocol-authenticated live-lease Seal authority and independently
+    /// bind it to the exact output-journal boundary recovered by this store.
+    pub(crate) fn apply_runtime_seal(
+        &self,
+        permit: GuardianCheckpointRuntimeSealPermitV1,
+        journal: &GuardianPaneOutputJournal,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianCheckpointStageStoreError> {
+        let shape = CheckpointStageRequestShape::from_request(permit.request())?;
+        if !matches!(shape.path_scope, CheckpointStagePathScope::Pane { .. }) {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        let (manifest_authority, request) =
+            GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit(
+                &shape.binding,
+                permit,
+            )?;
+        self.apply_seal(
+            request,
+            GuardianCheckpointOriginAuthority::Record {
+                journal,
+                manifest_authority,
+            },
+        )
     }
 
     pub(crate) fn apply_seal(
@@ -1581,6 +1965,138 @@ impl GuardianCheckpointStageStore {
                 boundary_id: shape.descriptor.boundary_id(),
                 total_bytes: shape.total_bytes,
             })
+        })
+    }
+
+    /// Storage-only catalog publication seam. Production routing remains
+    /// disabled until the mutation-sequenced Checkpoint transaction supplies
+    /// the non-forgeable adoption permit required by the next tranche.
+    #[allow(dead_code)]
+    pub(crate) fn publish_sealed_catalog_member(
+        &self,
+        request: &GuardianCheckpointStageRequestV1,
+        permit: GuardianCheckpointCatalogAdoptionPermitV1,
+    ) -> Result<(), GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| {
+            checkpoint_catalog_publish_sealed_stage(inner, request, &permit).map(|_| ())
+        })
+    }
+
+    /// Resolve the exact sealed Stage upload named by one authenticated
+    /// Checkpoint mutation, then publish it under that mutation's single-use
+    /// adoption authority.
+    pub(crate) fn publish_checkpoint_catalog_adoption(
+        &self,
+        permit: GuardianCheckpointCatalogAdoptionPermitV1,
+    ) -> Result<(), GuardianCheckpointStageStoreError> {
+        let pane_id = permit.pane_id();
+        let generation = permit.generation();
+        let intent = permit.intent();
+        self.with_exclusive_directory(|inner| {
+            let census = checkpoint_stage_census(inner)?;
+            let expected_scope = CheckpointStagePathScope::Pane {
+                pane_id,
+                generation,
+            };
+            let mut selected = None;
+            for entry in census.entries.iter().filter(|entry| {
+                entry.key.scope == expected_scope
+                    && entry.role == CheckpointStageFileRole::Candidate
+            }) {
+                let (_, plaintext) = checkpoint_open_record(
+                    inner,
+                    entry,
+                    u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                )?;
+                let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
+                if begin.kind() != GuardianCheckpointStageKindV1::Begin {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+                let shape = CheckpointStageRequestShape::from_request(&begin)?;
+                if shape.key() != entry.key {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+                if shape.descriptor.checkpoint_id() != intent.checkpoint_identity()
+                    || shape.descriptor.boundary_id() != intent.output_boundary_identity()
+                {
+                    continue;
+                }
+                let inspection = checkpoint_inspect_upload(
+                    inner,
+                    &census,
+                    &shape,
+                    CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+                )?
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                if !inspection.seal_present
+                    || inspection.ack_present
+                    || inspection.expiry_present
+                    || inspection.next_index != shape.total_chunks
+                    || inspection.committed_bytes != shape.total_bytes
+                {
+                    return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+                }
+                if selected.is_some() {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+                selected = Some(GuardianCheckpointStageRequestV1::seal(
+                    shape.scope,
+                    shape.upload_id,
+                    shape.descriptor,
+                    shape.chunk_bytes,
+                )?);
+            }
+            let request = selected.ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            checkpoint_catalog_publish_sealed_stage(inner, &request, &permit).map(|_| ())
+        })
+    }
+
+    /// Select only a checksum-bound published member with current replay
+    /// semantics. Directory entry timestamps are deliberately never read.
+    #[allow(dead_code)]
+    fn latest_compatible_catalog_member(
+        &self,
+        stage_scope: CheckpointStagePathScope,
+        replay_semantics_id: [u8; 32],
+    ) -> Result<Option<[u8; 32]>, GuardianCheckpointStageStoreError> {
+        if replay_semantics_id == [0; 32] {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        self.with_exclusive_directory(|inner| {
+            let scan = checkpoint_catalog_scan(
+                inner,
+                CheckpointCatalogScope::from_stage_scope(stage_scope),
+            )?;
+            Ok(scan
+                .published
+                .iter()
+                .rev()
+                .find(|member| member.metadata.replay_semantics_id == replay_semantics_id)
+                .map(|member| member.metadata.checkpoint_id))
+        })
+    }
+
+    /// Resolve one exact artifact identity from the published catalog only.
+    #[allow(dead_code)]
+    fn exact_catalog_member(
+        &self,
+        stage_scope: CheckpointStagePathScope,
+        checkpoint_id: [u8; 32],
+    ) -> Result<Option<[u8; 32]>, GuardianCheckpointStageStoreError> {
+        if checkpoint_id == [0; 32] {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        self.with_exclusive_directory(|inner| {
+            let scan = checkpoint_catalog_scan(
+                inner,
+                CheckpointCatalogScope::from_stage_scope(stage_scope),
+            )?;
+            Ok(scan
+                .published
+                .iter()
+                .find(|member| member.metadata.checkpoint_id == checkpoint_id)
+                .map(|member| member.metadata.checkpoint_id))
         })
     }
 
@@ -1735,6 +2251,101 @@ fn checkpoint_stage_longest_name_bytes() -> usize {
     .len()
 }
 
+fn checkpoint_catalog_base_name(identity: CheckpointCatalogIdentity) -> String {
+    let scope = match identity.scope {
+        CheckpointCatalogScope::Pane { pane_id } => format!("pane-{pane_id}"),
+        CheckpointCatalogScope::Genesis { spawn_effect_id } => {
+            format!("genesis-{spawn_effect_id}")
+        }
+    };
+    format!(
+        "{CHECKPOINT_CATALOG_FILE_PREFIX}{scope}.generation-{:020}.candidate-{}",
+        identity.generation, identity.candidate_id
+    )
+}
+
+fn checkpoint_catalog_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    identity: CheckpointCatalogIdentity,
+    role: CheckpointCatalogPathRole,
+) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
+    let suffix = match role {
+        CheckpointCatalogPathRole::Candidate => CHECKPOINT_CATALOG_CANDIDATE_SUFFIX,
+        CheckpointCatalogPathRole::Marker => CHECKPOINT_CATALOG_MARKER_SUFFIX,
+    };
+    let name = format!("{}{suffix}", checkpoint_catalog_base_name(identity));
+    if name.len() > inner.name_max {
+        return Err(GuardianCheckpointStageStoreError::NameLimit);
+    }
+    Ok(inner.directory_path.join(name))
+}
+
+fn checkpoint_catalog_longest_name_bytes() -> usize {
+    let identity = CheckpointCatalogIdentity {
+        scope: CheckpointCatalogScope::Genesis {
+            spawn_effect_id: Uuid::from_u128(u128::MAX),
+        },
+        generation: u64::MAX,
+        candidate_id: Uuid::from_u128(u128::MAX),
+    };
+    format!(
+        "{}{}",
+        checkpoint_catalog_base_name(identity),
+        CHECKPOINT_CATALOG_CANDIDATE_SUFFIX
+    )
+    .len()
+}
+
+fn checkpoint_catalog_parse_path(
+    name: &str,
+) -> Option<(CheckpointCatalogIdentity, CheckpointCatalogPathRole)> {
+    let (body, role) = if let Some(body) = name.strip_suffix(CHECKPOINT_CATALOG_CANDIDATE_SUFFIX) {
+        (body, CheckpointCatalogPathRole::Candidate)
+    } else {
+        (
+            name.strip_suffix(CHECKPOINT_CATALOG_MARKER_SUFFIX)?,
+            CheckpointCatalogPathRole::Marker,
+        )
+    };
+    let body = body.strip_prefix(CHECKPOINT_CATALOG_FILE_PREFIX)?;
+    let (scope_text, generation_and_candidate) = body.split_once(".generation-")?;
+    let (generation_text, candidate_text) = generation_and_candidate.split_once(".candidate-")?;
+    if generation_text.len() != 20 || !generation_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let generation = generation_text.parse::<u64>().ok()?;
+    let candidate_id = candidate_text.parse::<Uuid>().ok()?;
+    let scope = if let Some(pane_id) = scope_text.strip_prefix("pane-") {
+        CheckpointCatalogScope::Pane {
+            pane_id: pane_id.parse().ok()?,
+        }
+    } else {
+        let spawn_effect_id = scope_text.strip_prefix("genesis-")?;
+        CheckpointCatalogScope::Genesis {
+            spawn_effect_id: spawn_effect_id.parse().ok()?,
+        }
+    };
+    let identity = CheckpointCatalogIdentity {
+        scope,
+        generation,
+        candidate_id,
+    };
+    let expected = match role {
+        CheckpointCatalogPathRole::Candidate => format!(
+            "{}{}",
+            checkpoint_catalog_base_name(identity),
+            CHECKPOINT_CATALOG_CANDIDATE_SUFFIX
+        ),
+        CheckpointCatalogPathRole::Marker => format!(
+            "{}{}",
+            checkpoint_catalog_base_name(identity),
+            CHECKPOINT_CATALOG_MARKER_SUFFIX
+        ),
+    };
+    (name == expected && generation > 0 && !candidate_id.is_nil() && !scope.identity().is_nil())
+        .then_some((identity, role))
+}
+
 fn checkpoint_candidate_path(
     inner: &GuardianCheckpointStageStoreInner,
     key: CheckpointStageUploadKey,
@@ -1791,6 +2402,20 @@ fn checkpoint_ack_path(
     )
 }
 
+fn checkpoint_expiry_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    key: CheckpointStageUploadKey,
+    publication_id: Uuid,
+) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
+    checkpoint_stage_path(
+        inner,
+        format!(
+            "{}.publication-{publication_id}.expired{CHECKPOINT_STAGE_FILE_SUFFIX}",
+            key.base_name(),
+        ),
+    )
+}
+
 fn checkpoint_stage_path(
     inner: &GuardianCheckpointStageStoreInner,
     name: String,
@@ -1814,6 +2439,14 @@ fn checkpoint_stage_census(
     let mut total_bytes = 0_u64;
     for name in read_directory_names(&inner.directory)? {
         let raw = name.as_bytes();
+        // Stage uploads and the immutable published catalog intentionally
+        // share one pinned directory. The catalog owns the narrower
+        // `checkpoint-catalog-` namespace and validates every such entry in
+        // `checkpoint_catalog_scan`; do not misparse those files as malformed
+        // Stage upload names on an exact adoption retry.
+        if raw.starts_with(CHECKPOINT_CATALOG_FILE_PREFIX.as_bytes()) {
+            continue;
+        }
         if !raw.starts_with(CHECKPOINT_STAGE_FILE_PREFIX) {
             continue;
         }
@@ -1914,6 +2547,8 @@ fn checkpoint_parse_stage_name(
             CheckpointStageFileRole::Seal { publication_id }
         } else if rest == ".ack.ftgcp" {
             CheckpointStageFileRole::Ack { publication_id }
+        } else if rest == ".expired.ftgcp" {
+            CheckpointStageFileRole::Expired { publication_id }
         } else {
             let index_text = rest
                 .strip_prefix(".chunk-")
@@ -2284,6 +2919,11 @@ fn checkpoint_validate_context_path(
                 && context.publication_id() == publication_id
                 && context.chunk_position().is_none()
         }
+        CheckpointStageFileRole::Expired { publication_id } => {
+            context.kind() == GuardianCheckpointStageRecordKindV1::Finalizer
+                && context.publication_id() == publication_id
+                && context.chunk_position().is_none()
+        }
     };
     if matches {
         Ok(())
@@ -2322,6 +2962,7 @@ fn checkpoint_inspect_upload(
     let mut chunks = BTreeMap::new();
     let mut seal = None;
     let mut ack = None;
+    let mut expiry = None;
     for entry in census
         .entries
         .iter()
@@ -2348,10 +2989,15 @@ fn checkpoint_inspect_upload(
                     return Err(GuardianCheckpointStageStoreError::Poisoned);
                 }
             }
+            CheckpointStageFileRole::Expired { .. } => {
+                if expiry.replace(entry).is_some() {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+            }
         }
     }
     let Some(candidate) = candidate else {
-        return if chunks.is_empty() && seal.is_none() && ack.is_none() {
+        return if chunks.is_empty() && seal.is_none() && ack.is_none() && expiry.is_none() {
             Ok(None)
         } else {
             Err(GuardianCheckpointStageStoreError::Poisoned)
@@ -2359,7 +3005,8 @@ fn checkpoint_inspect_upload(
     };
     let seal_present = seal.is_some();
     let ack_present = ack.is_some();
-    if ack_present && !seal_present {
+    let expiry_present = expiry.is_some();
+    if (ack_present && expiry_present) || ((ack_present || expiry_present) && !seal_present) {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     if seal_present && matches!(seal_inspection, CheckpointStageSealInspection::Reject) {
@@ -2408,7 +3055,8 @@ fn checkpoint_inspect_upload(
             CheckpointStageFileRole::Chunk { publication_id, .. } => publication_id,
             CheckpointStageFileRole::Candidate
             | CheckpointStageFileRole::Seal { .. }
-            | CheckpointStageFileRole::Ack { .. } => {
+            | CheckpointStageFileRole::Ack { .. }
+            | CheckpointStageFileRole::Expired { .. } => {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
         };
@@ -2461,6 +3109,7 @@ fn checkpoint_inspect_upload(
         committed_bytes,
         seal_present,
         ack_present,
+        expiry_present,
         candidate_identity,
         ordered_chunk_set_identity,
     }))
@@ -2609,7 +3258,7 @@ fn checkpoint_zeroizing_sha256_digest(bytes: &[u8]) -> Zeroizing<[u8; 32]> {
 
 /// Descriptor-pinned encrypted input WAL owned by the live-input worker while
 /// one transaction is in flight.
-pub(crate) struct GuardianPaneInputJournal {
+pub struct GuardianPaneInputJournal {
     journal: GuardianInputJournal,
     directory: File,
     directory_path: PathBuf,
@@ -2618,9 +3267,9 @@ pub(crate) struct GuardianPaneInputJournal {
     persistence: Arc<PersistentOutputAuthority>,
 }
 
-pub(crate) type GuardianPaneInputTransaction = GuardianInputTransaction;
+pub type GuardianPaneInputTransaction = GuardianInputTransaction;
 
-pub(crate) enum GuardianPaneInputTransactionError {
+pub enum GuardianPaneInputTransactionError {
     Protocol(GuardianProtocolError),
     JournalBeforeWrite,
     AuthorityBeforeWrite,
@@ -2630,7 +3279,7 @@ pub(crate) enum GuardianPaneInputTransactionError {
     AcceptedProtocolUnavailable,
 }
 
-pub(crate) enum GuardianPaneInputCompletionError {
+pub enum GuardianPaneInputCompletionError {
     DispositionIndeterminate,
     Journal,
     Authority,
@@ -2761,22 +3410,22 @@ enum OutputCommitError {
     QueueInvariant,
 }
 
-pub(crate) struct GuardianOutputCompletion {
+pub struct GuardianOutputCompletion {
     pub(crate) pane_id: Uuid,
     pub(crate) payload_bytes: usize,
     pub(crate) result: Result<GuardianOutputAppendReceipt, GuardianOutputCommitFailure>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct GuardianOutputCommitFailure;
+pub struct GuardianOutputCommitFailure;
 
-pub(crate) enum GuardianOutputCompletionState {
+pub enum GuardianOutputCompletionState {
     Ready(GuardianOutputCompletion),
     Empty,
     Disconnected,
 }
 
-pub(crate) enum GuardianOutputSubmitError {
+pub enum GuardianOutputSubmitError {
     Saturated(Zeroizing<Vec<u8>>),
     Unavailable(Zeroizing<Vec<u8>>),
 }
@@ -2894,7 +3543,7 @@ impl OutputQueue {
 }
 
 /// Fixed-size worker pool plus secure per-pane journal factory.
-pub(crate) struct GuardianOutputPipeline {
+pub struct GuardianOutputPipeline {
     directory: File,
     directory_path: PathBuf,
     cipher: GuardianOutputCipher,
@@ -5198,6 +5847,1183 @@ fn validate_path_identity(path: &Path, identity: FileIdentity) -> Result<(), Gua
     Ok(())
 }
 
+fn checkpoint_catalog_checksum(
+    domain: &[u8],
+    bytes: &[u8],
+) -> [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn checkpoint_catalog_scope_from_wire(
+    tag: u8,
+    identity: Uuid,
+) -> Result<CheckpointCatalogScope, GuardianCheckpointStageStoreError> {
+    if identity.is_nil() {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    match tag {
+        1 => Ok(CheckpointCatalogScope::Pane { pane_id: identity }),
+        2 => Ok(CheckpointCatalogScope::Genesis {
+            spawn_effect_id: identity,
+        }),
+        _ => Err(GuardianCheckpointStageStoreError::Poisoned),
+    }
+}
+
+fn checkpoint_catalog_validate_metadata(
+    metadata: &CheckpointCatalogMetadata,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let predecessor_valid = match metadata.predecessor {
+        None => metadata.identity.generation == 1,
+        Some(predecessor) => {
+            predecessor.generation > 0
+                && predecessor.generation.checked_add(1) == Some(metadata.identity.generation)
+                && !predecessor.candidate_id.is_nil()
+                && predecessor.candidate_checksum != [0; OUTPUT_MANIFEST_CHECKSUM_BYTES]
+                && predecessor.checkpoint_id != [0; 32]
+                && predecessor.boundary_id != [0; 32]
+        }
+    };
+    if metadata.identity.scope.identity().is_nil()
+        || metadata.identity.generation == 0
+        || metadata.identity.candidate_id.is_nil()
+        || metadata.upload_id.is_nil()
+        || metadata.completion_id.is_nil()
+        || metadata.checkpoint_id == [0; 32]
+        || metadata.boundary_id == [0; 32]
+        || metadata.terminal_payload_digest == [0; 32]
+        || metadata.total_bytes == 0
+        || metadata.total_bytes > GUARDIAN_MAX_CHECKPOINT_BYTES
+        || metadata.chunk_count == 0
+        || metadata.chunk_count > GUARDIAN_MAX_CHECKPOINT_CHUNKS
+        || metadata.capture_generation == 0
+        || metadata.replay_semantics_id == [0; 32]
+        || metadata.rows == 0
+        || metadata.cols == 0
+        || metadata.adoption_mux_incarnation.is_nil()
+        || metadata.adoption_effect_id.is_nil()
+        || metadata.adoption_sequence == 0
+        || !predecessor_valid
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(())
+}
+
+fn checkpoint_catalog_encode_candidate(
+    candidate: &mut CheckpointCatalogCandidate,
+) -> Result<Vec<u8>, GuardianCheckpointStageStoreError> {
+    checkpoint_catalog_validate_metadata(&candidate.metadata)?;
+    let expected_records = usize::try_from(candidate.metadata.chunk_count)
+        .ok()
+        .and_then(|chunks| chunks.checked_add(2))
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    if candidate.records.len() != expected_records {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let record_bytes = candidate
+        .records
+        .iter()
+        .try_fold(0_usize, |total, record| {
+            total
+                .checked_add(GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES)
+                .and_then(|bytes| bytes.checked_add(record.ciphertext_bytes()))
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)
+        })?;
+    let total_bytes = CHECKPOINT_CATALOG_HEADER_BYTES
+        .checked_add(record_bytes)
+        .and_then(|bytes| bytes.checked_add(OUTPUT_MANIFEST_CHECKSUM_BYTES))
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    if u64::try_from(total_bytes)
+        .ok()
+        .is_none_or(|bytes| bytes == 0 || bytes > CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES)
+    {
+        return Err(GuardianCheckpointStageStoreError::Capacity);
+    }
+    let metadata = candidate.metadata;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(total_bytes)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    encoded.extend_from_slice(&CHECKPOINT_CATALOG_CANDIDATE_MAGIC);
+    encoded.extend_from_slice(&CHECKPOINT_CATALOG_VERSION.to_le_bytes());
+    encoded.push(metadata.identity.scope.tag());
+    encoded.push(u8::from(metadata.predecessor.is_some()));
+    encoded.extend_from_slice(&[0; 2]);
+    encoded.extend_from_slice(metadata.identity.scope.identity().as_bytes());
+    encoded.extend_from_slice(&metadata.identity.generation.to_le_bytes());
+    encoded.extend_from_slice(metadata.identity.candidate_id.as_bytes());
+    encoded.extend_from_slice(metadata.upload_id.as_bytes());
+    encoded.extend_from_slice(metadata.completion_id.as_bytes());
+    encoded.extend_from_slice(&metadata.checkpoint_id);
+    encoded.extend_from_slice(&metadata.boundary_id);
+    encoded.extend_from_slice(&metadata.terminal_payload_digest);
+    encoded.extend_from_slice(&metadata.total_bytes.to_le_bytes());
+    encoded.extend_from_slice(&metadata.chunk_count.to_le_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(candidate.records.len())
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(
+        &u64::try_from(record_bytes)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&metadata.capture_generation.to_le_bytes());
+    encoded.extend_from_slice(&metadata.replay_semantics_id);
+    encoded.extend_from_slice(&metadata.rows.to_le_bytes());
+    encoded.extend_from_slice(&metadata.cols.to_le_bytes());
+    encoded.extend_from_slice(metadata.adoption_mux_incarnation.as_bytes());
+    encoded.extend_from_slice(metadata.adoption_effect_id.as_bytes());
+    encoded.extend_from_slice(&metadata.adoption_sequence.to_le_bytes());
+    if let Some(predecessor) = metadata.predecessor {
+        encoded.extend_from_slice(&predecessor.generation.to_le_bytes());
+        encoded.extend_from_slice(predecessor.candidate_id.as_bytes());
+        encoded.extend_from_slice(&predecessor.candidate_checksum);
+        encoded.extend_from_slice(&predecessor.checkpoint_id);
+        encoded.extend_from_slice(&predecessor.boundary_id);
+    } else {
+        encoded.extend_from_slice(&[0; 120]);
+    }
+    encoded.extend_from_slice(&[0; 8]);
+    if encoded.len() != CHECKPOINT_CATALOG_HEADER_BYTES {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    for record in &candidate.records {
+        encoded.extend_from_slice(&record.fixed_header());
+        encoded.extend_from_slice(record.ciphertext());
+    }
+    candidate.checksum = checkpoint_catalog_checksum(CHECKPOINT_CATALOG_CHECKSUM_DOMAIN, &encoded);
+    encoded.extend_from_slice(&candidate.checksum);
+    if encoded.len() != total_bytes {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(encoded)
+}
+
+fn checkpoint_catalog_decode_candidate(
+    bytes: &[u8],
+) -> Result<CheckpointCatalogCandidate, GuardianCheckpointStageStoreError> {
+    if bytes.len() < CHECKPOINT_CATALOG_HEADER_BYTES + OUTPUT_MANIFEST_CHECKSUM_BYTES
+        || u64::try_from(bytes.len())
+            .ok()
+            .is_none_or(|length| length > CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES)
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let checksum_offset = bytes
+        .len()
+        .checked_sub(OUTPUT_MANIFEST_CHECKSUM_BYTES)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let mut checksum = [0; OUTPUT_MANIFEST_CHECKSUM_BYTES];
+    checksum.copy_from_slice(&bytes[checksum_offset..]);
+    if !checkpoint_bytes_match(
+        &checksum,
+        &checkpoint_catalog_checksum(
+            CHECKPOINT_CATALOG_CHECKSUM_DOMAIN,
+            &bytes[..checksum_offset],
+        ),
+    ) {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let mut decoder = ManifestDecoder::new(&bytes[..CHECKPOINT_CATALOG_HEADER_BYTES]);
+    if decoder.take::<8>()? != CHECKPOINT_CATALOG_CANDIDATE_MAGIC
+        || decoder.u32()? != CHECKPOINT_CATALOG_VERSION
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let scope_tag = decoder.take::<1>()?[0];
+    let predecessor_present = decoder.take::<1>()?[0];
+    if decoder.take::<2>()? != [0; 2] {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let scope = checkpoint_catalog_scope_from_wire(scope_tag, decoder.uuid()?)?;
+    let generation = decoder.u64()?;
+    let candidate_id = decoder.uuid()?;
+    let upload_id = decoder.uuid()?;
+    let completion_id = decoder.uuid()?;
+    let checkpoint_id = decoder.take::<32>()?;
+    let boundary_id = decoder.take::<32>()?;
+    let terminal_payload_digest = decoder.take::<32>()?;
+    let total_bytes = decoder.u64()?;
+    let chunk_count = decoder.u32()?;
+    let record_count = decoder.u32()?;
+    let record_bytes =
+        usize::try_from(decoder.u64()?).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let capture_generation = decoder.u64()?;
+    let replay_semantics_id = decoder.take::<32>()?;
+    let rows = decoder.u32()?;
+    let cols = decoder.u32()?;
+    let adoption_mux_incarnation = decoder.uuid()?;
+    let adoption_effect_id = decoder.uuid()?;
+    let adoption_sequence = decoder.u64()?;
+    let predecessor_generation = decoder.u64()?;
+    let predecessor_candidate_id = decoder.uuid()?;
+    let predecessor_checksum = decoder.take::<32>()?;
+    let predecessor_checkpoint_id = decoder.take::<32>()?;
+    let predecessor_boundary_id = decoder.take::<32>()?;
+    if decoder.take::<8>()? != [0; 8]
+        || decoder.offset != CHECKPOINT_CATALOG_HEADER_BYTES
+        || CHECKPOINT_CATALOG_HEADER_BYTES.checked_add(record_bytes) != Some(checksum_offset)
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let predecessor = match predecessor_present {
+        0 if predecessor_generation == 0
+            && predecessor_candidate_id.is_nil()
+            && predecessor_checksum == [0; 32]
+            && predecessor_checkpoint_id == [0; 32]
+            && predecessor_boundary_id == [0; 32] =>
+        {
+            None
+        }
+        1 => Some(CheckpointCatalogPredecessor {
+            generation: predecessor_generation,
+            candidate_id: predecessor_candidate_id,
+            candidate_checksum: predecessor_checksum,
+            checkpoint_id: predecessor_checkpoint_id,
+            boundary_id: predecessor_boundary_id,
+        }),
+        _ => return Err(GuardianCheckpointStageStoreError::Poisoned),
+    };
+    let metadata = CheckpointCatalogMetadata {
+        identity: CheckpointCatalogIdentity {
+            scope,
+            generation,
+            candidate_id,
+        },
+        predecessor,
+        upload_id,
+        completion_id,
+        checkpoint_id,
+        boundary_id,
+        terminal_payload_digest,
+        total_bytes,
+        chunk_count,
+        capture_generation,
+        replay_semantics_id,
+        rows,
+        cols,
+        adoption_mux_incarnation,
+        adoption_effect_id,
+        adoption_sequence,
+    };
+    checkpoint_catalog_validate_metadata(&metadata)?;
+    let expected_records = chunk_count
+        .checked_add(2)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    if record_count != expected_records {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let record_count =
+        usize::try_from(record_count).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(record_count)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    let mut offset = CHECKPOINT_CATALOG_HEADER_BYTES;
+    for _ in 0..record_count {
+        let header_end = offset
+            .checked_add(GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES)
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        let header = bytes
+            .get(offset..header_end)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        let ciphertext_bytes =
+            GuardianEncryptedCheckpointStageRecordV1::persisted_ciphertext_bytes(
+                header,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            )
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+        let record_end = header_end
+            .checked_add(ciphertext_bytes)
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        if record_end > checksum_offset {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        let mut ciphertext = Vec::new();
+        ciphertext
+            .try_reserve_exact(ciphertext_bytes)
+            .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+        ciphertext.extend_from_slice(&bytes[header_end..record_end]);
+        records.push(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                header,
+                ciphertext,
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            )
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?,
+        );
+        offset = record_end;
+    }
+    if offset != checksum_offset {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(CheckpointCatalogCandidate {
+        metadata,
+        records,
+        checksum,
+    })
+}
+
+fn checkpoint_catalog_marker_for_candidate(
+    candidate: &CheckpointCatalogCandidate,
+) -> CheckpointCatalogMarker {
+    let (predecessor_generation, predecessor_candidate_id, predecessor_checksum) = candidate
+        .metadata
+        .predecessor
+        .map_or((None, Uuid::nil(), [0; 32]), |predecessor| {
+            (
+                Some(predecessor.generation),
+                predecessor.candidate_id,
+                predecessor.candidate_checksum,
+            )
+        });
+    CheckpointCatalogMarker {
+        identity: candidate.metadata.identity,
+        predecessor_generation,
+        predecessor_candidate_id,
+        predecessor_checksum,
+        upload_id: candidate.metadata.upload_id,
+        completion_id: candidate.metadata.completion_id,
+        checkpoint_id: candidate.metadata.checkpoint_id,
+        boundary_id: candidate.metadata.boundary_id,
+        terminal_payload_digest: candidate.metadata.terminal_payload_digest,
+        candidate_checksum: candidate.checksum,
+        adoption_mux_incarnation: candidate.metadata.adoption_mux_incarnation,
+        adoption_effect_id: candidate.metadata.adoption_effect_id,
+        adoption_sequence: candidate.metadata.adoption_sequence,
+    }
+}
+
+fn checkpoint_catalog_encode_marker(marker: &CheckpointCatalogMarker) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(CHECKPOINT_CATALOG_MARKER_BYTES);
+    encoded.extend_from_slice(&CHECKPOINT_CATALOG_MARKER_MAGIC);
+    encoded.extend_from_slice(&CHECKPOINT_CATALOG_VERSION.to_le_bytes());
+    encoded.push(marker.identity.scope.tag());
+    encoded.push(u8::from(marker.predecessor_generation.is_some()));
+    encoded.extend_from_slice(&[0; 2]);
+    encoded.extend_from_slice(marker.identity.scope.identity().as_bytes());
+    encoded.extend_from_slice(&marker.identity.generation.to_le_bytes());
+    encoded.extend_from_slice(marker.identity.candidate_id.as_bytes());
+    encoded.extend_from_slice(&marker.candidate_checksum);
+    encoded.extend_from_slice(&marker.checkpoint_id);
+    encoded.extend_from_slice(&marker.boundary_id);
+    encoded.extend_from_slice(&marker.terminal_payload_digest);
+    encoded.extend_from_slice(marker.upload_id.as_bytes());
+    encoded.extend_from_slice(marker.completion_id.as_bytes());
+    encoded.extend_from_slice(&marker.predecessor_generation.unwrap_or(0).to_le_bytes());
+    encoded.extend_from_slice(marker.predecessor_candidate_id.as_bytes());
+    encoded.extend_from_slice(&marker.predecessor_checksum);
+    encoded.extend_from_slice(marker.adoption_mux_incarnation.as_bytes());
+    encoded.extend_from_slice(marker.adoption_effect_id.as_bytes());
+    encoded.extend_from_slice(&marker.adoption_sequence.to_le_bytes());
+    debug_assert_eq!(encoded.len(), CHECKPOINT_CATALOG_MARKER_BODY_BYTES);
+    let checksum = checkpoint_catalog_checksum(CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN, &encoded);
+    encoded.extend_from_slice(&checksum);
+    encoded
+}
+
+fn checkpoint_catalog_decode_marker(
+    bytes: &[u8],
+) -> Result<CheckpointCatalogMarker, GuardianCheckpointStageStoreError> {
+    if bytes.len() != CHECKPOINT_CATALOG_MARKER_BYTES {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let expected = checkpoint_catalog_checksum(
+        CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN,
+        &bytes[..CHECKPOINT_CATALOG_MARKER_BODY_BYTES],
+    );
+    if !checkpoint_bytes_match(&expected, &bytes[CHECKPOINT_CATALOG_MARKER_BODY_BYTES..]) {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let mut decoder = ManifestDecoder::new(&bytes[..CHECKPOINT_CATALOG_MARKER_BODY_BYTES]);
+    if decoder.take::<8>()? != CHECKPOINT_CATALOG_MARKER_MAGIC
+        || decoder.u32()? != CHECKPOINT_CATALOG_VERSION
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let scope_tag = decoder.take::<1>()?[0];
+    let predecessor_present = decoder.take::<1>()?[0];
+    if decoder.take::<2>()? != [0; 2] {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let scope = checkpoint_catalog_scope_from_wire(scope_tag, decoder.uuid()?)?;
+    let identity = CheckpointCatalogIdentity {
+        scope,
+        generation: decoder.u64()?,
+        candidate_id: decoder.uuid()?,
+    };
+    let candidate_checksum = decoder.take::<32>()?;
+    let checkpoint_id = decoder.take::<32>()?;
+    let boundary_id = decoder.take::<32>()?;
+    let terminal_payload_digest = decoder.take::<32>()?;
+    let upload_id = decoder.uuid()?;
+    let completion_id = decoder.uuid()?;
+    let predecessor_generation = decoder.u64()?;
+    let predecessor_candidate_id = decoder.uuid()?;
+    let predecessor_checksum = decoder.take::<32>()?;
+    let adoption_mux_incarnation = decoder.uuid()?;
+    let adoption_effect_id = decoder.uuid()?;
+    let adoption_sequence = decoder.u64()?;
+    if decoder.offset != CHECKPOINT_CATALOG_MARKER_BODY_BYTES
+        || identity.generation == 0
+        || identity.candidate_id.is_nil()
+        || upload_id.is_nil()
+        || completion_id.is_nil()
+        || candidate_checksum == [0; 32]
+        || checkpoint_id == [0; 32]
+        || boundary_id == [0; 32]
+        || terminal_payload_digest == [0; 32]
+        || adoption_mux_incarnation.is_nil()
+        || adoption_effect_id.is_nil()
+        || adoption_sequence == 0
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let predecessor_generation = match predecessor_present {
+        0 if predecessor_generation == 0
+            && predecessor_candidate_id.is_nil()
+            && predecessor_checksum == [0; 32] =>
+        {
+            None
+        }
+        1 if predecessor_generation > 0
+            && !predecessor_candidate_id.is_nil()
+            && predecessor_checksum != [0; 32] =>
+        {
+            Some(predecessor_generation)
+        }
+        _ => return Err(GuardianCheckpointStageStoreError::Poisoned),
+    };
+    Ok(CheckpointCatalogMarker {
+        identity,
+        predecessor_generation,
+        predecessor_candidate_id,
+        predecessor_checksum,
+        upload_id,
+        completion_id,
+        checkpoint_id,
+        boundary_id,
+        terminal_payload_digest,
+        candidate_checksum,
+        adoption_mux_incarnation,
+        adoption_effect_id,
+        adoption_sequence,
+    })
+}
+
+fn checkpoint_catalog_read_file(
+    inner: &GuardianCheckpointStageStoreInner,
+    path: &Path,
+    expected_identity: FileIdentity,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, GuardianCheckpointStageStoreError> {
+    let mut file = open_private_file_at(&inner.directory, &inner.directory_path, path, false)?;
+    let metadata_before = file.metadata().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-catalog-open-metadata", error)
+    })?;
+    validate_private_file_metadata(&metadata_before, expected_identity.expected_len)?;
+    if !expected_identity.matches(&metadata_before)
+        || metadata_before.len() == 0
+        || metadata_before.len() > maximum_bytes
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let length = usize::try_from(metadata_before.len())
+        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes).map_err(|error| {
+        if error.kind() == ErrorKind::UnexpectedEof {
+            GuardianCheckpointStageStoreError::Poisoned
+        } else {
+            GuardianCheckpointStageStoreError::io("checkpoint-catalog-read", error)
+        }
+    })?;
+    let metadata_after = file.metadata().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-catalog-final-metadata", error)
+    })?;
+    if !expected_identity.matches(&metadata_after) {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    validate_file_identity_at(
+        &inner.directory,
+        &inner.directory_path,
+        path,
+        expected_identity,
+    )?;
+    Ok(bytes)
+}
+
+fn checkpoint_catalog_validate_candidate_records(
+    inner: &GuardianCheckpointStageStoreInner,
+    candidate: &CheckpointCatalogCandidate,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let metadata = candidate.metadata;
+    checkpoint_catalog_validate_metadata(&metadata)?;
+    let expected_records = usize::try_from(metadata.chunk_count)
+        .ok()
+        .and_then(|chunks| chunks.checked_add(2))
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    if candidate.records.len() != expected_records {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let candidate_record = candidate
+        .records
+        .first()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let candidate_context = candidate_record.context();
+    if candidate_context.kind() != GuardianCheckpointStageRecordKindV1::CandidateMetadata
+        || candidate_context.publication_id() != metadata.completion_id
+        || candidate_context.plaintext_bytes()
+            != u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let begin_plaintext = inner.cipher.open(
+        &candidate_context,
+        candidate_record,
+        u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    )?;
+    let begin_request = GuardianCheckpointStageRequestV1::decode(&begin_plaintext)?;
+    if begin_request.kind() != GuardianCheckpointStageKindV1::Begin {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let shape = CheckpointStageRequestShape::from_request(&begin_request)?;
+    let canonical_begin = shape.begin_payload()?;
+    let total_bytes_match = shape.total_bytes == metadata.total_bytes;
+    let chunk_count_matches = shape.total_chunks == metadata.chunk_count;
+    let descriptor_geometry_matches =
+        shape.descriptor.rows() == metadata.rows && shape.descriptor.cols() == metadata.cols;
+    if !total_bytes_match
+        || !chunk_count_matches
+        || !descriptor_geometry_matches
+        || !checkpoint_bytes_match(&canonical_begin, &begin_plaintext)
+        || CheckpointCatalogScope::from_stage_scope(shape.path_scope) != metadata.identity.scope
+        || shape.upload_id != metadata.upload_id
+        || shape.descriptor.capture_generation() != metadata.capture_generation
+        || shape.descriptor.checkpoint_id().into_bytes() != metadata.checkpoint_id
+        || shape.descriptor.boundary_id().into_bytes() != metadata.boundary_id
+        || shape.descriptor.terminal_payload_digest() != metadata.terminal_payload_digest
+        || shape.descriptor.replay_semantics_id() != metadata.replay_semantics_id
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let candidate_identity =
+        GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(&canonical_begin)?;
+    let expected_candidate = GuardianCheckpointStageSealIntentV1::candidate_metadata(
+        &shape.binding,
+        shape.upload_id,
+        metadata.completion_id,
+        canonical_begin,
+    )?;
+    if !checkpoint_context_public_identity_matches(
+        &candidate_context,
+        &expected_candidate.context(),
+    ) {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+
+    let payload_bytes = usize::try_from(metadata.total_bytes)
+        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let mut payload = Zeroizing::new(Vec::new());
+    payload
+        .try_reserve_exact(payload_bytes)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    let mut chunk_set = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+        metadata.total_bytes,
+        shape.chunk_bytes,
+        metadata.chunk_count,
+    )?;
+    for index in 0..metadata.chunk_count {
+        let record_index = usize::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        let record = candidate
+            .records
+            .get(record_index)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        let context = record.context();
+        let offset = u64::from(index)
+            .checked_mul(u64::from(shape.chunk_bytes))
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        let expected_bytes = metadata
+            .total_bytes
+            .checked_sub(offset)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?
+            .min(u64::from(shape.chunk_bytes));
+        let expected_bytes_u32 = u32::try_from(expected_bytes)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+        let chunk = inner.cipher.open(&context, record, expected_bytes_u32)?;
+        if u64::try_from(chunk.len()).ok() != Some(expected_bytes) {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        chunk_set.push_authenticated_chunk(index, offset, &chunk)?;
+        payload.extend_from_slice(&chunk);
+        let expected = GuardianCheckpointStageSealIntentV1::chunk(
+            &shape.binding,
+            shape.upload_id,
+            metadata.completion_id,
+            index,
+            offset,
+            chunk,
+        )?;
+        if !checkpoint_context_public_identity_matches(&context, &expected.context()) {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+    }
+    if payload.len() != payload_bytes {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    shape.descriptor.validate_canonical_payload(&payload)?;
+    let ordered_chunk_set_identity = chunk_set.finish()?;
+    let seal_request = GuardianCheckpointStageRequestV1::seal(
+        shape.scope,
+        shape.upload_id,
+        shape.descriptor,
+        shape.chunk_bytes,
+    )?;
+    let seal_record = candidate
+        .records
+        .last()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    if seal_record.context().kind() != GuardianCheckpointStageRecordKindV1::SealManifest {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let _completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
+        &shape.binding,
+        seal_request,
+        metadata.completion_id,
+        candidate_identity,
+        ordered_chunk_set_identity,
+        seal_record,
+    )?;
+    Ok(())
+}
+
+fn checkpoint_catalog_marker_matches_candidate(
+    marker: &CheckpointCatalogMarker,
+    candidate: &CheckpointCatalogCandidate,
+) -> bool {
+    let expected = checkpoint_catalog_marker_for_candidate(candidate);
+    *marker == expected
+}
+
+fn checkpoint_catalog_validate_chain(
+    published: &mut Vec<PublishedCheckpointCatalogMember>,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    published.sort_by_key(|member| member.metadata.identity.generation);
+    let expected_scope = published
+        .first()
+        .map(|member| member.metadata.identity.scope);
+    let mut previous: Option<&PublishedCheckpointCatalogMember> = None;
+    let mut boundaries = BTreeMap::new();
+    let mut checkpoints = BTreeSet::new();
+    let mut adoption_effects = BTreeSet::new();
+    for member in published.iter() {
+        let expected_predecessor = previous.map(|prior| CheckpointCatalogPredecessor {
+            generation: prior.metadata.identity.generation,
+            candidate_id: prior.metadata.identity.candidate_id,
+            candidate_checksum: prior.candidate_checksum,
+            checkpoint_id: prior.metadata.checkpoint_id,
+            boundary_id: prior.metadata.boundary_id,
+        });
+        if Some(member.metadata.identity.scope) != expected_scope
+            || member.metadata.predecessor != expected_predecessor
+            || previous.is_none() != (member.metadata.identity.generation == 1)
+            || previous.is_some_and(|prior| {
+                prior.metadata.identity.generation.checked_add(1)
+                    != Some(member.metadata.identity.generation)
+            })
+            || !checkpoints.insert(member.metadata.checkpoint_id)
+            || !adoption_effects.insert(member.metadata.adoption_effect_id)
+            || previous.is_some_and(|prior| {
+                member.metadata.capture_generation < prior.metadata.capture_generation
+                    || (member.metadata.capture_generation == prior.metadata.capture_generation
+                        && (member.metadata.adoption_mux_incarnation
+                            != prior.metadata.adoption_mux_incarnation
+                            || member.metadata.adoption_sequence
+                                <= prior.metadata.adoption_sequence))
+            })
+        {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        if let Some(existing_checkpoint) =
+            boundaries.insert(member.metadata.boundary_id, member.metadata.checkpoint_id)
+            && existing_checkpoint != member.metadata.checkpoint_id
+        {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        previous = Some(member);
+    }
+    Ok(())
+}
+
+fn checkpoint_catalog_scan(
+    inner: &GuardianCheckpointStageStoreInner,
+    scope: CheckpointCatalogScope,
+) -> Result<CheckpointCatalogScan, GuardianCheckpointStageStoreError> {
+    let mut candidates = Vec::new();
+    let mut markers = Vec::new();
+    candidates
+        .try_reserve_exact(CHECKPOINT_CATALOG_MAX_RELEVANT_FILES)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    markers
+        .try_reserve_exact(CHECKPOINT_CATALOG_MAX_RELEVANT_FILES)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    let mut relevant_files = 0_usize;
+    let mut relevant_bytes = 0_u64;
+    for file_name in read_directory_names(&inner.directory)? {
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(CHECKPOINT_CATALOG_FILE_PREFIX) {
+            continue;
+        }
+        let (identity, role) = checkpoint_catalog_parse_path(name)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        if identity.scope != scope {
+            continue;
+        }
+        relevant_files = relevant_files
+            .checked_add(1)
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        if relevant_files > CHECKPOINT_CATALOG_MAX_RELEVANT_FILES {
+            return Err(GuardianCheckpointStageStoreError::Capacity);
+        }
+        let path = inner.directory_path.join(&file_name);
+        let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+        let metadata = file.metadata().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-catalog-census-metadata", error)
+        })?;
+        validate_private_file_metadata(&metadata, None)?;
+        let file_identity = FileIdentity::capture(&metadata, Some(metadata.len()));
+        validate_file_identity_at(
+            &inner.directory,
+            &inner.directory_path,
+            &path,
+            file_identity,
+        )?;
+        relevant_bytes = relevant_bytes
+            .checked_add(metadata.len())
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        if relevant_bytes > CHECKPOINT_CATALOG_MAX_RELEVANT_BYTES {
+            return Err(GuardianCheckpointStageStoreError::Capacity);
+        }
+        match role {
+            CheckpointCatalogPathRole::Candidate => {
+                if metadata.len() == 0 || metadata.len() > CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+                candidates.push(DiscoveredCheckpointCatalogCandidate {
+                    identity,
+                    path,
+                    file_identity,
+                    bytes: metadata.len(),
+                    published: false,
+                });
+            }
+            CheckpointCatalogPathRole::Marker => {
+                if metadata.len()
+                    != u64::try_from(CHECKPOINT_CATALOG_MARKER_BYTES)
+                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
+                {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+                let bytes = checkpoint_catalog_read_file(
+                    inner,
+                    &path,
+                    file_identity,
+                    u64::try_from(CHECKPOINT_CATALOG_MARKER_BYTES)
+                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                )?;
+                let marker = checkpoint_catalog_decode_marker(&bytes)?;
+                if marker.identity != identity {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+                markers.push(DiscoveredCheckpointCatalogMarker {
+                    marker,
+                    path,
+                    file_identity,
+                });
+            }
+        }
+    }
+
+    if markers.len() > CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS {
+        return Err(GuardianCheckpointStageStoreError::Capacity);
+    }
+    let mut published = Vec::new();
+    published
+        .try_reserve_exact(markers.len())
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    for discovered_marker in markers {
+        let candidate_entry = candidates
+            .iter_mut()
+            .find(|candidate| candidate.identity == discovered_marker.marker.identity)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        if candidate_entry.published {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        let candidate_bytes = checkpoint_catalog_read_file(
+            inner,
+            &candidate_entry.path,
+            candidate_entry.file_identity,
+            CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+        )?;
+        if u64::try_from(candidate_bytes.len()).ok() != Some(candidate_entry.bytes) {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        let candidate = checkpoint_catalog_decode_candidate(&candidate_bytes)?;
+        if candidate.metadata.identity != candidate_entry.identity
+            || !checkpoint_catalog_marker_matches_candidate(&discovered_marker.marker, &candidate)
+        {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
+        candidate_entry.published = true;
+        published.push(PublishedCheckpointCatalogMember {
+            metadata: candidate.metadata,
+            candidate_checksum: candidate.checksum,
+            candidate_path: candidate_entry.path.clone(),
+            candidate_file_identity: candidate_entry.file_identity,
+            marker_path: discovered_marker.path,
+            marker_file_identity: discovered_marker.file_identity,
+        });
+    }
+    checkpoint_catalog_validate_chain(&mut published)?;
+    Ok(CheckpointCatalogScan {
+        published,
+        relevant_files,
+        relevant_bytes,
+    })
+}
+
+fn checkpoint_catalog_stage_records(
+    inner: &GuardianCheckpointStageStoreInner,
+    census: &CheckpointStageCensus,
+    shape: &CheckpointStageRequestShape,
+    inspection: &CheckpointStageUploadInspection,
+) -> Result<Vec<GuardianEncryptedCheckpointStageRecordV1>, GuardianCheckpointStageStoreError> {
+    let complete_geometry = inspection.next_index == shape.total_chunks
+        && inspection.committed_bytes == shape.total_bytes;
+    if !complete_geometry || !inspection.seal_present || inspection.expiry_present {
+        return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+    }
+    let record_count = usize::try_from(shape.total_chunks)
+        .ok()
+        .and_then(|chunks| chunks.checked_add(2))
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(record_count)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    let candidate_entry = census
+        .entries
+        .iter()
+        .find(|entry| entry.key == shape.key() && entry.role == CheckpointStageFileRole::Candidate)
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let (_, candidate_record, _) = checkpoint_read_record(
+        inner,
+        candidate_entry,
+        u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    )?;
+    records.push(candidate_record);
+    for index in 0..shape.total_chunks {
+        let entry = census
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.key == shape.key()
+                    && entry.role
+                        == CheckpointStageFileRole::Chunk {
+                            publication_id: inspection.publication_id,
+                            index,
+                        }
+            })
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        let remaining = shape
+            .total_bytes
+            .checked_sub(
+                u64::from(index)
+                    .checked_mul(u64::from(shape.chunk_bytes))
+                    .ok_or(GuardianCheckpointStageStoreError::Capacity)?,
+            )
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        let max_plaintext_bytes = u32::try_from(remaining.min(u64::from(shape.chunk_bytes)))
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+        let (_, record, _) = checkpoint_read_record(inner, entry, max_plaintext_bytes)?;
+        records.push(record);
+    }
+    let seal_entry = census
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.key == shape.key()
+                && entry.role
+                    == CheckpointStageFileRole::Seal {
+                        publication_id: inspection.publication_id,
+                    }
+        })
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let (_, seal_record, _) =
+        checkpoint_read_record(inner, seal_entry, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)?;
+    records.push(seal_record);
+    if records.len() != record_count {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(records)
+}
+
+fn checkpoint_catalog_candidate_from_sealed_stage(
+    inner: &GuardianCheckpointStageStoreInner,
+    request: &GuardianCheckpointStageRequestV1,
+    identity: CheckpointCatalogIdentity,
+    predecessor: Option<CheckpointCatalogPredecessor>,
+    permit: &GuardianCheckpointCatalogAdoptionPermitV1,
+) -> Result<CheckpointCatalogCandidate, GuardianCheckpointStageStoreError> {
+    if request.kind() != GuardianCheckpointStageKindV1::Seal {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let shape = CheckpointStageRequestShape::from_request(request)?;
+    let intent = permit.intent();
+    if !matches!(identity.scope, CheckpointCatalogScope::Pane { .. })
+        || CheckpointCatalogScope::from_stage_scope(shape.path_scope) != identity.scope
+        || permit.pane_id() != identity.scope.identity()
+        || permit.generation() != shape.descriptor.capture_generation()
+        || permit.mux_incarnation().is_nil()
+        || permit.sequence() == 0
+        || permit.effect_id().is_nil()
+        || intent.checkpoint_identity().into_bytes()
+            != shape.descriptor.checkpoint_id().into_bytes()
+        || intent.output_boundary_identity().into_bytes()
+            != shape.descriptor.boundary_id().into_bytes()
+    {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let census = checkpoint_stage_census(inner)?;
+    let inspection = checkpoint_inspect_upload(
+        inner,
+        &census,
+        &shape,
+        CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+    )?
+    .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    let payload = checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)?;
+    shape.descriptor.validate_canonical_payload(&payload)?;
+    let records = checkpoint_catalog_stage_records(inner, &census, &shape, &inspection)?;
+    let candidate = CheckpointCatalogCandidate {
+        metadata: CheckpointCatalogMetadata {
+            identity,
+            predecessor,
+            upload_id: shape.upload_id,
+            completion_id: inspection.publication_id,
+            checkpoint_id: shape.descriptor.checkpoint_id().into_bytes(),
+            boundary_id: shape.descriptor.boundary_id().into_bytes(),
+            terminal_payload_digest: shape.descriptor.terminal_payload_digest(),
+            total_bytes: shape.total_bytes,
+            chunk_count: shape.total_chunks,
+            capture_generation: shape.descriptor.capture_generation(),
+            replay_semantics_id: shape.descriptor.replay_semantics_id(),
+            rows: shape.descriptor.rows(),
+            cols: shape.descriptor.cols(),
+            adoption_mux_incarnation: permit.mux_incarnation(),
+            adoption_effect_id: permit.effect_id(),
+            adoption_sequence: permit.sequence(),
+        },
+        records,
+        checksum: [0; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    };
+    checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
+    Ok(candidate)
+}
+
+fn checkpoint_catalog_create_file(
+    inner: &GuardianCheckpointStageStoreInner,
+    path: &Path,
+    bytes: &[u8],
+    write_site: &'static str,
+    sync_site: &'static str,
+) -> Result<FileIdentity, GuardianCheckpointStageStoreError> {
+    let mut file = create_private_file_new_at(&inner.directory, &inner.directory_path, path)?;
+    file.write_all(bytes)
+        .map_err(|error| GuardianCheckpointStageStoreError::io(write_site, error))?;
+    file.sync_all()
+        .map_err(|error| GuardianCheckpointStageStoreError::io(sync_site, error))?;
+    let expected_len =
+        u64::try_from(bytes.len()).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let metadata = file.metadata().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-catalog-created-metadata", error)
+    })?;
+    validate_private_file_metadata(&metadata, Some(expected_len))?;
+    let identity = FileIdentity::capture(&metadata, Some(expected_len));
+    validate_file_identity_at(&inner.directory, &inner.directory_path, path, identity)?;
+    Ok(identity)
+}
+
+fn checkpoint_catalog_publish_sealed_stage(
+    inner: &GuardianCheckpointStageStoreInner,
+    request: &GuardianCheckpointStageRequestV1,
+    permit: &GuardianCheckpointCatalogAdoptionPermitV1,
+) -> Result<PublishedCheckpointCatalogMember, GuardianCheckpointStageStoreError> {
+    if request.kind() != GuardianCheckpointStageKindV1::Seal {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let shape = CheckpointStageRequestShape::from_request(request)?;
+    let scope = CheckpointCatalogScope::from_stage_scope(shape.path_scope);
+    let scan = checkpoint_catalog_scan(inner, scope)?;
+    if let Some(existing) = scan.published.iter().find(|member| {
+        member.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
+            || member.metadata.boundary_id == shape.descriptor.boundary_id().into_bytes()
+    }) {
+        if existing.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
+            && existing.metadata.boundary_id == shape.descriptor.boundary_id().into_bytes()
+            && existing.metadata.upload_id == shape.upload_id
+            && existing.metadata.adoption_mux_incarnation == permit.mux_incarnation()
+            && existing.metadata.adoption_effect_id == permit.effect_id()
+            && existing.metadata.adoption_sequence == permit.sequence()
+        {
+            return Ok(existing.clone());
+        }
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    if scan.published.len() >= CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS
+        || scan
+            .relevant_files
+            .checked_add(2)
+            .is_none_or(|files| files > CHECKPOINT_CATALOG_MAX_RELEVANT_FILES)
+    {
+        return Err(GuardianCheckpointStageStoreError::Capacity);
+    }
+    let predecessor = scan
+        .published
+        .last()
+        .map(|member| CheckpointCatalogPredecessor {
+            generation: member.metadata.identity.generation,
+            candidate_id: member.metadata.identity.candidate_id,
+            candidate_checksum: member.candidate_checksum,
+            checkpoint_id: member.metadata.checkpoint_id,
+            boundary_id: member.metadata.boundary_id,
+        });
+    let generation = predecessor.map_or(1, |previous| previous.generation.saturating_add(1));
+    if generation == u64::MAX && predecessor.is_some_and(|previous| previous.generation == u64::MAX)
+    {
+        return Err(GuardianCheckpointStageStoreError::Capacity);
+    }
+    for _ in 0..OUTPUT_PATH_COLLISION_ATTEMPTS {
+        let identity = CheckpointCatalogIdentity {
+            scope,
+            generation,
+            candidate_id: Uuid::new_v4(),
+        };
+        let mut candidate = checkpoint_catalog_candidate_from_sealed_stage(
+            inner,
+            request,
+            identity,
+            predecessor,
+            permit,
+        )?;
+        let encoded_candidate = checkpoint_catalog_encode_candidate(&mut candidate)?;
+        let marker = checkpoint_catalog_marker_for_candidate(&candidate);
+        let encoded_marker = checkpoint_catalog_encode_marker(&marker);
+        let added_bytes = u64::try_from(encoded_candidate.len())
+            .ok()
+            .and_then(|bytes| {
+                u64::try_from(encoded_marker.len())
+                    .ok()
+                    .and_then(|marker| bytes.checked_add(marker))
+            })
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        if scan
+            .relevant_bytes
+            .checked_add(added_bytes)
+            .is_none_or(|bytes| bytes > CHECKPOINT_CATALOG_MAX_RELEVANT_BYTES)
+        {
+            return Err(GuardianCheckpointStageStoreError::Capacity);
+        }
+        let candidate_path =
+            checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Candidate)?;
+        let candidate_file_identity = match checkpoint_catalog_create_file(
+            inner,
+            &candidate_path,
+            &encoded_candidate,
+            "checkpoint-catalog-candidate-write",
+            "checkpoint-catalog-candidate-sync",
+        ) {
+            Ok(identity) => identity,
+            Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
+                source,
+                ..
+            })) if source.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        inner.directory.sync_all().map_err(|error| {
+            GuardianCheckpointStageStoreError::io(
+                "checkpoint-catalog-candidate-directory-sync",
+                error,
+            )
+        })?;
+        validate_file_identity_at(
+            &inner.directory,
+            &inner.directory_path,
+            &candidate_path,
+            candidate_file_identity,
+        )?;
+        let marker_path =
+            checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Marker)?;
+        let marker_file_identity = checkpoint_catalog_create_file(
+            inner,
+            &marker_path,
+            &encoded_marker,
+            "checkpoint-catalog-marker-write",
+            "checkpoint-catalog-marker-sync",
+        )?;
+        inner.directory.sync_all().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-catalog-marker-directory-sync", error)
+        })?;
+        validate_file_identity_at(
+            &inner.directory,
+            &inner.directory_path,
+            &candidate_path,
+            candidate_file_identity,
+        )?;
+        validate_file_identity_at(
+            &inner.directory,
+            &inner.directory_path,
+            &marker_path,
+            marker_file_identity,
+        )?;
+        let recovered = checkpoint_catalog_scan(inner, scope)?;
+        let head = recovered
+            .published
+            .last()
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        if head.metadata.identity != identity
+            || head.candidate_checksum != candidate.checksum
+            || head.candidate_path != candidate_path
+            || head.candidate_file_identity != candidate_file_identity
+            || head.marker_path != marker_path
+            || head.marker_file_identity != marker_file_identity
+        {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        return Ok(head.clone());
+    }
+    Err(GuardianCheckpointStageStoreError::Conflict)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5215,7 +7041,7 @@ mod tests {
     }
 
     fn kept_private_directory(prefix: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let canonical_temp = std::fs::canonicalize(std::env::temp_dir())?;
+        let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix(prefix)
             .tempdir_in(canonical_temp)?
@@ -5446,6 +7272,15 @@ mod tests {
             checkpoint_parse_stage_name(ack_name.as_bytes()).expect("parse canonical ACK"),
             (key, CheckpointStageFileRole::Ack { publication_id },)
         );
+        let expired_name = format!(
+            "{}.publication-{publication_id}.expired{CHECKPOINT_STAGE_FILE_SUFFIX}",
+            key.base_name(),
+        );
+        assert_eq!(
+            checkpoint_parse_stage_name(expired_name.as_bytes())
+                .expect("parse canonical expiry finalizer"),
+            (key, CheckpointStageFileRole::Expired { publication_id },)
+        );
 
         let uppercase =
             chunk_name.replace(&pane_id.to_string(), &pane_id.to_string().to_uppercase());
@@ -5470,6 +7305,255 @@ mod tests {
             checkpoint_parse_stage_name(&invalid_utf8),
             Err(GuardianCheckpointStageStoreError::Poisoned)
         ));
+    }
+
+    fn checkpoint_catalog_test_marker(
+        identity: CheckpointCatalogIdentity,
+    ) -> CheckpointCatalogMarker {
+        CheckpointCatalogMarker {
+            identity,
+            predecessor_generation: None,
+            predecessor_candidate_id: Uuid::nil(),
+            predecessor_checksum: [0; 32],
+            upload_id: Uuid::from_u128(0xc001),
+            completion_id: Uuid::from_u128(0xc002),
+            checkpoint_id: [0x31; 32],
+            boundary_id: [0x32; 32],
+            terminal_payload_digest: [0x33; 32],
+            candidate_checksum: [0x34; 32],
+            adoption_mux_incarnation: Uuid::from_u128(0xc003),
+            adoption_effect_id: Uuid::from_u128(0xc004),
+            adoption_sequence: 1,
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_name_grammar_is_canonical_and_bounded() {
+        let identity = CheckpointCatalogIdentity {
+            scope: CheckpointCatalogScope::Pane {
+                pane_id: Uuid::from_u128(0xc1),
+            },
+            generation: 7,
+            candidate_id: Uuid::from_u128(0xc2),
+        };
+        for role in [
+            CheckpointCatalogPathRole::Candidate,
+            CheckpointCatalogPathRole::Marker,
+        ] {
+            let suffix = match role {
+                CheckpointCatalogPathRole::Candidate => CHECKPOINT_CATALOG_CANDIDATE_SUFFIX,
+                CheckpointCatalogPathRole::Marker => CHECKPOINT_CATALOG_MARKER_SUFFIX,
+            };
+            let name = format!("{}{suffix}", checkpoint_catalog_base_name(identity));
+            assert_eq!(checkpoint_catalog_parse_path(&name), Some((identity, role)));
+            assert!(checkpoint_catalog_parse_path(&name.to_uppercase()).is_none());
+        }
+        assert!(checkpoint_catalog_longest_name_bytes() <= 255);
+    }
+
+    #[test]
+    fn checkpoint_catalog_candidate_without_marker_is_ignored()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-candidate-cut-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let scope = CheckpointCatalogScope::Pane {
+            pane_id: Uuid::from_u128(0xc3),
+        };
+        let identity = CheckpointCatalogIdentity {
+            scope,
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xc4),
+        };
+        let path =
+            checkpoint_catalog_path(&store.inner, identity, CheckpointCatalogPathRole::Candidate)?;
+        checkpoint_catalog_create_file(
+            &store.inner,
+            &path,
+            b"crash-before-candidate-file-sync-completed",
+            "checkpoint-catalog-test-candidate-write",
+            "checkpoint-catalog-test-candidate-sync",
+        )?;
+        store.inner.directory.sync_all()?;
+        let scan = checkpoint_catalog_scan(&store.inner, scope)?;
+        assert!(scan.published.is_empty());
+        assert_eq!(scan.relevant_files, 1);
+        assert_eq!(
+            std::fs::read(path)?,
+            b"crash-before-candidate-file-sync-completed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_marker_without_candidate_quarantines_exact_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-marker-cut-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let scope = CheckpointCatalogScope::Genesis {
+            spawn_effect_id: Uuid::from_u128(0xc5),
+        };
+        let identity = CheckpointCatalogIdentity {
+            scope,
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xc6),
+        };
+        let path =
+            checkpoint_catalog_path(&store.inner, identity, CheckpointCatalogPathRole::Marker)?;
+        let marker_value = checkpoint_catalog_test_marker(identity);
+        let marker = checkpoint_catalog_encode_marker(&marker_value);
+        checkpoint_catalog_create_file(
+            &store.inner,
+            &path,
+            &marker,
+            "checkpoint-catalog-test-marker-write",
+            "checkpoint-catalog-test-marker-sync",
+        )?;
+        store.inner.directory.sync_all()?;
+        assert!(matches!(
+            checkpoint_catalog_scan(&store.inner, scope),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        assert_eq!(std::fs::read(path)?, marker);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_marker_every_byte_is_checksum_bound() {
+        let identity = CheckpointCatalogIdentity {
+            scope: CheckpointCatalogScope::Pane {
+                pane_id: Uuid::from_u128(0xc7),
+            },
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xc8),
+        };
+        let marker_value = checkpoint_catalog_test_marker(identity);
+        let marker = checkpoint_catalog_encode_marker(&marker_value);
+        assert_eq!(
+            checkpoint_catalog_decode_marker(&marker).expect("decode canonical marker"),
+            checkpoint_catalog_test_marker(identity)
+        );
+        for index in 0..marker.len() {
+            let mut mutated = marker.clone();
+            mutated[index] ^= 1;
+            assert!(
+                checkpoint_catalog_decode_marker(&mutated).is_err(),
+                "byte {index}"
+            );
+        }
+    }
+
+    fn checkpoint_catalog_test_member(
+        scope: CheckpointCatalogScope,
+        generation: u64,
+        predecessor: Option<&PublishedCheckpointCatalogMember>,
+        identity_byte: u8,
+    ) -> PublishedCheckpointCatalogMember {
+        let candidate_id = Uuid::from_u128(u128::from(identity_byte) + 1);
+        let candidate_checksum = [identity_byte.wrapping_add(0x40); 32];
+        let predecessor = predecessor.map(|prior| CheckpointCatalogPredecessor {
+            generation: prior.metadata.identity.generation,
+            candidate_id: prior.metadata.identity.candidate_id,
+            candidate_checksum: prior.candidate_checksum,
+            checkpoint_id: prior.metadata.checkpoint_id,
+            boundary_id: prior.metadata.boundary_id,
+        });
+        let file_identity = FileIdentity {
+            device: 1,
+            inode: u64::from(identity_byte) + 1,
+            mode: 0o100600,
+            owner: geteuid().as_raw(),
+            links: 1,
+            expected_len: Some(1),
+        };
+        PublishedCheckpointCatalogMember {
+            metadata: CheckpointCatalogMetadata {
+                identity: CheckpointCatalogIdentity {
+                    scope,
+                    generation,
+                    candidate_id,
+                },
+                predecessor,
+                upload_id: Uuid::from_u128(u128::from(identity_byte) + 0x100),
+                completion_id: Uuid::from_u128(u128::from(identity_byte) + 0x200),
+                checkpoint_id: [identity_byte.wrapping_add(1); 32],
+                boundary_id: [identity_byte.wrapping_add(0x20); 32],
+                terminal_payload_digest: [identity_byte.wrapping_add(0x30); 32],
+                total_bytes: 1,
+                chunk_count: 1,
+                capture_generation: 1,
+                replay_semantics_id: [0x55; 32],
+                rows: 24,
+                cols: 80,
+                adoption_mux_incarnation: Uuid::from_u128(0x300),
+                adoption_effect_id: Uuid::from_u128(u128::from(identity_byte) + 0x400),
+                adoption_sequence: generation,
+            },
+            candidate_checksum,
+            candidate_path: PathBuf::from(format!("candidate-{identity_byte}")),
+            candidate_file_identity: file_identity,
+            marker_path: PathBuf::from(format!("marker-{identity_byte}")),
+            marker_file_identity: file_identity,
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_chain_rejects_gap_fork_duplicate_and_mixed_scope() {
+        let scope = CheckpointCatalogScope::Pane {
+            pane_id: Uuid::from_u128(0xd1),
+        };
+        let first = checkpoint_catalog_test_member(scope, 1, None, 1);
+        let second = checkpoint_catalog_test_member(scope, 2, Some(&first), 2);
+        let third = checkpoint_catalog_test_member(scope, 3, Some(&second), 3);
+        let mut valid_out_of_enumeration_order = vec![third.clone(), first.clone(), second.clone()];
+        checkpoint_catalog_validate_chain(&mut valid_out_of_enumeration_order)
+            .expect("generation and predecessor, never mtime, define order");
+        assert_eq!(
+            valid_out_of_enumeration_order
+                .iter()
+                .map(|member| member.metadata.identity.generation)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let mut gap = vec![first.clone(), third.clone()];
+        assert!(checkpoint_catalog_validate_chain(&mut gap).is_err());
+
+        let fork = checkpoint_catalog_test_member(scope, 2, Some(&first), 4);
+        let mut duplicate_generation = vec![first.clone(), second.clone(), fork];
+        assert!(checkpoint_catalog_validate_chain(&mut duplicate_generation).is_err());
+
+        let mut bad_predecessor = second.clone();
+        bad_predecessor
+            .metadata
+            .predecessor
+            .as_mut()
+            .expect("second member predecessor")
+            .candidate_checksum[0] ^= 1;
+        let mut predecessor_mismatch = vec![first.clone(), bad_predecessor];
+        assert!(checkpoint_catalog_validate_chain(&mut predecessor_mismatch).is_err());
+
+        let genesis_scope = CheckpointCatalogScope::Genesis {
+            spawn_effect_id: Uuid::from_u128(0xd2),
+        };
+        let mixed = checkpoint_catalog_test_member(genesis_scope, 2, Some(&first), 5);
+        let mut mixed_scope = vec![first.clone(), mixed];
+        assert!(checkpoint_catalog_validate_chain(&mut mixed_scope).is_err());
+
+        let mut divergent_boundary = second.clone();
+        divergent_boundary.metadata.boundary_id = first.metadata.boundary_id;
+        let mut boundary_splice = vec![first.clone(), divergent_boundary];
+        assert!(checkpoint_catalog_validate_chain(&mut boundary_splice).is_err());
+
+        let mut duplicate_checkpoint = second;
+        duplicate_checkpoint.metadata.checkpoint_id = first.metadata.checkpoint_id;
+        let mut checkpoint_replay = vec![first, duplicate_checkpoint];
+        assert!(checkpoint_catalog_validate_chain(&mut checkpoint_replay).is_err());
     }
 
     #[test]
@@ -5503,7 +7587,7 @@ mod tests {
             .expect("upload envelope");
         assert_eq!(CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD, 1_027);
         assert_eq!(CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD, expected_upload_bytes);
-        assert_eq!(expected_upload_bytes, 268_740_536);
+        assert_eq!(expected_upload_bytes, 268_740_576);
         assert_eq!(
             policy.max_stage_files,
             policy.max_retained_uploads * CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD
@@ -5512,6 +7596,23 @@ mod tests {
             policy.max_stage_bytes,
             u64::try_from(policy.max_retained_uploads).expect("retention count")
                 * CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD
+        );
+        let expected_catalog_candidate_bytes = GUARDIAN_MAX_CHECKPOINT_BYTES
+            + (u64::from(GUARDIAN_MAX_CHECKPOINT_CHUNKS) + 2) * record_overhead
+            + u64::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES).expect("candidate bytes")
+            + u64::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES).expect("seal bytes")
+            + u64::try_from(CHECKPOINT_CATALOG_HEADER_BYTES).expect("catalog header bytes")
+            + u64::try_from(OUTPUT_MANIFEST_CHECKSUM_BYTES).expect("catalog checksum bytes");
+        assert_eq!(
+            CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            expected_catalog_candidate_bytes
+        );
+        assert_eq!(CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS, 8);
+        assert_eq!(CHECKPOINT_CATALOG_MAX_RELEVANT_FILES, 24);
+        assert_eq!(
+            CHECKPOINT_CATALOG_MAX_RELEVANT_BYTES,
+            expected_catalog_candidate_bytes * 16
+                + u64::try_from(CHECKPOINT_CATALOG_MARKER_BYTES).expect("marker bytes") * 8
         );
     }
 
@@ -6043,6 +8144,18 @@ mod tests {
                 committed_bytes: u64::from(chunk_bytes),
             }
         );
+        let query = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Query,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            None,
+        )?;
+        assert_eq!(
+            store.apply_query(query)?,
+            GuardianCheckpointStageReplyV1::Quarantined { upload_id }
+        );
         assert!(matches!(
             store.apply_begin(&begin),
             Err(GuardianCheckpointStageStoreError::Poisoned)
@@ -6067,6 +8180,85 @@ mod tests {
             } if upload_id == fresh_upload_id
         ));
         assert_eq!(std::fs::metadata(seal_path)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_stage_finalizers_require_seal_and_ack_expiry_are_exclusive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-finalizer-conflict-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let spawn_effect_id = Uuid::from_u128(0xc01);
+        let upload_id = Uuid::from_u128(0xc02);
+        let payload = b"finalizer-conflict-fixture";
+        let chunk_bytes = 8_u32;
+        let begin = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            chunk_bytes,
+            None,
+        )?;
+        store.apply_begin(&begin)?;
+        let shape = CheckpointStageRequestShape::from_request(&begin)?;
+        let census = checkpoint_stage_census(&store.inner)?;
+        let inspection = checkpoint_inspect_upload(
+            &store.inner,
+            &census,
+            &shape,
+            CheckpointStageSealInspection::Reject,
+        )?
+        .ok_or("durable candidate disappeared")?;
+        let publication_id = inspection.publication_id;
+        let ack_path = checkpoint_ack_path(&store.inner, shape.key(), publication_id)?;
+        let expired_path = checkpoint_expiry_path(&store.inner, shape.key(), publication_id)?;
+        let seal_path = checkpoint_seal_path(&store.inner, shape.key(), publication_id)?;
+        let query = || {
+            checkpoint_test_genesis_request(
+                GuardianCheckpointStageKindV1::Query,
+                spawn_effect_id,
+                upload_id,
+                payload,
+                chunk_bytes,
+                None,
+            )
+        };
+
+        let mut ack = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &ack_path,
+        )?;
+        ack.write_all(b"FTGC")?;
+        ack.sync_all()?;
+        store.inner.directory.sync_all()?;
+        drop(ack);
+        assert_eq!(
+            store.apply_query(query()?)?,
+            GuardianCheckpointStageReplyV1::Quarantined { upload_id }
+        );
+
+        for path in [&seal_path, &expired_path] {
+            let mut file = create_private_file_new_at(
+                &store.inner.directory,
+                &store.inner.directory_path,
+                path,
+            )?;
+            file.write_all(b"FTGC")?;
+            file.sync_all()?;
+        }
+        store.inner.directory.sync_all()?;
+        assert_eq!(
+            store.apply_query(query()?)?,
+            GuardianCheckpointStageReplyV1::Quarantined { upload_id }
+        );
+        for path in [ack_path, seal_path, expired_path] {
+            assert_eq!(std::fs::metadata(path)?.len(), 4);
+        }
         Ok(())
     }
 
