@@ -12821,4 +12821,281 @@ mod tests {
         assert!(!storage.has_data("ephemeral_lease").unwrap());
         assert_eq!(storage.get_data("ephemeral_lease").unwrap(), None);
     }
+
+    #[derive(Clone)]
+    struct MixedRecoveryGateExecutor {
+        dispatched_compensations: Rc<RefCell<Vec<String>>>,
+        require_approval_step: Option<String>,
+        fail_precondition_step: Option<String>,
+    }
+
+    impl MixedRecoveryGateExecutor {
+        fn new() -> (Self, Rc<RefCell<Vec<String>>>) {
+            let dispatched_compensations = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    dispatched_compensations: Rc::clone(&dispatched_compensations),
+                    require_approval_step: None,
+                    fail_precondition_step: None,
+                },
+                dispatched_compensations,
+            )
+        }
+    }
+
+    impl effect_seal::NonEffectful for MixedRecoveryGateExecutor {}
+
+    impl StepExecutor for MixedRecoveryGateExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &MissionTxContract,
+            _now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
+            let mut gates = crate::plan::tx_prepare_gate_inputs_allow_all(contract);
+            for gate in &mut gates {
+                if let Some(ref req_step) = self.require_approval_step {
+                    if gate.step_id.0 == *req_step {
+                        gate.approval_required = true;
+                        gate.approval_granted = false;
+                        gate.approval_reason_code = Some("approval_required_for_test".to_string());
+                    }
+                }
+                if let Some(ref fail_step) = self.fail_precondition_step {
+                    if gate.step_id.0 == *fail_step {
+                        gate.preconditions_passed = false;
+                        gate.preconditions_reason_code = Some("precondition_target_dead".to_string());
+                    }
+                }
+            }
+            gates
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCommitStepInput> {
+            crate::plan::mission_tx_commit_step_inputs(contract, fail_step, now_ms)
+        }
+
+        fn execute_compensations(
+            &self,
+            _contract: &MissionTxContract,
+            commit_report: &TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCompensationStepInput> {
+            self.dispatched_compensations.borrow_mut().extend(
+                commit_report
+                    .step_results
+                    .iter()
+                    .filter(|result| result.outcome.is_committed())
+                    .map(|result| result.step_id.0.clone()),
+            );
+            crate::plan::mission_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
+        }
+    }
+
+    #[test]
+    fn mixed_recovery_reconstructs_proven_receipts_under_kill_switch() -> Result<(), String> {
+        let mut contract = make_test_contract(3);
+        let (_store_dir, mut store) = durable_store();
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("kill-switch-mixed-recovery", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        record_durable_test_outcome(
+            &mut store,
+            "kill-switch-mixed-recovery",
+            test_commit_key(&contract, "step-0"),
+            StepOutcome::Success {
+                result: Some("effect_0_applied".to_string()),
+            },
+            StepRisk::High,
+            "agent-step-0",
+            5_000,
+        )?;
+
+        let (executor, dispatched_compensations) = MixedRecoveryGateExecutor::new();
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                auto_compensate: true,
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        // Replay with KillSwitch on (Active)
+        let result = engine
+            .execute_with_store_and_kill_switch(
+                &mut contract,
+                &mut store,
+                MissionKillSwitchLevel::Active,
+                6_000,
+            )
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.outcome, TxOutcome::Compensated);
+        assert_eq!(*dispatched_compensations.borrow(), vec!["step-0".to_string()]);
+
+        // Verify reconstructed commit receipts for step-0, and skipped for step-1 & step-2
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-0", "committed"));
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-1", "skipped"));
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-2", "skipped"));
+        assert!(latest_tx_receipt_matches(&contract, "compensate", "step-0", "compensated"));
+
+        // Verify no duplicate receipts for step-0 commit
+        let commit_receipts_step_0 = contract
+            .receipts
+            .iter()
+            .filter(|r| {
+                r.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                    && r.get("step_id").and_then(serde_json::Value::as_str) == Some("step-0")
+            })
+            .count();
+        assert_eq!(commit_receipts_step_0, 1, "must not have duplicate commit receipts for step-0");
+
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_recovery_reconstructs_proven_receipts_under_approval_required() -> Result<(), String> {
+        let mut contract = make_test_contract(2);
+        let (_store_dir, mut store) = durable_store();
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("approval-mixed-recovery", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        record_durable_test_outcome(
+            &mut store,
+            "approval-mixed-recovery",
+            test_commit_key(&contract, "step-0"),
+            StepOutcome::Success {
+                result: Some("effect_0_applied".to_string()),
+            },
+            StepRisk::High,
+            "agent-step-0",
+            5_000,
+        )?;
+
+        let (mut executor, dispatched_compensations) = MixedRecoveryGateExecutor::new();
+        executor.require_approval_step = Some("step-1".to_string());
+
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                auto_compensate: true,
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let result = engine
+            .execute_with_store(&mut contract, &mut store, 6_000)
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.outcome, TxOutcome::Compensated);
+        assert_eq!(*dispatched_compensations.borrow(), vec!["step-0".to_string()]);
+
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-0", "committed"));
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-1", "skipped"));
+        assert!(latest_tx_receipt_matches(&contract, "compensate", "step-0", "compensated"));
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_recovery_reconstructs_proven_receipts_under_failed_precondition() -> Result<(), String> {
+        let mut contract = make_test_contract(2);
+        let (_store_dir, mut store) = durable_store();
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("precondition-mixed-recovery", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        record_durable_test_outcome(
+            &mut store,
+            "precondition-mixed-recovery",
+            test_commit_key(&contract, "step-0"),
+            StepOutcome::Success {
+                result: Some("effect_0_applied".to_string()),
+            },
+            StepRisk::High,
+            "agent-step-0",
+            5_000,
+        )?;
+
+        let (mut executor, dispatched_compensations) = MixedRecoveryGateExecutor::new();
+        executor.fail_precondition_step = Some("step-1".to_string());
+
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                auto_compensate: true,
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let result = engine
+            .execute_with_store(&mut contract, &mut store, 6_000)
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.outcome, TxOutcome::Compensated);
+        assert_eq!(*dispatched_compensations.borrow(), vec!["step-0".to_string()]);
+
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-0", "committed"));
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-1", "skipped"));
+        assert!(latest_tx_receipt_matches(&contract, "compensate", "step-0", "compensated"));
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_recovery_without_auto_compensate_fails_closed_in_committing_state() -> Result<(), String> {
+        let mut contract = make_test_contract(2);
+        let (_store_dir, mut store) = durable_store();
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("no-autocomp-mixed-recovery", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        record_durable_test_outcome(
+            &mut store,
+            "no-autocomp-mixed-recovery",
+            test_commit_key(&contract, "step-0"),
+            StepOutcome::Success {
+                result: Some("effect_0_applied".to_string()),
+            },
+            StepRisk::High,
+            "agent-step-0",
+            5_000,
+        )?;
+
+        let (executor, dispatched_compensations) = MixedRecoveryGateExecutor::new();
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                auto_compensate: false,
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let err = engine
+            .execute_with_store_and_kill_switch(
+                &mut contract,
+                &mut store,
+                MissionKillSwitchLevel::Active,
+                6_000,
+            )
+            .expect_err("must fail closed when auto-compensate is false and uncommitted steps exist");
+
+        assert!(matches!(err, TxExecutionError::CommitPhase(_)));
+        assert!(err.to_string().contains("automatic compensation is disabled"));
+        assert!(dispatched_compensations.borrow().is_empty());
+
+        assert_eq!(contract.lifecycle_state, MissionTxState::Committing);
+        assert_eq!(contract.outcome, TxOutcome::Pending);
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-0", "committed"));
+        assert!(latest_tx_receipt_matches(&contract, "commit", "step-1", "skipped"));
+        Ok(())
+    }
 }
