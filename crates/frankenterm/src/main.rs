@@ -104370,6 +104370,12 @@ esac
         assert!(app.contains("after-app-selector-switch"));
         assert!(app.contains("$operation\" || return 0"));
         assert!(!app.contains("move_no_clobber \"$target_app\""));
+        assert!(app.contains("dest=\"/Applications\""));
+        assert!(app.contains("dest=\"$HOME/Applications\""));
+        assert!(app.contains("s.st_uid == os.geteuid() and not (s.st_mode & 0o022)"));
+        assert!(app.contains("App destination cannot provide descriptor-pinned atomic authority"));
+        assert!(app.contains("ensure_exact_staged_tree \"$extracted_app\" \"$staged_app\""));
+        assert!(!app.contains("ditto \"$extracted_app\" \"$staged_app\""));
 
         let source_build_start = installer
             .find("build_from_source() {")
@@ -104500,7 +104506,9 @@ esac
                     &installer,
                     &new_family,
                     &destination,
-                    &fixture.path().join(format!("initial-{index}-retry-{retry}")),
+                    &fixture
+                        .path()
+                        .join(format!("initial-{index}-retry-{retry}")),
                     None,
                 );
                 assert!(
@@ -104668,11 +104676,7 @@ esac
             "standalone app-test family failed to install: {}",
             String::from_utf8_lossy(&installed.stderr)
         );
-        let app = create_installer_test_app(
-            &fixture.path().join("app-release"),
-            &build_id,
-            target,
-        );
+        let app = create_installer_test_app(&fixture.path().join("app-release"), &build_id, target);
         let fake_tools = fixture.path().join("fake-app-tools");
         write_installer_fake_download_tools(&fake_tools);
 
@@ -104714,11 +104718,8 @@ esac
         {
             let app_destination = fixture.path().join(format!("app-{index}-{failpoint}"));
             std::fs::create_dir(&app_destination).expect("create app failpoint destination");
-            std::fs::set_permissions(
-                &app_destination,
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .expect("make app failpoint destination private");
+            std::fs::set_permissions(&app_destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make app failpoint destination private");
             plant_old(&app_destination);
             let interrupted = run_installer_app_function(
                 &installer,
@@ -104833,11 +104834,8 @@ esac
         for (index, prefix_len) in [0usize, source_ft.len() / 2].into_iter().enumerate() {
             let app_destination = fixture.path().join(format!("app-prefix-{index}"));
             std::fs::create_dir(&app_destination).expect("create app prefix destination");
-            std::fs::set_permissions(
-                &app_destination,
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .expect("make app prefix destination private");
+            std::fs::set_permissions(&app_destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make app prefix destination private");
             plant_old(&app_destination);
             let prefix_path = app_destination.join(format!(
                 ".FrankenTerm.app.installing-{}/Contents/MacOS/ft",
@@ -104898,10 +104896,12 @@ esac
             None,
             None,
         );
-        assert!(rejected.status.success(), "app installer warns and skips safely");
+        assert!(
+            rejected.status.success(),
+            "app installer warns and skips safely"
+        );
         assert_eq!(
-            std::fs::read(conflict_destination.join("FrankenTerm.app/old-generation.txt"))
-                .unwrap(),
+            std::fs::read(conflict_destination.join("FrankenTerm.app/old-generation.txt")).unwrap(),
             b"retained old app generation\n"
         );
         assert_eq!(std::fs::read(&conflict_path).unwrap(), conflicting);
