@@ -373,6 +373,14 @@ impl MasterPty for UnixMasterPty {
         Ok(Box::new(fd))
     }
 
+    fn try_clone_master(&self) -> Result<Box<dyn MasterPty + Send>, Error> {
+        Ok(Box::new(Self {
+            fd: PtyFd(self.fd.try_clone()?),
+            took_writer: RefCell::new(false),
+            tty_name: self.tty_name.clone(),
+        }))
+    }
+
     fn try_clone_pollable_reader(&self) -> Result<Box<dyn PollablePtyReader>, Error> {
         let mut fd = PtyFd(self.fd.try_clone()?);
         fd.set_non_blocking(true)?;
@@ -441,6 +449,7 @@ impl Write for UnixMasterWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     #[test]
     fn tty_name_buffer_growth_is_bounded() {
@@ -452,5 +461,34 @@ mod tests {
         assert_eq!(next_tty_name_buffer_len(MAX_TTY_NAME_BUFFER_LEN + 1), None);
         assert_eq!(next_tty_name_buffer_len(usize::MAX), None);
         assert_eq!(next_tty_name_buffer_len(0), None);
+    }
+
+    #[test]
+    fn cloned_master_retains_the_same_pty_after_original_master_drop() {
+        let (master, slave) = openpty(PtySize::default()).expect("open native test PTY");
+        let retained = master
+            .try_clone_master()
+            .expect("duplicate complete master authority");
+        let mut reader = retained
+            .try_clone_reader()
+            .expect("clone reader from retained master");
+
+        drop(master);
+
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("printf 'retained-master\\n'");
+        let mut child = slave
+            .spawn_command(command)
+            .expect("spawn child after original master drop");
+        drop(slave);
+
+        let status = child.wait().expect("wait for PTY child");
+        assert!(status.success());
+        let mut output = String::new();
+        reader
+            .read_to_string(&mut output)
+            .expect("drain retained PTY master");
+        assert!(output.contains("retained-master"));
     }
 }

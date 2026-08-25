@@ -113,6 +113,24 @@ pub trait MasterPty: Downcast + Send {
     /// Obtain a readable handle; output from the slave(s) is readable
     /// via this stream.
     fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, Error>;
+    /// Duplicate the master endpoint as an independently owned PTY handle.
+    ///
+    /// This is distinct from [`Self::try_clone_reader`]: the returned handle
+    /// retains the complete master-side authority, including resize and the
+    /// ability to create its own reader and writer.  Native Unix backends use
+    /// a close-on-exec descriptor duplicate, so dropping one handle cannot
+    /// close the PTY while another process-local owner still retains its
+    /// duplicate.
+    ///
+    /// The default is deliberately unsupported.  Backends must opt in only
+    /// when they can prove that the duplicate has independent ownership and
+    /// preserves the same underlying PTY identity.
+    #[cfg(unix)]
+    fn try_clone_master(&self) -> Result<Box<dyn MasterPty + Send>, Error> {
+        Err(anyhow::anyhow!(
+            "this PTY backend does not provide an independently owned master duplicate"
+        ))
+    }
     /// Obtain a non-blocking readable handle suitable for registration with a
     /// Unix readiness poller.
     ///
