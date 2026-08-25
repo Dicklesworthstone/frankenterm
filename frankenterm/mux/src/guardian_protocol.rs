@@ -1472,10 +1472,6 @@ impl GuardianReplayProtectedDigest {
         checkpoint_chunk_digest_matches(self.bytes.as_slice(), other.bytes.as_slice())
     }
 
-    fn matches_wire(&self, other: &[u8]) -> bool {
-        checkpoint_chunk_digest_matches(self.bytes.as_slice(), other)
-    }
-
     fn is_zero(&self) -> bool {
         self.bytes.iter().all(|byte| *byte == 0)
     }
@@ -13912,14 +13908,9 @@ mod tests {
         let decoded_chunk: GuardianCheckpointStageChunkDeliveryV1 =
             decoded_chunk.into_chunk().unwrap();
         assert_eq!(decoded_chunk.position(), (0, 0));
-        assert_eq!(
-            decoded_chunk.chunk_digest(),
-            zeroizing_sha256_digest(&canonical[..first_len]).as_slice()
-        );
-        assert_eq!(
-            decoded_chunk.into_bytes().as_slice(),
-            &canonical[..first_len]
-        );
+        let (decoded_position, decoded_bytes) = decoded_chunk.into_validated_parts().unwrap();
+        assert_eq!(decoded_position, (0, 0));
+        assert_eq!(decoded_bytes.as_slice(), &canonical[..first_len]);
 
         let seal = GuardianCheckpointStageRequestV1::seal(
             scope,
@@ -14533,7 +14524,7 @@ mod tests {
         );
 
         let page = replay_output_page(pane, generation, snapshot_id, snapshot_digest);
-        let expected_page_digest = page.header().page_digest();
+        let expected_page_digest = page.header().declassify_page_digest_for_ack();
         assert!(!format!("{page:?}").contains("first"));
         let response = GuardianResponseEnvelope::replay_page(&authenticated, page).unwrap();
         let frame = encode_guardian_response(&secret(), &response).unwrap();
@@ -14542,7 +14533,10 @@ mod tests {
             .correlate(&original_request.header)
             .unwrap();
         let delivered = correlated.into_replay_page(&authenticated).unwrap();
-        assert_eq!(delivered.header().page_digest(), expected_page_digest);
+        assert_eq!(
+            delivered.header().declassify_page_digest_for_ack(),
+            expected_page_digest
+        );
         assert_eq!(delivered.header().page_index(), 0);
         let GuardianReplayPageBodyDelivery::OutputRecords(records) = delivered.into_body() else {
             panic!("resume replay must deliver output records");
@@ -14600,7 +14594,7 @@ mod tests {
         let repaired_page_digest =
             compute_replay_page_digest(&plaintext_digest_mutation).unwrap();
         plaintext_digest_mutation[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
-            .copy_from_slice(&repaired_page_digest);
+            .copy_from_slice(&repaired_page_digest.declassify_for_ack());
         assert!(matches!(
             GuardianReplayPageDelivery::decode(plaintext_digest_mutation),
             Err(GuardianProtocolError::InvalidReplyPayload)
@@ -14640,10 +14634,10 @@ mod tests {
         let altered_plaintext_digest =
             replay_record_plaintext_digest(altered_metadata, b"last\n").unwrap();
         order_mutation[second_record + 168..second_record + 200]
-            .copy_from_slice(&altered_plaintext_digest);
+            .copy_from_slice(&altered_plaintext_digest.declassify_for_ack());
         let repaired_page_digest = compute_replay_page_digest(&order_mutation).unwrap();
         order_mutation[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
-            .copy_from_slice(&repaired_page_digest);
+            .copy_from_slice(&repaired_page_digest.declassify_for_ack());
         assert!(matches!(
             GuardianReplayPageDelivery::decode(order_mutation),
             Err(GuardianProtocolError::InvalidReplyPayload)
@@ -15119,7 +15113,7 @@ mod tests {
         noncanonical_gap[REPLAY_PAGE_HEADER_BYTES + REPLAY_GAP_BYTES - 1] = 1;
         let repaired_page_digest = compute_replay_page_digest(&noncanonical_gap).unwrap();
         noncanonical_gap[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
-            .copy_from_slice(&repaired_page_digest);
+            .copy_from_slice(&repaired_page_digest.declassify_for_ack());
         assert!(matches!(
             GuardianReplayPageDelivery::decode(noncanonical_gap),
             Err(GuardianProtocolError::InvalidReplyPayload)
@@ -15134,7 +15128,7 @@ mod tests {
         let repaired_page_digest =
             compute_replay_page_digest(&false_compaction_boundary).unwrap();
         false_compaction_boundary[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
-            .copy_from_slice(&repaired_page_digest);
+            .copy_from_slice(&repaired_page_digest.declassify_for_ack());
         assert!(matches!(
             GuardianReplayPageDelivery::decode(false_compaction_boundary),
             Err(GuardianProtocolError::InvalidReplyPayload)
@@ -15158,7 +15152,7 @@ mod tests {
         let repaired_page_digest =
             compute_replay_page_digest(&invalid_expired_snapshot).unwrap();
         invalid_expired_snapshot[REPLAY_PAGE_DIGEST_OFFSET..REPLAY_PAGE_DIGEST_END]
-            .copy_from_slice(&repaired_page_digest);
+            .copy_from_slice(&repaired_page_digest.declassify_for_ack());
         assert!(matches!(
             GuardianReplayPageDelivery::decode(invalid_expired_snapshot),
             Err(GuardianProtocolError::InvalidReplyPayload)

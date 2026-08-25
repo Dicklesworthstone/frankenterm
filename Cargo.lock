@@ -7481,6 +7481,7 @@ dependencies = [
  "frankenterm-sigpipe",
  "frankenterm-ssh",
  "frankenterm-term",
+ "hex",
  "hmac 0.13.0",
  "hostname",
  "k9",
