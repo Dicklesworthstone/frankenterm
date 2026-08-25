@@ -80,6 +80,12 @@ pub struct GuardianRuntimeCounters {
     pub input_retryable_capacity_closes: u64,
     pub input_worker_disconnects: u64,
     pub input_worker_panics: u64,
+    pub checkpoint_activation_rejections: u64,
+    pub checkpoint_transactions_submitted: u64,
+    pub checkpoint_transactions_completed: u64,
+    pub checkpoint_retryable_capacity_closes: u64,
+    pub checkpoint_worker_disconnects: u64,
+    pub checkpoint_worker_panics: u64,
     pub pty_bytes_drained: u64,
     pub pty_bytes_durably_committed: u64,
     pub pty_records_durably_committed: u64,
@@ -421,6 +427,157 @@ enum GuardianRuntimeInputCompletionStateInternal {
     Disconnected,
 }
 
+struct CheckpointJob {
+    route: GuardianCheckpointRoute,
+    protocol: GuardianProtocolState,
+    request: AuthenticatedGuardianRequest,
+}
+
+struct CheckpointWorkerCompletion {
+    route: GuardianCheckpointRoute,
+    protocol: GuardianProtocolState,
+    response: Option<GuardianResponseEnvelope>,
+    worker_panicked: bool,
+}
+
+enum CheckpointSubmitError {
+    Saturated(CheckpointJob),
+    Unavailable(CheckpointJob),
+}
+
+struct GuardianCheckpointPipeline {
+    jobs: Option<SyncSender<CheckpointJob>>,
+    completions: Option<Receiver<CheckpointWorkerCompletion>>,
+    worker: Option<JoinHandle<()>>,
+    _completion_waker: Arc<Waker>,
+}
+
+impl GuardianCheckpointPipeline {
+    fn new(
+        store: GuardianCheckpointStageStore,
+        completion_waker: Arc<Waker>,
+    ) -> Result<Self, GuardianProtocolError> {
+        let (jobs, job_receiver) = sync_channel(CHECKPOINT_WORKER_QUEUE_CAPACITY);
+        let (completion_sender, completions) =
+            sync_channel(CHECKPOINT_WORKER_QUEUE_CAPACITY);
+        let worker_waker = Arc::clone(&completion_waker);
+        let worker = thread::Builder::new()
+            .name("ft-guardian-checkpoint".to_string())
+            .spawn(move || {
+                checkpoint_worker(store, job_receiver, completion_sender, worker_waker);
+            })
+            .map_err(|_| {
+                GuardianProtocolError::StateInvariantViolation(
+                    "guardian-checkpoint-worker-spawn",
+                )
+            })?;
+        Ok(Self {
+            jobs: Some(jobs),
+            completions: Some(completions),
+            worker: Some(worker),
+            _completion_waker: completion_waker,
+        })
+    }
+
+    fn try_submit(&self, job: CheckpointJob) -> Result<(), CheckpointSubmitError> {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return Err(CheckpointSubmitError::Unavailable(job));
+        };
+        jobs.try_send(job).map_err(|error| match error {
+            TrySendError::Full(job) => CheckpointSubmitError::Saturated(job),
+            TrySendError::Disconnected(job) => CheckpointSubmitError::Unavailable(job),
+        })
+    }
+
+    fn try_completion(&self) -> GuardianRuntimeCheckpointCompletionStateInternal {
+        let Some(completions) = self.completions.as_ref() else {
+            return GuardianRuntimeCheckpointCompletionStateInternal::Disconnected;
+        };
+        match completions.try_recv() {
+            Ok(completion) => {
+                GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion)
+            }
+            Err(TryRecvError::Empty) => GuardianRuntimeCheckpointCompletionStateInternal::Empty,
+            Err(TryRecvError::Disconnected) => {
+                GuardianRuntimeCheckpointCompletionStateInternal::Disconnected
+            }
+        }
+    }
+}
+
+impl Drop for GuardianCheckpointPipeline {
+    fn drop(&mut self) {
+        drop(self.completions.take());
+        drop(self.jobs.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+enum GuardianRuntimeCheckpointCompletionStateInternal {
+    Ready(CheckpointWorkerCompletion),
+    Empty,
+    Disconnected,
+}
+
+fn checkpoint_worker(
+    store: GuardianCheckpointStageStore,
+    jobs: Receiver<CheckpointJob>,
+    completions: SyncSender<CheckpointWorkerCompletion>,
+    completion_waker: Arc<Waker>,
+) {
+    while let Ok(mut job) = jobs.recv() {
+        let execution =
+            catch_guardian_checkpoint_worker_panic(|| execute_checkpoint_job(&store, &job));
+        // Response correlation validates against the authenticated request, so
+        // build it first. Then wipe plaintext before publishing any completion.
+        job.request.zeroize_payload();
+        let (response, worker_panicked) = match execution {
+            Ok(response) => (response, false),
+            Err(_) => (None, true),
+        };
+        let completion = CheckpointWorkerCompletion {
+            route: job.route,
+            protocol: job.protocol,
+            response,
+            worker_panicked,
+        };
+        if completions.send(completion).is_err() {
+            return;
+        }
+        let _ = completion_waker.wake();
+    }
+}
+
+fn execute_checkpoint_job(
+    store: &GuardianCheckpointStageStore,
+    job: &CheckpointJob,
+) -> Option<GuardianResponseEnvelope> {
+    let stage = match job.protocol.preflight_checkpoint_stage(&job.request) {
+        Ok(stage) => stage,
+        Err(error) => {
+            return Some(GuardianResponseEnvelope::rejection(
+                &job.request,
+                GuardianRejectionCode::from_protocol_error(&error),
+            ));
+        }
+    };
+    let reply = match stage.kind() {
+        GuardianCheckpointStageKindV1::Begin => store.apply_begin(&stage),
+        GuardianCheckpointStageKindV1::Chunk => store.apply_chunk(stage),
+        GuardianCheckpointStageKindV1::Query => store.apply_query(stage),
+        GuardianCheckpointStageKindV1::Seal | GuardianCheckpointStageKindV1::Ack => {
+            return Some(GuardianResponseEnvelope::rejection(
+                &job.request,
+                GuardianRejectionCode::InvalidRequest,
+            ));
+        }
+    };
+    let reply = reply.ok()?;
+    GuardianResponseEnvelope::reply(&job.request, &GuardianReply::CheckpointStage(reply)).ok()
+}
+
 fn input_worker(
     jobs: Receiver<InputJob>,
     completions: SyncSender<InputWorkerCompletion>,
@@ -561,6 +718,8 @@ pub struct GuardianRuntime {
     output_pipeline: GuardianOutputPipeline,
     input_pipeline: GuardianInputPipeline,
     input_pipeline_failed: bool,
+    checkpoint_pipeline: GuardianCheckpointPipeline,
+    checkpoint_pipeline_failed: bool,
     // This slot is reachable only if the pane map violates the invariant that
     // a worker-owned pane cannot retire while the sole protocol authority is
     // in flight.  Retain the descriptor-pinned WAL and writer even then: an
@@ -588,7 +747,10 @@ impl GuardianRuntime {
         pending_child_exits
             .try_reserve_exact(config.max_panes)
             .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
-        let input_pipeline = GuardianInputPipeline::new(completion_waker)?;
+        let checkpoint_store = output_pipeline.checkpoint_stage_store();
+        let input_pipeline = GuardianInputPipeline::new(Arc::clone(&completion_waker))?;
+        let checkpoint_pipeline =
+            GuardianCheckpointPipeline::new(checkpoint_store, completion_waker)?;
         Ok(Self {
             incarnation,
             protocol: Some(GuardianProtocolState::new(incarnation)?),
@@ -601,6 +763,8 @@ impl GuardianRuntime {
             output_pipeline,
             input_pipeline,
             input_pipeline_failed: false,
+            checkpoint_pipeline,
+            checkpoint_pipeline_failed: false,
             orphaned_input_authority: None,
             pending_child_exits,
             output_pipeline_failed: false,
@@ -643,9 +807,10 @@ impl GuardianRuntime {
 
     /// Dispatch one already authenticated request.
     ///
-    /// Input is submitted through [`Self::submit_input`] so its request and
-    /// connection survive the off-loop durable transaction. Checkpoint and
-    /// output replay remain fail-closed until their publishers exist.
+    /// Input and checkpoint staging are submitted through their owned worker
+    /// surfaces so each request and connection survive its off-loop durable
+    /// transaction. Final checkpoint publication and output replay remain
+    /// fail-closed until their publishers exist.
     pub fn dispatch(
         &mut self,
         request: &AuthenticatedGuardianRequest,
@@ -694,8 +859,17 @@ impl GuardianRuntime {
                     self.counters.input_activation_rejections.saturating_add(1);
                 return None;
             }
+            GuardianOperation::CheckpointStage => {
+                // A borrowed request cannot cross the storage-worker boundary.
+                // The transport must route owned Stage traffic through
+                // `submit_checkpoint`.
+                self.counters.checkpoint_activation_rejections = self
+                    .counters
+                    .checkpoint_activation_rejections
+                    .saturating_add(1);
+                return None;
+            }
             GuardianOperation::Checkpoint
-            | GuardianOperation::CheckpointStage
             | GuardianOperation::Replay
             | GuardianOperation::ReplayAck
             | GuardianOperation::GuardedStop => Err(GuardianRejectionCode::InvalidRequest),
