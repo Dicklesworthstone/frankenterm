@@ -12330,7 +12330,14 @@ mod tests {
     ) -> SnapshotResult {
         install_checkpoint_scrollback_artifact_fixture(db_path.as_str(), 1, contents);
         SnapshotEngine::new(db_path, SnapshotConfig::default())
-            .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Manual)
+            .capture_with_options(
+                &[make_test_pane(1, 24, 80)],
+                SnapshotTrigger::Manual,
+                SnapshotCaptureOptions {
+                    include_scrollback: true,
+                    metadata: None,
+                },
+            )
             .await
             .unwrap()
     }
@@ -12387,9 +12394,13 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), first_bytes);
             assert_eq!(first.created_at_epoch_ms, snapshot.checkpoint_at);
             assert_eq!(first.complete_pane_count, 1);
+            assert_eq!(first.segment_count, 3);
 
             let artifact: CheckpointScrollbackArtifact =
                 serde_json::from_slice(&first_bytes).unwrap();
+            assert_eq!(artifact.payload.scrollback.len(), 1);
+            assert_eq!(artifact.payload.scrollback[0].segment_count, 3);
+            assert_eq!(artifact.payload.scrollback[0].segments.len(), 3);
             assert_eq!(
                 artifact.payload.capabilities,
                 CheckpointScrollbackCapabilities::V1
