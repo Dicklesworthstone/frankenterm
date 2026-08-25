@@ -83037,29 +83037,40 @@ chmod 0755 "$ft_stage" "$mux_stage" "$guardian_stage"
     if active_mux {
         Ok(format!(
             r#"{prelude}
-restore_pending_ft() {{
-  verify_component "$ft_pending" "{ft_bytes}" "{ft_sha256}" || return 1
-  test ! -e "$ft_stage" && test ! -L "$ft_stage" || return 1
-  move_no_clobber "$ft_pending" "$ft_stage"
+restore_pending_component() {{
+  pending=$1
+  stage=$2
+  expected_bytes=$3
+  expected_sha256=$4
+  verify_component "$pending" "$expected_bytes" "$expected_sha256" || return 1
+  test ! -e "$stage" && test ! -L "$stage" || return 1
+  move_no_clobber "$pending" "$stage"
 }}
 report_incomplete_rollback() {{
   printf 'FT_COMPONENT_ROLLBACK_INCOMPLETE={suffix}\n' >&2
 }}
 ft_pending="$bin/ft.pending-{suffix}"
 mux_pending="$bin/frankenterm-mux-server.pending-{suffix}"
+guardian_pending="$bin/frankenterm-pty-guardian.pending-{suffix}"
 test ! -e "$ft_pending" && test ! -L "$ft_pending"
 test ! -e "$mux_pending" && test ! -L "$mux_pending"
+test ! -e "$guardian_pending" && test ! -L "$guardian_pending"
 verify_component "$ft_stage" "{ft_bytes}" "{ft_sha256}"
 move_no_clobber "$ft_stage" "$ft_pending"
-if ! verify_component "$mux_stage" "{mux_bytes}" "{mux_sha256}"; then
-  if restore_pending_ft; then
+if ! verify_component "$mux_stage" "{mux_bytes}" "{mux_sha256}" || \
+   ! move_no_clobber "$mux_stage" "$mux_pending"; then
+  if restore_pending_component "$ft_pending" "$ft_stage" "{ft_bytes}" "{ft_sha256}"; then
     exit 1
   fi
   report_incomplete_rollback
   exit 2
 fi
-if ! move_no_clobber "$mux_stage" "$mux_pending"; then
-  if restore_pending_ft; then
+if ! verify_component "$guardian_stage" "{guardian_bytes}" "{guardian_sha256}" || \
+   ! move_no_clobber "$guardian_stage" "$guardian_pending"; then
+  rollback_ok=1
+  restore_pending_component "$mux_pending" "$mux_stage" "{mux_bytes}" "{mux_sha256}" || rollback_ok=0
+  restore_pending_component "$ft_pending" "$ft_stage" "{ft_bytes}" "{ft_sha256}" || rollback_ok=0
+  if test "$rollback_ok" = 1; then
     exit 1
   fi
   report_incomplete_rollback
@@ -83082,12 +83093,17 @@ report_incomplete_rollback() {{
 }}
 ft_backup=""
 mux_backup=""
+guardian_backup=""
 ft_backup_candidate="$bin/ft.previous-{suffix}"
 mux_backup_candidate="$bin/frankenterm-mux-server.previous-{suffix}"
+guardian_backup_candidate="$bin/frankenterm-pty-guardian.previous-{suffix}"
 ft_failed="$bin/ft.failed-publish-{suffix}"
+mux_failed="$bin/frankenterm-mux-server.failed-publish-{suffix}"
 test ! -e "$ft_backup_candidate" && test ! -L "$ft_backup_candidate"
 test ! -e "$mux_backup_candidate" && test ! -L "$mux_backup_candidate"
+test ! -e "$guardian_backup_candidate" && test ! -L "$guardian_backup_candidate"
 test ! -e "$ft_failed" && test ! -L "$ft_failed"
+test ! -e "$mux_failed" && test ! -L "$mux_failed"
 if test -e "$bin/ft" || test -L "$bin/ft"; then
   test -f "$bin/ft" && test ! -L "$bin/ft"
   ft_backup="$ft_backup_candidate"
@@ -83104,11 +83120,26 @@ if test -e "$bin/frankenterm-mux-server" || test -L "$bin/frankenterm-mux-server
     exit 2
   fi
 fi
+if test -e "$bin/frankenterm-pty-guardian" || test -L "$bin/frankenterm-pty-guardian"; then
+  test -f "$bin/frankenterm-pty-guardian" && test ! -L "$bin/frankenterm-pty-guardian"
+  guardian_backup="$guardian_backup_candidate"
+  if ! move_no_clobber "$bin/frankenterm-pty-guardian" "$guardian_backup"; then
+    rollback_ok=1
+    restore_preserved_component "$mux_backup" "$bin/frankenterm-mux-server" || rollback_ok=0
+    restore_preserved_component "$ft_backup" "$bin/ft" || rollback_ok=0
+    if test "$rollback_ok" = 1; then
+      exit 1
+    fi
+    report_incomplete_rollback
+    exit 2
+  fi
+fi
 if ! verify_component "$ft_stage" "{ft_bytes}" "{ft_sha256}" || \
    ! move_no_clobber "$ft_stage" "$bin/ft"; then
   rollback_ok=1
   restore_preserved_component "$ft_backup" "$bin/ft" || rollback_ok=0
   restore_preserved_component "$mux_backup" "$bin/frankenterm-mux-server" || rollback_ok=0
+  restore_preserved_component "$guardian_backup" "$bin/frankenterm-pty-guardian" || rollback_ok=0
   if test "$rollback_ok" = 1; then
     exit 1
   fi
@@ -83126,6 +83157,31 @@ if ! verify_component "$mux_stage" "{mux_bytes}" "{mux_sha256}" || \
   fi
   restore_preserved_component "$ft_backup" "$bin/ft" || rollback_ok=0
   restore_preserved_component "$mux_backup" "$bin/frankenterm-mux-server" || rollback_ok=0
+  restore_preserved_component "$guardian_backup" "$bin/frankenterm-pty-guardian" || rollback_ok=0
+  if test "$rollback_ok" = 1; then
+    exit 1
+  fi
+  report_incomplete_rollback
+  exit 2
+fi
+if ! verify_component "$guardian_stage" "{guardian_bytes}" "{guardian_sha256}" || \
+   ! move_no_clobber "$guardian_stage" "$bin/frankenterm-pty-guardian"; then
+  rollback_ok=1
+  if verify_component "$bin/frankenterm-mux-server" "{mux_bytes}" "{mux_sha256}" && \
+     test ! -e "$mux_failed" && test ! -L "$mux_failed"; then
+    move_no_clobber "$bin/frankenterm-mux-server" "$mux_failed" || rollback_ok=0
+  else
+    rollback_ok=0
+  fi
+  if verify_component "$bin/ft" "{ft_bytes}" "{ft_sha256}" && \
+     test ! -e "$ft_failed" && test ! -L "$ft_failed"; then
+    move_no_clobber "$bin/ft" "$ft_failed" || rollback_ok=0
+  else
+    rollback_ok=0
+  fi
+  restore_preserved_component "$ft_backup" "$bin/ft" || rollback_ok=0
+  restore_preserved_component "$mux_backup" "$bin/frankenterm-mux-server" || rollback_ok=0
+  restore_preserved_component "$guardian_backup" "$bin/frankenterm-pty-guardian" || rollback_ok=0
   if test "$rollback_ok" = 1; then
     exit 1
   fi
@@ -83156,6 +83212,8 @@ fn remote_release_stage_command(
     let ft_sha256 = &receipt.ft.sha256;
     let mux_bytes = receipt.mux_server.byte_len;
     let mux_sha256 = &receipt.mux_server.sha256;
+    let guardian_bytes = receipt.guardian.byte_len;
+    let guardian_sha256 = &receipt.guardian.sha256;
     Ok(format!(
         r#"set -eu
 verify_component() {{
@@ -83190,12 +83248,16 @@ flock -n 9 || {{
 }}
 ft_source="$release_dir/ft"
 mux_source="$release_dir/frankenterm-mux-server"
+guardian_source="$release_dir/frankenterm-pty-guardian"
 ft_stage="$bin/ft.installing-{suffix}"
 mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
+guardian_stage="$bin/frankenterm-pty-guardian.installing-{suffix}"
 test ! -e "$ft_stage" && test ! -L "$ft_stage"
 test ! -e "$mux_stage" && test ! -L "$mux_stage"
+test ! -e "$guardian_stage" && test ! -L "$guardian_stage"
 verify_component "$ft_source" "{ft_bytes}" "{ft_sha256}"
 verify_component "$mux_source" "{mux_bytes}" "{mux_sha256}"
+verify_component "$guardian_source" "{guardian_bytes}" "{guardian_sha256}"
 verify_component "$ft_source" "{ft_bytes}" "{ft_sha256}"
 move_no_clobber "$ft_source" "$ft_stage"
 if ! verify_component "$mux_source" "{mux_bytes}" "{mux_sha256}" || \
@@ -83206,7 +83268,18 @@ if ! verify_component "$mux_source" "{mux_bytes}" "{mux_sha256}" || \
   printf 'FT_RELEASE_STAGE_ROLLBACK_INCOMPLETE={tag}:{suffix}\n' >&2
   exit 2
 fi
-printf 'FT_RELEASE_COMPONENT_STAGE_V1={tag}:{suffix}\n'"#
+if ! verify_component "$guardian_source" "{guardian_bytes}" "{guardian_sha256}" || \
+   ! move_no_clobber "$guardian_source" "$guardian_stage"; then
+  rollback_ok=1
+  move_no_clobber "$mux_stage" "$mux_source" || rollback_ok=0
+  move_no_clobber "$ft_stage" "$ft_source" || rollback_ok=0
+  if test "$rollback_ok" = 1; then
+    exit 1
+  fi
+  printf 'FT_RELEASE_STAGE_ROLLBACK_INCOMPLETE={tag}:{suffix}\n' >&2
+  exit 2
+fi
+printf 'FT_RELEASE_COMPONENT_STAGE_V2={tag}:{suffix}\n'"#
     ))
 }
 

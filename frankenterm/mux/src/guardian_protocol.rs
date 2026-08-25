@@ -8063,6 +8063,143 @@ impl GuardianProtocolState {
         Ok(permit)
     }
 
+    fn preflight_genesis_reservation_identity(
+        &self,
+        candidate: &GuardianGenesisReservationRecordV1,
+    ) -> Result<(), GuardianProtocolError> {
+        if let Some(existing) = self
+            .genesis_reservations_by_request
+            .get(&candidate.origin_request_id)
+        {
+            return Err(if existing == candidate {
+                GuardianProtocolError::GenesisReservationAlreadyIssued
+            } else {
+                GuardianProtocolError::RequestIdentityConflict
+            });
+        }
+        if self.requests.contains_key(&candidate.origin_request_id)
+            || self
+                .protected_spawn_requests
+                .contains(&candidate.origin_request_id)
+        {
+            return Err(GuardianProtocolError::RequestIdentityConflict);
+        }
+
+        if let Some(request_id) = self
+            .genesis_reservation_effects
+            .get(&candidate.spawn_effect_id)
+        {
+            let existing = self
+                .genesis_reservations_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "genesis-effect-request-index",
+                ))?;
+            return Err(if existing == candidate {
+                GuardianProtocolError::GenesisReservationAlreadyIssued
+            } else {
+                GuardianProtocolError::EffectIdentityConflict
+            });
+        }
+        if self.effects.contains_key(&candidate.spawn_effect_id)
+            || self
+                .protected_spawn_effects
+                .contains(&candidate.spawn_effect_id)
+        {
+            return Err(GuardianProtocolError::EffectIdentityConflict);
+        }
+
+        if let Some(request_id) = self
+            .genesis_reservation_panes
+            .get(&candidate.durable_pane_id)
+        {
+            let existing = self
+                .genesis_reservations_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "genesis-pane-request-index",
+                ))?;
+            return Err(if existing == candidate {
+                GuardianProtocolError::GenesisReservationAlreadyIssued
+            } else {
+                GuardianProtocolError::PaneAlreadyExists(
+                    candidate.durable_pane_id,
+                )
+            });
+        }
+        if self.panes.contains_key(&candidate.durable_pane_id) {
+            return Err(GuardianProtocolError::PaneAlreadyExists(
+                candidate.durable_pane_id,
+            ));
+        }
+
+        let reserved_panes = self
+            .panes
+            .len()
+            .checked_add(self.genesis_reservation_panes.len())
+            .ok_or(GuardianProtocolError::CapacityExhausted)?;
+        if reserved_panes >= GUARDIAN_MAX_PANES {
+            return Err(GuardianProtocolError::CapacityExhausted);
+        }
+        Ok(())
+    }
+
+    fn fence_reserved_genesis_spawn(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<(), GuardianProtocolError> {
+        if request.header.operation != GuardianOperation::Spawn {
+            return Ok(());
+        }
+        if let Some(existing) = self
+            .genesis_reservations_by_request
+            .get(&request.header.request_id)
+        {
+            return Err(if existing.matches_authenticated_spawn(request) {
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            } else {
+                GuardianProtocolError::RequestIdentityConflict
+            });
+        }
+        let effect_id = request.header.effect_id.ok_or(
+            GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Spawn,
+            },
+        )?;
+        if let Some(request_id) = self.genesis_reservation_effects.get(&effect_id) {
+            let existing = self
+                .genesis_reservations_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "genesis-effect-spawn-fence",
+                ))?;
+            return Err(if existing.matches_authenticated_spawn(request) {
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            } else {
+                GuardianProtocolError::EffectIdentityConflict
+            });
+        }
+        let pane_id = request.header.pane_id.ok_or(
+            GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Spawn,
+            },
+        )?;
+        if let Some(request_id) = self.genesis_reservation_panes.get(&pane_id) {
+            let existing = self
+                .genesis_reservations_by_request
+                .get(request_id)
+                .ok_or(GuardianProtocolError::StateInvariantViolation(
+                    "genesis-pane-spawn-fence",
+                ))?;
+            return Err(if existing.matches_authenticated_spawn(request) {
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            } else {
+                GuardianProtocolError::PaneAlreadyExists(pane_id)
+            });
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn pane_state(&self, pane_id: Uuid) -> Option<&GuardianPaneState> {
         self.panes.get(&pane_id)
@@ -8395,6 +8532,7 @@ impl GuardianProtocolState {
         if request.header.guardian_incarnation != self.incarnation {
             return Err(GuardianProtocolError::GuardianIncarnationMismatch.into());
         }
+        self.fence_reserved_genesis_spawn(request)?;
         if request.header.operation == GuardianOperation::Checkpoint {
             return Err(GuardianProtocolError::CheckpointRequiresTypedTransaction.into());
         }
@@ -10617,8 +10755,10 @@ fn validate_request_envelope(
         GuardianOperation::ReplayAck => {
             GuardianReplayAckV1::decode(request.payload())?;
         }
-        GuardianOperation::Hello
-        | GuardianOperation::GuardedStop
+        GuardianOperation::Hello if !request.payload.is_empty() => {
+            GuardianHelloBuildIdentityV1::decode(request.payload())?;
+        }
+        GuardianOperation::GuardedStop
         | GuardianOperation::Claim
         | GuardianOperation::Attach
         | GuardianOperation::Close
@@ -10630,6 +10770,33 @@ fn validate_request_envelope(
         _ => {}
     }
     Ok(())
+}
+
+fn compiled_atomic_build_identity() -> Result<AtomicBuildIdentity, GuardianProtocolError> {
+    let Some(encoded) = option_env!("FT_ATOMIC_BUILD_IDENTITY") else {
+        return Ok(AtomicBuildIdentity::UnsealedDevelopment);
+    };
+    if encoded == UNSEALED_BUILD_ID {
+        return Ok(AtomicBuildIdentity::UnsealedDevelopment);
+    }
+    SealedAtomicBuildIdentity::from_lower_hex(encoded)
+        .map(AtomicBuildIdentity::Sealed)
+        .map_err(|_| GuardianProtocolError::GenesisBuildIdentityUnavailable)
+}
+
+fn sealed_atomic_build_identity_from_bytes(
+    bytes: [u8; 32],
+) -> Result<SealedAtomicBuildIdentity, GuardianProtocolError> {
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = [0_u8; 64];
+    for (index, byte) in bytes.into_iter().enumerate() {
+        encoded[index * 2] = LOWER_HEX[usize::from(byte >> 4)];
+        encoded[index * 2 + 1] = LOWER_HEX[usize::from(byte & 0x0f)];
+    }
+    let encoded = std::str::from_utf8(&encoded)
+        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+    SealedAtomicBuildIdentity::from_lower_hex(encoded)
+        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)
 }
 
 fn require_nonzero(value: Uuid, label: &'static str) -> Result<(), GuardianProtocolError> {
