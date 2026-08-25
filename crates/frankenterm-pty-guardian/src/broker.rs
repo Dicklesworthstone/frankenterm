@@ -40,8 +40,8 @@
 
 use crate::SealedAtomicBuildIdentity;
 use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
-use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
 use mux::guardian_protocol::{
     GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1, GuardianSpawnPayload,
 };
@@ -413,7 +413,9 @@ pub enum BrokerSpawnAttemptExecutionV1<T> {
         value: T,
         observation: BrokerSpawnObservationPermitV1,
     },
-    OutcomeIndeterminate { retained_value: Option<T> },
+    OutcomeIndeterminate {
+        retained_value: Option<T>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -606,12 +608,7 @@ fn encode_broker_spawn_wal_record(
     child_identity: Option<BrokerKernelChildIdentityV1>,
     previous_record_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
 ) -> Result<[u8; BROKER_SPAWN_WAL_RECORD_BYTES], BrokerSpawnWalError> {
-    validate_broker_spawn_record_fields(
-        phase,
-        operation_id,
-        attempt_id,
-        child_identity,
-    )?;
+    validate_broker_spawn_record_fields(phase, operation_id, attempt_id, child_identity)?;
     let mut record = [0_u8; BROKER_SPAWN_WAL_RECORD_BYTES];
     record[0..8].copy_from_slice(&BROKER_SPAWN_WAL_RECORD_MAGIC);
     record[8..12].copy_from_slice(&BROKER_SPAWN_WAL_RECORD_BYTES_U32.to_le_bytes());
@@ -625,8 +622,8 @@ fn encode_broker_spawn_wal_record(
         record[80..112].copy_from_slice(&child_identity.kernel_start_identity_digest);
     }
     record[112..144].copy_from_slice(&previous_record_mac);
-    let mut authenticated = [0_u8;
-        BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES];
+    let mut authenticated =
+        [0_u8; BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES];
     authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&header_mac);
     authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
         .copy_from_slice(&record[..BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES]);
@@ -649,8 +646,7 @@ fn decode_broker_spawn_wal_record(
     {
         return Err(BrokerSpawnWalError::InvalidRecordFraming);
     }
-    if record[13..16].iter().any(|byte| *byte != 0)
-        || record[76..80].iter().any(|byte| *byte != 0)
+    if record[13..16].iter().any(|byte| *byte != 0) || record[76..80].iter().any(|byte| *byte != 0)
     {
         return Err(BrokerSpawnWalError::NonCanonicalRecord);
     }
@@ -661,8 +657,8 @@ fn decode_broker_spawn_wal_record(
     if record[112..144] != expected_previous_mac {
         return Err(BrokerSpawnWalError::RecordChainMismatch);
     }
-    let mut authenticated = [0_u8;
-        BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES];
+    let mut authenticated =
+        [0_u8; BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES];
     authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&header_mac);
     authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
         .copy_from_slice(&record[..BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES]);
@@ -686,12 +682,7 @@ fn decode_broker_spawn_wal_record(
             kernel_start_identity_digest,
         })
     };
-    validate_broker_spawn_record_fields(
-        phase,
-        operation_id,
-        attempt_id,
-        child_identity,
-    )?;
+    validate_broker_spawn_record_fields(phase, operation_id, attempt_id, child_identity)?;
     validate_broker_spawn_record_transition(previous, phase, attempt_id, child_identity)?;
     let record_mac = read_broker_array_32(&record[144..176]);
     Ok(BrokerSpawnWalRecordState {
@@ -724,8 +715,8 @@ fn encode_broker_spawn_head_record(
     record[16..24].copy_from_slice(&sequence.to_le_bytes());
     record[24..56].copy_from_slice(&wal_record_mac);
     record[56..88].copy_from_slice(&previous_head_mac);
-    let mut authenticated = [0_u8;
-        BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES];
+    let mut authenticated =
+        [0_u8; BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES];
     authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&head_header_mac);
     authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
         .copy_from_slice(&record[..BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES]);
@@ -754,8 +745,8 @@ fn decode_broker_spawn_head_record(
     {
         return Err(BrokerSpawnWalError::HeadAnchorMismatch);
     }
-    let mut authenticated = [0_u8;
-        BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES];
+    let mut authenticated =
+        [0_u8; BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES];
     authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&head_header_mac);
     authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
         .copy_from_slice(&record[..BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES]);
@@ -773,18 +764,13 @@ fn validate_broker_spawn_record_fields(
         return Err(BrokerSpawnWalError::NonCanonicalRecord);
     }
     match phase {
-        BrokerSpawnWalPhaseV1::Intent
-            if attempt_id.is_nil() && child_identity.is_none() => {}
+        BrokerSpawnWalPhaseV1::Intent if attempt_id.is_nil() && child_identity.is_none() => {}
         BrokerSpawnWalPhaseV1::Attempted
-            if !attempt_id.is_nil()
-                && operation_id == attempt_id
-                && child_identity.is_none() => {}
+            if !attempt_id.is_nil() && operation_id == attempt_id && child_identity.is_none() => {}
         BrokerSpawnWalPhaseV1::SpawnObserved | BrokerSpawnWalPhaseV1::ReplyAcknowledged
             if !attempt_id.is_nil() && child_identity.is_some() =>
         {
-            child_identity
-                .expect("checked child identity")
-                .validate()?;
+            child_identity.expect("checked child identity").validate()?;
         }
         _ => return Err(BrokerSpawnWalError::NonCanonicalRecord),
     }
@@ -849,10 +835,7 @@ fn scan_broker_spawn_wal(
     wal: &mut File,
     identity: BrokerSpawnWalIdentityV1,
     authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
-) -> Result<(
-    [u8; BROKER_SPAWN_WAL_MAC_BYTES],
-    BrokerSpawnWalScan,
-), BrokerSpawnWalError> {
+) -> Result<([u8; BROKER_SPAWN_WAL_MAC_BYTES], BrokerSpawnWalScan), BrokerSpawnWalError> {
     let metadata = wal.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(BrokerSpawnWalError::NotRegularFile);
@@ -887,8 +870,8 @@ fn scan_broker_spawn_wal(
         return Err(BrokerSpawnWalError::CapacityExhausted);
     }
     let trailing_bytes = record_region % BROKER_SPAWN_WAL_RECORD_BYTES_U64;
-    let capacity = usize::try_from(complete_records)
-        .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+    let capacity =
+        usize::try_from(complete_records).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
     let mut records = Vec::new();
     records
         .try_reserve_exact(capacity)
@@ -926,10 +909,7 @@ fn scan_broker_spawn_head(
     identity: BrokerSpawnWalIdentityV1,
     authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
     wal_records: &[BrokerSpawnWalRecordState],
-) -> Result<(
-    [u8; BROKER_SPAWN_WAL_MAC_BYTES],
-    BrokerSpawnHeadScan,
-), BrokerSpawnWalError> {
+) -> Result<([u8; BROKER_SPAWN_WAL_MAC_BYTES], BrokerSpawnHeadScan), BrokerSpawnWalError> {
     let metadata = head.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(BrokerSpawnWalError::NotRegularFile);
@@ -962,20 +942,22 @@ fn scan_broker_spawn_head(
     let complete_records = record_region / BROKER_SPAWN_HEAD_RECORD_BYTES_U64;
     if complete_records > BROKER_SPAWN_WAL_MAX_RECORDS
         || complete_records
-            > u64::try_from(wal_records.len()).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?
+            > u64::try_from(wal_records.len())
+                .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?
     {
         return Err(BrokerSpawnWalError::HeadAnchorMismatch);
     }
     let trailing_bytes = record_region % BROKER_SPAWN_HEAD_RECORD_BYTES_U64;
-    let capacity = usize::try_from(complete_records)
-        .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+    let capacity =
+        usize::try_from(complete_records).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
     let mut record_macs = Vec::new();
     record_macs
         .try_reserve_exact(capacity)
         .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
     let mut previous_head_mac = head_header_mac;
     for sequence in 0..complete_records {
-        let index = usize::try_from(sequence).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        let index =
+            usize::try_from(sequence).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
         let wal_record = wal_records
             .get(index)
             .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
@@ -1024,11 +1006,8 @@ impl BrokerSpawnJournalV1 {
         if wal.metadata()?.len() != 0 || head.metadata()?.len() != 0 {
             return Err(BrokerSpawnWalError::NewJournalNotEmpty);
         }
-        let wal_header = encode_broker_spawn_file_header(
-            BROKER_SPAWN_WAL_FILE_MAGIC,
-            identity,
-            &authenticator,
-        )?;
+        let wal_header =
+            encode_broker_spawn_file_header(BROKER_SPAWN_WAL_FILE_MAGIC, identity, &authenticator)?;
         let head_header = encode_broker_spawn_file_header(
             BROKER_SPAWN_HEAD_FILE_MAGIC,
             identity,
@@ -1083,8 +1062,7 @@ impl BrokerSpawnJournalV1 {
         authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
     ) -> Result<Self, BrokerSpawnWalError> {
         identity.validate()?;
-        let (header_mac, mut wal_scan) =
-            scan_broker_spawn_wal(&mut wal, identity, &authenticator)?;
+        let (header_mac, mut wal_scan) = scan_broker_spawn_wal(&mut wal, identity, &authenticator)?;
         let (head_header_mac, head_scan) =
             scan_broker_spawn_head(&mut head, identity, &authenticator, &wal_scan.records)?;
         let wal_record_count = wal_scan.records.len();
@@ -1102,8 +1080,7 @@ impl BrokerSpawnJournalV1 {
                 .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
             record.receipt.head_mac = head_mac;
             record.receipt.committed_head_bytes = BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
-                + u64::try_from(index + 1)
-                    .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?
+                + u64::try_from(index + 1).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?
                     * BROKER_SPAWN_HEAD_RECORD_BYTES_U64;
         }
         let mut records = Vec::new();
@@ -1329,6 +1306,296 @@ impl BrokerSpawnWalFilesystemRevalidationV1 {
             observed_wal_bytes,
             observed_head_bytes,
         })
+    }
+}
+
+impl BrokerSpawnJournalV1 {
+    /// Synchronize the durable pre-effect intent. Exact retries return the
+    /// original receipt and never advance the phase.
+    pub fn append_intent_and_sync(
+        &mut self,
+    ) -> Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError> {
+        if let Some(intent) = self.records.first() {
+            if intent.phase == BrokerSpawnWalPhaseV1::Intent
+                && intent.operation_id == self.identity.origin_request_id
+            {
+                return Ok(intent.receipt);
+            }
+            return Err(BrokerSpawnWalError::EffectIdentityConflict);
+        }
+        self.append_record_and_head(
+            BrokerSpawnWalPhaseV1::Intent,
+            self.identity.origin_request_id,
+            Uuid::nil(),
+            None,
+        )
+    }
+
+    /// Synchronize the one-way Attempt fence before invoking Spawn.
+    ///
+    /// Only a newly synchronized Attempt yields the non-cloneable callback
+    /// permit. An exact retry after reply loss returns Query state and cannot
+    /// invoke Spawn again.
+    pub fn begin_spawn_attempt_and_sync(
+        &mut self,
+        attempt_id: Uuid,
+    ) -> Result<BrokerSpawnAttemptAdmissionV1, BrokerSpawnWalError> {
+        if attempt_id.is_nil() {
+            return Err(BrokerSpawnWalError::InvalidIdentity);
+        }
+        let terminal = self.records.last().copied();
+        match terminal {
+            Some(record) if record.phase == BrokerSpawnWalPhaseV1::Intent => {
+                let receipt = self.append_record_and_head(
+                    BrokerSpawnWalPhaseV1::Attempted,
+                    attempt_id,
+                    attempt_id,
+                    None,
+                )?;
+                Ok(BrokerSpawnAttemptAdmissionV1::Authorized(
+                    BrokerSpawnAttemptPermitV1 {
+                        identity: self.identity,
+                        attempt_id,
+                        attempt_record_mac: receipt.record_mac,
+                    },
+                ))
+            }
+            Some(record)
+                if matches!(
+                    record.phase,
+                    BrokerSpawnWalPhaseV1::Attempted
+                        | BrokerSpawnWalPhaseV1::SpawnObserved
+                        | BrokerSpawnWalPhaseV1::ReplyAcknowledged
+                ) && record.attempt_id == attempt_id =>
+            {
+                Ok(BrokerSpawnAttemptAdmissionV1::Reconciled(self.status()))
+            }
+            Some(_) => Err(BrokerSpawnWalError::EffectIdentityConflict),
+            None => Err(BrokerSpawnWalError::InvalidTransition),
+        }
+    }
+
+    /// Synchronize the exact non-recycled child identity after the authorized
+    /// callback returned. Failure after the callback leaves Attempt durable and
+    /// permanently ambiguous; the caller still owns the callback's returned
+    /// value and must retain/quarantine it rather than retrying Spawn.
+    pub fn append_spawn_observed_and_sync(
+        &mut self,
+        observation: BrokerSpawnObservationPermitV1,
+    ) -> Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError> {
+        observation.child_identity.validate()?;
+        if observation.identity != self.identity {
+            return Err(BrokerSpawnWalError::EffectIdentityConflict);
+        }
+        let attempt = self
+            .records
+            .get(1)
+            .copied()
+            .ok_or(BrokerSpawnWalError::InvalidTransition)?;
+        if attempt.phase != BrokerSpawnWalPhaseV1::Attempted
+            || attempt.attempt_id != observation.attempt_id
+            || attempt.receipt.record_mac != observation.attempt_record_mac
+        {
+            return Err(BrokerSpawnWalError::EffectIdentityConflict);
+        }
+        match self.records.last().copied() {
+            Some(record) if record.phase == BrokerSpawnWalPhaseV1::Attempted => self
+                .append_record_and_head(
+                    BrokerSpawnWalPhaseV1::SpawnObserved,
+                    observation.attempt_id,
+                    observation.attempt_id,
+                    Some(observation.child_identity),
+                ),
+            Some(record)
+                if matches!(
+                    record.phase,
+                    BrokerSpawnWalPhaseV1::SpawnObserved | BrokerSpawnWalPhaseV1::ReplyAcknowledged
+                ) && record.attempt_id == observation.attempt_id
+                    && record.child_identity == Some(observation.child_identity) =>
+            {
+                Ok(record.receipt)
+            }
+            Some(_) => Err(BrokerSpawnWalError::EffectIdentityConflict),
+            None => Err(BrokerSpawnWalError::InvalidTransition),
+        }
+    }
+
+    /// Durably acknowledge delivery of the exact Spawned Query result.
+    ///
+    /// A lost acknowledgement reply is idempotent for the same `ack_id`; no
+    /// additional phase records or child effects are created.
+    pub fn acknowledge_spawn_reply_and_sync(
+        &mut self,
+        ack_id: Uuid,
+        child_identity: BrokerKernelChildIdentityV1,
+    ) -> Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError> {
+        if ack_id.is_nil() {
+            return Err(BrokerSpawnWalError::InvalidIdentity);
+        }
+        child_identity.validate()?;
+        match self.records.last().copied() {
+            Some(record)
+                if record.phase == BrokerSpawnWalPhaseV1::SpawnObserved
+                    && record.child_identity == Some(child_identity) =>
+            {
+                self.append_record_and_head(
+                    BrokerSpawnWalPhaseV1::ReplyAcknowledged,
+                    ack_id,
+                    record.attempt_id,
+                    Some(child_identity),
+                )
+            }
+            Some(record)
+                if record.phase == BrokerSpawnWalPhaseV1::ReplyAcknowledged
+                    && record.operation_id == ack_id
+                    && record.child_identity == Some(child_identity) =>
+            {
+                Ok(record.receipt)
+            }
+            Some(_) => Err(BrokerSpawnWalError::EffectIdentityConflict),
+            None => Err(BrokerSpawnWalError::InvalidTransition),
+        }
+    }
+
+    fn append_record_and_head(
+        &mut self,
+        phase: BrokerSpawnWalPhaseV1,
+        operation_id: Uuid,
+        attempt_id: Uuid,
+        child_identity: Option<BrokerKernelChildIdentityV1>,
+    ) -> Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError> {
+        self.require_append_authority()?;
+        let previous = self.records.last().copied();
+        validate_broker_spawn_record_transition(previous, phase, attempt_id, child_identity)?;
+        validate_broker_spawn_record_fields(phase, operation_id, attempt_id, child_identity)?;
+        let sequence = u64::try_from(self.records.len())
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        let previous_record_mac =
+            previous.map_or(self.header_mac, |record| record.receipt.record_mac);
+        let wal_record = encode_broker_spawn_wal_record(
+            self.header_mac,
+            &self.authenticator,
+            sequence,
+            phase,
+            operation_id,
+            attempt_id,
+            child_identity,
+            previous_record_mac,
+        )?;
+        let record_mac = read_broker_array_32(&wal_record[144..176]);
+        let head_record = encode_broker_spawn_head_record(
+            self.head_header_mac,
+            &self.authenticator,
+            sequence,
+            record_mac,
+            self.terminal_head_mac,
+        )?;
+        let projected_wal_bytes = self
+            .committed_wal_bytes
+            .checked_add(BROKER_SPAWN_WAL_RECORD_BYTES_U64)
+            .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+        let projected_head_bytes = self
+            .committed_head_bytes
+            .checked_add(BROKER_SPAWN_HEAD_RECORD_BYTES_U64)
+            .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+        if self.wal.metadata()?.len() != self.committed_wal_bytes
+            || self.head.metadata()?.len() != self.committed_head_bytes
+        {
+            self.poisoned = true;
+            return Err(BrokerSpawnWalError::ExternalLengthChange);
+        }
+
+        #[cfg(test)]
+        if let Err(error) = self.fail_if_injected(BrokerSpawnWalInjectedFault::BeforeWalWrite) {
+            return Err(BrokerSpawnWalError::Io(error));
+        }
+
+        let result = (|| -> Result<(), BrokerSpawnWalError> {
+            self.wal.seek(SeekFrom::Start(self.committed_wal_bytes))?;
+            self.wal.write_all(&wal_record)?;
+            self.wal.sync_all()?;
+            #[cfg(test)]
+            self.fail_if_injected(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead)?;
+            self.head.seek(SeekFrom::Start(self.committed_head_bytes))?;
+            self.head.write_all(&head_record)?;
+            #[cfg(test)]
+            self.fail_if_injected(BrokerSpawnWalInjectedFault::BeforeHeadSync)?;
+            self.head.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+
+        let head_mac = read_broker_array_32(&head_record[88..120]);
+        let receipt = BrokerSpawnWalReceiptV1 {
+            sequence,
+            phase,
+            committed_wal_bytes: projected_wal_bytes,
+            committed_head_bytes: projected_head_bytes,
+            record_mac,
+            head_mac,
+        };
+        self.records.push(BrokerSpawnWalRecordState {
+            phase,
+            operation_id,
+            attempt_id,
+            child_identity,
+            receipt,
+        });
+        self.committed_wal_bytes = projected_wal_bytes;
+        self.committed_head_bytes = projected_head_bytes;
+        self.terminal_head_mac = head_mac;
+        Ok(receipt)
+    }
+}
+
+impl BrokerSpawnAttemptPermitV1 {
+    /// Invoke the one Spawn callback behind the synchronized Attempt fence.
+    ///
+    /// Callback error or recovered panic is conservatively indeterminate and
+    /// never yields a replacement permit. If the callback succeeded but its
+    /// child identity proof is invalid, the returned value is retained for
+    /// quarantine rather than dropped accidentally.
+    pub fn invoke_once<T, E>(
+        self,
+        effect: impl FnOnce() -> Result<(T, BrokerKernelChildIdentityV1), E>,
+    ) -> BrokerSpawnAttemptExecutionV1<T> {
+        match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(effect),
+        ) {
+            Ok(Ok((value, child_identity))) => {
+                if child_identity.validate().is_err() {
+                    BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate {
+                        retained_value: Some(value),
+                    }
+                } else {
+                    BrokerSpawnAttemptExecutionV1::EffectSucceeded {
+                        value,
+                        observation: BrokerSpawnObservationPermitV1 {
+                            identity: self.identity,
+                            attempt_id: self.attempt_id,
+                            attempt_record_mac: self.attempt_record_mac,
+                            child_identity,
+                        },
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| drop(error)),
+                );
+                BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate {
+                    retained_value: None,
+                }
+            }
+            Err(_) => BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate {
+                retained_value: None,
+            },
+        }
     }
 }
 

@@ -1237,9 +1237,8 @@ fn validate_retained_publication_residue(
             effective_uid,
             expected_device,
         )?;
-        file.sync_all().with_context(|| {
-            format!("cannot re-durabilize pending upgrade artifact {name}")
-        })?;
+        file.sync_all()
+            .with_context(|| format!("cannot re-durabilize pending upgrade artifact {name}"))?;
         validate_remote_generation_file_metadata(
             transaction,
             Path::new(name),
@@ -2089,6 +2088,100 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn deterministic_publication_temp_recovers_every_crash_mode_without_namespace_growth() {
+        for retained_mode in [0o400, 0o600] {
+            let (fixture, root, effective_uid) = root_fixture();
+            let ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+                .expect("create deterministic-publication transaction");
+            let name = format!("probe-{retained_mode:o}.json");
+            let bytes = br#"{"schema":"deterministic-publication-probe.v1"}"#;
+            let temporary_name = synchronized_publication_temp_name(&name, bytes);
+            let transaction_path = fixture
+                .path()
+                .join("process-family/upgrade-transactions")
+                .join(TRANSACTION_ID);
+            let temporary_path = transaction_path.join(&temporary_name);
+            std::fs::write(&temporary_path, b"{\"schema")
+                .expect("plant a truncated deterministic publication temp");
+            std::fs::set_permissions(
+                &temporary_path,
+                std::fs::Permissions::from_mode(retained_mode),
+            )
+            .expect("set retained deterministic temp crash mode");
+            let entry_count_before = std::fs::read_dir(&transaction_path)
+                .expect("read transaction before recovery")
+                .count();
+
+            create_synchronized_file(
+                &ledger.transaction,
+                Path::new(&name),
+                bytes,
+                effective_uid,
+                ledger.device,
+            )
+            .expect("resume the exact deterministic publication temp");
+
+            assert_eq!(
+                std::fs::read(transaction_path.join(&name)).expect("read recovered artifact"),
+                bytes
+            );
+            assert!(!temporary_path.exists());
+            assert_eq!(
+                std::fs::read_dir(&transaction_path)
+                    .expect("read transaction after recovery")
+                    .count(),
+                entry_count_before,
+                "recovery must replace one deterministic temp rather than allocate another"
+            );
+        }
+    }
+
+    #[test]
+    fn post_rename_lost_reply_reconciles_exact_bytes_after_parent_sync_retry() {
+        let (fixture, root, effective_uid) = root_fixture();
+        let ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+            .expect("create lost-reply publication transaction");
+        let name = Path::new("post-rename-lost-reply.json");
+        let bytes = br#"{"schema":"post-rename-lost-reply.v1"}"#;
+
+        let error = create_synchronized_file_with_post_publish_sync(
+            &ledger.transaction,
+            name,
+            bytes,
+            effective_uid,
+            ledger.device,
+            |_| Err(std::io::Error::other("injected parent sync failure")),
+        )
+        .expect_err("post-rename parent sync failure must surface as a lost reply");
+        assert!(
+            error
+                .to_string()
+                .contains("is visible but its parent sync failed")
+        );
+        let transaction_path = fixture
+            .path()
+            .join("process-family/upgrade-transactions")
+            .join(TRANSACTION_ID);
+        assert_eq!(
+            std::fs::read(transaction_path.join(name)).expect("read visible exact artifact"),
+            bytes
+        );
+
+        create_synchronized_file(
+            &ledger.transaction,
+            name,
+            bytes,
+            effective_uid,
+            ledger.device,
+        )
+        .expect("retry must re-durabilize the already-applied exact artifact");
+        assert_eq!(
+            std::fs::read(transaction_path.join(name)).expect("read reconciled exact artifact"),
+            bytes
+        );
+    }
+
     fn authorize_activation_from_pending(ledger: &mut RemoteUpgradeLedger<'_>) {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
@@ -2787,6 +2880,55 @@ mod tests {
             records_before,
             "orphan adoption must add only its commit marker"
         );
+    }
+
+    #[test]
+    fn exact_intended_zero_and_prefix_records_are_quarantined_then_republished() {
+        for corruption in [Vec::new(), b"{\"schema".to_vec()] {
+            let (fixture, root, effective_uid) = root_fixture();
+            let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+                .expect("create partial-record recovery transaction");
+            ledger
+                .authorize_publication(SelectorAuthority::Missing)
+                .expect("commit Prepared authorization")
+                .consume_publication(&ledger)
+                .expect("consume publication permit");
+            let (intended, intended_bytes, digest) = pending_outcome_record(&ledger);
+            let record_name = format!(
+                "record-{:04}-{digest}-{:02}.json",
+                intended.sequence, intended.attempt
+            );
+            let transaction_path = fixture
+                .path()
+                .join("process-family/upgrade-transactions")
+                .join(TRANSACTION_ID);
+            let record_path = transaction_path.join(&record_name);
+            std::fs::write(&record_path, &corruption)
+                .expect("plant crash-truncated canonical record name");
+            std::fs::set_permissions(
+                &record_path,
+                std::fs::Permissions::from_mode(REMOTE_GENERATION_MANIFEST_MODE),
+            )
+            .expect("seal crash-truncated canonical record");
+
+            let committed = ledger
+                .commit_pending_live_owner(SelectorAuthority::Missing, intended.receipt.clone())
+                .expect("quarantine partial canonical record and republish exact bytes");
+            assert_eq!(committed, intended);
+            assert_eq!(
+                std::fs::read(&record_path).expect("read recovered canonical record"),
+                intended_bytes
+            );
+            assert!(
+                std::fs::read_dir(&transaction_path)
+                    .expect("read retained recovery evidence")
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .any(|name| name
+                        .starts_with(&format!("{QUARANTINED_ARTIFACT_PREFIX}{record_name}-"))),
+                "the crash-truncated bytes must be retained outside canonical authority"
+            );
+        }
     }
 
     #[test]
