@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::{Zeroize as _, Zeroizing};
+#[cfg(test)]
+use zeroize::Zeroize as _;
+use zeroize::Zeroizing;
 
 const LISTENER_TOKEN: Token = Token(0);
 const MAX_CONNECTIONS: usize = 1024;
@@ -2759,13 +2761,6 @@ fn publish_token_stage_noreplace(
         ErrorKind::Unsupported,
         "atomic no-replace guardian token publication is unsupported on this Unix target",
     ))
-}
-
-fn complete_frame_len(bytes: &[u8]) -> Option<usize> {
-    let prefix: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
-    usize::try_from(u32::from_be_bytes(prefix))
-        .ok()?
-        .checked_add(4)
 }
 
 fn read_blocking_frame(

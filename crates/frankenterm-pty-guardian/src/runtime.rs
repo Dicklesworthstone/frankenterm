@@ -1921,7 +1921,7 @@ mod tests {
         payload: &[u8],
     ) -> AuthenticatedGuardianRequest {
         let payload = payload.to_vec();
-        let request = GuardianRequestEnvelope::new(
+        let request = GuardianRequestEnvelope::from_zeroizing_payload(
             GuardianRequestHeader::new(
                 GuardianOperation::Input,
                 Uuid::from_u128(1),
