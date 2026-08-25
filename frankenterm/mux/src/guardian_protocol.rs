@@ -7902,6 +7902,125 @@ impl std::fmt::Debug for GuardianGenesisReservationRecordV1 {
     }
 }
 
+/// Authenticated Spawn identity recovered from a broker's durable WAL.
+///
+/// Installing this value into a fresh protocol state permanently fences the
+/// legacy in-process Spawn path for the same request, effect, or pane.  It is
+/// intentionally narrower than the complete Genesis reservation: the broker
+/// WAL retains the full reservation digest separately, while this state
+/// machine needs the exact authenticated Spawn fields it can compare before a
+/// callback is admitted.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianDurableSpawnFenceV1 {
+    mux_incarnation: Uuid,
+    spawn_effect_id: Uuid,
+    durable_pane_id: Uuid,
+    origin_request_id: Uuid,
+    spawn_payload_bytes: u64,
+    spawn_payload_digest: [u8; 32],
+}
+
+impl GuardianDurableSpawnFenceV1 {
+    pub fn new(
+        mux_incarnation: Uuid,
+        spawn_effect_id: Uuid,
+        durable_pane_id: Uuid,
+        origin_request_id: Uuid,
+        spawn_payload_bytes: u64,
+        spawn_payload_digest: [u8; 32],
+    ) -> Result<Self, GuardianProtocolError> {
+        require_nonzero(mux_incarnation, "durable Spawn fence mux incarnation")?;
+        require_nonzero(spawn_effect_id, "durable Spawn fence effect")?;
+        require_nonzero(durable_pane_id, "durable Spawn fence pane")?;
+        require_nonzero(origin_request_id, "durable Spawn fence request")?;
+        if spawn_payload_bytes == 0
+            || spawn_payload_bytes
+                > u64::try_from(GUARDIAN_MAX_PAYLOAD_BYTES)
+                    .map_err(|_| GuardianProtocolError::CapacityExhausted)?
+        {
+            return Err(GuardianProtocolError::PayloadTooLarge);
+        }
+        Ok(Self {
+            mux_incarnation,
+            spawn_effect_id,
+            durable_pane_id,
+            origin_request_id,
+            spawn_payload_bytes,
+            spawn_payload_digest,
+        })
+    }
+
+    fn from_genesis_record(record: &GuardianGenesisReservationRecordV1) -> Self {
+        Self {
+            mux_incarnation: record.mux_incarnation,
+            spawn_effect_id: record.spawn_effect_id,
+            durable_pane_id: record.durable_pane_id,
+            origin_request_id: record.origin_request_id,
+            spawn_payload_bytes: record.spawn_payload_bytes,
+            spawn_payload_digest: record.spawn_payload_digest,
+        }
+    }
+
+    fn matches_authenticated_spawn(self, request: &AuthenticatedGuardianRequest) -> bool {
+        self.mux_incarnation == request.header.mux_incarnation
+            && self.spawn_effect_id == request.header.effect_id.unwrap_or(Uuid::nil())
+            && self.durable_pane_id == request.header.pane_id.unwrap_or(Uuid::nil())
+            && self.origin_request_id == request.header.request_id
+            && self.spawn_payload_bytes == u64::from(request.authenticated_payload_bytes())
+            && self.spawn_payload_digest == request.header.payload_sha256
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(self) -> Uuid {
+        self.mux_incarnation
+    }
+
+    #[must_use]
+    pub const fn spawn_effect_id(self) -> Uuid {
+        self.spawn_effect_id
+    }
+
+    #[must_use]
+    pub const fn durable_pane_id(self) -> Uuid {
+        self.durable_pane_id
+    }
+
+    #[must_use]
+    pub const fn origin_request_id(self) -> Uuid {
+        self.origin_request_id
+    }
+
+    #[must_use]
+    pub const fn spawn_payload_bytes(self) -> u64 {
+        self.spawn_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn spawn_payload_digest(self) -> [u8; 32] {
+        self.spawn_payload_digest
+    }
+}
+
+impl std::fmt::Debug for GuardianDurableSpawnFenceV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianDurableSpawnFenceV1")
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("spawn_effect_id", &self.spawn_effect_id)
+            .field("durable_pane_id", &self.durable_pane_id)
+            .field("origin_request_id", &self.origin_request_id)
+            .field("spawn_payload_bytes", &self.spawn_payload_bytes)
+            .field("spawn_payload_digest", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianDurableSpawnFenceInstallV1 {
+    Installed,
+    AlreadyPresent,
+}
+
 #[derive(Debug)]
 #[cfg_attr(test, derive(Clone, Eq, PartialEq))]
 pub struct GuardianProtocolState {
@@ -7925,6 +8044,9 @@ pub struct GuardianProtocolState {
     genesis_reservations_by_request: HashMap<Uuid, GuardianGenesisReservationRecordV1>,
     genesis_reservation_effects: HashMap<Uuid, Uuid>,
     genesis_reservation_panes: HashMap<Uuid, Uuid>,
+    durable_spawn_fences_by_request: HashMap<Uuid, GuardianDurableSpawnFenceV1>,
+    durable_spawn_fence_effects: HashMap<Uuid, Uuid>,
+    durable_spawn_fence_panes: HashMap<Uuid, Uuid>,
     receipt_capacity: usize,
 }
 
@@ -7948,6 +8070,9 @@ impl GuardianProtocolState {
             genesis_reservations_by_request: HashMap::new(),
             genesis_reservation_effects: HashMap::new(),
             genesis_reservation_panes: HashMap::new(),
+            durable_spawn_fences_by_request: HashMap::new(),
+            durable_spawn_fence_effects: HashMap::new(),
+            durable_spawn_fence_panes: HashMap::new(),
             receipt_capacity: GUARDIAN_MAX_EFFECT_RECEIPTS,
         })
     }
