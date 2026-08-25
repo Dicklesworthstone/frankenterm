@@ -1921,7 +1921,7 @@ mod tests {
         payload: &[u8],
     ) -> AuthenticatedGuardianRequest {
         let payload = payload.to_vec();
-        let request = GuardianRequestEnvelope::from_zeroizing_payload(
+        let request = GuardianRequestEnvelope::new(
             GuardianRequestHeader::new(
                 GuardianOperation::Input,
                 Uuid::from_u128(1),
@@ -2073,7 +2073,7 @@ mod tests {
             .expect("test spawn payload is valid")
             .encode()
             .expect("test spawn payload encodes");
-        let request = GuardianRequestEnvelope::new(
+        let request = GuardianRequestEnvelope::from_zeroizing_payload(
             GuardianRequestHeader::new(
                 GuardianOperation::Spawn,
                 guardian,
