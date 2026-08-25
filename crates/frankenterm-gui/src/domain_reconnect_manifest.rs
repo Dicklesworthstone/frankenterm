@@ -1494,9 +1494,13 @@ pub fn set_intent_fenced(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
+
+    fn private_tempdir(label: &'static str) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect(label);
+        #[cfg(unix)]
+        let _ = std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700));
+        temp
+    }
 
     #[test]
     fn production_authority_uses_a_dedicated_private_leaf() {
@@ -1534,7 +1538,7 @@ mod tests {
 
     #[test]
     fn production_v1_root_survives_upgrade_and_explicit_update_stays_in_root() {
-        let data_directory = tempfile::tempdir().expect("temporary production data root");
+        let data_directory = private_tempdir("temporary production data root");
         let legacy_name = "private-legacy-trj-domain";
         let added_name = "private-added-csd-domain";
         let legacy = attached_manifest(legacy_name);
@@ -1629,7 +1633,7 @@ mod tests {
 
     #[test]
     fn production_corrupt_root_never_defaults_to_a_fresh_private_authority() {
-        let data_directory = tempfile::tempdir().expect("temporary production data root");
+        let data_directory = private_tempdir("temporary production data root");
         write_corrupt_fixture(data_directory.path(), 0);
         let before = namespace_slot_bytes(data_directory.path());
 
@@ -1650,7 +1654,7 @@ mod tests {
 
     #[test]
     fn production_dual_namespace_evidence_fails_before_any_mutation() {
-        let data_directory = tempfile::tempdir().expect("temporary production data root");
+        let data_directory = private_tempdir("temporary production data root");
         let root_manifest = attached_manifest("private-root-trj-domain");
         write_fixture(
             data_directory.path(),
@@ -1861,7 +1865,7 @@ mod tests {
 
     #[test]
     fn explicit_attach_and_detach_survive_restart_and_override_config() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir("temporary directory");
         let missing = load_from(temp.path()).expect("missing manifest");
         assert!(missing.should_connect("trj", true));
         assert!(!missing.should_connect("trj", false));
@@ -1946,7 +1950,7 @@ mod tests {
         ];
 
         for (fixtures, expected) in cuts {
-            let temp = tempfile::tempdir().expect("temporary crash-cut directory");
+            let temp = private_tempdir("temporary crash-cut directory");
             for (slot, fixture) in fixtures.into_iter().enumerate() {
                 match fixture {
                     Fixture::Manifest(manifest) => {
@@ -1970,7 +1974,7 @@ mod tests {
 
     #[test]
     fn retained_floor_rejects_rollback_before_repair_or_write() {
-        let temp = tempfile::tempdir().expect("temporary rollback-fence directory");
+        let temp = private_tempdir("temporary rollback-fence directory");
         let retained = manifest_with_intent("trj", DomainAttachmentIntent::Detached, 10);
         let rolled_back = manifest_with_intent("trj", DomainAttachmentIntent::Attached, 8);
         write_fixture(temp.path(), 0, &rolled_back, SCHEMA_VERSION);
@@ -2015,7 +2019,7 @@ mod tests {
 
     #[test]
     fn retained_floor_rejects_equal_generation_aba_without_mutation() {
-        let temp = tempfile::tempdir().expect("temporary ABA-fence directory");
+        let temp = private_tempdir("temporary ABA-fence directory");
         let retained = manifest_with_intent("trj", DomainAttachmentIntent::Detached, 10);
         let replacement = manifest_with_intent("trj", DomainAttachmentIntent::Attached, 10);
         write_fixture(temp.path(), 0, &replacement, SCHEMA_VERSION);
@@ -2047,7 +2051,7 @@ mod tests {
 
     #[test]
     fn retained_floor_accepts_and_repairs_a_strictly_newer_quorum() {
-        let temp = tempfile::tempdir().expect("temporary forward-fence directory");
+        let temp = private_tempdir("temporary forward-fence directory");
         let retained = manifest_with_intent("trj", DomainAttachmentIntent::Detached, 10);
         let advanced = manifest_with_intent("csd", DomainAttachmentIntent::Attached, 11);
         write_fixture(temp.path(), 0, &advanced, SCHEMA_VERSION);
@@ -2066,7 +2070,7 @@ mod tests {
     fn a_committed_detach_survives_corruption_of_each_single_replica() {
         let detached = detached_manifest("trj");
         for corrupt_slot in 0..SLOT_NAMES.len() {
-            let temp = tempfile::tempdir().expect("temporary corruption directory");
+            let temp = private_tempdir("temporary corruption directory");
             for slot in 0..SLOT_NAMES.len() {
                 write_fixture(temp.path(), slot, &detached, SCHEMA_VERSION);
             }
@@ -2084,7 +2088,7 @@ mod tests {
         let attached = attached_manifest("trj");
         let detached = detached_manifest("trj");
         for corrupt_slot in 0..2 {
-            let temp = tempfile::tempdir().expect("temporary rollback directory");
+            let temp = private_tempdir("temporary rollback directory");
             write_fixture(temp.path(), 0, &detached, SCHEMA_VERSION);
             write_fixture(temp.path(), 1, &detached, SCHEMA_VERSION);
             write_fixture(temp.path(), 2, &attached, SCHEMA_VERSION);
@@ -2102,7 +2106,7 @@ mod tests {
         let attached = attached_manifest("trj");
         let detached = detached_manifest("trj");
 
-        let first_publication = tempfile::tempdir().expect("first-publication migration directory");
+        let first_publication = private_tempdir("first-publication migration directory");
         write_fixture(
             first_publication.path(),
             0,
@@ -2115,7 +2119,7 @@ mod tests {
         );
         assert_fully_replicated_v2(first_publication.path(), &attached);
 
-        let ordinary = tempfile::tempdir().expect("ordinary migration directory");
+        let ordinary = private_tempdir("ordinary migration directory");
         write_fixture(ordinary.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
         write_fixture(ordinary.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         assert_eq!(
@@ -2124,7 +2128,7 @@ mod tests {
         );
         assert_fully_replicated_v2(ordinary.path(), &detached);
 
-        let torn_third = tempfile::tempdir().expect("third-slot-cut migration directory");
+        let torn_third = private_tempdir("third-slot-cut migration directory");
         write_fixture(torn_third.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
         write_fixture(torn_third.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         write_corrupt_fixture(torn_third.path(), 2);
@@ -2134,7 +2138,7 @@ mod tests {
         );
         assert_fully_replicated_v2(torn_third.path(), &detached);
 
-        let after_first = tempfile::tempdir().expect("first-cut migration directory");
+        let after_first = private_tempdir("first-cut migration directory");
         write_fixture(after_first.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
         write_fixture(after_first.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         write_fixture(after_first.path(), 2, &detached, SCHEMA_VERSION);
@@ -2144,7 +2148,7 @@ mod tests {
         );
         assert_fully_replicated_v2(after_first.path(), &detached);
 
-        let torn_stale = tempfile::tempdir().expect("stale-cut migration directory");
+        let torn_stale = private_tempdir("stale-cut migration directory");
         write_corrupt_fixture(torn_stale.path(), 0);
         write_fixture(torn_stale.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         write_fixture(torn_stale.path(), 2, &detached, SCHEMA_VERSION);
@@ -2154,7 +2158,7 @@ mod tests {
         );
         assert_fully_replicated_v2(torn_stale.path(), &detached);
 
-        let after_stale = tempfile::tempdir().expect("post-stale migration directory");
+        let after_stale = private_tempdir("post-stale migration directory");
         write_fixture(after_stale.path(), 0, &detached, SCHEMA_VERSION);
         write_fixture(after_stale.path(), 1, &detached, LEGACY_SCHEMA_VERSION);
         write_fixture(after_stale.path(), 2, &detached, SCHEMA_VERSION);
@@ -2167,7 +2171,7 @@ mod tests {
 
     #[test]
     fn ambiguous_legacy_singleton_fails_closed_without_repair() {
-        let temp = tempfile::tempdir().expect("temporary legacy ambiguity directory");
+        let temp = private_tempdir("temporary legacy ambiguity directory");
         let attached = attached_manifest("trj");
         write_fixture(temp.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
         write_corrupt_fixture(temp.path(), 1);
@@ -2183,7 +2187,7 @@ mod tests {
 
     #[test]
     fn a_v2_singleton_never_falls_back_to_an_older_legacy_generation() {
-        let temp = tempfile::tempdir().expect("temporary mixed-schema directory");
+        let temp = private_tempdir("temporary mixed-schema directory");
         let attached = attached_manifest("trj");
         let detached = detached_manifest("trj");
         write_fixture(temp.path(), 0, &attached, LEGACY_SCHEMA_VERSION);
@@ -2198,7 +2202,7 @@ mod tests {
 
     #[test]
     fn divergent_states_at_the_same_generation_fail_closed() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir("temporary directory");
         let attached = attached_manifest("trj");
         let mut detached = attached.clone();
         detached.intents.insert(
@@ -2250,7 +2254,7 @@ mod tests {
             Err(DomainReconnectManifestError::DirectoryNotPrivate)
         ));
 
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir("temporary directory");
         set_intent_at(temp.path(), "trj", DomainAttachmentIntent::Attached)
             .expect("persist manifest");
         let paths = manifest_paths(temp.path());
@@ -2261,7 +2265,7 @@ mod tests {
             Err(DomainReconnectManifestError::UnsafeFile { .. })
         ));
 
-        let other = tempfile::tempdir().expect("second temporary directory");
+        let other = private_tempdir("second temporary directory");
         std::os::unix::fs::symlink(other.path(), &manifest_paths(other.path())[0])
             .expect("create slot symlink");
         assert!(matches!(
@@ -2273,7 +2277,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replacing_the_locked_authority_is_detected_before_success() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir("temporary directory");
         let lease = ManifestLease::acquire(temp.path(), true).expect("acquire manifest lease");
         let original_lock = lock_path(temp.path());
         let displaced_lock = temp.path().join("displaced-lock");
@@ -2294,7 +2298,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replacing_an_open_slot_is_detected_by_descriptor_identity() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir("temporary directory");
         let manifest = set_intent_at(temp.path(), "trj", DomainAttachmentIntent::Attached)
             .expect("persist manifest");
         let directory = open_manifest_directory(temp.path()).expect("open manifest directory");
@@ -2328,7 +2332,7 @@ mod tests {
     fn replacing_the_manifest_directory_is_detected_by_pinned_identity() {
         use std::os::unix::fs::DirBuilderExt as _;
 
-        let parent = tempfile::tempdir().expect("temporary parent directory");
+        let parent = private_tempdir("temporary parent directory");
         let authority_path = parent.path().join("authority");
         set_intent_at(&authority_path, "trj", DomainAttachmentIntent::Attached)
             .expect("persist manifest");
@@ -2352,7 +2356,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hard_linked_authority_slot_is_rejected() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir("temporary directory");
         set_intent_at(temp.path(), "trj", DomainAttachmentIntent::Attached)
             .expect("persist manifest");
         std::fs::hard_link(
@@ -2369,7 +2373,7 @@ mod tests {
 
     #[test]
     fn diagnostics_and_persisted_bytes_do_not_contain_domain_names() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = private_tempdir("temporary directory");
         let secret_name = "private-production-host";
         set_intent_at(temp.path(), secret_name, DomainAttachmentIntent::Attached)
             .expect("persist manifest");
