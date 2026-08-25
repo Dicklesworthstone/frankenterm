@@ -7354,7 +7354,7 @@ fn checkpoint_catalog_genesis_candidate_plan<'a>(
         [existing] if existing.identity == identity && existing.path == candidate_path => {
             Ok(CheckpointCatalogGenesisCandidatePlan::Reuse(existing))
         }
-        [_] | [_, ..] => Err(GuardianCheckpointStageStoreError::Poisoned),
+        _ => Err(GuardianCheckpointStageStoreError::Poisoned),
     }
 }
 

@@ -9059,11 +9059,7 @@ mod tests {
                 "pixel_height",
                 "u16",
             ),
-            expected_authority_field(
-                "GuardianGenesisReservationIdentityV1",
-                "pixel_width",
-                "u16",
-            ),
+            expected_authority_field("GuardianGenesisReservationIdentityV1", "pixel_width", "u16"),
             expected_authority_field("GuardianGenesisReservationIdentityV1", "rows", "u16"),
             expected_authority_field(
                 "GuardianGenesisReservationIdentityV1",
@@ -9085,11 +9081,7 @@ mod tests {
                 "spawning_mux_build_identity_digest",
                 "[u8; 32]",
             ),
-            expected_authority_field(
-                "GuardianGenesisReservationIdentityV1",
-                "upload_id",
-                "Uuid",
-            ),
+            expected_authority_field("GuardianGenesisReservationIdentityV1", "upload_id", "Uuid"),
             expected_authority_field("LiveParserCaptureAuthority", "_private", "()"),
             expected_authority_field(
                 "LiveParserCheckpointAck",
