@@ -5446,6 +5446,21 @@ mod tests {
             ),
         ];
         sort_authority_methods(&mut expected_methods);
+        if inventory.methods != expected_methods {
+            for unexpected in inventory
+                .methods
+                .iter()
+                .filter(|surface| !expected_methods.contains(surface))
+            {
+                eprintln!("unexpected protocol delivery method surface: {unexpected:#?}");
+            }
+            for missing in expected_methods
+                .iter()
+                .filter(|surface| !inventory.methods.contains(surface))
+            {
+                eprintln!("missing protocol delivery method surface: {missing:#?}");
+            }
+        }
         assert_eq!(inventory.methods, expected_methods);
 
         sort_protocol_ownership_methods(&mut inventory.ownership_methods);
