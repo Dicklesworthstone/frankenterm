@@ -535,13 +535,13 @@ impl BrokerPreparedPaneV1 {
         permit: GuardianPublishedGenesisAdmissionPermitV1,
     ) -> Result<BrokerAdoptionV1, BrokerError> {
         let proof = BrokerDurablePreSpawnIntentProof::from_permit(permit);
-        self.commit_with_proof(control, proof)
+        self.commit_with_proof(control, &proof)
     }
 
     fn commit_with_proof(
         self,
         control: BrokerControlLeaseV1,
-        proof: BrokerDurablePreSpawnIntentProof,
+        proof: &BrokerDurablePreSpawnIntentProof,
     ) -> Result<BrokerAdoptionV1, BrokerError> {
         self.validate_control(&control)?;
         if proof.binding != self.binding {
@@ -628,7 +628,7 @@ impl BrokerPreparedPaneV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct BrokerDurablePreSpawnIntentProof {
     binding: BrokerGenesisBinding,
     catalog_candidate_checksum: [u8; BROKER_CATALOG_CHECKSUM_BYTES],
@@ -636,11 +636,11 @@ struct BrokerDurablePreSpawnIntentProof {
 
 impl BrokerDurablePreSpawnIntentProof {
     fn from_permit(permit: GuardianPublishedGenesisAdmissionPermitV1) -> Self {
-        let binding = BrokerGenesisBinding::from(permit.reservation_identity());
         let catalog_candidate_checksum = *permit.catalog_candidate_checksum();
         // This consumes the catalog's one-way pre-Spawn intent. It does not
         // assert that a child exists; the future broker WAL supplies that fact.
-        drop(permit.into_reservation_identity());
+        let reservation_identity = permit.into_reservation_identity();
+        let binding = BrokerGenesisBinding::from(&reservation_identity);
         Self {
             binding,
             catalog_candidate_checksum,
@@ -1834,13 +1834,11 @@ mod tests {
         control: BrokerControlLeaseV1,
         binding: BrokerGenesisBinding,
     ) -> Result<BrokerAdoptionV1, BrokerError> {
-        prepared.commit_with_proof(
-            control,
-            BrokerDurablePreSpawnIntentProof {
-                binding,
-                catalog_candidate_checksum: [0x71; BROKER_CATALOG_CHECKSUM_BYTES],
-            },
-        )
+        let proof = BrokerDurablePreSpawnIntentProof {
+            binding,
+            catalog_candidate_checksum: [0x71; BROKER_CATALOG_CHECKSUM_BYTES],
+        };
+        prepared.commit_with_proof(control, &proof)
     }
 
     fn proxy_write(
@@ -2071,7 +2069,7 @@ mod tests {
         let eof = BrokerAuthenticatedControlEofV1::from_authenticated_transport_close(
             attachment.identity(),
         );
-        drop(attachment);
+        let _detached_attachment = attachment;
         assert_eq!(
             pane.observe_authenticated_control_eof(eof),
             Ok(BrokerControlEofOutcomeV1::AwaitingSuccessor { next_generation: 1 })
@@ -2159,7 +2157,7 @@ mod tests {
         };
         assert_eq!(recovered_attachment.identity(), successor_identity);
         assert_eq!(pane.resource_usage().live_guardian_leases, 1);
-        drop(successor_attachment);
+        let _superseded_successor_reply = successor_attachment;
         let successor_attachment = recovered_attachment;
 
         let delayed_predecessor_eof =
@@ -2267,7 +2265,7 @@ mod tests {
         let eof = BrokerAuthenticatedControlEofV1::from_authenticated_transport_close(
             attachment_identity,
         );
-        drop(attachment);
+        let _detached_attachment = attachment;
         pane.observe_authenticated_control_eof(eof)
             .expect("observe exact EOF");
 

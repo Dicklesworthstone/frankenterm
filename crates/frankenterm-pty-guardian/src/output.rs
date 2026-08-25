@@ -7827,16 +7827,13 @@ fn checkpoint_catalog_publish_genesis_stage(
     let staging_role = checkpoint_catalog_staging_role(inner, &scan, identity)?;
     if !matches!(
         (&candidate_plan, staging_role),
-        (CheckpointCatalogGenesisCandidatePlan::Create, None)
-            | (
-                CheckpointCatalogGenesisCandidatePlan::Create,
-                Some(CheckpointCatalogPathRole::Candidate)
-            )
-            | (CheckpointCatalogGenesisCandidatePlan::Reuse(_), None)
-            | (
-                CheckpointCatalogGenesisCandidatePlan::Reuse(_),
-                Some(CheckpointCatalogPathRole::Marker)
-            )
+        (
+            CheckpointCatalogGenesisCandidatePlan::Create,
+            None | Some(CheckpointCatalogPathRole::Candidate)
+        ) | (
+            CheckpointCatalogGenesisCandidatePlan::Reuse(_),
+            None | Some(CheckpointCatalogPathRole::Marker)
+        )
     ) {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
@@ -8038,16 +8035,13 @@ fn checkpoint_catalog_publish_sealed_stage(
     let staging_role = checkpoint_catalog_staging_role(inner, &scan, identity)?;
     if !matches!(
         (&candidate_plan, staging_role),
-        (CheckpointCatalogGenesisCandidatePlan::Create, None)
-            | (
-                CheckpointCatalogGenesisCandidatePlan::Create,
-                Some(CheckpointCatalogPathRole::Candidate)
-            )
-            | (CheckpointCatalogGenesisCandidatePlan::Reuse(_), None)
-            | (
-                CheckpointCatalogGenesisCandidatePlan::Reuse(_),
-                Some(CheckpointCatalogPathRole::Marker)
-            )
+        (
+            CheckpointCatalogGenesisCandidatePlan::Create,
+            None | Some(CheckpointCatalogPathRole::Candidate)
+        ) | (
+            CheckpointCatalogGenesisCandidatePlan::Reuse(_),
+            None | Some(CheckpointCatalogPathRole::Marker)
+        )
     ) {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
