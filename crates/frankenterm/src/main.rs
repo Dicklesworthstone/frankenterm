@@ -102336,6 +102336,20 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(installer.contains("sed 's/:ft:/:ROLE:/' | sort -u"));
         assert!(installer.contains("sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u"));
         assert!(installer.contains("sed 's/:frankenterm-pty-guardian:/:ROLE:/' | sort -u"));
+        assert!(installer.contains("GUARDIAN_BIN=\"$PACKAGE_ROOT/frankenterm-pty-guardian\""));
+        assert!(installer.contains(
+            "-name \"frankenterm-pty-guardian\" -perm -111"
+        ));
+        assert!(installer.contains(
+            "install_process_family \"$BIN\" \"$MUX_BIN\" \"$GUARDIAN_BIN\""
+        ));
+        let offline_verification = installer
+            .find("Verifying atomic CLI/mux-server/PTY-guardian build identity")
+            .expect("offline archive triplet verification");
+        let offline_install = installer
+            .find("install_process_family \"$BIN\" \"$MUX_BIN\" \"$GUARDIAN_BIN\"")
+            .expect("offline archive triplet installation");
+        assert!(offline_verification < offline_install);
 
         let source_build_start = installer
             .find("build_from_source() {")
@@ -102385,7 +102399,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             .expect("source-family manifest verification");
         let family_install = source_build
             .find(
-                "install_process_family \\\n+    \"$proof_root/ft\" \\\n+    \"$proof_root/frankenterm-mux-server\" \\\n+    \"$proof_root/frankenterm-pty-guardian\"",
+                "install_process_family \\\n    \"$proof_root/ft\" \\\n    \"$proof_root/frankenterm-mux-server\" \\\n    \"$proof_root/frankenterm-pty-guardian\"",
             )
             .expect("verified process-family installation");
         assert!(identity_derivation < cargo_build);
