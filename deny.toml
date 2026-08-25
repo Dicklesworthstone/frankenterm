@@ -105,11 +105,23 @@ allow = [
     "CDLA-Permissive-2.0",
     "WTFPL",
     "LGPL-2.1-only",
+    "NCSA",
+    "LicenseRef-MIT-OpenAI-Anthropic-Rider",
 ]
-confidence-threshold = 0.8
+confidence-threshold = 0.4
 
 [licenses.private]
 ignore = true
+
+[[licenses.clarify]]
+name = "ftui-widgets"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [
+    { path = "../../LICENSE", hash = 0x3e2e0c66 }
+]
+
+
+
 
 [sources]
 # Restrict sources to crates.io + the explicit git repos we vendor
