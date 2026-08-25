@@ -103643,6 +103643,8 @@ log_level = "debug"
 
     #[test]
     fn local_remote_setup_components_reject_unsealed_or_wrong_role_markers() {
+        use std::io::Write as _;
+
         let dir = tempfile::tempdir().expect("create component fixture directory");
         let path = dir.path().join("component");
         assert!(
@@ -103661,6 +103663,48 @@ log_level = "debug"
             "x86_64-unknown-linux-gnu",
         );
         assert!(read_local_component_snapshot(&path, AtomicComponentRole::Ft).is_err());
+
+        let build_id = "d".repeat(64);
+        write_atomic_component_fixture(&path, &build_id, "ft", "x86_64-unknown-linux-gnu");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                writeln!(
+                    file,
+                    "# FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:ft:x86_64-unknown-linux-gnu:release-interactive:0.15.2;"
+                )
+            })
+            .expect("append an identical second component marker");
+        let duplicate_identical =
+            read_local_component_snapshot(&path, AtomicComponentRole::Ft)
+                .expect_err("an identical second component marker must fail closed");
+        assert!(
+            duplicate_identical
+                .to_string()
+                .contains("more than one atomic identity marker")
+        );
+
+        write_atomic_component_fixture(&path, &build_id, "ft", "x86_64-unknown-linux-gnu");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                writeln!(
+                    file,
+                    "# FT_ATOMIC_COMPONENT_IDENTITY_V1:{}:ft:x86_64-unknown-linux-gnu:release-interactive:0.15.2;",
+                    "e".repeat(64)
+                )
+            })
+            .expect("append a conflicting second component marker");
+        let duplicate_conflicting =
+            read_local_component_snapshot(&path, AtomicComponentRole::Ft)
+                .expect_err("a conflicting second component marker must fail closed");
+        assert!(
+            duplicate_conflicting
+                .to_string()
+                .contains("more than one atomic identity marker")
+        );
 
         #[cfg(unix)]
         {
@@ -105109,6 +105153,100 @@ esac
         let installer = include_str!("../../../install.sh");
         assert!(installer.contains("identity[\"build_id\"] == \"0\" * 64"));
         assert!(installer.contains("build == \"0\" * 64"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_component_manifest_rejects_duplicate_identical_component_marker() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create duplicate-marker fixture");
+        let package = fixture.path().join("package");
+        std::fs::create_dir(&package).expect("create duplicate-marker package root");
+        let build_id = "f".repeat(64);
+        let ft = package.join("ft");
+        let mux = package.join("frankenterm-mux-server");
+        let guardian = package.join("frankenterm-pty-guardian");
+        write_atomic_component_fixture(&ft, &build_id, "ft", "x86_64-unknown-linux-gnu");
+        write_atomic_component_fixture(
+            &mux,
+            &build_id,
+            "frankenterm-mux-server",
+            "x86_64-unknown-linux-gnu",
+        );
+        write_atomic_component_fixture(
+            &guardian,
+            &build_id,
+            "frankenterm-pty-guardian",
+            "x86_64-unknown-linux-gnu",
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ft)
+            .and_then(|mut file| {
+                writeln!(
+                    file,
+                    "# FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:ft:x86_64-unknown-linux-gnu:release-interactive:0.15.2;"
+                )
+            })
+            .expect("append an identical second ft marker");
+        for path in [&ft, &mux, &guardian] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+                .expect("make duplicate-marker component executable");
+        }
+
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let verifier = repository.join("scripts/atomic-component-manifest.sh");
+        let packaged_verifier = package.join("verify-components.sh");
+        std::fs::copy(&verifier, &packaged_verifier).expect("copy verifier into package");
+        std::fs::set_permissions(
+            &packaged_verifier,
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("make packaged verifier executable");
+        let manifest = fixture.path().join("manifest.json");
+        let rejected = std::process::Command::new("bash")
+            .arg(&verifier)
+            .arg("generate")
+            .arg("--root")
+            .arg(&package)
+            .arg("--source-root")
+            .arg(&repository)
+            .arg("--output")
+            .arg(&manifest)
+            .arg("--build-id")
+            .arg(&build_id)
+            .arg("--source-revision")
+            .arg("1".repeat(40))
+            .arg("--version")
+            .arg("0.15.2")
+            .arg("--target")
+            .arg("x86_64-unknown-linux-gnu")
+            .arg("--profile")
+            .arg("release-interactive")
+            .arg("--feature-contract")
+            .arg("process-family-ft-mux-server-pty-guardian-default-features-v1")
+            .arg("--entry")
+            .arg("executable:cli:ft:ft")
+            .arg("--entry")
+            .arg("executable:mux-server:frankenterm-mux-server:frankenterm-mux-server")
+            .arg("--entry")
+            .arg("executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian")
+            .arg("--entry")
+            .arg("verifier:offline-verifier:verify-components.sh")
+            .arg("--source-match")
+            .arg("verify-components.sh=scripts/atomic-component-manifest.sh")
+            .output()
+            .expect("execute duplicate-marker manifest generator");
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("duplicate_component_identity_marker"),
+            "unexpected duplicate-marker rejection: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(!manifest.exists());
     }
 
     #[test]
