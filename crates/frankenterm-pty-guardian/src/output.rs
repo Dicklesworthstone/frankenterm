@@ -6768,6 +6768,7 @@ fn checkpoint_catalog_validate_chain(
     let mut checkpoints = BTreeSet::new();
     let mut adoption_effects = BTreeSet::new();
     for member in published.iter() {
+        checkpoint_catalog_validate_metadata(&member.metadata)?;
         let expected_predecessor = previous.map(|prior| CheckpointCatalogPredecessor {
             generation: prior.metadata.identity.generation,
             candidate_id: prior.metadata.identity.candidate_id,
@@ -6810,6 +6811,10 @@ fn checkpoint_catalog_scan(
     inner: &GuardianCheckpointStageStoreInner,
     scope: CheckpointCatalogScope,
 ) -> Result<CheckpointCatalogScan, GuardianCheckpointStageStoreError> {
+    inner
+        .persistence
+        .validate(&inner.directory)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     let mut candidates = Vec::new();
     let mut markers = Vec::new();
     candidates
@@ -6939,8 +6944,17 @@ fn checkpoint_catalog_scan(
         });
     }
     checkpoint_catalog_validate_chain(&mut published)?;
+    let unpublished_candidates = candidates
+        .into_iter()
+        .filter(|candidate| !candidate.published)
+        .collect();
+    inner
+        .persistence
+        .validate(&inner.directory)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     Ok(CheckpointCatalogScan {
         published,
+        unpublished_candidates,
         relevant_files,
         relevant_bytes,
     })
