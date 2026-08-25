@@ -8849,7 +8849,7 @@ fn validate_checkpoint_artifact_file_metadata(
 }
 
 fn checkpoint_artifact_staging_name(leaf: &Path, artifact_sha256: &str) -> String {
-    let leaf_digest = checkpoint_artifact_sha256(leaf.to_string_lossy().as_bytes());
+    let leaf_digest = checkpoint_artifact_sha256(leaf.as_os_str().as_encoded_bytes());
     format!(".ft-checkpoint-scrollback-{leaf_digest}-{artifact_sha256}.staging")
 }
 
@@ -12587,6 +12587,67 @@ mod tests {
             assert!(matches!(
                 verify_checkpoint_scrollback_artifact(&mutated_path, limits),
                 Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
+
+            let mut sequence_mutation = artifact.clone();
+            sequence_mutation.payload.scrollback[0].segments[1].seq = 0;
+            assert!(matches!(
+                validate_checkpoint_scrollback_payload(&sequence_mutation.payload, limits),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
+
+            let mut gap_mutation = artifact.clone();
+            gap_mutation.payload.scrollback[0].sequence_gaps.push(
+                CheckpointScrollbackSequenceGap {
+                    first_missing_seq: 1,
+                    last_missing_seq: 1,
+                },
+            );
+            assert!(matches!(
+                validate_checkpoint_scrollback_payload(&gap_mutation.payload, limits),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
+
+            let mut completeness_mutation = artifact.clone();
+            completeness_mutation.payload.scrollback[0].complete = false;
+            assert!(matches!(
+                validate_checkpoint_scrollback_payload(&completeness_mutation.payload, limits),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
+
+            let mut redaction_mutation = artifact.clone();
+            let secret =
+                "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let prefix = &mut redaction_mutation.payload.scrollback[0];
+            let prior_content_bytes = prefix.segments[0].content_bytes;
+            prefix.segments[0].content = secret.to_string();
+            prefix.segments[0].content_bytes = secret.len();
+            prefix.segments[0].content_sha256 = checkpoint_artifact_sha256(secret.as_bytes());
+            prefix.content_bytes = prefix
+                .content_bytes
+                .checked_sub(u64::try_from(prior_content_bytes).unwrap())
+                .unwrap()
+                .checked_add(u64::try_from(secret.len()).unwrap())
+                .unwrap();
+            prefix.prefix_sha256 = checkpoint_scrollback_prefix_sha256(prefix).unwrap();
+            redaction_mutation.payload.summary.content_bytes = prefix.content_bytes;
+            redaction_mutation.payload_sha256 = hash_checkpoint_artifact_json(
+                &redaction_mutation.payload,
+                limits.max_artifact_bytes,
+            )
+            .unwrap();
+            let redaction_bytes =
+                serialize_checkpoint_artifact(&redaction_mutation, limits.max_artifact_bytes)
+                    .unwrap();
+            let redaction_directory = tempfile::TempDir::new().unwrap();
+            let redaction_path = redaction_directory.path().join(format!(
+                "redaction-mutation{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
+            ));
+            publish_checkpoint_artifact_bytes(&redaction_path, &redaction_bytes).unwrap();
+            assert!(matches!(
+                verify_checkpoint_scrollback_artifact(&redaction_path, limits),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(ref message))
+                    if message.contains("fixed point")
             ));
 
             let mut capability_mutation = artifact;

@@ -103817,6 +103817,478 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         );
     }
 
+    #[cfg(unix)]
+    struct InstallerTestFamily {
+        root: std::path::PathBuf,
+        manifest: std::path::PathBuf,
+        verifier: std::path::PathBuf,
+        generation_id: String,
+    }
+
+    #[cfg(unix)]
+    fn write_installer_atomic_helper_fixture(
+        path: &Path,
+        build_id: &str,
+        target: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut source = format!(
+            "#!/usr/bin/env python3\n# FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:ft:{target}:release-interactive:0.15.2;\n"
+        );
+        source.push_str(
+            r#"import hashlib, os, sys
+
+arguments = sys.argv[1:]
+if arguments == ["--version"]:
+    print("ft 0.15.2")
+    raise SystemExit(0)
+if len(arguments) < 2 or arguments[0] != "setup":
+    raise SystemExit(64)
+command = arguments[1]
+options = dict(zip(arguments[2::2], arguments[3::2]))
+if command == "__atomic-path-content-id":
+    path = os.path.join(options["--parent"], options["--name"])
+    observed = os.lstat(path)
+    if os.path.islink(path):
+        payload = b"symlink\0" + os.fsencode(os.readlink(path))
+    elif os.path.isfile(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as source_file:
+            while True:
+                chunk = source_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        payload = b"file\0" + digest.digest()
+    elif os.path.isdir(path):
+        payload = f"directory\0{observed.st_dev}\0{observed.st_ino}".encode()
+    else:
+        raise SystemExit(65)
+    print("FT_ATOMIC_PATH_CONTENT_ID_V2=sha256:" + hashlib.sha256(payload).hexdigest())
+    raise SystemExit(0)
+if command != "__atomic-path-transition":
+    raise SystemExit(64)
+parent = options["--parent"]
+stage_name = options["--stage-name"]
+target_name = options["--target-name"]
+transaction_id = options["--transaction-id"]
+operation = options["--operation"]
+stage = os.path.join(parent, stage_name)
+target = os.path.join(parent, target_name)
+stage_exists = os.path.lexists(stage)
+target_exists = os.path.lexists(target)
+outcome = "applied"
+if operation == "publish-noreplace":
+    if stage_exists and not target_exists:
+        os.rename(stage, target)
+    elif not stage_exists and target_exists:
+        outcome = "already-applied"
+    else:
+        raise SystemExit(66)
+elif operation == "exchange":
+    if stage_exists and target_exists:
+        swap = os.path.join(parent, ".fixture-swap-" + transaction_id)
+        if os.path.lexists(swap):
+            raise SystemExit(67)
+        os.rename(target, swap)
+        os.rename(stage, target)
+        os.rename(swap, stage)
+    else:
+        raise SystemExit(68)
+else:
+    raise SystemExit(69)
+parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{target_name}:{outcome}")
+"#,
+        );
+        std::fs::write(path, source).expect("write installer atomic helper fixture");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+            .expect("make installer atomic helper executable");
+    }
+
+    #[cfg(unix)]
+    fn create_installer_test_family(
+        root: &Path,
+        build_id: &str,
+        target: &str,
+        feature_contract: &str,
+    ) -> InstallerTestFamily {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::create_dir_all(root).expect("create installer family root");
+        let ft = root.join("ft");
+        let mux = root.join("frankenterm-mux-server");
+        let guardian = root.join("frankenterm-pty-guardian");
+        write_installer_atomic_helper_fixture(&ft, build_id, target);
+        write_atomic_component_fixture(&mux, build_id, "frankenterm-mux-server", target);
+        write_atomic_component_fixture(&guardian, build_id, "frankenterm-pty-guardian", target);
+        for path in [&mux, &guardian] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+                .expect("make installer family member executable");
+        }
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let verifier_source = repository.join("scripts/atomic-component-manifest.sh");
+        let verifier = root.join("verify-components.sh");
+        std::fs::copy(&verifier_source, &verifier)
+            .expect("copy externally trusted component verifier");
+        std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o555))
+            .expect("make component verifier executable");
+        let manifest = root.join("process-family.component-manifest.json");
+        let generated = std::process::Command::new("bash")
+            .arg(&verifier_source)
+            .arg("generate")
+            .arg("--root")
+            .arg(root)
+            .arg("--source-root")
+            .arg(&repository)
+            .arg("--output")
+            .arg(&manifest)
+            .arg("--build-id")
+            .arg(build_id)
+            .arg("--source-revision")
+            .arg("1".repeat(40))
+            .arg("--version")
+            .arg("0.15.2")
+            .arg("--target")
+            .arg(target)
+            .arg("--profile")
+            .arg("release-interactive")
+            .arg("--feature-contract")
+            .arg(feature_contract)
+            .arg("--entry")
+            .arg("executable:cli:ft:ft")
+            .arg("--entry")
+            .arg("executable:mux-server:frankenterm-mux-server:frankenterm-mux-server")
+            .arg("--entry")
+            .arg("executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian")
+            .arg("--entry")
+            .arg("verifier:offline-verifier:verify-components.sh")
+            .arg("--source-match")
+            .arg("verify-components.sh=scripts/atomic-component-manifest.sh")
+            .output()
+            .expect("execute installer family manifest generator");
+        assert!(
+            generated.status.success(),
+            "installer family manifest generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let manifest_value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest).expect("read generated installer family manifest"),
+        )
+        .expect("parse generated installer family manifest");
+        let generation_id = manifest_value["manifest_id"]
+            .as_str()
+            .and_then(|value| value.strip_prefix("sha256:"))
+            .filter(|value| value.len() == 64)
+            .expect("generated installer family manifest ID")
+            .to_string();
+        InstallerTestFamily {
+            root: root.to_path_buf(),
+            manifest,
+            verifier,
+            generation_id,
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_installer_family_function(
+        installer: &Path,
+        family: &InstallerTestFamily,
+        destination: &Path,
+        scratch: &Path,
+        failpoint: Option<&str>,
+    ) -> std::process::Output {
+        std::fs::create_dir_all(destination).expect("create installer destination");
+        std::fs::create_dir_all(scratch).expect("create installer shell scratch");
+        let failpoint = failpoint.unwrap_or("");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\ninstall_process_family {} {} {} {} {}\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&destination.to_string_lossy()),
+            shell_single_quote(&scratch.to_string_lossy()),
+            if failpoint.is_empty() { "0" } else { "1" },
+            shell_single_quote(failpoint),
+            shell_single_quote(&family.root.join("ft").to_string_lossy()),
+            shell_single_quote(
+                &family
+                    .root
+                    .join("frankenterm-mux-server")
+                    .to_string_lossy()
+            ),
+            shell_single_quote(
+                &family
+                    .root
+                    .join("frankenterm-pty-guardian")
+                    .to_string_lossy()
+            ),
+            shell_single_quote(&family.manifest.to_string_lossy()),
+            shell_single_quote(&family.verifier.to_string_lossy()),
+        );
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute production installer family function")
+    }
+
+    #[cfg(unix)]
+    fn family_bytes_match(destination: &Path, family: &InstallerTestFamily) -> bool {
+        ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"]
+            .into_iter()
+            .all(|name| {
+                std::fs::read(destination.join(name)).ok()
+                    == std::fs::read(family.root.join(name)).ok()
+            })
+    }
+
+    #[cfg(unix)]
+    fn assert_initial_family_is_uniformly_unavailable(destination: &Path) {
+        for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+            let path = destination.join(name);
+            if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                assert!(metadata.file_type().is_symlink());
+                assert!(!path.exists(), "first-install link must remain dangling");
+            }
+            assert!(
+                std::process::Command::new(&path).arg("--version").status().is_err(),
+                "partial first-install namespace unexpectedly executed {name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn installer_residue_count(destination: &Path) -> usize {
+        let mut count = 0;
+        let mut pending = vec![(destination.to_path_buf(), 0usize)];
+        while let Some((directory, depth)) = pending.pop() {
+            if depth > 4 {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.contains(".installing")
+                    || name.starts_with(".ft-entrypoint-")
+                    || name.starts_with(".current-")
+                    || name.starts_with(".fixture-swap-")
+                {
+                    count += 1;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push((entry.path(), depth + 1));
+                }
+            }
+        }
+        count
+    }
+
+    #[cfg(unix)]
+    struct InstallerTestApp {
+        app_root: std::path::PathBuf,
+        archive: std::path::PathBuf,
+        checksum: String,
+        app_id: String,
+    }
+
+    #[cfg(unix)]
+    fn create_installer_test_app(
+        root: &Path,
+        build_id: &str,
+        target: &str,
+    ) -> InstallerTestApp {
+        use sha2::Digest as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let app_root = root.join("FrankenTerm.app");
+        let macos = app_root.join("Contents/MacOS");
+        let resources = app_root.join("Contents/Resources");
+        std::fs::create_dir_all(&macos).expect("create app executable directory");
+        std::fs::create_dir_all(&resources).expect("create app resource directory");
+        write_installer_atomic_helper_fixture(&macos.join("ft"), build_id, target);
+        for (name, component) in [
+            ("frankenterm-gui", "frankenterm-gui"),
+            ("frankenterm-mux-server", "frankenterm-mux-server"),
+            ("frankenterm-pty-guardian", "frankenterm-pty-guardian"),
+        ] {
+            let path = macos.join(name);
+            write_atomic_component_fixture(&path, build_id, component, target);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+                .expect("make app executable fixture runnable");
+        }
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let verifier_source = repository.join("scripts/atomic-component-manifest.sh");
+        let verifier = resources.join("verify-components.sh");
+        std::fs::copy(&verifier_source, &verifier).expect("copy app verifier fixture");
+        std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o555))
+            .expect("make app verifier executable");
+        let manifest = root.join("FrankenTerm.app.component-manifest.json");
+        let generated = std::process::Command::new("bash")
+            .arg(&verifier_source)
+            .arg("generate")
+            .arg("--root")
+            .arg(&app_root)
+            .arg("--source-root")
+            .arg(&repository)
+            .arg("--output")
+            .arg(&manifest)
+            .arg("--build-id")
+            .arg(build_id)
+            .arg("--source-revision")
+            .arg("1".repeat(40))
+            .arg("--version")
+            .arg("0.15.2")
+            .arg("--target")
+            .arg(target)
+            .arg("--profile")
+            .arg("release-interactive")
+            .arg("--feature-contract")
+            .arg("application-family-gui-ft-mux-server-pty-guardian-default-features-v1")
+            .arg("--entry")
+            .arg("executable:gui:Contents/MacOS/frankenterm-gui:frankenterm-gui")
+            .arg("--entry")
+            .arg("executable:cli:Contents/MacOS/ft:ft")
+            .arg("--entry")
+            .arg("executable:mux-server:Contents/MacOS/frankenterm-mux-server:frankenterm-mux-server")
+            .arg("--entry")
+            .arg("executable:pty-guardian:Contents/MacOS/frankenterm-pty-guardian:frankenterm-pty-guardian")
+            .arg("--entry")
+            .arg("verifier:offline-verifier:Contents/Resources/verify-components.sh")
+            .arg("--source-match")
+            .arg("Contents/Resources/verify-components.sh=scripts/atomic-component-manifest.sh")
+            .output()
+            .expect("execute app manifest generator");
+        assert!(
+            generated.status.success(),
+            "app manifest generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let manifest_value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest).expect("read generated app manifest"),
+        )
+        .expect("parse generated app manifest");
+        let app_id = manifest_value["manifest_id"]
+            .as_str()
+            .and_then(|value| value.strip_prefix("sha256:"))
+            .filter(|value| value.len() == 64)
+            .expect("generated app manifest ID")
+            .to_string();
+        let archive = root.join("FrankenTerm-darwin-arm64.app.tar.xz");
+        let archived = std::process::Command::new("tar")
+            .arg("-cJf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(root)
+            .arg("FrankenTerm.app")
+            .arg("FrankenTerm.app.component-manifest.json")
+            .output()
+            .expect("create installer app archive");
+        assert!(
+            archived.status.success(),
+            "app archive creation failed: {}",
+            String::from_utf8_lossy(&archived.stderr)
+        );
+        let checksum = hex::encode(sha2::Sha256::digest(
+            std::fs::read(&archive).expect("read app archive for checksum"),
+        ));
+        InstallerTestApp {
+            app_root,
+            archive,
+            checksum,
+            app_id,
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_installer_fake_download_tools(directory: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::create_dir_all(directory).expect("create fake app download tool directory");
+        let curl = directory.join("curl");
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+set -eu
+output=""
+url=""
+while test "$#" -gt 0; do
+  case "$1" in
+    -o) shift; output=$1 ;;
+    http://*|https://*) url=$1 ;;
+  esac
+  shift
+done
+test -n "$output"
+case "$url" in
+  *.sha256) printf '%s  FrankenTerm-darwin-arm64.app.tar.xz\n' "$FAKE_APP_CHECKSUM" > "$output" ;;
+  *) cp "$FAKE_APP_ARCHIVE" "$output" ;;
+esac
+"#,
+        )
+        .expect("write fake app curl");
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o555))
+            .expect("make fake app curl executable");
+        let codesign = directory.join("codesign");
+        std::fs::write(&codesign, b"#!/bin/sh\nexit 0\n").expect("write fake codesign");
+        std::fs::set_permissions(&codesign, std::fs::Permissions::from_mode(0o555))
+            .expect("make fake codesign executable");
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn run_installer_app_function(
+        installer: &Path,
+        family: &InstallerTestFamily,
+        destination: &Path,
+        app: &InstallerTestApp,
+        app_destination: &Path,
+        scratch: &Path,
+        fake_tools: &Path,
+        failpoint: Option<&str>,
+        tree_fail_after_files: Option<usize>,
+    ) -> std::process::Output {
+        std::fs::create_dir_all(scratch).expect("create app installer shell scratch");
+        let selected_manifest = destination
+            .join(".frankenterm-process-family/generations")
+            .join(&family.generation_id)
+            .join("process-family.component-manifest.json");
+        let inherited_path = std::env::var("PATH").expect("test PATH");
+        let test_path = format!("{}:{inherited_path}", fake_tools.display());
+        let failpoint = failpoint.unwrap_or("");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_CHECKSUM=0\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&destination.to_string_lossy()),
+            shell_single_quote(&scratch.to_string_lossy()),
+            shell_single_quote(&app_destination.to_string_lossy()),
+            shell_single_quote(&selected_manifest.to_string_lossy()),
+            shell_single_quote(&family.verifier.to_string_lossy()),
+            shell_single_quote(&destination.join("ft").to_string_lossy()),
+            if failpoint.is_empty() && tree_fail_after_files.is_none() {
+                "0"
+            } else {
+                "1"
+            },
+            shell_single_quote(failpoint),
+            tree_fail_after_files.unwrap_or(0),
+        );
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", test_path)
+            .env("FAKE_APP_ARCHIVE", &app.archive)
+            .env("FAKE_APP_CHECKSUM", &app.checksum)
+            .output()
+            .expect("execute production installer app function")
+    }
+
     #[test]
     fn top_level_installer_seals_and_switches_one_exact_triplet_generation() {
         let installer = include_str!("../../../install.sh");
@@ -103962,6 +104434,159 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         assert!(cargo_build < manifest_generation);
         assert!(manifest_generation < manifest_verification);
         assert!(manifest_verification < family_install);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_failpoint_matrix_retries_without_partial_or_mixed_process_family() {
+        use std::os::unix::fs::{ExitStatusExt as _, PermissionsExt as _};
+
+        let fixture = tempfile::tempdir().expect("create installer failpoint matrix fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let new_family = create_installer_test_family(
+            &fixture.path().join("new-family"),
+            &"a".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let old_family = create_installer_test_family(
+            &fixture.path().join("old-family"),
+            &"b".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+
+        let initial_failpoints = [
+            ("after-generation-publish", false),
+            ("after-mux-entrypoint", false),
+            ("after-guardian-entrypoint", false),
+            ("after-ft-entrypoint", false),
+            ("before-initial-selector", false),
+            ("after-initial-selector", true),
+            ("before-selector-switch", true),
+            ("after-selector-switch", true),
+        ];
+        for (index, (failpoint, activated)) in initial_failpoints.into_iter().enumerate() {
+            let destination = fixture.path().join(format!("initial-{index}-{failpoint}"));
+            std::fs::create_dir(&destination).expect("create initial-install destination");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make initial-install destination private");
+            let interrupted = run_installer_family_function(
+                &installer,
+                &new_family,
+                &destination,
+                &fixture.path().join(format!("initial-{index}-interrupted")),
+                Some(failpoint),
+            );
+            assert_eq!(
+                interrupted.status.signal(),
+                Some(9),
+                "failpoint {failpoint} did not kill at its intended boundary: {}",
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            let generation = destination
+                .join(".frankenterm-process-family/generations")
+                .join(&new_family.generation_id);
+            for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+                assert_eq!(
+                    std::fs::read(generation.join(name)).expect("read published generation member"),
+                    std::fs::read(new_family.root.join(name)).expect("read source family member")
+                );
+            }
+            if activated {
+                assert!(
+                    family_bytes_match(&destination, &new_family),
+                    "{failpoint} exposed anything except the complete new family"
+                );
+            } else {
+                assert_initial_family_is_uniformly_unavailable(&destination);
+            }
+            assert!(
+                installer_residue_count(&destination) <= 1,
+                "{failpoint} leaked an unbounded or forked installer stage"
+            );
+
+            for retry in 0..2 {
+                let replay = run_installer_family_function(
+                    &installer,
+                    &new_family,
+                    &destination,
+                    &fixture.path().join(format!("initial-{index}-retry-{retry}")),
+                    None,
+                );
+                assert!(
+                    replay.status.success(),
+                    "initial-install retry after {failpoint} failed: {}",
+                    String::from_utf8_lossy(&replay.stderr)
+                );
+                assert!(family_bytes_match(&destination, &new_family));
+                assert!(installer_residue_count(&destination) <= 1);
+            }
+        }
+
+        let legacy_failpoints = [
+            ("after-generation-publish", false),
+            ("after-legacy-selector", false),
+            ("after-mux-entrypoint", false),
+            ("after-guardian-entrypoint", false),
+            ("after-ft-entrypoint", false),
+            ("before-selector-switch", false),
+            ("after-selector-switch", true),
+        ];
+        for (index, (failpoint, activated)) in legacy_failpoints.into_iter().enumerate() {
+            let destination = fixture.path().join(format!("legacy-{index}-{failpoint}"));
+            std::fs::create_dir(&destination).expect("create legacy-install destination");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make legacy-install destination private");
+            for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+                std::fs::copy(old_family.root.join(name), destination.join(name))
+                    .expect("plant coherent legacy family member");
+                std::fs::set_permissions(
+                    destination.join(name),
+                    std::fs::Permissions::from_mode(0o555),
+                )
+                .expect("seal coherent legacy family member");
+            }
+            let interrupted = run_installer_family_function(
+                &installer,
+                &new_family,
+                &destination,
+                &fixture.path().join(format!("legacy-{index}-interrupted")),
+                Some(failpoint),
+            );
+            assert_eq!(
+                interrupted.status.signal(),
+                Some(9),
+                "legacy failpoint {failpoint} did not kill at its intended boundary: {}",
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            assert!(
+                if activated {
+                    family_bytes_match(&destination, &new_family)
+                } else {
+                    family_bytes_match(&destination, &old_family)
+                },
+                "legacy failpoint {failpoint} exposed a mixed process family"
+            );
+            assert!(installer_residue_count(&destination) <= 4);
+
+            for retry in 0..2 {
+                let replay = run_installer_family_function(
+                    &installer,
+                    &new_family,
+                    &destination,
+                    &fixture.path().join(format!("legacy-{index}-retry-{retry}")),
+                    None,
+                );
+                assert!(
+                    replay.status.success(),
+                    "legacy retry after {failpoint} failed: {}",
+                    String::from_utf8_lossy(&replay.stderr)
+                );
+                assert!(family_bytes_match(&destination, &new_family));
+                assert!(installer_residue_count(&destination) <= 4);
+            }
+        }
     }
 
     #[cfg(unix)]
