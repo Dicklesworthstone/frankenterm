@@ -125,6 +125,10 @@ const REPLAY_PAGE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-page.v1";
 const REPLAY_RECORD_PLAINTEXT_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-output-plaintext-delivery.v3\0";
 const REPLAY_RECORD_PLAINTEXT_DIGEST_VERSION: u32 = 3;
+const GUARDIAN_BROKER_SPAWN_WAL_MAC_DOMAIN: &[u8] =
+    b"frankenterm.guardian-broker-spawn-wal.hmac.v1\0";
+const GUARDIAN_BROKER_SPAWN_WAL_KEY_ID_DOMAIN: &[u8] =
+    b"frankenterm.guardian-broker-spawn-wal.key-id.v1\0";
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -163,11 +167,97 @@ impl GuardianSecret {
         mac.verify_slice(tag)
             .map_err(|_| GuardianProtocolError::AuthenticationFailed)
     }
+
+    /// Derive a domain-separated authenticator for the broker Spawn WAL.
+    ///
+    /// The returned value never exposes the guardian token or a derived key.
+    /// It only authenticates the fixed canonical WAL headers and records. The
+    /// token's durable provisioning and descriptor-revalidation lifecycle is
+    /// owned by the guardian transport; this derivation does not weaken or
+    /// replace those filesystem checks.
+    pub fn broker_spawn_wal_authenticator(
+        &self,
+    ) -> Result<GuardianBrokerSpawnWalAuthenticatorV1, GuardianProtocolError> {
+        GuardianBrokerSpawnWalAuthenticatorV1::from_secret(self)
+    }
 }
 
 impl std::fmt::Debug for GuardianSecret {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("GuardianSecret([REDACTED])")
+    }
+}
+
+/// Narrow HMAC authority for the broker's fixed-format Spawn WAL.
+///
+/// This type is deliberately not serializable and never exposes key bytes.
+/// HMAC authenticates a recovered prefix but cannot prove that a valid newer
+/// prefix was not rolled back. Broker recovery must therefore withhold append
+/// authority until a separate durable anti-rollback head proof is validated.
+#[derive(Clone)]
+pub struct GuardianBrokerSpawnWalAuthenticatorV1 {
+    secret: GuardianSecret,
+    key_id: [u8; 8],
+}
+
+impl GuardianBrokerSpawnWalAuthenticatorV1 {
+    fn from_secret(secret: &GuardianSecret) -> Result<Self, GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_SPAWN_WAL_KEY_ID_DOMAIN);
+        let digest = mac.finalize().into_bytes();
+        let mut key_id = [0_u8; 8];
+        key_id.copy_from_slice(&digest[..8]);
+        Ok(Self {
+            secret: secret.clone(),
+            key_id,
+        })
+    }
+
+    /// Nonsecret fingerprint stored in each WAL header.
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; 8] {
+        self.key_id
+    }
+
+    /// Authenticate one canonical fixed-size WAL structure.
+    pub fn authenticate(
+        &self,
+        authenticated_bytes: &[u8],
+    ) -> Result<[u8; GUARDIAN_MAC_BYTES], GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_SPAWN_WAL_MAC_DOMAIN);
+        mac.update(&self.key_id);
+        mac.update(authenticated_bytes);
+        let output = mac.finalize().into_bytes();
+        let mut tag = [0_u8; GUARDIAN_MAC_BYTES];
+        tag.copy_from_slice(&output);
+        Ok(tag)
+    }
+
+    /// Verify one canonical fixed-size WAL structure in constant time.
+    pub fn verify(
+        &self,
+        authenticated_bytes: &[u8],
+        tag: &[u8],
+    ) -> Result<(), GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_SPAWN_WAL_MAC_DOMAIN);
+        mac.update(&self.key_id);
+        mac.update(authenticated_bytes);
+        mac.verify_slice(tag)
+            .map_err(|_| GuardianProtocolError::AuthenticationFailed)
+    }
+}
+
+impl std::fmt::Debug for GuardianBrokerSpawnWalAuthenticatorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianBrokerSpawnWalAuthenticatorV1")
+            .field("key_id", &"[REDACTED]")
+            .finish_non_exhaustive()
     }
 }
 
