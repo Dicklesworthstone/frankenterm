@@ -6285,9 +6285,19 @@ mod tests {
             .scope()
             .pane_identity()
             .expect("record manifest fixture uses pane scope");
-        let protocol_descriptor =
-            GuardianCheckpointDescriptorV1::from_live_capture(capture, generation)
-                .expect("construct authoritative protocol descriptor");
+        let protocol_descriptor = GuardianCheckpointDescriptorV1::from_live_capture(
+            capture,
+            generation,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "construct authoritative protocol descriptor: {error:?}; generation={generation}; parser_stream_bytes={}; terminal_payload_bytes={}; rows={}; cols={}",
+                capture.parser_stream_bytes(),
+                capture.terminal_payload_bytes(),
+                capture.terminal_checkpoint().rows(),
+                capture.terminal_checkpoint().cols(),
+            )
+        });
         GuardianCheckpointStageRequestV1::begin(
             GuardianCheckpointScopeV1::Pane {
                 pane_id,
