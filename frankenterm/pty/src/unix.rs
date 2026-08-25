@@ -803,17 +803,16 @@ mod tests {
         drop(writer);
         let output = read_until(reader.as_mut(), b":end");
         let output = String::from_utf8_lossy(&output);
-        assert!(output.contains("bytes:"));
-        assert!(
-            output.contains("10"),
-            "legacy newline byte missing: {:?}",
-            output
-        );
-        assert!(
-            output.contains(&eot.to_string()),
-            "legacy VEOF byte missing: {:?}",
-            output
-        );
+        let encoded_bytes = output
+            .split_once("bytes:")
+            .and_then(|(_, suffix)| suffix.split_once(":end"))
+            .map(|(encoded, _)| encoded)
+            .expect("raw-mode byte report delimiters");
+        let delivered = encoded_bytes
+            .split_ascii_whitespace()
+            .map(|byte| byte.parse::<u8>().expect("decimal byte from od"))
+            .collect::<Vec<_>>();
+        assert_eq!(delivered, [b'\n', eot]);
         assert!(child.wait().expect("wait for raw-mode reader").success());
     }
 

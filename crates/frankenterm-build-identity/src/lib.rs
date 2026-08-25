@@ -59,9 +59,10 @@ impl fmt::Display for AtomicComponentRole {
 
 /// Validated and decoded authority for one sealed process-family build.
 ///
-/// Construction accepts exactly 64 lowercase hexadecimal characters. There is
-/// deliberately no constructor from a version, inode, path, or arbitrary byte
-/// array: those values are not process-family identity authorities.
+/// Construction accepts exactly 64 lowercase hexadecimal characters encoding
+/// a non-zero value. There is deliberately no constructor from a version,
+/// inode, path, or arbitrary byte array: those values are not process-family
+/// identity authorities.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct SealedAtomicBuildIdentity([u8; 32]);
 
@@ -79,6 +80,9 @@ impl SealedAtomicBuildIdentity {
             let low = decode_lower_hex_nibble(pair[1])
                 .ok_or(AtomicComponentIdentityError::InvalidBuildIdentity)?;
             decoded[index] = (high << 4) | low;
+        }
+        if decoded == [0_u8; 32] {
+            return Err(AtomicComponentIdentityError::InvalidBuildIdentity);
         }
         Ok(Self(decoded))
     }
@@ -177,7 +181,8 @@ impl fmt::Display for AtomicComponentMarkerField {
 /// Fail-closed errors for marker construction, parsing, and sealing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtomicComponentIdentityError {
-    /// A build ID was not exactly 64 lowercase hexadecimal characters.
+    /// A build ID was not a non-zero value encoded as exactly 64 lowercase
+    /// hexadecimal characters.
     InvalidBuildIdentity,
     /// A target, profile, or version token violated the marker grammar.
     InvalidMarkerToken(AtomicComponentMarkerField),
@@ -202,7 +207,7 @@ impl fmt::Display for AtomicComponentIdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBuildIdentity => formatter.write_str(
-                "atomic build identity must be exactly 64 lowercase hexadecimal characters",
+                "atomic build identity must be a non-zero value encoded as exactly 64 lowercase hexadecimal characters",
             ),
             Self::InvalidMarkerToken(field) => write!(
                 formatter,
@@ -663,6 +668,7 @@ mod tests {
     #[test]
     fn uppercase_short_long_and_explicit_unsealed_values_are_not_sealed_ids() {
         let invalid = [
+            "0".repeat(64),
             SEALED_HEX.to_uppercase(),
             SEALED_HEX[..63].to_owned(),
             format!("{SEALED_HEX}0"),
@@ -675,5 +681,27 @@ mod tests {
                 "accepted invalid sealed identity {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn all_zero_marker_never_becomes_build_authority() {
+        let marker = format!(
+            "FT_ATOMIC_COMPONENT_IDENTITY_V1:{}:frankenterm-pty-guardian:aarch64-apple-darwin:release-interactive:0.15.1;",
+            "0".repeat(64)
+        );
+        assert_eq!(
+            parse_atomic_component_marker(
+                &marker,
+                AtomicComponentRole::FrankenTermPtyGuardian
+            ),
+            Err(AtomicComponentIdentityError::InvalidBuildIdentity)
+        );
+        assert_eq!(
+            parse_sealed_atomic_component_marker(
+                &marker,
+                AtomicComponentRole::FrankenTermPtyGuardian
+            ),
+            Err(AtomicComponentIdentityError::InvalidBuildIdentity)
+        );
     }
 }
