@@ -5196,6 +5196,8 @@ mod tests {
                         Begin,
                         Chunk(GuardianCheckpointStageChunkDeliveryV1),
                         Seal,
+                        Query,
+                        Ack { completion_id: Uuid },
                     }
                 "#,
             )
