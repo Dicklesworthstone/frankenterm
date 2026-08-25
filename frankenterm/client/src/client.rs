@@ -3201,20 +3201,13 @@ impl RpcGenerationScope {
                 )));
             }
             let result = match rx.recv().await {
-                Ok(Ok(pdu)) => {
-                    rpc_transport
-                        .validate(
-                            binding,
-                            RpcRetirementStage::CompletionChannel,
-                            RpcDeliveryCertainty::OutcomeUnknown,
-                            "transport retired after response delivery and before caller observation",
-                        )
-                        .map_err(|error| {
-                            record_rpc_transport_error(&error);
-                            anyhow::Error::new(error)
-                        })?;
-                    Ok(pdu)
-                }
+                // The physical reader validates the exact generation and the
+                // typed serial correlation before it removes the pending RPC
+                // and enqueues this value. That successful enqueue is the
+                // response-delivery linearization point. A later socket EOF
+                // may retire the transport before this task is scheduled, but
+                // it cannot revoke an already decoded and correlated reply.
+                Ok(Ok(pdu)) => Ok(pdu),
                 Ok(Err(error)) => Err(error),
                 Err(_) => Err(anyhow::Error::new(rpc_transport.retirement_error(
                     binding,
@@ -13841,6 +13834,48 @@ mod tests {
             .try_send(Ok(Pdu::Pong(Pong {})))
             .expect("complete admitted interactive RPC");
         asupersync_block_on(pending).expect("admitted interactive RPC should observe its reply");
+    }
+
+    #[test]
+    fn delivered_rpc_reply_survives_retirement_before_caller_observation() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let authority = client.test_dispatch_authority(Weak::new());
+        let pending = admit_interactive_rpc_now(client.ping())
+            .expect("live RPC admission should succeed")
+            .expect("admitted RPC should await its reader response");
+
+        let ReaderMessage::SendPdu { lease, promise, .. } = receiver
+            .try_recv()
+            .expect("the physical reader should receive the admitted RPC")
+        else {
+            panic!("admitted RPC enqueued a non-PDU reader message");
+        };
+        let prepared = lease
+            .claim_for_reader()
+            .expect("reader claim state should remain coherent")
+            .expect("the live reader should retain the exact request");
+        assert!(matches!(prepared.pdu(), Pdu::Ping(Ping {})));
+
+        promise
+            .try_send(Ok(Pdu::Pong(Pong {})))
+            .expect("the validated response should enter the one-shot channel");
+        authority
+            .begin_rpc_transport_retirement()
+            .expect("EOF after response delivery should retire the old transport");
+        assert_eq!(
+            client
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire),
+            0,
+            "the response must be observed after its transport is no longer live"
+        );
+
+        let response = asupersync_block_on(pending)
+            .expect("retirement after delivery must not erase a correlated response");
+        assert_eq!(response, Pong {});
+        drop(prepared);
+        drop(lease);
     }
 
     #[test]

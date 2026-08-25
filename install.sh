@@ -479,11 +479,17 @@ target_fd = -1
 try:
     source_before = os.fstat(source_fd)
     parent_before = os.fstat(parent_fd)
+    source_named_before = os.stat(source_path, follow_symlinks=False)
+    parent_named_before = os.stat(parent_path, follow_symlinks=False)
     if (not stat.S_ISREG(source_before.st_mode) or source_before.st_nlink != 1 or
-            source_before.st_size > 16 * 1024 * 1024 * 1024):
+            source_before.st_size > 16 * 1024 * 1024 * 1024 or
+            (source_before.st_dev, source_before.st_ino) !=
+            (source_named_before.st_dev, source_named_before.st_ino)):
         raise SystemExit("staged source is not one bounded single-link regular file")
     if (not stat.S_ISDIR(parent_before.st_mode) or parent_before.st_uid != os.geteuid() or
-            stat.S_IMODE(parent_before.st_mode) not in (0o700, 0o555)):
+            stat.S_IMODE(parent_before.st_mode) not in (0o700, 0o555) or
+            (parent_before.st_dev, parent_before.st_ino) !=
+            (parent_named_before.st_dev, parent_named_before.st_ino)):
         raise SystemExit("staged target parent is not one owner-controlled directory")
 
     try:
@@ -587,6 +593,10 @@ try:
             named_sealed.st_dev, named_sealed.st_ino, source_before.st_size, final_mode):
         raise SystemExit("staged file seal did not survive exact readback")
     os.fsync(parent_fd)
+    parent_named_final = os.stat(parent_path, follow_symlinks=False)
+    if (parent_before.st_dev, parent_before.st_ino) != (
+            parent_named_final.st_dev, parent_named_final.st_ino):
+        raise SystemExit("staged target parent detached during publication")
 finally:
     if target_fd >= 0:
         os.close(target_fd)
@@ -611,7 +621,14 @@ MAX_ENTRIES = 1_000_000
 MAX_NAME_BYTES = 64 * 1024 * 1024
 MAX_BYTES = 16 * 1024 * 1024 * 1024
 MAX_DEPTH = 128
-budget = {"entries": 0, "name_bytes": 0, "bytes": 0, "files": 0}
+budget = {
+    "source_entries": 0,
+    "source_name_bytes": 0,
+    "target_entries": 0,
+    "target_name_bytes": 0,
+    "bytes": 0,
+    "files": 0,
+}
 fail_after = 0
 if os.environ.get("FT_INSTALL_TEST_ENABLE_FAILPOINTS") == "1":
     fail_after = int(os.environ.get("FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES", "0"))
@@ -620,15 +637,16 @@ def stable(metadata):
     return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
             metadata.st_mtime_ns, metadata.st_ctime_ns)
 
-def scan_names(fd, label):
+def scan_names(fd, kind):
     names = []
     with os.scandir(fd) as entries:
         for entry in entries:
             encoded = entry.name.encode("utf-8", "surrogateescape")
-            budget["entries"] += 1
-            budget["name_bytes"] += len(encoded)
-            if budget["entries"] > 2 * MAX_ENTRIES or budget["name_bytes"] > 2 * MAX_NAME_BYTES:
-                raise SystemExit(f"{label} tree exceeds its bounded inventory")
+            budget[f"{kind}_entries"] += 1
+            budget[f"{kind}_name_bytes"] += len(encoded)
+            if (budget[f"{kind}_entries"] > MAX_ENTRIES or
+                    budget[f"{kind}_name_bytes"] > MAX_NAME_BYTES):
+                raise SystemExit(f"{kind} app tree exceeds its bounded inventory")
             names.append(entry.name)
     names.sort(key=lambda value: value.encode("utf-8", "surrogateescape"))
     return names
@@ -740,8 +758,8 @@ def materialize(source_fd, target_fd, depth):
         raise SystemExit("app tree contains an unsafe directory")
     os.fchmod(target_fd, 0o700)
     os.fsync(target_fd)
-    source_names = scan_names(source_fd, "source app")
-    target_names = scan_names(target_fd, "retained app stage")
+    source_names = scan_names(source_fd, "source")
+    target_names = scan_names(target_fd, "target")
     unexpected = set(target_names).difference(source_names)
     if unexpected:
         raise SystemExit("retained app stage contains an unexpected entry")
@@ -770,7 +788,9 @@ def materialize(source_fd, target_fd, depth):
                 raise SystemExit("app source symlink target exceeds its bound")
             if name in target_set:
                 target_named = os.stat(name, dir_fd=target_fd, follow_symlinks=False)
-                if not stat.S_ISLNK(target_named.st_mode) or os.readlink(name, dir_fd=target_fd) != link_target:
+                if (not stat.S_ISLNK(target_named.st_mode) or
+                        target_named.st_uid != os.geteuid() or
+                        os.readlink(name, dir_fd=target_fd) != link_target):
                     raise SystemExit("retained app symlink differs from its source")
             else:
                 os.symlink(link_target, name, dir_fd=target_fd)
@@ -787,12 +807,23 @@ def materialize(source_fd, target_fd, depth):
 
 source_fd = os.open(source_path, os.O_RDONLY | directory | nofollow | cloexec)
 parent_path, target_name = os.path.split(target_path)
+if not target_name or target_name in (".", "..") or "/" in target_name:
+    raise SystemExit("app stage target is not one canonical child")
 parent_fd = os.open(parent_path, os.O_RDONLY | directory | nofollow | cloexec)
 target_fd = -1
 try:
+    source_metadata = os.fstat(source_fd)
     parent_metadata = os.fstat(parent_fd)
+    source_named = os.stat(source_path, follow_symlinks=False)
+    parent_named = os.stat(parent_path, follow_symlinks=False)
+    if (not stat.S_ISDIR(source_metadata.st_mode) or
+            (source_metadata.st_dev, source_metadata.st_ino) !=
+            (source_named.st_dev, source_named.st_ino)):
+        raise SystemExit("app source root is not one stable nofollow directory")
     if (not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_uid != os.geteuid() or
-            stat.S_IMODE(parent_metadata.st_mode) & 0o7022):
+            stat.S_IMODE(parent_metadata.st_mode) & 0o7022 or
+            (parent_metadata.st_dev, parent_metadata.st_ino) !=
+            (parent_named.st_dev, parent_named.st_ino)):
         raise SystemExit("app stage parent is not one private owner-controlled directory")
     try:
         os.mkdir(target_name, 0o700, dir_fd=parent_fd)
@@ -807,6 +838,10 @@ try:
         raise SystemExit("app stage root is not one stable owner-controlled directory")
     materialize(source_fd, target_fd, 0)
     os.fsync(parent_fd)
+    parent_named_final = os.stat(parent_path, follow_symlinks=False)
+    if (parent_metadata.st_dev, parent_metadata.st_ino) != (
+            parent_named_final.st_dev, parent_named_final.st_ino):
+        raise SystemExit("app stage parent detached during materialization")
 finally:
     if target_fd >= 0:
         os.close(target_fd)
@@ -1925,6 +1960,18 @@ build_from_source() {
     "$proof_manifest" \
     "$proof_root/verify-components.sh"
 }
+
+# Test subprocesses source the exact production functions so failpoint tests
+# execute the installer state machine rather than a structural reimplementation.
+# The seam is source-only: executing install.sh with this variable is rejected.
+if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" = 1 ]; then
+  if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    err "FT_INSTALL_TEST_LIBRARY_ONLY requires sourcing from an isolated test shell"
+    exit 2
+  fi
+  trap - EXIT
+  return 0
+fi
 
 # ───────────────────────────────────────────────────────────────────────────
 # Usage + arg parsing

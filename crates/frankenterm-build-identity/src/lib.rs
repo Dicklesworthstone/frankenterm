@@ -690,10 +690,7 @@ mod tests {
             "0".repeat(64)
         );
         assert_eq!(
-            parse_atomic_component_marker(
-                &marker,
-                AtomicComponentRole::FrankenTermPtyGuardian
-            ),
+            parse_atomic_component_marker(&marker, AtomicComponentRole::FrankenTermPtyGuardian),
             Err(AtomicComponentIdentityError::InvalidBuildIdentity)
         );
         assert_eq!(

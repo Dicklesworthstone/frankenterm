@@ -3,10 +3,10 @@
 use crate::{
     Child, CommandBuilder, MasterPty, PollablePtyReader, PtyPair, PtySize, PtySystem, SlavePty,
 };
-use anyhow::{Error, bail};
+use anyhow::{bail, Error};
 use filedescriptor::FileDescriptor;
 use libc::{self, winsize};
-use nix::unistd::{PathconfVar, fpathconf};
+use nix::unistd::{fpathconf, PathconfVar};
 use std::cell::RefCell;
 use std::convert::TryInto as _;
 use std::ffi::OsStr;
@@ -16,8 +16,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::{io, mem, ptr};
 
 pub use std::os::unix::io::RawFd;
@@ -766,11 +766,9 @@ mod tests {
         drop(writer);
 
         let output = read_until(reader.as_mut(), b"drop-eof");
-        assert!(
-            output
-                .windows(b"drop-line:".len())
-                .any(|window| window == b"drop-line:")
-        );
+        assert!(output
+            .windows(b"drop-line:".len())
+            .any(|window| window == b"drop-line:"));
         assert!(child.wait().expect("wait after writer drop").success());
     }
 

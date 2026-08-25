@@ -13,7 +13,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use serde::{Deserialize, Serialize};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
@@ -95,6 +94,7 @@ use frankenterm_core::runtime_telemetry::{
 };
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
+use serde::{Deserialize, Serialize};
 
 /// Build metadata captured at compile time.
 mod build_meta {
@@ -6647,16 +6647,16 @@ where
     let temporary_name = format!("{name}.pending");
     anyhow::ensure!(
         temporary_name.len() <= 255
-            && temporary_name.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-            }),
+            && temporary_name
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') }),
         "transition artifact temp name is not one bounded path component"
     );
     let temporary_exists = match parent.symlink_metadata(&temporary_name) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
-            return Err(error).context("cannot inspect deterministic transition artifact temp")
+            return Err(error).context("cannot inspect deterministic transition artifact temp");
         }
     };
     let (retained_count, retained_bytes) = atomic_path_transition_artifact_inventory(parent)?;
@@ -6680,9 +6680,11 @@ where
     if !temporary_exists {
         options.create_new(true);
     }
-    let mut file = parent.open_with(&temporary_name, &options).with_context(|| {
-        format!("cannot open deterministic atomic transition artifact {temporary_name}")
-    })?;
+    let mut file = parent
+        .open_with(&temporary_name, &options)
+        .with_context(|| {
+            format!("cannot open deterministic atomic transition artifact {temporary_name}")
+        })?;
     let metadata_before = file.metadata()?;
     let path_before = parent.symlink_metadata(&temporary_name)?;
     anyhow::ensure!(
@@ -101973,7 +101975,7 @@ log_level = "debug"
             &pinned,
             "frankenterm-mux-server",
         )
-            .expect("descriptor-pinned execution must still run the admitted inode");
+        .expect("descriptor-pinned execution must still run the admitted inode");
         let ambient_status = std::process::Command::new(&named)
             .arg("--version")
             .status()
@@ -102052,9 +102054,8 @@ log_level = "debug"
         )
         .expect("set deterministic temp mode");
         let parent_file = std::fs::File::open(fixture.path()).expect("open journal parent");
-        let parent = cap_std::fs::Dir::from_std_file(
-            parent_file.try_clone().expect("clone journal parent"),
-        );
+        let parent =
+            cap_std::fs::Dir::from_std_file(parent_file.try_clone().expect("clone journal parent"));
         let ack = AtomicPathTransitionAck {
             schema_version: "frankenterm.atomic-path-transition-ack.v4".to_string(),
             transaction_id: transaction_id.to_string(),
@@ -102165,7 +102166,12 @@ log_level = "debug"
         barrier.wait();
         let mut outcomes = workers
             .into_iter()
-            .map(|worker| worker.join().expect("exchange worker did not panic").unwrap())
+            .map(|worker| {
+                worker
+                    .join()
+                    .expect("exchange worker did not panic")
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         outcomes.sort_by_key(|outcome| match outcome {
             AtomicPathTransitionOutcome::Applied => 0,
