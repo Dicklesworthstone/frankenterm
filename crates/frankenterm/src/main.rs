@@ -6511,6 +6511,7 @@ fn acquire_atomic_path_transition_lock(
     parent_file: &fs::File,
 ) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
     use cap_std::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
 
     // Serialize the whole parent namespace. Transaction- or pair-scoped locks
     // do not cover different transactions whose entry sets overlap; in
@@ -6813,7 +6814,6 @@ fn atomic_path_hash_node(
     budget: &mut AtomicPathHashBudget,
 ) -> anyhow::Result<(AtomicPathObjectMetadata, bool)> {
     use cap_fs_ext::DirExt as _;
-    use cap_std::fs::MetadataExt as _;
     use sha2::Digest as _;
     use std::io::Read as _;
     use std::os::unix::ffi::OsStrExt as _;
