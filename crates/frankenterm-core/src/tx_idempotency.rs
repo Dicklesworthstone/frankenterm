@@ -9237,8 +9237,8 @@ mod tests {
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         ledger.transition_phase(TxPhase::Committing).unwrap();
 
-        let key0 = make_key("test-plan", "step-0");
-        let key1 = make_key("test-plan", "step-1");
+        let key0 = make_key("test-plan", &plan.steps[0].id);
+        let key1 = make_key("test-plan", &plan.steps[1].id);
         ledger
             .append(
                 key0,
@@ -9267,7 +9267,7 @@ mod tests {
             .terminal_certificate()
             .expect("certificate synthesized on Completed");
         assert_eq!(cert.disposition, TerminalDispositionKind::Committed);
-        assert_eq!(cert.completed_step_ids, vec!["step-0", "step-1"]);
+        assert_eq!(cert.completed_step_ids, vec!["step-b0", "step-b1"]);
         assert!(cert.failed_step_ids.is_empty());
         assert!(cert.compensated_step_ids.is_empty());
 
@@ -9286,8 +9286,8 @@ mod tests {
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         ledger.transition_phase(TxPhase::Committing).unwrap();
 
-        let key0 = make_key("test-plan", "step-0");
-        let key1 = make_key("test-plan", "step-1");
+        let key0 = make_key("test-plan", &plan.steps[0].id);
+        let key1 = make_key("test-plan", &plan.steps[1].id);
         ledger
             .append(
                 key0.clone(),
@@ -9314,7 +9314,8 @@ mod tests {
             .unwrap();
 
         ledger.transition_phase(TxPhase::Compensating).unwrap();
-        let comp_key0 = IdempotencyKey::for_compensation("test-plan", "step-0", "rollback");
+        let comp_key0 =
+            IdempotencyKey::for_compensation("test-plan", &plan.steps[0].id, "rollback");
         ledger
             .append(
                 comp_key0,
@@ -9335,9 +9336,9 @@ mod tests {
             .terminal_certificate()
             .expect("certificate synthesized on rollback Completed");
         assert_eq!(cert.disposition, TerminalDispositionKind::RolledBack);
-        assert_eq!(cert.completed_step_ids, vec!["step-0"]);
-        assert_eq!(cert.failed_step_ids, vec!["step-1"]);
-        assert_eq!(cert.compensated_step_ids, vec!["step-0"]);
+        assert_eq!(cert.completed_step_ids, vec!["step-b0"]);
+        assert_eq!(cert.failed_step_ids, vec!["step-b1"]);
+        assert_eq!(cert.compensated_step_ids, vec!["step-b0"]);
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
         assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
@@ -9350,7 +9351,7 @@ mod tests {
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         ledger.transition_phase(TxPhase::Committing).unwrap();
 
-        let key0 = make_key("test-plan", "step-0");
+        let key0 = make_key("test-plan", &plan.steps[0].id);
         ledger
             .append(
                 key0,
@@ -9374,7 +9375,7 @@ mod tests {
         let mut ledger = TxExecutionLedger::new("exec-cert-tamper", "test-plan", plan.plan_hash);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         ledger.transition_phase(TxPhase::Committing).unwrap();
-        let key0 = make_key("test-plan", "step-0");
+        let key0 = make_key("test-plan", &plan.steps[0].id);
         ledger
             .append(
                 key0,
@@ -9423,7 +9424,7 @@ mod tests {
             .unwrap()
             .insert(
                 "completed_step_ids".to_string(),
-                serde_json::json!(["step-0", "step-unexecuted"]),
+                serde_json::json!(["step-b0", "step-unexecuted"]),
             );
         let err = serde_json::from_value::<TxExecutionLedger>(json_val).unwrap_err();
         assert!(err.to_string().contains("completed_step_ids"));

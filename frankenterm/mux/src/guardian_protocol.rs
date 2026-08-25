@@ -8156,12 +8156,11 @@ impl GuardianProtocolState {
             .durable_spawn_fence_effects
             .get(&candidate.spawn_effect_id)
         {
-            let existing = self
-                .durable_spawn_fences_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
+            let existing = self.durable_spawn_fences_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
                     "durable-spawn-effect-request-index",
-                ))?;
+                ),
+            )?;
             return Err(if *existing == candidate {
                 GuardianProtocolError::GenesisReservationAlreadyIssued
             } else {
@@ -8193,12 +8192,9 @@ impl GuardianProtocolState {
             .durable_spawn_fence_panes
             .get(&candidate.durable_pane_id)
         {
-            let existing = self
-                .durable_spawn_fences_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
-                    "durable-spawn-pane-request-index",
-                ))?;
+            let existing = self.durable_spawn_fences_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation("durable-spawn-pane-request-index"),
+            )?;
             return Err(if *existing == candidate {
                 GuardianProtocolError::GenesisReservationAlreadyIssued
             } else {
@@ -8215,9 +8211,7 @@ impl GuardianProtocolState {
             .get(&candidate.durable_pane_id)
         {
             let existing = self.genesis_reservations_by_request.get(request_id).ok_or(
-                GuardianProtocolError::StateInvariantViolation(
-                    "genesis-pane-durable-spawn-index",
-                ),
+                GuardianProtocolError::StateInvariantViolation("genesis-pane-durable-spawn-index"),
             )?;
             if GuardianDurableSpawnFenceV1::from_genesis_record(existing) != candidate {
                 return Err(GuardianProtocolError::PaneAlreadyExists(
@@ -8462,12 +8456,11 @@ impl GuardianProtocolState {
             .durable_spawn_fence_effects
             .get(&candidate.spawn_effect_id)
         {
-            let existing = self
-                .durable_spawn_fences_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
+            let existing = self.durable_spawn_fences_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation(
                     "durable-spawn-effect-genesis-index",
-                ))?;
+                ),
+            )?;
             return Err(if *existing == durable_candidate {
                 GuardianProtocolError::GenesisReservationAlreadyIssued
             } else {
@@ -8478,12 +8471,9 @@ impl GuardianProtocolState {
             .durable_spawn_fence_panes
             .get(&candidate.durable_pane_id)
         {
-            let existing = self
-                .durable_spawn_fences_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
-                    "durable-spawn-pane-genesis-index",
-                ))?;
+            let existing = self.durable_spawn_fences_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation("durable-spawn-pane-genesis-index"),
+            )?;
             return Err(if *existing == durable_candidate {
                 GuardianProtocolError::GenesisReservationAlreadyIssued
             } else {
@@ -8594,12 +8584,9 @@ impl GuardianProtocolState {
             });
         }
         if let Some(request_id) = self.durable_spawn_fence_effects.get(&effect_id) {
-            let existing = self
-                .durable_spawn_fences_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
-                    "durable-spawn-effect-spawn-fence",
-                ))?;
+            let existing = self.durable_spawn_fences_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation("durable-spawn-effect-spawn-fence"),
+            )?;
             return Err(if existing.matches_authenticated_spawn(request) {
                 GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
             } else {
@@ -8607,12 +8594,9 @@ impl GuardianProtocolState {
             });
         }
         if let Some(request_id) = self.durable_spawn_fence_panes.get(&pane_id) {
-            let existing = self
-                .durable_spawn_fences_by_request
-                .get(request_id)
-                .ok_or(GuardianProtocolError::StateInvariantViolation(
-                    "durable-spawn-pane-spawn-fence",
-                ))?;
+            let existing = self.durable_spawn_fences_by_request.get(request_id).ok_or(
+                GuardianProtocolError::StateInvariantViolation("durable-spawn-pane-spawn-fence"),
+            )?;
             return Err(if existing.matches_authenticated_spawn(request) {
                 GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
             } else {

@@ -14,9 +14,10 @@ use mux::guardian_input_journal::{GuardianInputDisposition, catch_guardian_input
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_PANES, GuardianCheckpointStageKindV1,
     GuardianEffectOutcome, GuardianEffectTransactionError, GuardianMuxLeaseRetirement,
-    GuardianOperation, GuardianPaneState, GuardianProtocolError, GuardianProtocolState,
-    GuardianRejectionCode, GuardianReply, GuardianResizePayload, GuardianResponseEnvelope,
-    GuardianSignal, GuardianSpawnPayload, InputEffectState,
+    GuardianDurableSpawnFenceInstallV1, GuardianDurableSpawnFenceV1, GuardianOperation,
+    GuardianPaneState, GuardianProtocolError, GuardianProtocolState, GuardianRejectionCode,
+    GuardianReply, GuardianResizePayload, GuardianResponseEnvelope, GuardianSignal,
+    GuardianSpawnPayload, InputEffectState,
 };
 use portable_pty::{Child, ChildKiller, MasterPty, PollablePtyReader, native_pty_system};
 use std::collections::HashMap;
@@ -855,6 +856,33 @@ impl GuardianRuntime {
     #[must_use]
     pub fn owns_pty_token(&self, token: Token) -> bool {
         self.pty_tokens.contains_key(&token)
+    }
+
+    /// Install one authenticated broker-WAL Spawn fence during startup.
+    ///
+    /// Recovery must finish before any pane, worker-owned protocol transfer, or
+    /// external effect can exist. This seam does not restore a broker pane; it
+    /// only guarantees that every later generic Spawn dispatch reaches the
+    /// durable fence before `spawn_runtime_pane` can run.
+    #[allow(dead_code)] // Consumed by standalone broker-WAL recovery before activation.
+    pub(crate) fn install_durable_spawn_fence(
+        &mut self,
+        fence: GuardianDurableSpawnFenceV1,
+    ) -> Result<GuardianDurableSpawnFenceInstallV1, GuardianProtocolError> {
+        if !self.panes.is_empty()
+            || self.orphaned_input_authority.is_some()
+            || self.indeterminate_effect
+        {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "durable-spawn-fence-installed-after-runtime-activation",
+            ));
+        }
+        self.protocol
+            .as_mut()
+            .ok_or(GuardianProtocolError::StateInvariantViolation(
+                "durable-spawn-fence-protocol-in-flight",
+            ))?
+            .install_durable_spawn_fence(fence)
     }
 
     /// Dispatch one already authenticated request.
@@ -2666,6 +2694,46 @@ mod tests {
         command.arg("-c");
         command.arg("exit 0");
         authenticated_spawn_request_for(request_id, pane_id, effect_id, command)
+    }
+
+    #[test]
+    fn recovered_durable_spawn_fence_blocks_runtime_child_creation() {
+        let (directory, _poll, mut runtime) = runtime_for_input_rejection();
+        let sentinel = directory.join("durable-spawn-fence-sentinel");
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("printf unexpected > \"$GUARDIAN_FENCE_SENTINEL\"");
+        command.env("GUARDIAN_FENCE_SENTINEL", &sentinel);
+        let request_id = Uuid::from_u128(32);
+        let pane_id = Uuid::from_u128(31);
+        let effect_id = Uuid::from_u128(33);
+        let spawn = authenticated_spawn_request_for(request_id, pane_id, effect_id, command);
+        let fence = GuardianDurableSpawnFenceV1::new(
+            spawn.header().mux_incarnation,
+            effect_id,
+            pane_id,
+            request_id,
+            u64::from(spawn.authenticated_payload_bytes()),
+            spawn.header().payload_sha256,
+        )
+        .expect("valid recovered durable Spawn fence");
+        assert_eq!(
+            runtime
+                .install_durable_spawn_fence(fence)
+                .expect("install recovered Spawn fence before traffic"),
+            GuardianDurableSpawnFenceInstallV1::Installed
+        );
+
+        let response = runtime
+            .dispatch(&spawn)
+            .expect("durable Spawn fence returns a terminal rejection");
+        assert_eq!(
+            response,
+            GuardianResponseEnvelope::rejection(&spawn, GuardianRejectionCode::InvalidRequest)
+        );
+        assert_eq!(runtime.pane_count(), 0);
+        assert!(runtime.panes.is_empty());
+        assert!(!sentinel.exists(), "legacy Spawn callback created a child");
     }
 
     fn claimed_runtime_with_writer(

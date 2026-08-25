@@ -7,15 +7,19 @@
 //! `SCM_RIGHTS` transfer cannot be revoked and socket EOF cannot fence a master
 //! already installed in a predecessor guardian.
 //!
-//! There is deliberately no transport or command-line activation. This
-//! in-process typestate does **not** survive guardian `SIGKILL`, and catalog
-//! Genesis admission below is durable pre-Spawn intent, never proof that a
-//! child exists. Activation additionally requires a separately spawned
-//! same-binary broker, its own durable prepare/admit/spawn/ack log keyed by
-//! `spawn_effect_id` plus non-recycled OS child identity, Query/Ack recovery,
-//! startup reconciliation of every crash cut, and a real cross-process crash
-//! matrix. In particular, catalog-marker-before-spawn and
-//! spawn-success-before-ack remain deliberately unresolved here.
+//! There is deliberately no transport or command-line activation. This module
+//! now contains the authenticated append-only Spawn WAL/head substrate for
+//! Intent, Attempt, observed non-recycled child identity, Query, and reply Ack;
+//! it also projects recovered records into the mux protocol's durable legacy
+//! Spawn fence. The filesystem discovery/revalidation service and OS child
+//! identity verifier are not wired yet, however, and the process-local PTY
+//! typestate still does **not** survive guardian `SIGKILL`. Catalog Genesis
+//! admission below remains durable pre-Spawn intent, never proof that a child
+//! exists. Activation additionally requires a separately spawned same-binary
+//! broker that opens/reconciles this WAL before traffic, sole-master proxy
+//! transport, and a real cross-process crash matrix. The WAL types model the
+//! marker-before-spawn and spawn-success-before-Ack cuts without claiming that
+//! the current service executes those recovery paths.
 //!
 //! The ordering enforced here is:
 //!
@@ -24,17 +28,19 @@
 //! 2. open the PTY and reserve one broker-owned master/reader/writer proxy, but
 //!    create no child;
 //! 3. consume the synchronously durable Genesis pre-Spawn intent;
-//! 4. process-locally spawn once and issue one logical guardian lease;
-//! 5. fence every proxy operation at admission and again immediately before
+//! 4. synchronize the broker Spawn Attempt before invoking the one callback,
+//!    then record the verified child identity and reply acknowledgement;
+//! 5. process-locally issue one logical guardian lease;
+//! 6. fence every proxy operation at admission and again immediately before
 //!    effect, so rotation invalidates already-queued stale work;
-//! 6. accept a successor only after authenticated connection EOF revoked the
+//! 7. accept a successor only after authenticated connection EOF revoked the
 //!    old logical proxy lease and an exact generation/build-fenced handoff.
 //!
-//! The durable broker recovery tranche must also reconstruct the Spawn fence
-//! before accepting traffic and make every Spawn dispatch consult it. The
-//! existing generic guardian protocol keeps reservation/effect/pane maps only
-//! in memory; restart plus legacy Spawn replay can otherwise bypass this
-//! typestate and create a second child for a broker-managed identity.
+//! Recovered WAL state can now reconstruct the pure protocol Spawn fence, and
+//! every generic protocol Spawn dispatch consults it. Production startup must
+//! still enumerate every WAL, perform the pinned no-follow filesystem checks,
+//! install all fences before accepting traffic, and represent broker-owned
+//! panes in census; until then the activation selector remains hard-disabled.
 
 #![allow(dead_code)] // Activation is intentionally held for the cross-process tranche.
 
@@ -43,8 +49,8 @@ use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
 use mux::guardian_protocol::{
-    GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1,
-    GuardianDurableSpawnFenceV1, GuardianSpawnPayload,
+    GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1, GuardianDurableSpawnFenceV1,
+    GuardianSpawnPayload,
 };
 #[cfg(test)]
 use portable_pty::ExitStatus;
@@ -4131,11 +4137,32 @@ mod tests {
         let authenticator = wal_authenticator(0x81);
         let (mut journal, wal_path, head_path) =
             create_test_spawn_journal(temp.path(), identity, authenticator.clone());
+        assert_eq!(
+            journal
+                .status()
+                .durable_protocol_fence()
+                .expect("validate empty WAL identity"),
+            None,
+            "authenticated setup headers alone fenced an unattempted Spawn"
+        );
 
         let intent = journal
             .append_intent_and_sync()
             .expect("synchronize Spawn intent");
         assert_eq!(intent.phase(), BrokerSpawnWalPhaseV1::Intent);
+        let durable_fence = journal
+            .status()
+            .durable_protocol_fence()
+            .expect("project durable Spawn fence")
+            .expect("Intent creates the global Spawn fence");
+        assert_eq!(durable_fence.mux_incarnation(), binding.mux_incarnation);
+        assert_eq!(durable_fence.spawn_effect_id(), binding.spawn_effect_id);
+        assert_eq!(durable_fence.durable_pane_id(), binding.durable_pane_id);
+        assert_eq!(durable_fence.origin_request_id(), binding.origin_request_id);
+        assert_eq!(
+            durable_fence.spawn_payload_digest(),
+            binding.spawn_payload_digest
+        );
         assert_eq!(
             journal.append_intent_and_sync().expect("replay intent"),
             intent,
@@ -4230,6 +4257,12 @@ mod tests {
         );
         assert_eq!(recovered_status.reply_ack_id, Some(ack_id));
         assert_eq!(recovered_status.child_identity, Some(child_identity));
+        assert_eq!(
+            recovered_status
+                .durable_protocol_fence()
+                .expect("project recovered durable Spawn fence"),
+            Some(durable_fence)
+        );
         assert!(recovered_status.append_authority_withheld);
         let revalidation = revalidate_recovered_test_journal(&recovered);
         recovered
@@ -4344,6 +4377,41 @@ mod tests {
                 wal_authenticator(0x84),
             ),
             Err(BrokerSpawnWalError::KeyIdentityMismatch)
+        ));
+
+        let tamper_dir = temp.path().join("tamper");
+        fs::create_dir(&tamper_dir).expect("create tamper fixture directory");
+        let (mut authenticated, tamper_wal_path, tamper_head_path) =
+            create_test_spawn_journal(&tamper_dir, identity, authenticator.clone());
+        authenticated
+            .append_intent_and_sync()
+            .expect("commit authenticated tamper fixture");
+        drop(authenticated);
+        let mut tampered = open_existing_test_file(&tamper_wal_path);
+        tampered
+            .seek(SeekFrom::Start(BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 - 1))
+            .expect("seek authenticated header tag");
+        let mut byte = [0_u8; 1];
+        tampered
+            .read_exact(&mut byte)
+            .expect("read authenticated header tag byte");
+        byte[0] ^= 0x80;
+        tampered
+            .seek(SeekFrom::Start(BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 - 1))
+            .expect("rewind authenticated header tag");
+        tampered
+            .write_all(&byte)
+            .expect("tamper authenticated header tag");
+        tampered.sync_all().expect("sync authenticated tamper");
+        drop(tampered);
+        assert!(matches!(
+            BrokerSpawnJournalV1::open(
+                open_existing_test_file(&tamper_wal_path),
+                open_existing_test_file(&tamper_head_path),
+                identity,
+                authenticator.clone(),
+            ),
+            Err(BrokerSpawnWalError::AuthenticationFailed)
         ));
 
         // A head rollback by two complete authenticated records is not a valid
