@@ -7916,7 +7916,14 @@ impl GuardianProtocolState {
     pub fn live_build_authority_for_genesis(
         &self,
     ) -> Result<GuardianLiveBuildAuthorityV1, GuardianProtocolError> {
-        let guardian_build_identity = compiled_atomic_build_identity()?
+        self.live_build_authority_from_identity(compiled_atomic_build_identity()?)
+    }
+
+    fn live_build_authority_from_identity(
+        &self,
+        build_identity: AtomicBuildIdentity,
+    ) -> Result<GuardianLiveBuildAuthorityV1, GuardianProtocolError> {
+        let guardian_build_identity = build_identity
             .require_sealed()
             .map_err(|_| GuardianProtocolError::GenesisBuildIdentityUnavailable)?;
         if guardian_build_identity
@@ -10916,6 +10923,10 @@ mod tests {
     static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);
     static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);
     static_assertions::assert_not_impl_any!(GuardianCheckpointChunkNonDuplicable: Clone, Copy);
+    static_assertions::assert_not_impl_any!(GuardianAuthenticatedMuxConnectionAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
+    static_assertions::assert_not_impl_any!(GuardianLiveBuildAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
+    static_assertions::assert_not_impl_any!(GuardianSuccessorMuxHandoffAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
+    static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
     static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: ZeroizeOnDrop);
     static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: ZeroizeOnDrop);
 
@@ -10937,12 +10948,21 @@ mod tests {
     }
 
     fn terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+        terminal_checkpoint_with_size(24, 80, 640, 384)
+    }
+
+    fn terminal_checkpoint_with_size(
+        rows: usize,
+        cols: usize,
+        pixel_width: usize,
+        pixel_height: usize,
+    ) -> RecoveryTerminalCheckpointV2 {
         Terminal::new(
             TerminalSize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 640,
-                pixel_height: 384,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
                 dpi: 96,
             },
             Arc::new(ProtocolCheckpointConfig),
@@ -11184,7 +11204,11 @@ mod tests {
     }
 
     fn spawn_payload(command: &str) -> Zeroizing<Vec<u8>> {
-        GuardianSpawnPayload::new(CommandBuilder::new(command), pty_size(24, 80))
+        spawn_payload_with_size(command, pty_size(24, 80))
+    }
+
+    fn spawn_payload_with_size(command: &str, size: PtySize) -> Zeroizing<Vec<u8>> {
+        GuardianSpawnPayload::new(CommandBuilder::new(command), size)
             .unwrap()
             .encode()
             .unwrap()
@@ -11277,7 +11301,16 @@ mod tests {
     }
 
     fn spawn_request(guardian: Uuid, mux: Uuid, pane: Uuid) -> GuardianRequestEnvelope {
-        let payload = spawn_payload("bounded-command");
+        spawn_request_with_size(guardian, mux, pane, pty_size(24, 80))
+    }
+
+    fn spawn_request_with_size(
+        guardian: Uuid,
+        mux: Uuid,
+        pane: Uuid,
+        size: PtySize,
+    ) -> GuardianRequestEnvelope {
+        let payload = spawn_payload_with_size("bounded-command", size);
         request(
             GuardianOperation::Spawn,
             guardian,
@@ -11288,6 +11321,80 @@ mod tests {
             0,
             Some(id(5)),
             &payload,
+        )
+    }
+
+    fn sealed_build_identity(byte: u8) -> SealedAtomicBuildIdentity {
+        let pair = format!("{byte:02x}");
+        SealedAtomicBuildIdentity::from_lower_hex(&pair.repeat(32)).unwrap()
+    }
+
+    fn mux_genesis_authority(
+        state: &GuardianProtocolState,
+        mux: Uuid,
+        build_byte: u8,
+    ) -> GuardianAuthenticatedMuxConnectionAuthorityV1 {
+        let hello_payload = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(build_byte)),
+        )
+        .encode();
+        let hello = authenticate(&request(
+            GuardianOperation::Hello,
+            Uuid::nil(),
+            mux,
+            id(70),
+            None,
+            0,
+            0,
+            None,
+            &hello_payload,
+        ));
+        state
+            .authenticate_mux_connection_for_genesis(&hello)
+            .unwrap()
+    }
+
+    fn live_genesis_authority(
+        state: &GuardianProtocolState,
+        build_byte: u8,
+    ) -> GuardianLiveBuildAuthorityV1 {
+        state
+            .live_build_authority_from_identity(AtomicBuildIdentity::Sealed(
+                sealed_build_identity(build_byte),
+            ))
+            .unwrap()
+    }
+
+    fn genesis_begin_request(
+        guardian: Uuid,
+        mux: Uuid,
+        request_id: Uuid,
+        spawn_effect_id: Uuid,
+        upload_id: Uuid,
+        terminal: &RecoveryTerminalCheckpointV2,
+    ) -> GuardianRequestEnvelope {
+        let descriptor =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(spawn_effect_id, terminal)
+                .unwrap();
+        let payload = GuardianCheckpointStageRequestV1::begin(
+            GuardianCheckpointScopeV1::Genesis { spawn_effect_id },
+            upload_id,
+            descriptor,
+            1_024,
+        )
+        .unwrap()
+        .into_zeroizing_payload()
+        .unwrap();
+        request_zeroizing(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            request_id,
+            None,
+            0,
+            0,
+            Some(spawn_effect_id),
+            payload,
         )
     }
 

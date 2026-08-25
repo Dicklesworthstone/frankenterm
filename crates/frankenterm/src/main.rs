@@ -99974,6 +99974,7 @@ log_level = "debug"
             install_ft: true,
             ft_path: None,
             mux_server_path: None,
+            guardian_path: None,
             ft_version: Some("v0.15.2"),
             transaction_id: None,
             timeout_secs: 5,
@@ -100007,6 +100008,7 @@ log_level = "debug"
             install_ft: true,
             ft_path: None,
             mux_server_path: None,
+            guardian_path: None,
             ft_version: Some("v0.15.2"),
             transaction_id: None,
             timeout_secs: 5,
@@ -100041,6 +100043,7 @@ log_level = "debug"
             install_ft: false,
             ft_path: None,
             mux_server_path: None,
+            guardian_path: None,
             ft_version: None,
             transaction_id: None,
             timeout_secs: 5,
@@ -100057,7 +100060,7 @@ log_level = "debug"
 
     #[cfg(unix)]
     #[test]
-    fn remote_setup_stages_release_tag_while_mux_is_live_without_replacing_active_pair() {
+    fn remote_setup_stages_release_tag_while_mux_is_live_without_replacing_active_triplet() {
         use std::os::unix::process::ExitStatusExt;
         use std::sync::Mutex;
 
@@ -100080,15 +100083,16 @@ log_level = "debug"
                 "FT_REMOTE_SERVICE_STATE_V1=missing\n".to_string()
             } else if command.contains("loginctl show-user") {
                 "Linger=yes\n".to_string()
-            } else if command.contains("FT_RELEASE_COMPONENT_RECEIPT_V1=") {
+            } else if command.contains("FT_RELEASE_COMPONENT_RECEIPT_V2=") {
                 format!(
-                    "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\n",
+                    "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:mux:202:{}:guardian:303:{}\n",
                     "b".repeat(64),
-                    "c".repeat(64)
+                    "c".repeat(64),
+                    "e".repeat(64)
                 )
             } else if command.contains("__publish-remote-generation") {
                 format!(
-                    "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                    "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
                     "d".repeat(64)
                 )
             } else {
@@ -100108,6 +100112,7 @@ log_level = "debug"
             install_ft: true,
             ft_path: None,
             mux_server_path: None,
+            guardian_path: None,
             ft_version: Some("v0.15.2"),
             transaction_id: Some("0123456789abcdef0123456789abcdef"),
             timeout_secs: 5,
@@ -100157,10 +100162,12 @@ log_level = "debug"
         assert!(pending.contains("$HOME/.local/share/frankenterm/process-family"));
         assert!(pending.contains("--expected-ft-sha256"));
         assert!(pending.contains("--expected-mux-sha256"));
+        assert!(pending.contains("--expected-guardian-sha256"));
         assert!(pending.contains("--transaction-id \"0123456789abcdef0123456789abcdef\""));
         assert!(!pending.contains("--activate-current"));
         assert!(pending.matches(&"b".repeat(64)).count() >= 2);
         assert!(pending.matches(&"c".repeat(64)).count() >= 2);
+        assert!(pending.matches(&"e".repeat(64)).count() >= 2);
         assert!(!pending.contains("mv -n"));
         assert!(
             !commands
@@ -100207,15 +100214,16 @@ log_level = "debug"
                 "/usr/bin/wezterm\n".to_string()
             } else if command.contains("wezterm --version") {
                 "wezterm 20260824\n".to_string()
-            } else if command.contains("FT_RELEASE_COMPONENT_RECEIPT_V1=") {
+            } else if command.contains("FT_RELEASE_COMPONENT_RECEIPT_V2=") {
                 format!(
-                    "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\n",
+                    "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2:ft:101:{}:mux:202:{}:guardian:303:{}\n",
                     "b".repeat(64),
-                    "c".repeat(64)
+                    "c".repeat(64),
+                    "e".repeat(64)
                 )
             } else if command.contains("__publish-remote-generation") {
                 format!(
-                    "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                    "FT_REMOTE_GENERATION_PUBLICATION_V2={}:pending_activation_lease\n",
                     "d".repeat(64)
                 )
             } else if command.contains("command -v frankenterm-mux-server") {
@@ -100243,6 +100251,7 @@ log_level = "debug"
             install_ft: true,
             ft_path: None,
             mux_server_path: None,
+            guardian_path: None,
             ft_version: Some("v0.15.2"),
             transaction_id: Some("0123456789abcdef0123456789abcdef"),
             timeout_secs: 5,
@@ -100318,6 +100327,7 @@ log_level = "debug"
             install_ft: false,
             ft_path: None,
             mux_server_path: None,
+            guardian_path: None,
             ft_version: None,
             transaction_id: None,
             timeout_secs: 5,
@@ -100381,6 +100391,7 @@ log_level = "debug"
             install_ft: false,
             ft_path: None,
             mux_server_path: None,
+            guardian_path: None,
             ft_version: None,
             transaction_id: None,
             timeout_secs: 5,
@@ -100428,6 +100439,7 @@ log_level = "debug"
             install_ft: false,
             ft_path: None,
             mux_server_path: None,
+            guardian_path: None,
             ft_version: None,
             transaction_id: None,
             timeout_secs: 5,
@@ -100450,9 +100462,11 @@ log_level = "debug"
         ft_bytes: u64,
         mux_sha256: &str,
         mux_bytes: u64,
+        guardian_sha256: &str,
+        guardian_bytes: u64,
     ) -> ValidatedLocalProcessFamily {
         let identity = LocalComponentIdentity {
-            build_id: "a".repeat(64),
+            build_id: SealedAtomicBuildIdentity::from_lower_hex(&"a".repeat(64)).unwrap(),
             target: "x86_64-unknown-linux-gnu".to_string(),
             profile: "release-interactive".to_string(),
             version: "0.15.2".to_string(),
@@ -100470,17 +100484,37 @@ log_level = "debug"
                 source_identity: DiagnosticFileSnapshot::synthetic(ft_bytes, 1),
             },
             mux_server: LocalComponentSnapshot {
-                identity,
+                identity: LocalComponentIdentity {
+                    build_id: identity.build_id,
+                    target: identity.target.clone(),
+                    profile: identity.profile.clone(),
+                    version: identity.version.clone(),
+                },
                 sha256: mux_sha256.to_string(),
                 byte_len: mux_bytes,
                 source_identity: DiagnosticFileSnapshot::synthetic(mux_bytes, 2),
+            },
+            guardian: LocalComponentSnapshot {
+                identity,
+                sha256: guardian_sha256.to_string(),
+                byte_len: guardian_bytes,
+                source_identity: DiagnosticFileSnapshot::synthetic(guardian_bytes, 3),
             },
         }
     }
 
     #[test]
     fn remote_generation_manifest_has_one_stable_content_derived_identity() {
-        let family = synthetic_remote_generation_family(&"b".repeat(64), 101, &"c".repeat(64), 202);
+        let family = synthetic_remote_generation_family(
+            &"b".repeat(64),
+            101,
+            &"c".repeat(64),
+            202,
+            &"d".repeat(64),
+            303,
+            &"d".repeat(64),
+            303,
+        );
         let first = RemoteGenerationManifest::from_process_family(&family).unwrap();
         let second = RemoteGenerationManifest::from_process_family(&family).unwrap();
         assert_eq!(first, second);
@@ -100491,12 +100525,23 @@ log_level = "debug"
         assert_eq!(first.schema, REMOTE_GENERATION_MANIFEST_SCHEMA);
         assert_eq!(first.ft.filename, REMOTE_GENERATION_FT_FILE);
         assert_eq!(first.mux_server.filename, REMOTE_GENERATION_MUX_FILE);
+        assert_eq!(first.guardian.filename, REMOTE_GENERATION_GUARDIAN_FILE);
+        assert_eq!(first.ft.role, AtomicComponentRole::Ft.as_str());
+        assert_eq!(
+            first.mux_server.role,
+            AtomicComponentRole::FrankenTermMuxServer.as_str()
+        );
+        assert_eq!(
+            first.guardian.role,
+            AtomicComponentRole::FrankenTermPtyGuardian.as_str()
+        );
         assert_eq!(
             first.lifetime_lease.filename,
             REMOTE_GENERATION_LIFETIME_LEASE_FILE
         );
         assert_eq!(first.ft.mode, 0o500);
         assert_eq!(first.mux_server.mode, 0o500);
+        assert_eq!(first.guardian.mode, 0o500);
         assert_eq!(first.lifetime_lease.mode, 0o600);
         assert_eq!(first.lifetime_lease.byte_len, 0);
         assert_eq!(
@@ -100508,13 +100553,31 @@ log_level = "debug"
         verify_exact_pretty_json_encoding(&first, &canonical, REMOTE_GENERATION_MANIFEST_MAX_BYTES)
             .unwrap();
 
-        let changed =
-            synthetic_remote_generation_family(&"b".repeat(64), 102, &"c".repeat(64), 202);
+        let changed = synthetic_remote_generation_family(
+            &"b".repeat(64),
+            102,
+            &"c".repeat(64),
+            202,
+            &"d".repeat(64),
+            303,
+        );
         let changed = RemoteGenerationManifest::from_process_family(&changed).unwrap();
         assert_ne!(first.generation_id, changed.generation_id);
 
+        let guardian_changed = synthetic_remote_generation_family(
+            &"b".repeat(64),
+            101,
+            &"c".repeat(64),
+            202,
+            &"e".repeat(64),
+            303,
+        );
+        let guardian_changed =
+            RemoteGenerationManifest::from_process_family(&guardian_changed).unwrap();
+        assert_ne!(first.generation_id, guardian_changed.generation_id);
+
         let mut rejected_legacy = first.clone();
-        rejected_legacy.schema = "frankenterm.remote-process-family-generation.v1".to_string();
+        rejected_legacy.schema = "frankenterm.remote-process-family-generation.v2".to_string();
         rejected_legacy.generation_id = rejected_legacy.recompute_generation_id().unwrap();
         assert!(rejected_legacy.validate().is_err());
 
@@ -100527,7 +100590,14 @@ log_level = "debug"
 
     #[test]
     fn remote_generation_shell_command_delegates_one_atomic_publication() {
-        let family = synthetic_remote_generation_family(&"b".repeat(64), 101, &"c".repeat(64), 202);
+        let family = synthetic_remote_generation_family(
+            &"b".repeat(64),
+            101,
+            &"c".repeat(64),
+            202,
+            &"d".repeat(64),
+            303,
+        );
         let receipt = ProcessFamilyByteReceipt::from(&family);
         let suffix = "0123456789abcdef0123456789abcdef";
         let pending = uploaded_process_family_generation_command(suffix, &receipt).unwrap();
@@ -100536,11 +100606,17 @@ log_level = "debug"
         assert!(pending.contains("chmod 0500"));
         assert!(pending.contains("exec 8<\"$ft_source\""));
         assert!(pending.contains("exec 9<\"$mux_source\""));
+        assert!(pending.contains("exec 10<\"$guardian_source\""));
         assert!(pending.contains("ft_descriptor=/proc/self/fd/8"));
         assert!(pending.contains("mux_descriptor=/proc/self/fd/9"));
+        assert!(pending.contains("guardian_descriptor=/proc/self/fd/10"));
         assert!(pending.contains("verify_descriptor \"$ft_descriptor\""));
-        assert!(pending.contains("chmod 0500 -- \"$ft_descriptor\" \"$mux_descriptor\""));
-        assert!(!pending.contains("chmod 0500 -- \"$ft_source\" \"$mux_source\""));
+        assert!(pending.contains(
+            "chmod 0500 -- \"$ft_descriptor\" \"$mux_descriptor\" \"$guardian_descriptor\""
+        ));
+        assert!(!pending.contains(
+            "chmod 0500 -- \"$ft_source\" \"$mux_source\" \"$guardian_source\""
+        ));
         assert!(pending.contains("exec \"$ft_descriptor\" setup"));
         assert!(!pending.contains("exec \"$ft_source\" setup"));
         assert!(!pending.contains("--activate-current"));
@@ -100548,6 +100624,7 @@ log_level = "debug"
         assert!(!pending.contains("flock"));
         assert!(pending.matches(&family.ft.sha256).count() >= 3);
         assert!(pending.matches(&family.mux_server.sha256).count() >= 3);
+        assert!(pending.matches(&family.guardian.sha256).count() >= 3);
         assert!(uploaded_process_family_generation_command("unsafe", &receipt).is_err());
     }
 
@@ -100555,26 +100632,30 @@ log_level = "debug"
     fn remote_generation_receipt_parser_is_exact_and_fail_closed() {
         let generation_id = "d".repeat(64);
         let pending = parse_remote_generation_publication_receipt(&format!(
-            "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
+            "FT_REMOTE_GENERATION_PUBLICATION_V2={generation_id}:pending_activation_lease\n"
         ))
         .unwrap();
         assert_eq!(pending.generation_id, generation_id);
         assert_eq!(pending.activation, RemoteGenerationActivation::PendingLease);
         let current = parse_remote_generation_publication_receipt(&format!(
-            "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:generations/{generation_id}\n"
+            "FT_REMOTE_GENERATION_PUBLICATION_V2={generation_id}:current:generations/{generation_id}\n"
         ))
         .unwrap();
         assert_eq!(current.activation, RemoteGenerationActivation::Current);
         assert!(parse_remote_generation_publication_receipt(&format!(
-            "banner\nFT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
+            "banner\nFT_REMOTE_GENERATION_PUBLICATION_V2={generation_id}:pending_activation_lease\n"
         ))
         .is_err());
         assert!(
             parse_remote_generation_publication_receipt(&format!(
-                "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:../{generation_id}\n"
+                "FT_REMOTE_GENERATION_PUBLICATION_V2={generation_id}:current:../{generation_id}\n"
             ))
             .is_err()
         );
+        assert!(parse_remote_generation_publication_receipt(&format!(
+            "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
+        ))
+        .is_err());
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -100626,10 +100707,10 @@ log_level = "debug"
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
-    fn remote_generation_rejects_legacy_three_file_inventory_without_lifetime_lease() {
+    fn remote_generation_rejects_v2_pair_inventory_without_guardian() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create legacy generation fixture");
+        let fixture = tempfile::tempdir().expect("create v2 pair generation fixture");
         let root_path = fixture.path().join("process-family");
         let effective_uid = remote_generation_effective_uid();
         let (_root, generations) = open_remote_generation_root(&root_path, effective_uid)
@@ -100638,6 +100719,10 @@ log_level = "debug"
         let generation_path = root_path.join("generations").join(&generation_id);
         std::fs::create_dir(&generation_path).expect("create legacy generation directory");
         for (filename, mode) in [
+            (
+                REMOTE_GENERATION_LIFETIME_LEASE_FILE,
+                REMOTE_GENERATION_LIFETIME_LEASE_MODE,
+            ),
             (REMOTE_GENERATION_FT_FILE, REMOTE_GENERATION_BINARY_MODE),
             (REMOTE_GENERATION_MUX_FILE, REMOTE_GENERATION_BINARY_MODE),
             (
@@ -100646,7 +100731,12 @@ log_level = "debug"
             ),
         ] {
             let path = generation_path.join(filename);
-            std::fs::write(&path, b"legacy-v1").expect("write legacy generation entry");
+            let bytes: &[u8] = if filename == REMOTE_GENERATION_LIFETIME_LEASE_FILE {
+                b""
+            } else {
+                b"legacy-v2"
+            };
+            std::fs::write(&path, bytes).expect("write v2 pair generation entry");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
                 .expect("set legacy generation entry mode");
         }
@@ -100663,8 +100753,8 @@ log_level = "debug"
             None,
             effective_uid,
         )
-        .expect_err("a managed generation without a lifetime lease must fail closed");
-        assert!(error.to_string().contains("lifetime lease"));
+        .expect_err("a managed generation without the guardian must fail closed");
+        assert!(error.to_string().contains("guardian"));
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -100752,7 +100842,7 @@ log_level = "debug"
             &remote_upgrade_ledger::SelectorAuthority::Missing,
             effective_uid,
             format!(
-                "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:generations/{generation_id}\n"
+                "FT_REMOTE_GENERATION_PUBLICATION_V2={generation_id}:current:generations/{generation_id}\n"
             ),
             |_| Err(std::io::Error::other("planted selector-root fsync failure")),
         )
@@ -100781,6 +100871,8 @@ log_level = "debug"
             101,
             &"c".repeat(64),
             202,
+            &"d".repeat(64),
+            303,
         )
         .expect("create pending observation claim");
         let mut ledger =
@@ -100800,7 +100892,7 @@ log_level = "debug"
             &mut ledger,
             Err(anyhow::anyhow!("planted selector observation failure")),
             format!(
-                "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:pending_activation_lease\n"
+                "FT_REMOTE_GENERATION_PUBLICATION_V2={generation_id}:pending_activation_lease\n"
             ),
         )
         .expect_err("unresolved selector authority must not be committed as pending");
@@ -100856,6 +100948,8 @@ log_level = "debug"
                 expected.ft.byte_len,
                 &expected.mux_server.sha256,
                 expected.mux_server.byte_len,
+                &expected.guardian.sha256,
+                expected.guardian.byte_len,
             )
             .expect("reconstruct exact pending claim");
             let mut ledger =
