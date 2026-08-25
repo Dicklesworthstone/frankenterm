@@ -95,7 +95,8 @@ const REJECTION_PAYLOAD_BYTES: usize = 6;
 const CHECKPOINT_STAGE_SCOPE_BYTES: usize = 32;
 const CHECKPOINT_STAGE_COMMON_BYTES: usize = 64 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES;
 const CHECKPOINT_STAGE_CHUNK_FIXED_BYTES: usize = CHECKPOINT_STAGE_COMMON_BYTES + 48;
-const CHECKPOINT_STAGE_REPLY_BYTES: usize = 100;
+const CHECKPOINT_STAGE_ACK_BYTES: usize = CHECKPOINT_STAGE_COMMON_BYTES + 16;
+const CHECKPOINT_STAGE_REPLY_BYTES: usize = 116;
 const REPLAY_CURSOR_BYTES: usize = 160;
 const REPLAY_OPEN_REQUEST_BYTES: usize = 92;
 const REPLAY_CONTINUE_REQUEST_BYTES: usize = 8 + REPLAY_CURSOR_BYTES;
@@ -112,7 +113,7 @@ const REPLAY_COMPLETE_BYTES: usize = 80;
 const REPLAY_GAP_BYTES: usize = 32;
 const REPLAY_COMPACTED_BYTES: usize = 32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 16;
 const REPLAY_SNAPSHOT_EXPIRED_BYTES: usize = 16;
-const CHECKPOINT_STAGE_WIRE_VERSION: u16 = 1;
+const CHECKPOINT_STAGE_WIRE_VERSION: u16 = 2;
 const REPLAY_WIRE_VERSION: u16 = 1;
 const REPLAY_CURSOR_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-cursor.v1";
 const REPLAY_PAGE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-page.v1";
@@ -1402,12 +1403,16 @@ pub enum GuardianCheckpointStageKindV1 {
     Begin,
     Chunk,
     Seal,
+    Query,
+    Ack,
 }
 
 enum GuardianCheckpointStageBodyV1 {
     Begin,
     Chunk(GuardianCheckpointStageChunkDeliveryV1),
     Seal,
+    Query,
+    Ack { completion_id: Uuid },
 }
 
 fn zeroizing_sha256_digest(bytes: &[u8]) -> Zeroizing<[u8; 32]> {
@@ -1743,6 +1748,38 @@ impl GuardianCheckpointStageRequestV1 {
         )
     }
 
+    pub fn query(
+        scope: GuardianCheckpointScopeV1,
+        upload_id: Uuid,
+        descriptor: GuardianCheckpointDescriptorV1,
+        chunk_bytes: u32,
+    ) -> Result<Self, GuardianProtocolError> {
+        Self::new(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+            GuardianCheckpointStageBodyV1::Query,
+        )
+    }
+
+    pub fn ack(
+        scope: GuardianCheckpointScopeV1,
+        upload_id: Uuid,
+        descriptor: GuardianCheckpointDescriptorV1,
+        chunk_bytes: u32,
+        completion_id: Uuid,
+    ) -> Result<Self, GuardianProtocolError> {
+        require_nonzero(completion_id, "checkpoint completion")?;
+        Self::new(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+            GuardianCheckpointStageBodyV1::Ack { completion_id },
+        )
+    }
+
     fn new(
         scope: GuardianCheckpointScopeV1,
         upload_id: Uuid,
@@ -1809,6 +1846,8 @@ impl GuardianCheckpointStageRequestV1 {
             GuardianCheckpointStageBodyV1::Begin => GuardianCheckpointStageKindV1::Begin,
             GuardianCheckpointStageBodyV1::Chunk(_) => GuardianCheckpointStageKindV1::Chunk,
             GuardianCheckpointStageBodyV1::Seal => GuardianCheckpointStageKindV1::Seal,
+            GuardianCheckpointStageBodyV1::Query => GuardianCheckpointStageKindV1::Query,
+            GuardianCheckpointStageBodyV1::Ack { .. } => GuardianCheckpointStageKindV1::Ack,
         }
     }
 
@@ -1816,7 +1855,21 @@ impl GuardianCheckpointStageRequestV1 {
     pub const fn chunk_position(&self) -> Option<(u32, u64)> {
         match &self.body {
             GuardianCheckpointStageBodyV1::Chunk(chunk) => Some(chunk.position()),
-            GuardianCheckpointStageBodyV1::Begin | GuardianCheckpointStageBodyV1::Seal => None,
+            GuardianCheckpointStageBodyV1::Begin
+            | GuardianCheckpointStageBodyV1::Seal
+            | GuardianCheckpointStageBodyV1::Query
+            | GuardianCheckpointStageBodyV1::Ack { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn completion_id(&self) -> Option<Uuid> {
+        match &self.body {
+            GuardianCheckpointStageBodyV1::Ack { completion_id } => Some(*completion_id),
+            GuardianCheckpointStageBodyV1::Begin
+            | GuardianCheckpointStageBodyV1::Chunk(_)
+            | GuardianCheckpointStageBodyV1::Seal
+            | GuardianCheckpointStageBodyV1::Query => None,
         }
     }
 
@@ -1825,13 +1878,16 @@ impl GuardianCheckpointStageRequestV1 {
     ) -> Result<GuardianCheckpointStageChunkDeliveryV1, GuardianProtocolError> {
         match self.body {
             GuardianCheckpointStageBodyV1::Chunk(chunk) => Ok(chunk),
-            GuardianCheckpointStageBodyV1::Begin | GuardianCheckpointStageBodyV1::Seal => {
+            GuardianCheckpointStageBodyV1::Begin
+            | GuardianCheckpointStageBodyV1::Seal
+            | GuardianCheckpointStageBodyV1::Query
+            | GuardianCheckpointStageBodyV1::Ack { .. } => {
                 Err(GuardianProtocolError::InvalidOperationPayload)
             }
         }
     }
 
-    /// Encode metadata-only Begin/Seal requests.
+    /// Encode metadata-only Begin, Seal, Query, and Ack requests.
     ///
     /// A Chunk owns terminal plaintext and its content-derived digest, so the
     /// borrow-based encoder rejects it rather than creating repeatable raw
@@ -1865,12 +1921,17 @@ impl GuardianCheckpointStageRequestV1 {
     fn encoded_capacity(&self) -> Result<usize, GuardianProtocolError> {
         let extra = match &self.body {
             GuardianCheckpointStageBodyV1::Chunk(chunk) => chunk.bytes.len(),
-            GuardianCheckpointStageBodyV1::Begin | GuardianCheckpointStageBodyV1::Seal => 0,
+            GuardianCheckpointStageBodyV1::Begin
+            | GuardianCheckpointStageBodyV1::Seal
+            | GuardianCheckpointStageBodyV1::Query => 0,
+            GuardianCheckpointStageBodyV1::Ack { .. } => 16,
         };
-        let fixed = if matches!(&self.body, GuardianCheckpointStageBodyV1::Chunk(_)) {
-            CHECKPOINT_STAGE_CHUNK_FIXED_BYTES
-        } else {
-            CHECKPOINT_STAGE_COMMON_BYTES
+        let fixed = match &self.body {
+            GuardianCheckpointStageBodyV1::Chunk(_) => CHECKPOINT_STAGE_CHUNK_FIXED_BYTES,
+            GuardianCheckpointStageBodyV1::Ack { .. } => CHECKPOINT_STAGE_COMMON_BYTES,
+            GuardianCheckpointStageBodyV1::Begin
+            | GuardianCheckpointStageBodyV1::Seal
+            | GuardianCheckpointStageBodyV1::Query => CHECKPOINT_STAGE_COMMON_BYTES,
         };
         let capacity = fixed
             .checked_add(extra)
@@ -1892,6 +1953,8 @@ impl GuardianCheckpointStageRequestV1 {
             GuardianCheckpointStageBodyV1::Begin => 1,
             GuardianCheckpointStageBodyV1::Chunk(_) => 2,
             GuardianCheckpointStageBodyV1::Seal => 3,
+            GuardianCheckpointStageBodyV1::Query => 4,
+            GuardianCheckpointStageBodyV1::Ack { .. } => 5,
         });
         payload.push(0);
         self.scope.encode_into(payload);
@@ -1909,6 +1972,8 @@ impl GuardianCheckpointStageRequestV1 {
                     .to_be_bytes(),
             );
             payload.extend_from_slice(chunk.bytes.as_slice());
+        } else if let GuardianCheckpointStageBodyV1::Ack { completion_id } = &self.body {
+            push_uuid(payload, *completion_id);
         }
         if payload.len() != capacity {
             return Err(GuardianProtocolError::StateInvariantViolation(
@@ -1978,6 +2043,14 @@ impl GuardianCheckpointStageRequestV1 {
             3 if payload.len() == CHECKPOINT_STAGE_COMMON_BYTES => {
                 GuardianCheckpointStageBodyV1::Seal
             }
+            4 if payload.len() == CHECKPOINT_STAGE_COMMON_BYTES => {
+                GuardianCheckpointStageBodyV1::Query
+            }
+            5 if payload.len() == CHECKPOINT_STAGE_ACK_BYTES => {
+                GuardianCheckpointStageBodyV1::Ack {
+                    completion_id: read_required_uuid(payload, CHECKPOINT_STAGE_COMMON_BYTES)?,
+                }
+            }
             _ => return Err(GuardianProtocolError::InvalidOperationPayload),
         };
         let request = Self {
@@ -2028,6 +2101,10 @@ impl GuardianCheckpointStageRequestV1 {
             {
                 return Err(GuardianProtocolError::InvalidOperationPayload);
             }
+        } else if let GuardianCheckpointStageBodyV1::Ack { completion_id } = &self.body
+            && completion_id.is_nil()
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         Ok(())
     }
@@ -2079,6 +2156,9 @@ fn checkpoint_total_chunks(total_bytes: u64, chunk_bytes: u32) -> Result<u32, Gu
 /// Metadata-only result of an idempotent checkpoint staging request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuardianCheckpointStageReplyV1 {
+    Absent {
+        upload_id: Uuid,
+    },
     Ready {
         upload_id: Uuid,
         next_index: u32,
@@ -2091,9 +2171,27 @@ pub enum GuardianCheckpointStageReplyV1 {
     },
     Sealed {
         upload_id: Uuid,
+        completion_id: Uuid,
         checkpoint_id: GuardianCheckpointIdentityDigest,
         boundary_id: GuardianCheckpointBoundaryIdentityDigest,
         total_bytes: u64,
+    },
+    Acked {
+        upload_id: Uuid,
+        completion_id: Uuid,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary_id: GuardianCheckpointBoundaryIdentityDigest,
+        total_bytes: u64,
+    },
+    Expired {
+        upload_id: Uuid,
+        completion_id: Uuid,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary_id: GuardianCheckpointBoundaryIdentityDigest,
+        total_bytes: u64,
+    },
+    Quarantined {
+        upload_id: Uuid,
     },
 }
 
@@ -2104,6 +2202,10 @@ impl GuardianCheckpointStageReplyV1 {
         payload[..4].copy_from_slice(&CHECKPOINT_STAGE_REPLY_MAGIC);
         payload[4..6].copy_from_slice(&CHECKPOINT_STAGE_WIRE_VERSION.to_be_bytes());
         match self {
+            Self::Absent { upload_id } | Self::Quarantined { upload_id } => {
+                payload[6] = if matches!(self, Self::Absent { .. }) { 4 } else { 7 };
+                payload[8..24].copy_from_slice(upload_id.as_bytes());
+            }
             Self::Ready {
                 upload_id,
                 next_index,
@@ -2121,15 +2223,41 @@ impl GuardianCheckpointStageReplyV1 {
             }
             Self::Sealed {
                 upload_id,
+                completion_id,
+                checkpoint_id,
+                boundary_id,
+                total_bytes,
+            }
+            | Self::Acked {
+                upload_id,
+                completion_id,
+                checkpoint_id,
+                boundary_id,
+                total_bytes,
+            }
+            | Self::Expired {
+                upload_id,
+                completion_id,
                 checkpoint_id,
                 boundary_id,
                 total_bytes,
             } => {
-                payload[6] = 3;
+                payload[6] = match self {
+                    Self::Sealed { .. } => 3,
+                    Self::Acked { .. } => 5,
+                    Self::Expired { .. } => 6,
+                    Self::Absent { .. }
+                    | Self::Ready { .. }
+                    | Self::Progress { .. }
+                    | Self::Quarantined { .. } => unreachable!(
+                        "checkpoint completion reply branch is exhaustively matched"
+                    ),
+                };
                 payload[8..24].copy_from_slice(upload_id.as_bytes());
                 payload[28..36].copy_from_slice(&total_bytes.to_be_bytes());
                 payload[36..68].copy_from_slice(&checkpoint_id.0);
                 payload[68..100].copy_from_slice(&boundary_id.0);
+                payload[100..116].copy_from_slice(completion_id.as_bytes());
             }
         }
         Ok(payload)
@@ -2162,18 +2290,50 @@ impl GuardianCheckpointStageReplyV1 {
                     }
                 }
             }
-            3 if next_index == 0 => {
+            3 | 5 | 6 if next_index == 0 => {
                 let mut checkpoint_id = [0; 32];
                 checkpoint_id.copy_from_slice(&payload[36..68]);
                 let mut boundary_id = [0; 32];
                 boundary_id.copy_from_slice(&payload[68..100]);
-                Self::Sealed {
-                    upload_id,
-                    checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
-                        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
-                    boundary_id: GuardianCheckpointBoundaryIdentityDigest::from_bytes(boundary_id)
-                        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
-                    total_bytes: committed_bytes,
+                let completion_id = read_required_uuid(payload, 100)?;
+                let checkpoint_id = GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+                let boundary_id = GuardianCheckpointBoundaryIdentityDigest::from_bytes(boundary_id)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+                match payload[6] {
+                    3 => Self::Sealed {
+                        upload_id,
+                        completion_id,
+                        checkpoint_id,
+                        boundary_id,
+                        total_bytes: committed_bytes,
+                    },
+                    5 => Self::Acked {
+                        upload_id,
+                        completion_id,
+                        checkpoint_id,
+                        boundary_id,
+                        total_bytes: committed_bytes,
+                    },
+                    6 => Self::Expired {
+                        upload_id,
+                        completion_id,
+                        checkpoint_id,
+                        boundary_id,
+                        total_bytes: committed_bytes,
+                    },
+                    _ => unreachable!("checkpoint completion reply kind is guarded"),
+                }
+            }
+            4 | 7
+                if next_index == 0
+                    && committed_bytes == 0
+                    && payload[36..].iter().all(|byte| *byte == 0) =>
+            {
+                if payload[6] == 4 {
+                    Self::Absent { upload_id }
+                } else {
+                    Self::Quarantined { upload_id }
                 }
             }
             _ => return Err(GuardianProtocolError::InvalidReplyPayload),
@@ -2200,13 +2360,28 @@ impl GuardianCheckpointStageReplyV1 {
             }
             Self::Sealed {
                 upload_id,
+                completion_id,
+                total_bytes,
+                ..
+            }
+            | Self::Acked {
+                upload_id,
+                completion_id,
+                total_bytes,
+                ..
+            }
+            | Self::Expired {
+                upload_id,
+                completion_id,
                 total_bytes,
                 ..
             } => {
                 !upload_id.is_nil()
+                    && !completion_id.is_nil()
                     && total_bytes > 0
                     && total_bytes <= GUARDIAN_MAX_CHECKPOINT_BYTES
             }
+            Self::Absent { upload_id } | Self::Quarantined { upload_id } => !upload_id.is_nil(),
         };
         if valid {
             Ok(())
@@ -2218,9 +2393,26 @@ impl GuardianCheckpointStageReplyV1 {
     #[must_use]
     pub const fn upload_id(self) -> Uuid {
         match self {
-            Self::Ready { upload_id, .. }
+            Self::Absent { upload_id }
+            | Self::Ready { upload_id, .. }
             | Self::Progress { upload_id, .. }
-            | Self::Sealed { upload_id, .. } => upload_id,
+            | Self::Sealed { upload_id, .. }
+            | Self::Acked { upload_id, .. }
+            | Self::Expired { upload_id, .. }
+            | Self::Quarantined { upload_id } => upload_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn completion_id(self) -> Option<Uuid> {
+        match self {
+            Self::Sealed { completion_id, .. }
+            | Self::Acked { completion_id, .. }
+            | Self::Expired { completion_id, .. } => Some(completion_id),
+            Self::Absent { .. }
+            | Self::Ready { .. }
+            | Self::Progress { .. }
+            | Self::Quarantined { .. } => None,
         }
     }
 }
@@ -6371,6 +6563,70 @@ impl GuardianReply {
                         GuardianCheckpointStageKindV1::Seal,
                         GuardianCheckpointStageReplyV1::Sealed { .. },
                     ) => Err(GuardianProtocolError::ResponseRequestMismatch),
+                    (
+                        GuardianCheckpointStageKindV1::Query,
+                        GuardianCheckpointStageReplyV1::Absent { .. }
+                        | GuardianCheckpointStageReplyV1::Quarantined { .. },
+                    ) => Ok(()),
+                    (
+                        GuardianCheckpointStageKindV1::Query,
+                        GuardianCheckpointStageReplyV1::Ready {
+                            next_index,
+                            committed_bytes,
+                            ..
+                        }
+                        | GuardianCheckpointStageReplyV1::Progress {
+                            next_index,
+                            committed_bytes,
+                            ..
+                        },
+                    ) => {
+                        let expected = u64::from(next_index)
+                            .checked_mul(u64::from(stage.chunk_bytes()))
+                            .map(|bytes| bytes.min(stage.total_bytes()))
+                            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                        if next_index <= stage.total_chunks() && committed_bytes == expected {
+                            Ok(())
+                        } else {
+                            Err(GuardianProtocolError::InvalidReplyPayload)
+                        }
+                    }
+                    (
+                        GuardianCheckpointStageKindV1::Query,
+                        GuardianCheckpointStageReplyV1::Sealed {
+                            checkpoint_id,
+                            boundary_id,
+                            total_bytes,
+                            ..
+                        }
+                        | GuardianCheckpointStageReplyV1::Acked {
+                            checkpoint_id,
+                            boundary_id,
+                            total_bytes,
+                            ..
+                        }
+                        | GuardianCheckpointStageReplyV1::Expired {
+                            checkpoint_id,
+                            boundary_id,
+                            total_bytes,
+                            ..
+                        },
+                    ) if checkpoint_id == stage.checkpoint_id()
+                        && boundary_id == stage.boundary_id()
+                        && total_bytes == stage.total_bytes() => Ok(()),
+                    (
+                        GuardianCheckpointStageKindV1::Ack,
+                        GuardianCheckpointStageReplyV1::Acked {
+                            completion_id,
+                            checkpoint_id,
+                            boundary_id,
+                            total_bytes,
+                            ..
+                        },
+                    ) if Some(completion_id) == stage.completion_id()
+                        && checkpoint_id == stage.checkpoint_id()
+                        && boundary_id == stage.boundary_id()
+                        && total_bytes == stage.total_bytes() => Ok(()),
                     _ => Err(GuardianProtocolError::ResponseRequestMismatch),
                 }
             }
