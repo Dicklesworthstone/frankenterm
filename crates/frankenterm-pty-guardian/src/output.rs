@@ -1244,20 +1244,20 @@ impl GuardianCheckpointStageStore {
 
     pub(crate) fn apply_seal(
         &self,
-        request: &GuardianCheckpointStageRequestV1,
+        request: GuardianCheckpointStageRequestV1,
         origin_authority: GuardianCheckpointOriginAuthority<'_>,
     ) -> Result<GuardianCheckpointStageReplyV1, GuardianCheckpointStageStoreError> {
         if request.kind() != GuardianCheckpointStageKindV1::Seal {
             return Err(GuardianCheckpointStageStoreError::Conflict);
         }
-        let shape = CheckpointStageRequestShape::from_request(request)?;
+        let shape = CheckpointStageRequestShape::from_request(&request)?;
         self.with_exclusive_directory(|inner| {
             let census = checkpoint_stage_census(inner)?;
             let inspection = checkpoint_inspect_upload(
                 inner,
                 &census,
                 &shape,
-                CheckpointStageSealInspection::Reject,
+                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
             )?
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if inspection.next_index != shape.total_chunks
@@ -1275,7 +1275,7 @@ impl GuardianCheckpointStageStore {
                 inspection.publication_id,
             )?;
             request.validate_staged_plaintext(payload.as_slice())?;
-            let _manifest_authority = match origin_authority {
+            let manifest_authority = match origin_authority {
                 GuardianCheckpointOriginAuthority::Record {
                     journal,
                     manifest_authority,
@@ -1295,18 +1295,81 @@ impl GuardianCheckpointStageStore {
                     return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
                 }
             };
-            let _validated_logical_components = (
+            let capabilities = manifest_authority.bind_durable_stage_assembly(
+                request,
+                inspection.publication_id,
                 inspection.candidate_identity,
                 ordered_chunk_set_identity,
-            );
-            // The filesystem inspection above derives the cipher-owned opaque
-            // logical identities for the exact assembly. Those identities and
-            // raw request fields still cannot mint the independent,
-            // nonconstructible assembly witness. Until the authenticated
-            // runtime/journal boundary issues that witness, canonical 400-byte
-            // manifest construction, final publication, and adoption remain
-            // deliberately unavailable.
-            Err(GuardianCheckpointStageStoreError::PublicationAuthorityUnavailable)
+            )?;
+            let (primary, retry) = capabilities.into_primary_and_retry();
+            let seal_path = checkpoint_seal_path(
+                inner,
+                shape.key(),
+                inspection.publication_id,
+            )?;
+            if inspection.seal_present {
+                let seal_entry = census
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.key == shape.key()
+                            && entry.role
+                                == (CheckpointStageFileRole::Seal {
+                                    publication_id: inspection.publication_id,
+                                })
+                    })
+                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                let (_, record, _) = checkpoint_read_record(
+                    inner,
+                    seal_entry,
+                    GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+                )?;
+                inner.cipher.retry_open_manifest(&retry, &record)?;
+            } else {
+                let record_bytes = checkpoint_record_bytes_for_plaintext(
+                    usize::try_from(GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)
+                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                )?;
+                checkpoint_stage_require_capacity(
+                    inner,
+                    &census,
+                    shape.key(),
+                    1,
+                    record_bytes,
+                )?;
+                match checkpoint_create_record_new(inner, &seal_path)? {
+                    CheckpointStageCreateOutcome::Created(file) => {
+                        let record = inner.cipher.seal_manifest(primary)?;
+                        checkpoint_write_created_record(inner, &seal_path, file, &record)?;
+                    }
+                    CheckpointStageCreateOutcome::Existing => {
+                        let refreshed = checkpoint_stage_census(inner)?;
+                        let seal_entry = refreshed
+                            .entries
+                            .iter()
+                            .find(|entry| {
+                                entry.key == shape.key()
+                                    && entry.role
+                                        == (CheckpointStageFileRole::Seal {
+                                            publication_id: inspection.publication_id,
+                                        })
+                            })
+                            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                        let (_, record, _) = checkpoint_read_record(
+                            inner,
+                            seal_entry,
+                            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+                        )?;
+                        inner.cipher.retry_open_manifest(&retry, &record)?;
+                    }
+                }
+            }
+            Ok(GuardianCheckpointStageReplyV1::Sealed {
+                upload_id: shape.upload_id,
+                checkpoint_id: shape.descriptor.checkpoint_id(),
+                boundary_id: shape.descriptor.boundary_id(),
+                total_bytes: shape.total_bytes,
+            })
         })
     }
 
@@ -1833,14 +1896,15 @@ fn checkpoint_remember_durable_record(
     Ok(())
 }
 
-fn checkpoint_open_record(
+fn checkpoint_read_record(
     inner: &GuardianCheckpointStageStoreInner,
     entry: &CheckpointStageCensusEntry,
     max_plaintext_bytes: u32,
 ) -> Result<
     (
         GuardianCheckpointStageRecordContextV1,
-        Zeroizing<Vec<u8>>,
+        GuardianEncryptedCheckpointStageRecordV1,
+        FileIdentity,
     ),
     GuardianCheckpointStageStoreError,
 > {
@@ -1958,6 +2022,22 @@ fn checkpoint_open_record(
     .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     let context = record.context();
     checkpoint_validate_context_path(entry, &context)?;
+    Ok((context, record, identity))
+}
+
+fn checkpoint_open_record(
+    inner: &GuardianCheckpointStageStoreInner,
+    entry: &CheckpointStageCensusEntry,
+    max_plaintext_bytes: u32,
+) -> Result<
+    (
+        GuardianCheckpointStageRecordContextV1,
+        Zeroizing<Vec<u8>>,
+    ),
+    GuardianCheckpointStageStoreError,
+> {
+    let (context, record, identity) =
+        checkpoint_read_record(inner, entry, max_plaintext_bytes)?;
     let plaintext = inner
         .cipher
         .open(&context, &record, max_plaintext_bytes)

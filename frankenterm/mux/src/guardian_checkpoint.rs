@@ -1016,6 +1016,42 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
     ) -> Result<GuardianCheckpointManifestSealCapabilitiesV1, GuardianCheckpointCipherError> {
         GuardianCheckpointManifestSealCapabilitiesV1::from_authority(self, assembly)
     }
+
+    /// Bind one store-recovered, fully authenticated Stage assembly directly
+    /// to this independent live-capture or Genesis authority. The component
+    /// identities are opaque, non-copyable results of decrypting the exact
+    /// candidate and contiguous chunk set; raw wire digests cannot call this
+    /// boundary.
+    pub fn bind_durable_stage_assembly(
+        self,
+        seal_request: GuardianCheckpointStageRequestV1,
+        publication_id: Uuid,
+        candidate_identity: GuardianCheckpointCandidateIdentityV1,
+        ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1,
+    ) -> Result<GuardianCheckpointManifestSealCapabilitiesV1, GuardianCheckpointCipherError> {
+        self.binding.validate_seal_request(&seal_request)?;
+        if seal_request.upload_id().is_nil()
+            || publication_id.is_nil()
+            || candidate_identity.is_zero()
+            || ordered_chunk_set_identity.is_zero()
+            || seal_request
+                .encode()
+                .map_err(|_| GuardianCheckpointCipherError::InvalidSealRequest)?
+                .len()
+                != usize::try_from(GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES)
+                    .map_err(|_| GuardianCheckpointCipherError::ArithmeticOverflow)?
+        {
+            return Err(GuardianCheckpointCipherError::InvalidSealRequest);
+        }
+        let assembly = GuardianCheckpointValidatedStageAssemblyV1 {
+            seal_request,
+            publication_id,
+            candidate_identity,
+            ordered_chunk_set_identity,
+            _private: (),
+        };
+        GuardianCheckpointManifestSealCapabilitiesV1::from_authority(self, assembly)
+    }
 }
 
 impl std::fmt::Debug for GuardianCheckpointValidatedManifestAuthorityV1 {

@@ -9039,7 +9039,7 @@ pub fn encode_guardian_request(
     );
     bytes.extend_from_slice(&request.payload);
     let tag = Zeroizing::new(secret.mac(&frame)?);
-    frame.bytes_mut().extend_from_slice(&tag);
+    frame.bytes_mut().extend_from_slice(tag.as_slice());
     debug_assert_eq!(frame.len(), total_len);
     Ok(frame)
 }
@@ -9167,7 +9167,7 @@ pub fn encode_guardian_response(
     );
     bytes.extend_from_slice(&response.payload);
     let tag = Zeroizing::new(secret.mac(&frame)?);
-    frame.bytes_mut().extend_from_slice(&tag);
+    frame.bytes_mut().extend_from_slice(tag.as_slice());
     debug_assert_eq!(frame.len(), total_len);
     Ok(frame)
 }
