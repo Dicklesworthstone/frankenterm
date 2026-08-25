@@ -7001,6 +7001,8 @@ pub struct CheckpointScrollbackArtifactReceipt {
     pub checkpoint_id: i64,
     /// Exact checkpoint state witness.
     pub checkpoint_state_hash: String,
+    /// Artifact construction timestamp in epoch milliseconds.
+    pub created_at_epoch_ms: u64,
     /// Exact compact payload digest.
     pub payload_sha256: String,
     /// Exact published-file digest.
@@ -7972,6 +7974,273 @@ fn build_checkpoint_scrollback_payload(
             incomplete_pane_count: pane_count.saturating_sub(complete_pane_count),
         },
     })
+}
+
+#[derive(Clone, Copy)]
+struct CheckpointArtifactJsonStructureLimits {
+    max_nodes: usize,
+    max_map_entries: usize,
+    max_sequence_entries: usize,
+    max_string_bytes: u64,
+    max_depth: usize,
+}
+
+const CHECKPOINT_ARTIFACT_JSON_STRUCTURE_LIMITS: CheckpointArtifactJsonStructureLimits =
+    CheckpointArtifactJsonStructureLimits {
+        max_nodes: 20_000_000,
+        max_map_entries: 9_000_000,
+        max_sequence_entries: 2_000_000,
+        max_string_bytes: CHECKPOINT_SCROLLBACK_ARTIFACT_HARD_MAX_BYTES,
+        max_depth: 64,
+    };
+
+struct CheckpointArtifactJsonStructureBudget {
+    limits: CheckpointArtifactJsonStructureLimits,
+    nodes: std::cell::Cell<usize>,
+    map_entries: std::cell::Cell<usize>,
+    sequence_entries: std::cell::Cell<usize>,
+    string_bytes: std::cell::Cell<u64>,
+}
+
+impl CheckpointArtifactJsonStructureBudget {
+    fn new(limits: CheckpointArtifactJsonStructureLimits) -> Self {
+        Self {
+            limits,
+            nodes: std::cell::Cell::new(0),
+            map_entries: std::cell::Cell::new(0),
+            sequence_entries: std::cell::Cell::new(0),
+            string_bytes: std::cell::Cell::new(0),
+        }
+    }
+
+    fn consume_usize(
+        counter: &std::cell::Cell<usize>,
+        amount: usize,
+        limit: usize,
+        label: &'static str,
+    ) -> Result<(), String> {
+        let next = counter
+            .get()
+            .checked_add(amount)
+            .ok_or_else(|| format!("artifact JSON {label} count overflow"))?;
+        if next > limit {
+            return Err(format!(
+                "artifact JSON exceeds the {limit} {label} safety limit"
+            ));
+        }
+        counter.set(next);
+        Ok(())
+    }
+
+    fn consume_node(&self, depth: usize) -> Result<(), String> {
+        if depth > self.limits.max_depth {
+            return Err(format!(
+                "artifact JSON exceeds the {} level nesting safety limit",
+                self.limits.max_depth
+            ));
+        }
+        Self::consume_usize(&self.nodes, 1, self.limits.max_nodes, "node")
+    }
+
+    fn consume_map_entry(&self) -> Result<(), String> {
+        Self::consume_usize(
+            &self.map_entries,
+            1,
+            self.limits.max_map_entries,
+            "map entry",
+        )
+    }
+
+    fn consume_sequence_entry(&self) -> Result<(), String> {
+        Self::consume_usize(
+            &self.sequence_entries,
+            1,
+            self.limits.max_sequence_entries,
+            "sequence entry",
+        )
+    }
+
+    fn consume_string(&self, bytes: usize) -> Result<(), String> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| "artifact JSON decoded string length overflow".to_string())?;
+        let next = self
+            .string_bytes
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| "artifact JSON decoded string byte count overflow".to_string())?;
+        if next > self.limits.max_string_bytes {
+            return Err(format!(
+                "artifact JSON exceeds the {} decoded string byte safety limit",
+                self.limits.max_string_bytes
+            ));
+        }
+        self.string_bytes.set(next);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CheckpointArtifactJsonStructureSeed<'a> {
+    budget: &'a CheckpointArtifactJsonStructureBudget,
+    depth: usize,
+}
+
+impl CheckpointArtifactJsonStructureSeed<'_> {
+    fn child(self) -> Self {
+        Self {
+            budget: self.budget,
+            depth: self.depth.saturating_add(1),
+        }
+    }
+
+    fn budget_error<E: serde::de::Error>(error: String) -> E {
+        E::custom(error)
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for CheckpointArtifactJsonStructureSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget
+            .consume_node(self.depth)
+            .map_err(Self::budget_error)?;
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CheckpointArtifactJsonStructureSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON within the checkpoint artifact structural budget")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::DeserializeSeed::deserialize(self.child(), deserializer)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.budget
+            .consume_string(value.len())
+            .map_err(Self::budget_error)
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.budget
+            .consume_string(value.len())
+            .map_err(Self::budget_error)
+    }
+
+    fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_bytes(value)
+    }
+
+    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_bytes(&value)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(self.child())?.is_some() {
+            self.budget
+                .consume_sequence_entry()
+                .map_err(Self::budget_error)?;
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        while map.next_key_seed(self.child())?.is_some() {
+            self.budget
+                .consume_map_entry()
+                .map_err(Self::budget_error)?;
+            map.next_value_seed(self.child())?;
+        }
+        Ok(())
+    }
+}
+
+fn verify_checkpoint_artifact_json_structure(
+    bytes: &[u8],
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    use serde::de::DeserializeSeed as _;
+
+    let budget =
+        CheckpointArtifactJsonStructureBudget::new(CHECKPOINT_ARTIFACT_JSON_STRUCTURE_LIMITS);
+    let seed = CheckpointArtifactJsonStructureSeed {
+        budget: &budget,
+        depth: 0,
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    seed.deserialize(&mut deserializer).map_err(|error| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(format!(
+            "JSON structure exceeds its safety contract: {error}"
+        ))
+    })?;
+    deserializer.end()?;
+    Ok(())
 }
 
 #[cfg(test)]

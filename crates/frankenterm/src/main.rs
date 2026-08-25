@@ -6371,12 +6371,16 @@ struct AtomicPathObjectMetadata {
     gid: u32,
     hard_link_count: u64,
     byte_len: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl AtomicPathObjectMetadata {
     fn from_cap_metadata(metadata: &cap_std::fs::Metadata) -> anyhow::Result<Self> {
-        use cap_std::fs::MetadataExt as _;
+        use cap_fs_ext::OsMetadataExt as _;
         use cap_std::fs::PermissionsExt as _;
 
         let file_type = metadata.file_type();
@@ -6400,6 +6404,10 @@ impl AtomicPathObjectMetadata {
             gid: metadata.gid(),
             hard_link_count: metadata.nlink(),
             byte_len: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
         })
     }
 }
@@ -6769,6 +6777,10 @@ fn atomic_path_hash_metadata(hasher: &mut sha2::Sha256, metadata: &AtomicPathObj
     hasher.update(metadata.gid.to_le_bytes());
     hasher.update(metadata.hard_link_count.to_le_bytes());
     hasher.update(metadata.byte_len.to_le_bytes());
+    hasher.update(metadata.modified_seconds.to_le_bytes());
+    hasher.update(metadata.modified_nanoseconds.to_le_bytes());
+    hasher.update(metadata.changed_seconds.to_le_bytes());
+    hasher.update(metadata.changed_nanoseconds.to_le_bytes());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -6955,7 +6967,7 @@ fn atomic_path_entry_identity(
         }
     }
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"frankenterm.atomic-path-object-content.v1\0");
+    hasher.update(b"frankenterm.atomic-path-object-content.v2\0");
     let mut budget = AtomicPathHashBudget::default();
     let (metadata, fully_sealed) = atomic_path_hash_node(
         parent,
