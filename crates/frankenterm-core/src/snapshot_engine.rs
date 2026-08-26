@@ -9742,11 +9742,9 @@ pub fn inventory_checkpoint_scrollback_artifacts(
                 "verified artifact does not use its canonical checkpoint leaf name".to_string(),
             ));
         }
-        if !checkpoint_identities
-            .insert((receipt.checkpoint_id, receipt.checkpoint_state_hash.clone()))
-        {
+        if !checkpoint_identities.insert(receipt.checkpoint_id) {
             return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
-                "artifact inventory contains a duplicate checkpoint identity".to_string(),
+                "artifact inventory contains a duplicate or forked checkpoint identity".to_string(),
             ));
         }
         if !artifact_identities.insert(receipt.artifact_sha256.clone()) {
@@ -9816,13 +9814,17 @@ pub fn plan_checkpoint_scrollback_artifact_retention(
                 "retention entry identity is not canonical".to_string(),
             ));
         }
+        if entry.artifact_bytes > limits.max_artifact_bytes {
+            return Err(CheckpointScrollbackArtifactError::ResourceLimit(
+                "retention entry exceeds the verifier artifact-byte limit".to_string(),
+            ));
+        }
         if !names.insert(entry.file_name.clone())
-            || !checkpoint_identities
-                .insert((entry.checkpoint_id, entry.checkpoint_state_hash.clone()))
+            || !checkpoint_identities.insert(entry.checkpoint_id)
             || !artifact_identities.insert(entry.artifact_sha256.clone())
         {
             return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
-                "retention inventory contains duplicate identities".to_string(),
+                "retention inventory contains duplicate or forked identities".to_string(),
             ));
         }
     }
@@ -13609,6 +13611,28 @@ mod tests {
         assert!(matches!(
             plan_checkpoint_scrollback_artifact_retention(&duplicate_artifact, 3, 100, limits,),
             Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+        ));
+
+        let mut forked_checkpoint = entries.clone();
+        forked_checkpoint[2].checkpoint_id = forked_checkpoint[0].checkpoint_id;
+        forked_checkpoint[2].file_name = PathBuf::from(
+            checkpoint_scrollback_artifact_file_name(
+                forked_checkpoint[2].created_at_epoch_ms,
+                forked_checkpoint[2].checkpoint_id,
+                &forked_checkpoint[2].checkpoint_state_hash,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(&forked_checkpoint, 3, 100, limits,),
+            Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+        ));
+
+        let mut oversized = entries.clone();
+        oversized[0].artifact_bytes = limits.max_artifact_bytes + 1;
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(&oversized, 3, u64::MAX, limits),
+            Err(CheckpointScrollbackArtifactError::ResourceLimit(_))
         ));
         assert!(matches!(
             plan_checkpoint_scrollback_artifact_retention(&entries, 0, 100, limits),
