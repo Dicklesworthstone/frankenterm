@@ -34,8 +34,9 @@ use mux::guardian_input_journal::{
 };
 use mux::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputJournal,
-    GuardianOutputJournalError, GuardianOutputJournalLimits, GuardianOutputJournalTail,
-    GuardianOutputKey, GuardianOutputPredecessor, GuardianOutputSegmentIdentity,
+    GuardianOutputJournalError, GuardianOutputJournalLimits, GuardianOutputJournalReader,
+    GuardianOutputJournalTail, GuardianOutputKey, GuardianOutputPredecessor,
+    GuardianOutputSegmentIdentity,
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
@@ -1732,19 +1733,13 @@ impl GuardianPaneOutputJournal {
             .iter()
             .find(|segment| segment.segment_identity.segment_id() == segment_id)
             .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
-        validate_file_identity_at(
+        let file = open_private_file_read_only_at_identity(
             &authority.directory,
             &authority.directory_path,
             &segment.path,
             segment.file_identity,
         )?;
-        let file = open_private_file_at(
-            &authority.directory,
-            &authority.directory_path,
-            &segment.path,
-            false,
-        )?;
-        let journal = GuardianOutputJournal::open(
+        let journal = GuardianOutputJournalReader::open_existing(
             file,
             segment.segment_identity,
             authority.cipher.clone(),
@@ -3531,25 +3526,19 @@ fn guardian_replay_capture_output(
         .try_reserve_exact(authority.segments.len())
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
     for (index, segment) in authority.segments.iter().enumerate() {
-        validate_file_identity_at(
+        let file = open_private_file_read_only_at_identity(
             &authority.directory,
             &authority.directory_path,
             &segment.path,
             segment.file_identity,
         )?;
-        let file = open_private_file_at(
-            &authority.directory,
-            &authority.directory_path,
-            &segment.path,
-            false,
-        )?;
-        let opened = GuardianOutputJournal::open(
+        let opened = GuardianOutputJournalReader::open_existing(
             file,
             segment.segment_identity,
             authority.cipher.clone(),
             authority.policy.journal_limits,
         )?;
-        if opened.tail() != GuardianOutputJournalTail::Clean || opened.is_poisoned() {
+        if opened.tail() != GuardianOutputJournalTail::Clean {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
         segments.push(GuardianReplayOutputSegmentPin {
@@ -3626,17 +3615,11 @@ fn guardian_replay_validate_resume(
 fn guardian_replay_validate_output_pin(
     output: &GuardianReplayOutputPin,
 ) -> Result<(), GuardianCheckpointStageStoreError> {
-    validate_file_identity_at(
+    let manifest_file = open_private_file_read_only_at_identity(
         &output.directory,
         &output.directory_path,
         &output.manifest_path,
         output.manifest_file_identity,
-    )?;
-    let manifest_file = open_private_file_at(
-        &output.directory,
-        &output.directory_path,
-        &output.manifest_path,
-        false,
     )?;
     let manifest_metadata = manifest_file.metadata().map_err(|error| {
         GuardianCheckpointStageStoreError::io("replay-manifest-metadata", error)
@@ -3656,7 +3639,7 @@ fn guardian_replay_validate_output_pin(
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    validate_file_identity_at(
+    let _publication_authority = open_private_file_read_only_at_identity(
         &output.directory,
         &output.directory_path,
         &output.publication_path,
@@ -3672,26 +3655,19 @@ fn guardian_replay_validate_output_pin(
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     for segment in &output.segments {
-        validate_file_identity_at(
+        let file = open_private_file_read_only_at_identity(
             &output.directory,
             &output.directory_path,
             &segment.authority.path,
             segment.authority.file_identity,
         )?;
-        let file = open_private_file_at(
-            &output.directory,
-            &output.directory_path,
-            &segment.authority.path,
-            false,
-        )?;
-        let journal = GuardianOutputJournal::open(
+        let journal = GuardianOutputJournalReader::open_existing(
             file,
             segment.authority.segment_identity,
             output.cipher.clone(),
             output.policy.journal_limits,
         )?;
         if journal.tail() != GuardianOutputJournalTail::Clean
-            || journal.is_poisoned()
             || journal.committed_bytes() < segment.committed_bytes
             || (!segment.was_current && journal.committed_bytes() != segment.committed_bytes)
         {
@@ -3734,13 +3710,13 @@ fn guardian_replay_recover_receipt(
             first <= sequence && sequence <= last
         })
         .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
-    let file = open_private_file_at(
+    let file = open_private_file_read_only_at_identity(
         &output.directory,
         &output.directory_path,
         &segment.authority.path,
-        false,
+        segment.authority.file_identity,
     )?;
-    let journal = GuardianOutputJournal::open(
+    let journal = GuardianOutputJournalReader::open_existing(
         file,
         segment.authority.segment_identity,
         output.cipher.clone(),
@@ -4052,13 +4028,13 @@ fn guardian_replay_output_page(
         if next_sequence > segment_terminal.sequence() || next_sequence < segment_first {
             continue;
         }
-        let file = open_private_file_at(
+        let file = open_private_file_read_only_at_identity(
             &output.directory,
             &output.directory_path,
             &segment.authority.path,
-            false,
+            segment.authority.file_identity,
         )?;
-        let journal = GuardianOutputJournal::open(
+        let journal = GuardianOutputJournalReader::open_existing(
             file,
             segment.authority.segment_identity,
             output.cipher.clone(),
@@ -6481,7 +6457,7 @@ fn create_segment_at_identity(
             .map_err(|error| GuardianOutputError::io("output-segment-created-metadata", error))?,
         None,
     );
-    let mut journal = GuardianOutputJournal::open(file, identity, cipher, limits)?;
+    let mut journal = GuardianOutputJournal::create_new(file, identity, cipher, limits)?;
     journal.sync_parent_directory_and_activate(directory)?;
     validate_file_identity_at(directory, directory_path, &path, file_identity)?;
     if journal.tail() != GuardianOutputJournalTail::Clean
@@ -7541,13 +7517,55 @@ fn open_scanned_pane_segment_manager(
     Ok(authority)
 }
 
-fn open_and_validate_segment_chain(
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct AuthenticatedOutputSegmentSnapshot {
+    descriptor_identity: FileIdentity,
+    segment_identity: GuardianOutputSegmentIdentity,
+    committed_bytes: u64,
+    record_count: u64,
+    cumulative_plaintext_bytes: u64,
+    next_sequence: Option<u64>,
+    terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    tail: GuardianOutputJournalTail,
+}
+
+impl AuthenticatedOutputSegmentSnapshot {
+    fn from_reader(
+        descriptor_identity: FileIdentity,
+        reader: &GuardianOutputJournalReader,
+    ) -> Self {
+        Self {
+            descriptor_identity,
+            segment_identity: reader.identity(),
+            committed_bytes: reader.committed_bytes(),
+            record_count: reader.record_count(),
+            cumulative_plaintext_bytes: reader.cumulative_plaintext_bytes(),
+            next_sequence: reader.next_sequence(),
+            terminal_receipt: reader.terminal_receipt(),
+            tail: reader.tail(),
+        }
+    }
+
+    fn matches_append_authority(self, journal: &GuardianOutputJournal) -> bool {
+        self.segment_identity == journal.identity()
+            && self.committed_bytes == journal.committed_bytes()
+            && self.record_count == journal.record_count()
+            && self.cumulative_plaintext_bytes == journal.cumulative_plaintext_bytes()
+            && self.next_sequence == journal.next_sequence()
+            && self.terminal_receipt == journal.terminal_receipt()
+            && self.tail == journal.tail()
+            && !journal.directory_entry_sync_required()
+            && !journal.is_poisoned()
+    }
+}
+
+fn authenticate_segment_chain_read_only(
     directory: &File,
     directory_path: &Path,
     segments: &[SegmentPathAuthority],
     cipher: &GuardianOutputCipher,
     policy: OutputSegmentPolicy,
-) -> Result<(GuardianOutputJournal, u64, u64), GuardianOutputError> {
+) -> Result<(AuthenticatedOutputSegmentSnapshot, u64, u64), GuardianOutputError> {
     if segments.is_empty() || segments.len() > policy.max_segments {
         return Err(GuardianOutputError::FilesystemAuthority(
             "guardian output segment chain length is invalid",
@@ -7558,25 +7576,42 @@ fn open_and_validate_segment_chain(
     let mut total_committed_log_bytes = 0_u64;
     let mut total_records = 0_u64;
     for (index, segment) in segments.iter().enumerate() {
-        validate_file_identity_at(
+        let file = open_private_file_read_only_at_identity(
             directory,
             directory_path,
             &segment.path,
             segment.file_identity,
         )?;
-        let file = open_private_file_at(directory, directory_path, &segment.path, false)?;
-        let journal = GuardianOutputJournal::open(
+        let metadata_before = file.metadata().map_err(|error| {
+            GuardianOutputError::io("output-read-only-segment-metadata-before", error)
+        })?;
+        let descriptor_before =
+            FileIdentity::capture(&metadata_before, Some(metadata_before.len()));
+        if !segment.file_identity.matches(&metadata_before) {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian output read-only descriptor does not match its pinned segment",
+            ));
+        }
+        let verification_file = file
+            .try_clone()
+            .map_err(|error| GuardianOutputError::io("output-read-only-segment-clone", error))?;
+        let journal = GuardianOutputJournalReader::open_existing(
             file,
             segment.segment_identity,
             cipher.clone(),
             policy.journal_limits,
         )?;
-        if journal.directory_entry_sync_required()
-            || journal.is_poisoned()
+        let descriptor_after = verification_file
+            .metadata()
+            .map(|metadata| FileIdentity::capture(&metadata, Some(metadata.len())))
+            .map_err(|error| {
+                GuardianOutputError::io("output-read-only-segment-metadata-after", error)
+            })?;
+        if descriptor_before != descriptor_after
             || journal.tail() != GuardianOutputJournalTail::Clean
         {
             return Err(GuardianOutputError::FilesystemAuthority(
-                "guardian output immutable segment is torn, poisoned, or unpublished",
+                "guardian output immutable segment changed or has an incomplete tail",
             ));
         }
         if index == 0 {
@@ -7602,7 +7637,10 @@ fn open_and_validate_segment_chain(
             ));
         }
         if index + 1 == segments.len() {
-            current = Some(journal);
+            current = Some(AuthenticatedOutputSegmentSnapshot::from_reader(
+                descriptor_after,
+                &journal,
+            ));
         } else {
             previous_terminal = journal
                 .terminal_receipt()
@@ -7623,6 +7661,55 @@ fn open_and_validate_segment_chain(
     ))
 }
 
+fn open_and_validate_segment_chain(
+    directory: &File,
+    directory_path: &Path,
+    segments: &[SegmentPathAuthority],
+    cipher: &GuardianOutputCipher,
+    policy: OutputSegmentPolicy,
+) -> Result<(GuardianOutputJournal, u64, u64), GuardianOutputError> {
+    let (snapshot, total_committed_log_bytes, total_records) =
+        authenticate_segment_chain_read_only(directory, directory_path, segments, cipher, policy)?;
+    let current_segment = segments
+        .last()
+        .ok_or(GuardianOutputError::FilesystemAuthority(
+            "guardian output segment chain has no current segment",
+        ))?;
+    validate_file_identity_at(
+        directory,
+        directory_path,
+        &current_segment.path,
+        snapshot.descriptor_identity,
+    )?;
+    let file = open_private_file_at(directory, directory_path, &current_segment.path, false)?;
+    let promoted_metadata = file.metadata().map_err(|error| {
+        GuardianOutputError::io("output-append-segment-promotion-metadata", error)
+    })?;
+    if !snapshot.descriptor_identity.matches(&promoted_metadata) {
+        return Err(GuardianOutputError::FilesystemAuthority(
+            "guardian output current segment changed before append promotion",
+        ));
+    }
+    let journal = GuardianOutputJournal::open_existing_for_append(
+        file,
+        current_segment.segment_identity,
+        cipher.clone(),
+        policy.journal_limits,
+    )?;
+    if !snapshot.matches_append_authority(&journal) {
+        return Err(GuardianOutputError::FilesystemAuthority(
+            "guardian output current append authority differs from read-only authentication",
+        ));
+    }
+    validate_file_identity_at(
+        directory,
+        directory_path,
+        &current_segment.path,
+        snapshot.descriptor_identity,
+    )?;
+    Ok((journal, total_committed_log_bytes, total_records))
+}
+
 fn validate_replayable_segment_chain(
     directory: &File,
     directory_path: &Path,
@@ -7630,7 +7717,8 @@ fn validate_replayable_segment_chain(
     cipher: &GuardianOutputCipher,
     policy: OutputSegmentPolicy,
 ) -> Result<(), GuardianOutputError> {
-    let _ = open_and_validate_segment_chain(directory, directory_path, segments, cipher, policy)?;
+    let _ =
+        authenticate_segment_chain_read_only(directory, directory_path, segments, cipher, policy)?;
     Ok(())
 }
 
@@ -7647,13 +7735,13 @@ fn recover_all_segment_bytes(
     )?;
     let mut recovered = Vec::new();
     for segment in &authority.segments {
-        let file = open_private_file_at(
+        let file = open_private_file_read_only_at_identity(
             &authority.directory,
             &authority.directory_path,
             &segment.path,
-            false,
+            segment.file_identity,
         )?;
-        let journal = GuardianOutputJournal::open(
+        let journal = GuardianOutputJournalReader::open_existing(
             file,
             segment.segment_identity,
             authority.cipher.clone(),
@@ -8008,22 +8096,86 @@ fn open_private_file_at(
     ))
 }
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn open_private_file_read_only_at(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+) -> Result<File, GuardianOutputError> {
+    let name = output_child_name(directory_path, path)?;
+    rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        GuardianOutputError::io(
+            "output-private-file-read-only-open-at",
+            std::io::Error::from(error),
+        )
+    })
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn open_private_file_read_only_at(
+    _directory: &File,
+    _directory_path: &Path,
+    _path: &Path,
+) -> Result<File, GuardianOutputError> {
+    Err(GuardianOutputError::FilesystemAuthority(
+        "descriptor-relative read-only guardian output file access is unsupported on this Unix target",
+    ))
+}
+
+fn open_private_file_read_only_at_identity(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+    identity: FileIdentity,
+) -> Result<File, GuardianOutputError> {
+    let file = open_private_file_read_only_at(directory, directory_path, path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| GuardianOutputError::io("output-read-only-file-identity-at", error))?;
+    validate_private_file_metadata(&metadata, identity.expected_len)?;
+    if !identity.matches(&metadata) {
+        return Err(GuardianOutputError::FilesystemAuthority(
+            "guardian output read-only descriptor-relative file identity changed",
+        ));
+    }
+    Ok(file)
+}
+
 fn validate_file_identity_at(
     directory: &File,
     directory_path: &Path,
     path: &Path,
     identity: FileIdentity,
 ) -> Result<(), GuardianOutputError> {
-    let file = open_private_file_at(directory, directory_path, path, false)?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| GuardianOutputError::io("output-file-identity-at", error))?;
-    validate_private_file_metadata(&metadata, identity.expected_len)?;
-    if !identity.matches(&metadata) {
-        return Err(GuardianOutputError::FilesystemAuthority(
-            "guardian output descriptor-relative file identity changed",
-        ));
-    }
+    drop(open_private_file_read_only_at_identity(
+        directory,
+        directory_path,
+        path,
+        identity,
+    )?);
     Ok(())
 }
 
@@ -15621,6 +15773,49 @@ mod tests {
         );
         assert_eq!(std::fs::metadata(&segment_path)?.len(), torn_bytes);
         assert!(segment_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn published_zero_length_segment_is_not_reinitialized_during_cold_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-zero-segment-", tiny_rotation_policy(3))?;
+        let guardian_incarnation = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+        let segment_path = journal
+            .authority
+            .lock()
+            .map_err(|_| "journal authority was poisoned")?
+            .segments[0]
+            .path
+            .clone();
+        drop(journal);
+
+        let segment = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&segment_path)?;
+        segment.sync_all()?;
+        drop(segment);
+        sync_directory(
+            segment_path
+                .parent()
+                .ok_or("published segment has no parent directory")?,
+        )?;
+        assert_eq!(std::fs::metadata(&segment_path)?.len(), 0);
+
+        assert!(
+            pipeline
+                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(&segment_path)?.len(),
+            0,
+            "cold validation must never initialize crash-truncated evidence"
+        );
         Ok(())
     }
 
