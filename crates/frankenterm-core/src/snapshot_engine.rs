@@ -12767,6 +12767,176 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_scrollback_memory_phases_and_untrusted_errors_are_content_free() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["alpha\n", "beta\n", "gamma\n"],
+            )
+            .await;
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let bytes = build_checkpoint_scrollback_artifact_fixture_bytes(
+                db_path.as_str(),
+                snapshot.checkpoint_id,
+                limits,
+            );
+            let artifact: CheckpointScrollbackArtifact =
+                serde_json::from_slice(&bytes).unwrap();
+
+            assert!(
+                checkpoint_artifact_has_canonical_encoding(
+                    &artifact,
+                    &bytes,
+                    limits.max_artifact_bytes,
+                )
+                .unwrap()
+            );
+            let compact = serde_json::to_vec(&artifact).unwrap();
+            assert!(
+                !checkpoint_artifact_has_canonical_encoding(
+                    &artifact,
+                    &compact,
+                    limits.max_artifact_bytes,
+                )
+                .unwrap()
+            );
+            let mut trailing = bytes.clone();
+            trailing.push(b' ');
+            assert!(
+                !checkpoint_artifact_has_canonical_encoding(
+                    &artifact,
+                    &trailing,
+                    limits.max_artifact_bytes,
+                )
+                .unwrap()
+            );
+            assert!(
+                !checkpoint_artifact_has_canonical_encoding(
+                    &artifact,
+                    &bytes[..bytes.len() - 1],
+                    limits.max_artifact_bytes,
+                )
+                .unwrap()
+            );
+
+            let admitted_bytes_dropped = std::cell::Cell::new(false);
+            let receipt = verify_checkpoint_scrollback_artifact_bytes_with_hook(
+                bytes.clone(),
+                limits,
+                || admitted_bytes_dropped.set(true),
+            )
+            .unwrap();
+            assert!(admitted_bytes_dropped.get());
+            assert_eq!(receipt.checkpoint_id, snapshot.checkpoint_id);
+
+            let publication_directory = tempfile::TempDir::new().unwrap();
+            let publication_path = publication_directory.path().join(format!(
+                "phase-order{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
+            ));
+            let publication_error = write_checkpoint_scrollback_artifact_with_hook(
+                db_path.as_str(),
+                snapshot.checkpoint_id,
+                &publication_path,
+                limits,
+                || {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&publication_path)
+                        .unwrap();
+                    file.seek(SeekFrom::Start(0)).unwrap();
+                    file.write_all(b"!").unwrap();
+                    file.sync_all().unwrap();
+                },
+            )
+            .expect_err("offline reread must run after the producer buffer-drop hook");
+            assert!(matches!(
+                publication_error,
+                CheckpointScrollbackArtifactError::InvalidArtifact(_)
+            ));
+
+            let secret = "sk-memory-envelope-secret-unknown-field-value";
+            let encode_value = |value: &Value| {
+                let mut encoded = serde_json::to_vec_pretty(value).unwrap();
+                encoded.push(b'\n');
+                encoded
+            };
+            let mut unknown_field: Value = serde_json::from_slice(&bytes).unwrap();
+            unknown_field
+                .as_object_mut()
+                .unwrap()
+                .insert(secret.to_string(), Value::Bool(true));
+            let unknown_error = verify_checkpoint_scrollback_artifact_bytes_with_hook(
+                encode_value(&unknown_field),
+                limits,
+                || {},
+            )
+            .expect_err("unknown artifact keys must be rejected");
+            assert!(!unknown_error.to_string().contains(secret));
+
+            let mut invalid_type: Value = serde_json::from_slice(&bytes).unwrap();
+            invalid_type["payload"]["schema_version"] = Value::String(secret.to_string());
+            let type_error = verify_checkpoint_scrollback_artifact_bytes_with_hook(
+                encode_value(&invalid_type),
+                limits,
+                || {},
+            )
+            .expect_err("attacker-controlled type values must be rejected");
+            assert!(!type_error.to_string().contains(secret));
+
+            let mut invalid_topology = artifact.clone();
+            invalid_topology.payload.checkpoint.topology_json =
+                format!("{{\"{secret}\":true}}");
+            invalid_topology.payload.checkpoint.topology_sha256 = checkpoint_artifact_sha256(
+                invalid_topology
+                    .payload
+                    .checkpoint
+                    .topology_json
+                    .as_bytes(),
+            );
+            invalid_topology.payload_sha256 = hash_checkpoint_artifact_json(
+                &invalid_topology.payload,
+                limits.max_artifact_bytes,
+            )
+            .unwrap();
+            let topology_error = verify_checkpoint_scrollback_artifact_bytes_with_hook(
+                serialize_checkpoint_artifact(&invalid_topology, limits.max_artifact_bytes)
+                    .unwrap(),
+                limits,
+                || {},
+            )
+            .expect_err("invalid topology must be rejected without reflecting its text");
+            assert!(!topology_error.to_string().contains(secret));
+
+            let mut zero_checkpoint = artifact;
+            zero_checkpoint.payload.checkpoint.checkpoint_id = 0;
+            zero_checkpoint.payload_sha256 = hash_checkpoint_artifact_json(
+                &zero_checkpoint.payload,
+                limits.max_artifact_bytes,
+            )
+            .unwrap();
+            assert!(matches!(
+                verify_checkpoint_scrollback_artifact_bytes_with_hook(
+                    serialize_checkpoint_artifact(
+                        &zero_checkpoint,
+                        limits.max_artifact_bytes,
+                    )
+                    .unwrap(),
+                    limits,
+                    || {},
+                ),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
+            assert!(checkpoint_scrollback_artifact_file_name(
+                snapshot.checkpoint_at,
+                0,
+                &snapshot.state_hash,
+            )
+            .is_err());
+        });
+    }
+
+    #[test]
     fn checkpoint_scrollback_source_rejects_unbound_and_mutated_durable_rows() {
         run_async_test(async {
             let (_unbound_db_file, unbound_db_path) = setup_test_db();
@@ -12834,6 +13004,85 @@ mod tests {
                 ),
                 Err(CheckpointScrollbackArtifactError::Checkpoint(ref message))
                     if message.contains("timestamp witness")
+            ));
+
+            let (_extra_pane_db_file, extra_pane_db_path) = setup_test_db();
+            let extra_pane_snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                extra_pane_db_path.clone(),
+                &["zero\n", "one\n", "two\n"],
+            )
+            .await;
+            Connection::open(extra_pane_db_path.as_str())
+                .unwrap()
+                .execute(
+                    "INSERT INTO mux_pane_state
+                     (checkpoint_id, pane_id, terminal_state_json)
+                     VALUES (?1, 'malformed-pane-id', '{}')",
+                    [extra_pane_snapshot.checkpoint_id],
+                )
+                .unwrap();
+            assert!(matches!(
+                build_checkpoint_scrollback_payload(
+                    extra_pane_db_path.as_str(),
+                    extra_pane_snapshot.checkpoint_id,
+                    CheckpointScrollbackArtifactLimits::default(),
+                ),
+                Err(CheckpointScrollbackArtifactError::Checkpoint(ref message))
+                    if message.contains("contains 2 pane rows")
+            ));
+
+            let (_gap_db_file, gap_db_path) = setup_test_db();
+            let gap_snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                gap_db_path.clone(),
+                &["zero\n", "one\n", "two\n"],
+            )
+            .await;
+            let gap_conn = Connection::open(gap_db_path.as_str()).unwrap();
+            gap_conn
+                .execute(
+                    "INSERT INTO output_gaps
+                     (pane_id, seq_before, seq_after, reason, detected_at)
+                     VALUES (1, 0, 1, 'later', 20)",
+                    [],
+                )
+                .unwrap();
+            gap_conn
+                .execute(
+                    "INSERT INTO output_gaps
+                     (pane_id, seq_before, seq_after, reason, detected_at)
+                     VALUES (1, 0, 1, 'earlier', 10)",
+                    [],
+                )
+                .unwrap();
+            let ordered_payload = build_checkpoint_scrollback_payload(
+                gap_db_path.as_str(),
+                gap_snapshot.checkpoint_id,
+                CheckpointScrollbackArtifactLimits::default(),
+            )
+            .unwrap();
+            let ordered_gaps = &ordered_payload.scrollback[0].capture_gaps;
+            assert_eq!(ordered_gaps.len(), 2);
+            assert_eq!(ordered_gaps[0].detected_at, 10);
+            assert_eq!(ordered_gaps[0].reason, "earlier");
+            assert_eq!(ordered_gaps[1].detected_at, 20);
+            assert_eq!(ordered_gaps[1].reason, "later");
+
+            gap_conn
+                .execute(
+                    "INSERT INTO output_gaps
+                     (pane_id, seq_before, seq_after, reason, detected_at)
+                     VALUES (1, 0, 1, 'earlier', 10)",
+                    [],
+                )
+                .unwrap();
+            assert!(matches!(
+                build_checkpoint_scrollback_payload(
+                    gap_db_path.as_str(),
+                    gap_snapshot.checkpoint_id,
+                    CheckpointScrollbackArtifactLimits::default(),
+                ),
+                Err(CheckpointScrollbackArtifactError::Checkpoint(ref message))
+                    if message.contains("duplicate canonical identity")
             ));
         });
     }

@@ -2033,12 +2033,15 @@ impl BrokerSpawnJournalV1 {
         authority: BrokerSpawnWalFilesystemRevalidationV1,
     ) -> Result<(), BrokerSpawnWalError> {
         self.require_healthy_for_recovery()?;
-        let authority_matches = authority.identity == self.identity
-            && authority.observed_wal_bytes == self.committed_wal_bytes
-            && authority.observed_head_bytes == self.committed_head_bytes;
-        let descriptors_match = self.wal.metadata()?.len() == authority.observed_wal_bytes
-            && self.head.metadata()?.len() == authority.observed_head_bytes;
-        if !authority_matches || !descriptors_match {
+        if authority.identity != self.identity
+            || authority.observed_wal_bytes != self.committed_wal_bytes
+            || authority.observed_head_bytes != self.committed_head_bytes
+        {
+            return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
+        }
+        if self.wal.metadata()?.len() != authority.observed_wal_bytes
+            || self.head.metadata()?.len() != authority.observed_head_bytes
+        {
             return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
         }
         if self.head_reconciliation_required {
