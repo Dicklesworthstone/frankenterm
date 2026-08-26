@@ -97628,6 +97628,21 @@ recorder_backend = "rusqlite"
     #[test]
     fn compatible_client_subprocess_timeout_and_cancellation_settle_before_return() {
         run_async_test(async {
+            fn assert_leader_reaped(directory: &Path) {
+                let process_id: i64 = std::fs::read_to_string(directory.join("leader.pid"))
+                    .expect("compatible-client test child must publish its leader pid")
+                    .parse()
+                    .expect("compatible-client test leader pid must be numeric");
+                let probe = frankenterm_core::runtime_async::process::send_unix_signal_to_pid(
+                    process_id, "0",
+                )
+                .expect("compatible-client leader process-existence probe must execute");
+                assert!(
+                    !probe.success(),
+                    "compatible-client subprocess leader must already be reaped when the wrapper returns"
+                );
+            }
+
             async fn exercise(
                 cx: &frankenterm_core::cx::Cx,
                 directory: &Path,
@@ -97666,6 +97681,7 @@ recorder_backend = "rusqlite"
             )
             .await;
             assert!(timeout_error.to_string().contains("wall-clock deadline"));
+            assert_leader_reaped(timeout_directory.path());
             frankenterm_core::runtime_async::sleep(Duration::from_millis(900)).await;
             assert!(!timeout_directory.path().join("delayed-marker").exists());
 
@@ -97686,6 +97702,7 @@ recorder_backend = "rusqlite"
             )
             .await;
             assert!(cancellation_error.to_string().contains("was cancelled"));
+            assert_leader_reaped(cancellation_directory.path());
             frankenterm_core::runtime_async::sleep(Duration::from_millis(900)).await;
             assert!(
                 !cancellation_directory
