@@ -9639,13 +9639,13 @@ fn open_or_resume_checkpoint_artifact_staging(
         return Ok(file);
     }
 
-    file.seek(SeekFrom::Start(
-        u64::try_from(prefix_len).map_err(|_| {
+    file.seek(SeekFrom::Start(u64::try_from(prefix_len).map_err(
+        |_| {
             CheckpointScrollbackArtifactError::ResourceLimit(
                 "artifact staging append offset does not fit u64".to_string(),
             )
-        })?,
-    ))?;
+        },
+    )?))?;
     let missing = &bytes[prefix_len..];
     if let Some(partial_len) = fault.partial_staging_append_len(missing.len()) {
         file.write_all(&missing[..partial_len])?;
@@ -9664,9 +9664,7 @@ fn open_or_resume_checkpoint_artifact_staging(
                 )
             })?),
         )?;
-        if checkpoint_artifact_existing_stage_prefix(parent, staging, &mut file, bytes)?
-            .is_none()
-        {
+        if checkpoint_artifact_existing_stage_prefix(parent, staging, &mut file, bytes)?.is_none() {
             return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
                 "partially completed artifact staging bytes are not an exact payload prefix"
                     .to_string(),
@@ -9709,6 +9707,8 @@ enum CheckpointArtifactPublicationFault {
 
 impl CheckpointArtifactPublicationFault {
     fn partial_staging_append_len(self, missing_len: usize) -> Option<usize> {
+        #[cfg(not(test))]
+        let _ = missing_len;
         match self {
             #[cfg(test)]
             Self::AfterPartialStagingAppend if missing_len > 1 => {
@@ -13493,15 +13493,8 @@ mod tests {
                 limits,
             );
 
-            let mut conflicting_residue = bytes.clone();
-            conflicting_residue[0] ^= 1;
-            let residues = [
-                Vec::new(),
-                bytes[..bytes.len() / 2].to_vec(),
-                conflicting_residue,
-                bytes.clone(),
-            ];
-            for residue in residues {
+            let resumable_residues = [Vec::new(), bytes[..bytes.len() / 2].to_vec(), bytes.clone()];
+            for residue in resumable_residues {
                 let directory = checkpoint_artifact_test_directory();
                 let path = directory
                     .path()
@@ -13521,6 +13514,84 @@ mod tests {
                     "the one deterministic staging inode must become the target"
                 );
             }
+
+            let mut conflicting_prefix = bytes[..bytes.len() / 2].to_vec();
+            conflicting_prefix[0] ^= 1;
+            let mut conflicting_full = bytes.clone();
+            conflicting_full[0] ^= 1;
+            let mut overlong = bytes.clone();
+            overlong.push(b'!');
+            for residue in [conflicting_prefix, conflicting_full, overlong] {
+                let directory = checkpoint_artifact_test_directory();
+                let path = directory
+                    .path()
+                    .join(format!("conflict{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
+                let staging_name =
+                    checkpoint_artifact_staging_name(Path::new(path.file_name().unwrap()));
+                let staging_path = directory.path().join(&staging_name);
+                write_private_checkpoint_artifact_test_file(&staging_path, &residue);
+                let before = CheckpointArtifactFileSnapshot::capture_std(
+                    &std::fs::metadata(&staging_path).unwrap(),
+                )
+                .unwrap();
+
+                assert!(matches!(
+                    publish_checkpoint_artifact_bytes(&path, &bytes),
+                    Err(CheckpointScrollbackArtifactError::StagingConflict)
+                ));
+                let after = CheckpointArtifactFileSnapshot::capture_std(
+                    &std::fs::metadata(&staging_path).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    before, after,
+                    "conflicting stage metadata must be preserved"
+                );
+                assert_eq!(
+                    std::fs::read(&staging_path).unwrap(),
+                    residue,
+                    "conflicting stage bytes must be preserved"
+                );
+                assert!(!path.exists());
+            }
+
+            let second_crash_directory = checkpoint_artifact_test_directory();
+            let second_crash_path = second_crash_directory.path().join(format!(
+                "second-crash{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
+            ));
+            let second_crash_staging_name =
+                checkpoint_artifact_staging_name(Path::new(second_crash_path.file_name().unwrap()));
+            let second_crash_staging_path = second_crash_directory
+                .path()
+                .join(second_crash_staging_name);
+            let initial_prefix_len = bytes.len() / 3;
+            write_private_checkpoint_artifact_test_file(
+                &second_crash_staging_path,
+                &bytes[..initial_prefix_len],
+            );
+            let interrupted_append = publish_checkpoint_artifact_bytes_with_fault(
+                &second_crash_path,
+                &bytes,
+                CheckpointArtifactPublicationFault::AfterPartialStagingAppend,
+            )
+            .expect_err("a second crash must interrupt after only part of the missing suffix");
+            assert!(matches!(
+                interrupted_append,
+                CheckpointScrollbackArtifactError::Io(ref error)
+                    if error.kind() == std::io::ErrorKind::Interrupted
+            ));
+            let twice_partial = std::fs::read(&second_crash_staging_path).unwrap();
+            assert!(twice_partial.len() > initial_prefix_len);
+            assert!(twice_partial.len() < bytes.len());
+            let twice_partial_len = twice_partial.len();
+            assert_eq!(twice_partial.as_slice(), &bytes[..twice_partial_len]);
+            assert!(!second_crash_path.exists());
+            assert_eq!(
+                publish_checkpoint_artifact_bytes(&second_crash_path, &bytes).unwrap(),
+                CheckpointArtifactPublicationOutcome::Published
+            );
+            assert_eq!(std::fs::read(&second_crash_path).unwrap(), bytes);
+            assert!(!second_crash_staging_path.exists());
 
             let lost_reply_directory = checkpoint_artifact_test_directory();
             let lost_reply_path = lost_reply_directory
@@ -13551,6 +13622,32 @@ mod tests {
             assert_eq!(
                 publish_checkpoint_artifact_bytes(&lost_reply_path, &bytes).unwrap(),
                 CheckpointArtifactPublicationOutcome::AlreadyApplied
+            );
+
+            let unrelated_stage_name =
+                checkpoint_artifact_staging_name(Path::new(lost_reply_path.file_name().unwrap()));
+            let unrelated_stage_path = lost_reply_directory.path().join(unrelated_stage_name);
+            let unrelated_stage_bytes = b"retained-unrelated-stage";
+            write_private_checkpoint_artifact_test_file(
+                &unrelated_stage_path,
+                unrelated_stage_bytes,
+            );
+            let unrelated_before = CheckpointArtifactFileSnapshot::capture_std(
+                &std::fs::metadata(&unrelated_stage_path).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                publish_checkpoint_artifact_bytes(&lost_reply_path, &bytes).unwrap(),
+                CheckpointArtifactPublicationOutcome::AlreadyApplied
+            );
+            let unrelated_after = CheckpointArtifactFileSnapshot::capture_std(
+                &std::fs::metadata(&unrelated_stage_path).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(unrelated_before, unrelated_after);
+            assert_eq!(
+                std::fs::read(unrelated_stage_path).unwrap(),
+                unrelated_stage_bytes
             );
         });
     }

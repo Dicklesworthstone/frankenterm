@@ -74,12 +74,12 @@ pub mod runtime;
 pub mod transport;
 
 #[cfg(unix)]
-pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
-#[cfg(unix)]
 pub use broker::{
     BrokerControlClientError, BrokerControlClientV1, BrokerControlServiceConfigV1,
     BrokerControlServiceError, BrokerControlServiceV1, BrokerGuardianConnectionIdentityV1,
 };
+#[cfg(unix)]
+pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
 #[cfg(unix)]
 pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};
 #[cfg(unix)]

@@ -1658,9 +1658,9 @@ struct ProofBarrierGuard {
 /// 3. `ProofBarrier` / `KeyLock` (`key_locks/<key_hash>.lock`): Acquired THIRD for individual step reservations/outcomes.
 #[derive(Debug)]
 pub struct DurablePlanLockGuard {
-    lock_dir: Arc<Dir>,
-    lock_name: PathBuf,
-    spool_display: PathBuf,
+    _lock_dir: Arc<Dir>,
+    _lock_name: PathBuf,
+    _spool_display: PathBuf,
     _lock_file: File,
 }
 
@@ -3318,9 +3318,9 @@ impl IdempotencyStore {
         }
         validate_pinned_file_entry(&spool.plan_lock_dir, &lock_name, &lock_file, &lock_display)?;
         Ok(DurablePlanLockGuard {
-            lock_dir: Arc::clone(&spool.plan_lock_dir),
-            lock_name,
-            spool_display: spool.display_path.clone(),
+            _lock_dir: Arc::clone(&spool.plan_lock_dir),
+            _lock_name: lock_name,
+            _spool_display: spool.display_path.clone(),
             _lock_file: lock_file,
         })
     }

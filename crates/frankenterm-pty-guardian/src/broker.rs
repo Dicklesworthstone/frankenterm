@@ -5985,6 +5985,42 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    struct TestBrokerControlService {
+        stop: Arc<AtomicBool>,
+        join: Option<thread::JoinHandle<Result<(), BrokerControlServiceError>>>,
+    }
+
+    impl TestBrokerControlService {
+        fn start(mut service: BrokerControlServiceV1) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let join = thread::spawn(move || service.run_until(&thread_stop));
+            Self {
+                stop,
+                join: Some(join),
+            }
+        }
+
+        fn finish(mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.join
+                .take()
+                .expect("broker service join handle")
+                .join()
+                .expect("broker service thread")
+                .expect("broker service loop");
+        }
+    }
+
+    impl Drop for TestBrokerControlService {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)
     }
@@ -6334,6 +6370,136 @@ mod tests {
             forged_leased_query,
             Err(BrokerControlProtocolError::InvalidShape)
         ));
+    }
+
+    #[test]
+    fn broker_process_control_loop_authenticates_recovers_hello_and_rejects_effects() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create broker service test root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set broker service root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path).expect("provision broker token");
+        let broker_build = sealed(0x91);
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path.clone(),
+            spawn_catalog_path,
+            broker_build,
+            4,
+            Duration::from_millis(5),
+        )
+        .expect("valid broker service config");
+        let service = BrokerControlServiceV1::bind(config).expect("bind broker service");
+        let broker_incarnation = service.incarnation();
+        let service = TestBrokerControlService::start(service);
+
+        let connection_identity =
+            BrokerGuardianConnectionIdentityV1::new(id(741), id(742), sealed(0x92), sealed(0x93))
+                .expect("valid guardian connection identity");
+        let mut client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            connection_identity,
+            broker_build,
+        )
+        .expect("authenticated broker Hello");
+        assert_eq!(client.broker_incarnation(), broker_incarnation);
+        assert!(!client.recovered_hello());
+
+        let census = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Census,
+                request_id: id(743),
+                broker_incarnation,
+                guardian_incarnation: connection_identity.guardian_incarnation,
+                connection_id: client.connection_id,
+                mux_incarnation: connection_identity.mux_incarnation,
+                guardian_build_identity_digest: connection_identity
+                    .guardian_build_identity
+                    .into_bytes(),
+                mux_build_identity_digest: connection_identity.mux_build_identity.into_bytes(),
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+            },
+            &[],
+        )
+        .expect("canonical production-disabled Census");
+        let census_response = client.exchange(&census).expect("bounded Census rejection");
+        assert_eq!(
+            census_response.header.status,
+            BrokerControlResponseStatusV1::Rejected
+        );
+        assert_eq!(census_response.payload(), &[] as &[u8]);
+
+        let lost_hello_request_id = id(744);
+        let lost_connection_id = id(745);
+        let secret =
+            crate::transport::load_guardian_secret(&token_path).expect("reload broker test token");
+        let control_authenticator = secret
+            .broker_control_authenticator()
+            .expect("derive broker test control authenticator");
+        let lost_hello = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Hello,
+                request_id: lost_hello_request_id,
+                broker_incarnation: Uuid::nil(),
+                guardian_incarnation: connection_identity.guardian_incarnation,
+                connection_id: lost_connection_id,
+                mux_incarnation: connection_identity.mux_incarnation,
+                guardian_build_identity_digest: connection_identity
+                    .guardian_build_identity
+                    .into_bytes(),
+                mux_build_identity_digest: connection_identity.mux_build_identity.into_bytes(),
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+            },
+            &[],
+        )
+        .expect("canonical lost-reply Hello");
+        let lost_frame = encode_broker_control_request(&control_authenticator, &lost_hello)
+            .expect("encode lost-reply Hello");
+        let mut dropped_client =
+            BlockingUnixStream::connect(&socket_path).expect("connect dropped broker client");
+        dropped_client
+            .write_all(lost_frame.as_slice())
+            .expect("write lost-reply Hello");
+        drop(dropped_client);
+        thread::sleep(Duration::from_millis(50));
+
+        let recovered = BrokerControlClientV1::connect_with_hello_ids(
+            &socket_path,
+            &token_path,
+            connection_identity,
+            broker_build,
+            lost_hello_request_id,
+            lost_connection_id,
+        )
+        .expect("recover dropped Hello response without minting new identity");
+        assert_eq!(recovered.broker_incarnation(), broker_incarnation);
+        assert!(recovered.recovered_hello());
+
+        let wrong_expected_build = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            connection_identity,
+            sealed(0x94),
+        );
+        assert!(matches!(
+            wrong_expected_build,
+            Err(BrokerControlClientError::BrokerBuildIdentityMismatch)
+        ));
+
+        drop(recovered);
+        drop(client);
+        service.finish();
     }
 
     #[test]

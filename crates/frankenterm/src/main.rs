@@ -76677,6 +76677,7 @@ enum PrivateArtifactPublicationPoint {
     StagePrefixWritten,
     StageSynchronized,
     TargetRenamed,
+    ExistingTargetSynchronized,
     ParentSynchronized,
 }
 
@@ -79146,6 +79147,8 @@ fn verify_private_artifact_named_bytes(
         persisted_sha256 == expected_sha256,
         "{label} digest conflicts with the requested artifact"
     );
+    file.sync_all()
+        .with_context(|| format!("cannot synchronize {label}"))?;
     let metadata_after = file
         .metadata()
         .with_context(|| format!("cannot re-inspect {label}"))?;
@@ -79160,7 +79163,7 @@ fn verify_private_artifact_named_bytes(
     Ok(PrivateArtifactReceipt {
         bytes: identity_before.byte_len,
         sha256: persisted_sha256,
-        durability: "file_and_parent_directory_synced",
+        durability: "file_synchronized_parent_pending",
         recovered_existing: false,
     })
 }
