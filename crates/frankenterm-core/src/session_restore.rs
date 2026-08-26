@@ -2,7 +2,7 @@
 //!
 //! This library module can detect sessions that did not shut down cleanly
 //! (`shutdown_clean = 0`) and load their latest checkpoint. The production
-//! `ft watch` startup path does not currently call that detector. An explicit
+//! `ft watch` startup path invokes that detector on initialization to identify restorable candidates. An explicit
 //! restore reconstructs the mux topology via
 //! [`LayoutRestorer`] without writing banners or historical output through PTY
 //! input APIs.

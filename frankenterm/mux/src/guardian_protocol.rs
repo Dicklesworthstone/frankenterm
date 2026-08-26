@@ -129,6 +129,12 @@ const GUARDIAN_BROKER_SPAWN_WAL_MAC_DOMAIN: &[u8] =
     b"frankenterm.guardian-broker-spawn-wal.hmac.v1\0";
 const GUARDIAN_BROKER_SPAWN_WAL_KEY_ID_DOMAIN: &[u8] =
     b"frankenterm.guardian-broker-spawn-wal.key-id.v1\0";
+const GUARDIAN_BROKER_LINEAGE_ID_DOMAIN: &[u8] = b"frankenterm.guardian-broker-lineage-id.v1\0";
+const GUARDIAN_BROKER_CONTROL_MAC_DOMAIN: &[u8] = b"frankenterm.guardian-broker-control.hmac.v1\0";
+const GUARDIAN_BROKER_CONTROL_KEY_ID_DOMAIN: &[u8] =
+    b"frankenterm.guardian-broker-control.key-id.v1\0";
+const GUARDIAN_BROKER_CONTROL_REQUEST_DIRECTION: u8 = 1;
+const GUARDIAN_BROKER_CONTROL_RESPONSE_DIRECTION: u8 = 2;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -180,6 +186,14 @@ impl GuardianSecret {
     ) -> Result<GuardianBrokerSpawnWalAuthenticatorV1, GuardianProtocolError> {
         GuardianBrokerSpawnWalAuthenticatorV1::from_secret(self)
     }
+
+    /// Derive the broker's request/response-separated control-channel MAC
+    /// authority without exposing either the guardian token or a derived key.
+    pub fn broker_control_authenticator(
+        &self,
+    ) -> Result<GuardianBrokerControlAuthenticatorV1, GuardianProtocolError> {
+        GuardianBrokerControlAuthenticatorV1::from_secret(self)
+    }
 }
 
 impl std::fmt::Debug for GuardianSecret {
@@ -198,6 +212,7 @@ impl std::fmt::Debug for GuardianSecret {
 pub struct GuardianBrokerSpawnWalAuthenticatorV1 {
     secret: GuardianSecret,
     key_id: [u8; 8],
+    lineage_id: Uuid,
 }
 
 impl GuardianBrokerSpawnWalAuthenticatorV1 {
@@ -208,9 +223,18 @@ impl GuardianBrokerSpawnWalAuthenticatorV1 {
         let digest = mac.finalize().into_bytes();
         let mut key_id = [0_u8; 8];
         key_id.copy_from_slice(&digest[..8]);
+        let mut lineage_mac = HmacSha256::new_from_slice(&secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        lineage_mac.update(GUARDIAN_BROKER_LINEAGE_ID_DOMAIN);
+        let lineage_digest = lineage_mac.finalize().into_bytes();
+        let mut lineage_bytes = [0_u8; 16];
+        lineage_bytes.copy_from_slice(&lineage_digest[..16]);
+        let lineage_id = Uuid::from_bytes(lineage_bytes);
+        require_nonzero(lineage_id, "broker lineage identity")?;
         Ok(Self {
             secret: secret.clone(),
             key_id,
+            lineage_id,
         })
     }
 
@@ -218,6 +242,13 @@ impl GuardianBrokerSpawnWalAuthenticatorV1 {
     #[must_use]
     pub const fn key_id(&self) -> [u8; 8] {
         self.key_id
+    }
+
+    /// Stable token-derived broker lineage shared by separately spawned
+    /// broker incarnations without adding a mutable identity file.
+    #[must_use]
+    pub const fn lineage_id(&self) -> Uuid {
+        self.lineage_id
     }
 
     /// Authenticate one canonical fixed-size WAL structure.
@@ -256,6 +287,124 @@ impl std::fmt::Debug for GuardianBrokerSpawnWalAuthenticatorV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GuardianBrokerSpawnWalAuthenticatorV1")
+            .field("key_id", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Narrow HMAC authority for the broker's fixed bounded control frames.
+///
+/// Request and response tags use distinct direction bytes, so a valid frame
+/// in one direction cannot be reflected as authority in the other. This type
+/// is deliberately non-serializable and never exposes key bytes.
+#[derive(Clone)]
+pub struct GuardianBrokerControlAuthenticatorV1 {
+    secret: GuardianSecret,
+    key_id: [u8; 8],
+}
+
+impl GuardianBrokerControlAuthenticatorV1 {
+    fn from_secret(secret: &GuardianSecret) -> Result<Self, GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_CONTROL_KEY_ID_DOMAIN);
+        let digest = mac.finalize().into_bytes();
+        let mut key_id = [0_u8; 8];
+        key_id.copy_from_slice(&digest[..8]);
+        Ok(Self {
+            secret: secret.clone(),
+            key_id,
+        })
+    }
+
+    /// Nonsecret fingerprint included in every broker-control frame.
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; 8] {
+        self.key_id
+    }
+
+    pub fn authenticate_request(
+        &self,
+        authenticated_bytes: &[u8],
+    ) -> Result<[u8; GUARDIAN_MAC_BYTES], GuardianProtocolError> {
+        self.authenticate_direction(
+            GUARDIAN_BROKER_CONTROL_REQUEST_DIRECTION,
+            authenticated_bytes,
+        )
+    }
+
+    pub fn verify_request(
+        &self,
+        authenticated_bytes: &[u8],
+        tag: &[u8],
+    ) -> Result<(), GuardianProtocolError> {
+        self.verify_direction(
+            GUARDIAN_BROKER_CONTROL_REQUEST_DIRECTION,
+            authenticated_bytes,
+            tag,
+        )
+    }
+
+    pub fn authenticate_response(
+        &self,
+        authenticated_bytes: &[u8],
+    ) -> Result<[u8; GUARDIAN_MAC_BYTES], GuardianProtocolError> {
+        self.authenticate_direction(
+            GUARDIAN_BROKER_CONTROL_RESPONSE_DIRECTION,
+            authenticated_bytes,
+        )
+    }
+
+    pub fn verify_response(
+        &self,
+        authenticated_bytes: &[u8],
+        tag: &[u8],
+    ) -> Result<(), GuardianProtocolError> {
+        self.verify_direction(
+            GUARDIAN_BROKER_CONTROL_RESPONSE_DIRECTION,
+            authenticated_bytes,
+            tag,
+        )
+    }
+
+    fn authenticate_direction(
+        &self,
+        direction: u8,
+        authenticated_bytes: &[u8],
+    ) -> Result<[u8; GUARDIAN_MAC_BYTES], GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_CONTROL_MAC_DOMAIN);
+        mac.update(&self.key_id);
+        mac.update(&[direction]);
+        mac.update(authenticated_bytes);
+        let output = mac.finalize().into_bytes();
+        let mut tag = [0_u8; GUARDIAN_MAC_BYTES];
+        tag.copy_from_slice(&output);
+        Ok(tag)
+    }
+
+    fn verify_direction(
+        &self,
+        direction: u8,
+        authenticated_bytes: &[u8],
+        tag: &[u8],
+    ) -> Result<(), GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_CONTROL_MAC_DOMAIN);
+        mac.update(&self.key_id);
+        mac.update(&[direction]);
+        mac.update(authenticated_bytes);
+        mac.verify_slice(tag)
+            .map_err(|_| GuardianProtocolError::AuthenticationFailed)
+    }
+}
+
+impl std::fmt::Debug for GuardianBrokerControlAuthenticatorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianBrokerControlAuthenticatorV1")
             .field("key_id", &"[REDACTED]")
             .finish_non_exhaustive()
     }
@@ -11375,6 +11524,49 @@ mod tests {
 
     fn secret() -> GuardianSecret {
         GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap()
+    }
+
+    #[test]
+    fn broker_control_mac_is_key_scoped_direction_separated_and_mutation_sensitive() {
+        let authority = secret().broker_control_authenticator().unwrap();
+        let same_authority = secret().broker_control_authenticator().unwrap();
+        let wal_authority = secret().broker_spawn_wal_authenticator().unwrap();
+        let same_wal_authority = secret().broker_spawn_wal_authenticator().unwrap();
+        let other_authority = GuardianSecret::from_bytes([0x6b; GUARDIAN_AUTH_TOKEN_BYTES])
+            .unwrap()
+            .broker_control_authenticator()
+            .unwrap();
+        let other_wal_authority = GuardianSecret::from_bytes([0x6b; GUARDIAN_AUTH_TOKEN_BYTES])
+            .unwrap()
+            .broker_spawn_wal_authenticator()
+            .unwrap();
+        let request = b"fixed bounded broker request";
+        let request_tag = authority.authenticate_request(request).unwrap();
+        let response_tag = authority.authenticate_response(request).unwrap();
+
+        assert_eq!(authority.key_id(), same_authority.key_id());
+        assert_ne!(authority.key_id(), other_authority.key_id());
+        assert_eq!(wal_authority.lineage_id(), same_wal_authority.lineage_id());
+        assert_ne!(wal_authority.lineage_id(), other_wal_authority.lineage_id());
+        assert!(!wal_authority.lineage_id().is_nil());
+        assert_ne!(request_tag, response_tag);
+        same_authority
+            .verify_request(request, &request_tag)
+            .unwrap();
+        same_authority
+            .verify_response(request, &response_tag)
+            .unwrap();
+        assert!(authority.verify_response(request, &request_tag).is_err());
+        assert!(authority.verify_request(request, &response_tag).is_err());
+        assert!(other_authority
+            .verify_request(request, &request_tag)
+            .is_err());
+
+        let mut mutated = *request;
+        mutated[7] ^= 1;
+        assert!(authority.verify_request(&mutated, &request_tag).is_err());
+        assert!(format!("{authority:?}").contains("[REDACTED]"));
+        assert!(!format!("{authority:?}").contains("5a5a"));
     }
 
     fn terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {

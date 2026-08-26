@@ -7970,6 +7970,54 @@ enum SessionCommands {
         format: String,
     },
 
+    /// Export a live mux through an explicitly pinned compatible FrankenTerm client
+    #[command(name = "compatible-client-dump")]
+    CompatibleClientDump {
+        /// Absolute path to the compatible v0.13.0 `ft` executable
+        #[arg(long, value_name = "PATH")]
+        client: PathBuf,
+
+        /// Expected lowercase SHA-256 of the exact compatible client bytes
+        #[arg(long, value_name = "SHA256")]
+        expected_client_sha256: String,
+
+        /// Expected byte length of the exact compatible client
+        #[arg(long, value_name = "BYTES")]
+        expected_client_bytes: u64,
+
+        /// Absolute path to the live FrankenTerm GUI mux Unix socket
+        #[arg(long, value_name = "PATH")]
+        mux_socket: PathBuf,
+
+        /// New output file; existing files are never overwritten
+        #[arg(long, short = 'o', value_name = "PATH")]
+        output: PathBuf,
+
+        /// Maximum number of panes admitted to one compatible-client dump
+        #[arg(long, default_value_t = 1024)]
+        max_panes: usize,
+
+        /// Maximum aggregate UTF-8 pane-content bytes admitted to the dump
+        #[arg(long, default_value_t = 67_108_864)]
+        max_total_bytes: usize,
+
+        /// Pane IDs requested per compatible-client subprocess
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
+
+        /// Hard timeout for each census or pane batch subprocess
+        #[arg(long, default_value_t = 30)]
+        batch_timeout_secs: u64,
+
+        /// Maximum retained stdout bytes from one pane batch
+        #[arg(long, default_value_t = 33_554_432)]
+        max_batch_output_bytes: usize,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
     /// Verify a previously written mux dump without contacting a live mux
     VerifyDump {
         /// Dump artifact to verify
@@ -42260,6 +42308,27 @@ async fn run_watcher(
     tracing::info!(db_path = %db_path, "Storage initialized");
     let scheduler_storage = storage.clone();
 
+    // Detect prior unclean sessions on startup (wa-2l27x.5)
+    let session_restorer = frankenterm_core::session_restore::SessionRestorer::new(
+        Arc::new(db_path.clone().into_owned()),
+        frankenterm_core::session_restore::SessionRestoreConfig::default(),
+    );
+    match session_restorer.detect() {
+        Ok(Some(candidate)) => {
+            tracing::info!(
+                session_id = %candidate.session_id,
+                checkpoint_id = ?candidate.selected_checkpoint_id,
+                "Detected restorable unclean session from previous run on startup"
+            );
+        }
+        Ok(None) => {
+            tracing::debug!("No unclean sessions found on startup — clean startup");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Unclean session detection reported non-restorable condition on startup");
+        }
+    }
+
     maybe_trigger_e2e_watcher_panic_once(layout);
 
     let patterns_root = config_path
@@ -44173,6 +44242,47 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     // or any session/mux access so even a malformed external workspace cannot
     // turn this no-mutation surface into an initializer.
     if dispatch_static_restart(command.as_ref())? {
+        return Ok(());
+    }
+
+    // Incident recovery through a pinned older client must not depend on the
+    // current config, workspace database, logging, font setup, or mux client.
+    // Dispatch it before all of those surfaces so an explicit compatible
+    // client + socket pair is the only live-mux authority involved.
+    if let Some(Commands::Session {
+        command:
+            SessionCommands::CompatibleClientDump {
+                client,
+                expected_client_sha256,
+                expected_client_bytes,
+                mux_socket,
+                output,
+                max_panes,
+                max_total_bytes,
+                batch_size,
+                batch_timeout_secs,
+                max_batch_output_bytes,
+                format,
+            },
+    }) = command.as_ref()
+    {
+        run_compatible_client_dump_command(
+            cx,
+            CompatibleClientDumpRequest {
+                client: client.clone(),
+                expected_client_sha256: expected_client_sha256.clone(),
+                expected_client_bytes: *expected_client_bytes,
+                mux_socket: mux_socket.clone(),
+                output: output.clone(),
+                max_panes: *max_panes,
+                max_total_bytes: *max_total_bytes,
+                batch_size: *batch_size,
+                batch_timeout: Duration::from_secs(*batch_timeout_secs),
+                max_batch_output_bytes: *max_batch_output_bytes,
+            },
+            format,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -76546,6 +76656,20 @@ const LIVE_MUX_DUMP_MAX_PANES: usize = 65_536;
 const LIVE_MUX_DUMP_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES: u64 = 384 * 1024 * 1024;
 const LIVE_MUX_DUMP_MAX_TOPOLOGY_BYTES: u64 = 64 * 1024 * 1024;
+const COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION: &str = "0.13.0";
+const COMPATIBLE_CLIENT_DUMP_MAX_PANES: usize = 1_024;
+const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE: usize = 64;
+const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT: Duration = Duration::from_secs(120);
+const COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(7_200);
+const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
+const COMPATIBLE_CLIENT_DUMP_MAX_STATE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES: usize = 1024 * 1024;
+const COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES: usize = 16 * 1024;
+const COMPATIBLE_CLIENT_DUMP_MAX_CLIENT_BYTES: u64 = 256 * 1024 * 1024;
+const COMPATIBLE_CLIENT_DUMP_VERSION_TIMEOUT: Duration = Duration::from_secs(15);
+const COMPATIBLE_CLIENT_DUMP_CAPTURE_TRANSPORT: &str = "pinned_v0_13_robot_double_census_v1";
+const COMPATIBLE_CLIENT_DUMP_BACKEND_CONSTRAINT: &str =
+    "explicit_vendored_socket_external_cli_unreachable";
 const LIVE_SCROLLBACK_EXPORT_MAX_PANES: usize =
     frankenterm_mux_server_impl::LIVE_SCROLLBACK_EXPORT_MAX_PANES;
 const LIVE_SCROLLBACK_EXPORT_MAX_ROWS: usize =
@@ -76573,6 +76697,264 @@ struct MuxDumpVerificationReceipt {
     pane_count: usize,
     error_count: usize,
     content_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CompatibleClientDumpRequest {
+    client: PathBuf,
+    expected_client_sha256: String,
+    expected_client_bytes: u64,
+    mux_socket: PathBuf,
+    output: PathBuf,
+    max_panes: usize,
+    max_total_bytes: usize,
+    batch_size: usize,
+    batch_timeout: Duration,
+    max_batch_output_bytes: usize,
+}
+
+#[derive(Debug)]
+struct CompatibleClientDumpReceipt {
+    path: PathBuf,
+    pane_count: usize,
+    content_bytes: usize,
+    payload_sha256: String,
+    artifact_sha256: String,
+    artifact_bytes: u64,
+    client_sha256: String,
+    client_bytes: u64,
+    client_version: String,
+    client_git_hash: String,
+    mux_socket_path_sha256: String,
+    subprocess_count: usize,
+    stderr_warning_commands: usize,
+    stderr_bytes: usize,
+    total_deadline_ms: u128,
+}
+
+#[derive(Debug)]
+struct PublishedMuxDumpReceipt {
+    complete: bool,
+    pane_count: usize,
+    error_count: usize,
+    content_bytes: usize,
+    payload_sha256: String,
+    artifact_sha256: String,
+    artifact_bytes: u64,
+    durability: &'static str,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompatibleClientNamedIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    hard_link_count: u64,
+    byte_len: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl CompatibleClientNamedIdentity {
+    fn from_std(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: metadata.permissions().mode() & 0o7777,
+            hard_link_count: metadata.nlink(),
+            byte_len: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+
+    fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
+        use cap_fs_ext::OsMetadataExt as _;
+        use cap_std::fs::PermissionsExt as _;
+
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: metadata.permissions().mode() & 0o7777,
+            hard_link_count: metadata.nlink(),
+            byte_len: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct PinnedCompatibleClient {
+    path: PathBuf,
+    parent_path: PathBuf,
+    leaf: PathBuf,
+    parent: cap_std::fs::Dir,
+    file: cap_std::fs::File,
+    identity: CompatibleClientNamedIdentity,
+    sha256: String,
+}
+
+#[cfg(unix)]
+struct PinnedCompatibleMuxSocket {
+    path: PathBuf,
+    parent_path: PathBuf,
+    leaf: PathBuf,
+    parent: cap_std::fs::Dir,
+    identity: CompatibleClientNamedIdentity,
+    path_sha256: String,
+}
+
+struct CompatibleClientEnvironment {
+    root: PathBuf,
+    empty_path: PathBuf,
+    home: PathBuf,
+    config: PathBuf,
+    data: PathBuf,
+    workspace: PathBuf,
+    temp: PathBuf,
+    nonexistent_external_cli: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompatibleClientVersionIdentity {
+    version: String,
+    git_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompatibleClientRobotEnvelope<T> {
+    ok: bool,
+    data: Option<T>,
+    error: Option<String>,
+    error_code: Option<String>,
+    hint: Option<String>,
+    elapsed_ms: u64,
+    version: String,
+    now: u64,
+    schema_version: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompatibleClientPaneState {
+    pane_id: u64,
+    pane_uuid: Option<String>,
+    tab_id: u64,
+    window_id: u64,
+    domain: String,
+    title: Option<String>,
+    cwd: Option<String>,
+    observed: bool,
+    #[serde(default)]
+    ignore_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompatibleClientRawPaneTopology {
+    pane_id: u64,
+    pane_uuid: Option<String>,
+    tab_id: u64,
+    window_id: u64,
+    domain: String,
+}
+
+#[derive(Serialize)]
+struct CompatibleClientConfig<'a> {
+    vendored: CompatibleClientVendoredConfig<'a>,
+}
+
+#[derive(Serialize)]
+struct CompatibleClientVendoredConfig<'a> {
+    mux_socket_path: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompatibleClientBatchTextData {
+    pane_ids: Vec<u64>,
+    tail_lines: usize,
+    escapes_included: bool,
+    results: BTreeMap<u64, CompatibleClientPaneTextResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum CompatibleClientPaneTextResult {
+    Ok {
+        text: String,
+        #[serde(default)]
+        truncated: bool,
+        truncation_info: Option<CompatibleClientTruncationInfo>,
+    },
+    Error {
+        code: String,
+        message: String,
+        hint: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompatibleClientTruncationInfo {
+    original_bytes: usize,
+    returned_bytes: usize,
+    original_lines: usize,
+    returned_lines: usize,
+}
+
+#[derive(Debug)]
+struct CompatibleClientCommandReceipt {
+    stdout: Vec<u8>,
+    stderr_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompatibleClientCommandKind<'a> {
+    Version,
+    State,
+    GetText {
+        pane_ids: &'a [u64],
+        requested_tail: usize,
+    },
+}
+
+struct CompatibleClientCapture {
+    payload: serde_json::Value,
+    client_sha256: String,
+    client_bytes: u64,
+    client_version: String,
+    client_git_hash: String,
+    mux_socket_path_sha256: String,
+    subprocess_count: usize,
+    stderr_warning_commands: usize,
+    stderr_bytes: usize,
+    total_deadline_ms: u128,
+}
+
+#[derive(Debug, Default)]
+struct CompatibleClientSubprocessAccounting {
+    commands: usize,
+    stderr_warning_commands: usize,
+    stderr_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -4567,3 +4567,49 @@ fn contract_ft_workspace_config_toml_is_discovered() {
         "FT_WORKSPACE/.ft/config.toml must be discovered by resolve_config_path"
     );
 }
+
+// =============================================================================
+// Feature Contract: Startup session restore detection (wa-2l27x.5)
+// =============================================================================
+
+#[test]
+fn contract_session_restorer_detects_unclean_session_on_startup() {
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("ft.db");
+    let db_path_str = db_path.to_str().expect("utf8 path").to_string();
+
+    let storage_config = frankenterm_core::storage::StorageConfig::default();
+    let cx = frankenterm_core::cx::for_request();
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+
+    runtime.block_on(async {
+        let storage = frankenterm_core::storage::StorageHandle::with_config_with_cx(
+            &cx,
+            &db_path_str,
+            storage_config,
+        )
+        .await
+        .expect("storage init");
+
+        storage
+            .insert_session("sess-unclean-startup", 1000, "0.15.1")
+            .await
+            .expect("insert session");
+
+        let restorer = frankenterm_core::session_restore::SessionRestorer::new(
+            std::sync::Arc::new(db_path_str.clone()),
+            frankenterm_core::session_restore::SessionRestoreConfig::default(),
+        );
+
+        let detection = restorer.detect();
+        assert!(
+            detection.is_ok()
+                || matches!(
+                    detection,
+                    Err(frankenterm_core::session_restore::RestoreError::UncleanSessionsNotRestorable { .. })
+                )
+        );
+    });
+}

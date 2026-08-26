@@ -49,7 +49,8 @@ use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
 use mux::guardian_protocol::{
-    GUARDIAN_MAX_PANES, GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1,
+    GUARDIAN_MAC_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_PAYLOAD_BYTES,
+    GuardianBrokerControlAuthenticatorV1, GuardianBrokerSpawnWalAuthenticatorV1,
     GuardianDurableSpawnFenceV1, GuardianSpawnPayload,
 };
 use nix::unistd::geteuid;
@@ -67,6 +68,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 const BROKER_ABSOLUTE_MAX_SUCCESSOR_HANDOFFS: u32 = 1_024;
 const BROKER_CATALOG_CHECKSUM_BYTES: usize = 32;
@@ -103,9 +105,589 @@ const BROKER_SPAWN_CATALOG_PREFIX: &str = "spawn-";
 const BROKER_SPAWN_CATALOG_WAL_SUFFIX: &str = ".wal.v1";
 const BROKER_SPAWN_CATALOG_HEAD_SUFFIX: &str = ".head.v1";
 const BROKER_SPAWN_CATALOG_MAX_ENTRIES: usize = GUARDIAN_MAX_PANES * 2 + 1;
+const BROKER_CONTROL_REQUEST_MAGIC: [u8; 4] = *b"FTBQ";
+const BROKER_CONTROL_RESPONSE_MAGIC: [u8; 4] = *b"FTBP";
+const BROKER_CONTROL_VERSION: u16 = 1;
+const BROKER_CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+const BROKER_CONTROL_REQUEST_FIXED_BYTES: usize = 240;
+const BROKER_CONTROL_REQUEST_PAYLOAD_OFFSET: usize = 208;
+const BROKER_CONTROL_RESPONSE_FIXED_BYTES: usize = 228;
+const BROKER_CONTROL_RESPONSE_PAYLOAD_OFFSET: usize = 196;
+pub(crate) const BROKER_CONTROL_MAX_FRAME_BYTES: usize =
+    BROKER_CONTROL_REQUEST_FIXED_BYTES + BROKER_CONTROL_MAX_PAYLOAD_BYTES;
+const BROKER_GENESIS_BINDING_BYTES: usize = 256;
+const BROKER_SPAWN_CONTROL_MAGIC: [u8; 4] = *b"BSP1";
+const BROKER_SPAWN_CONTROL_FIXED_BYTES: usize = 332;
 
 fn is_pty_terminal_eio(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::EIO)
+}
+
+/// Fixed operation vocabulary for the guardian-to-broker control channel.
+///
+/// Every effect has an explicit query and acknowledgement path. Reads remain
+/// replayable until `AcknowledgeOutput`; writes, resizes, Spawn, attachment,
+/// and retirement retain content-free receipts until `AcknowledgeEffect`.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokerControlOperationV1 {
+    Hello = 1,
+    Spawn = 2,
+    QueryEffect = 3,
+    AcknowledgeEffect = 4,
+    Write = 5,
+    Resize = 6,
+    ReadOutput = 7,
+    AcknowledgeOutput = 8,
+    AttachSuccessor = 9,
+    Census = 10,
+    ClosePane = 11,
+}
+
+impl BrokerControlOperationV1 {
+    fn from_wire(value: u8) -> Result<Self, BrokerControlProtocolError> {
+        match value {
+            1 => Ok(Self::Hello),
+            2 => Ok(Self::Spawn),
+            3 => Ok(Self::QueryEffect),
+            4 => Ok(Self::AcknowledgeEffect),
+            5 => Ok(Self::Write),
+            6 => Ok(Self::Resize),
+            7 => Ok(Self::ReadOutput),
+            8 => Ok(Self::AcknowledgeOutput),
+            9 => Ok(Self::AttachSuccessor),
+            10 => Ok(Self::Census),
+            11 => Ok(Self::ClosePane),
+            _ => Err(BrokerControlProtocolError::InvalidOperation),
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokerControlResponseStatusV1 {
+    Applied = 1,
+    Recovered = 2,
+    Rejected = 3,
+    Retryable = 4,
+    Quarantined = 5,
+    Terminal = 6,
+}
+
+impl BrokerControlResponseStatusV1 {
+    fn from_wire(value: u8) -> Result<Self, BrokerControlProtocolError> {
+        match value {
+            1 => Ok(Self::Applied),
+            2 => Ok(Self::Recovered),
+            3 => Ok(Self::Rejected),
+            4 => Ok(Self::Retryable),
+            5 => Ok(Self::Quarantined),
+            6 => Ok(Self::Terminal),
+            _ => Err(BrokerControlProtocolError::InvalidStatus),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BrokerControlRequestHeaderV1 {
+    pub operation: BrokerControlOperationV1,
+    pub request_id: Uuid,
+    pub broker_incarnation: Uuid,
+    pub guardian_incarnation: Uuid,
+    pub connection_id: Uuid,
+    pub mux_incarnation: Uuid,
+    pub guardian_build_identity_digest: [u8; 32],
+    pub mux_build_identity_digest: [u8; 32],
+    pub durable_pane_id: Uuid,
+    pub lease_generation: u64,
+    pub operation_id: Uuid,
+}
+
+impl BrokerControlRequestHeaderV1 {
+    fn validate(self, payload_bytes: usize) -> Result<(), BrokerControlProtocolError> {
+        if self.request_id.is_nil()
+            || self.guardian_incarnation.is_nil()
+            || self.connection_id.is_nil()
+            || self.mux_incarnation.is_nil()
+            || self.guardian_build_identity_digest == [0; 32]
+            || self.mux_build_identity_digest == [0; 32]
+            || payload_bytes > BROKER_CONTROL_MAX_PAYLOAD_BYTES
+        {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        let valid = match self.operation {
+            BrokerControlOperationV1::Hello => {
+                self.broker_incarnation.is_nil()
+                    && self.durable_pane_id.is_nil()
+                    && self.lease_generation == 0
+                    && self.operation_id.is_nil()
+                    && payload_bytes == 0
+            }
+            BrokerControlOperationV1::Census => {
+                !self.broker_incarnation.is_nil()
+                    && self.durable_pane_id.is_nil()
+                    && self.lease_generation == 0
+                    && self.operation_id.is_nil()
+                    && payload_bytes == 0
+            }
+            BrokerControlOperationV1::Spawn => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && self.lease_generation == 0
+                    && !self.operation_id.is_nil()
+                    && payload_bytes > 0
+            }
+            BrokerControlOperationV1::QueryEffect
+            | BrokerControlOperationV1::AcknowledgeEffect
+            | BrokerControlOperationV1::AttachSuccessor
+            | BrokerControlOperationV1::ClosePane => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == 0
+            }
+            BrokerControlOperationV1::Write => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && !self.operation_id.is_nil()
+                    && payload_bytes > 0
+            }
+            BrokerControlOperationV1::Resize => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == 8
+            }
+            BrokerControlOperationV1::ReadOutput => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == 4
+            }
+            BrokerControlOperationV1::AcknowledgeOutput => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == 8
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(BrokerControlProtocolError::InvalidShape)
+        }
+    }
+}
+
+/// Authenticated request owner. Plaintext-bearing payload bytes are wiped on
+/// drop and the type intentionally has no `Clone` implementation.
+pub(crate) struct BrokerControlRequestV1 {
+    pub header: BrokerControlRequestHeaderV1,
+    payload: Zeroizing<Vec<u8>>,
+}
+
+impl BrokerControlRequestV1 {
+    pub(crate) fn new(
+        header: BrokerControlRequestHeaderV1,
+        payload: &[u8],
+    ) -> Result<Self, BrokerControlProtocolError> {
+        header.validate(payload.len())?;
+        let mut owned = Zeroizing::new(Vec::new());
+        owned
+            .try_reserve_exact(payload.len())
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        owned.extend_from_slice(payload);
+        Ok(Self {
+            header,
+            payload: owned,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+impl std::fmt::Debug for BrokerControlRequestV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerControlRequestV1")
+            .field("header", &self.header)
+            .field("payload_bytes", &self.payload.len())
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BrokerControlResponseHeaderV1 {
+    pub operation: BrokerControlOperationV1,
+    pub status: BrokerControlResponseStatusV1,
+    pub request_id: Uuid,
+    pub broker_incarnation: Uuid,
+    pub guardian_incarnation: Uuid,
+    pub connection_id: Uuid,
+    pub durable_pane_id: Uuid,
+    pub lease_generation: u64,
+    pub operation_id: Uuid,
+    pub child_identity: Option<BrokerKernelChildIdentityV1>,
+    pub output_sequence_start: u64,
+    pub output_sequence_end: u64,
+}
+
+impl BrokerControlResponseHeaderV1 {
+    fn validate(self, payload_bytes: usize) -> Result<(), BrokerControlProtocolError> {
+        if self.request_id.is_nil()
+            || self.broker_incarnation.is_nil()
+            || self.guardian_incarnation.is_nil()
+            || self.connection_id.is_nil()
+            || payload_bytes > BROKER_CONTROL_MAX_PAYLOAD_BYTES
+            || self.output_sequence_start > self.output_sequence_end
+        {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        if let Some(child) = self.child_identity {
+            child
+                .validate()
+                .map_err(|_| BrokerControlProtocolError::InvalidIdentity)?;
+        }
+        let pane_scoped = !self.durable_pane_id.is_nil() && !self.operation_id.is_nil();
+        let valid = match self.operation {
+            BrokerControlOperationV1::Hello | BrokerControlOperationV1::Census => {
+                self.durable_pane_id.is_nil()
+                    && self.lease_generation == 0
+                    && self.operation_id.is_nil()
+                    && self.child_identity.is_none()
+            }
+            BrokerControlOperationV1::ReadOutput => pane_scoped,
+            _ => pane_scoped && payload_bytes == 0,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(BrokerControlProtocolError::InvalidShape)
+        }
+    }
+}
+
+pub(crate) struct BrokerControlResponseV1 {
+    pub header: BrokerControlResponseHeaderV1,
+    payload: Zeroizing<Vec<u8>>,
+}
+
+impl BrokerControlResponseV1 {
+    pub(crate) fn new(
+        header: BrokerControlResponseHeaderV1,
+        payload: &[u8],
+    ) -> Result<Self, BrokerControlProtocolError> {
+        header.validate(payload.len())?;
+        let mut owned = Zeroizing::new(Vec::new());
+        owned
+            .try_reserve_exact(payload.len())
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        owned.extend_from_slice(payload);
+        Ok(Self {
+            header,
+            payload: owned,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+impl std::fmt::Debug for BrokerControlResponseV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerControlResponseV1")
+            .field("header", &self.header)
+            .field("payload_bytes", &self.payload.len())
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Wipe-on-drop encoded broker-control frame.
+pub(crate) struct BrokerControlWireFrameV1 {
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+impl BrokerControlWireFrameV1 {
+    #[must_use]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl ZeroizeOnDrop for BrokerControlWireFrameV1 {}
+
+impl std::fmt::Debug for BrokerControlWireFrameV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerControlWireFrameV1")
+            .field("frame_bytes", &self.bytes.len())
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum BrokerControlProtocolError {
+    #[error("broker control frame exceeds its fixed resource bound")]
+    CapacityExhausted,
+    #[error("broker control frame is truncated or has a noncanonical length")]
+    InvalidLength,
+    #[error("broker control frame magic or version is invalid")]
+    InvalidVersion,
+    #[error("broker control operation is invalid")]
+    InvalidOperation,
+    #[error("broker control response status is invalid")]
+    InvalidStatus,
+    #[error("broker control frame identity is invalid")]
+    InvalidIdentity,
+    #[error("broker control frame shape is invalid for its operation")]
+    InvalidShape,
+    #[error("broker control authentication failed")]
+    AuthenticationFailed,
+}
+
+pub(crate) fn encode_broker_control_request(
+    authority: &GuardianBrokerControlAuthenticatorV1,
+    request: &BrokerControlRequestV1,
+) -> Result<BrokerControlWireFrameV1, BrokerControlProtocolError> {
+    request.header.validate(request.payload.len())?;
+    let total_bytes = BROKER_CONTROL_REQUEST_FIXED_BYTES
+        .checked_add(request.payload.len())
+        .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+    if total_bytes > BROKER_CONTROL_MAX_FRAME_BYTES {
+        return Err(BrokerControlProtocolError::CapacityExhausted);
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    bytes
+        .try_reserve_exact(total_bytes)
+        .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    bytes.resize(BROKER_CONTROL_REQUEST_PAYLOAD_OFFSET, 0);
+    let body_bytes = u32::try_from(total_bytes - 4)
+        .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    bytes[0..4].copy_from_slice(&body_bytes.to_be_bytes());
+    bytes[4..8].copy_from_slice(&BROKER_CONTROL_REQUEST_MAGIC);
+    bytes[8..10].copy_from_slice(&BROKER_CONTROL_VERSION.to_be_bytes());
+    bytes[10] = request.header.operation as u8;
+    bytes[11] = 0;
+    bytes[12..20].copy_from_slice(&authority.key_id());
+    bytes[20..36].copy_from_slice(request.header.request_id.as_bytes());
+    bytes[36..52].copy_from_slice(request.header.broker_incarnation.as_bytes());
+    bytes[52..68].copy_from_slice(request.header.guardian_incarnation.as_bytes());
+    bytes[68..84].copy_from_slice(request.header.connection_id.as_bytes());
+    bytes[84..100].copy_from_slice(request.header.mux_incarnation.as_bytes());
+    bytes[100..132].copy_from_slice(&request.header.guardian_build_identity_digest);
+    bytes[132..164].copy_from_slice(&request.header.mux_build_identity_digest);
+    bytes[164..180].copy_from_slice(request.header.durable_pane_id.as_bytes());
+    bytes[180..188].copy_from_slice(&request.header.lease_generation.to_be_bytes());
+    bytes[188..204].copy_from_slice(request.header.operation_id.as_bytes());
+    let payload_bytes = u32::try_from(request.payload.len())
+        .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    bytes[204..208].copy_from_slice(&payload_bytes.to_be_bytes());
+    bytes.extend_from_slice(&request.payload);
+    let tag = authority
+        .authenticate_request(&bytes)
+        .map_err(|_| BrokerControlProtocolError::AuthenticationFailed)?;
+    bytes.extend_from_slice(&tag);
+    debug_assert_eq!(bytes.len(), total_bytes);
+    Ok(BrokerControlWireFrameV1 { bytes })
+}
+
+pub(crate) fn decode_broker_control_request(
+    authority: &GuardianBrokerControlAuthenticatorV1,
+    frame: &[u8],
+) -> Result<BrokerControlRequestV1, BrokerControlProtocolError> {
+    validate_broker_control_frame_length(frame, BROKER_CONTROL_REQUEST_FIXED_BYTES)?;
+    if frame[4..8] != BROKER_CONTROL_REQUEST_MAGIC
+        || read_broker_be_u16(&frame[8..10]) != BROKER_CONTROL_VERSION
+        || frame[11] != 0
+        || frame[12..20] != authority.key_id()
+    {
+        return Err(BrokerControlProtocolError::InvalidVersion);
+    }
+    let payload_bytes = usize::try_from(read_broker_be_u32(&frame[204..208]))
+        .map_err(|_| BrokerControlProtocolError::InvalidLength)?;
+    let authenticated_bytes = BROKER_CONTROL_REQUEST_PAYLOAD_OFFSET
+        .checked_add(payload_bytes)
+        .ok_or(BrokerControlProtocolError::InvalidLength)?;
+    if payload_bytes > BROKER_CONTROL_MAX_PAYLOAD_BYTES
+        || authenticated_bytes
+            .checked_add(GUARDIAN_MAC_BYTES)
+            .ok_or(BrokerControlProtocolError::InvalidLength)?
+            != frame.len()
+    {
+        return Err(BrokerControlProtocolError::InvalidLength);
+    }
+    authority
+        .verify_request(&frame[..authenticated_bytes], &frame[authenticated_bytes..])
+        .map_err(|_| BrokerControlProtocolError::AuthenticationFailed)?;
+    BrokerControlRequestV1::new(
+        BrokerControlRequestHeaderV1 {
+            operation: BrokerControlOperationV1::from_wire(frame[10])?,
+            request_id: read_broker_uuid(&frame[20..36]),
+            broker_incarnation: read_broker_uuid(&frame[36..52]),
+            guardian_incarnation: read_broker_uuid(&frame[52..68]),
+            connection_id: read_broker_uuid(&frame[68..84]),
+            mux_incarnation: read_broker_uuid(&frame[84..100]),
+            guardian_build_identity_digest: read_broker_array_32(&frame[100..132]),
+            mux_build_identity_digest: read_broker_array_32(&frame[132..164]),
+            durable_pane_id: read_broker_uuid(&frame[164..180]),
+            lease_generation: read_broker_be_u64(&frame[180..188]),
+            operation_id: read_broker_uuid(&frame[188..204]),
+        },
+        &frame[BROKER_CONTROL_REQUEST_PAYLOAD_OFFSET..authenticated_bytes],
+    )
+}
+
+pub(crate) fn encode_broker_control_response(
+    authority: &GuardianBrokerControlAuthenticatorV1,
+    response: &BrokerControlResponseV1,
+) -> Result<BrokerControlWireFrameV1, BrokerControlProtocolError> {
+    response.header.validate(response.payload.len())?;
+    let total_bytes = BROKER_CONTROL_RESPONSE_FIXED_BYTES
+        .checked_add(response.payload.len())
+        .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+    if total_bytes > BROKER_CONTROL_MAX_FRAME_BYTES {
+        return Err(BrokerControlProtocolError::CapacityExhausted);
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    bytes
+        .try_reserve_exact(total_bytes)
+        .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    bytes.resize(BROKER_CONTROL_RESPONSE_PAYLOAD_OFFSET, 0);
+    let body_bytes = u32::try_from(total_bytes - 4)
+        .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    bytes[0..4].copy_from_slice(&body_bytes.to_be_bytes());
+    bytes[4..8].copy_from_slice(&BROKER_CONTROL_RESPONSE_MAGIC);
+    bytes[8..10].copy_from_slice(&BROKER_CONTROL_VERSION.to_be_bytes());
+    bytes[10] = response.header.operation as u8;
+    bytes[11] = response.header.status as u8;
+    bytes[12..20].copy_from_slice(&authority.key_id());
+    bytes[20..36].copy_from_slice(response.header.request_id.as_bytes());
+    bytes[36..52].copy_from_slice(response.header.broker_incarnation.as_bytes());
+    bytes[52..68].copy_from_slice(response.header.guardian_incarnation.as_bytes());
+    bytes[68..84].copy_from_slice(response.header.connection_id.as_bytes());
+    bytes[84..100].copy_from_slice(response.header.durable_pane_id.as_bytes());
+    bytes[100..108].copy_from_slice(&response.header.lease_generation.to_be_bytes());
+    bytes[108..124].copy_from_slice(response.header.operation_id.as_bytes());
+    if let Some(child) = response.header.child_identity {
+        bytes[124..128].copy_from_slice(&child.process_id.to_be_bytes());
+        bytes[128..144].copy_from_slice(child.broker_child_nonce.as_bytes());
+        bytes[144..176].copy_from_slice(&child.kernel_start_identity_digest);
+    }
+    bytes[176..184].copy_from_slice(&response.header.output_sequence_start.to_be_bytes());
+    bytes[184..192].copy_from_slice(&response.header.output_sequence_end.to_be_bytes());
+    let payload_bytes = u32::try_from(response.payload.len())
+        .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    bytes[192..196].copy_from_slice(&payload_bytes.to_be_bytes());
+    bytes.extend_from_slice(&response.payload);
+    let tag = authority
+        .authenticate_response(&bytes)
+        .map_err(|_| BrokerControlProtocolError::AuthenticationFailed)?;
+    bytes.extend_from_slice(&tag);
+    debug_assert_eq!(bytes.len(), total_bytes);
+    Ok(BrokerControlWireFrameV1 { bytes })
+}
+
+pub(crate) fn decode_broker_control_response(
+    authority: &GuardianBrokerControlAuthenticatorV1,
+    frame: &[u8],
+) -> Result<BrokerControlResponseV1, BrokerControlProtocolError> {
+    validate_broker_control_frame_length(frame, BROKER_CONTROL_RESPONSE_FIXED_BYTES)?;
+    if frame[4..8] != BROKER_CONTROL_RESPONSE_MAGIC
+        || read_broker_be_u16(&frame[8..10]) != BROKER_CONTROL_VERSION
+        || frame[12..20] != authority.key_id()
+    {
+        return Err(BrokerControlProtocolError::InvalidVersion);
+    }
+    let payload_bytes = usize::try_from(read_broker_be_u32(&frame[192..196]))
+        .map_err(|_| BrokerControlProtocolError::InvalidLength)?;
+    let authenticated_bytes = BROKER_CONTROL_RESPONSE_PAYLOAD_OFFSET
+        .checked_add(payload_bytes)
+        .ok_or(BrokerControlProtocolError::InvalidLength)?;
+    if payload_bytes > BROKER_CONTROL_MAX_PAYLOAD_BYTES
+        || authenticated_bytes
+            .checked_add(GUARDIAN_MAC_BYTES)
+            .ok_or(BrokerControlProtocolError::InvalidLength)?
+            != frame.len()
+    {
+        return Err(BrokerControlProtocolError::InvalidLength);
+    }
+    authority
+        .verify_response(&frame[..authenticated_bytes], &frame[authenticated_bytes..])
+        .map_err(|_| BrokerControlProtocolError::AuthenticationFailed)?;
+    let process_id = read_broker_be_u32(&frame[124..128]);
+    let broker_child_nonce = read_broker_uuid(&frame[128..144]);
+    let kernel_start_identity_digest = read_broker_array_32(&frame[144..176]);
+    let child_identity = if process_id == 0
+        && broker_child_nonce.is_nil()
+        && kernel_start_identity_digest == [0; 32]
+    {
+        None
+    } else {
+        Some(BrokerKernelChildIdentityV1 {
+            process_id,
+            broker_child_nonce,
+            kernel_start_identity_digest,
+        })
+    };
+    BrokerControlResponseV1::new(
+        BrokerControlResponseHeaderV1 {
+            operation: BrokerControlOperationV1::from_wire(frame[10])?,
+            status: BrokerControlResponseStatusV1::from_wire(frame[11])?,
+            request_id: read_broker_uuid(&frame[20..36]),
+            broker_incarnation: read_broker_uuid(&frame[36..52]),
+            guardian_incarnation: read_broker_uuid(&frame[52..68]),
+            connection_id: read_broker_uuid(&frame[68..84]),
+            durable_pane_id: read_broker_uuid(&frame[84..100]),
+            lease_generation: read_broker_be_u64(&frame[100..108]),
+            operation_id: read_broker_uuid(&frame[108..124]),
+            child_identity,
+            output_sequence_start: read_broker_be_u64(&frame[176..184]),
+            output_sequence_end: read_broker_be_u64(&frame[184..192]),
+        },
+        &frame[BROKER_CONTROL_RESPONSE_PAYLOAD_OFFSET..authenticated_bytes],
+    )
+}
+
+fn validate_broker_control_frame_length(
+    frame: &[u8],
+    minimum_bytes: usize,
+) -> Result<(), BrokerControlProtocolError> {
+    if frame.len() < minimum_bytes || frame.len() > BROKER_CONTROL_MAX_FRAME_BYTES {
+        return Err(BrokerControlProtocolError::InvalidLength);
+    }
+    let announced = usize::try_from(read_broker_be_u32(&frame[..4]))
+        .map_err(|_| BrokerControlProtocolError::InvalidLength)?;
+    if announced.checked_add(4) != Some(frame.len()) {
+        return Err(BrokerControlProtocolError::InvalidLength);
+    }
+    Ok(())
+}
+
+fn read_broker_be_u16(bytes: &[u8]) -> u16 {
+    let mut value = [0_u8; 2];
+    value.copy_from_slice(bytes);
+    u16::from_be_bytes(value)
+}
+
+fn read_broker_be_u32(bytes: &[u8]) -> u32 {
+    let mut value = [0_u8; 4];
+    value.copy_from_slice(bytes);
+    u32::from_be_bytes(value)
+}
+
+fn read_broker_be_u64(bytes: &[u8]) -> u64 {
+    let mut value = [0_u8; 8];
+    value.copy_from_slice(bytes);
+    u64::from_be_bytes(value)
 }
 
 /// Exact identity bound into one broker Spawn WAL and its local head anchor.
@@ -2726,6 +3308,219 @@ impl BrokerGenesisBinding {
             pixel_height: self.pixel_height,
         }
     }
+
+    fn encode(self) -> [u8; BROKER_GENESIS_BINDING_BYTES] {
+        let mut bytes = [0_u8; BROKER_GENESIS_BINDING_BYTES];
+        bytes[0..16].copy_from_slice(self.mux_incarnation.as_bytes());
+        bytes[16..32].copy_from_slice(self.spawn_effect_id.as_bytes());
+        bytes[32..48].copy_from_slice(self.durable_pane_id.as_bytes());
+        bytes[48..64].copy_from_slice(self.origin_request_id.as_bytes());
+        bytes[64..72].copy_from_slice(&self.spawn_payload_bytes.to_be_bytes());
+        bytes[72..104].copy_from_slice(&self.spawn_payload_digest);
+        bytes[104..136].copy_from_slice(&self.spawning_mux_build_identity_digest);
+        bytes[136..168].copy_from_slice(&self.live_guardian_build_identity_digest);
+        bytes[168..170].copy_from_slice(&self.rows.to_be_bytes());
+        bytes[170..172].copy_from_slice(&self.cols.to_be_bytes());
+        bytes[172..174].copy_from_slice(&self.pixel_width.to_be_bytes());
+        bytes[174..176].copy_from_slice(&self.pixel_height.to_be_bytes());
+        bytes[176..208].copy_from_slice(&self.checkpoint_identity_digest);
+        bytes[208..240].copy_from_slice(&self.boundary_identity_digest);
+        bytes[240..256].copy_from_slice(self.upload_id.as_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, BrokerControlProtocolError> {
+        if bytes.len() != BROKER_GENESIS_BINDING_BYTES {
+            return Err(BrokerControlProtocolError::InvalidLength);
+        }
+        let binding = Self {
+            mux_incarnation: read_broker_uuid(&bytes[0..16]),
+            spawn_effect_id: read_broker_uuid(&bytes[16..32]),
+            durable_pane_id: read_broker_uuid(&bytes[32..48]),
+            origin_request_id: read_broker_uuid(&bytes[48..64]),
+            spawn_payload_bytes: read_broker_be_u64(&bytes[64..72]),
+            spawn_payload_digest: read_broker_array_32(&bytes[72..104]),
+            spawning_mux_build_identity_digest: read_broker_array_32(&bytes[104..136]),
+            live_guardian_build_identity_digest: read_broker_array_32(&bytes[136..168]),
+            rows: read_broker_be_u16(&bytes[168..170]),
+            cols: read_broker_be_u16(&bytes[170..172]),
+            pixel_width: read_broker_be_u16(&bytes[172..174]),
+            pixel_height: read_broker_be_u16(&bytes[174..176]),
+            checkpoint_identity_digest: read_broker_array_32(&bytes[176..208]),
+            boundary_identity_digest: read_broker_array_32(&bytes[208..240]),
+            upload_id: read_broker_uuid(&bytes[240..256]),
+        };
+        binding
+            .validate()
+            .map_err(|_| BrokerControlProtocolError::InvalidIdentity)?;
+        Ok(binding)
+    }
+
+    fn matches_control_header(self, header: BrokerControlRequestHeaderV1) -> bool {
+        self.mux_incarnation == header.mux_incarnation
+            && self.spawn_effect_id == header.operation_id
+            && self.durable_pane_id == header.durable_pane_id
+            && self.spawning_mux_build_identity_digest == header.mux_build_identity_digest
+            && self.live_guardian_build_identity_digest == header.guardian_build_identity_digest
+    }
+}
+
+/// Complete, authenticated Spawn admission carried over the broker-control
+/// channel. The production constructor consumes the guardian's already
+/// durable pre-Spawn permit; the broker independently revalidates its exact
+/// binding before allocating a PTY or appending its own WAL.
+pub(crate) struct BrokerSpawnControlRequestV1 {
+    journal_id: Uuid,
+    attempt_id: Uuid,
+    catalog_candidate_checksum: [u8; BROKER_CATALOG_CHECKSUM_BYTES],
+    binding: BrokerGenesisBinding,
+    payload: GuardianSpawnPayload,
+}
+
+impl BrokerSpawnControlRequestV1 {
+    pub(crate) fn from_published_admission(
+        permit: GuardianPublishedGenesisAdmissionPermitV1,
+        payload: GuardianSpawnPayload,
+        journal_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Self, BrokerControlProtocolError> {
+        let proof = BrokerDurablePreSpawnIntentProof::from_permit(permit);
+        Self::from_parts(
+            journal_id,
+            attempt_id,
+            proof.catalog_candidate_checksum,
+            proof.binding,
+            payload,
+        )
+    }
+
+    fn from_parts(
+        journal_id: Uuid,
+        attempt_id: Uuid,
+        catalog_candidate_checksum: [u8; BROKER_CATALOG_CHECKSUM_BYTES],
+        binding: BrokerGenesisBinding,
+        payload: GuardianSpawnPayload,
+    ) -> Result<Self, BrokerControlProtocolError> {
+        let request = Self {
+            journal_id,
+            attempt_id,
+            catalog_candidate_checksum,
+            binding,
+            payload,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<(), BrokerControlProtocolError> {
+        if self.journal_id.is_nil()
+            || self.attempt_id.is_nil()
+            || self.catalog_candidate_checksum == [0; BROKER_CATALOG_CHECKSUM_BYTES]
+        {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        self.binding
+            .validate()
+            .map_err(|_| BrokerControlProtocolError::InvalidIdentity)?;
+        let canonical = self
+            .payload
+            .encode()
+            .map_err(|_| BrokerControlProtocolError::InvalidShape)?;
+        let canonical_bytes = u64::try_from(canonical.len())
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        if canonical.is_empty()
+            || canonical.len() > BROKER_CONTROL_MAX_PAYLOAD_BYTES - BROKER_SPAWN_CONTROL_FIXED_BYTES
+            || canonical_bytes != self.binding.spawn_payload_bytes
+            || <[u8; 32]>::from(Sha256::digest(canonical.as_slice()))
+                != self.binding.spawn_payload_digest
+            || self.payload.size() != self.binding.pty_size()
+        {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        }
+        Ok(())
+    }
+
+    fn validate_control_header(
+        &self,
+        header: BrokerControlRequestHeaderV1,
+    ) -> Result<(), BrokerControlProtocolError> {
+        if header.operation != BrokerControlOperationV1::Spawn
+            || !self.binding.matches_control_header(header)
+        {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Zeroizing<Vec<u8>>, BrokerControlProtocolError> {
+        self.validate()?;
+        let canonical = self
+            .payload
+            .encode()
+            .map_err(|_| BrokerControlProtocolError::InvalidShape)?;
+        let total_bytes = BROKER_SPAWN_CONTROL_FIXED_BYTES
+            .checked_add(canonical.len())
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        if total_bytes > BROKER_CONTROL_MAX_PAYLOAD_BYTES {
+            return Err(BrokerControlProtocolError::CapacityExhausted);
+        }
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes
+            .try_reserve_exact(total_bytes)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        bytes.resize(BROKER_SPAWN_CONTROL_FIXED_BYTES, 0);
+        bytes[0..4].copy_from_slice(&BROKER_SPAWN_CONTROL_MAGIC);
+        bytes[4..6].copy_from_slice(&BROKER_CONTROL_VERSION.to_be_bytes());
+        bytes[6..8].fill(0);
+        bytes[8..24].copy_from_slice(self.journal_id.as_bytes());
+        bytes[24..40].copy_from_slice(self.attempt_id.as_bytes());
+        bytes[40..72].copy_from_slice(&self.catalog_candidate_checksum);
+        bytes[72..328].copy_from_slice(&self.binding.encode());
+        let payload_bytes = u32::try_from(canonical.len())
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        bytes[328..332].copy_from_slice(&payload_bytes.to_be_bytes());
+        bytes.extend_from_slice(&canonical);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, BrokerControlProtocolError> {
+        if bytes.len() < BROKER_SPAWN_CONTROL_FIXED_BYTES
+            || bytes.len() > BROKER_CONTROL_MAX_PAYLOAD_BYTES
+            || bytes[0..4] != BROKER_SPAWN_CONTROL_MAGIC
+            || read_broker_be_u16(&bytes[4..6]) != BROKER_CONTROL_VERSION
+            || bytes[6..8] != [0, 0]
+        {
+            return Err(BrokerControlProtocolError::InvalidLength);
+        }
+        let payload_bytes = usize::try_from(read_broker_be_u32(&bytes[328..332]))
+            .map_err(|_| BrokerControlProtocolError::InvalidLength)?;
+        if BROKER_SPAWN_CONTROL_FIXED_BYTES.checked_add(payload_bytes) != Some(bytes.len()) {
+            return Err(BrokerControlProtocolError::InvalidLength);
+        }
+        let payload = GuardianSpawnPayload::decode(&bytes[BROKER_SPAWN_CONTROL_FIXED_BYTES..])
+            .map_err(|_| BrokerControlProtocolError::InvalidShape)?;
+        Self::from_parts(
+            read_broker_uuid(&bytes[8..24]),
+            read_broker_uuid(&bytes[24..40]),
+            read_broker_array_32(&bytes[40..72]),
+            BrokerGenesisBinding::decode(&bytes[72..328])?,
+            payload,
+        )
+    }
+}
+
+impl std::fmt::Debug for BrokerSpawnControlRequestV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerSpawnControlRequestV1")
+            .field("journal_id", &self.journal_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("durable_pane_id", &self.binding.durable_pane_id)
+            .field("spawn_effect_id", &self.binding.spawn_effect_id)
+            .field("catalog_candidate_checksum", &"[REDACTED]")
+            .field("spawn_payload", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Nonduplicable authority over one prepared, child-free PTY reservation.
@@ -4234,9 +5029,172 @@ mod tests {
             .expect("derive broker WAL authenticator")
     }
 
+    fn control_authenticator(byte: u8) -> GuardianBrokerControlAuthenticatorV1 {
+        mux::guardian_protocol::GuardianSecret::from_bytes([byte; 32])
+            .expect("nonzero guardian test secret")
+            .broker_control_authenticator()
+            .expect("derive broker control authenticator")
+    }
+
     fn wal_identity(binding: BrokerGenesisBinding) -> BrokerSpawnWalIdentityV1 {
         BrokerSpawnWalIdentityV1::from_binding(id(900), id(901), binding)
             .expect("valid broker WAL identity")
+    }
+
+    #[test]
+    fn control_codec_is_bounded_direction_separated_and_mutation_sensitive() {
+        static_assertions::assert_not_impl_any!(BrokerControlRequestV1: Clone, Copy);
+        static_assertions::assert_not_impl_any!(BrokerControlResponseV1: Clone, Copy);
+        static_assertions::assert_not_impl_any!(BrokerControlWireFrameV1: Clone, Copy);
+        static_assertions::assert_impl_all!(BrokerControlWireFrameV1: ZeroizeOnDrop);
+
+        let authority = control_authenticator(0x5a);
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Hello,
+                request_id: id(701),
+                broker_incarnation: Uuid::nil(),
+                guardian_incarnation: id(702),
+                connection_id: id(703),
+                mux_incarnation: id(704),
+                guardian_build_identity_digest: [0x71; 32],
+                mux_build_identity_digest: [0x72; 32],
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+            },
+            &[],
+        )
+        .expect("canonical Hello request");
+        let encoded = encode_broker_control_request(&authority, &request).expect("encode request");
+        assert_eq!(encoded.as_slice().len(), BROKER_CONTROL_REQUEST_FIXED_BYTES);
+        let decoded =
+            decode_broker_control_request(&authority, encoded.as_slice()).expect("decode request");
+        assert_eq!(decoded.header, request.header);
+        assert!(decoded.payload().is_empty());
+
+        let mut mutated = encoded.as_slice().to_vec();
+        mutated[20] ^= 1;
+        assert!(matches!(
+            decode_broker_control_request(&authority, &mutated),
+            Err(BrokerControlProtocolError::AuthenticationFailed)
+        ));
+        let mut length_mutated = encoded.as_slice().to_vec();
+        length_mutated[3] ^= 1;
+        assert!(matches!(
+            decode_broker_control_request(&authority, &length_mutated),
+            Err(BrokerControlProtocolError::InvalidLength)
+        ));
+
+        let response = BrokerControlResponseV1::new(
+            BrokerControlResponseHeaderV1 {
+                operation: BrokerControlOperationV1::Hello,
+                status: BrokerControlResponseStatusV1::Applied,
+                request_id: request.header.request_id,
+                broker_incarnation: id(705),
+                guardian_incarnation: request.header.guardian_incarnation,
+                connection_id: request.header.connection_id,
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+                child_identity: None,
+                output_sequence_start: 0,
+                output_sequence_end: 0,
+            },
+            &[],
+        )
+        .expect("canonical Hello response");
+        let encoded_response =
+            encode_broker_control_response(&authority, &response).expect("encode response");
+        assert_eq!(
+            encoded_response.as_slice().len(),
+            BROKER_CONTROL_RESPONSE_FIXED_BYTES
+        );
+        let decoded_response =
+            decode_broker_control_response(&authority, encoded_response.as_slice())
+                .expect("decode response");
+        assert_eq!(decoded_response.header, response.header);
+        assert!(decoded_response.payload().is_empty());
+        assert!(
+            decode_broker_control_request(&authority, encoded_response.as_slice()).is_err(),
+            "a response-direction frame was accepted as a request"
+        );
+        assert!(
+            decode_broker_control_response(&authority, encoded.as_slice()).is_err(),
+            "a request-direction frame was accepted as a response"
+        );
+
+        let invalid_write = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Write,
+                request_id: id(706),
+                broker_incarnation: id(705),
+                guardian_incarnation: id(702),
+                connection_id: id(703),
+                mux_incarnation: id(704),
+                guardian_build_identity_digest: [0x71; 32],
+                mux_build_identity_digest: [0x72; 32],
+                durable_pane_id: id(707),
+                lease_generation: 1,
+                operation_id: id(708),
+            },
+            &[],
+        );
+        assert!(matches!(
+            invalid_write,
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+    }
+
+    #[test]
+    fn spawn_control_payload_round_trips_exact_admission_binding() {
+        let authenticated = authority(id(721), id(722), id(723), id(724), 0x81, 0x82);
+        let sentinel = crate::canonical_test_temp_root().join("broker-control-spawn-never-created");
+        let payload = command_payload("printf never-spawned", &sentinel);
+        let binding = binding_for(&payload, &authenticated);
+        let request = BrokerSpawnControlRequestV1::from_parts(
+            id(725),
+            id(726),
+            [0x83; BROKER_CATALOG_CHECKSUM_BYTES],
+            binding,
+            payload,
+        )
+        .expect("canonical Spawn control request");
+        let encoded = request.encode().expect("encode Spawn control request");
+        let decoded =
+            BrokerSpawnControlRequestV1::decode(&encoded).expect("decode Spawn control request");
+        assert_eq!(decoded.journal_id, id(725));
+        assert_eq!(decoded.attempt_id, id(726));
+        assert_eq!(decoded.binding, binding);
+        assert_eq!(decoded.payload, request.payload);
+
+        let header = BrokerControlRequestHeaderV1 {
+            operation: BrokerControlOperationV1::Spawn,
+            request_id: id(727),
+            broker_incarnation: authenticated.broker_incarnation,
+            guardian_incarnation: authenticated.owner.guardian_incarnation,
+            connection_id: authenticated.owner.connection_id,
+            mux_incarnation: authenticated.owner.mux_incarnation,
+            guardian_build_identity_digest: authenticated.owner.guardian_build_identity_digest,
+            mux_build_identity_digest: authenticated.owner.mux_build_identity_digest,
+            durable_pane_id: binding.durable_pane_id,
+            lease_generation: 0,
+            operation_id: binding.spawn_effect_id,
+        };
+        decoded
+            .validate_control_header(header)
+            .expect("control header binds exact admission");
+        let mut wrong_header = header;
+        wrong_header.operation_id = id(728);
+        assert!(matches!(
+            decoded.validate_control_header(wrong_header),
+            Err(BrokerControlProtocolError::InvalidIdentity)
+        ));
+
+        let mut mutated = encoded.to_vec();
+        mutated[72 + 72] ^= 1;
+        assert!(BrokerSpawnControlRequestV1::decode(&mutated).is_err());
+        assert!(!sentinel.exists(), "control decode launched a user child");
     }
 
     fn private_catalog_directory() -> tempfile::TempDir {
