@@ -8403,12 +8403,11 @@ fn verify_checkpoint_artifact_json_structure(
         depth: 0,
     };
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    seed.deserialize(&mut deserializer).map_err(|error| {
-        CheckpointScrollbackArtifactError::InvalidArtifact(format!(
-            "JSON structure exceeds its safety contract: {error}"
-        ))
-    })?;
-    deserializer.end()?;
+    seed.deserialize(&mut deserializer)
+        .map_err(|error| checkpoint_artifact_untrusted_json_error("JSON structure", &error))?;
+    deserializer
+        .end()
+        .map_err(|error| checkpoint_artifact_untrusted_json_error("JSON trailing data", &error))?;
     Ok(())
 }
 
@@ -8417,7 +8416,7 @@ fn validate_checkpoint_scrollback_checkpoint(
     limits: CheckpointScrollbackArtifactLimits,
     redactor: &crate::redactor::Redactor,
 ) -> Result<(), CheckpointScrollbackArtifactError> {
-    if checkpoint.checkpoint_id < 0
+    if checkpoint.checkpoint_id <= 0
         || checkpoint.checkpoint_role != CHECKPOINT_ROLE_SNAPSHOT
         || !checkpoint.state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX)
         || checkpoint.pane_count != checkpoint.panes.len()
@@ -8433,10 +8432,10 @@ fn validate_checkpoint_scrollback_checkpoint(
             "checkpoint topology checksum mismatch".to_string(),
         ));
     }
-    let topology = TopologySnapshot::from_json(&checkpoint.topology_json).map_err(|error| {
-        CheckpointScrollbackArtifactError::InvalidArtifact(format!(
-            "checkpoint topology is invalid: {error}"
-        ))
+    let topology = TopologySnapshot::from_json(&checkpoint.topology_json).map_err(|_| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint topology JSON is invalid".to_string(),
+        )
     })?;
     let mut prior_pane_id = None;
     for pane in &checkpoint.panes {
@@ -8493,10 +8492,10 @@ fn validate_checkpoint_scrollback_checkpoint(
         Some(&checkpoint.topology_json),
         &persisted_panes,
     )
-    .map_err(|error| {
-        CheckpointScrollbackArtifactError::InvalidArtifact(format!(
-            "checkpoint witness cannot be recomputed: {error}"
-        ))
+    .map_err(|_| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(
+            "checkpoint witness cannot be recomputed".to_string(),
+        )
     })?;
     if recomputed != checkpoint.state_hash {
         return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
@@ -9109,20 +9108,19 @@ fn publish_checkpoint_artifact_noreplace(
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn publish_checkpoint_artifact_noreplace(
-    parent: &cap_std::fs::Dir,
-    staging: &Path,
-    target: &Path,
+    _parent: &cap_std::fs::Dir,
+    _staging: &Path,
+    _target: &Path,
 ) -> Result<(), CheckpointScrollbackArtifactError> {
-    if parent.symlink_metadata(target).is_ok() {
-        return Err(CheckpointScrollbackArtifactError::AlreadyExists);
-    }
-    parent.rename(staging, parent, target).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            CheckpointScrollbackArtifactError::AlreadyExists
-        } else {
-            CheckpointScrollbackArtifactError::Io(error)
-        }
-    })
+    checkpoint_artifact_noreplace_unsupported()
+}
+
+fn checkpoint_artifact_noreplace_unsupported()
+-> Result<(), CheckpointScrollbackArtifactError> {
+    Err(CheckpointScrollbackArtifactError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace artifact publication is unsupported on this platform",
+    )))
 }
 
 fn read_checkpoint_artifact_from_parent_bounded(
@@ -9207,6 +9205,86 @@ fn read_checkpoint_artifact_bounded(
     Ok(bytes)
 }
 
+fn checkpoint_artifact_open_file_matches_expected(
+    parent: &cap_std::fs::Dir,
+    leaf: &Path,
+    file: &mut cap_std::fs::File,
+    expected: &[u8],
+    synchronize_file: bool,
+) -> Result<bool, CheckpointScrollbackArtifactError> {
+    checkpoint_artifact_open_file_matches_expected_with_hook(
+        parent,
+        leaf,
+        file,
+        expected,
+        synchronize_file,
+        || {},
+    )
+}
+
+fn checkpoint_artifact_open_file_matches_expected_with_hook(
+    parent: &cap_std::fs::Dir,
+    leaf: &Path,
+    file: &mut cap_std::fs::File,
+    expected: &[u8],
+    synchronize_file: bool,
+    after_read: impl FnOnce(),
+) -> Result<bool, CheckpointScrollbackArtifactError> {
+    const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
+
+    let expected_len = u64::try_from(expected.len()).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact length does not fit u64".to_string(),
+        )
+    })?;
+    let before = validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(leaf)?,
+        &file.metadata()?,
+        None,
+    )?;
+    if before.byte_len != expected_len {
+        return Ok(false);
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut buffer = [0_u8; COMPARE_BUFFER_BYTES];
+    let mut offset = 0_usize;
+    let mut exact = true;
+    while offset < expected.len() {
+        let remaining = expected.len() - offset;
+        let chunk_len = remaining.min(COMPARE_BUFFER_BYTES);
+        let read = file.read(&mut buffer[..chunk_len])?;
+        if read == 0 {
+            exact = false;
+            break;
+        }
+        let end = offset.checked_add(read).ok_or_else(|| {
+            CheckpointScrollbackArtifactError::ResourceLimit(
+                "artifact comparison offset overflow".to_string(),
+            )
+        })?;
+        if buffer[..read] != expected[offset..end] {
+            exact = false;
+        }
+        offset = end;
+    }
+    after_read();
+    if synchronize_file {
+        file.sync_all()?;
+    }
+    let after = validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(leaf)?,
+        &file.metadata()?,
+        Some(expected_len),
+    )?;
+    if before != after {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact changed while it was compared".to_string(),
+        ));
+    }
+    Ok(exact && offset == expected.len())
+}
+
 fn checkpoint_artifact_existing_target_matches(
     parent: &cap_std::fs::Dir,
     leaf: &Path,
@@ -9217,13 +9295,12 @@ fn checkpoint_artifact_existing_target_matches(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     }
-    let expected_len = u64::try_from(bytes.len()).map_err(|_| {
-        CheckpointScrollbackArtifactError::ResourceLimit(
-            "artifact length does not fit u64".to_string(),
-        )
-    })?;
-    let existing = read_checkpoint_artifact_from_parent_bounded(parent, leaf, expected_len, true)?;
-    if existing != bytes {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = parent.open_with(leaf, &options)?;
+    if !checkpoint_artifact_open_file_matches_expected(
+        parent, leaf, &mut file, bytes, true,
+    )? {
         return Err(CheckpointScrollbackArtifactError::AlreadyExists);
     }
     sync_checkpoint_artifact_directory(parent)?;
@@ -9261,41 +9338,16 @@ fn open_or_rewrite_checkpoint_artifact_staging(
         }
         Err(error) => return Err(error.into()),
     };
-    let before = validate_checkpoint_artifact_file_metadata(
+    validate_checkpoint_artifact_file_metadata(
         &parent.symlink_metadata(staging)?,
         &file.metadata()?,
         None,
     )?;
 
-    let exact_residue = if created || before.byte_len != expected_len {
-        false
-    } else {
-        let capacity = usize::try_from(expected_len).map_err(|_| {
-            CheckpointScrollbackArtifactError::ResourceLimit(
-                "artifact length does not fit this platform".to_string(),
-            )
-        })?;
-        let mut observed = Vec::new();
-        observed.try_reserve_exact(capacity).map_err(|error| {
-            CheckpointScrollbackArtifactError::ResourceLimit(format!(
-                "bounded staging allocation failed: {error}"
-            ))
-        })?;
-        (&mut file)
-            .take(expected_len.saturating_add(1))
-            .read_to_end(&mut observed)?;
-        let after_read = validate_checkpoint_artifact_file_metadata(
-            &parent.symlink_metadata(staging)?,
-            &file.metadata()?,
-            Some(u64::try_from(observed.len()).unwrap_or(u64::MAX)),
+    let exact_residue = !created
+        && checkpoint_artifact_open_file_matches_expected(
+            parent, staging, &mut file, bytes, false,
         )?;
-        if before != after_read {
-            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
-                "staging residue changed while it was inspected".to_string(),
-            ));
-        }
-        observed == bytes
-    };
 
     if !exact_residue {
         file.set_len(0)?;
@@ -9360,7 +9412,7 @@ fn publish_checkpoint_artifact_bytes_with_fault(
 
     let staging_name = checkpoint_artifact_staging_name(&leaf);
     let staging = Path::new(&staging_name);
-    let file = open_or_rewrite_checkpoint_artifact_staging(&parent, staging, bytes)?;
+    let mut file = open_or_rewrite_checkpoint_artifact_staging(&parent, staging, bytes)?;
     match publish_checkpoint_artifact_noreplace(&parent, staging, &leaf) {
         Ok(()) => {}
         Err(CheckpointScrollbackArtifactError::AlreadyExists) => {
@@ -9385,13 +9437,9 @@ fn publish_checkpoint_artifact_bytes_with_fault(
         &file.metadata()?,
         Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
     )?;
-    let published = read_checkpoint_artifact_from_parent_bounded(
-        &parent,
-        &leaf,
-        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        true,
-    )?;
-    if published != bytes {
+    if !checkpoint_artifact_open_file_matches_expected(
+        &parent, &leaf, &mut file, bytes, true,
+    )? {
         return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
             "published artifact bytes differ from the synchronized staging inode".to_string(),
         ));
