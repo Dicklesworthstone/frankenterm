@@ -9666,21 +9666,21 @@ pub fn checkpoint_scrollback_artifact_file_name(
                 "checkpoint state hash is not a v2 snapshot witness".to_string(),
             )
         })?;
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        || checkpoint_id < 0
-    {
+    if !checkpoint_artifact_is_lower_hex_digest(digest) || checkpoint_id <= 0 {
         return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
             "checkpoint identity cannot form a canonical artifact name".to_string(),
         ));
     }
     Ok(format!(
-        "checkpoint-{checkpoint_at}-{checkpoint_id}-{}{}",
-        &digest[..16],
-        CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX
+        "checkpoint-{checkpoint_at}-{checkpoint_id}-{digest}{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
     ))
+}
+
+fn checkpoint_artifact_is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Inventory and independently verify a bounded dedicated artifact directory.
@@ -9703,6 +9703,8 @@ pub fn inventory_checkpoint_scrollback_artifacts(
     }
     let mut observed_entries = 0_usize;
     let mut artifacts = Vec::new();
+    let mut checkpoint_identities = HashSet::new();
+    let mut artifact_identities = HashSet::new();
     for entry in pinned.entries()? {
         let entry = entry?;
         observed_entries = observed_entries.checked_add(1).ok_or_else(|| {
@@ -9730,10 +9732,33 @@ pub fn inventory_checkpoint_scrollback_artifacts(
             false,
         )?;
         let receipt = verify_checkpoint_scrollback_artifact_bytes_with_hook(bytes, limits, || {})?;
+        let canonical_file_name = checkpoint_scrollback_artifact_file_name(
+            receipt.created_at_epoch_ms,
+            receipt.checkpoint_id,
+            &receipt.checkpoint_state_hash,
+        )?;
+        if file_name_utf8 != canonical_file_name {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "verified artifact does not use its canonical checkpoint leaf name".to_string(),
+            ));
+        }
+        if !checkpoint_identities
+            .insert((receipt.checkpoint_id, receipt.checkpoint_state_hash.clone()))
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "artifact inventory contains a duplicate checkpoint identity".to_string(),
+            ));
+        }
+        if !artifact_identities.insert(receipt.artifact_sha256.clone()) {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "artifact inventory contains a duplicate file identity".to_string(),
+            ));
+        }
         artifacts.push(CheckpointScrollbackInventoryEntry {
             file_name: PathBuf::from(file_name),
             created_at_epoch_ms: receipt.created_at_epoch_ms,
             checkpoint_id: receipt.checkpoint_id,
+            checkpoint_state_hash: receipt.checkpoint_state_hash,
             artifact_bytes: receipt.artifact_bytes,
             artifact_sha256: receipt.artifact_sha256,
         });
@@ -9762,6 +9787,11 @@ pub fn plan_checkpoint_scrollback_artifact_retention(
     limits: CheckpointScrollbackArtifactLimits,
 ) -> Result<CheckpointScrollbackRetentionPlan, CheckpointScrollbackArtifactError> {
     let limits = limits.validate()?;
+    if retention_count == 0 || max_retained_bytes == 0 {
+        return Err(CheckpointScrollbackArtifactError::InvalidLimits(
+            "retention must preserve at least one recovery artifact".to_string(),
+        ));
+    }
     if entries.len() > limits.max_inventory_entries {
         return Err(CheckpointScrollbackArtifactError::ResourceLimit(format!(
             "retention input has {} entries, limit {}",
@@ -9769,6 +9799,34 @@ pub fn plan_checkpoint_scrollback_artifact_retention(
             limits.max_inventory_entries
         )));
     }
+    let mut names = HashSet::with_capacity(entries.len());
+    let mut checkpoint_identities = HashSet::with_capacity(entries.len());
+    let mut artifact_identities = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let canonical_file_name = checkpoint_scrollback_artifact_file_name(
+            entry.created_at_epoch_ms,
+            entry.checkpoint_id,
+            &entry.checkpoint_state_hash,
+        )?;
+        if entry.file_name != Path::new(&canonical_file_name)
+            || entry.artifact_bytes == 0
+            || !checkpoint_artifact_is_lower_hex_digest(&entry.artifact_sha256)
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "retention entry identity is not canonical".to_string(),
+            ));
+        }
+        if !names.insert(entry.file_name.clone())
+            || !checkpoint_identities
+                .insert((entry.checkpoint_id, entry.checkpoint_state_hash.clone()))
+            || !artifact_identities.insert(entry.artifact_sha256.clone())
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "retention inventory contains duplicate identities".to_string(),
+            ));
+        }
+    }
+
     let mut sorted = entries.to_vec();
     sorted.sort_unstable_by(|left, right| {
         right
@@ -9777,13 +9835,12 @@ pub fn plan_checkpoint_scrollback_artifact_retention(
             .then_with(|| right.checkpoint_id.cmp(&left.checkpoint_id))
             .then_with(|| left.file_name.cmp(&right.file_name))
     });
-    let mut names = HashSet::with_capacity(sorted.len());
     if sorted
-        .iter()
-        .any(|entry| !names.insert(entry.file_name.clone()))
+        .first()
+        .is_some_and(|newest| newest.artifact_bytes > max_retained_bytes)
     {
-        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
-            "retention inventory contains duplicate leaf names".to_string(),
+        return Err(CheckpointScrollbackArtifactError::InvalidLimits(
+            "retained-byte budget cannot preserve the newest recovery artifact".to_string(),
         ));
     }
 
@@ -13480,6 +13537,17 @@ mod tests {
         ));
 
         let limits = CheckpointScrollbackArtifactLimits::default();
+        let shared_prefix = "0123456789abcdef";
+        let first_collision_hash =
+            format!("{SNAPSHOT_WITNESS_PREFIX}{shared_prefix}{}", "a".repeat(48));
+        let second_collision_hash =
+            format!("{SNAPSHOT_WITNESS_PREFIX}{shared_prefix}{}", "b".repeat(48));
+        assert_ne!(
+            checkpoint_scrollback_artifact_file_name(40, 4, &first_collision_hash).unwrap(),
+            checkpoint_scrollback_artifact_file_name(40, 4, &second_collision_hash).unwrap(),
+            "canonical leaves must bind the full witness rather than a 64-bit prefix"
+        );
+
         let make_entry = |created_at_epoch_ms: u64,
                           checkpoint_id: i64,
                           witness_digit: char,
