@@ -46,7 +46,13 @@
 
 use crate::SealedAtomicBuildIdentity;
 use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
+use crate::transport::{
+    GuardianServiceError, SocketPathAuthority, bind_private_unix_listener,
+    load_guardian_secret, validate_existing_socket,
+};
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use mio::net::{UnixListener, UnixStream};
+use mio::{Events, Interest, Poll, Token};
 use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
 use mux::guardian_protocol::{
     GUARDIAN_MAC_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_PAYLOAD_BYTES,
@@ -58,14 +64,17 @@ use nix::unistd::geteuid;
 use portable_pty::ExitStatus;
 use portable_pty::{Child, MasterPty, PollablePtyReader, PtyPair, PtySize, native_pty_system};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::net::UnixStream as BlockingUnixStream;
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
@@ -113,8 +122,13 @@ const BROKER_CONTROL_REQUEST_FIXED_BYTES: usize = 240;
 const BROKER_CONTROL_REQUEST_PAYLOAD_OFFSET: usize = 208;
 const BROKER_CONTROL_RESPONSE_FIXED_BYTES: usize = 228;
 const BROKER_CONTROL_RESPONSE_PAYLOAD_OFFSET: usize = 196;
+const BROKER_CONTROL_HELLO_PAYLOAD_BYTES: usize = 48;
 pub(crate) const BROKER_CONTROL_MAX_FRAME_BYTES: usize =
     BROKER_CONTROL_REQUEST_FIXED_BYTES + BROKER_CONTROL_MAX_PAYLOAD_BYTES;
+const BROKER_CONTROL_LISTENER_TOKEN: Token = Token(0);
+const BROKER_CONTROL_MAX_CONNECTIONS: usize = 1_024;
+const BROKER_CONTROL_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const BROKER_CONTROL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_GENESIS_BINDING_BYTES: usize = 256;
 const BROKER_SPAWN_CONTROL_MAGIC: [u8; 4] = *b"BSP1";
 const BROKER_SPAWN_CONTROL_FIXED_BYTES: usize = 332;
@@ -383,7 +397,12 @@ impl BrokerControlResponseHeaderV1 {
         );
         let valid = match self.operation {
             BrokerControlOperationV1::Hello => {
-                global_scoped && empty_effect && (successful || unsuccessful)
+                global_scoped
+                    && self.child_identity.is_none()
+                    && self.output_sequence_start == 0
+                    && self.output_sequence_end == 0
+                    && ((successful && payload_bytes == BROKER_CONTROL_HELLO_PAYLOAD_BYTES)
+                        || (unsuccessful && payload_bytes == 0))
             }
             BrokerControlOperationV1::Census => {
                 global_scoped
@@ -5180,6 +5199,7 @@ mod tests {
             Err(BrokerControlProtocolError::InvalidLength)
         ));
 
+        let hello_payload = [0x74; BROKER_CONTROL_HELLO_PAYLOAD_BYTES];
         let response = BrokerControlResponseV1::new(
             BrokerControlResponseHeaderV1 {
                 operation: BrokerControlOperationV1::Hello,
@@ -5195,7 +5215,7 @@ mod tests {
                 output_sequence_start: 0,
                 output_sequence_end: 0,
             },
-            &[],
+            &hello_payload,
         )
         .expect("canonical Hello response");
         let encoded_response =
@@ -5208,7 +5228,7 @@ mod tests {
             decode_broker_control_response(&authority, encoded_response.as_slice())
                 .expect("decode response");
         assert_eq!(decoded_response.header, response.header);
-        assert_eq!(decoded_response.payload(), &[] as &[u8]);
+        assert_eq!(decoded_response.payload(), hello_payload);
         assert!(
             decode_broker_control_request(&authority, encoded_response.as_slice()).is_err(),
             "a response-direction frame was accepted as a request"

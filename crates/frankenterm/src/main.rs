@@ -76636,6 +76636,17 @@ struct PrivateArtifactReceipt {
     bytes: u64,
     sha256: String,
     durability: &'static str,
+    recovered_existing: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateArtifactPublicationPoint {
+    StageOpened,
+    StagePrefixWritten,
+    StageSynchronized,
+    TargetRenamed,
+    ParentSynchronized,
 }
 
 #[derive(Debug)]
@@ -76696,6 +76707,7 @@ struct PublishedMuxDumpReceipt {
     artifact_sha256: String,
     artifact_bytes: u64,
     durability: &'static str,
+    recovered_existing: bool,
 }
 
 #[cfg(unix)]
