@@ -8815,15 +8815,132 @@ fn sync_checkpoint_artifact_directory(directory: &cap_std::fs::Dir) -> std::io::
     }
 }
 
-fn ensure_checkpoint_artifact_directory_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+fn checkpoint_artifact_absolute_directory_path(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn checkpoint_artifact_validate_directory_type(
+    metadata: &cap_std::fs::Metadata,
+) -> std::io::Result<()> {
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "artifact directory authority is not a directory",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn checkpoint_artifact_uid_is_trusted(uid: u32, effective_uid: u32) -> bool {
+    uid == effective_uid || uid == 0
+}
+
+/// Require an opened ancestor to protect one child pathname from peer rename.
+///
+/// A trusted, non-peer-writable directory protects all of its entries. The
+/// Unix sticky bit is the one deliberate exception for shared roots such as
+/// `/tmp`, but it is sufficient only when the child owner is also the effective
+/// user or root. An untrusted directory owner could first change its mode, so
+/// mode bits alone never authenticate an ancestor.
+fn validate_checkpoint_artifact_parent_child_authority(
+    parent: &cap_std::fs::Dir,
+    child: &cap_std::fs::Dir,
+) -> std::io::Result<()> {
+    let parent_metadata = parent.dir_metadata()?;
+    let child_metadata = child.dir_metadata()?;
+    checkpoint_artifact_validate_directory_type(&parent_metadata)?;
+    checkpoint_artifact_validate_directory_type(&child_metadata)?;
+    #[cfg(unix)]
+    {
+        let effective_uid = rustix::process::geteuid().as_raw();
+        let parent_mode = cap_std::fs::MetadataExt::mode(&parent_metadata);
+        let peer_writable = parent_mode & 0o022 != 0;
+        let sticky = parent_mode & 0o1000 != 0;
+        let parent_owner_is_trusted = checkpoint_artifact_uid_is_trusted(
+            cap_std::fs::MetadataExt::uid(&parent_metadata),
+            effective_uid,
+        );
+        let child_owner_is_trusted = checkpoint_artifact_uid_is_trusted(
+            cap_std::fs::MetadataExt::uid(&child_metadata),
+            effective_uid,
+        );
+        if !parent_owner_is_trusted || (peer_writable && !(sticky && child_owner_is_trusted)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "artifact directory ancestor does not protect its child entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check whether a new effective-user-owned child can be created safely.
+///
+/// This runs before `mkdir`, so an unsafe ancestor fails without leaving a new
+/// directory behind. An existing child is checked again using its actual owner.
+fn validate_checkpoint_artifact_parent_for_new_child(
+    parent: &cap_std::fs::Dir,
+) -> std::io::Result<()> {
+    let metadata = parent.dir_metadata()?;
+    checkpoint_artifact_validate_directory_type(&metadata)?;
+    #[cfg(unix)]
+    {
+        let effective_uid = rustix::process::geteuid().as_raw();
+        let mode = cap_std::fs::MetadataExt::mode(&metadata);
+        let peer_writable = mode & 0o022 != 0;
+        let sticky = mode & 0o1000 != 0;
+        let owner_is_trusted = checkpoint_artifact_uid_is_trusted(
+            cap_std::fs::MetadataExt::uid(&metadata),
+            effective_uid,
+        );
+        if !owner_is_trusted || (peer_writable && !sticky) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "artifact directory ancestor cannot safely admit a new child",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The directory containing artifact, lock, and staging names is a private
+/// authority, not merely a traversal component. Refuse existing directories
+/// that another effective user owns or that group/other users can modify.
+fn validate_checkpoint_artifact_final_directory_authority(
+    directory: &cap_std::fs::Dir,
+) -> std::io::Result<()> {
+    let metadata = directory.dir_metadata()?;
+    checkpoint_artifact_validate_directory_type(&metadata)?;
+    #[cfg(unix)]
+    {
+        let effective_uid = rustix::process::geteuid().as_raw();
+        if cap_std::fs::MetadataExt::uid(&metadata) != effective_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "artifact directory is not owned by the effective user",
+            ));
+        }
+        if cap_std::fs::MetadataExt::mode(&metadata) & 0o022 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "artifact directory is writable by group or other users",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_checkpoint_artifact_directory_tree_nofollow(
+    path: &Path,
+) -> std::io::Result<cap_std::fs::Dir> {
     use cap_fs_ext::DirExt as _;
 
-    if checkpoint_artifact_path_contains_parent(path) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "artifact directory contains a parent component",
-        ));
-    }
     let Some(leaf) = path.file_name() else {
         let base = if path.as_os_str().is_empty() {
             Path::new(".")
@@ -8836,7 +8953,8 @@ fn ensure_checkpoint_artifact_directory_nofollow(path: &Path) -> std::io::Result
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = ensure_checkpoint_artifact_directory_nofollow(parent_path)?;
+    let parent = ensure_checkpoint_artifact_directory_tree_nofollow(parent_path)?;
+    validate_checkpoint_artifact_parent_for_new_child(&parent)?;
     let leaf = Path::new(leaf);
     let created = match create_checkpoint_artifact_private_directory(&parent, leaf) {
         Ok(()) => true,
@@ -8844,21 +8962,31 @@ fn ensure_checkpoint_artifact_directory_nofollow(path: &Path) -> std::io::Result
         Err(error) => return Err(error),
     };
     let directory = parent.open_dir_nofollow(leaf)?;
+    validate_checkpoint_artifact_parent_child_authority(&parent, &directory)?;
     if created {
         sync_checkpoint_artifact_directory(&parent)?;
     }
     Ok(directory)
 }
 
-fn open_checkpoint_artifact_directory_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
-    use cap_fs_ext::DirExt as _;
-
+fn ensure_checkpoint_artifact_directory_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     if checkpoint_artifact_path_contains_parent(path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "artifact directory contains a parent component",
         ));
     }
+    let absolute = checkpoint_artifact_absolute_directory_path(path)?;
+    let directory = ensure_checkpoint_artifact_directory_tree_nofollow(&absolute)?;
+    validate_checkpoint_artifact_final_directory_authority(&directory)?;
+    Ok(directory)
+}
+
+fn open_checkpoint_artifact_directory_tree_nofollow(
+    path: &Path,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+
     let Some(leaf) = path.file_name() else {
         let base = if path.as_os_str().is_empty() {
             Path::new(".")
@@ -8871,8 +8999,23 @@ fn open_checkpoint_artifact_directory_nofollow(path: &Path) -> std::io::Result<c
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = open_checkpoint_artifact_directory_nofollow(parent_path)?;
-    parent.open_dir_nofollow(Path::new(leaf))
+    let parent = open_checkpoint_artifact_directory_tree_nofollow(parent_path)?;
+    let directory = parent.open_dir_nofollow(Path::new(leaf))?;
+    validate_checkpoint_artifact_parent_child_authority(&parent, &directory)?;
+    Ok(directory)
+}
+
+fn open_checkpoint_artifact_directory_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    if checkpoint_artifact_path_contains_parent(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact directory contains a parent component",
+        ));
+    }
+    let absolute = checkpoint_artifact_absolute_directory_path(path)?;
+    let directory = open_checkpoint_artifact_directory_tree_nofollow(&absolute)?;
+    validate_checkpoint_artifact_final_directory_authority(&directory)?;
+    Ok(directory)
 }
 
 fn checkpoint_artifact_parent_and_leaf(
@@ -8912,6 +9055,7 @@ fn revalidate_checkpoint_artifact_parent(
 ) -> Result<(), CheckpointScrollbackArtifactError> {
     use cap_fs_ext::OsMetadataExt as _;
 
+    validate_checkpoint_artifact_final_directory_authority(pinned)?;
     let pinned_metadata = pinned.dir_metadata()?;
     let reopened = open_checkpoint_artifact_directory_nofollow(parent_path)?;
     let reopened_metadata = reopened.dir_metadata()?;
@@ -13225,6 +13369,87 @@ mod tests {
                 CheckpointArtifactPublicationOutcome::AlreadyApplied
             );
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_scrollback_directory_authority_rejects_writable_final_and_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let final_directory = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            final_directory.path(),
+            std::fs::Permissions::from_mode(0o770),
+        )
+        .unwrap();
+        let final_target = final_directory
+            .path()
+            .join(format!("final-mode{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
+        let final_error = publish_checkpoint_artifact_bytes(&final_target, b"artifact-bytes")
+            .expect_err("a group-writable final artifact directory must fail closed");
+        assert!(matches!(
+            final_error,
+            CheckpointScrollbackArtifactError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!final_target.exists());
+        assert!(matches!(
+            inventory_checkpoint_scrollback_artifacts(
+                final_directory.path(),
+                CheckpointScrollbackArtifactLimits::default(),
+            ),
+            Err(CheckpointScrollbackArtifactError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+
+        let ancestor_root = tempfile::TempDir::new().unwrap();
+        let writable_parent = ancestor_root.path().join("peer-writable-parent");
+        std::fs::create_dir(&writable_parent).unwrap();
+        std::fs::set_permissions(&writable_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let private_catalog = writable_parent.join("private-catalog");
+        std::fs::create_dir(&private_catalog).unwrap();
+        std::fs::set_permissions(&private_catalog, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ancestor_target = private_catalog.join(format!(
+            "renameable-parent{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
+        ));
+        let ancestor_error = publish_checkpoint_artifact_bytes(&ancestor_target, b"artifact-bytes")
+            .expect_err("a writable non-sticky parent can replace a private catalog");
+        assert!(matches!(
+            ancestor_error,
+            CheckpointScrollbackArtifactError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!ancestor_target.exists());
+
+        let absent_catalog = writable_parent.join("must-not-be-created");
+        let absent_target = absent_catalog.join(format!(
+            "unsafe-create{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
+        ));
+        assert!(matches!(
+            publish_checkpoint_artifact_bytes(&absent_target, b"artifact-bytes"),
+            Err(CheckpointScrollbackArtifactError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(
+            !absent_catalog.exists(),
+            "unsafe ancestry must be rejected before creating a directory"
+        );
+
+        let sticky_root = tempfile::TempDir::new().unwrap();
+        let sticky_parent = sticky_root.path().join("sticky-shared-parent");
+        std::fs::create_dir(&sticky_parent).unwrap();
+        std::fs::set_permissions(&sticky_parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let sticky_catalog = sticky_parent.join("private-catalog");
+        std::fs::create_dir(&sticky_catalog).unwrap();
+        std::fs::set_permissions(&sticky_catalog, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sticky_target = sticky_catalog.join(format!(
+            "sticky-parent{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
+        ));
+        assert_eq!(
+            publish_checkpoint_artifact_bytes(&sticky_target, b"artifact-bytes").unwrap(),
+            CheckpointArtifactPublicationOutcome::Published
+        );
+        assert_eq!(std::fs::read(sticky_target).unwrap(), b"artifact-bytes");
     }
 
     #[cfg(unix)]
