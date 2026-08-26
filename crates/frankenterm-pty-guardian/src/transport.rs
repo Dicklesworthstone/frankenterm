@@ -539,7 +539,7 @@ struct SocketPathIdentity {
     links: u64,
 }
 
-struct SocketPathAuthority {
+pub(crate) struct SocketPathAuthority {
     parent: File,
     socket_path: PathBuf,
     leaf_name: OsString,
@@ -547,7 +547,7 @@ struct SocketPathAuthority {
 }
 
 impl SocketPathAuthority {
-    fn validate(&self) -> Result<(), GuardianServiceError> {
+    pub(crate) fn validate(&self) -> Result<(), GuardianServiceError> {
         validate_pinned_private_parent(&self.socket_path, &self.parent)?;
         let observed = socket_path_identity_at(&self.parent, &self.leaf_name)?;
         if observed != self.identity {
@@ -557,6 +557,50 @@ impl SocketPathAuthority {
         }
         Ok(())
     }
+}
+
+fn preflight_private_unix_listener_path(path: &Path) -> Result<(), GuardianServiceError> {
+    validate_absolute_path(path)?;
+    validate_private_parent(path)?;
+    let parent = open_private_parent(path)?;
+    let leaf_name = path
+        .file_name()
+        .ok_or(GuardianServiceError::InvalidConfiguration(
+            "guardian socket path has no file name",
+        ))?;
+    require_absent_at(&parent, leaf_name)
+}
+
+/// Bind a new nonblocking Unix listener through the guardian's pinned,
+/// owner-only, no-replacement endpoint contract.
+///
+/// The returned authority must remain alive and be revalidated before accepts
+/// so pathname replacement cannot silently redirect successor guardians.
+pub(crate) fn bind_private_unix_listener(
+    path: &Path,
+) -> Result<(UnixListener, SocketPathAuthority), GuardianServiceError> {
+    preflight_private_unix_listener_path(path)?;
+    let parent = open_private_parent(path)?;
+    let leaf_name = path
+        .file_name()
+        .ok_or(GuardianServiceError::InvalidConfiguration(
+            "guardian socket path has no file name",
+        ))?;
+    require_absent_at(&parent, leaf_name)?;
+    let listener = UnixListener::bind(path)
+        .map_err(|error| GuardianServiceError::io("socket-bind", error))?;
+    chmod_socket_at(&parent, leaf_name)?;
+    validate_pinned_private_parent(path, &parent)?;
+    let identity = socket_path_identity_at(&parent, leaf_name)?;
+    prove_socket_path_routes_to_listener(&listener, path)?;
+    let authority = SocketPathAuthority {
+        parent,
+        socket_path: path.to_path_buf(),
+        leaf_name: leaf_name.to_os_string(),
+        identity,
+    };
+    authority.validate()?;
+    Ok((listener, authority))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -629,15 +673,7 @@ impl GuardianService {
     pub fn bind(config: GuardianServiceConfig) -> Result<Self, GuardianServiceError> {
         validate_private_parent(&config.socket_path)?;
         validate_private_parent(&config.token_path)?;
-        let socket_parent = open_private_parent(&config.socket_path)?;
-        let socket_name =
-            config
-                .socket_path
-                .file_name()
-                .ok_or(GuardianServiceError::InvalidConfiguration(
-                    "guardian socket path has no file name",
-                ))?;
-        require_absent_at(&socket_parent, socket_name)?;
+        preflight_private_unix_listener_path(&config.socket_path)?;
         let secret = load_guardian_secret(&config.token_path)?;
 
         let poll = Poll::new().map_err(|error| GuardianServiceError::io("poll-create", error))?;
@@ -708,19 +744,8 @@ impl GuardianService {
         // all endpoint allocations exist. A post-bind permission or
         // registration failure deliberately leaves the socket in place for
         // operator inspection; this process never unlinks an existing path.
-        let mut listener = UnixListener::bind(&config.socket_path)
-            .map_err(|error| GuardianServiceError::io("socket-bind", error))?;
-        chmod_socket_at(&socket_parent, socket_name)?;
-        validate_pinned_private_parent(&config.socket_path, &socket_parent)?;
-        let socket_identity = socket_path_identity_at(&socket_parent, socket_name)?;
-        prove_socket_path_routes_to_listener(&listener, &config.socket_path)?;
-        let socket_authority = SocketPathAuthority {
-            parent: socket_parent,
-            socket_path: config.socket_path.clone(),
-            leaf_name: socket_name.to_os_string(),
-            identity: socket_identity,
-        };
-        socket_authority.validate()?;
+        let (mut listener, socket_authority) =
+            bind_private_unix_listener(&config.socket_path)?;
         poll.registry()
             .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)
             .map_err(|error| GuardianServiceError::io("listener-register", error))?;
@@ -3145,12 +3170,12 @@ fn validate_bound_socket(path: &Path) -> Result<(), GuardianServiceError> {
     Ok(())
 }
 
-fn validate_existing_socket(path: &Path) -> Result<(), GuardianServiceError> {
+pub(crate) fn validate_existing_socket(path: &Path) -> Result<(), GuardianServiceError> {
     validate_private_parent(path)?;
     validate_bound_socket(path)
 }
 
-fn load_guardian_secret(path: &Path) -> Result<GuardianSecret, GuardianServiceError> {
+pub(crate) fn load_guardian_secret(path: &Path) -> Result<GuardianSecret, GuardianServiceError> {
     let parent = open_private_parent(path)?;
     let name = path
         .file_name()
