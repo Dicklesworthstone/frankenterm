@@ -465,6 +465,7 @@ pub struct TerminalState {
     term_version: String,
 
     writer: BufWriter<ThreadedWriter>,
+    #[cfg_attr(not(feature = "use_serde"), allow(dead_code))]
     writer_is_inert: bool,
 
     image_cache: lru::LruCache<[u8; 32], Arc<ImageData>>,
@@ -556,7 +557,10 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
 /// and we're in control of the write side, which represents
 /// input from the interactive user, or pastes.
 enum ThreadedWriter {
-    Live { sender: Sender<WriterMessage> },
+    Live {
+        sender: Sender<WriterMessage>,
+    },
+    #[cfg(feature = "use_serde")]
     Inert,
     Failed,
 }
@@ -623,6 +627,7 @@ impl ThreadedWriter {
         Ok(Self::Live { sender })
     }
 
+    #[cfg(feature = "use_serde")]
     const fn inert() -> Self {
         Self::Inert
     }
@@ -642,6 +647,7 @@ impl std::io::Write for ThreadedWriter {
                     .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
                 Ok(buf.len())
             }
+            #[cfg(feature = "use_serde")]
             Self::Inert => Ok(buf.len()),
             Self::Failed => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -661,6 +667,7 @@ impl std::io::Write for ThreadedWriter {
                     .recv()
                     .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?
             }
+            #[cfg(feature = "use_serde")]
             Self::Inert => Ok(()),
             Self::Failed => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,

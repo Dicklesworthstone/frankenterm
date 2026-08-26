@@ -2921,7 +2921,9 @@ fn encode_broker_spawn_creation_base85(
     bytes: &[u8; BROKER_SPAWN_CREATION_MARKER_BYTES],
 ) -> [u8; BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES] {
     let mut encoded = [0_u8; BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES];
-    for (chunk_index, chunk) in bytes.chunks_exact(4).enumerate() {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    debug_assert_eq!(remainder, []);
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
         let mut value = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let encoded_offset = chunk_index * 5;
         for digit in (0..5).rev() {
@@ -2941,7 +2943,11 @@ fn decode_broker_spawn_creation_base85(
         return Err(BrokerSpawnWalError::InvalidCreationMarker);
     }
     let mut decoded = [0_u8; BROKER_SPAWN_CREATION_MARKER_BYTES];
-    for (chunk_index, chunk) in encoded.chunks_exact(5).enumerate() {
+    let (chunks, remainder) = encoded.as_chunks::<5>();
+    if !remainder.is_empty() {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
         let mut value = 0_u64;
         for byte in chunk {
             let digit = BROKER_SPAWN_CREATION_BASE85
@@ -4644,6 +4650,7 @@ impl BrokerSpawnWalCatalogV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(clippy::needless_pass_by_ref_mut))]
     fn materialize_creation_header(
         &mut self,
         existing: Option<File>,

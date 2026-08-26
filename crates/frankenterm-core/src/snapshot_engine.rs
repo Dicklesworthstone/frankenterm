@@ -8677,8 +8677,11 @@ fn validate_checkpoint_scrollback_prefix(
     limits: CheckpointScrollbackArtifactLimits,
     redactor: &crate::redactor::Redactor,
 ) -> Result<(usize, usize, u64), CheckpointScrollbackArtifactError> {
-    if prefix.pane_id != checkpoint_pane.pane_id
-        || prefix.checkpoint_seq != checkpoint_pane.scrollback_checkpoint_seq
+    let pane_identity_matches = prefix.pane_id == checkpoint_pane.pane_id;
+    let scrollback_sequence_matches =
+        prefix.checkpoint_seq == checkpoint_pane.scrollback_checkpoint_seq;
+    if !pane_identity_matches
+        || !scrollback_sequence_matches
         || !prefix.redaction_fixed_point
         || prefix.segment_count != prefix.segments.len()
         || prefix.segment_count > limits.max_segments_per_pane

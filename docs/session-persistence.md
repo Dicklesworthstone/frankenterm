@@ -534,16 +534,21 @@ proven:
    for those identities to coincide; it never combines an older ground offset
    with newer screen state, because replaying that suffix would duplicate
    already-applied terminal effects.
-7. `Attach` returns a census entry plus the newest verified checkpoint and raw
-   output strictly after its sequence. The mux reconstructs the terminal parser
-   behind a replay gate whose writer discards parser-generated device replies and
-   whose clipboard, download, notification, and device-control handlers are inert.
-   Replayed bytes must never write into the surviving child or invoke host-facing
-   callbacks. The mux verifies the resulting digest and parser boundary before it
-   atomically installs the live guardian writer and approved handlers and publishes
-   the pane into topology. A gap, unsupported parser state, or digest mismatch
-   keeps the live writer unreachable and quarantines the pane for transcript
-   recovery instead of presenting invented state.
+7. `Attach` returns only the exact pane, generation, and next-mutation-sequence
+   identity; that reply is not continuity evidence. After claiming the observed
+   generation, the mux opens an explicit authenticated `Replay` using the
+   `LatestCompatible` selector. It consumes the newest verified checkpoint and
+   authenticated raw output strictly after that checkpoint's sequence. The mux
+   reconstructs the terminal parser behind a replay gate whose writer discards
+   parser-generated device replies and whose clipboard, download, notification,
+   and device-control handlers are inert. Replayed bytes must never write into the
+   surviving child or invoke host-facing callbacks. The mux validates the
+   checkpoint's canonical digest, the ordered suffix record/digest chain, the
+   resulting recovery-ground parser boundary, and the terminal completion witness
+   before it installs the single-use live guardian reader/writer capabilities.
+   A gap, unsupported parser state, geometry mismatch, or digest mismatch keeps
+   those capabilities unreachable and the pane unpublished instead of presenting
+   invented state.
 
 #### Canonical terminal checkpoint inventory (current v2)
 
@@ -566,8 +571,11 @@ handlers, caches, worker threads, telemetry counters, and scheduler state are
 capabilities or derived state and are never deserialized from a checkpoint.
 Restore constructs a new terminal behind a discard writer and inert handlers,
 validates and installs only the semantic model, replays the authenticated raw
-suffix, compares the resulting canonical semantic digest, and only then swaps
-in live capabilities atomically.
+suffix, verifies the suffix's cumulative sequence/digest witness and the
+resulting recovery-ground parser boundary, and only then makes live capabilities
+available for one consuming activation. The current protocol does not carry an
+independent expected digest of the post-suffix semantic model, so this document
+does not claim that comparison.
 
 The decoder applies an outer payload-byte ceiling before allocation, then
 independent row, cell, stack, map, string, custom-width, image, placement, and
@@ -689,12 +697,15 @@ that identity-only reply is not continuity evidence. Protocol v4 now defines
 bounded typed codecs for content-addressed `CheckpointStage` begin/chunk/seal
 requests and replies, `Checkpoint` publication intents and receipts, paginated
 `Replay` requests and pages, and cumulative `ReplayAck` requests and receipts.
-Those are wire and pure-state surfaces, not a live checkpoint service. The
-standalone guardian runtime still rejects `Checkpoint`, `CheckpointStage`,
-`Replay`, and `ReplayAck` instead of dispatching them. Durable checkpoint
-artifact storage/publication, runtime checkpoint dispatch, the replay service,
-retention-watermark advancement, and automated live migration remain
-unimplemented and withheld.
+The standalone guardian runtime now routes owned `CheckpointStage`,
+`Checkpoint`, `Replay`, and `ReplayAck` requests through one fixed-capacity
+checkpoint worker. That worker owns the protocol authority while it performs
+bounded protected-v3 artifact staging, authenticated catalog adoption, replay
+page construction from pinned encrypted files, and exact replay-Ack ledger
+mutation away from the readiness loop. The replay snapshot/request ledger is
+still process-local metadata, generic mutation effects and lease secrets do not
+yet have complete restart-recoverable authority, and retention-watermark
+advancement and automated live migration remain unimplemented and withheld.
 
 `Input`, `Resize`, `Signal`, live-pane `Close`, `Checkpoint`, and
 `RetireLease` require the exact current lease. Mutation operations consume the
@@ -721,7 +732,9 @@ without replay. A newly accepted input acknowledgement can contain only
 protocol/state-machine layer, resize, signal, close, and checkpoint operations
 have the same request-digest replay rule, so an ambiguous response is queried
 or replayed by identity rather than converted into a second effect. This
-checkpoint rule does not imply runtime checkpoint dispatch.
+checkpoint rule is enforced by the owned checkpoint-worker dispatch path; the
+borrowed readiness-loop path deliberately rejects these operations so storage
+and AEAD work cannot run inline.
 
 The protocol contract requires runtime effects to pass through a transactional
 API rather than the pure observation surface. Authentication, incarnation,
@@ -846,7 +859,8 @@ claimed by a successor incarnation. The pure state machine preserves the
 identities required for future replay, checkpoint, effect-query, and
 retention-close authority after child exit, while permanently rejecting new
 PTY/process mutations. The current runtime exposes census and effect-query
-behavior but does not yet dispatch checkpoint, replay, or retention advancement.
+behavior and dispatches checkpoint staging/adoption plus replay/Ack through its
+bounded owned worker. It does not yet dispatch retention advancement.
 An accepted input whose
 durable/terminal disposition is still ambiguous survives child exit and blocks
 lease takeover, retirement, and terminal close until that exact effect identity
@@ -878,11 +892,16 @@ An eventual transactional mux upgrade may stage and verify a same-build mux,
 capture and verify a content dump, stop accepting new mux mutations, retire the
 old mux lease, start the successor, claim/replay every guardian pane, verify
 topology and content digests, and only then commit the service-manager pointer.
-That automated live-migration transaction is not implemented. Until durable
-checkpoint storage, checkpoint runtime dispatch, replay, retention advancement,
-and restart recovery are all live and proven, an upgrade command must fail
-closed when a mux owns live PTYs; it may offer a verified content dump and a
-disruptive restart, but it must never label that path lossless.
+That automated live-migration transaction is not implemented. Protected
+checkpoint storage, runtime dispatch, and consuming replay now exist in current
+source, but they are not sufficient to claim a lossless upgrade. Activation
+remains withheld until a restart-recoverable broker and generic effect journal,
+recoverable lease-secret rotation, non-blocking shared replay readiness,
+durable selector/upgrade-ledger publication, topology reconciliation, retention
+and compaction authority, and real crash-cut/SIGKILL evidence prove that an
+upgrade cannot fork or discard pane state. Until then an upgrade command must
+fail closed when a mux owns live PTYs; it may offer a verified content dump and
+a disruptive restart, but it must never label that path lossless.
 
 ### Live mux content dump
 

@@ -1,19 +1,27 @@
 //! Concrete mux-side proxy objects for one already-claimed guardian pane.
 //!
-//! This module deliberately stops short of production activation. It owns the
-//! mutation-sequence actor and the portable-pty object implementations, but it
-//! does not claim panes, fetch replay pages, construct a replay-tail reader, or
-//! publish a [`mux::LocalPane`]. The reader slot remains fail-closed in
-//! production. A future consuming replay coordinator must validate and bind the
-//! checkpoint, raw suffix, final output sequence/digest witness, and live
-//! subscription before it may add the sole activation path.
+//! This module owns the mutation-sequence actor, consuming checkpoint/output
+//! replay, the resumable replay-tail reader, and the portable-pty proxy facets.
+//! It still does not claim panes, choose a production guardian, rebuild the
+//! window/tab topology manifest, or publish a [`LocalPane`]. The explicit
+//! production selector therefore remains fail-closed: replay can return only
+//! an off-topology [`ActivatedGuardianProxy`], and mux registration stays a
+//! separate caller-owned commit boundary.
 
 use frankenterm_pty_guardian::{GuardianClient, GuardianClientError};
+use mux::domain::DomainId;
 use mux::guardian_protocol::{
-    GUARDIAN_MAX_INPUT_BYTES, GUARDIAN_MAX_PANES, GuardianCensusEntry, GuardianCensusPaneStatus,
-    GuardianInputEffectQuery, GuardianRejectionCode, GuardianReply, InputEffectState,
+    GUARDIAN_MAX_INPUT_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+    GUARDIAN_MAX_REPLAY_RECORDS, GUARDIAN_MAX_REPLAY_WAIT_MILLIS, GuardianCensusEntry,
+    GuardianCensusPaneStatus, GuardianCheckpointDescriptorV1, GuardianCheckpointIdentityDigest,
+    GuardianCheckpointOutputBoundaryV1, GuardianInputEffectQuery, GuardianProtocolError,
+    GuardianRejectionCode, GuardianReplayAckReceiptV1, GuardianReplayAckV1, GuardianReplayCursorV1,
+    GuardianReplayDeliveryError, GuardianReplayGapReasonV1, GuardianReplayPageBodyDelivery,
+    GuardianReplayPageDelivery, GuardianReplayRequestV1, GuardianReplaySelectorV1, GuardianReply,
+    InputEffectState,
 };
-use mux::localpane::{GuardianPaneLeaseControl, GuardianPaneLeaseIdentity};
+use mux::localpane::{GuardianPaneLeaseControl, GuardianPaneLeaseIdentity, LocalPane};
+use mux::pane::PaneId;
 use parking_lot::Mutex;
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use sha2::{Digest as _, Sha256};
@@ -26,9 +34,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
+use wezterm_term::terminalstate::checkpoint::{
+    TerminalCheckpointError, TerminalCheckpointLimits, TerminalCheckpointV2,
+};
+use wezterm_term::{InertTerminal, InertTerminalError, Terminal, TerminalConfiguration};
+use zeroize::{Zeroize as _, Zeroizing};
 
 const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_CENSUS_REFRESH_ATTEMPTS: usize = 2;
+const GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS: usize = 2;
+const GUARDIAN_RESTORE_REOPEN_ATTEMPTS: usize = 2;
+const GUARDIAN_RESTORE_MAX_PAGES: usize = 65_536;
+const GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL: Duration = Duration::from_millis(50);
+const GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL: Duration = Duration::from_millis(1_000);
 
 /// Maximum age of one guardian-scoped census snapshot used by child facets.
 ///
@@ -65,6 +83,24 @@ pub enum GuardianProxyError {
     GuardianIncarnationChanged,
     #[error("guardian replay snapshot expired; durable restore must be reopened")]
     ReplaySnapshotExpired,
+    #[error("guardian replay has an authenticated output gap")]
+    ReplayGap,
+    #[error("guardian replay checkpoint was compacted during restore")]
+    ReplayCompacted,
+    #[error("guardian replay violated the consuming restore contract: {0}")]
+    ReplayInvariant(&'static str),
+    #[error("guardian replay exceeded a bounded restore resource")]
+    ReplayCapacity,
+    #[error("guardian replay protocol validation failed")]
+    ReplayProtocol(#[source] GuardianProtocolError),
+    #[error("guardian replay plaintext delivery failed")]
+    ReplayDelivery(#[source] GuardianReplayDeliveryError),
+    #[error("guardian terminal checkpoint validation failed")]
+    TerminalCheckpoint(#[source] TerminalCheckpointError),
+    #[error("guardian terminal suffix replay failed")]
+    TerminalReplay(#[source] InertTerminalError),
+    #[error("guardian terminal activation failed before topology publication")]
+    TerminalActivation,
     #[error("guardian mutation outcome is indeterminate; the lease is quarantined")]
     MutationOutcomeIndeterminate,
     #[error("guardian returned a reply inconsistent with the pending mutation")]
@@ -106,8 +142,17 @@ impl From<GuardianProxyError> for io::Error {
             }
             GuardianProxyError::InputDurabilityPending
             | GuardianProxyError::PendingInputPayloadRequired
-            | GuardianProxyError::ReplaySnapshotExpired => {
-                Self::new(io::ErrorKind::WouldBlock, error)
+            | GuardianProxyError::ReplaySnapshotExpired
+            | GuardianProxyError::ReplayCompacted => Self::new(io::ErrorKind::WouldBlock, error),
+            GuardianProxyError::ReplayGap
+            | GuardianProxyError::ReplayInvariant(_)
+            | GuardianProxyError::ReplayCapacity
+            | GuardianProxyError::ReplayProtocol(_)
+            | GuardianProxyError::ReplayDelivery(_)
+            | GuardianProxyError::TerminalCheckpoint(_)
+            | GuardianProxyError::TerminalReplay(_)
+            | GuardianProxyError::TerminalActivation => {
+                Self::new(io::ErrorKind::InvalidData, error)
             }
             other => Self::other(other),
         }
@@ -279,6 +324,26 @@ trait GuardianMutationTransport: Send {
         request_id: Uuid,
         effect_id: Uuid,
     ) -> Result<GuardianReply, GuardianMutationTransportError>;
+}
+
+/// Consuming replay transport for one exact guardian pane lease.
+///
+/// It is intentionally separate from the mutation actor. Replay can retain a
+/// paginated snapshot and block while tailing output, while input/resize/close
+/// must remain independently serialized. Plaintext pages are non-cloneable and
+/// cross this boundary only by ownership transfer.
+trait GuardianReplayTransport: Send {
+    fn replay(
+        &mut self,
+        request_id: Uuid,
+        request: GuardianReplayRequestV1,
+    ) -> Result<GuardianReplayPageDelivery, GuardianProxyError>;
+
+    fn replay_ack(
+        &mut self,
+        request_id: Uuid,
+        ack: GuardianReplayAckV1,
+    ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError>;
 }
 
 /// One authenticated, bounded fleet census source.
@@ -506,6 +571,111 @@ struct GuardianClientTransport {
     token_path: PathBuf,
     identity: GuardianPaneLeaseIdentity,
     client: Option<GuardianClient>,
+}
+
+struct GuardianReplayClientTransport {
+    socket_path: PathBuf,
+    token_path: PathBuf,
+    identity: GuardianPaneLeaseIdentity,
+    client: Option<GuardianClient>,
+}
+
+impl GuardianReplayClientTransport {
+    fn connect(
+        socket_path: &Path,
+        token_path: &Path,
+        identity: GuardianPaneLeaseIdentity,
+    ) -> Result<Self, GuardianProxyError> {
+        let mut transport = Self {
+            socket_path: socket_path.to_path_buf(),
+            token_path: token_path.to_path_buf(),
+            identity,
+            client: None,
+        };
+        transport.ensure_client()?;
+        Ok(transport)
+    }
+
+    fn ensure_client(&mut self) -> Result<&mut GuardianClient, GuardianProxyError> {
+        if self.client.is_none() {
+            let client = GuardianClient::connect(
+                &self.socket_path,
+                &self.token_path,
+                self.identity.mux_incarnation(),
+            )
+            .map_err(GuardianProxyError::Client)?;
+            if client.guardian_incarnation() != self.identity.guardian_incarnation() {
+                return Err(GuardianProxyError::GuardianIncarnationChanged);
+            }
+            self.client = Some(client);
+        }
+        self.client
+            .as_mut()
+            .ok_or(GuardianProxyError::GuardianIncarnationChanged)
+    }
+
+    fn call<T>(
+        &mut self,
+        operation: impl FnOnce(&mut GuardianClient) -> Result<T, GuardianClientError>,
+    ) -> Result<T, GuardianProxyError> {
+        let result = operation(self.ensure_client()?);
+        if matches!(&result, Err(GuardianClientError::Io(_))) {
+            // The framed stream may still contain a delayed response. Exact
+            // request-ID recovery must reconnect before retrying.
+            self.client = None;
+        }
+        result.map_err(map_replay_client_error)
+    }
+}
+
+impl GuardianReplayTransport for GuardianReplayClientTransport {
+    fn replay(
+        &mut self,
+        request_id: Uuid,
+        request: GuardianReplayRequestV1,
+    ) -> Result<GuardianReplayPageDelivery, GuardianProxyError> {
+        let identity = self.identity;
+        self.call(|client| {
+            client.replay(
+                identity.pane_id(),
+                identity.generation(),
+                request_id,
+                request,
+            )
+        })
+    }
+
+    fn replay_ack(
+        &mut self,
+        request_id: Uuid,
+        ack: GuardianReplayAckV1,
+    ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError> {
+        let identity = self.identity;
+        self.call(|client| {
+            client.replay_ack(identity.pane_id(), identity.generation(), request_id, ack)
+        })
+    }
+}
+
+fn map_replay_client_error(error: GuardianClientError) -> GuardianProxyError {
+    match error {
+        GuardianClientError::Rejected(GuardianRejectionCode::ReplaySnapshotExpired) => {
+            GuardianProxyError::ReplaySnapshotExpired
+        }
+        GuardianClientError::Rejected(GuardianRejectionCode::PaneNotFound) => {
+            GuardianProxyError::PaneNotFound
+        }
+        GuardianClientError::Rejected(GuardianRejectionCode::GuardianIncarnationMismatch) => {
+            GuardianProxyError::GuardianIncarnationChanged
+        }
+        GuardianClientError::Rejected(
+            GuardianRejectionCode::StaleLease | GuardianRejectionCode::ClaimGenerationMismatch,
+        ) => GuardianProxyError::LeaseFenced,
+        GuardianClientError::Rejected(GuardianRejectionCode::PaneTerminal) => {
+            GuardianProxyError::LeaseNotAttached
+        }
+        other => GuardianProxyError::Client(other),
+    }
 }
 
 impl GuardianClientTransport {
@@ -1483,9 +1653,1073 @@ fn validate_pty_size(size: PtySize) -> Result<(), GuardianProxyError> {
     }
 }
 
+/// Wipe-on-drop buffer with a hard pre-allocation ceiling.
+///
+/// Replay delivery APIs consume plaintext into an `io::Write`; this sink makes
+/// the bound effective before every allocation and never materializes a second
+/// raw checkpoint/output copy.
+struct BoundedReplayBuffer {
+    bytes: Zeroizing<Vec<u8>>,
+    maximum: usize,
+}
+
+impl BoundedReplayBuffer {
+    fn new(maximum: usize) -> Result<Self, GuardianProxyError> {
+        if maximum == 0 {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "guardian replay buffer maximum must be nonzero",
+            ));
+        }
+        Ok(Self {
+            bytes: Zeroizing::new(Vec::new()),
+            maximum,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
+    fn copy_out(&mut self, offset: usize, target: &mut [u8]) -> Result<usize, GuardianProxyError> {
+        if offset > self.bytes.len() {
+            return Err(GuardianProxyError::ReplayInvariant(
+                "guardian replay reader offset exceeded its plaintext buffer",
+            ));
+        }
+        let count = target.len().min(self.bytes.len() - offset);
+        let end = offset
+            .checked_add(count)
+            .ok_or(GuardianProxyError::ReplayCapacity)?;
+        target[..count].copy_from_slice(&self.bytes[offset..end]);
+        self.bytes[offset..end].zeroize();
+        Ok(count)
+    }
+
+    fn zeroize_and_clear(&mut self) {
+        self.bytes.as_mut_slice().zeroize();
+        self.bytes.clear();
+    }
+}
+
+impl Write for BoundedReplayBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("guardian replay buffer length overflow"))?;
+        if next > self.maximum {
+            return Err(io::Error::other(
+                "guardian replay buffer exceeded its configured ceiling",
+            ));
+        }
+        self.bytes
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| io::Error::other("guardian replay buffer allocation failed"))?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuardianReplayAckPlan {
+    snapshot_id: Uuid,
+    snapshot_digest: [u8; 32],
+    page_index: u32,
+    page_digest: [u8; 32],
+    next_cursor: Option<GuardianReplayCursorV1>,
+    through_sequence: u64,
+    through_record_digest: [u8; 32],
+    release_if_complete: bool,
+    request_id: Uuid,
+}
+
+impl GuardianReplayAckPlan {
+    fn ack(self) -> Result<GuardianReplayAckV1, GuardianProxyError> {
+        GuardianReplayAckV1::new(
+            self.snapshot_id,
+            self.snapshot_digest,
+            self.page_index,
+            self.page_digest,
+            self.next_cursor.map(GuardianReplayCursorV1::digest),
+            self.through_sequence,
+            self.through_record_digest,
+            self.release_if_complete,
+        )
+        .map_err(GuardianProxyError::ReplayProtocol)
+    }
+}
+
+fn replay_error_is_retryable_io(error: &GuardianProxyError) -> bool {
+    matches!(
+        error,
+        GuardianProxyError::Client(GuardianClientError::Io(_) | GuardianClientError::Setup(_))
+    )
+}
+
+fn replay_page_with_exact_retry(
+    transport: &mut dyn GuardianReplayTransport,
+    request_id: Uuid,
+    request: GuardianReplayRequestV1,
+) -> Result<GuardianReplayPageDelivery, GuardianProxyError> {
+    for attempt in 0..GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS {
+        match transport.replay(request_id, request) {
+            Err(error)
+                if replay_error_is_retryable_io(&error)
+                    && attempt + 1 < GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS =>
+            {
+                metrics::counter!(
+                    "mux.guardian_proxy.replay_exact_retry_total",
+                    "operation" => "replay",
+                )
+                .increment(1);
+            }
+            result => return result,
+        }
+    }
+    Err(GuardianProxyError::ReplayInvariant(
+        "bounded replay retry loop exhausted without a result",
+    ))
+}
+
+fn replay_ack_with_exact_retry(
+    transport: &mut dyn GuardianReplayTransport,
+    plan: GuardianReplayAckPlan,
+) -> Result<(), GuardianProxyError> {
+    let ack = plan.ack()?;
+    for attempt in 0..GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS {
+        match transport.replay_ack(plan.request_id, ack) {
+            Ok(receipt) if receipt == GuardianReplayAckReceiptV1::from_ack(ack) => return Ok(()),
+            Ok(_) => {
+                return Err(GuardianProxyError::ReplayInvariant(
+                    "guardian replay acknowledgement receipt did not match its exact request",
+                ));
+            }
+            Err(error)
+                if replay_error_is_retryable_io(&error)
+                    && attempt + 1 < GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS =>
+            {
+                metrics::counter!(
+                    "mux.guardian_proxy.replay_exact_retry_total",
+                    "operation" => "replay_ack",
+                )
+                .increment(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(GuardianProxyError::ReplayInvariant(
+        "bounded replay acknowledgement retry loop exhausted without a result",
+    ))
+}
+
+fn validate_replay_page_identity(
+    page: &GuardianReplayPageDelivery,
+    identity: GuardianPaneLeaseIdentity,
+) -> Result<(), GuardianProxyError> {
+    if page.header().pane_id() != identity.pane_id()
+        || page.header().generation() != identity.generation()
+    {
+        Err(GuardianProxyError::LeaseIdentityMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuardianReplayBoundary {
+    next_sequence: u64,
+    previous_record_digest: [u8; 32],
+    cumulative_plaintext_bytes: u64,
+}
+
+impl GuardianReplayBoundary {
+    fn from_descriptor(
+        descriptor: GuardianCheckpointDescriptorV1,
+    ) -> Result<Self, GuardianProxyError> {
+        let GuardianCheckpointOutputBoundaryV1::Record {
+            sequence,
+            record_digest,
+            cumulative_plaintext_bytes,
+            ..
+        } = descriptor.output_boundary()
+        else {
+            return Err(GuardianProxyError::ReplayInvariant(
+                "a claimed pane replay selected a genesis checkpoint",
+            ));
+        };
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(GuardianProxyError::ReplayCapacity)?;
+        Ok(Self {
+            next_sequence,
+            previous_record_digest: record_digest,
+            cumulative_plaintext_bytes,
+        })
+    }
+
+    fn through_sequence(self) -> Result<u64, GuardianProxyError> {
+        self.next_sequence
+            .checked_sub(1)
+            .ok_or(GuardianProxyError::ReplayInvariant(
+                "guardian replay boundary has no predecessor sequence",
+            ))
+    }
+}
+
+struct InertReplayWriter<'a> {
+    terminal: &'a mut InertTerminal,
+    failure: Option<InertTerminalError>,
+}
+
+impl Write for InertReplayWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(io::Error::other(
+                "guardian inert replay writer is already poisoned",
+            ));
+        }
+        match self.terminal.replay_bytes(bytes) {
+            Ok(()) => Ok(bytes.len()),
+            Err(error) => {
+                self.failure = Some(error);
+                Err(io::Error::other("guardian inert terminal rejected replay"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct VerifiedGuardianReplayRestore {
+    inert_terminal: InertTerminal,
+    checkpoint_id: GuardianCheckpointIdentityDigest,
+    boundary: GuardianReplayBoundary,
+}
+
+impl fmt::Debug for VerifiedGuardianReplayRestore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedGuardianReplayRestore")
+            .field("checkpoint_id", &"[REDACTED]")
+            .field("boundary", &self.boundary)
+            .field("terminal", &self.inert_terminal)
+            .finish()
+    }
+}
+
+fn validate_checkpoint_descriptor_for_proxy(
+    descriptor: GuardianCheckpointDescriptorV1,
+    identity: GuardianPaneLeaseIdentity,
+    expected_size: PtySize,
+    limits: TerminalCheckpointLimits,
+) -> Result<(), GuardianProxyError> {
+    if descriptor.durable_pane_id() != Some(identity.pane_id()) {
+        return Err(GuardianProxyError::LeaseIdentityMismatch);
+    }
+    if descriptor.capture_generation() > identity.generation() {
+        return Err(GuardianProxyError::ReplayInvariant(
+            "checkpoint capture generation is newer than the claimed lease fence",
+        ));
+    }
+    if descriptor.rows() != u32::from(expected_size.rows)
+        || descriptor.cols() != u32::from(expected_size.cols)
+    {
+        return Err(GuardianProxyError::ReplayInvariant(
+            "checkpoint geometry does not match the claimed topology manifest",
+        ));
+    }
+    if usize::try_from(descriptor.total_bytes())
+        .ok()
+        .is_none_or(|bytes| bytes == 0 || bytes > limits.max_encoded_bytes)
+    {
+        return Err(GuardianProxyError::ReplayCapacity);
+    }
+    GuardianReplayBoundary::from_descriptor(descriptor)?;
+    Ok(())
+}
+
+fn restore_inert_checkpoint(
+    descriptor: GuardianCheckpointDescriptorV1,
+    checkpoint: &BoundedReplayBuffer,
+    expected_size: PtySize,
+    config: Arc<dyn TerminalConfiguration>,
+    limits: TerminalCheckpointLimits,
+) -> Result<InertTerminal, GuardianProxyError> {
+    if u64::try_from(checkpoint.len()) != Ok(descriptor.total_bytes()) {
+        return Err(GuardianProxyError::ReplayInvariant(
+            "checkpoint replay did not assemble its exact declared length",
+        ));
+    }
+    descriptor
+        .validate_canonical_payload(checkpoint.as_slice())
+        .map_err(GuardianProxyError::ReplayProtocol)?;
+    let validated = TerminalCheckpointV2::decode_canonical_json(checkpoint.as_slice(), limits)
+        .map_err(GuardianProxyError::TerminalCheckpoint)?;
+    if validated.rows() != descriptor.rows() || validated.cols() != descriptor.cols() {
+        return Err(GuardianProxyError::ReplayInvariant(
+            "decoded checkpoint geometry differs from its authenticated descriptor",
+        ));
+    }
+    if validated.pixel_width() != u64::from(expected_size.pixel_width)
+        || validated.pixel_height() != u64::from(expected_size.pixel_height)
+    {
+        return Err(GuardianProxyError::ReplayInvariant(
+            "checkpoint pixel geometry does not match the claimed topology manifest",
+        ));
+    }
+    validated
+        .restore_inert(config)
+        .map_err(GuardianProxyError::TerminalCheckpoint)
+}
+
+fn replay_record_into_inert_terminal(
+    terminal: &mut InertTerminal,
+    record: mux::guardian_protocol::GuardianReplayRecordDelivery,
+    maximum_record_bytes: u32,
+) -> Result<mux::guardian_protocol::GuardianReplayRecordMetadataV1, GuardianProxyError> {
+    let expected = record.metadata();
+    let mut writer = InertReplayWriter {
+        terminal,
+        failure: None,
+    };
+    let delivery = record.write_all_bounded(&mut writer, maximum_record_bytes);
+    if let Some(error) = writer.failure.take() {
+        return Err(GuardianProxyError::TerminalReplay(error));
+    }
+    let observed = delivery.map_err(GuardianProxyError::ReplayDelivery)?;
+    if observed != expected {
+        return Err(GuardianProxyError::ReplayInvariant(
+            "consuming replay record returned different authenticated metadata",
+        ));
+    }
+    Ok(observed)
+}
+
+fn replay_page_ack_plan(
+    snapshot_id: Uuid,
+    snapshot_digest: [u8; 32],
+    page_index: u32,
+    page_digest: [u8; 32],
+    next_cursor: Option<GuardianReplayCursorV1>,
+    terminal: bool,
+    through_sequence: u64,
+    through_record_digest: [u8; 32],
+) -> GuardianReplayAckPlan {
+    GuardianReplayAckPlan {
+        snapshot_id,
+        snapshot_digest,
+        page_index,
+        page_digest,
+        next_cursor,
+        through_sequence,
+        through_record_digest,
+        release_if_complete: terminal,
+        request_id: Uuid::new_v4(),
+    }
+}
+
+fn consume_one_guardian_replay_snapshot(
+    transport: &mut dyn GuardianReplayTransport,
+    identity: GuardianPaneLeaseIdentity,
+    expected_size: PtySize,
+    config: Arc<dyn TerminalConfiguration>,
+    limits: TerminalCheckpointLimits,
+) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
+    let maximum_record_bytes = u32::try_from(limits.max_replay_record_bytes)
+        .unwrap_or(u32::MAX)
+        .min(GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES);
+    if maximum_record_bytes == 0 || limits.max_replay_records == 0 {
+        return Err(GuardianProxyError::InvalidConfiguration(
+            "guardian terminal replay limits must be nonzero",
+        ));
+    }
+    let maximum_page_records = u16::try_from(limits.max_replay_records)
+        .unwrap_or(u16::MAX)
+        .min(GUARDIAN_MAX_REPLAY_RECORDS);
+    let mut request = GuardianReplayRequestV1::Open {
+        selector: GuardianReplaySelectorV1::LatestCompatible,
+        max_plaintext_bytes: maximum_record_bytes,
+        max_records: maximum_page_records,
+        wait_millis: 0,
+    };
+    let mut checkpoint = BoundedReplayBuffer::new(limits.max_encoded_bytes)?;
+    let mut descriptor = None;
+    let mut inert_terminal = None;
+    let mut boundary = None;
+
+    for _ in 0..GUARDIAN_RESTORE_MAX_PAGES {
+        let page = replay_page_with_exact_retry(transport, Uuid::new_v4(), request)?;
+        validate_replay_page_identity(&page, identity)?;
+        let snapshot_id = page.header().snapshot_id();
+        let snapshot_digest = page.header().snapshot_digest();
+        let page_index = page.header().page_index();
+        let page_digest = page.header().declassify_page_digest_for_ack();
+        let next_cursor = page.header().next_cursor();
+        let terminal_page = page.is_terminal();
+
+        match page.into_body() {
+            GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
+                if inert_terminal.is_some() || boundary.is_some() {
+                    return Err(GuardianProxyError::ReplayInvariant(
+                        "checkpoint bytes arrived after suffix replay began",
+                    ));
+                }
+                let observed_descriptor = chunk.descriptor();
+                validate_checkpoint_descriptor_for_proxy(
+                    observed_descriptor,
+                    identity,
+                    expected_size,
+                    limits,
+                )?;
+                if descriptor.is_some_and(|expected| expected != observed_descriptor) {
+                    return Err(GuardianProxyError::ReplayInvariant(
+                        "checkpoint descriptor changed within one replay snapshot",
+                    ));
+                }
+                descriptor = Some(observed_descriptor);
+                let expected_offset = u64::try_from(checkpoint.len())
+                    .map_err(|_| GuardianProxyError::ReplayCapacity)?;
+                if chunk.offset() != expected_offset {
+                    return Err(GuardianProxyError::ReplayInvariant(
+                        "checkpoint chunks were not delivered contiguously",
+                    ));
+                }
+                let (_, observed_offset, observed_bytes) = chunk
+                    .write_all_bounded(&mut checkpoint, GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES)
+                    .map_err(GuardianProxyError::ReplayDelivery)?;
+                if observed_offset != expected_offset || observed_bytes == 0 {
+                    return Err(GuardianProxyError::ReplayInvariant(
+                        "checkpoint chunk delivery changed its authenticated position",
+                    ));
+                }
+                let base = GuardianReplayBoundary::from_descriptor(observed_descriptor)?;
+                let through_sequence = base.through_sequence()?;
+                let ack = replay_page_ack_plan(
+                    snapshot_id,
+                    snapshot_digest,
+                    page_index,
+                    page_digest,
+                    next_cursor,
+                    terminal_page,
+                    through_sequence,
+                    base.previous_record_digest,
+                );
+                replay_ack_with_exact_retry(transport, ack)?;
+
+                if u64::try_from(checkpoint.len()) == Ok(observed_descriptor.total_bytes()) {
+                    let restored = restore_inert_checkpoint(
+                        observed_descriptor,
+                        &checkpoint,
+                        expected_size,
+                        Arc::clone(&config),
+                        limits,
+                    )?;
+                    checkpoint.zeroize_and_clear();
+                    inert_terminal = Some(restored);
+                    boundary = Some(base);
+                }
+            }
+            GuardianReplayPageBodyDelivery::OutputRecords(records) => {
+                let restored =
+                    inert_terminal
+                        .as_mut()
+                        .ok_or(GuardianProxyError::ReplayInvariant(
+                            "output records arrived before a complete checkpoint",
+                        ))?;
+                let mut current = boundary.ok_or(GuardianProxyError::ReplayInvariant(
+                    "output records arrived without a checkpoint boundary",
+                ))?;
+                if records.first_sequence() != current.next_sequence
+                    || records.previous_record_digest() != current.previous_record_digest
+                {
+                    return Err(GuardianProxyError::ReplayInvariant(
+                        "output page does not continue the exact restored boundary",
+                    ));
+                }
+                for record in records.into_records() {
+                    let metadata = record.metadata();
+                    if metadata.sequence() != current.next_sequence
+                        || metadata.cumulative_plaintext_bytes()
+                            != current
+                                .cumulative_plaintext_bytes
+                                .checked_add(u64::from(metadata.payload_bytes()))
+                                .ok_or(GuardianProxyError::ReplayCapacity)?
+                    {
+                        return Err(GuardianProxyError::ReplayInvariant(
+                            "output record does not extend cumulative replay authority",
+                        ));
+                    }
+                    let observed =
+                        replay_record_into_inert_terminal(restored, record, maximum_record_bytes)?;
+                    current = GuardianReplayBoundary {
+                        next_sequence: observed
+                            .sequence()
+                            .checked_add(1)
+                            .ok_or(GuardianProxyError::ReplayCapacity)?,
+                        previous_record_digest: observed.record_digest(),
+                        cumulative_plaintext_bytes: observed.cumulative_plaintext_bytes(),
+                    };
+                }
+                let through_sequence = current.through_sequence()?;
+                let ack = replay_page_ack_plan(
+                    snapshot_id,
+                    snapshot_digest,
+                    page_index,
+                    page_digest,
+                    next_cursor,
+                    terminal_page,
+                    through_sequence,
+                    current.previous_record_digest,
+                );
+                replay_ack_with_exact_retry(transport, ack)?;
+                boundary = Some(current);
+            }
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id,
+                through_sequence,
+                terminal_record_digest,
+                cumulative_plaintext_bytes,
+            } => {
+                let expected_descriptor = descriptor.ok_or(GuardianProxyError::ReplayInvariant(
+                    "replay completed without a checkpoint descriptor",
+                ))?;
+                let restored =
+                    inert_terminal
+                        .as_ref()
+                        .ok_or(GuardianProxyError::ReplayInvariant(
+                            "replay completed without an inert terminal",
+                        ))?;
+                let current = boundary.ok_or(GuardianProxyError::ReplayInvariant(
+                    "replay completed without an output boundary",
+                ))?;
+                if checkpoint_id != expected_descriptor.checkpoint_id()
+                    || through_sequence != current.through_sequence()?
+                    || terminal_record_digest != current.previous_record_digest
+                    || cumulative_plaintext_bytes != current.cumulative_plaintext_bytes
+                    || next_cursor.is_some()
+                    || !terminal_page
+                {
+                    return Err(GuardianProxyError::ReplayInvariant(
+                        "terminal replay witness does not match the consumed checkpoint and suffix",
+                    ));
+                }
+                restored
+                    .checkpoint()
+                    .map_err(GuardianProxyError::TerminalReplay)?;
+                let ack = replay_page_ack_plan(
+                    snapshot_id,
+                    snapshot_digest,
+                    page_index,
+                    page_digest,
+                    next_cursor,
+                    terminal_page,
+                    through_sequence,
+                    terminal_record_digest,
+                );
+                replay_ack_with_exact_retry(transport, ack)?;
+                return Ok(VerifiedGuardianReplayRestore {
+                    inert_terminal: inert_terminal.ok_or(GuardianProxyError::ReplayInvariant(
+                        "verified terminal disappeared before activation",
+                    ))?,
+                    checkpoint_id,
+                    boundary: current,
+                });
+            }
+            GuardianReplayPageBodyDelivery::Gap { .. } => {
+                let _ = replay_ack_with_exact_retry(
+                    transport,
+                    replay_page_ack_plan(
+                        snapshot_id,
+                        snapshot_digest,
+                        page_index,
+                        page_digest,
+                        next_cursor,
+                        terminal_page,
+                        0,
+                        [0; 32],
+                    ),
+                );
+                return Err(GuardianProxyError::ReplayGap);
+            }
+            GuardianReplayPageBodyDelivery::Compacted { .. } => {
+                let _ = replay_ack_with_exact_retry(
+                    transport,
+                    replay_page_ack_plan(
+                        snapshot_id,
+                        snapshot_digest,
+                        page_index,
+                        page_digest,
+                        next_cursor,
+                        terminal_page,
+                        0,
+                        [0; 32],
+                    ),
+                );
+                return Err(GuardianProxyError::ReplayCompacted);
+            }
+            GuardianReplayPageBodyDelivery::SnapshotExpired {
+                snapshot_id: expired,
+            } if expired == snapshot_id => {
+                return Err(GuardianProxyError::ReplaySnapshotExpired);
+            }
+            GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => {
+                return Err(GuardianProxyError::ReplayInvariant(
+                    "snapshot-expired body named a different replay snapshot",
+                ));
+            }
+        }
+
+        let cursor = next_cursor.ok_or(GuardianProxyError::ReplayInvariant(
+            "nonterminal replay page omitted its continuation cursor",
+        ))?;
+        request = GuardianReplayRequestV1::Continue { cursor };
+    }
+    Err(GuardianProxyError::ReplayCapacity)
+}
+
+fn consume_guardian_replay_for_restore(
+    transport: &mut dyn GuardianReplayTransport,
+    identity: GuardianPaneLeaseIdentity,
+    expected_size: PtySize,
+    config: Arc<dyn TerminalConfiguration>,
+    limits: TerminalCheckpointLimits,
+) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
+    for attempt in 0..GUARDIAN_RESTORE_REOPEN_ATTEMPTS {
+        match consume_one_guardian_replay_snapshot(
+            transport,
+            identity,
+            expected_size,
+            Arc::clone(&config),
+            limits,
+        ) {
+            Err(GuardianProxyError::ReplaySnapshotExpired)
+                if attempt + 1 < GUARDIAN_RESTORE_REOPEN_ATTEMPTS =>
+            {
+                metrics::counter!(
+                    "mux.guardian_proxy.replay_snapshot_reopen_total",
+                    "phase" => "restore",
+                )
+                .increment(1);
+            }
+            result => return result,
+        }
+    }
+    Err(GuardianProxyError::ReplaySnapshotExpired)
+}
+
+/// Blocking raw-output reader that resumes from the exact terminal witness
+/// proven by off-topology restore.
+///
+/// A page is acknowledged only after every plaintext byte has been returned to
+/// the pane reader. If an acknowledgement snapshot expires after delivery, a
+/// fresh Resume snapshot starts strictly after that delivered sequence/digest;
+/// no byte is guessed, skipped, or replayed twice into the live parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianReplayDeferredTerminalError {
+    Gap,
+}
+
+impl GuardianReplayDeferredTerminalError {
+    const fn into_proxy_error(self) -> GuardianProxyError {
+        match self {
+            Self::Gap => GuardianProxyError::ReplayGap,
+        }
+    }
+}
+
+struct GuardianReplayTailReader {
+    transport: Box<dyn GuardianReplayTransport>,
+    identity: GuardianPaneLeaseIdentity,
+    checkpoint_id: GuardianCheckpointIdentityDigest,
+    boundary: GuardianReplayBoundary,
+    cursor: Option<GuardianReplayCursorV1>,
+    pending_replay: Option<(Uuid, GuardianReplayRequestV1)>,
+    plaintext: BoundedReplayBuffer,
+    plaintext_offset: usize,
+    pending_ack: Option<GuardianReplayAckPlan>,
+    pending_boundary: Option<GuardianReplayBoundary>,
+    pending_terminal_error: Option<GuardianReplayDeferredTerminalError>,
+    maximum_record_bytes: u32,
+    maximum_page_records: u16,
+    idle_poll_interval: Duration,
+}
+
+impl fmt::Debug for GuardianReplayTailReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardianReplayTailReader")
+            .field("identity", &self.identity)
+            .field("checkpoint_id", &"[REDACTED]")
+            .field("boundary", &self.boundary)
+            .field("has_cursor", &self.cursor.is_some())
+            .field("has_pending_replay", &self.pending_replay.is_some())
+            .field("buffered_bytes", &self.plaintext.len())
+            .field("plaintext_offset", &self.plaintext_offset)
+            .field("has_pending_ack", &self.pending_ack.is_some())
+            .field(
+                "has_pending_terminal_error",
+                &self.pending_terminal_error.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianReplayTailReader {
+    fn new(
+        transport: Box<dyn GuardianReplayTransport>,
+        identity: GuardianPaneLeaseIdentity,
+        checkpoint_id: GuardianCheckpointIdentityDigest,
+        boundary: GuardianReplayBoundary,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<Self, GuardianProxyError> {
+        let maximum_record_bytes = u32::try_from(limits.max_replay_record_bytes)
+            .unwrap_or(u32::MAX)
+            .min(GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES);
+        let maximum_page_records = u16::try_from(limits.max_replay_records)
+            .unwrap_or(u16::MAX)
+            .min(GUARDIAN_MAX_REPLAY_RECORDS);
+        if maximum_record_bytes == 0 || maximum_page_records == 0 {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "guardian tail replay limits must be nonzero",
+            ));
+        }
+        boundary.through_sequence()?;
+        Ok(Self {
+            transport,
+            identity,
+            checkpoint_id,
+            boundary,
+            cursor: None,
+            pending_replay: None,
+            plaintext: BoundedReplayBuffer::new(
+                usize::try_from(maximum_record_bytes)
+                    .map_err(|_| GuardianProxyError::ReplayCapacity)?,
+            )?,
+            plaintext_offset: 0,
+            pending_ack: None,
+            pending_boundary: None,
+            pending_terminal_error: None,
+            maximum_record_bytes,
+            maximum_page_records,
+            idle_poll_interval: GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL,
+        })
+    }
+
+    fn request(&self) -> GuardianReplayRequestV1 {
+        self.cursor.map_or(
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::Resume {
+                    checkpoint_id: self.checkpoint_id,
+                    next_sequence: self.boundary.next_sequence,
+                    previous_record_digest: self.boundary.previous_record_digest,
+                },
+                max_plaintext_bytes: self.maximum_record_bytes,
+                max_records: self.maximum_page_records,
+                wait_millis: GUARDIAN_MAX_REPLAY_WAIT_MILLIS,
+            },
+            |cursor| GuardianReplayRequestV1::Continue { cursor },
+        )
+    }
+
+    fn finish_delivered_page(&mut self) -> Result<(), GuardianProxyError> {
+        let Some(plan) = self.pending_ack else {
+            return Ok(());
+        };
+        if self.plaintext_offset != self.plaintext.len() {
+            return Err(GuardianProxyError::ReplayInvariant(
+                "guardian replay page was acknowledged before plaintext delivery completed",
+            ));
+        }
+        let delivered = self
+            .pending_boundary
+            .ok_or(GuardianProxyError::ReplayInvariant(
+                "guardian replay page has no delivered terminal boundary",
+            ))?;
+        // Commit the local delivery fence before attempting Ack. If the
+        // process-local snapshot expired, Resume must begin after bytes that
+        // the parser has already received.
+        self.boundary = delivered;
+        match replay_ack_with_exact_retry(self.transport.as_mut(), plan) {
+            Ok(()) => {
+                self.cursor = plan.next_cursor;
+            }
+            Err(GuardianProxyError::ReplaySnapshotExpired) => {
+                self.cursor = None;
+                metrics::counter!(
+                    "mux.guardian_proxy.replay_snapshot_reopen_total",
+                    "phase" => "tail_ack",
+                )
+                .increment(1);
+            }
+            Err(error) => return Err(error),
+        }
+        self.pending_ack = None;
+        self.pending_boundary = None;
+        self.plaintext_offset = 0;
+        self.plaintext.zeroize_and_clear();
+        Ok(())
+    }
+
+    fn load_next_output_page(&mut self) -> Result<(), GuardianProxyError> {
+        if self.pending_ack.is_some()
+            || self.pending_terminal_error.is_some()
+            || !self.plaintext.is_empty()
+        {
+            return Err(GuardianProxyError::ReplayInvariant(
+                "guardian tail attempted to fetch past unacknowledged plaintext",
+            ));
+        }
+        for _ in 0..GUARDIAN_RESTORE_MAX_PAGES {
+            let (request_id, request) = match self.pending_replay {
+                Some(pending) => pending,
+                None => {
+                    let pending = (Uuid::new_v4(), self.request());
+                    self.pending_replay = Some(pending);
+                    pending
+                }
+            };
+            let page = replay_page_with_exact_retry(self.transport.as_mut(), request_id, request)?;
+            validate_replay_page_identity(&page, self.identity)?;
+            let snapshot_id = page.header().snapshot_id();
+            let snapshot_digest = page.header().snapshot_digest();
+            let page_index = page.header().page_index();
+            let page_digest = page.header().declassify_page_digest_for_ack();
+            let next_cursor = page.header().next_cursor();
+            let terminal_page = page.is_terminal();
+
+            match page.into_body() {
+                GuardianReplayPageBodyDelivery::OutputRecords(records) => {
+                    if records.first_sequence() != self.boundary.next_sequence
+                        || records.previous_record_digest() != self.boundary.previous_record_digest
+                        || next_cursor.is_none()
+                        || terminal_page
+                    {
+                        return Err(GuardianProxyError::ReplayInvariant(
+                            "live output page does not continue the delivered parser boundary",
+                        ));
+                    }
+                    let mut candidate = self.boundary;
+                    let mut candidate_plaintext = BoundedReplayBuffer::new(self.plaintext.maximum)?;
+                    for record in records.into_records() {
+                        let metadata = record.metadata();
+                        if metadata.sequence() != candidate.next_sequence
+                            || metadata.cumulative_plaintext_bytes()
+                                != candidate
+                                    .cumulative_plaintext_bytes
+                                    .checked_add(u64::from(metadata.payload_bytes()))
+                                    .ok_or(GuardianProxyError::ReplayCapacity)?
+                        {
+                            return Err(GuardianProxyError::ReplayInvariant(
+                                "live output record breaks the delivered sequence/digest chain",
+                            ));
+                        }
+                        let observed = record
+                            .write_all_bounded(&mut candidate_plaintext, self.maximum_record_bytes)
+                            .map_err(GuardianProxyError::ReplayDelivery)?;
+                        if observed != metadata {
+                            return Err(GuardianProxyError::ReplayInvariant(
+                                "live replay delivery changed authenticated record metadata",
+                            ));
+                        }
+                        candidate = GuardianReplayBoundary {
+                            next_sequence: observed
+                                .sequence()
+                                .checked_add(1)
+                                .ok_or(GuardianProxyError::ReplayCapacity)?,
+                            previous_record_digest: observed.record_digest(),
+                            cumulative_plaintext_bytes: observed.cumulative_plaintext_bytes(),
+                        };
+                    }
+                    if candidate_plaintext.is_empty() {
+                        return Err(GuardianProxyError::ReplayInvariant(
+                            "live output page contained no plaintext",
+                        ));
+                    }
+                    let pending_ack = replay_page_ack_plan(
+                        snapshot_id,
+                        snapshot_digest,
+                        page_index,
+                        page_digest,
+                        next_cursor,
+                        terminal_page,
+                        candidate.through_sequence()?,
+                        candidate.previous_record_digest,
+                    );
+                    self.plaintext = candidate_plaintext;
+                    self.pending_ack = Some(pending_ack);
+                    self.pending_boundary = Some(candidate);
+                    self.pending_replay = None;
+                    self.idle_poll_interval = GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL;
+                    return Ok(());
+                }
+                GuardianReplayPageBodyDelivery::Complete {
+                    checkpoint_id,
+                    through_sequence,
+                    terminal_record_digest,
+                    cumulative_plaintext_bytes,
+                } => {
+                    if checkpoint_id != self.checkpoint_id
+                        || through_sequence != self.boundary.through_sequence()?
+                        || terminal_record_digest != self.boundary.previous_record_digest
+                        || cumulative_plaintext_bytes != self.boundary.cumulative_plaintext_bytes
+                        || next_cursor.is_some()
+                        || !terminal_page
+                    {
+                        return Err(GuardianProxyError::ReplayInvariant(
+                            "live replay completion does not match the delivered parser boundary",
+                        ));
+                    }
+                    let completion_ack = replay_page_ack_plan(
+                        snapshot_id,
+                        snapshot_digest,
+                        page_index,
+                        page_digest,
+                        next_cursor,
+                        terminal_page,
+                        through_sequence,
+                        terminal_record_digest,
+                    );
+                    // Persist even a zero-plaintext completion Ack in the
+                    // reader state before the first transport attempt. If its
+                    // reply is lost beyond the bounded inner retry, the next
+                    // `read` must retry this exact request ID rather than issue
+                    // a fresh Replay request past an unacknowledged page.
+                    self.pending_ack = Some(completion_ack);
+                    self.pending_boundary = Some(self.boundary);
+                    self.pending_replay = None;
+                    self.finish_delivered_page()?;
+                    // The v1 store currently treats wait_millis as a bounded
+                    // client hint rather than a server-held subscription.
+                    // Exponential idle backoff prevents one RPC every 50 ms
+                    // per dormant pane while preserving a fast first wake;
+                    // authenticated output resets the interval immediately.
+                    let idle_delay = self.idle_poll_interval;
+                    self.idle_poll_interval = next_guardian_idle_poll_interval(idle_delay);
+                    thread::sleep(idle_delay);
+                }
+                GuardianReplayPageBodyDelivery::SnapshotExpired {
+                    snapshot_id: expired,
+                } if expired == snapshot_id => {
+                    self.pending_replay = None;
+                    self.cursor = None;
+                    metrics::counter!(
+                        "mux.guardian_proxy.replay_snapshot_reopen_total",
+                        "phase" => "tail_page",
+                    )
+                    .increment(1);
+                }
+                GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => {
+                    return Err(GuardianProxyError::ReplayInvariant(
+                        "tail snapshot-expired body named a different replay snapshot",
+                    ));
+                }
+                GuardianReplayPageBodyDelivery::Gap {
+                    verified_through_sequence,
+                    reason,
+                    ..
+                } => {
+                    self.pending_replay = None;
+                    if reason == GuardianReplayGapReasonV1::NoRecoveryBase {
+                        if verified_through_sequence != 0 {
+                            return Err(GuardianProxyError::ReplayInvariant(
+                                "no-recovery-base gap carried a nonzero replay witness",
+                            ));
+                        }
+                        // The current store emits NoRecoveryBase with the
+                        // canonical zero witness. Release that terminal
+                        // snapshot before surfacing the data-loss fence. If an
+                        // Ack reply is lost beyond the bounded inner retry,
+                        // retain both the exact Ack ID and the Gap disposition
+                        // across the next caller-visible `read`.
+                        self.pending_ack = Some(replay_page_ack_plan(
+                            snapshot_id,
+                            snapshot_digest,
+                            page_index,
+                            page_digest,
+                            next_cursor,
+                            terminal_page,
+                            0,
+                            [0; 32],
+                        ));
+                        self.pending_boundary = Some(self.boundary);
+                        self.pending_terminal_error =
+                            Some(GuardianReplayDeferredTerminalError::Gap);
+                        self.finish_delivered_page()?;
+                        self.pending_terminal_error = None;
+                    }
+                    return Err(GuardianProxyError::ReplayGap);
+                }
+                GuardianReplayPageBodyDelivery::Compacted { .. } => {
+                    self.pending_replay = None;
+                    return Err(GuardianProxyError::ReplayCompacted);
+                }
+                GuardianReplayPageBodyDelivery::CheckpointChunk(_) => {
+                    return Err(GuardianProxyError::ReplayInvariant(
+                        "resume tail unexpectedly returned checkpoint plaintext",
+                    ));
+                }
+            }
+        }
+        Err(GuardianProxyError::ReplayCapacity)
+    }
+}
+
+fn next_guardian_idle_poll_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .min(GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL)
+}
+
+impl Read for GuardianReplayTailReader {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        if target.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.plaintext_offset < self.plaintext.len() {
+                let copied = self
+                    .plaintext
+                    .copy_out(self.plaintext_offset, target)
+                    .map_err(io::Error::from)?;
+                self.plaintext_offset = self
+                    .plaintext_offset
+                    .checked_add(copied)
+                    .ok_or_else(|| io::Error::from(GuardianProxyError::ReplayCapacity))?;
+                if self.plaintext_offset == self.plaintext.len() {
+                    self.boundary = self.pending_boundary.ok_or_else(|| {
+                        io::Error::from(GuardianProxyError::ReplayInvariant(
+                            "delivered replay plaintext omitted its terminal boundary",
+                        ))
+                    })?;
+                }
+                return Ok(copied);
+            }
+            self.finish_delivered_page().map_err(io::Error::from)?;
+            if let Some(error) = self.pending_terminal_error.take() {
+                return Err(io::Error::from(error.into_proxy_error()));
+            }
+            self.load_next_output_page().map_err(io::Error::from)?;
+        }
+    }
+}
+
 enum GuardianReplayReaderState {
     Staged,
-    #[cfg(test)]
     Ready(Option<Box<dyn Read + Send>>),
     Taken,
 }
@@ -1494,9 +2728,7 @@ impl fmt::Debug for GuardianReplayReaderState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Staged => formatter.write_str("Staged"),
-            #[cfg(test)]
             Self::Ready(Some(_)) => formatter.write_str("Ready(Some(<reader>))"),
-            #[cfg(test)]
             Self::Ready(None) => formatter.write_str("Ready(None)"),
             Self::Taken => formatter.write_str("Taken"),
         }
@@ -1519,9 +2751,7 @@ impl GuardianReplayReaderSlot {
         let mut state = self.state.lock();
         let prior = std::mem::replace(&mut *state, GuardianReplayReaderState::Taken);
         match prior {
-            #[cfg(test)]
             GuardianReplayReaderState::Ready(Some(reader)) => Ok(reader),
-            #[cfg(test)]
             GuardianReplayReaderState::Ready(None)
             | GuardianReplayReaderState::Staged
             | GuardianReplayReaderState::Taken => {
@@ -1530,18 +2760,10 @@ impl GuardianReplayReaderSlot {
                     "guardian replay reader is unavailable before exact restore activation or after its single take",
                 ))
             }
-            #[cfg(not(test))]
-            GuardianReplayReaderState::Staged | GuardianReplayReaderState::Taken => {
-                *state = prior;
-                Err(GuardianProxyError::InvalidConfiguration(
-                    "guardian replay reader is unavailable before exact restore activation or after its single take",
-                ))
-            }
         }
     }
 
-    #[cfg(test)]
-    fn install_after_test_restore(
+    fn install_after_restore(
         &self,
         reader: Box<dyn Read + Send>,
     ) -> Result<(), GuardianProxyError> {
@@ -1553,6 +2775,14 @@ impl GuardianReplayReaderSlot {
         }
         *state = GuardianReplayReaderState::Ready(Some(reader));
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_after_test_restore(
+        &self,
+        reader: Box<dyn Read + Send>,
+    ) -> Result<(), GuardianProxyError> {
+        self.install_after_restore(reader)
     }
 }
 
@@ -1566,6 +2796,8 @@ pub struct GuardianProxyStaging {
     actor: SharedGuardianPaneLeaseActor,
     census: Arc<GuardianCensusCoordinator>,
     reader_slot: Arc<GuardianReplayReaderSlot>,
+    replay_transport: Option<Box<dyn GuardianReplayTransport>>,
+    lease_rollback: GuardianClaimedLeaseRollback,
 }
 
 impl fmt::Debug for GuardianProxyStaging {
@@ -1581,8 +2813,80 @@ impl fmt::Debug for GuardianProxyStaging {
             .field("census_guardian", &self.census.guardian_incarnation())
             .field("census_mux", &self.census.mux_incarnation())
             .field("reader_state", &self.reader_slot.state.lock())
+            .field("has_replay_transport", &self.replay_transport.is_some())
+            .field("lease_rollback_armed", &self.lease_rollback.armed)
             .finish_non_exhaustive()
     }
+}
+
+/// Drop guard for an already-claimed lease that has not reached `LocalPane`.
+///
+/// The mutation actor owns the idempotency record, so a lost retirement reply
+/// can be retried here with the exact same sequence/request/effect tuple. Once
+/// a `LocalPane` exists, its guardian ownership state becomes the sole lifetime
+/// authority and this guard is explicitly disarmed.
+struct GuardianClaimedLeaseRollback {
+    actor: SharedGuardianPaneLeaseActor,
+    census: Arc<GuardianCensusCoordinator>,
+    identity: GuardianPaneLeaseIdentity,
+    armed: bool,
+}
+
+impl GuardianClaimedLeaseRollback {
+    fn new(
+        actor: SharedGuardianPaneLeaseActor,
+        census: Arc<GuardianCensusCoordinator>,
+        identity: GuardianPaneLeaseIdentity,
+    ) -> Self {
+        Self {
+            actor,
+            census,
+            identity,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn retire_unpublished_lease(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.census.invalidate();
+        let first_result = self.actor.lock().retire(self.identity);
+        match first_result {
+            Ok(()) => self.armed = false,
+            Err(error) if guardian_cleanup_retry_is_safe(&error) => {
+                log::warn!(
+                    "guardian lease retirement reply was lost before topology publication; retrying the exact pending mutation: {error}"
+                );
+                match self.actor.lock().retire(self.identity) {
+                    Ok(()) => self.armed = false,
+                    Err(retry_error) => log::error!(
+                        "guardian lease retirement after unpublished restore was not confirmed after an exact retry: {retry_error}"
+                    ),
+                }
+            }
+            Err(error) => log::error!(
+                "guardian lease retirement after unpublished restore was not confirmed: {error}"
+            ),
+        }
+    }
+}
+
+impl Drop for GuardianClaimedLeaseRollback {
+    fn drop(&mut self) {
+        self.retire_unpublished_lease();
+    }
+}
+
+fn guardian_cleanup_retry_is_safe(error: &GuardianProxyError) -> bool {
+    matches!(
+        error,
+        GuardianProxyError::Client(GuardianClientError::Io(_) | GuardianClientError::Setup(_))
+    )
 }
 
 impl GuardianProxyStaging {
@@ -1597,15 +2901,28 @@ impl GuardianProxyStaging {
         census: Arc<GuardianCensusCoordinator>,
     ) -> Result<Self, GuardianProxyError> {
         census.ensure_binding(identity)?;
+        if next_sequence == 0 {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "next mutation sequence must be nonzero",
+            ));
+        }
+        validate_pty_size(size)?;
         let mutation_transport =
             GuardianClientTransport::connect(socket_path, token_path, identity)?;
-        Self::with_transports(
+        let mut staging = Self::with_transports(
             identity,
             next_sequence,
             size,
             Box::new(mutation_transport),
             census,
-        )
+        )?;
+        // Stage the rollback guard before opening the independent replay
+        // channel. A replay-channel setup failure must not leak the Claim that
+        // the caller completed before entering this constructor.
+        let replay_transport =
+            GuardianReplayClientTransport::connect(socket_path, token_path, identity)?;
+        staging.replay_transport = Some(Box::new(replay_transport));
+        Ok(staging)
     }
 
     fn with_transports(
@@ -1626,10 +2943,14 @@ impl GuardianProxyStaging {
         // an otherwise fresh shared snapshot. Never publish a new pane
         // against a cache that could still describe the pre-claim fleet.
         census.invalidate();
+        let lease_rollback =
+            GuardianClaimedLeaseRollback::new(Arc::clone(&actor), Arc::clone(&census), identity);
         Ok(Self {
             actor,
             census,
             reader_slot: Arc::new(GuardianReplayReaderSlot::new()),
+            replay_transport: None,
+            lease_rollback,
         })
     }
 
@@ -1646,10 +2967,95 @@ impl GuardianProxyStaging {
         Arc::clone(&self.actor)
     }
 
+    /// Consume the authenticated checkpoint/output replay while this pane is
+    /// still absent from mux topology, bind a resumable raw-output reader, and
+    /// activate the terminal's live guardian writer.
+    ///
+    /// This method never registers the returned pane. Callers must first build
+    /// the desired tab/window topology off to the side, convert the result with
+    /// [`ActivatedGuardianProxy::into_local_pane`], and use the mux's atomic
+    /// pane-registration path. Any replay gap, compaction race, configuration
+    /// drift, or reader/writer activation failure leaves no `LocalPane` to
+    /// publish.
+    pub fn restore_and_activate(
+        mut self,
+        config: Arc<dyn TerminalConfiguration>,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
+        let identity = self.identity();
+        let expected_size = self.actor.lock().size;
+        let mut replay_transport =
+            self.replay_transport
+                .take()
+                .ok_or(GuardianProxyError::InvalidConfiguration(
+                    "guardian staging has no replay transport bound to its claimed lease",
+                ))?;
+        let verified = consume_guardian_replay_for_restore(
+            replay_transport.as_mut(),
+            identity,
+            expected_size,
+            config,
+            limits,
+        )?;
+        let tail = GuardianReplayTailReader::new(
+            replay_transport,
+            identity,
+            verified.checkpoint_id,
+            verified.boundary,
+            limits,
+        )?;
+        self.activate_verified_restore(verified.inert_terminal, Box::new(tail))
+    }
+
+    fn activate_verified_restore(
+        self,
+        inert_terminal: InertTerminal,
+        reader: Box<dyn Read + Send>,
+    ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
+        let identity = self.identity();
+        let terminal_writer = GuardianProxyWriter {
+            actor: Arc::clone(&self.actor),
+        };
+        let terminal = match inert_terminal.into_live(Box::new(terminal_writer.clone())) {
+            Ok(terminal) => terminal,
+            Err(failure) => {
+                let (error, _inert_terminal) = failure.into_parts();
+                log::error!(
+                    "guardian terminal activation failed before topology publication: {error}"
+                );
+                return Err(GuardianProxyError::TerminalActivation);
+            }
+        };
+        if let Err(error) = self.reader_slot.install_after_restore(reader) {
+            return Err(error);
+        }
+        let actor = Arc::clone(&self.actor);
+        Ok(ActivatedGuardianProxy {
+            terminal,
+            process: Box::new(GuardianProxyChild {
+                actor: Arc::clone(&actor),
+                census: Arc::clone(&self.census),
+            }),
+            pty: Box::new(GuardianProxyMasterPty {
+                actor: Arc::clone(&actor),
+                reader_slot: Arc::clone(&self.reader_slot),
+            }),
+            writer: Box::new(GuardianProxyWriter {
+                actor: Arc::clone(&actor),
+            }),
+            lease_control: Arc::new(GuardianProxyLeaseControl {
+                actor,
+                census: Arc::clone(&self.census),
+            }),
+            lease_identity: identity,
+            lease_rollback: self.lease_rollback,
+        })
+    }
+
     #[cfg(test)]
     fn activate_after_inert_restore_for_test(
         self,
-        inert_terminal: frankenterm_term::InertTerminal,
+        inert_terminal: InertTerminal,
         reader: Box<dyn Read + Send>,
     ) -> TestActivatedGuardianProxy {
         let terminal_writer = GuardianProxyWriter {
@@ -1681,19 +3087,62 @@ impl GuardianProxyStaging {
                 census: Arc::clone(&self.census),
             }),
             lease_identity: identity,
+            lease_rollback: self.lease_rollback,
         }
     }
 }
 
-#[cfg(test)]
-struct TestActivatedGuardianProxy {
-    terminal: frankenterm_term::Terminal,
+/// Fully restored guardian proxy facets that remain unpublished until the
+/// caller deliberately constructs and registers a [`LocalPane`].
+pub struct ActivatedGuardianProxy {
+    terminal: Terminal,
     process: Box<dyn Child + Send>,
     pty: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
     lease_control: Arc<dyn GuardianPaneLeaseControl>,
     lease_identity: GuardianPaneLeaseIdentity,
+    lease_rollback: GuardianClaimedLeaseRollback,
 }
+
+impl fmt::Debug for ActivatedGuardianProxy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivatedGuardianProxy")
+            .field("lease_identity", &self.lease_identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ActivatedGuardianProxy {
+    /// Construct the guardian-backed LocalPane without publishing it.
+    #[must_use]
+    pub fn into_local_pane(
+        mut self,
+        pane_id: PaneId,
+        domain_id: DomainId,
+        command_description: String,
+    ) -> LocalPane {
+        let pane = LocalPane::new_guardian_proxy(
+            pane_id,
+            self.terminal,
+            self.process,
+            self.pty,
+            self.writer,
+            domain_id,
+            self.lease_identity,
+            Arc::clone(&self.lease_control),
+            command_description,
+        );
+        // Construction completed, so the LocalPane's guardian ownership is
+        // now the sole close/retire authority. If construction unwinds before
+        // this point, the still-armed rollback guard releases the lease.
+        self.lease_rollback.disarm();
+        pane
+    }
+}
+
+#[cfg(test)]
+type TestActivatedGuardianProxy = ActivatedGuardianProxy;
 
 #[derive(Clone)]
 /// Opaque guardian-backed portable-pty writer facet.
@@ -1941,13 +3390,22 @@ fn exit_status(status: i32) -> ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankenterm_term::color::ColorPalette;
-    use frankenterm_term::terminalstate::checkpoint::{
-        TerminalCheckpointLimits, TerminalCheckpointV2,
+    use mux::Mux;
+    use mux::guardian_output_journal::{
+        GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputJournal,
+        GuardianOutputJournalLimits, GuardianOutputSegmentIdentity,
     };
-    use frankenterm_term::{InertTerminal, Terminal, TerminalConfiguration, TerminalSize};
+    use mux::guardian_protocol::{
+        GuardianCheckpointChunkDelivery, GuardianReplayOutputRecordsDelivery,
+        GuardianReplayPhaseV1, GuardianReplayRecordDelivery, GuardianReplayRecordMetadataV1,
+    };
+    use mux::pane::{Pane, alloc_pane_id};
     use std::collections::VecDeque;
+    use std::fs::File;
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+    use wezterm_term::color::ColorPalette;
+    use wezterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2};
+    use wezterm_term::{InertTerminal, Terminal, TerminalConfiguration, TerminalSize};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FakeDirective {
@@ -2028,6 +3486,95 @@ mod tests {
         state: Arc<Mutex<ScriptedCensusState>>,
         entered_once: Option<SyncSender<()>>,
         release_once: Option<Receiver<()>>,
+    }
+
+    struct FakeReplayState {
+        pages: VecDeque<GuardianReplayPageDelivery>,
+        replay_io_failures: usize,
+        ack_io_failures: usize,
+        requests: Vec<(Uuid, GuardianReplayRequestV1)>,
+        acks: Vec<(Uuid, GuardianReplayAckV1)>,
+    }
+
+    #[derive(Clone)]
+    struct FakeReplayTransport {
+        state: Arc<Mutex<FakeReplayState>>,
+    }
+
+    impl GuardianReplayTransport for FakeReplayTransport {
+        fn replay(
+            &mut self,
+            request_id: Uuid,
+            request: GuardianReplayRequestV1,
+        ) -> Result<GuardianReplayPageDelivery, GuardianProxyError> {
+            let mut state = self.state.lock();
+            state.requests.push((request_id, request));
+            if state.replay_io_failures > 0 {
+                state.replay_io_failures -= 1;
+                return Err(GuardianProxyError::Client(GuardianClientError::Io(
+                    io::Error::new(io::ErrorKind::ConnectionReset, "injected lost replay reply"),
+                )));
+            }
+            state
+                .pages
+                .pop_front()
+                .ok_or(GuardianProxyError::ReplayInvariant(
+                    "fake replay transport has no remaining page",
+                ))
+        }
+
+        fn replay_ack(
+            &mut self,
+            request_id: Uuid,
+            ack: GuardianReplayAckV1,
+        ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError> {
+            let mut state = self.state.lock();
+            state.acks.push((request_id, ack));
+            if state.ack_io_failures > 0 {
+                state.ack_io_failures -= 1;
+                return Err(GuardianProxyError::Client(GuardianClientError::Io(
+                    io::Error::new(io::ErrorKind::ConnectionReset, "injected lost ack reply"),
+                )));
+            }
+            Ok(GuardianReplayAckReceiptV1::from_ack(ack))
+        }
+    }
+
+    struct ChannelReplayReader {
+        receiver: Receiver<Vec<u8>>,
+        current: io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for ChannelReplayReader {
+        fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+            if target.is_empty() {
+                return Ok(0);
+            }
+            loop {
+                if usize::try_from(self.current.position()).ok()
+                    != Some(self.current.get_ref().len())
+                {
+                    return self.current.read(target);
+                }
+                match self.receiver.recv_timeout(Duration::from_secs(5)) {
+                    Ok(bytes) => self.current = io::Cursor::new(bytes),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "test replay reader timed out",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    struct RecordCheckpointFixture {
+        descriptor: GuardianCheckpointDescriptorV1,
+        checkpoint: Zeroizing<Vec<u8>>,
+        segment: GuardianOutputSegmentIdentity,
+        receipt: GuardianOutputAppendReceipt,
     }
 
     impl FakeTransport {
@@ -2330,9 +3877,9 @@ mod tests {
 
     fn identity_for(pane_id: Uuid, generation: u64) -> GuardianPaneLeaseIdentity {
         GuardianPaneLeaseIdentity::new(
-            pane_id,
             identity().guardian_incarnation(),
             identity().mux_incarnation(),
+            pane_id,
             generation,
         )
         .expect("valid guardian lease identity")
@@ -2410,23 +3957,309 @@ mod tests {
     }
 
     fn inert_terminal() -> InertTerminal {
-        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(TestTerminalConfig);
+        let config = test_terminal_config();
         let terminal = Terminal::new(
-            TerminalSize::default(),
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
             Arc::clone(&config),
             "FrankenTerm",
             "guardian-proxy-test",
             Box::new(Vec::<u8>::new()),
         );
         let limits = TerminalCheckpointLimits::default();
-        let canonical = TerminalCheckpointV2::capture_with_limits(&terminal, limits)
+        let canonical = terminal
+            .capture_recovery_checkpoint(limits)
             .expect("capture terminal fixture")
-            .to_canonical_json(limits)
-            .expect("encode terminal fixture");
+            .into_canonical_payload();
         TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
             .expect("validate terminal fixture")
             .restore_inert(config)
             .expect("restore terminal fixture off topology")
+    }
+
+    fn test_terminal_config() -> Arc<dyn TerminalConfiguration + Send + Sync> {
+        Arc::new(TestTerminalConfig)
+    }
+
+    fn capture_record_checkpoint_fixture() -> RecordCheckpointFixture {
+        let payload = b"guardian-checkpoint-base".to_vec();
+        let (sender, receiver) = sync_channel::<Vec<u8>>(1);
+        let (staging, mutation_state) = fake_staging([], 1);
+        let activated = staging.activate_after_inert_restore_for_test(
+            inert_terminal(),
+            Box::new(ChannelReplayReader {
+                receiver,
+                current: io::Cursor::new(Vec::new()),
+            }),
+        );
+        let pane_id = alloc_pane_id().expect("allocate checkpoint fixture pane id");
+        let pane: Arc<dyn Pane> = Arc::new(activated.into_local_pane(
+            pane_id,
+            0,
+            "guardian replay checkpoint fixture".to_string(),
+        ));
+        let mux = Arc::new(Mux::new(None));
+        mux.add_pane(&pane)
+            .expect("register checkpoint fixture pane");
+        let operation = mux
+            .capture_pane_operation(pane_id)
+            .expect("capture exact checkpoint fixture registration");
+
+        let directory = tempfile::tempdir().expect("create checkpoint fixture journal directory");
+        let file = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("guardian-output.segment"))
+            .expect("create checkpoint fixture output segment");
+        let segment = GuardianOutputSegmentIdentity::new(identity().pane_id(), id(0x500), 1, None)
+            .expect("construct checkpoint fixture segment identity");
+        let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32])
+            .expect("construct checkpoint fixture cipher");
+        let mut journal = GuardianOutputJournal::open(
+            file,
+            segment,
+            cipher,
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("open checkpoint fixture journal");
+        let directory_file = File::open(directory.path()).expect("open fixture journal parent");
+        journal
+            .sync_parent_directory_and_activate(&directory_file)
+            .expect("activate checkpoint fixture journal");
+        let receipt = journal
+            .append_and_sync(&payload)
+            .expect("append checkpoint fixture output");
+        operation
+            .authorize_guardian_output_delivery(
+                segment,
+                receipt,
+                Arc::<[u8]>::from(payload.clone()),
+            )
+            .expect("authorize checkpoint fixture parser delivery");
+        sender
+            .send(payload)
+            .expect("release checkpoint fixture parser delivery");
+        let capture = operation
+            .capture_live_parser_checkpoint(
+                segment,
+                receipt,
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(5),
+            )
+            .expect("capture exact live parser checkpoint fixture");
+        let descriptor =
+            GuardianCheckpointDescriptorV1::from_live_capture(&capture, identity().generation())
+                .expect("bind checkpoint fixture descriptor");
+        let checkpoint = Zeroizing::new(capture.terminal_checkpoint().canonical_payload().to_vec());
+        drop(operation);
+        drop(sender);
+        mutation_state
+            .lock()
+            .directives
+            .push_back(FakeDirective::Observe(ObservedChildState::Exited(0)));
+        RecordCheckpointFixture {
+            descriptor,
+            checkpoint,
+            segment,
+            receipt,
+        }
+    }
+
+    fn checkpoint_and_complete_pages(
+        descriptor: GuardianCheckpointDescriptorV1,
+        checkpoint: Zeroizing<Vec<u8>>,
+    ) -> VecDeque<GuardianReplayPageDelivery> {
+        let snapshot_id = id(0x600);
+        let snapshot_digest = [0x61; 32];
+        let (next_sequence, previous_record_digest) = descriptor
+            .suffix_start()
+            .expect("record checkpoint has a suffix boundary");
+        let cursor = GuardianReplayCursorV1::new(
+            snapshot_id,
+            snapshot_digest,
+            GuardianReplayPhaseV1::Output,
+            1,
+            0,
+            next_sequence,
+            previous_record_digest,
+            0,
+            GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+            GUARDIAN_MAX_REPLAY_RECORDS,
+        )
+        .expect("construct checkpoint fixture continuation cursor");
+        let checkpoint_page = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            [0; 32],
+            0,
+            Some(cursor),
+            GuardianReplayPageBodyDelivery::CheckpointChunk(
+                GuardianCheckpointChunkDelivery::new(descriptor, 0, checkpoint)
+                    .expect("construct checkpoint fixture delivery"),
+            ),
+        )
+        .expect("construct checkpoint fixture page");
+        let GuardianCheckpointOutputBoundaryV1::Record {
+            sequence,
+            record_digest,
+            cumulative_plaintext_bytes,
+            ..
+        } = descriptor.output_boundary()
+        else {
+            panic!("checkpoint fixture must be record-backed");
+        };
+        let complete_page = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            cursor.digest(),
+            1,
+            None,
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id: descriptor.checkpoint_id(),
+                through_sequence: sequence,
+                terminal_record_digest: record_digest,
+                cumulative_plaintext_bytes,
+            },
+        )
+        .expect("construct checkpoint fixture completion page");
+        VecDeque::from([checkpoint_page, complete_page])
+    }
+
+    fn tail_output_page(
+        fixture: &RecordCheckpointFixture,
+        payload: &[u8],
+    ) -> GuardianReplayPageDelivery {
+        let GuardianCheckpointOutputBoundaryV1::Record {
+            sequence,
+            record_digest,
+            committed_log_bytes,
+            cumulative_plaintext_bytes,
+            ..
+        } = fixture.descriptor.output_boundary()
+        else {
+            panic!("tail fixture must be record-backed");
+        };
+        let output_sequence = sequence.checked_add(1).expect("tail sequence advances");
+        let output_cumulative = cumulative_plaintext_bytes
+            .checked_add(u64::try_from(payload.len()).expect("tail payload length fits u64"))
+            .expect("tail cumulative bytes advance");
+        let output_log_bytes = committed_log_bytes
+            .checked_add(u64::try_from(payload.len()).expect("tail payload length fits u64"))
+            .and_then(|bytes| bytes.checked_add(256))
+            .expect("tail committed bytes advance");
+        let output_digest: [u8; 32] = Sha256::digest(payload).into();
+        let metadata = GuardianReplayRecordMetadataV1::new(
+            fixture.segment.segment_id(),
+            fixture.segment.first_sequence(),
+            None,
+            output_sequence,
+            u32::try_from(payload.len()).expect("tail payload length fits u32"),
+            output_cumulative,
+            output_log_bytes,
+            output_digest,
+        )
+        .expect("construct tail record metadata");
+        let records = GuardianReplayOutputRecordsDelivery::new(
+            output_sequence,
+            record_digest,
+            vec![
+                GuardianReplayRecordDelivery::new(metadata, Zeroizing::new(payload.to_vec()))
+                    .expect("construct tail record delivery"),
+            ],
+        )
+        .expect("construct tail output page body");
+        let snapshot_id = id(0x700);
+        let snapshot_digest = [0x71; 32];
+        let cursor = GuardianReplayCursorV1::new(
+            snapshot_id,
+            snapshot_digest,
+            GuardianReplayPhaseV1::Output,
+            1,
+            0,
+            output_sequence
+                .checked_add(1)
+                .expect("tail continuation sequence advances"),
+            output_digest,
+            0,
+            GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+            GUARDIAN_MAX_REPLAY_RECORDS,
+        )
+        .expect("construct tail continuation cursor");
+        GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            snapshot_id,
+            snapshot_digest,
+            [0; 32],
+            0,
+            Some(cursor),
+            GuardianReplayPageBodyDelivery::OutputRecords(records),
+        )
+        .expect("construct tail replay page")
+    }
+
+    fn tail_complete_page(
+        descriptor: GuardianCheckpointDescriptorV1,
+    ) -> GuardianReplayPageDelivery {
+        let GuardianCheckpointOutputBoundaryV1::Record {
+            sequence,
+            record_digest,
+            cumulative_plaintext_bytes,
+            ..
+        } = descriptor.output_boundary()
+        else {
+            panic!("tail completion fixture must be record-backed");
+        };
+        GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            id(0x710),
+            [0x72; 32],
+            [0; 32],
+            0,
+            None,
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id: descriptor.checkpoint_id(),
+                through_sequence: sequence,
+                terminal_record_digest: record_digest,
+                cumulative_plaintext_bytes,
+            },
+        )
+        .expect("construct tail completion replay page")
+    }
+
+    fn tail_no_recovery_base_gap_page(
+        descriptor: GuardianCheckpointDescriptorV1,
+    ) -> GuardianReplayPageDelivery {
+        let (requested_sequence, _) = descriptor
+            .suffix_start()
+            .expect("gap fixture must have a suffix boundary");
+        GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            id(0x720),
+            [0x73; 32],
+            [0; 32],
+            0,
+            None,
+            GuardianReplayPageBodyDelivery::Gap {
+                requested_sequence,
+                oldest_retained_sequence: 0,
+                verified_through_sequence: 0,
+                reason: GuardianReplayGapReasonV1::NoRecoveryBase,
+            },
+        )
+        .expect("construct terminal no-recovery-base gap page")
     }
 
     fn call_ids(call: &FakeCall) -> Option<(u64, Uuid, Uuid)> {
@@ -2463,6 +4296,375 @@ mod tests {
     }
 
     #[test]
+    fn consuming_restore_binds_real_checkpoint_exact_retries_and_tail_ack_after_delivery() {
+        let fixture = capture_record_checkpoint_fixture();
+        let tail_payload = b"tail";
+        let tail_page = tail_output_page(&fixture, tail_payload);
+        let mut pages = checkpoint_and_complete_pages(fixture.descriptor, fixture.checkpoint);
+        pages.push_back(tail_page);
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages,
+            replay_io_failures: 1,
+            ack_io_failures: 1,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let (mut staging, _mutation_state) = fake_staging([], 11);
+        staging.replay_transport = Some(Box::new(FakeReplayTransport {
+            state: Arc::clone(&replay_state),
+        }));
+
+        let activated = staging
+            .restore_and_activate(test_terminal_config(), TerminalCheckpointLimits::default())
+            .expect("consume checkpoint and activate proxy off topology");
+        activated
+            .terminal
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .expect("restored terminal remains recovery-ground after activation");
+        {
+            let state = replay_state.lock();
+            assert_eq!(
+                state.pages.len(),
+                1,
+                "tail page stays unread until pane I/O"
+            );
+            assert_eq!(
+                state.acks.len(),
+                3,
+                "lost checkpoint Ack is retried exactly"
+            );
+            assert_eq!(state.requests.len(), 3, "lost Replay is retried exactly");
+            assert_eq!(state.requests[0].0, state.requests[1].0);
+            assert_eq!(state.requests[0].1, state.requests[1].1);
+            assert_eq!(state.acks[0].0, state.acks[1].0);
+            assert_eq!(state.acks[0].1, state.acks[1].1);
+        }
+
+        let mut reader = activated
+            .pty
+            .try_clone_reader()
+            .expect("take sole verified guardian tail reader");
+        let mut first = [0_u8; 1];
+        assert_eq!(reader.read(&mut first).expect("read first tail byte"), 1);
+        assert_eq!(&first, &tail_payload[..1]);
+        let acks_before_drain = replay_state.lock().acks.len();
+        assert_eq!(
+            acks_before_drain, 3,
+            "partial plaintext is not acknowledged"
+        );
+
+        let mut remainder = [0_u8; 3];
+        assert_eq!(
+            reader
+                .read(&mut remainder)
+                .expect("read remaining tail bytes"),
+            remainder.len()
+        );
+        assert_eq!(&remainder, &tail_payload[1..]);
+        assert_eq!(
+            replay_state.lock().acks.len(),
+            acks_before_drain,
+            "the call returning final bytes cannot hide a failed Ack"
+        );
+
+        let error = reader
+            .read(&mut first)
+            .expect_err("fake source ends after exact tail Ack");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let state = replay_state.lock();
+        assert_eq!(state.acks.len(), acks_before_drain + 1);
+        let tail_ack = state.acks.last().expect("tail Ack recorded").1;
+        assert_eq!(
+            tail_ack.through_sequence(),
+            fixture
+                .receipt
+                .sequence()
+                .checked_add(1)
+                .expect("fixture tail sequence advances")
+        );
+        assert!(!tail_ack.release_if_complete());
+        assert!(activated.pty.try_clone_reader().is_err());
+    }
+
+    #[test]
+    fn restore_rejects_checkpoint_pixel_geometry_drift_before_activation() {
+        let fixture = capture_record_checkpoint_fixture();
+        let limits = TerminalCheckpointLimits::default();
+        let mut checkpoint =
+            BoundedReplayBuffer::new(limits.max_encoded_bytes).expect("bound checkpoint fixture");
+        checkpoint
+            .write_all(&fixture.checkpoint)
+            .expect("copy checkpoint fixture into bounded restore buffer");
+        let mut mismatched_size = size(24, 80);
+        mismatched_size.pixel_width = mismatched_size
+            .pixel_width
+            .checked_add(1)
+            .expect("fixture pixel width advances");
+
+        let error = restore_inert_checkpoint(
+            fixture.descriptor,
+            &checkpoint,
+            mismatched_size,
+            test_terminal_config(),
+            limits,
+        )
+        .expect_err("pixel geometry drift cannot become a live terminal");
+        assert!(matches!(
+            error,
+            GuardianProxyError::ReplayInvariant(
+                "checkpoint pixel geometry does not match the claimed topology manifest"
+            )
+        ));
+    }
+
+    #[test]
+    fn unpublished_staging_drop_retires_with_exact_retry_after_lost_reply() {
+        let (staging, state) = fake_staging([FakeDirective::Io, FakeDirective::Auto], 81);
+
+        drop(staging);
+
+        let state = state.lock();
+        let retire_calls = state
+            .calls
+            .iter()
+            .filter_map(|call| match call {
+                FakeCall::Retire {
+                    sequence,
+                    request_id,
+                    effect_id,
+                } => Some((*sequence, *request_id, *effect_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retire_calls.len(), 2, "lost retirement reply is retried");
+        assert_eq!(retire_calls[0], retire_calls[1]);
+        assert_eq!(retire_calls[0].0, 81);
+    }
+
+    #[test]
+    fn unpublished_activated_proxy_drop_retires_its_claimed_lease_once() {
+        let (staging, state) = fake_staging([FakeDirective::Auto], 91);
+        let activated = staging.activate_after_inert_restore_for_test(
+            inert_terminal(),
+            Box::new(io::Cursor::new(Vec::<u8>::new())),
+        );
+
+        drop(activated);
+
+        assert!(matches!(
+            state.lock().calls.as_slice(),
+            [FakeCall::Retire { sequence: 91, .. }]
+        ));
+    }
+
+    #[test]
+    fn tail_completion_ack_survives_lost_reply_across_read_calls() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive tail completion boundary");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([tail_complete_page(fixture.descriptor)]),
+            replay_io_failures: 0,
+            ack_io_failures: GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct exact tail completion reader");
+        let mut byte = [0_u8; 1];
+
+        let first_error = reader
+            .read(&mut byte)
+            .expect_err("two lost completion Ack replies remain visible");
+        assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
+        {
+            let state = replay_state.lock();
+            assert_eq!(state.requests.len(), 1);
+            assert_eq!(state.acks.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS);
+            assert_eq!(state.acks[0], state.acks[1]);
+        }
+
+        let second_error = reader
+            .read(&mut byte)
+            .expect_err("fake source ends after the retained Ack succeeds");
+        assert_eq!(second_error.kind(), io::ErrorKind::InvalidData);
+        let state = replay_state.lock();
+        assert_eq!(state.acks.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
+        assert!(state.acks.iter().all(|ack| *ack == state.acks[0]));
+    }
+
+    #[test]
+    fn tail_gap_releases_snapshot_with_exact_ack_before_surfacing_gap() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive tail gap boundary");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([tail_no_recovery_base_gap_page(fixture.descriptor)]),
+            replay_io_failures: 0,
+            ack_io_failures: GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct no-recovery-base tail reader");
+        let mut byte = [0_u8; 1];
+
+        let first_error = reader
+            .read(&mut byte)
+            .expect_err("two lost terminal Ack replies remain visible");
+        assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
+        {
+            let state = replay_state.lock();
+            assert_eq!(state.requests.len(), 1);
+            assert_eq!(state.acks.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS);
+            assert_eq!(state.acks[0], state.acks[1]);
+            assert!(state.acks[0].1.release_if_complete());
+            assert_eq!(state.acks[0].1.through_sequence(), 0);
+            assert_eq!(state.acks[0].1.through_record_digest(), [0; 32]);
+        }
+
+        let gap = reader
+            .read(&mut byte)
+            .expect_err("retained terminal Ack succeeds before Gap is surfaced");
+        assert_eq!(gap.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            gap.get_ref()
+                .and_then(|error| error.downcast_ref::<GuardianProxyError>()),
+            Some(GuardianProxyError::ReplayGap)
+        ));
+        let state = replay_state.lock();
+        assert_eq!(
+            state.requests.len(),
+            1,
+            "Gap is not reopened before delivery"
+        );
+        assert_eq!(state.acks.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
+        assert!(state.acks.iter().all(|ack| *ack == state.acks[0]));
+    }
+
+    #[test]
+    fn tail_replay_request_survives_lost_reply_across_read_calls() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive lost Replay boundary");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([tail_output_page(&fixture, b"tail")]),
+            replay_io_failures: GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct lost Replay tail reader");
+        let mut byte = [0_u8; 1];
+
+        let first_error = reader
+            .read(&mut byte)
+            .expect_err("two lost Replay replies remain visible");
+        assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            reader.read(&mut byte).expect("retry the retained Replay"),
+            1
+        );
+        assert_eq!(byte, [b't']);
+
+        let state = replay_state.lock();
+        assert_eq!(state.requests.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| *request == state.requests[0])
+        );
+        assert!(
+            state.acks.is_empty(),
+            "partial plaintext is not acknowledged"
+        );
+    }
+
+    #[test]
+    fn idle_tail_polling_backs_off_to_the_protocol_wait_ceiling() {
+        assert_eq!(
+            GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL,
+            Duration::from_millis(u64::from(GUARDIAN_MAX_REPLAY_WAIT_MILLIS))
+        );
+        let mut interval = GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL;
+        let observed = (0..7)
+            .map(|_| {
+                let current = interval;
+                interval = next_guardian_idle_poll_interval(interval);
+                current
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            [50, 100, 200, 400, 800, 1_000, 1_000]
+                .map(Duration::from_millis)
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn replay_client_rejections_preserve_identity_failure_classes() {
+        for (rejection, expected) in [
+            (
+                GuardianRejectionCode::PaneNotFound,
+                GuardianProxyError::PaneNotFound,
+            ),
+            (
+                GuardianRejectionCode::GuardianIncarnationMismatch,
+                GuardianProxyError::GuardianIncarnationChanged,
+            ),
+            (
+                GuardianRejectionCode::StaleLease,
+                GuardianProxyError::LeaseFenced,
+            ),
+            (
+                GuardianRejectionCode::ClaimGenerationMismatch,
+                GuardianProxyError::LeaseFenced,
+            ),
+            (
+                GuardianRejectionCode::PaneTerminal,
+                GuardianProxyError::LeaseNotAttached,
+            ),
+        ] {
+            let observed = map_replay_client_error(GuardianClientError::Rejected(rejection));
+            assert_eq!(
+                std::mem::discriminant(&observed),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(
+                io::Error::from(observed).kind(),
+                io::Error::from(expected).kind()
+            );
+        }
+    }
+
+    #[test]
     fn test_only_inert_activation_is_the_only_reader_gate_and_all_facets_share_one_sequence_actor()
     {
         let (staging, state) = fake_staging(
@@ -2483,7 +4685,10 @@ mod tests {
             Box::new(io::Cursor::new(b"authenticated-tail".to_vec())),
         );
         assert!(
-            activated.terminal.checkpoint().is_ok(),
+            activated
+                .terminal
+                .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+                .is_ok(),
             "test-only activation preserves the restored terminal"
         );
 
@@ -2593,7 +4798,7 @@ mod tests {
         ));
         let pending_debug = format!("{:?}", actor.lock());
         assert!(!pending_debug.contains("highly-sensitive-input"));
-        let digest_debug = format!("{:x}", Sha256::digest(payload));
+        let digest_debug = hex::encode(Sha256::digest(payload));
         assert!(!pending_debug.contains(&digest_debug));
 
         assert!(matches!(

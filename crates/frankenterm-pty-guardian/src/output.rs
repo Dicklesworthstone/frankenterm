@@ -53,6 +53,7 @@ use mux::guardian_protocol::{
 };
 use nix::unistd::{PathconfVar, fpathconf, geteuid};
 use sha2::{Digest as _, Sha256};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata, OpenOptions};
@@ -957,7 +958,7 @@ impl CheckpointCatalogRestorePermit {
     fn new(
         stage_scope: CheckpointStagePathScope,
         selected_format: CheckpointCatalogFormat,
-        selected_metadata: CheckpointCatalogMetadata,
+        selected_metadata: &CheckpointCatalogMetadata,
         selected_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
         settled_head_identity: CheckpointCatalogIdentity,
         settled_head_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
@@ -2710,7 +2711,7 @@ impl GuardianCheckpointStageStore {
             if binding.fingerprint != fingerprint {
                 return Err(GuardianCheckpointStageStoreError::Conflict);
             }
-            return guardian_replay_retry_page(&self.inner, &mut state, request, binding);
+            return guardian_replay_retry_page(&self.inner, &state, request, binding);
         }
 
         let pane_id = request
@@ -3253,7 +3254,7 @@ fn guardian_replay_publish_request_binding(
 
 fn guardian_replay_retry_page(
     inner: &GuardianCheckpointStageStoreInner,
-    state: &mut GuardianReplayState,
+    state: &GuardianReplayState,
     request: &AuthenticatedGuardianRequest,
     binding: GuardianReplayRequestBinding,
 ) -> Result<GuardianReplayPageDelivery, GuardianCheckpointStageStoreError> {
@@ -4201,12 +4202,12 @@ fn guardian_replay_build_page(
             let next_offset = checkpoint_offset
                 .checked_add(chunk_bytes)
                 .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
-            let next_phase = if next_offset < snapshot.descriptor.total_bytes() {
-                GuardianReplayPhaseV1::Checkpoint
-            } else if next_offset == snapshot.descriptor.total_bytes() {
-                GuardianReplayPhaseV1::Output
-            } else {
-                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            let next_phase = match next_offset.cmp(&snapshot.descriptor.total_bytes()) {
+                Ordering::Less => GuardianReplayPhaseV1::Checkpoint,
+                Ordering::Equal => GuardianReplayPhaseV1::Output,
+                Ordering::Greater => {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
             };
             let cursor = GuardianReplayCursorV1::new(
                 snapshot.snapshot_id,
@@ -4452,7 +4453,7 @@ fn checkpoint_catalog_select_restore_permit(
     };
     let selected = &scan.published[selected_index];
     let selected_format = selected.format;
-    let selected_metadata = selected.metadata;
+    let selected_metadata = &selected.metadata;
     let selected_candidate_checksum = selected.candidate_checksum;
     let head = scan
         .published
@@ -10379,9 +10380,9 @@ fn checkpoint_catalog_publish_sealed_stage(
                 CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
             )?;
             let recovered_candidate = checkpoint_catalog_decode_candidate(&existing_bytes)?;
-            if recovered_candidate.metadata != existing.metadata
-                || recovered_candidate.checksum != existing.candidate_checksum
-            {
+            let metadata_matches = recovered_candidate.metadata == existing.metadata;
+            let checksum_matches = recovered_candidate.checksum == existing.candidate_checksum;
+            if !metadata_matches || !checksum_matches {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
             checkpoint_catalog_validate_candidate_records(inner, &recovered_candidate)?;
@@ -12885,6 +12886,7 @@ mod tests {
             let published = &first_scan.published[0];
             assert_eq!(published.metadata.identity, identity);
             assert_eq!(published.candidate_path, canonical);
+            assert_eq!(published.candidate_checksum, second_candidate.checksum);
             let marker_before_retry = std::fs::read(&published.marker_path)?;
 
             checkpoint_catalog_publish_test_adoption(

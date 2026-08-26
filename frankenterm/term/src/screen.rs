@@ -1,8 +1,10 @@
 #![allow(clippy::range_plus_one)]
 use super::*;
+use crate::config::{BidiMode, ScrollbackSnapshotGeneration, ScrollbackSpillError};
+#[cfg(feature = "use_serde")]
 use crate::config::{
-    BidiMode, ScrollbackActivationError, ScrollbackPrefix, ScrollbackSnapshotFidelity,
-    ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits, ScrollbackSpillError,
+    ScrollbackActivationError, ScrollbackPrefix, ScrollbackSnapshotFidelity,
+    ScrollbackSnapshotLimits,
 };
 use crossbeam::thread;
 use frankenterm_surface::line::{
@@ -90,6 +92,7 @@ pub struct Screen {
 
 #[derive(Clone, Copy, Debug)]
 struct RecoveryScrollbackBoundary {
+    #[cfg_attr(not(feature = "use_serde"), allow(dead_code))]
     expected_generation: Option<ScrollbackSnapshotGeneration>,
     original_cold_prefix_newest_exclusive: StableRowIndex,
 }
@@ -1472,6 +1475,7 @@ impl Screen {
         self.clear_rewrap_line_cache();
     }
 
+    #[cfg(feature = "use_serde")]
     fn validated_recovery_scrollback_boundary(
         &self,
     ) -> Result<RecoveryScrollbackBoundary, ScrollbackActivationError> {
@@ -1496,6 +1500,7 @@ impl Screen {
         Ok(recovery)
     }
 
+    #[cfg(feature = "use_serde")]
     pub(crate) fn preflight_recovery_without_scrollback(
         &self,
     ) -> Result<(), ScrollbackActivationError> {
@@ -1515,6 +1520,7 @@ impl Screen {
             .map_err(|_| ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)
     }
 
+    #[cfg(feature = "use_serde")]
     pub(crate) fn finish_recovery_without_scrollback(&mut self) {
         debug_assert!(!self.allow_scrollback);
         self.recovery_scrollback = None;
@@ -1524,6 +1530,7 @@ impl Screen {
     /// recovered resident row. Every fallible calculation and sink operation
     /// precedes the in-memory split, so an error leaves the complete model
     /// available for retry.
+    #[cfg(feature = "use_serde")]
     pub(crate) fn activate_recovered_scrollback(
         &mut self,
         live_config: &Arc<dyn TerminalConfiguration>,

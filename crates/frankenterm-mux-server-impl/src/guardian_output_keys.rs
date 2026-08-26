@@ -2179,7 +2179,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().expect("create keyring directory");
-        let mut keyring =
+        let keyring =
             GuardianOutputKeyring::open_or_provision(open_private_directory(directory.path()))
                 .expect("provision keyring");
         let original_id = keyring.active_key_id();

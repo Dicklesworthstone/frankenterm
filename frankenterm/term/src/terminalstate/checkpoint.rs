@@ -3882,6 +3882,18 @@ impl ValidatedTerminalCheckpointV2 {
         self.checkpoint.primary_screen.physical_cols
     }
 
+    /// Authenticated terminal pixel width retained by the canonical model.
+    #[must_use]
+    pub const fn pixel_width(&self) -> u64 {
+        self.checkpoint.pixel_width
+    }
+
+    /// Authenticated terminal pixel height retained by the canonical model.
+    #[must_use]
+    pub const fn pixel_height(&self) -> u64 {
+        self.checkpoint.pixel_height
+    }
+
     /// Rebuild an off-topology terminal with no writer thread, callbacks, or
     /// spill capability. The supplied live configuration is retained only as
     /// the revision-fenced activation authority; replay runs against an
@@ -5052,25 +5064,33 @@ mod tests {
             Err(TerminalCheckpointError::UnsupportedVersion { observed: 3, .. })
         ));
 
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&canonical).expect("parse fixture JSON");
-        value
-            .as_object_mut()
-            .expect("checkpoint is an object")
-            .remove("title");
-        let omitted = serde_json::to_vec(&value).expect("encode omitted-field fixture");
+        // Mutate the canonical bytes in place so this negative reaches typed
+        // missing-field validation. Round-tripping through `Value` sorts map
+        // keys when serde_json's preserve-order feature is disabled, which
+        // would reject at the earlier canonical-version-prefix fence and fail
+        // to exercise the intended contract.
+        let encoded_title =
+            serde_json::to_vec(&checkpoint.title).expect("encode fixture title value");
+        let mut title_field = b",\"title\":".to_vec();
+        title_field.extend_from_slice(&encoded_title);
+        let title_offset = canonical
+            .windows(title_field.len())
+            .position(|window| window == title_field)
+            .expect("find the exact canonical title field");
+        let mut omitted = canonical.clone();
+        omitted.drain(title_offset..title_offset + title_field.len());
         assert!(matches!(
             TerminalCheckpointV2::decode_canonical_json(&omitted, limits),
             Err(TerminalCheckpointError::Serialization)
         ));
 
-        let mut extra_value: serde_json::Value =
-            serde_json::from_slice(&canonical).expect("reparse fixture JSON");
-        extra_value
-            .as_object_mut()
-            .expect("checkpoint is an object")
-            .insert("unexpected".into(), serde_json::Value::Bool(true));
-        let extra = serde_json::to_vec(&extra_value).expect("encode extra-field fixture");
+        let final_brace = canonical
+            .len()
+            .checked_sub(1)
+            .expect("canonical checkpoint is nonempty");
+        assert_eq!(canonical[final_brace], b'}');
+        let mut extra = canonical[..final_brace].to_vec();
+        extra.extend_from_slice(b",\"unexpected\":true}");
         assert!(matches!(
             TerminalCheckpointV2::decode_canonical_json(&extra, limits),
             Err(TerminalCheckpointError::Serialization)

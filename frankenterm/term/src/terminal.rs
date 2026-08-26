@@ -1,6 +1,8 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
-use frankenterm_escape_parser::parser::{Parser, RecoveryGroundBoundary};
+use frankenterm_escape_parser::parser::Parser;
+#[cfg(feature = "use_serde")]
+use frankenterm_escape_parser::parser::RecoveryGroundBoundary;
 #[cfg(feature = "use_serde")]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -705,6 +707,7 @@ impl Default for TerminalSize {
 }
 
 impl Terminal {
+    #[cfg(feature = "use_serde")]
     pub(crate) fn from_restored_state(
         state: TerminalState,
         max_string_sequence_bytes: usize,

@@ -17,9 +17,9 @@ pub mod delivery_ledger;
 pub mod delivery_scheduler;
 pub mod dispatch;
 pub mod generation_lifetime;
+pub mod guardian_output_keys;
 #[cfg(unix)]
 pub mod guardian_proxy;
-pub mod guardian_output_keys;
 pub mod local;
 pub mod pki;
 pub mod sessionhandler;
@@ -7986,7 +7986,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().expect("create append WAL fixture directory");
         let context = config::ScrollbackSpillSinkContext {
-            pane_id: u64::from(identity_byte) + 20_000,
+            pane_id: usize::from(identity_byte) + 20_000,
             domain_id: 3,
             durable_pane_id: [identity_byte; 16],
             command_description: "append-wal-crash-fixture".to_string(),
@@ -8126,9 +8126,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("create incremental-authority fixture");
         let identity_byte = u8::try_from(retained_rows).unwrap_or(201);
         let context = config::ScrollbackSpillSinkContext {
-            pane_id: 40_000_u64
-                .checked_add(u64::try_from(retained_rows).expect("fixture row count fits u64"))
-                .expect("fixture pane identity fits u64"),
+            pane_id: 40_000_usize
+                .checked_add(retained_rows)
+                .expect("fixture pane identity fits usize"),
             domain_id: 3,
             durable_pane_id: [identity_byte; 16],
             command_description: "incremental-authority-counter".to_string(),
@@ -8142,7 +8142,7 @@ mod tests {
                 &Line::from_text(
                     &format!("incremental-authority-row-{row}"),
                     &attributes,
-                    u64::try_from(row).expect("fixture row sequence fits u64"),
+                    row,
                     None,
                 ),
                 retained_rows,
@@ -8154,7 +8154,7 @@ mod tests {
             &Line::from_text(
                 "incremental-authority-measured-row",
                 &attributes,
-                u64::try_from(retained_rows).expect("fixture row sequence fits u64"),
+                retained_rows,
                 None,
             ),
             target_retention,
@@ -8508,7 +8508,7 @@ mod tests {
                 &Line::from_text(
                     text,
                     &attrs,
-                    u64::try_from(stable_row).expect("fixture stable row fits u64"),
+                    usize::try_from(stable_row).expect("fixture stable row fits usize"),
                     None,
                 ),
                 8,

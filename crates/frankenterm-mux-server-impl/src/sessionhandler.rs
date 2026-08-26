@@ -4,8 +4,6 @@ use crate::dispatch::EstablishedOrderedWindowAuthority;
 #[cfg(test)]
 use crate::dispatch::established_ordered_window_authority_for_test;
 use anyhow::{Context, anyhow};
-#[cfg(test)]
-use codec::PduWireIdent;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CoherentPaneSnapshot, CreateFloatingPane,
     CycleStack, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
@@ -31,6 +29,8 @@ use codec::{
     ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
+#[cfg(test)]
+use codec::{PduWireIdent, ReliablePaneWriteV1};
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
     RecorderEpochId, RecorderMode, RecorderSamplerAlgorithm, RecorderSamplerConfigV1,
     SampledTraceContextV1,
