@@ -79210,10 +79210,7 @@ where
 
     match parent.symlink_metadata(&leaf) {
         Ok(_) => {
-            parent_file
-                .sync_all()
-                .context("cannot synchronize a reconciled private artifact parent directory")?;
-            let mut receipt = verify_private_artifact_named_bytes(
+            verify_private_artifact_named_bytes(
                 &parent,
                 &leaf,
                 bytes,
@@ -79226,7 +79223,27 @@ where
                     path.display()
                 )
             })?;
+            hook(PrivateArtifactPublicationPoint::ExistingTargetSynchronized)?;
+            parent_file
+                .sync_all()
+                .context("cannot synchronize a reconciled private artifact parent directory")?;
+            hook(PrivateArtifactPublicationPoint::ParentSynchronized)?;
             revalidate_artifact_parent_directory(&parent_path, &parent)?;
+            let mut receipt = verify_private_artifact_named_bytes(
+                &parent,
+                &leaf,
+                bytes,
+                &expected_sha256,
+                "durable existing private artifact target",
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Private artifact {} changed while its existing publication was reconciled; existing files are never overwritten",
+                    path.display()
+                )
+            })?;
+            revalidate_artifact_parent_directory(&parent_path, &parent)?;
+            receipt.durability = "file_and_parent_directory_synced";
             receipt.recovered_existing = true;
             return Ok(receipt);
         }
@@ -79372,10 +79389,29 @@ where
                 .context("cannot atomically publish the private artifact without replacement");
         }
     };
-    parent_file
-        .sync_all()
-        .context("cannot synchronize the private artifact parent after publication")?;
+    if recovered_existing {
+        verify_private_artifact_named_bytes(
+            &parent,
+            &leaf,
+            bytes,
+            &expected_sha256,
+            "concurrently published private artifact target",
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Private artifact {} is bound to conflicting or unsafe bytes; existing files are never overwritten",
+                path.display()
+            )
+        })?;
+        hook(PrivateArtifactPublicationPoint::ExistingTargetSynchronized)?;
+    }
+    parent_file.sync_all().context(if recovered_existing {
+        "cannot synchronize a reconciled private artifact parent directory"
+    } else {
+        "cannot synchronize the private artifact parent after publication"
+    })?;
     hook(PrivateArtifactPublicationPoint::ParentSynchronized)?;
+    revalidate_artifact_parent_directory(&parent_path, &parent)?;
     let mut receipt = verify_private_artifact_named_bytes(
         &parent,
         &leaf,
@@ -79390,6 +79426,7 @@ where
         )
     })?;
     revalidate_artifact_parent_directory(&parent_path, &parent)?;
+    receipt.durability = "file_and_parent_directory_synced";
     receipt.recovered_existing = recovered_existing;
     Ok(receipt)
 }
@@ -98235,6 +98272,9 @@ recorder_backend = "rusqlite"
                         "successful rename moves the exact stage into the target"
                     );
                 }
+                PrivateArtifactPublicationPoint::ExistingTargetSynchronized => {
+                    unreachable!("the first publication attempt cannot reconcile a final target")
+                }
             }
 
             let retry = write_new_private_artifact(&path, &payload)
@@ -98260,6 +98300,48 @@ recorder_backend = "rusqlite"
             assert!(conflict.to_string().contains("never overwritten"));
             assert_eq!(std::fs::read(&path).unwrap(), payload);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn private_artifact_existing_final_sync_cut_reconciles_durably() {
+        let directory = tempfile::tempdir().expect("private artifact existing-final tempdir");
+        let path = directory.path().join("private").join("dump.json");
+        let payload = vec![b'y'; 96 * 1024 + 23];
+        let initial = write_new_private_artifact(&path, &payload)
+            .expect("initial private artifact publication");
+        assert_eq!(initial.durability, "file_and_parent_directory_synced");
+        assert!(!initial.recovered_existing);
+
+        let mut injected = false;
+        let error = write_new_private_artifact_with_hook(&path, &payload, |observed| {
+            if observed == PrivateArtifactPublicationPoint::ExistingTargetSynchronized
+                && !injected
+            {
+                injected = true;
+                anyhow::bail!("existing-final reply lost after target synchronization");
+            }
+            Ok(())
+        })
+        .expect_err("existing-final synchronization cut must interrupt reconciliation");
+        assert!(error.to_string().contains("reply lost"));
+        assert!(injected);
+        assert_eq!(
+            std::fs::read(&path).expect("exact existing final remains readable"),
+            payload
+        );
+
+        let retry = write_new_private_artifact(&path, &payload)
+            .expect("retry must resynchronize and reconcile the exact existing final");
+        assert!(retry.recovered_existing);
+        assert_eq!(retry.durability, "file_and_parent_directory_synced");
+        assert_eq!(retry.sha256, sha256_hex(&payload));
+        assert_eq!(retry.bytes, u64::try_from(payload.len()).unwrap());
+
+        let conflict = write_new_private_artifact(&path, b"conflicting artifact")
+            .expect_err("a conflicting replay must never replace the durable final");
+        assert!(conflict.to_string().contains("never overwritten"));
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
