@@ -14,7 +14,10 @@
 //! delivery/replay, checkpoint publication, guardian crash recovery, durable
 //! same-incarnation WAL reopening, and automated mux migration remain
 //! intentionally rejected until their anti-rollback and recovery authorities
-//! are integrated. The service can be stopped through an authenticated guarded
+//! are integrated. The production-disabled broker separately exposes a
+//! content-free, paginated view of authenticated recovered Spawn journals, but
+//! that view grants no PTY, lease, output-replay, or mutation authority. The
+//! service can be stopped through an authenticated guarded
 //! transaction only while it owns no panes; a successful stop deliberately
 //! retains the socket path, so restart remains fail-closed until an explicit
 //! non-overwriting retirement design lands.
@@ -75,9 +78,11 @@ pub mod transport;
 
 #[cfg(unix)]
 pub use broker::{
+    BrokerCensusEntryV1, BrokerCensusPageRequestV1, BrokerCensusPageV1,
     BrokerControlClientError, BrokerControlClientV1, BrokerControlServiceConfigV1,
     BrokerControlServiceError, BrokerControlServiceV1, BrokerExecBootstrapErrorV1,
-    BrokerGuardianConnectionIdentityV1, run_broker_exec_bootstrap,
+    BrokerGuardianConnectionIdentityV1, BrokerRecoveredPaneDispositionV1,
+    run_broker_exec_bootstrap,
 };
 #[cfg(unix)]
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};

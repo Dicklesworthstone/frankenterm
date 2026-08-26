@@ -7,20 +7,22 @@
 //! `SCM_RIGHTS` transfer cannot be revoked and socket EOF cannot fence a master
 //! already installed in a predecessor guardian.
 //!
-//! A hidden same-binary broker subcommand now read-only scans and uniquely
-//! admits the complete authenticated Spawn catalog before it may reconcile a
-//! valid crash cut or bind its pinned private control socket. Its bounded event
-//! loop authenticates exact guardian, mux, build, connection,
-//! broker-incarnation, and token-derived lineage identities. The same-binary
-//! exec bootstrap and its durable Attempt/SpawnObserved/Release ordering are
-//! implemented below, but the live service still rejects every PTY effect:
-//! activation wiring, startup adoption, durable output replay into census, and
-//! successor lease rotation must land before any production selector may start
-//! it. The process-local PTY typestate below therefore still does **not** prove
-//! guardian-`SIGKILL` continuity. Catalog Genesis admission remains durable
-//! pre-Spawn intent, never proof that a child exists, and the current service
-//! refuses startup without reconciling when it encounters an existing nonempty
-//! Spawn lifecycle it cannot yet reconstruct without ambiguity.
+//! A hidden same-binary broker subcommand now uniquely admits the complete
+//! authenticated Spawn catalog before binding its pinned private control
+//! socket. Admission may finish an authenticated interrupted file-creation
+//! transaction, but it does not append lifecycle records, reconcile recovered
+//! head files, or grant append authority. Its bounded event loop authenticates exact
+//! guardian, mux, build, connection, broker-incarnation, and token-derived
+//! lineage identities. The same-binary exec bootstrap and its durable
+//! Attempt/SpawnObserved/Release ordering are implemented below. The live
+//! service exposes only a bounded immutable recovery census and exact read-only
+//! Spawn-effect queries; every PTY-changing effect remains rejected. Activation
+//! wiring, startup adoption, durable output replay, and successor lease rotation
+//! must land before any production selector may start it. The process-local PTY
+//! typestate below therefore still does **not** prove guardian-`SIGKILL`
+//! continuity. Catalog Genesis admission remains durable pre-Spawn intent,
+//! never proof that a child exists, and recovered lifecycle rows explicitly
+//! report that PTY, lease, output-replay, and mutation authorities are absent.
 //!
 //! The ordering enforced here is:
 //!
@@ -148,6 +150,13 @@ const BROKER_CONTROL_REQUEST_PAYLOAD_OFFSET: usize = 208;
 const BROKER_CONTROL_RESPONSE_FIXED_BYTES: usize = 228;
 const BROKER_CONTROL_RESPONSE_PAYLOAD_OFFSET: usize = 196;
 const BROKER_CONTROL_HELLO_PAYLOAD_BYTES: usize = 48;
+const BROKER_CONTROL_CENSUS_REQUEST_BYTES: usize = 30;
+const BROKER_CONTROL_CENSUS_PAGE_MAGIC: [u8; 4] = *b"FTBC";
+const BROKER_CONTROL_CENSUS_PAGE_VERSION: u16 = 1;
+const BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES: usize = 48;
+const BROKER_CONTROL_CENSUS_ENTRY_BYTES: usize = 224;
+const BROKER_CONTROL_CENSUS_NO_CURSOR: u64 = u64::MAX;
+const BROKER_CONTROL_CENSUS_SNAPSHOT_ID_ATTEMPTS: usize = 16;
 pub(crate) const BROKER_CONTROL_MAX_FRAME_BYTES: usize =
     BROKER_CONTROL_REQUEST_FIXED_BYTES + BROKER_CONTROL_MAX_PAYLOAD_BYTES;
 const BROKER_CONTROL_LISTENER_TOKEN: Token = Token(0);
@@ -1183,6 +1192,109 @@ impl BrokerControlOperationV1 {
     }
 }
 
+/// Bounded immutable-page request for the broker recovery census.
+///
+/// Cursor zero always requests a fresh broker-owned snapshot and therefore
+/// requires a nil snapshot identity. Continuations carry the exact nonzero
+/// identity returned by the first page. The byte ceiling applies to the
+/// encoded page payload, not to an unbounded intermediate serialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrokerCensusPageRequestV1 {
+    snapshot_id: Uuid,
+    cursor: u64,
+    max_entries: u16,
+    max_bytes: u32,
+}
+
+impl BrokerCensusPageRequestV1 {
+    pub fn new(
+        snapshot_id: Uuid,
+        cursor: u64,
+        max_entries: u16,
+        max_bytes: u32,
+    ) -> Result<Self, BrokerControlClientError> {
+        let request = Self {
+            snapshot_id,
+            cursor,
+            max_entries,
+            max_bytes,
+        };
+        request
+            .validate()
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        Ok(request)
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(self) -> Uuid {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn cursor(self) -> u64 {
+        self.cursor
+    }
+
+    #[must_use]
+    pub const fn max_entries(self) -> u16 {
+        self.max_entries
+    }
+
+    #[must_use]
+    pub const fn max_bytes(self) -> u32 {
+        self.max_bytes
+    }
+
+    fn validate(self) -> Result<(), BrokerControlProtocolError> {
+        let snapshot_identity_is_valid = if self.cursor == 0 {
+            self.snapshot_id.is_nil()
+        } else {
+            !self.snapshot_id.is_nil()
+        };
+        let maximum_entries = u16::try_from(GUARDIAN_MAX_PANES)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        let minimum_page_bytes = BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
+            .checked_add(BROKER_CONTROL_CENSUS_ENTRY_BYTES)
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        let minimum_page_bytes = u32::try_from(minimum_page_bytes)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        let maximum_page_bytes = u32::try_from(BROKER_CONTROL_MAX_PAYLOAD_BYTES)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        if !snapshot_identity_is_valid
+            || self.max_entries == 0
+            || self.max_entries > maximum_entries
+            || self.max_bytes < minimum_page_bytes
+            || self.max_bytes > maximum_page_bytes
+        {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        }
+        Ok(())
+    }
+
+    fn encode(self) -> [u8; BROKER_CONTROL_CENSUS_REQUEST_BYTES] {
+        let mut encoded = [0_u8; BROKER_CONTROL_CENSUS_REQUEST_BYTES];
+        encoded[..16].copy_from_slice(self.snapshot_id.as_bytes());
+        encoded[16..24].copy_from_slice(&self.cursor.to_be_bytes());
+        encoded[24..26].copy_from_slice(&self.max_entries.to_be_bytes());
+        encoded[26..30].copy_from_slice(&self.max_bytes.to_be_bytes());
+        encoded
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, BrokerControlProtocolError> {
+        if payload.len() != BROKER_CONTROL_CENSUS_REQUEST_BYTES {
+            return Err(BrokerControlProtocolError::InvalidLength);
+        }
+        let request = Self {
+            snapshot_id: read_broker_uuid(&payload[..16]),
+            cursor: read_broker_be_u64(&payload[16..24]),
+            max_entries: read_broker_be_u16(&payload[24..26]),
+            max_bytes: read_broker_be_u32(&payload[26..30]),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BrokerControlResponseStatusV1 {
@@ -1248,7 +1360,7 @@ impl BrokerControlRequestHeaderV1 {
                     && self.durable_pane_id.is_nil()
                     && self.lease_generation == 0
                     && self.operation_id.is_nil()
-                    && payload_bytes == 0
+                    && payload_bytes == BROKER_CONTROL_CENSUS_REQUEST_BYTES
             }
             BrokerControlOperationV1::Spawn => {
                 !self.broker_incarnation.is_nil()
@@ -1415,7 +1527,12 @@ impl BrokerControlResponseHeaderV1 {
                     && self.child_identity.is_none()
                     && self.output_sequence_start == 0
                     && self.output_sequence_end == 0
-                    && (successful || (unsuccessful && payload_bytes == 0))
+                    && ((successful
+                        && payload_bytes >= BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
+                        && (payload_bytes - BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES)
+                            % BROKER_CONTROL_CENSUS_ENTRY_BYTES
+                            == 0)
+                        || (unsuccessful && payload_bytes == 0))
             }
             BrokerControlOperationV1::Spawn => {
                 pane_scoped
@@ -1431,11 +1548,18 @@ impl BrokerControlResponseHeaderV1 {
                 pane_scoped
                     && self.output_sequence_start == 0
                     && self.output_sequence_end == 0
-                    && payload_bytes == 0
                     && ((successful
+                        && payload_bytes == 0
                         && ((self.lease_generation == 0 && self.child_identity.is_some())
                             || (self.lease_generation > 0 && self.child_identity.is_none())))
-                        || (unsuccessful && self.child_identity.is_none()))
+                        || (self.status == BrokerControlResponseStatusV1::Quarantined
+                            && self.lease_generation == 0
+                            && self.child_identity.is_none()
+                            && payload_bytes == BROKER_CONTROL_CENSUS_ENTRY_BYTES)
+                        || (unsuccessful
+                            && self.status != BrokerControlResponseStatusV1::Quarantined
+                            && self.child_identity.is_none()
+                            && payload_bytes == 0))
             }
             BrokerControlOperationV1::AcknowledgeEffect => {
                 pane_scoped && empty_effect && (successful || unsuccessful)
@@ -1889,8 +2013,8 @@ pub enum BrokerControlServiceError {
     SpawnCatalog(#[from] BrokerSpawnWalError),
     #[error("broker authentication authority initialization failed")]
     AuthenticationAuthority,
-    #[error("broker process cannot yet recover an existing live Spawn lifecycle")]
-    ExistingSpawnLifecycleUnsupported,
+    #[error("broker recovered Spawn state cannot be represented safely")]
+    InvalidRecoveredSpawnState,
     #[error("broker control readiness loop failed at {site}")]
     Io {
         site: &'static str,
@@ -1921,6 +2045,14 @@ pub enum BrokerControlClientError {
     BrokerBuildIdentityMismatch,
     #[error("broker lineage did not match the persistent token authority")]
     BrokerLineageMismatch,
+    #[error("broker recovery Census snapshot expired; restart at cursor zero")]
+    CensusSnapshotUnavailable,
+    #[error("broker recovery Census snapshot belongs to a different authenticated owner")]
+    CensusAuthorityConflict,
+    #[error("broker recovery Census snapshot capacity is temporarily unavailable")]
+    CensusCapacityUnavailable,
+    #[error("broker client connection is poisoned after an ambiguous exchange")]
+    ConnectionPoisoned,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2132,6 +2264,11 @@ struct BrokerReadyEventV1 {
     closed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct BrokerCensusSnapshotV1 {
+    owner: BrokerGuardianOwnerIdentity,
+}
+
 /// Fail-closed admission of the complete recovered Spawn catalog.
 ///
 /// The four indexes are constructed before the broker begins listening, so a
@@ -2244,6 +2381,83 @@ impl BrokerRecoveredSpawnCatalogV1 {
         }
         Ok(())
     }
+
+    fn recovery_census_entries(
+        &self,
+    ) -> Result<Vec<BrokerCensusEntryV1>, BrokerControlProtocolError> {
+        debug_assert_eq!(self.by_journal_id.len(), self.journals.len());
+        debug_assert_eq!(self.by_durable_pane_id.len(), self.journals.len());
+        debug_assert_eq!(self.by_spawn_effect_id.len(), self.journals.len());
+        debug_assert_eq!(self.by_origin_request_id.len(), self.journals.len());
+        if self.journals.len() > GUARDIAN_MAX_PANES {
+            return Err(BrokerControlProtocolError::CapacityExhausted);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.journals.len())
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        for journal in &self.journals {
+            entries.push(BrokerCensusEntryV1::from_recovered_status(
+                journal.status(),
+            )?);
+        }
+        entries.sort_unstable_by(|left, right| {
+            left.durable_pane_id
+                .as_bytes()
+                .cmp(right.durable_pane_id.as_bytes())
+        });
+        Ok(entries)
+    }
+
+    fn recovered_status_for_spawn_effect(
+        &self,
+        mux_incarnation: Uuid,
+        durable_pane_id: Uuid,
+        spawn_effect_id: Uuid,
+    ) -> Option<BrokerSpawnWalStatusV1> {
+        let by_pane = *self.by_durable_pane_id.get(&durable_pane_id)?;
+        let by_effect = *self.by_spawn_effect_id.get(&spawn_effect_id)?;
+        if by_pane != by_effect {
+            return None;
+        }
+        let status = self.journals.get(by_pane)?.status();
+        (status.identity.mux_incarnation() == mux_incarnation).then_some(status)
+    }
+}
+
+fn index_broker_recovery_census_by_mux(
+    entries: Vec<BrokerCensusEntryV1>,
+) -> Result<HashMap<Uuid, Vec<BrokerCensusEntryV1>>, BrokerControlProtocolError> {
+    let mut entry_counts = HashMap::<Uuid, usize>::new();
+    entry_counts
+        .try_reserve(entries.len())
+        .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    for entry in &entries {
+        let count = entry_counts.entry(entry.mux_incarnation).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+    }
+    let mut by_mux = HashMap::new();
+    by_mux
+        .try_reserve(entry_counts.len())
+        .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    for (mux_incarnation, entry_count) in entry_counts {
+        let mut mux_entries = Vec::new();
+        mux_entries
+            .try_reserve_exact(entry_count)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        if by_mux.insert(mux_incarnation, mux_entries).is_some() {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+    }
+    for entry in entries {
+        by_mux
+            .get_mut(&entry.mux_incarnation)
+            .ok_or(BrokerControlProtocolError::InvalidIdentity)?
+            .push(entry);
+    }
+    Ok(by_mux)
 }
 
 fn reconcile_broker_catalog_under_token_authority(
@@ -2263,11 +2477,12 @@ fn reconcile_broker_catalog_under_token_authority(
 
 /// Separately spawned, single-owner broker control loop.
 ///
-/// This first executable slice authenticates and fences connections and opens
-/// the complete Spawn catalog before listening. It deliberately rejects every
-/// PTY effect: live child creation is enabled only after the landed exec
-/// barrier is wired into this service together with startup adoption, census,
-/// output replay, and successor rotation.
+/// The service authenticates and fences connections, opens the complete Spawn
+/// catalog before listening, and exposes only an immutable paginated recovery
+/// census plus read-only Spawn-effect queries. Every recovered journal keeps
+/// append authority withheld. All PTY effects remain rejected until live pane
+/// ownership, durable output replay, connection-EOF lease fencing, and
+/// successor rotation are integrated and proven together.
 pub struct BrokerControlServiceV1 {
     poll: Poll,
     events: Events,
@@ -2276,8 +2491,10 @@ pub struct BrokerControlServiceV1 {
     socket_authority: SocketPathAuthority,
     token_authority: GuardianTokenPathAuthority,
     control_authenticator: GuardianBrokerControlAuthenticatorV1,
+    _spawn_authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
     _spawn_catalog: BrokerSpawnWalCatalogV1,
-    _recovered_catalog: BrokerRecoveredSpawnCatalogV1,
+    recovered_catalog: BrokerRecoveredSpawnCatalogV1,
+    recovery_census_by_mux: HashMap<Uuid, Vec<BrokerCensusEntryV1>>,
     broker_incarnation: Uuid,
     broker_lineage_id: Uuid,
     broker_build_identity: SealedAtomicBuildIdentity,
@@ -2285,6 +2502,9 @@ pub struct BrokerControlServiceV1 {
     free_connection_tokens: Vec<usize>,
     hello_receipts: BTreeMap<Uuid, BrokerHelloReceiptV1>,
     hello_receipt_order: VecDeque<Uuid>,
+    census_snapshots: HashMap<Uuid, BrokerCensusSnapshotV1>,
+    max_census_snapshots: usize,
+    next_census_snapshot_sequence: u64,
     max_hello_receipts: usize,
     accept_quantum: usize,
     next_connection_generation: u64,
@@ -2306,16 +2526,18 @@ impl BrokerControlServiceV1 {
         let broker_lineage_id = spawn_authenticator.lineage_id();
         let mut spawn_catalog = BrokerSpawnWalCatalogV1::open(config.spawn_catalog_path)?;
         let recovered_journals = spawn_catalog.scan_all_for_admission(&spawn_authenticator)?;
-        let mut recovered_catalog =
+        let recovered_catalog =
             BrokerRecoveredSpawnCatalogV1::admit(recovered_journals, &spawn_authenticator)?;
-        if recovered_catalog.contains_spawn_lifecycle() {
-            return Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported);
-        }
-        reconcile_broker_catalog_under_token_authority(
-            &mut token_authority,
-            &spawn_catalog,
-            &mut recovered_catalog,
-        )?;
+        // Classify every recovered journal before binding, but deliberately do
+        // not reconcile its head or grant append authority. A restarted broker
+        // no longer owns the old PTY master, even when WAL proves that the old
+        // process observed a child.
+        let recovery_census = recovered_catalog
+            .recovery_census_entries()
+            .map_err(|_| BrokerControlServiceError::InvalidRecoveredSpawnState)?;
+        let recovery_census_by_mux = index_broker_recovery_census_by_mux(recovery_census)
+            .map_err(|_| BrokerControlServiceError::InvalidRecoveredSpawnState)?;
+        token_authority.validate()?;
 
         let poll = Poll::new().map_err(|error| BrokerControlServiceError::io("poll", error))?;
         let event_capacity = config.max_connections.checked_add(1).ok_or(
@@ -2351,6 +2573,14 @@ impl BrokerControlServiceV1 {
             .map_err(|_| {
                 BrokerControlServiceError::InvalidConfiguration("Hello receipt allocation failed")
             })?;
+        let mut census_snapshots = HashMap::new();
+        census_snapshots
+            .try_reserve(config.max_connections)
+            .map_err(|_| {
+                BrokerControlServiceError::InvalidConfiguration(
+                    "Census snapshot allocation failed",
+                )
+            })?;
 
         // Bind only after catalog policy and every avoidable fallible
         // allocation have succeeded. A post-bind permission or registration
@@ -2374,8 +2604,10 @@ impl BrokerControlServiceV1 {
             socket_authority,
             token_authority,
             control_authenticator,
+            _spawn_authenticator: spawn_authenticator,
             _spawn_catalog: spawn_catalog,
-            _recovered_catalog: recovered_catalog,
+            recovered_catalog,
+            recovery_census_by_mux,
             broker_incarnation: Uuid::new_v4(),
             broker_lineage_id,
             broker_build_identity: config.broker_build_identity,
@@ -2383,6 +2615,9 @@ impl BrokerControlServiceV1 {
             free_connection_tokens,
             hello_receipts: BTreeMap::new(),
             hello_receipt_order,
+            census_snapshots,
+            max_census_snapshots: config.max_connections,
+            next_census_snapshot_sequence: 1,
             max_hello_receipts,
             accept_quantum,
             next_connection_generation: 1,
@@ -2669,11 +2904,194 @@ impl BrokerControlServiceV1 {
         {
             return Err(());
         }
+        let owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: hello.guardian_incarnation,
+            connection_id: hello.connection_id,
+            mux_incarnation: hello.mux_incarnation,
+            mux_build_identity_digest: hello.mux_build_identity_digest,
+            guardian_build_identity_digest: hello.guardian_build_identity_digest,
+        };
+        if !owner.is_valid() {
+            return Err(());
+        }
+        match request.header.operation {
+            BrokerControlOperationV1::Census => {
+                return self.dispatch_recovery_census(owner, request);
+            }
+            BrokerControlOperationV1::QueryEffect if request.header.lease_generation == 0 => {
+                return self.dispatch_recovered_spawn_query(owner, request);
+            }
+            _ => {}
+        }
         BrokerControlResponseV1::new(
             self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
             &[],
         )
         .map_err(|_| ())
+    }
+
+    fn dispatch_recovery_census(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let page_request = match BrokerCensusPageRequestV1::decode(request.payload()) {
+            Ok(page_request) => page_request,
+            Err(_) => {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Rejected,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
+        let (snapshot_id, response_status) = if page_request.cursor == 0 {
+            let snapshot_id = self.allocate_census_snapshot_id()?;
+            self.census_snapshots
+                .retain(|_, snapshot| snapshot.owner != owner);
+            if self.census_snapshots.len() >= self.max_census_snapshots {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Retryable,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            if self
+                .census_snapshots
+                .insert(snapshot_id, BrokerCensusSnapshotV1 { owner })
+                .is_some()
+            {
+                return Err(());
+            }
+            (snapshot_id, BrokerControlResponseStatusV1::Applied)
+        } else {
+            (
+                page_request.snapshot_id,
+                BrokerControlResponseStatusV1::Recovered,
+            )
+        };
+        let Some(snapshot) = self.census_snapshots.get(&snapshot_id).copied() else {
+            return BrokerControlResponseV1::new(
+                self.response_header(
+                    request.header,
+                    BrokerControlResponseStatusV1::Rejected,
+                ),
+                &[],
+            )
+            .map_err(|_| ());
+        };
+        if snapshot.owner != owner {
+            return BrokerControlResponseV1::new(
+                self.response_header(
+                    request.header,
+                    BrokerControlResponseStatusV1::Quarantined,
+                ),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+        let snapshot_entries = self
+            .recovery_census_by_mux
+            .get(&owner.mux_incarnation)
+            .map_or(&[] as &[BrokerCensusEntryV1], Vec::as_slice);
+        let total_entry_count = snapshot_entries.len();
+        let total_entries = u64::try_from(total_entry_count).map_err(|_| ())?;
+        let start = usize::try_from(page_request.cursor).map_err(|_| ())?;
+        if start > total_entry_count {
+            return BrokerControlResponseV1::new(
+                self.response_header(
+                    request.header,
+                    BrokerControlResponseStatusV1::Rejected,
+                ),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+        let maximum_page_bytes = usize::try_from(page_request.max_bytes).map_err(|_| ())?;
+        let entries_by_bytes = maximum_page_bytes
+            .checked_sub(BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES)
+            .ok_or(())?
+            / BROKER_CONTROL_CENSUS_ENTRY_BYTES;
+        let page_capacity = usize::from(page_request.max_entries).min(entries_by_bytes);
+        let available = total_entry_count.checked_sub(start).ok_or(())?;
+        let entry_count = available.min(page_capacity);
+        let end = start.checked_add(entry_count).ok_or(())?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(entry_count).map_err(|_| ())?;
+        entries.extend_from_slice(&snapshot_entries[start..end]);
+        if entries.len() != entry_count {
+            return Err(());
+        }
+        let next_cursor = if end < total_entry_count {
+            Some(u64::try_from(end).map_err(|_| ())?)
+        } else {
+            None
+        };
+        let page = BrokerCensusPageV1 {
+            snapshot_id,
+            entries,
+            next_cursor,
+            total_entries,
+        };
+        page.validate_for_request(page_request).map_err(|_| ())?;
+        let encoded = page.encode().map_err(|_| ())?;
+        BrokerControlResponseV1::new(
+            self.response_header(request.header, response_status),
+            &encoded,
+        )
+        .map_err(|_| ())
+    }
+
+    fn dispatch_recovered_spawn_query(
+        &self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let Some(status) = self.recovered_catalog.recovered_status_for_spawn_effect(
+            owner.mux_incarnation,
+            request.header.durable_pane_id,
+            request.header.operation_id,
+        ) else {
+            return BrokerControlResponseV1::new(
+                self.response_header(
+                    request.header,
+                    BrokerControlResponseStatusV1::Rejected,
+                ),
+                &[],
+            )
+            .map_err(|_| ());
+        };
+        let entry = BrokerCensusEntryV1::from_recovered_status(status).map_err(|_| ())?;
+        let encoded = entry.encode().map_err(|_| ())?;
+        BrokerControlResponseV1::new(
+            self.response_header(
+                request.header,
+                BrokerControlResponseStatusV1::Quarantined,
+            ),
+            &encoded,
+        )
+        .map_err(|_| ())
+    }
+
+    fn allocate_census_snapshot_id(&mut self) -> Result<Uuid, ()> {
+        for _ in 0..BROKER_CONTROL_CENSUS_SNAPSHOT_ID_ATTEMPTS {
+            let sequence = self.next_census_snapshot_sequence;
+            self.next_census_snapshot_sequence = sequence.checked_add(1).ok_or(())?;
+            let mut snapshot_bytes = [0_u8; 16];
+            snapshot_bytes[..8].copy_from_slice(&self.broker_incarnation.as_bytes()[..8]);
+            snapshot_bytes[8..].copy_from_slice(&sequence.to_be_bytes());
+            let snapshot_id = Uuid::from_bytes(snapshot_bytes);
+            if !snapshot_id.is_nil() && !self.census_snapshots.contains_key(&snapshot_id) {
+                return Ok(snapshot_id);
+            }
+        }
+        Err(())
     }
 
     fn dispatch_hello(
@@ -2782,6 +3200,15 @@ impl BrokerControlServiceV1 {
         }
         let _ = self.poll.registry().deregister(&mut connection.stream);
         if let Some(hello) = connection.hello {
+            let owner = BrokerGuardianOwnerIdentity {
+                guardian_incarnation: hello.guardian_incarnation,
+                connection_id: hello.connection_id,
+                mux_incarnation: hello.mux_incarnation,
+                mux_build_identity_digest: hello.mux_build_identity_digest,
+                guardian_build_identity_digest: hello.guardian_build_identity_digest,
+            };
+            self.census_snapshots
+                .retain(|_, snapshot| snapshot.owner != owner);
             if let Some(receipt) = self.hello_receipts.get_mut(&hello.request_id) {
                 if receipt.active_connection == Some((token, generation)) {
                     receipt.active_connection = None;
@@ -2825,6 +3252,7 @@ pub struct BrokerControlClientV1 {
     connection_id: Uuid,
     broker_incarnation: Uuid,
     recovered_hello: bool,
+    poisoned: bool,
 }
 
 fn broker_control_response_lease_generation_matches(
@@ -2895,6 +3323,7 @@ impl BrokerControlClientV1 {
             connection_id,
             broker_incarnation: Uuid::nil(),
             recovered_hello: false,
+            poisoned: false,
         };
         let request = BrokerControlRequestV1::new(
             BrokerControlRequestHeaderV1 {
@@ -2942,12 +3371,157 @@ impl BrokerControlClientV1 {
         self.recovered_hello
     }
 
+    /// Read one immutable page from the broker's content-free recovery
+    /// census. This operation never grants pane or PTY authority.
+    pub fn census_page(
+        &mut self,
+        page: BrokerCensusPageRequestV1,
+    ) -> Result<BrokerCensusPageV1, BrokerControlClientError> {
+        self.census_page_with_request_id(Uuid::new_v4(), page)
+    }
+
+    #[doc(hidden)]
+    pub fn census_page_with_request_id(
+        &mut self,
+        request_id: Uuid,
+        page: BrokerCensusPageRequestV1,
+    ) -> Result<BrokerCensusPageV1, BrokerControlClientError> {
+        if request_id.is_nil() {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        page.validate()
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Census,
+                request_id,
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self
+                    .identity
+                    .guardian_build_identity
+                    .into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+            },
+            &page.encode(),
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Applied
+            | BrokerControlResponseStatusV1::Recovered => {}
+            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
+                return Err(BrokerControlClientError::CensusSnapshotUnavailable);
+            }
+            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+                return Err(BrokerControlClientError::CensusAuthorityConflict);
+            }
+            BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
+                return Err(BrokerControlClientError::CensusCapacityUnavailable);
+            }
+            _ => {
+                self.poisoned = true;
+                return Err(BrokerControlClientError::UnexpectedResponse);
+            }
+        }
+        let census = match BrokerCensusPageV1::decode(response.payload()) {
+            Ok(census) => census,
+            Err(_) => {
+                self.poisoned = true;
+                return Err(BrokerControlClientError::Protocol);
+            }
+        };
+        if census.validate_for_request(page).is_err() {
+            self.poisoned = true;
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        if census
+            .validate_for_mux(self.identity.mux_incarnation)
+            .is_err()
+        {
+            self.poisoned = true;
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        Ok(census)
+    }
+
+    /// Query one exact recovered Spawn identity without granting Release,
+    /// attachment, or retry authority. `None` means the exact pane/effect/mux
+    /// tuple is absent; a returned row is always explicitly non-adoptable.
+    pub fn query_recovered_spawn(
+        &mut self,
+        durable_pane_id: Uuid,
+        spawn_effect_id: Uuid,
+    ) -> Result<Option<BrokerCensusEntryV1>, BrokerControlClientError> {
+        if durable_pane_id.is_nil() || spawn_effect_id.is_nil() {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::QueryEffect,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self
+                    .identity
+                    .guardian_build_identity
+                    .into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id,
+                lease_generation: 0,
+                operation_id: spawn_effect_id,
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => Ok(None),
+            BrokerControlResponseStatusV1::Quarantined => {
+                let entry = match BrokerCensusEntryV1::decode(response.payload()) {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        self.poisoned = true;
+                        return Err(BrokerControlClientError::Protocol);
+                    }
+                };
+                if entry.durable_pane_id != durable_pane_id
+                    || entry.spawn_effect_id != spawn_effect_id
+                    || entry.mux_incarnation != self.identity.mux_incarnation
+                {
+                    self.poisoned = true;
+                    return Err(BrokerControlClientError::UnexpectedResponse);
+                }
+                Ok(Some(entry))
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
     fn exchange(
         &mut self,
         request: &BrokerControlRequestV1,
     ) -> Result<BrokerControlResponseV1, BrokerControlClientError> {
+        if self.poisoned {
+            return Err(BrokerControlClientError::ConnectionPoisoned);
+        }
         let frame = encode_broker_control_request(&self.control_authenticator, request)
             .map_err(|_| BrokerControlClientError::Protocol)?;
+        // From the first possible stream mutation until a complete,
+        // authenticated, request-correlated response is consumed, any failure
+        // leaves reply ownership ambiguous. This one-request/one-response
+        // connection may not be reused after such a cut.
+        self.poisoned = true;
         self.stream.write_all(frame.as_slice())?;
         let response_frame = read_blocking_broker_control_frame(
             &mut self.stream,
@@ -2970,6 +3544,7 @@ impl BrokerControlClientV1 {
         {
             return Err(BrokerControlClientError::UnexpectedResponse);
         }
+        self.poisoned = false;
         Ok(response)
     }
 }
@@ -3071,6 +3646,11 @@ impl BrokerSpawnWalIdentityV1 {
     #[must_use]
     pub const fn broker_lineage_id(self) -> Uuid {
         self.broker_lineage_id
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(self) -> Uuid {
+        self.mux_incarnation
     }
 
     #[must_use]
@@ -3544,6 +4124,528 @@ impl BrokerSpawnWalStatusV1 {
         self.phase
             .map(|_| self.identity.durable_protocol_fence())
             .transpose()
+    }
+}
+
+/// Fail-closed recovery classification for a Spawn WAL retained after a
+/// broker-process restart.
+///
+/// None of these variants grants PTY, child, Release, lease, or mutation
+/// authority. In particular, a durable child observation proves only what the
+/// previous broker recorded; its unique PTY master descriptor did not survive
+/// that broker process and must never be reconstructed from WAL bytes.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerRecoveredPaneDispositionV1 {
+    PreparedHeaderOnly = 1,
+    IntentEffectsDisabled = 2,
+    AttemptOutcomeIndeterminate = 3,
+    SpawnObservedPtyUnavailable = 4,
+    ReplyAcknowledgedPtyUnavailable = 5,
+}
+
+impl BrokerRecoveredPaneDispositionV1 {
+    fn from_wire(value: u8) -> Result<Self, BrokerControlProtocolError> {
+        match value {
+            1 => Ok(Self::PreparedHeaderOnly),
+            2 => Ok(Self::IntentEffectsDisabled),
+            3 => Ok(Self::AttemptOutcomeIndeterminate),
+            4 => Ok(Self::SpawnObservedPtyUnavailable),
+            5 => Ok(Self::ReplyAcknowledgedPtyUnavailable),
+            _ => Err(BrokerControlProtocolError::InvalidShape),
+        }
+    }
+}
+
+/// One fixed-width, content-free row in the immutable broker recovery census.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrokerCensusEntryV1 {
+    pub journal_id: Uuid,
+    pub mux_incarnation: Uuid,
+    pub durable_pane_id: Uuid,
+    pub spawn_effect_id: Uuid,
+    pub origin_request_id: Uuid,
+    pub phase: Option<BrokerSpawnWalPhaseV1>,
+    pub disposition: BrokerRecoveredPaneDispositionV1,
+    pub attempt_id: Option<Uuid>,
+    pub child_identity: Option<BrokerKernelChildIdentityV1>,
+    pub reply_ack_id: Option<Uuid>,
+    pub committed_records: u64,
+    pub committed_wal_bytes: u64,
+    pub committed_head_bytes: u64,
+    pub append_authority_withheld: bool,
+    pub head_reconciliation_required: bool,
+    pub effects_disabled: bool,
+    pub pty_available: bool,
+    pub lease_available: bool,
+    pub output_replay_available: bool,
+}
+
+impl BrokerCensusEntryV1 {
+    fn from_recovered_status(
+        status: BrokerSpawnWalStatusV1,
+    ) -> Result<Self, BrokerControlProtocolError> {
+        if !matches!(status.tail, BrokerSpawnWalTailV1::Clean) {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        }
+        let disposition = match status.phase {
+            None => BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly,
+            Some(BrokerSpawnWalPhaseV1::Intent) => {
+                BrokerRecoveredPaneDispositionV1::IntentEffectsDisabled
+            }
+            Some(BrokerSpawnWalPhaseV1::Attempted) => {
+                BrokerRecoveredPaneDispositionV1::AttemptOutcomeIndeterminate
+            }
+            Some(BrokerSpawnWalPhaseV1::SpawnObserved) => {
+                BrokerRecoveredPaneDispositionV1::SpawnObservedPtyUnavailable
+            }
+            Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged) => {
+                BrokerRecoveredPaneDispositionV1::ReplyAcknowledgedPtyUnavailable
+            }
+        };
+        let entry = Self {
+            journal_id: status.identity.journal_id(),
+            mux_incarnation: status.identity.mux_incarnation(),
+            durable_pane_id: status.identity.durable_pane_id(),
+            spawn_effect_id: status.identity.spawn_effect_id(),
+            origin_request_id: status.identity.origin_request_id(),
+            phase: status.phase,
+            disposition,
+            attempt_id: status.attempt_id,
+            child_identity: status.child_identity,
+            reply_ack_id: status.reply_ack_id,
+            committed_records: status.committed_records,
+            committed_wal_bytes: status.committed_wal_bytes,
+            committed_head_bytes: status.committed_head_bytes,
+            append_authority_withheld: status.append_authority_withheld,
+            head_reconciliation_required: status.head_reconciliation_required,
+            effects_disabled: true,
+            pty_available: false,
+            lease_available: false,
+            output_replay_available: false,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    fn validate(self) -> Result<(), BrokerControlProtocolError> {
+        if self.journal_id.is_nil()
+            || self.mux_incarnation.is_nil()
+            || self.durable_pane_id.is_nil()
+            || self.spawn_effect_id.is_nil()
+            || self.origin_request_id.is_nil()
+            || !self.append_authority_withheld
+            || !self.effects_disabled
+            || self.pty_available
+            || self.lease_available
+            || self.output_replay_available
+        {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        if let Some(child_identity) = self.child_identity {
+            child_identity
+                .validate()
+                .map_err(|_| BrokerControlProtocolError::InvalidIdentity)?;
+        }
+        let expected_records = match (self.phase, self.disposition) {
+            (None, BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly)
+                if self.attempt_id.is_none()
+                    && self.child_identity.is_none()
+                    && self.reply_ack_id.is_none() =>
+            {
+                0
+            }
+            (
+                Some(BrokerSpawnWalPhaseV1::Intent),
+                BrokerRecoveredPaneDispositionV1::IntentEffectsDisabled,
+            ) if self.attempt_id.is_none()
+                && self.child_identity.is_none()
+                && self.reply_ack_id.is_none() =>
+            {
+                1
+            }
+            (
+                Some(BrokerSpawnWalPhaseV1::Attempted),
+                BrokerRecoveredPaneDispositionV1::AttemptOutcomeIndeterminate,
+            ) if self.attempt_id.is_some()
+                && self.child_identity.is_none()
+                && self.reply_ack_id.is_none() =>
+            {
+                2
+            }
+            (
+                Some(BrokerSpawnWalPhaseV1::SpawnObserved),
+                BrokerRecoveredPaneDispositionV1::SpawnObservedPtyUnavailable,
+            ) if self.attempt_id.is_some()
+                && self.child_identity.is_some()
+                && self.reply_ack_id.is_none() =>
+            {
+                3
+            }
+            (
+                Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged),
+                BrokerRecoveredPaneDispositionV1::ReplyAcknowledgedPtyUnavailable,
+            ) if self.attempt_id.is_some()
+                && self.child_identity.is_some()
+                && self.reply_ack_id.is_some() =>
+            {
+                4
+            }
+            _ => return Err(BrokerControlProtocolError::InvalidShape),
+        };
+        if self.committed_records != expected_records {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        }
+        let expected_wal_bytes = BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+            .checked_add(
+                expected_records
+                    .checked_mul(BROKER_SPAWN_WAL_RECORD_BYTES_U64)
+                    .ok_or(BrokerControlProtocolError::CapacityExhausted)?,
+            )
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        let committed_head_records = if self.head_reconciliation_required {
+            expected_records
+                .checked_sub(1)
+                .ok_or(BrokerControlProtocolError::InvalidShape)?
+        } else {
+            expected_records
+        };
+        let expected_head_bytes = BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+            .checked_add(
+                committed_head_records
+                    .checked_mul(BROKER_SPAWN_HEAD_RECORD_BYTES_U64)
+                    .ok_or(BrokerControlProtocolError::CapacityExhausted)?,
+            )
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        if self.committed_wal_bytes != expected_wal_bytes
+            || self.committed_head_bytes != expected_head_bytes
+        {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        }
+        Ok(())
+    }
+
+    fn encode(self) -> Result<[u8; BROKER_CONTROL_CENSUS_ENTRY_BYTES], BrokerControlProtocolError> {
+        self.validate()?;
+        let mut encoded = [0_u8; BROKER_CONTROL_CENSUS_ENTRY_BYTES];
+        encoded[0..16].copy_from_slice(self.journal_id.as_bytes());
+        encoded[16..32].copy_from_slice(self.mux_incarnation.as_bytes());
+        encoded[32..48].copy_from_slice(self.durable_pane_id.as_bytes());
+        encoded[48..64].copy_from_slice(self.spawn_effect_id.as_bytes());
+        encoded[64..80].copy_from_slice(self.origin_request_id.as_bytes());
+        encoded[80] = self.phase.map_or(0, BrokerSpawnWalPhaseV1::to_wire);
+        encoded[81] = self.disposition as u8;
+        encoded[82] = u8::from(self.attempt_id.is_some());
+        encoded[83] = u8::from(self.child_identity.is_some());
+        encoded[84] = u8::from(self.reply_ack_id.is_some());
+        encoded[85] = u8::from(self.append_authority_withheld);
+        encoded[86] = u8::from(self.head_reconciliation_required);
+        encoded[87] = u8::from(self.effects_disabled);
+        if let Some(attempt_id) = self.attempt_id {
+            encoded[88..104].copy_from_slice(attempt_id.as_bytes());
+        }
+        if let Some(child_identity) = self.child_identity {
+            encoded[104..108].copy_from_slice(&child_identity.process_id().to_be_bytes());
+            encoded[112..128].copy_from_slice(child_identity.broker_child_nonce().as_bytes());
+            encoded[128..160]
+                .copy_from_slice(&child_identity.kernel_start_identity_digest());
+        }
+        if let Some(reply_ack_id) = self.reply_ack_id {
+            encoded[160..176].copy_from_slice(reply_ack_id.as_bytes());
+        }
+        encoded[176..184].copy_from_slice(&self.committed_records.to_be_bytes());
+        encoded[184..192].copy_from_slice(&self.committed_wal_bytes.to_be_bytes());
+        encoded[192..200].copy_from_slice(&self.committed_head_bytes.to_be_bytes());
+        encoded[200] = u8::from(self.pty_available);
+        encoded[201] = u8::from(self.lease_available);
+        encoded[202] = u8::from(self.output_replay_available);
+        Ok(encoded)
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, BrokerControlProtocolError> {
+        if encoded.len() != BROKER_CONTROL_CENSUS_ENTRY_BYTES
+            || encoded[108..112] != [0; 4]
+            || encoded[203..224] != [0; 21]
+        {
+            return Err(BrokerControlProtocolError::InvalidLength);
+        }
+        let phase = match encoded[80] {
+            0 => None,
+            value => Some(
+                BrokerSpawnWalPhaseV1::from_wire(value)
+                    .map_err(|_| BrokerControlProtocolError::InvalidShape)?,
+            ),
+        };
+        let optional_uuid = |present: u8, bytes: &[u8]| match present {
+            0 if bytes == [0; 16] => Ok(None),
+            1 => {
+                let value = read_broker_uuid(bytes);
+                if value.is_nil() {
+                    Err(BrokerControlProtocolError::InvalidIdentity)
+                } else {
+                    Ok(Some(value))
+                }
+            }
+            _ => Err(BrokerControlProtocolError::InvalidShape),
+        };
+        let attempt_id = optional_uuid(encoded[82], &encoded[88..104])?;
+        let child_identity = match encoded[83] {
+            0 if encoded[104..108] == [0; 4]
+                && encoded[112..128] == [0; 16]
+                && encoded[128..160] == [0; 32] =>
+            {
+                None
+            }
+            1 => Some(BrokerKernelChildIdentityV1 {
+                process_id: read_broker_be_u32(&encoded[104..108]),
+                broker_child_nonce: read_broker_uuid(&encoded[112..128]),
+                kernel_start_identity_digest: read_broker_array_32(&encoded[128..160]),
+            }),
+            _ => return Err(BrokerControlProtocolError::InvalidShape),
+        };
+        let entry = Self {
+            journal_id: read_broker_uuid(&encoded[0..16]),
+            mux_incarnation: read_broker_uuid(&encoded[16..32]),
+            durable_pane_id: read_broker_uuid(&encoded[32..48]),
+            spawn_effect_id: read_broker_uuid(&encoded[48..64]),
+            origin_request_id: read_broker_uuid(&encoded[64..80]),
+            phase,
+            disposition: BrokerRecoveredPaneDispositionV1::from_wire(encoded[81])?,
+            attempt_id,
+            child_identity,
+            reply_ack_id: optional_uuid(encoded[84], &encoded[160..176])?,
+            committed_records: read_broker_be_u64(&encoded[176..184]),
+            committed_wal_bytes: read_broker_be_u64(&encoded[184..192]),
+            committed_head_bytes: read_broker_be_u64(&encoded[192..200]),
+            append_authority_withheld: match encoded[85] {
+                0 => false,
+                1 => true,
+                _ => return Err(BrokerControlProtocolError::InvalidShape),
+            },
+            head_reconciliation_required: match encoded[86] {
+                0 => false,
+                1 => true,
+                _ => return Err(BrokerControlProtocolError::InvalidShape),
+            },
+            effects_disabled: match encoded[87] {
+                0 => false,
+                1 => true,
+                _ => return Err(BrokerControlProtocolError::InvalidShape),
+            },
+            pty_available: match encoded[200] {
+                0 => false,
+                1 => true,
+                _ => return Err(BrokerControlProtocolError::InvalidShape),
+            },
+            lease_available: match encoded[201] {
+                0 => false,
+                1 => true,
+                _ => return Err(BrokerControlProtocolError::InvalidShape),
+            },
+            output_replay_available: match encoded[202] {
+                0 => false,
+                1 => true,
+                _ => return Err(BrokerControlProtocolError::InvalidShape),
+            },
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+}
+
+/// One immutable, authenticated page of the broker's recovery census.
+#[derive(Debug, Eq, PartialEq)]
+pub struct BrokerCensusPageV1 {
+    snapshot_id: Uuid,
+    entries: Vec<BrokerCensusEntryV1>,
+    next_cursor: Option<u64>,
+    total_entries: u64,
+}
+
+impl BrokerCensusPageV1 {
+    #[must_use]
+    pub const fn snapshot_id(&self) -> Uuid {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[BrokerCensusEntryV1] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub const fn next_cursor(&self) -> Option<u64> {
+        self.next_cursor
+    }
+
+    #[must_use]
+    pub const fn total_entries(&self) -> u64 {
+        self.total_entries
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, BrokerControlProtocolError> {
+        self.validate()?;
+        let entries_bytes = self
+            .entries
+            .len()
+            .checked_mul(BROKER_CONTROL_CENSUS_ENTRY_BYTES)
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        let total_bytes = BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
+            .checked_add(entries_bytes)
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        if total_bytes > BROKER_CONTROL_MAX_PAYLOAD_BYTES {
+            return Err(BrokerControlProtocolError::CapacityExhausted);
+        }
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(total_bytes)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        encoded.resize(BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES, 0);
+        encoded[0..4].copy_from_slice(&BROKER_CONTROL_CENSUS_PAGE_MAGIC);
+        encoded[4..6].copy_from_slice(&BROKER_CONTROL_CENSUS_PAGE_VERSION.to_be_bytes());
+        encoded[6..8].copy_from_slice(
+            &u16::try_from(BROKER_CONTROL_CENSUS_ENTRY_BYTES)
+                .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?
+                .to_be_bytes(),
+        );
+        encoded[8..24].copy_from_slice(self.snapshot_id.as_bytes());
+        encoded[24..32].copy_from_slice(&self.total_entries.to_be_bytes());
+        encoded[32..40].copy_from_slice(
+            &self
+                .next_cursor
+                .unwrap_or(BROKER_CONTROL_CENSUS_NO_CURSOR)
+                .to_be_bytes(),
+        );
+        encoded[40..42].copy_from_slice(
+            &u16::try_from(self.entries.len())
+                .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?
+                .to_be_bytes(),
+        );
+        for entry in &self.entries {
+            encoded.extend_from_slice(&entry.encode()?);
+        }
+        Ok(encoded)
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, BrokerControlProtocolError> {
+        if encoded.len() < BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
+            || encoded.len() > BROKER_CONTROL_MAX_PAYLOAD_BYTES
+            || encoded[0..4] != BROKER_CONTROL_CENSUS_PAGE_MAGIC
+            || read_broker_be_u16(&encoded[4..6]) != BROKER_CONTROL_CENSUS_PAGE_VERSION
+            || usize::from(read_broker_be_u16(&encoded[6..8]))
+                != BROKER_CONTROL_CENSUS_ENTRY_BYTES
+            || encoded[42..48] != [0; 6]
+        {
+            return Err(BrokerControlProtocolError::InvalidLength);
+        }
+        let entry_count = usize::from(read_broker_be_u16(&encoded[40..42]));
+        let expected_bytes = BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
+            .checked_add(
+                entry_count
+                    .checked_mul(BROKER_CONTROL_CENSUS_ENTRY_BYTES)
+                    .ok_or(BrokerControlProtocolError::CapacityExhausted)?,
+            )
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        if encoded.len() != expected_bytes {
+            return Err(BrokerControlProtocolError::InvalidLength);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(entry_count)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        for row in encoded[BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES..]
+            .chunks_exact(BROKER_CONTROL_CENSUS_ENTRY_BYTES)
+        {
+            entries.push(BrokerCensusEntryV1::decode(row)?);
+        }
+        let encoded_next_cursor = read_broker_be_u64(&encoded[32..40]);
+        let page = Self {
+            snapshot_id: read_broker_uuid(&encoded[8..24]),
+            entries,
+            next_cursor: (encoded_next_cursor != BROKER_CONTROL_CENSUS_NO_CURSOR)
+                .then_some(encoded_next_cursor),
+            total_entries: read_broker_be_u64(&encoded[24..32]),
+        };
+        page.validate()?;
+        Ok(page)
+    }
+
+    fn validate(&self) -> Result<(), BrokerControlProtocolError> {
+        if self.snapshot_id.is_nil()
+            || self.total_entries
+                > u64::try_from(GUARDIAN_MAX_PANES)
+                    .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?
+            || u64::try_from(self.entries.len())
+                .ok()
+                .is_none_or(|entries| entries > self.total_entries)
+            || self
+                .next_cursor
+                .is_some_and(|cursor| cursor == BROKER_CONTROL_CENSUS_NO_CURSOR || cursor > self.total_entries)
+            || self
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].durable_pane_id.as_bytes() >= pair[1].durable_pane_id.as_bytes())
+        {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        }
+        for entry in &self.entries {
+            entry.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validate_for_request(
+        &self,
+        request: BrokerCensusPageRequestV1,
+    ) -> Result<(), BrokerControlProtocolError> {
+        request.validate()?;
+        let snapshot_identity_matches = request.cursor == 0 && request.snapshot_id.is_nil()
+            || request.snapshot_id == self.snapshot_id;
+        if !snapshot_identity_matches {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        let start = request.cursor;
+        let page_entries = u64::try_from(self.entries.len())
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        let end = start
+            .checked_add(page_entries)
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        let expected_next_cursor = (end < self.total_entries).then_some(end);
+        let encoded_bytes = BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
+            .checked_add(
+                self.entries
+                    .len()
+                    .checked_mul(BROKER_CONTROL_CENSUS_ENTRY_BYTES)
+                    .ok_or(BrokerControlProtocolError::CapacityExhausted)?,
+            )
+            .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
+        if start > self.total_entries
+            || end > self.total_entries
+            || (page_entries == 0 && start < self.total_entries)
+            || self.next_cursor != expected_next_cursor
+            || self.entries.len() > usize::from(request.max_entries)
+            || encoded_bytes
+                > usize::try_from(request.max_bytes)
+                    .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?
+        {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        }
+        Ok(())
+    }
+
+    fn validate_for_mux(
+        &self,
+        mux_incarnation: Uuid,
+    ) -> Result<(), BrokerControlProtocolError> {
+        if mux_incarnation.is_nil()
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.mux_incarnation != mux_incarnation)
+        {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        Ok(())
     }
 }
 
@@ -10965,6 +12067,171 @@ mod tests {
     }
 
     #[test]
+    fn recovery_census_codec_is_canonical_bounded_and_request_correlated() {
+        let first_request = BrokerCensusPageRequestV1::new(
+            Uuid::nil(),
+            0,
+            1,
+            u32::try_from(
+                BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES + BROKER_CONTROL_CENSUS_ENTRY_BYTES,
+            )
+            .expect("single-row Census page bytes"),
+        )
+        .expect("canonical first Census request");
+        assert_eq!(
+            BrokerCensusPageRequestV1::decode(&first_request.encode())
+                .expect("decode first Census request"),
+            first_request
+        );
+        let continuation = BrokerCensusPageRequestV1::new(
+            id(760),
+            1,
+            2,
+            u32::try_from(
+                BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES + BROKER_CONTROL_CENSUS_ENTRY_BYTES * 2,
+            )
+            .expect("two-row Census page bytes"),
+        )
+        .expect("canonical continuation Census request");
+        assert_eq!(
+            BrokerCensusPageRequestV1::decode(&continuation.encode())
+                .expect("decode continuation Census request"),
+            continuation
+        );
+        assert!(matches!(
+            BrokerCensusPageRequestV1::new(
+                Uuid::nil(),
+                1,
+                1,
+                u32::try_from(
+                    BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
+                        + BROKER_CONTROL_CENSUS_ENTRY_BYTES,
+                )
+                .expect("single-row Census page bytes"),
+            ),
+            Err(BrokerControlClientError::Protocol)
+        ));
+        assert!(matches!(
+            BrokerCensusPageRequestV1::new(
+                id(761),
+                0,
+                1,
+                u32::try_from(
+                    BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
+                        + BROKER_CONTROL_CENSUS_ENTRY_BYTES,
+                )
+                .expect("single-row Census page bytes"),
+            ),
+            Err(BrokerControlClientError::Protocol)
+        ));
+
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xb1);
+        let identity = recovered_catalog_identity(&authenticator, 0x51);
+        let (_catalog, journals) = recover_header_only_catalog_journals(
+            directory.path(),
+            &[identity],
+            &authenticator,
+        );
+        let admitted = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("admit one header-only Census fixture");
+        let entries = admitted
+            .recovery_census_entries()
+            .expect("classify one header-only Census row");
+        let [entry] = entries.as_slice() else {
+            panic!("expected one header-only Census row")
+        };
+        assert_eq!(
+            entry.disposition,
+            BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly
+        );
+        assert!(entry.effects_disabled);
+        assert!(!entry.pty_available);
+        assert!(!entry.lease_available);
+        assert!(!entry.output_replay_available);
+        let encoded_entry = entry.encode().expect("encode canonical Census row");
+        assert_eq!(
+            BrokerCensusEntryV1::decode(&encoded_entry).expect("decode canonical Census row"),
+            *entry
+        );
+        let mut enabled_effects = encoded_entry;
+        enabled_effects[87] = 0;
+        assert!(matches!(
+            BrokerCensusEntryV1::decode(&enabled_effects),
+            Err(BrokerControlProtocolError::InvalidIdentity)
+        ));
+        let mut forged_pty = encoded_entry;
+        forged_pty[200] = 1;
+        assert!(matches!(
+            BrokerCensusEntryV1::decode(&forged_pty),
+            Err(BrokerControlProtocolError::InvalidIdentity)
+        ));
+        let mut noncanonical_reserved = encoded_entry;
+        noncanonical_reserved[223] = 1;
+        assert!(matches!(
+            BrokerCensusEntryV1::decode(&noncanonical_reserved),
+            Err(BrokerControlProtocolError::InvalidLength)
+        ));
+
+        let snapshot_id = id(762);
+        let page = BrokerCensusPageV1 {
+            snapshot_id,
+            entries,
+            next_cursor: None,
+            total_entries: 1,
+        };
+        let encoded_page = page.encode().expect("encode canonical Census page");
+        let decoded_page =
+            BrokerCensusPageV1::decode(&encoded_page).expect("decode canonical Census page");
+        decoded_page
+            .validate_for_request(first_request)
+            .expect("correlate canonical first Census response");
+        decoded_page
+            .validate_for_mux(identity.mux_incarnation())
+            .expect("bind canonical Census response to its mux");
+        assert_eq!(decoded_page, page);
+
+        let mut cross_mux_entry = *entry;
+        cross_mux_entry.mux_incarnation = id(764);
+        let cross_mux_page = BrokerCensusPageV1 {
+            snapshot_id,
+            entries: vec![cross_mux_entry],
+            next_cursor: None,
+            total_entries: 1,
+        };
+        assert!(matches!(
+            cross_mux_page.validate_for_mux(identity.mux_incarnation()),
+            Err(BrokerControlProtocolError::InvalidIdentity)
+        ));
+
+        let mut forged_cursor = encoded_page.clone();
+        forged_cursor[32..40].copy_from_slice(&0_u64.to_be_bytes());
+        let forged_cursor =
+            BrokerCensusPageV1::decode(&forged_cursor).expect("decode structurally valid cursor");
+        assert!(matches!(
+            forged_cursor.validate_for_request(first_request),
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+        let continuation_request = BrokerCensusPageRequestV1::new(
+            snapshot_id,
+            1,
+            1,
+            first_request.max_bytes(),
+        )
+        .expect("canonical continuation request");
+        let forged_snapshot = BrokerCensusPageV1 {
+            snapshot_id: id(763),
+            entries: vec![*entry],
+            next_cursor: None,
+            total_entries: 2,
+        };
+        assert!(matches!(
+            forged_snapshot.validate_for_request(continuation_request),
+            Err(BrokerControlProtocolError::InvalidIdentity)
+        ));
+    }
+
+    #[test]
     fn exec_bootstrap_codec_binds_attempt_payload_and_message_direction() {
         fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<BrokerExecBootstrapWireFrameV1>();
@@ -11621,7 +12888,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_process_control_loop_authenticates_recovers_hello_and_rejects_effects() {
+    fn broker_process_control_loop_exposes_empty_recovery_census_and_rejects_pty_effects() {
         let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
             .expect("create broker service test root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
@@ -11660,10 +12927,28 @@ mod tests {
         assert_eq!(client.broker_incarnation(), broker_incarnation);
         assert!(!client.recovered_hello());
 
-        let census = BrokerControlRequestV1::new(
+        let page_request = BrokerCensusPageRequestV1::new(
+            Uuid::nil(),
+            0,
+            16,
+            u32::try_from(
+                BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES + BROKER_CONTROL_CENSUS_ENTRY_BYTES * 16,
+            )
+            .expect("bounded Census page bytes"),
+        )
+        .expect("canonical first Census page request");
+        let census = client
+            .census_page_with_request_id(id(743), page_request)
+            .expect("read empty immutable recovery Census");
+        assert!(!census.snapshot_id().is_nil());
+        assert_eq!(census.total_entries(), 0);
+        assert!(census.entries().is_empty());
+        assert_eq!(census.next_cursor(), None);
+
+        let rejected_spawn = BrokerControlRequestV1::new(
             BrokerControlRequestHeaderV1 {
-                operation: BrokerControlOperationV1::Census,
-                request_id: id(743),
+                operation: BrokerControlOperationV1::Spawn,
+                request_id: id(746),
                 broker_incarnation,
                 guardian_incarnation: connection_identity.guardian_incarnation,
                 connection_id: client.connection_id,
@@ -11672,19 +12957,27 @@ mod tests {
                     .guardian_build_identity
                     .into_bytes(),
                 mux_build_identity_digest: connection_identity.mux_build_identity.into_bytes(),
-                durable_pane_id: Uuid::nil(),
+                durable_pane_id: id(747),
                 lease_generation: 0,
-                operation_id: Uuid::nil(),
+                operation_id: id(748),
             },
-            &[],
+            &[0x01],
         )
-        .expect("canonical production-disabled Census");
-        let census_response = client.exchange(&census).expect("bounded Census rejection");
+        .expect("canonical still-disabled Spawn request");
+        let spawn_response = client
+            .exchange(&rejected_spawn)
+            .expect("bounded Spawn rejection");
         assert_eq!(
-            census_response.header.status,
+            spawn_response.header.status,
             BrokerControlResponseStatusV1::Rejected
         );
-        assert_eq!(census_response.payload(), &[] as &[u8]);
+        assert_eq!(spawn_response.payload(), &[] as &[u8]);
+        assert_eq!(
+            client
+                .query_recovered_spawn(id(747), id(748))
+                .expect("query absent recovered Spawn identity"),
+            None
+        );
 
         let lost_hello_request_id = id(744);
         let lost_connection_id = id(745);
@@ -11748,6 +13041,298 @@ mod tests {
         drop(recovered);
         drop(client);
         service.finish();
+    }
+
+    #[test]
+    fn broker_recovery_census_is_mux_scoped_paginated_owner_fenced_and_restartable() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create paginated recovery Census root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set paginated recovery Census root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create paginated recovery Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set paginated recovery Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision paginated recovery token");
+        let secret = crate::transport::load_guardian_secret(&token_path)
+            .expect("load paginated recovery token");
+        let authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive paginated recovery WAL authority");
+        let shared_mux_incarnation = id(6_200);
+        let other_mux_incarnation = id(6_201);
+        let mut first = recovered_catalog_identity(&authenticator, 0x61);
+        let mut second = recovered_catalog_identity(&authenticator, 0x62);
+        let mut third = recovered_catalog_identity(&authenticator, 0x63);
+        let mut other = recovered_catalog_identity(&authenticator, 0x64);
+        first.mux_incarnation = shared_mux_incarnation;
+        second.mux_incarnation = shared_mux_incarnation;
+        third.mux_incarnation = shared_mux_incarnation;
+        other.mux_incarnation = other_mux_incarnation;
+        let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
+            .expect("open paginated recovery Spawn catalog");
+        for identity in [third, other, first, second] {
+            drop(
+                catalog
+                    .create_spawn_journal(identity, authenticator.clone())
+                    .expect("create paginated recovery header-only journal"),
+            );
+        }
+        drop(catalog);
+
+        let broker_build = sealed(0xb2);
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path.clone(),
+            spawn_catalog_path,
+            broker_build,
+            4,
+            Duration::from_millis(5),
+        )
+        .expect("valid paginated recovery service config");
+        let service = bind_test_service_after_owner_drop(&config)
+            .expect("bind paginated recovery service");
+        let service = TestBrokerControlService::start(service);
+        let first_connection = BrokerGuardianConnectionIdentityV1::new(
+            id(6_202),
+            shared_mux_incarnation,
+            sealed(0xb3),
+            sealed(0xb4),
+        )
+        .expect("valid first paginated recovery connection");
+        let second_connection = BrokerGuardianConnectionIdentityV1::new(
+            id(6_203),
+            shared_mux_incarnation,
+            sealed(0xb5),
+            sealed(0xb4),
+        )
+        .expect("valid second paginated recovery connection");
+        let mut first_client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            first_connection,
+            broker_build,
+        )
+        .expect("connect first paginated recovery client");
+        let mut second_client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            second_connection,
+            broker_build,
+        )
+        .expect("connect second paginated recovery client");
+        let one_row_bytes = u32::try_from(
+            BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES + BROKER_CONTROL_CENSUS_ENTRY_BYTES,
+        )
+        .expect("single-row Census byte bound");
+        let first_page_request =
+            BrokerCensusPageRequestV1::new(Uuid::nil(), 0, 1, one_row_bytes)
+                .expect("valid first paginated Census request");
+        let first_page = first_client
+            .census_page(first_page_request)
+            .expect("read first paginated recovery page");
+        assert_eq!(first_page.total_entries(), 3);
+        assert_eq!(first_page.entries().len(), 1);
+        assert_eq!(
+            first_page.entries()[0].durable_pane_id,
+            first.durable_pane_id()
+        );
+        assert_eq!(first_page.entries()[0].mux_incarnation, shared_mux_incarnation);
+        assert_eq!(first_page.next_cursor(), Some(1));
+        let original_snapshot_id = first_page.snapshot_id();
+
+        let stolen_continuation = BrokerCensusPageRequestV1::new(
+            original_snapshot_id,
+            1,
+            1,
+            one_row_bytes,
+        )
+        .expect("valid cross-owner continuation shape");
+        assert!(matches!(
+            second_client.census_page(stolen_continuation),
+            Err(BrokerControlClientError::CensusAuthorityConflict)
+        ));
+        second_client
+            .census_page(first_page_request)
+            .expect("authority conflict does not poison a fresh Census request");
+
+        let second_page = first_client
+            .census_page(stolen_continuation)
+            .expect("read second paginated recovery page");
+        assert_eq!(second_page.entries().len(), 1);
+        assert_eq!(
+            second_page.entries()[0].durable_pane_id,
+            second.durable_pane_id()
+        );
+        assert_eq!(second_page.next_cursor(), Some(2));
+
+        let replacement_page = first_client
+            .census_page(first_page_request)
+            .expect("replace owner snapshot with a fresh immutable snapshot");
+        assert_ne!(replacement_page.snapshot_id(), original_snapshot_id);
+        let expired_continuation = BrokerCensusPageRequestV1::new(
+            original_snapshot_id,
+            2,
+            1,
+            one_row_bytes,
+        )
+        .expect("valid expired continuation shape");
+        assert!(matches!(
+            first_client.census_page(expired_continuation),
+            Err(BrokerControlClientError::CensusSnapshotUnavailable)
+        ));
+        assert!(
+            first_client
+                .census_page(first_page_request)
+                .is_ok(),
+            "an expired snapshot response poisoned a valid cursor-zero restart"
+        );
+        assert_eq!(
+            first_client
+                .query_recovered_spawn(other.durable_pane_id(), other.spawn_effect_id())
+                .expect("query cross-mux recovered identity"),
+            None,
+            "one mux connection observed another mux's recovered Spawn row"
+        );
+
+        let other_connection = BrokerGuardianConnectionIdentityV1::new(
+            id(6_204),
+            other_mux_incarnation,
+            sealed(0xb6),
+            sealed(0xb7),
+        )
+        .expect("valid other-mux recovery connection");
+        let mut other_client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            other_connection,
+            broker_build,
+        )
+        .expect("connect other-mux recovery client");
+        let other_page = other_client
+            .census_page(first_page_request)
+            .expect("read other-mux recovery Census");
+        assert_eq!(other_page.total_entries(), 1);
+        assert_eq!(other_page.entries().len(), 1);
+        assert_eq!(other_page.entries()[0].durable_pane_id, other.durable_pane_id());
+
+        drop(other_client);
+        drop(second_client);
+        drop(first_client);
+        service.finish();
+    }
+
+    #[test]
+    fn ambiguous_control_exchange_permanently_poisoned_the_connection_before_retry() {
+        let client_authority = control_authenticator(0xbc);
+        let server_authority = control_authenticator(0xbc);
+        let connection_identity = BrokerGuardianConnectionIdentityV1::new(
+            id(6_220),
+            id(6_221),
+            sealed(0xbd),
+            sealed(0xbe),
+        )
+        .expect("valid poisoned-exchange connection identity");
+        let connection_id = id(6_222);
+        let broker_incarnation = id(6_223);
+        let durable_pane_id = id(6_224);
+        let operation_id = id(6_225);
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::QueryEffect,
+                request_id: id(6_226),
+                broker_incarnation,
+                guardian_incarnation: connection_identity.guardian_incarnation,
+                connection_id,
+                mux_incarnation: connection_identity.mux_incarnation,
+                guardian_build_identity_digest: connection_identity
+                    .guardian_build_identity
+                    .into_bytes(),
+                mux_build_identity_digest: connection_identity.mux_build_identity.into_bytes(),
+                durable_pane_id,
+                lease_generation: 0,
+                operation_id,
+            },
+            &[],
+        )
+        .expect("canonical lost-reply QueryEffect request");
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair()
+            .expect("create poisoned-exchange socket pair");
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("set short poisoned-exchange client timeout");
+        client_stream
+            .set_write_timeout(Some(Duration::from_millis(10)))
+            .expect("set poisoned-exchange client write timeout");
+        let server = thread::spawn(move || {
+            let frame = read_blocking_broker_control_frame(
+                &mut server_stream,
+                BROKER_CONTROL_REQUEST_FIXED_BYTES,
+            )
+            .expect("read one lost-reply request");
+            let decoded = decode_broker_control_request(&server_authority, &frame)
+                .expect("decode one lost-reply request");
+            thread::sleep(Duration::from_millis(50));
+            let response = BrokerControlResponseV1::new(
+                BrokerControlResponseHeaderV1 {
+                    operation: decoded.header.operation,
+                    status: BrokerControlResponseStatusV1::Rejected,
+                    request_id: decoded.header.request_id,
+                    broker_incarnation,
+                    guardian_incarnation: decoded.header.guardian_incarnation,
+                    connection_id: decoded.header.connection_id,
+                    durable_pane_id: decoded.header.durable_pane_id,
+                    lease_generation: decoded.header.lease_generation,
+                    operation_id: decoded.header.operation_id,
+                    child_identity: None,
+                    output_sequence_start: 0,
+                    output_sequence_end: 0,
+                },
+                &[],
+            )
+            .expect("construct delayed lost-reply response");
+            let response = encode_broker_control_response(&server_authority, &response)
+                .expect("encode delayed lost-reply response");
+            server_stream
+                .write_all(response.as_slice())
+                .expect("write delayed lost-reply response");
+            server_stream
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .expect("set duplicate-request observation timeout");
+            let mut duplicate = [0_u8; 1];
+            let error = server_stream
+                .read_exact(&mut duplicate)
+                .expect_err("poisoned client sent a duplicate request on the ambiguous stream");
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut
+            ));
+        });
+        let mut client = BrokerControlClientV1 {
+            stream: client_stream,
+            control_authenticator: client_authority,
+            identity: connection_identity,
+            connection_id,
+            broker_incarnation,
+            recovered_hello: false,
+            poisoned: false,
+        };
+        let first_error = client
+            .exchange(&request)
+            .expect_err("delayed response must cross the client timeout");
+        assert!(matches!(
+            first_error,
+            BrokerControlClientError::Io(ref error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+        ));
+        assert!(matches!(
+            client.exchange(&request),
+            Err(BrokerControlClientError::ConnectionPoisoned)
+        ));
+        server.join().expect("join delayed-response broker fixture");
     }
 
     #[test]
@@ -12650,7 +14235,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_service_refuses_recovered_lifecycle_before_head_reconciliation_or_socket_bind() {
+    fn broker_service_exposes_recovered_lifecycle_read_only_without_head_reconciliation() {
         let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
             .expect("create broker lifecycle-refusal root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
@@ -12669,6 +14254,8 @@ mod tests {
             .broker_spawn_wal_authenticator()
             .expect("derive lifecycle-refusal WAL authority");
         let identity = recovered_catalog_identity(&authenticator, 14);
+        let wal_path =
+            spawn_catalog_path.join(broker_spawn_catalog_wal_name(identity.journal_id()));
         let head_path =
             spawn_catalog_path.join(broker_spawn_catalog_head_name(identity.journal_id()));
         let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
@@ -12683,35 +14270,169 @@ mod tests {
         ));
         drop(journal);
         drop(catalog);
-        let head_before_refusal =
-            fs::read(&head_path).expect("read lifecycle-refusal head before bind");
+        let wal_before_bind = fs::read(&wal_path).expect("read recovered lifecycle WAL before bind");
+        let head_before_bind =
+            fs::read(&head_path).expect("read recovered lifecycle head before bind");
         assert_eq!(
-            u64::try_from(head_before_refusal.len()).expect("lifecycle-refusal head length"),
+            u64::try_from(head_before_bind.len()).expect("recovered lifecycle head length"),
             BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
         );
 
+        let broker_build = sealed(0xa8);
         let config = BrokerControlServiceConfigV1::new(
             socket_path.clone(),
-            token_path,
-            spawn_catalog_path,
-            sealed(0xa8),
+            token_path.clone(),
+            spawn_catalog_path.clone(),
+            broker_build,
             4,
             Duration::from_millis(5),
         )
-        .expect("valid lifecycle-refusal service config");
-        match bind_test_service_after_owner_drop(&config) {
-            Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported) => {}
-            Err(error) => panic!("lifecycle refusal returned the wrong error: {error:?}"),
-            Ok(_) => panic!("lifecycle refusal unexpectedly bound the broker service"),
-        }
+        .expect("valid recovered-lifecycle service config");
+        let service = bind_test_service_after_owner_drop(&config)
+            .expect("bind read-only service over recovered lifecycle");
+        let broker_incarnation = service.incarnation();
         assert_eq!(
-            fs::read(&head_path).expect("read lifecycle-refusal head after bind"),
-            head_before_refusal,
-            "unsupported lifecycle changed durable head bytes before refusal"
+            fs::read(&wal_path).expect("read recovered lifecycle WAL after bind"),
+            wal_before_bind,
+            "read-only bind changed durable WAL bytes"
         );
-        assert!(
-            !socket_path.exists(),
-            "unsupported lifecycle bound a broker socket before refusal"
+        assert_eq!(
+            fs::read(&head_path).expect("read recovered lifecycle head after bind"),
+            head_before_bind,
+            "read-only bind reconciled durable head bytes"
+        );
+        assert!(socket_path.exists(), "read-only broker did not bind its socket");
+        let service = TestBrokerControlService::start(service);
+
+        let connection_identity = BrokerGuardianConnectionIdentityV1::new(
+            id(6_100),
+            identity.mux_incarnation(),
+            sealed(0xa9),
+            sealed(0xaa),
+        )
+        .expect("valid recovered-lifecycle connection identity");
+        let mut client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            connection_identity,
+            broker_build,
+        )
+        .expect("connect to read-only recovered-lifecycle broker");
+        assert_eq!(client.broker_incarnation(), broker_incarnation);
+
+        let page_request = BrokerCensusPageRequestV1::new(
+            Uuid::nil(),
+            0,
+            1,
+            u32::try_from(
+                BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES + BROKER_CONTROL_CENSUS_ENTRY_BYTES,
+            )
+            .expect("single-row Census byte bound"),
+        )
+        .expect("valid first recovered-lifecycle Census request");
+        let page = client
+            .census_page(page_request)
+            .expect("read recovered lifecycle Census row");
+        assert_eq!(page.total_entries(), 1);
+        assert_eq!(page.next_cursor(), None);
+        let [entry] = page.entries() else {
+            panic!("expected one recovered lifecycle Census row")
+        };
+        assert_eq!(entry.journal_id, identity.journal_id());
+        assert_eq!(entry.mux_incarnation, identity.mux_incarnation());
+        assert_eq!(entry.durable_pane_id, identity.durable_pane_id());
+        assert_eq!(entry.spawn_effect_id, identity.spawn_effect_id());
+        assert_eq!(entry.origin_request_id, identity.origin_request_id());
+        assert_eq!(entry.phase, Some(BrokerSpawnWalPhaseV1::Intent));
+        assert_eq!(
+            entry.disposition,
+            BrokerRecoveredPaneDispositionV1::IntentEffectsDisabled
+        );
+        assert!(entry.append_authority_withheld);
+        assert!(entry.head_reconciliation_required);
+        assert!(entry.effects_disabled);
+        assert!(!entry.pty_available);
+        assert!(!entry.lease_available);
+        assert!(!entry.output_replay_available);
+
+        assert_eq!(
+            client
+                .query_recovered_spawn(identity.durable_pane_id(), identity.spawn_effect_id())
+                .expect("query exact recovered Spawn identity"),
+            Some(*entry)
+        );
+        assert_eq!(
+            client
+                .query_recovered_spawn(identity.durable_pane_id(), id(6_101))
+                .expect("query absent recovered Spawn identity"),
+            None
+        );
+
+        let sentinel = root.path().join("recovered-census-must-not-exec");
+        let spawn_payload = command_payload("printf must-not-run", &sentinel);
+        let authenticated = BrokerAuthenticatedGuardianConnectionV1 {
+            broker_incarnation,
+            owner: BrokerGuardianOwnerIdentity {
+                guardian_incarnation: connection_identity.guardian_incarnation,
+                connection_id: client.connection_id,
+                mux_incarnation: connection_identity.mux_incarnation,
+                mux_build_identity_digest: connection_identity.mux_build_identity.into_bytes(),
+                guardian_build_identity_digest: connection_identity
+                    .guardian_build_identity
+                    .into_bytes(),
+            },
+        };
+        let binding = binding_for(&spawn_payload, &authenticated);
+        let control_spawn = BrokerSpawnControlRequestV1::from_parts(
+            id(6_102),
+            id(6_103),
+            [0xab; BROKER_CATALOG_CHECKSUM_BYTES],
+            binding,
+            spawn_payload,
+        )
+        .expect("valid disabled Spawn control payload");
+        let encoded_spawn = control_spawn
+            .encode()
+            .expect("encode disabled Spawn control payload");
+        let spawn_request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Spawn,
+                request_id: id(6_104),
+                broker_incarnation,
+                guardian_incarnation: connection_identity.guardian_incarnation,
+                connection_id: client.connection_id,
+                mux_incarnation: connection_identity.mux_incarnation,
+                guardian_build_identity_digest: connection_identity
+                    .guardian_build_identity
+                    .into_bytes(),
+                mux_build_identity_digest: connection_identity.mux_build_identity.into_bytes(),
+                durable_pane_id: binding.durable_pane_id,
+                lease_generation: 0,
+                operation_id: binding.spawn_effect_id,
+            },
+            &encoded_spawn,
+        )
+        .expect("canonical disabled Spawn request");
+        let spawn_response = client
+            .exchange(&spawn_request)
+            .expect("receive disabled Spawn rejection");
+        assert_eq!(
+            spawn_response.header.status,
+            BrokerControlResponseStatusV1::Rejected
+        );
+        assert!(!sentinel.exists(), "recovery visibility executed a child");
+
+        drop(client);
+        service.finish();
+        assert_eq!(
+            fs::read(&wal_path).expect("read recovered lifecycle WAL after queries"),
+            wal_before_bind,
+            "recovery visibility appended a lifecycle record"
+        );
+        assert_eq!(
+            fs::read(&head_path).expect("read recovered lifecycle head after queries"),
+            head_before_bind,
+            "recovery visibility reconciled the durable head"
         );
     }
 
