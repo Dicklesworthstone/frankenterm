@@ -7124,10 +7124,7 @@ struct ExactCheckpointArtifactWriter<'a> {
 }
 
 impl<'a> ExactCheckpointArtifactWriter<'a> {
-    fn new(
-        expected: &'a [u8],
-        limit: u64,
-    ) -> Result<Self, CheckpointScrollbackArtifactError> {
+    fn new(expected: &'a [u8], limit: u64) -> Result<Self, CheckpointScrollbackArtifactError> {
         let limit = usize::try_from(limit).map_err(|_| {
             CheckpointScrollbackArtifactError::InvalidLimits(
                 "artifact byte limit does not fit this platform".to_string(),
@@ -9115,8 +9112,7 @@ fn publish_checkpoint_artifact_noreplace(
     checkpoint_artifact_noreplace_unsupported()
 }
 
-fn checkpoint_artifact_noreplace_unsupported()
--> Result<(), CheckpointScrollbackArtifactError> {
+fn checkpoint_artifact_noreplace_unsupported() -> Result<(), CheckpointScrollbackArtifactError> {
     Err(CheckpointScrollbackArtifactError::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "atomic no-replace artifact publication is unsupported on this platform",
@@ -9298,9 +9294,7 @@ fn checkpoint_artifact_existing_target_matches(
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let mut file = parent.open_with(leaf, &options)?;
-    if !checkpoint_artifact_open_file_matches_expected(
-        parent, leaf, &mut file, bytes, true,
-    )? {
+    if !checkpoint_artifact_open_file_matches_expected(parent, leaf, &mut file, bytes, true)? {
         return Err(CheckpointScrollbackArtifactError::AlreadyExists);
     }
     sync_checkpoint_artifact_directory(parent)?;
@@ -9437,9 +9431,7 @@ fn publish_checkpoint_artifact_bytes_with_fault(
         &file.metadata()?,
         Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
     )?;
-    if !checkpoint_artifact_open_file_matches_expected(
-        &parent, &leaf, &mut file, bytes, true,
-    )? {
+    if !checkpoint_artifact_open_file_matches_expected(&parent, &leaf, &mut file, bytes, true)? {
         return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
             "published artifact bytes differ from the synchronized staging inode".to_string(),
         ));
@@ -9447,20 +9439,21 @@ fn publish_checkpoint_artifact_bytes_with_fault(
     Ok(CheckpointArtifactPublicationOutcome::Published)
 }
 
-/// Construct, atomically publish, reread, and independently verify one artifact.
-///
-/// The source database is observed through one pinned read-only SQLite
-/// transaction. The final path is never overwritten: bytes are synchronized in
-/// a private sibling staging file and published with a no-replace rename before
-/// the parent directory is synchronized.
-pub fn write_checkpoint_scrollback_artifact(
+struct PreparedCheckpointArtifactPublication {
+    bytes: Vec<u8>,
+    checkpoint_id: i64,
+    payload_sha256: String,
+    artifact_sha256: String,
+    artifact_bytes: u64,
+}
+
+fn prepare_checkpoint_scrollback_artifact_publication(
     db_path: &str,
     checkpoint_id: i64,
-    output_path: &Path,
     limits: CheckpointScrollbackArtifactLimits,
-) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
-    let limits = limits.validate()?;
+) -> Result<PreparedCheckpointArtifactPublication, CheckpointScrollbackArtifactError> {
     let payload = build_checkpoint_scrollback_payload(db_path, checkpoint_id, limits)?;
+    validate_checkpoint_scrollback_payload(&payload, limits)?;
     let payload_sha256 = hash_checkpoint_artifact_json(&payload, limits.max_artifact_bytes)?;
     let artifact = CheckpointScrollbackArtifact {
         schema: CHECKPOINT_SCROLLBACK_ARTIFACT_SCHEMA.to_string(),
@@ -9468,13 +9461,50 @@ pub fn write_checkpoint_scrollback_artifact(
         payload_sha256: payload_sha256.clone(),
         payload,
     };
-    validate_checkpoint_scrollback_payload(&artifact.payload, limits)?;
     let bytes = serialize_checkpoint_artifact(&artifact, limits.max_artifact_bytes)?;
-    publish_checkpoint_artifact_bytes(output_path, &bytes)?;
+    let artifact_sha256 = checkpoint_artifact_sha256(&bytes);
+    let artifact_bytes = u64::try_from(bytes.len()).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact length does not fit u64".to_string(),
+        )
+    })?;
+
+    // The potentially content-heavy producer tree is not allowed to survive
+    // into publication.  The returned owner contains only one artifact-sized
+    // allocation plus scalar identities needed for the independent reread.
+    drop(artifact);
+    Ok(PreparedCheckpointArtifactPublication {
+        bytes,
+        checkpoint_id,
+        payload_sha256,
+        artifact_sha256,
+        artifact_bytes,
+    })
+}
+
+fn write_checkpoint_scrollback_artifact_with_hook(
+    db_path: &str,
+    checkpoint_id: i64,
+    output_path: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+    after_publication_buffer_drop: impl FnOnce(),
+) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
+    let limits = limits.validate()?;
+    let prepared =
+        prepare_checkpoint_scrollback_artifact_publication(db_path, checkpoint_id, limits)?;
+    publish_checkpoint_artifact_bytes(output_path, &prepared.bytes)?;
+    let expected_checkpoint_id = prepared.checkpoint_id;
+    let expected_payload_sha256 = prepared.payload_sha256;
+    let expected_artifact_sha256 = prepared.artifact_sha256;
+    let expected_artifact_bytes = prepared.artifact_bytes;
+    drop(prepared.bytes);
+    after_publication_buffer_drop();
+
     let mut receipt = verify_checkpoint_scrollback_artifact(output_path, limits)?;
-    if receipt.payload_sha256 != payload_sha256
-        || receipt.artifact_sha256 != checkpoint_artifact_sha256(&bytes)
-        || receipt.checkpoint_id != checkpoint_id
+    if receipt.payload_sha256 != expected_payload_sha256
+        || receipt.artifact_sha256 != expected_artifact_sha256
+        || receipt.artifact_bytes != expected_artifact_bytes
+        || receipt.checkpoint_id != expected_checkpoint_id
     {
         return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
             "published artifact reread differs from the constructed source".to_string(),
@@ -9484,51 +9514,107 @@ pub fn write_checkpoint_scrollback_artifact(
     Ok(receipt)
 }
 
+/// Construct, atomically publish, reread, and independently verify one artifact.
+///
+/// The source database is observed through one pinned read-only SQLite
+/// transaction. The final path is never overwritten: bytes are synchronized in
+/// a private sibling staging file and published with a no-replace rename before
+/// the parent directory is synchronized.
+///
+/// The producer's memory envelope contains at most the payload tree plus one
+/// bounded serialized buffer during construction.  The tree is dropped before
+/// publication, and that serialized buffer is dropped before the independent
+/// offline verifier rereads the file.
+pub fn write_checkpoint_scrollback_artifact(
+    db_path: &str,
+    checkpoint_id: i64,
+    output_path: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
+    write_checkpoint_scrollback_artifact_with_hook(
+        db_path,
+        checkpoint_id,
+        output_path,
+        limits,
+        || {},
+    )
+}
+
+fn verify_checkpoint_scrollback_artifact_bytes_with_hook(
+    bytes: Vec<u8>,
+    limits: CheckpointScrollbackArtifactLimits,
+    after_admitted_bytes_drop: impl FnOnce(),
+) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
+    let artifact_bytes = u64::try_from(bytes.len()).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact length does not fit u64".to_string(),
+        )
+    })?;
+    let artifact_sha256 = checkpoint_artifact_sha256(&bytes);
+    verify_checkpoint_artifact_json_structure(&bytes)?;
+    let artifact: CheckpointScrollbackArtifact = serde_json::from_slice(&bytes)
+        .map_err(|error| checkpoint_artifact_untrusted_json_error("JSON schema", &error))?;
+    if !checkpoint_artifact_has_canonical_encoding(&artifact, &bytes, limits.max_artifact_bytes)? {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact is not the one canonical pretty JSON encoding".to_string(),
+        ));
+    }
+
+    // Canonical comparison is streamed against the admitted slice.  Once it
+    // succeeds, the original file buffer is no longer needed: deep semantic,
+    // redaction, hash, gap, and topology validation retain only the decoded
+    // bounded tree rather than two artifact-sized owners.
+    drop(bytes);
+    after_admitted_bytes_drop();
+
+    let CheckpointScrollbackArtifact {
+        schema,
+        publication_state,
+        payload_sha256: declared_payload_sha256,
+        payload,
+    } = artifact;
+    if schema != CHECKPOINT_SCROLLBACK_ARTIFACT_SCHEMA || publication_state != "complete" {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact schema or publication state is unsupported".to_string(),
+        ));
+    }
+    let payload_sha256 = hash_checkpoint_artifact_json(&payload, limits.max_artifact_bytes)?;
+    if declared_payload_sha256 != payload_sha256 {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact payload checksum mismatch".to_string(),
+        ));
+    }
+    validate_checkpoint_scrollback_payload(&payload, limits)?;
+    Ok(CheckpointScrollbackArtifactReceipt {
+        schema,
+        capabilities: payload.capabilities,
+        checkpoint_id: payload.checkpoint.checkpoint_id,
+        checkpoint_state_hash: payload.checkpoint.state_hash.clone(),
+        created_at_epoch_ms: payload.created_at_epoch_ms,
+        payload_sha256,
+        artifact_sha256,
+        artifact_bytes,
+        pane_count: payload.summary.pane_count,
+        segment_count: payload.summary.segment_count,
+        content_bytes: payload.summary.content_bytes,
+        complete_pane_count: payload.summary.complete_pane_count,
+        durability: "private_regular_file_verified_offline",
+    })
+}
+
 /// Verify a private artifact without opening the source database or touching a mux.
+///
+/// Peak verifier ownership is the bounded admitted file buffer plus the decoded
+/// tree. Canonical equality is checked by a streaming serializer comparator,
+/// never by constructing a third artifact-sized buffer; the file buffer is
+/// then dropped before semantic validation.
 pub fn verify_checkpoint_scrollback_artifact(
     path: &Path,
     limits: CheckpointScrollbackArtifactLimits,
 ) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
     let limits = limits.validate()?;
     let bytes = read_checkpoint_artifact_bounded(path, limits.max_artifact_bytes)?;
-    verify_checkpoint_artifact_json_structure(&bytes)?;
-    let artifact: CheckpointScrollbackArtifact = serde_json::from_slice(&bytes)?;
-    let canonical = serialize_checkpoint_artifact(&artifact, limits.max_artifact_bytes)?;
-    if canonical != bytes {
-        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
-            "artifact is not the one canonical pretty JSON encoding".to_string(),
-        ));
-    }
-    if artifact.schema != CHECKPOINT_SCROLLBACK_ARTIFACT_SCHEMA
-        || artifact.publication_state != "complete"
-    {
-        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
-            "artifact schema or publication state is unsupported".to_string(),
-        ));
-    }
-    let payload_sha256 =
-        hash_checkpoint_artifact_json(&artifact.payload, limits.max_artifact_bytes)?;
-    if artifact.payload_sha256 != payload_sha256 {
-        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
-            "artifact payload checksum mismatch".to_string(),
-        ));
-    }
-    validate_checkpoint_scrollback_payload(&artifact.payload, limits)?;
-    Ok(CheckpointScrollbackArtifactReceipt {
-        schema: artifact.schema,
-        capabilities: artifact.payload.capabilities,
-        checkpoint_id: artifact.payload.checkpoint.checkpoint_id,
-        checkpoint_state_hash: artifact.payload.checkpoint.state_hash.clone(),
-        created_at_epoch_ms: artifact.payload.created_at_epoch_ms,
-        payload_sha256,
-        artifact_sha256: checkpoint_artifact_sha256(&bytes),
-        artifact_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        pane_count: artifact.payload.summary.pane_count,
-        segment_count: artifact.payload.summary.segment_count,
-        content_bytes: artifact.payload.summary.content_bytes,
-        complete_pane_count: artifact.payload.summary.complete_pane_count,
-        durability: "private_regular_file_verified_offline",
-    })
+    verify_checkpoint_scrollback_artifact_bytes_with_hook(bytes, limits, || {})
 }
 
 /// Derive the canonical production leaf name for a verified checkpoint identity.

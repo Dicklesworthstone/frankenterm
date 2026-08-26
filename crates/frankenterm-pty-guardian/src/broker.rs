@@ -2127,7 +2127,6 @@ impl BrokerSpawnJournalV1 {
             Ok(())
         }
     }
-
 }
 
 impl BrokerSpawnWalFilesystemRevalidationV1 {
@@ -4551,8 +4550,8 @@ mod tests {
         drop(journal);
         assert!(matches!(
             catalog.recover_all(&authenticator),
-            Err(BrokerSpawnWalError::UnexpectedCatalogEntry)
-                | Err(BrokerSpawnWalError::InsecureCatalogIdentity)
+            Err(BrokerSpawnWalError::UnexpectedCatalogEntry
+                | BrokerSpawnWalError::InsecureCatalogIdentity)
         ));
 
         let target_directory = private_catalog_directory();
@@ -5207,7 +5206,7 @@ mod tests {
         assert_eq!(effect_invocations.load(Ordering::Acquire), 1);
 
         let observed = journal
-            .append_spawn_observed_and_sync(observation)
+            .append_spawn_observed_and_sync(*observation)
             .expect("synchronize exact child observation");
         assert_eq!(observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
         let query = journal.status();

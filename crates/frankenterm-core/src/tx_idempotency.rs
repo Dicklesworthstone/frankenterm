@@ -3260,6 +3260,7 @@ impl IdempotencyStore {
 
         Ok(store)
     }
+}
 
 fn plan_lock_name(plan_id: &str, plan_hash: u64) -> PathBuf {
     let digest = sha256_domain_digest(
