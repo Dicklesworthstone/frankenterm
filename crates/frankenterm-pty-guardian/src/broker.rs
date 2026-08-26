@@ -77,7 +77,7 @@ use portable_pty::{Child, MasterPty, PollablePtyReader, PtyPair, PtySize, native
 #[cfg(target_os = "macos")]
 use procinfo::{LocalProcessInfo, ProcessStartTimeObservation};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -1254,6 +1254,8 @@ impl BrokerCensusPageRequestV1 {
         };
         let maximum_entries = u16::try_from(GUARDIAN_MAX_PANES)
             .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        let maximum_cursor = u64::try_from(GUARDIAN_MAX_PANES)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
         let minimum_page_bytes = BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES
             .checked_add(BROKER_CONTROL_CENSUS_ENTRY_BYTES)
             .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
@@ -1262,6 +1264,7 @@ impl BrokerCensusPageRequestV1 {
         let maximum_page_bytes = u32::try_from(BROKER_CONTROL_MAX_PAYLOAD_BYTES)
             .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
         if !snapshot_identity_is_valid
+            || self.cursor > maximum_cursor
             || self.max_entries == 0
             || self.max_entries > maximum_entries
             || self.max_bytes < minimum_page_bytes
@@ -2494,14 +2497,36 @@ fn reconcile_broker_catalog_under_token_authority(
     spawn_catalog: &BrokerSpawnWalCatalogV1,
     recovered_catalog: &mut BrokerRecoveredSpawnCatalogV1,
 ) -> Result<(), BrokerControlServiceError> {
-    // The scan was authenticated with token-derived authority. Revalidate the
-    // exact still-named token immediately before and after the only startup
-    // transition that may append a recovered head record, so token rotation or
-    // pathname replacement cannot separate recovery from client authority.
+    reconcile_broker_catalog_under_token_authority_with_hook(
+        token_authority,
+        spawn_catalog,
+        recovered_catalog,
+        || {},
+    )
+}
+
+fn reconcile_broker_catalog_under_token_authority_with_hook(
+    token_authority: &mut GuardianTokenPathAuthority,
+    spawn_catalog: &BrokerSpawnWalCatalogV1,
+    recovered_catalog: &mut BrokerRecoveredSpawnCatalogV1,
+    before_reconciliation: impl FnOnce(),
+) -> Result<(), BrokerControlServiceError> {
+    // The scan was authenticated with token-derived authority. Hold the shared
+    // token-publication fence across the only startup transition that may
+    // append a recovered head record, then revalidate both lease and pathname.
+    // Cooperative token rotation therefore cannot cross this mutation.
+    let mut token_effect_lease = token_authority.acquire_effect_lease()?;
+    token_effect_lease.validate()?;
     token_authority.validate()?;
-    spawn_catalog.reconcile_admitted_and_activate(recovered_catalog)?;
-    token_authority.validate()?;
-    Ok(())
+    before_reconciliation();
+    let result = spawn_catalog
+        .reconcile_admitted_and_activate(recovered_catalog)
+        .map_err(BrokerControlServiceError::from);
+    let effect_validation = token_effect_lease.validate();
+    let authority_validation = token_authority.validate();
+    effect_validation?;
+    authority_validation?;
+    result
 }
 
 /// Separately spawned, single-owner broker control loop.
@@ -2837,6 +2862,15 @@ impl BrokerControlServiceV1 {
         token: Token,
         generation: u64,
     ) -> Result<(), BrokerControlServiceError> {
+        self.drive_connection_read_with_hook(token, generation, || {})
+    }
+
+    fn drive_connection_read_with_hook(
+        &mut self,
+        token: Token,
+        generation: u64,
+        after_response_queued: impl FnOnce(),
+    ) -> Result<(), BrokerControlServiceError> {
         let outcome = match self.connections.get_mut(&token) {
             Some(connection) if connection.generation == generation => connection.read_one(),
             _ => return Ok(()),
@@ -2858,6 +2892,7 @@ impl BrokerControlServiceV1 {
         };
         let mut token_effect_lease = self.token_authority.acquire_effect_lease()?;
         token_effect_lease.validate()?;
+        let mut after_response_queued = Some(after_response_queued);
         let outcome = (|| {
             let response = match self.dispatch_request(token, generation, &request) {
                 Ok(response) => response,
@@ -2883,6 +2918,9 @@ impl BrokerControlServiceV1 {
             }
             connection.write_frame = Some(encoded);
             connection.write_offset = 0;
+            if let Some(after_response_queued) = after_response_queued.take() {
+                after_response_queued();
+            }
             if self
                 .poll
                 .registry()
@@ -2903,16 +2941,29 @@ impl BrokerControlServiceV1 {
         token: Token,
         generation: u64,
     ) -> Result<(), BrokerControlServiceError> {
+        self.drive_connection_write_with_hook(token, generation, || {})
+    }
+
+    fn drive_connection_write_with_hook(
+        &mut self,
+        token: Token,
+        generation: u64,
+        after_flush_attempt: impl FnOnce(),
+    ) -> Result<(), BrokerControlServiceError> {
         if !self.connection_matches(token, generation) {
             return Ok(());
         }
         let mut token_effect_lease = self.token_authority.acquire_effect_lease()?;
         token_effect_lease.validate()?;
+        let mut after_flush_attempt = Some(after_flush_attempt);
         let outcome = (|| {
             let complete = match self.connections.get_mut(&token) {
                 Some(connection) if connection.generation == generation => connection.flush_one(),
                 _ => return Ok(()),
             };
+            if let Some(after_flush_attempt) = after_flush_attempt.take() {
+                after_flush_attempt();
+            }
             match complete {
                 Ok(false) => {}
                 Ok(true) => {
@@ -3480,20 +3531,30 @@ impl BrokerControlClientV1 {
         let mut entries = Vec::new();
 
         for _ in 0..maximum_pages {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
             if remaining.is_zero() {
                 return Err(BrokerControlClientError::CensusCollectionDeadlineExceeded);
             }
-            let operation_timeout = remaining.min(BROKER_CONTROL_CLIENT_IO_TIMEOUT);
-            self.stream.set_read_timeout(Some(operation_timeout))?;
-            self.stream.set_write_timeout(Some(operation_timeout))?;
+            let operation_deadline = now
+                .checked_add(BROKER_CONTROL_CLIENT_IO_TIMEOUT)
+                .map_or(deadline, |io_deadline| io_deadline.min(deadline));
+            let operation_consumes_remaining_budget = operation_deadline == deadline;
             let request = BrokerCensusPageRequestV1::new(
                 snapshot_id,
                 cursor,
                 page_capacity_u16,
                 page_bytes,
             )?;
-            let page = self.census_page(request)?;
+            let page = match self.census_page_with_deadline(request, operation_deadline) {
+                Err(BrokerControlClientError::Io(error))
+                    if operation_consumes_remaining_budget
+                        && matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return Err(BrokerControlClientError::CensusCollectionDeadlineExceeded);
+                }
+                result => result?,
+            };
             match expected_total {
                 None => {
                     snapshot_id = page.snapshot_id();
@@ -3537,6 +3598,15 @@ impl BrokerControlClientV1 {
                         self.poisoned = true;
                         return Err(BrokerControlClientError::UnexpectedResponse);
                     }
+                    if let Err(error) = validate_broker_recovery_census_entries(&entries) {
+                        self.poisoned = true;
+                        return Err(match error {
+                            BrokerControlProtocolError::CapacityExhausted => {
+                                BrokerControlClientError::CensusCollectionCapacityExhausted
+                            }
+                            _ => BrokerControlClientError::UnexpectedResponse,
+                        });
+                    }
                     if Instant::now() > deadline {
                         return Err(
                             BrokerControlClientError::CensusCollectionDeadlineExceeded,
@@ -3554,7 +3624,9 @@ impl BrokerControlClientV1 {
     }
 
     /// Read one immutable page from the broker's content-free recovery
-    /// census. This operation never grants pane or PTY authority.
+    /// census. A fresh cursor-zero snapshot is `Applied`; an authenticated
+    /// continuation of that snapshot is `Recovered`. This operation never
+    /// grants pane or PTY authority.
     pub fn census_page(
         &mut self,
         page: BrokerCensusPageRequestV1,
@@ -3567,6 +3639,23 @@ impl BrokerControlClientV1 {
         &mut self,
         request_id: Uuid,
         page: BrokerCensusPageRequestV1,
+    ) -> Result<BrokerCensusPageV1, BrokerControlClientError> {
+        self.census_page_with_request_id_and_deadline(request_id, page, None)
+    }
+
+    fn census_page_with_deadline(
+        &mut self,
+        page: BrokerCensusPageRequestV1,
+        deadline: Instant,
+    ) -> Result<BrokerCensusPageV1, BrokerControlClientError> {
+        self.census_page_with_request_id_and_deadline(Uuid::new_v4(), page, Some(deadline))
+    }
+
+    fn census_page_with_request_id_and_deadline(
+        &mut self,
+        request_id: Uuid,
+        page: BrokerCensusPageRequestV1,
+        deadline: Option<Instant>,
     ) -> Result<BrokerCensusPageV1, BrokerControlClientError> {
         if request_id.is_nil() {
             return Err(BrokerControlClientError::UnexpectedResponse);
@@ -3593,17 +3682,23 @@ impl BrokerControlClientV1 {
             &page.encode(),
         )
         .map_err(|_| BrokerControlClientError::Protocol)?;
-        let response = self.exchange(&request)?;
-        match response.header.status {
-            BrokerControlResponseStatusV1::Applied
-            | BrokerControlResponseStatusV1::Recovered => {}
-            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
+        let response = self.exchange_with_deadline(&request, deadline)?;
+        match (page.cursor() == 0, response.header.status) {
+            (true, BrokerControlResponseStatusV1::Applied)
+            | (false, BrokerControlResponseStatusV1::Recovered) => {}
+            (false, BrokerControlResponseStatusV1::Rejected)
+                if response.payload().is_empty() =>
+            {
                 return Err(BrokerControlClientError::CensusSnapshotUnavailable);
             }
-            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+            (false, BrokerControlResponseStatusV1::Quarantined)
+                if response.payload().is_empty() =>
+            {
                 return Err(BrokerControlClientError::CensusAuthorityConflict);
             }
-            BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
+            (true, BrokerControlResponseStatusV1::Retryable)
+                if response.payload().is_empty() =>
+            {
                 return Err(BrokerControlClientError::CensusCapacityUnavailable);
             }
             _ => {
@@ -3694,6 +3789,14 @@ impl BrokerControlClientV1 {
         &mut self,
         request: &BrokerControlRequestV1,
     ) -> Result<BrokerControlResponseV1, BrokerControlClientError> {
+        self.exchange_with_deadline(request, None)
+    }
+
+    fn exchange_with_deadline(
+        &mut self,
+        request: &BrokerControlRequestV1,
+        deadline: Option<Instant>,
+    ) -> Result<BrokerControlResponseV1, BrokerControlClientError> {
         if self.poisoned {
             return Err(BrokerControlClientError::ConnectionPoisoned);
         }
@@ -3704,11 +3807,20 @@ impl BrokerControlClientV1 {
         // leaves reply ownership ambiguous. This one-request/one-response
         // connection may not be reused after such a cut.
         self.poisoned = true;
-        self.stream.write_all(frame.as_slice())?;
-        let response_frame = read_blocking_broker_control_frame(
-            &mut self.stream,
-            BROKER_CONTROL_RESPONSE_FIXED_BYTES,
-        )?;
+        let response_frame = if let Some(deadline) = deadline {
+            write_all_blocking_with_deadline(&mut self.stream, frame.as_slice(), deadline)?;
+            read_blocking_broker_control_frame_with_deadline(
+                &mut self.stream,
+                BROKER_CONTROL_RESPONSE_FIXED_BYTES,
+                deadline,
+            )?
+        } else {
+            self.stream.write_all(frame.as_slice())?;
+            read_blocking_broker_control_frame(
+                &mut self.stream,
+                BROKER_CONTROL_RESPONSE_FIXED_BYTES,
+            )?
+        };
         let response = decode_broker_control_response(&self.control_authenticator, &response_frame)
             .map_err(|_| BrokerControlClientError::Protocol)?;
         let lease_generation_matches =
@@ -3735,8 +3847,28 @@ fn read_blocking_broker_control_frame(
     stream: &mut BlockingUnixStream,
     minimum_bytes: usize,
 ) -> Result<Zeroizing<Vec<u8>>, std::io::Error> {
+    read_broker_control_frame_with(stream, minimum_bytes, |stream, buffer| {
+        stream.read_exact(buffer)
+    })
+}
+
+fn read_blocking_broker_control_frame_with_deadline(
+    stream: &mut BlockingUnixStream,
+    minimum_bytes: usize,
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>, std::io::Error> {
+    read_broker_control_frame_with(stream, minimum_bytes, |stream, buffer| {
+        read_exact_blocking_with_deadline(stream, buffer, deadline)
+    })
+}
+
+fn read_broker_control_frame_with(
+    stream: &mut BlockingUnixStream,
+    minimum_bytes: usize,
+    mut read_exact: impl FnMut(&mut BlockingUnixStream, &mut [u8]) -> Result<(), std::io::Error>,
+) -> Result<Zeroizing<Vec<u8>>, std::io::Error> {
     let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix)?;
+    read_exact(stream, &mut prefix)?;
     let announced = usize::try_from(read_broker_be_u32(&prefix)).map_err(|_| {
         std::io::Error::new(
             ErrorKind::InvalidData,
@@ -3758,8 +3890,64 @@ fn read_blocking_broker_control_frame(
     })?;
     frame.resize(total_bytes, 0);
     frame[..prefix.len()].copy_from_slice(&prefix);
-    stream.read_exact(&mut frame[prefix.len()..])?;
+    read_exact(stream, &mut frame[prefix.len()..])?;
     Ok(frame)
+}
+
+fn blocking_io_deadline_remaining(deadline: Instant) -> Result<Duration, std::io::Error> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::TimedOut,
+                "broker control exchange exceeded its absolute deadline",
+            )
+        })
+}
+
+fn write_all_blocking_with_deadline(
+    stream: &mut BlockingUnixStream,
+    mut buffer: &[u8],
+    deadline: Instant,
+) -> Result<(), std::io::Error> {
+    while !buffer.is_empty() {
+        stream.set_write_timeout(Some(blocking_io_deadline_remaining(deadline)?))?;
+        match stream.write(buffer) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "broker control stream accepted zero bytes",
+                ));
+            }
+            Ok(written) => buffer = &buffer[written..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn read_exact_blocking_with_deadline(
+    stream: &mut BlockingUnixStream,
+    mut buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<(), std::io::Error> {
+    while !buffer.is_empty() {
+        stream.set_read_timeout(Some(blocking_io_deadline_remaining(deadline)?))?;
+        match stream.read(buffer) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "broker control stream closed before the complete frame",
+                ));
+            }
+            Ok(read) => buffer = &mut buffer[read..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Exact identity bound into one broker Spawn WAL and its local head anchor.
@@ -4763,17 +4951,10 @@ impl BrokerCensusPageV1 {
             || self
                 .next_cursor
                 .is_some_and(|cursor| cursor == BROKER_CONTROL_CENSUS_NO_CURSOR || cursor > self.total_entries)
-            || self
-                .entries
-                .windows(2)
-                .any(|pair| pair[0].durable_pane_id.as_bytes() >= pair[1].durable_pane_id.as_bytes())
         {
             return Err(BrokerControlProtocolError::InvalidShape);
         }
-        for entry in &self.entries {
-            entry.validate()?;
-        }
-        Ok(())
+        validate_broker_recovery_census_entries(&self.entries)
     }
 
     fn validate_for_request(
@@ -4789,6 +4970,20 @@ impl BrokerCensusPageV1 {
         let start = request.cursor;
         let page_entries = u64::try_from(self.entries.len())
             .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+        let available = self
+            .total_entries
+            .checked_sub(start)
+            .ok_or(BrokerControlProtocolError::InvalidShape)?;
+        let entries_by_bytes = usize::try_from(request.max_bytes)
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?
+            .checked_sub(BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES)
+            .ok_or(BrokerControlProtocolError::InvalidShape)?
+            / BROKER_CONTROL_CENSUS_ENTRY_BYTES;
+        let maximum_page_entries = usize::from(request.max_entries).min(entries_by_bytes);
+        let expected_page_entries = available.min(
+            u64::try_from(maximum_page_entries)
+                .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?,
+        );
         let end = start
             .checked_add(page_entries)
             .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
@@ -4801,9 +4996,8 @@ impl BrokerCensusPageV1 {
                     .ok_or(BrokerControlProtocolError::CapacityExhausted)?,
             )
             .ok_or(BrokerControlProtocolError::CapacityExhausted)?;
-        if start > self.total_entries
+        if page_entries != expected_page_entries
             || end > self.total_entries
-            || (page_entries == 0 && start < self.total_entries)
             || self.next_cursor != expected_next_cursor
             || self.entries.len() > usize::from(request.max_entries)
             || encoded_bytes
@@ -4849,6 +5043,43 @@ impl BrokerRecoveryCensusV1 {
     pub fn entries(&self) -> &[BrokerCensusEntryV1] {
         &self.entries
     }
+}
+
+fn validate_broker_recovery_census_entries(
+    entries: &[BrokerCensusEntryV1],
+) -> Result<(), BrokerControlProtocolError> {
+    if entries.len() > GUARDIAN_MAX_PANES
+        || entries
+            .windows(2)
+            .any(|pair| pair[0].durable_pane_id.as_bytes() >= pair[1].durable_pane_id.as_bytes())
+    {
+        return Err(BrokerControlProtocolError::InvalidShape);
+    }
+    let mut journal_ids = HashSet::new();
+    let mut durable_pane_ids = HashSet::new();
+    let mut spawn_effect_ids = HashSet::new();
+    let mut origin_request_ids = HashSet::new();
+    for identities in [
+        &mut journal_ids,
+        &mut durable_pane_ids,
+        &mut spawn_effect_ids,
+        &mut origin_request_ids,
+    ] {
+        identities
+            .try_reserve(entries.len())
+            .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
+    }
+    for entry in entries {
+        entry.validate()?;
+        if !journal_ids.insert(entry.journal_id)
+            || !durable_pane_ids.insert(entry.durable_pane_id)
+            || !spawn_effect_ids.insert(entry.spawn_effect_id)
+            || !origin_request_ids.insert(entry.origin_request_id)
+        {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -10953,7 +11184,6 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::os::fd::{AsFd, BorrowedFd};
-    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10998,6 +11228,32 @@ mod tests {
 
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)
+    }
+
+    fn prepared_census_entry(ordinal: u128, mux_incarnation: Uuid) -> BrokerCensusEntryV1 {
+        let entry = BrokerCensusEntryV1 {
+            journal_id: id(100_000 + ordinal),
+            mux_incarnation,
+            durable_pane_id: id(200_000 + ordinal),
+            spawn_effect_id: id(300_000 + ordinal),
+            origin_request_id: id(400_000 + ordinal),
+            phase: None,
+            disposition: BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly,
+            attempt_id: None,
+            child_identity: None,
+            reply_ack_id: None,
+            committed_records: 0,
+            committed_wal_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            committed_head_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            append_authority_withheld: true,
+            head_reconciliation_required: false,
+            effects_disabled: true,
+            pty_available: false,
+            lease_available: false,
+            output_replay_available: false,
+        };
+        entry.validate().expect("valid prepared Census fixture");
+        entry
     }
 
     fn record_test_exec_bootstrap_stage(diagnostic: &mut Option<File>, stage: &str) {
@@ -12327,6 +12583,33 @@ mod tests {
             ),
             Err(BrokerControlClientError::Protocol)
         ));
+        let maximum_cursor = u64::try_from(GUARDIAN_MAX_PANES).expect("maximum Census cursor");
+        let maximum_cursor_request = BrokerCensusPageRequestV1::new(
+            id(761),
+            maximum_cursor,
+            1,
+            first_request.max_bytes(),
+        )
+        .expect("maximum bounded Census cursor");
+        assert_eq!(maximum_cursor_request.cursor(), maximum_cursor);
+        assert!(matches!(
+            BrokerCensusPageRequestV1::new(
+                id(761),
+                maximum_cursor.checked_add(1).expect("cursor above maximum"),
+                1,
+                first_request.max_bytes(),
+            ),
+            Err(BrokerControlClientError::Protocol)
+        ));
+        assert!(matches!(
+            BrokerCensusPageRequestV1::new(
+                id(761),
+                BROKER_CONTROL_CENSUS_NO_CURSOR,
+                1,
+                first_request.max_bytes(),
+            ),
+            Err(BrokerControlClientError::Protocol)
+        ));
 
         let directory = private_catalog_directory();
         let authenticator = wal_authenticator(0xb1);
@@ -12408,6 +12691,59 @@ mod tests {
             Err(BrokerControlProtocolError::InvalidIdentity)
         ));
 
+        let distinct_entry = prepared_census_entry(900, identity.mux_incarnation());
+        let canonical_pair = [entry, distinct_entry];
+        validate_broker_recovery_census_entries(&canonical_pair)
+            .expect("distinct Census identities are canonical");
+        let mut duplicate_journal = distinct_entry;
+        duplicate_journal.journal_id = entry.journal_id;
+        let mut duplicate_spawn_effect = distinct_entry;
+        duplicate_spawn_effect.spawn_effect_id = entry.spawn_effect_id;
+        let mut duplicate_origin_request = distinct_entry;
+        duplicate_origin_request.origin_request_id = entry.origin_request_id;
+        for (namespace, duplicate) in [
+            ("journal", duplicate_journal),
+            ("Spawn effect", duplicate_spawn_effect),
+            ("origin request", duplicate_origin_request),
+        ] {
+            let duplicate_page = BrokerCensusPageV1 {
+                snapshot_id,
+                entries: vec![entry, duplicate],
+                next_cursor: None,
+                total_entries: 2,
+            };
+            assert!(
+                matches!(
+                    duplicate_page.validate(),
+                    Err(BrokerControlProtocolError::InvalidIdentity)
+                ),
+                "same-page duplicate {namespace} identity was accepted"
+            );
+        }
+        let mut duplicate_pane = distinct_entry;
+        duplicate_pane.durable_pane_id = entry.durable_pane_id;
+        let duplicate_pane_page = BrokerCensusPageV1 {
+            snapshot_id,
+            entries: vec![entry, duplicate_pane],
+            next_cursor: None,
+            total_entries: 2,
+        };
+        assert!(matches!(
+            duplicate_pane_page.validate(),
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+
+        let underfilled_continuation = BrokerCensusPageV1 {
+            snapshot_id: continuation.snapshot_id(),
+            entries: vec![distinct_entry],
+            next_cursor: Some(2),
+            total_entries: 3,
+        };
+        assert!(matches!(
+            underfilled_continuation.validate_for_request(continuation),
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+
         let mut forged_cursor = encoded_page.clone();
         forged_cursor[32..40].copy_from_slice(&0_u64.to_be_bytes());
         let forged_cursor =
@@ -12433,6 +12769,229 @@ mod tests {
             forged_snapshot.validate_for_request(continuation_request),
             Err(BrokerControlProtocolError::InvalidIdentity)
         ));
+    }
+
+    #[test]
+    fn recovery_census_classifies_every_spawn_phase_and_head_crash_cut() {
+        fn advance_to_phase(
+            journal: &mut BrokerSpawnJournalV1,
+            target: Option<BrokerSpawnWalPhaseV1>,
+            attempt_id: Uuid,
+            child_identity: BrokerKernelChildIdentityV1,
+            reply_ack_id: Uuid,
+            crash_before_terminal_head: bool,
+        ) {
+            let Some(target) = target else {
+                return;
+            };
+            if target == BrokerSpawnWalPhaseV1::Intent && crash_before_terminal_head {
+                journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHeadForPhase(
+                    target,
+                ));
+            }
+            let intent = journal.append_intent_and_sync();
+            if target == BrokerSpawnWalPhaseV1::Intent {
+                if crash_before_terminal_head {
+                    assert!(matches!(intent, Err(BrokerSpawnWalError::Io(_))));
+                } else {
+                    assert_eq!(
+                        intent.expect("append exact-head Census Intent").phase(),
+                        BrokerSpawnWalPhaseV1::Intent
+                    );
+                }
+                return;
+            }
+            intent.expect("append preterminal Census Intent");
+
+            if target == BrokerSpawnWalPhaseV1::Attempted && crash_before_terminal_head {
+                journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHeadForPhase(
+                    target,
+                ));
+            }
+            let attempt = journal.begin_spawn_attempt_and_sync(attempt_id);
+            let permit = match attempt {
+                Ok(BrokerSpawnAttemptAdmissionV1::Authorized(permit)) => permit,
+                Ok(BrokerSpawnAttemptAdmissionV1::Reconciled(_)) => {
+                    panic!("first Census Attempt unexpectedly reconciled")
+                }
+                Err(BrokerSpawnWalError::Io(_))
+                    if target == BrokerSpawnWalPhaseV1::Attempted
+                        && crash_before_terminal_head =>
+                {
+                    return;
+                }
+                Err(error) => panic!("append Census Attempt failed unexpectedly: {error:?}"),
+            };
+            if target == BrokerSpawnWalPhaseV1::Attempted {
+                drop(permit);
+                return;
+            }
+            let execution = permit.invoke_once(|| Ok::<_, ()>(((), child_identity)));
+            let observation = match execution {
+                BrokerSpawnAttemptExecutionV1::EffectSucceeded { observation, .. } => observation,
+                BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate { .. } => {
+                    panic!("valid Census child identity became indeterminate")
+                }
+            };
+
+            if target == BrokerSpawnWalPhaseV1::SpawnObserved && crash_before_terminal_head {
+                journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHeadForPhase(
+                    target,
+                ));
+            }
+            let observed = journal.append_spawn_observed_and_sync(*observation);
+            if target == BrokerSpawnWalPhaseV1::SpawnObserved {
+                if crash_before_terminal_head {
+                    assert!(matches!(observed, Err(BrokerSpawnWalError::Io(_))));
+                } else {
+                    assert_eq!(
+                        observed
+                            .expect("append exact-head Census SpawnObserved")
+                            .phase(),
+                        BrokerSpawnWalPhaseV1::SpawnObserved
+                    );
+                }
+                return;
+            }
+            observed.expect("append preterminal Census SpawnObserved");
+
+            if crash_before_terminal_head {
+                journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHeadForPhase(
+                    target,
+                ));
+            }
+            let acknowledged =
+                journal.acknowledge_spawn_reply_and_sync(reply_ack_id, child_identity);
+            if crash_before_terminal_head {
+                assert!(matches!(acknowledged, Err(BrokerSpawnWalError::Io(_))));
+            } else {
+                assert_eq!(
+                    acknowledged
+                        .expect("append exact-head Census ReplyAcknowledged")
+                        .phase(),
+                    BrokerSpawnWalPhaseV1::ReplyAcknowledged
+                );
+            }
+        }
+
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create all-phase recovery Census root");
+        let authenticator = wal_authenticator(0xc1);
+        let phases = [
+            None,
+            Some(BrokerSpawnWalPhaseV1::Intent),
+            Some(BrokerSpawnWalPhaseV1::Attempted),
+            Some(BrokerSpawnWalPhaseV1::SpawnObserved),
+            Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged),
+        ];
+        for (phase_index, phase) in phases.into_iter().enumerate() {
+            for head_gap in [false, true] {
+                if phase.is_none() && head_gap {
+                    continue;
+                }
+                let directory = root
+                    .path()
+                    .join(format!("phase-{phase_index}-gap-{}", u8::from(head_gap)));
+                fs::create_dir(&directory).expect("create all-phase Census case directory");
+                let seed = 0x70_u8
+                    .checked_add(u8::try_from(phase_index * 2 + usize::from(head_gap)).unwrap())
+                    .expect("bounded all-phase Census seed");
+                let identity = recovered_catalog_identity(&authenticator, seed);
+                let attempt_id = id(7_000 + u128::from(seed));
+                let child_identity = test_kernel_child(20_000 + u32::from(seed));
+                let reply_ack_id = id(8_000 + u128::from(seed));
+                let (mut journal, wal_path, head_path) = create_test_spawn_journal(
+                    &directory,
+                    identity,
+                    authenticator.clone(),
+                );
+                advance_to_phase(
+                    &mut journal,
+                    phase,
+                    attempt_id,
+                    child_identity,
+                    reply_ack_id,
+                    head_gap,
+                );
+                drop(journal);
+                let recovered = reopen_test_spawn_journal(
+                    &wal_path,
+                    &head_path,
+                    identity,
+                    authenticator.clone(),
+                );
+                let status = recovered.status();
+                let entry = BrokerCensusEntryV1::from_recovered_status(status)
+                    .expect("classify all-phase recovered Census row");
+                let expected_records = match phase {
+                    None => 0,
+                    Some(BrokerSpawnWalPhaseV1::Intent) => 1,
+                    Some(BrokerSpawnWalPhaseV1::Attempted) => 2,
+                    Some(BrokerSpawnWalPhaseV1::SpawnObserved) => 3,
+                    Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged) => 4,
+                };
+                let expected_disposition = match phase {
+                    None => BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly,
+                    Some(BrokerSpawnWalPhaseV1::Intent) => {
+                        BrokerRecoveredPaneDispositionV1::IntentEffectsDisabled
+                    }
+                    Some(BrokerSpawnWalPhaseV1::Attempted) => {
+                        BrokerRecoveredPaneDispositionV1::AttemptOutcomeIndeterminate
+                    }
+                    Some(BrokerSpawnWalPhaseV1::SpawnObserved) => {
+                        BrokerRecoveredPaneDispositionV1::SpawnObservedPtyUnavailable
+                    }
+                    Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged) => {
+                        BrokerRecoveredPaneDispositionV1::ReplyAcknowledgedPtyUnavailable
+                    }
+                };
+                assert_eq!(entry.phase, phase);
+                assert_eq!(entry.disposition, expected_disposition);
+                assert_eq!(entry.committed_records, expected_records);
+                assert_eq!(
+                    entry.committed_wal_bytes,
+                    BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+                        + expected_records * BROKER_SPAWN_WAL_RECORD_BYTES_U64
+                );
+                assert_eq!(entry.head_reconciliation_required, head_gap);
+                assert_eq!(
+                    entry.committed_head_bytes,
+                    BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+                        + (expected_records - u64::from(head_gap))
+                            * BROKER_SPAWN_HEAD_RECORD_BYTES_U64
+                );
+                assert_eq!(
+                    entry.attempt_id,
+                    phase
+                        .is_some_and(|phase| phase != BrokerSpawnWalPhaseV1::Intent)
+                        .then_some(attempt_id)
+                );
+                assert_eq!(
+                    entry.child_identity,
+                    phase
+                        .is_some_and(|phase| {
+                            matches!(
+                                phase,
+                                BrokerSpawnWalPhaseV1::SpawnObserved
+                                    | BrokerSpawnWalPhaseV1::ReplyAcknowledged
+                            )
+                        })
+                        .then_some(child_identity)
+                );
+                assert_eq!(
+                    entry.reply_ack_id,
+                    (phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged))
+                        .then_some(reply_ack_id)
+                );
+                assert_eq!(
+                    BrokerCensusEntryV1::decode(
+                        &entry.encode().expect("encode all-phase Census row")
+                    )
+                    .expect("decode all-phase Census row"),
+                    entry
+                );
+            }
+        }
     }
 
     #[test]
@@ -12956,6 +13515,132 @@ mod tests {
         drop(planted_connections);
     }
 
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn broker_response_enqueue_and_flush_hold_the_token_effect_lease() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create broker response-token-fence test root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set broker response-token-fence root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create response-token-fence Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set response-token-fence Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision response-token-fence token");
+        let secret = crate::transport::load_guardian_secret(&token_path)
+            .expect("load response-token-fence token");
+        let control_authenticator = secret
+            .broker_control_authenticator()
+            .expect("derive response-token-fence authority");
+        let broker_build = sealed(0xa2);
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path.clone(),
+            spawn_catalog_path,
+            broker_build,
+            1,
+            Duration::from_millis(5),
+        )
+        .expect("valid response-token-fence broker config");
+        let mut service = BrokerControlServiceV1::bind(config)
+            .expect("bind response-token-fence broker service");
+        let broker_incarnation = service.incarnation();
+        let mut client = BlockingUnixStream::connect(&socket_path)
+            .expect("connect response-token-fence client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound response-token-fence client read");
+        service
+            .accept_connections()
+            .expect("accept response-token-fence client");
+        let (&token, connection) = service
+            .connections
+            .iter()
+            .next()
+            .expect("one accepted response-token-fence connection");
+        let generation = connection.generation;
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Hello,
+                request_id: id(6_180),
+                broker_incarnation: Uuid::nil(),
+                guardian_incarnation: id(6_181),
+                connection_id: id(6_182),
+                mux_incarnation: id(6_183),
+                guardian_build_identity_digest: sealed(0xa3).into_bytes(),
+                mux_build_identity_digest: sealed(0xa4).into_bytes(),
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+            },
+            &[],
+        )
+        .expect("canonical response-token-fence Hello");
+        let frame = encode_broker_control_request(&control_authenticator, &request)
+            .expect("authenticate response-token-fence Hello");
+        client
+            .write_all(frame.as_slice())
+            .expect("write response-token-fence Hello");
+
+        service
+            .drive_connection_read_with_hook(token, generation, || {
+                assert!(
+                    !crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                        .expect("probe token publication during response enqueue"),
+                    "cooperative token publication crossed response enqueue"
+                );
+            })
+            .expect("queue response under token effect lease");
+        assert!(
+            crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe token publication after response enqueue"),
+            "response enqueue retained its token effect lease"
+        );
+        assert!(
+            service
+                .connections
+                .get(&token)
+                .is_some_and(|connection| connection.write_frame.is_some()),
+            "response was not queued before its fence probe"
+        );
+
+        service
+            .drive_connection_write_with_hook(token, generation, || {
+                assert!(
+                    !crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                        .expect("probe token publication during response flush"),
+                    "cooperative token publication crossed response flush"
+                );
+            })
+            .expect("flush response under token effect lease");
+        assert!(
+            crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe token publication after response flush"),
+            "response flush retained its token effect lease"
+        );
+        let response_frame = read_blocking_broker_control_frame(
+            &mut client,
+            BROKER_CONTROL_RESPONSE_FIXED_BYTES,
+        )
+        .expect("read response-token-fence Hello response");
+        let response = decode_broker_control_response(&control_authenticator, &response_frame)
+            .expect("authenticate response-token-fence Hello response");
+        assert_eq!(response.header.operation, BrokerControlOperationV1::Hello);
+        assert_eq!(response.header.status, BrokerControlResponseStatusV1::Applied);
+        assert_eq!(response.header.broker_incarnation, broker_incarnation);
+    }
+
     #[test]
     fn broker_control_authentication_deadline_reclaims_saturated_partial_connections() {
         let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
@@ -13457,6 +14142,598 @@ mod tests {
         drop(second_client);
         drop(first_client);
         service.finish();
+    }
+
+    #[test]
+    fn recovery_census_collector_rejects_cross_page_duplicate_global_identities() {
+        let page_capacity = BROKER_CONTROL_MAX_PAYLOAD_BYTES
+            .checked_sub(BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES)
+            .expect("Census payload holds its fixed header")
+            / BROKER_CONTROL_CENSUS_ENTRY_BYTES;
+        assert!(page_capacity > 0);
+        assert!(page_capacity < GUARDIAN_MAX_PANES);
+        let mux_incarnation = id(6_210);
+        let mut canonical_entries = Vec::with_capacity(page_capacity + 1);
+        for index in 0..=page_capacity {
+            canonical_entries.push(prepared_census_entry(
+                u128::try_from(index).expect("Census fixture ordinal"),
+                mux_incarnation,
+            ));
+        }
+        validate_broker_recovery_census_entries(&canonical_entries)
+            .expect("canonical cross-page Census fixture");
+
+        for (case, namespace) in ["journal", "Spawn effect", "origin request"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut entries = canonical_entries.clone();
+            match namespace {
+                "journal" => entries[page_capacity].journal_id = entries[0].journal_id,
+                "Spawn effect" => {
+                    entries[page_capacity].spawn_effect_id = entries[0].spawn_effect_id;
+                }
+                "origin request" => {
+                    entries[page_capacity].origin_request_id = entries[0].origin_request_id;
+                }
+                _ => unreachable!("the duplicate-identity fixture namespace is exhaustive"),
+            }
+            assert!(matches!(
+                validate_broker_recovery_census_entries(&entries),
+                Err(BrokerControlProtocolError::InvalidIdentity)
+            ));
+
+            let authority_byte = 0xc0_u8
+                .checked_add(u8::try_from(case).expect("duplicate fixture case"))
+                .expect("duplicate fixture authority byte");
+            let client_authority = control_authenticator(authority_byte);
+            let server_authority = control_authenticator(authority_byte);
+            let connection_identity = BrokerGuardianConnectionIdentityV1::new(
+                id(6_211 + u128::try_from(case).expect("connection fixture case")),
+                mux_incarnation,
+                sealed(0xc4),
+                sealed(0xc5),
+            )
+            .expect("valid duplicate Census connection identity");
+            let connection_id = id(6_214 + u128::try_from(case).expect("connection fixture case"));
+            let broker_incarnation =
+                id(6_217 + u128::try_from(case).expect("broker fixture case"));
+            let snapshot_id = id(6_230 + u128::try_from(case).expect("snapshot fixture case"));
+            let (client_stream, mut server_stream) =
+                BlockingUnixStream::pair().expect("create duplicate Census socket pair");
+            let server = thread::spawn(move || {
+                let total_entries =
+                    u64::try_from(entries.len()).expect("duplicate Census total rows");
+                let second_cursor =
+                    u64::try_from(page_capacity).expect("duplicate Census second cursor");
+                for page_index in 0..2 {
+                    let frame = read_blocking_broker_control_frame(
+                        &mut server_stream,
+                        BROKER_CONTROL_REQUEST_FIXED_BYTES,
+                    )
+                    .expect("read duplicate Census request");
+                    let request = decode_broker_control_request(&server_authority, &frame)
+                        .expect("decode duplicate Census request");
+                    assert_eq!(request.header.operation, BrokerControlOperationV1::Census);
+                    let page_request = BrokerCensusPageRequestV1::decode(request.payload())
+                        .expect("decode duplicate Census page request");
+                    let expected_cursor = if page_index == 0 { 0 } else { second_cursor };
+                    assert_eq!(page_request.cursor(), expected_cursor);
+                    let page_entries = if page_index == 0 {
+                        entries[..page_capacity].to_vec()
+                    } else {
+                        vec![entries[page_capacity]]
+                    };
+                    let page = BrokerCensusPageV1 {
+                        snapshot_id,
+                        entries: page_entries,
+                        next_cursor: (page_index == 0).then_some(second_cursor),
+                        total_entries,
+                    };
+                    page.validate_for_request(page_request)
+                        .expect("serve one canonical duplicate Census page");
+                    let payload = page.encode().expect("encode duplicate Census page");
+                    let response = BrokerControlResponseV1::new(
+                        BrokerControlResponseHeaderV1 {
+                            operation: BrokerControlOperationV1::Census,
+                            status: if page_index == 0 {
+                                BrokerControlResponseStatusV1::Applied
+                            } else {
+                                BrokerControlResponseStatusV1::Recovered
+                            },
+                            request_id: request.header.request_id,
+                            broker_incarnation,
+                            guardian_incarnation: request.header.guardian_incarnation,
+                            connection_id: request.header.connection_id,
+                            durable_pane_id: Uuid::nil(),
+                            lease_generation: 0,
+                            operation_id: Uuid::nil(),
+                            child_identity: None,
+                            output_sequence_start: 0,
+                            output_sequence_end: 0,
+                        },
+                        &payload,
+                    )
+                    .expect("construct duplicate Census response");
+                    let response = encode_broker_control_response(&server_authority, &response)
+                        .expect("authenticate duplicate Census response");
+                    server_stream
+                        .write_all(response.as_slice())
+                        .expect("write duplicate Census response");
+                }
+            });
+            let mut client = BrokerControlClientV1 {
+                stream: client_stream,
+                control_authenticator: client_authority,
+                identity: connection_identity,
+                connection_id,
+                broker_incarnation,
+                recovered_hello: false,
+                poisoned: false,
+            };
+            assert!(
+                matches!(
+                    client.recovery_census(),
+                    Err(BrokerControlClientError::UnexpectedResponse)
+                ),
+                "cross-page duplicate {namespace} identity was accepted"
+            );
+            assert!(client.poisoned, "duplicate Census did not poison the stream");
+            server.join().expect("join duplicate Census fixture");
+        }
+    }
+
+    #[test]
+    fn recovery_census_collects_the_exact_global_pane_bound_without_extra_page() {
+        let page_capacity = BROKER_CONTROL_MAX_PAYLOAD_BYTES
+            .checked_sub(BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES)
+            .expect("Census payload holds its fixed header")
+            / BROKER_CONTROL_CENSUS_ENTRY_BYTES;
+        assert!(page_capacity > 0);
+        let mux_incarnation = id(6_235);
+        let mut entries = Vec::with_capacity(GUARDIAN_MAX_PANES);
+        for index in 0..GUARDIAN_MAX_PANES {
+            entries.push(prepared_census_entry(
+                u128::try_from(index).expect("maximum Census fixture ordinal"),
+                mux_incarnation,
+            ));
+        }
+        validate_broker_recovery_census_entries(&entries)
+            .expect("canonical maximum-sized Census fixture");
+
+        let client_authority = control_authenticator(0xc6);
+        let server_authority = control_authenticator(0xc6);
+        let connection_identity = BrokerGuardianConnectionIdentityV1::new(
+            id(6_236),
+            mux_incarnation,
+            sealed(0xc7),
+            sealed(0xc8),
+        )
+        .expect("valid maximum Census connection identity");
+        let connection_id = id(6_237);
+        let broker_incarnation = id(6_238);
+        let snapshot_id = id(6_239);
+        let (client_stream, mut server_stream) =
+            BlockingUnixStream::pair().expect("create maximum Census socket pair");
+        let server = thread::spawn(move || {
+            let total_entries =
+                u64::try_from(entries.len()).expect("maximum Census total rows");
+            let mut cursor = 0_usize;
+            while cursor < entries.len() {
+                let frame = read_blocking_broker_control_frame(
+                    &mut server_stream,
+                    BROKER_CONTROL_REQUEST_FIXED_BYTES,
+                )
+                .expect("read maximum Census request");
+                let request = decode_broker_control_request(&server_authority, &frame)
+                    .expect("decode maximum Census request");
+                let page_request = BrokerCensusPageRequestV1::decode(request.payload())
+                    .expect("decode maximum Census page request");
+                assert_eq!(
+                    page_request.cursor(),
+                    u64::try_from(cursor).expect("maximum Census cursor")
+                );
+                let end = cursor
+                    .checked_add(page_capacity)
+                    .expect("maximum Census page end")
+                    .min(entries.len());
+                let next_cursor = (end < entries.len())
+                    .then(|| u64::try_from(end).expect("maximum Census next cursor"));
+                let page = BrokerCensusPageV1 {
+                    snapshot_id,
+                    entries: entries[cursor..end].to_vec(),
+                    next_cursor,
+                    total_entries,
+                };
+                page.validate_for_request(page_request)
+                    .expect("serve canonical maximum Census page");
+                let payload = page.encode().expect("encode maximum Census page");
+                let response = BrokerControlResponseV1::new(
+                    BrokerControlResponseHeaderV1 {
+                        operation: BrokerControlOperationV1::Census,
+                        status: if cursor == 0 {
+                            BrokerControlResponseStatusV1::Applied
+                        } else {
+                            BrokerControlResponseStatusV1::Recovered
+                        },
+                        request_id: request.header.request_id,
+                        broker_incarnation,
+                        guardian_incarnation: request.header.guardian_incarnation,
+                        connection_id: request.header.connection_id,
+                        durable_pane_id: Uuid::nil(),
+                        lease_generation: 0,
+                        operation_id: Uuid::nil(),
+                        child_identity: None,
+                        output_sequence_start: 0,
+                        output_sequence_end: 0,
+                    },
+                    &payload,
+                )
+                .expect("construct maximum Census response");
+                let response = encode_broker_control_response(&server_authority, &response)
+                    .expect("authenticate maximum Census response");
+                server_stream
+                    .write_all(response.as_slice())
+                    .expect("write maximum Census response");
+                cursor = end;
+            }
+            server_stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("bound extra maximum Census request observation");
+            let mut unexpected_request = [0_u8; 1];
+            let error = server_stream
+                .read_exact(&mut unexpected_request)
+                .expect_err("collector requested a page beyond the exact global bound");
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut
+            ));
+        });
+        let mut client = BrokerControlClientV1 {
+            stream: client_stream,
+            control_authenticator: client_authority,
+            identity: connection_identity,
+            connection_id,
+            broker_incarnation,
+            recovered_hello: false,
+            poisoned: false,
+        };
+        let census = client
+            .recovery_census()
+            .expect("collect exact maximum-sized recovery Census");
+        assert_eq!(census.snapshot_id(), snapshot_id);
+        assert_eq!(census.entries().len(), GUARDIAN_MAX_PANES);
+        assert_eq!(
+            census.entries().first().map(|entry| entry.durable_pane_id),
+            Some(prepared_census_entry(0, mux_incarnation).durable_pane_id)
+        );
+        assert_eq!(
+            census.entries().last().map(|entry| entry.durable_pane_id),
+            Some(
+                prepared_census_entry(
+                    u128::try_from(GUARDIAN_MAX_PANES - 1)
+                        .expect("last maximum Census ordinal"),
+                    mux_incarnation,
+                )
+                .durable_pane_id
+            )
+        );
+        server.join().expect("join maximum Census fixture");
+    }
+
+    #[test]
+    fn census_client_rejects_phase_inconsistent_success_and_failure_statuses() {
+        let mux_incarnation = id(6_240);
+        let first_entry = prepared_census_entry(1, mux_incarnation);
+        let second_entry = prepared_census_entry(2, mux_incarnation);
+        let one_row_bytes = u32::try_from(
+            BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES + BROKER_CONTROL_CENSUS_ENTRY_BYTES,
+        )
+        .expect("single-row Census response bound");
+
+        for case in 0..4 {
+            let case = u128::try_from(case).expect("status fixture case");
+            let snapshot_id = id(6_241 + case);
+            let (page_request, page) = if case % 2 == 0 {
+                (
+                    BrokerCensusPageRequestV1::new(Uuid::nil(), 0, 1, one_row_bytes)
+                        .expect("fresh status fixture request"),
+                    BrokerCensusPageV1 {
+                        snapshot_id,
+                        entries: vec![first_entry],
+                        next_cursor: None,
+                        total_entries: 1,
+                    },
+                )
+            } else {
+                (
+                    BrokerCensusPageRequestV1::new(snapshot_id, 1, 1, one_row_bytes)
+                        .expect("continuation status fixture request"),
+                    BrokerCensusPageV1 {
+                        snapshot_id,
+                        entries: vec![second_entry],
+                        next_cursor: None,
+                        total_entries: 2,
+                    },
+                )
+            };
+            let wrong_status = match case {
+                0 => BrokerControlResponseStatusV1::Recovered,
+                1 => BrokerControlResponseStatusV1::Applied,
+                2 => BrokerControlResponseStatusV1::Rejected,
+                3 => BrokerControlResponseStatusV1::Retryable,
+                _ => unreachable!("the Census status fixture cases are exhaustive"),
+            };
+            page.validate_for_request(page_request)
+                .expect("canonical status fixture page");
+
+            let authority_byte = 0xc8_u8
+                .checked_add(u8::try_from(case).expect("status fixture authority case"))
+                .expect("status fixture authority byte");
+            let client_authority = control_authenticator(authority_byte);
+            let server_authority = control_authenticator(authority_byte);
+            let connection_identity = BrokerGuardianConnectionIdentityV1::new(
+                id(6_243 + case),
+                mux_incarnation,
+                sealed(0xca),
+                sealed(0xcb),
+            )
+            .expect("valid status fixture connection identity");
+            let connection_id = id(6_245 + case);
+            let broker_incarnation = id(6_247 + case);
+            let (client_stream, mut server_stream) =
+                BlockingUnixStream::pair().expect("create status fixture socket pair");
+            let server = thread::spawn(move || {
+                let frame = read_blocking_broker_control_frame(
+                    &mut server_stream,
+                    BROKER_CONTROL_REQUEST_FIXED_BYTES,
+                )
+                .expect("read swapped-status Census request");
+                let request = decode_broker_control_request(&server_authority, &frame)
+                    .expect("decode swapped-status Census request");
+                assert_eq!(request.header.operation, BrokerControlOperationV1::Census);
+                assert_eq!(
+                    BrokerCensusPageRequestV1::decode(request.payload())
+                        .expect("decode swapped-status page request"),
+                    page_request
+                );
+                let payload = if matches!(
+                    wrong_status,
+                    BrokerControlResponseStatusV1::Applied
+                        | BrokerControlResponseStatusV1::Recovered
+                ) {
+                    page.encode().expect("encode swapped-status Census page")
+                } else {
+                    Vec::new()
+                };
+                let response = BrokerControlResponseV1::new(
+                    BrokerControlResponseHeaderV1 {
+                        operation: BrokerControlOperationV1::Census,
+                        status: wrong_status,
+                        request_id: request.header.request_id,
+                        broker_incarnation,
+                        guardian_incarnation: request.header.guardian_incarnation,
+                        connection_id: request.header.connection_id,
+                        durable_pane_id: Uuid::nil(),
+                        lease_generation: 0,
+                        operation_id: Uuid::nil(),
+                        child_identity: None,
+                        output_sequence_start: 0,
+                        output_sequence_end: 0,
+                    },
+                    &payload,
+                )
+                .expect("construct swapped-status Census response");
+                let response = encode_broker_control_response(&server_authority, &response)
+                    .expect("authenticate swapped-status Census response");
+                server_stream
+                    .write_all(response.as_slice())
+                    .expect("write swapped-status Census response");
+            });
+            let mut client = BrokerControlClientV1 {
+                stream: client_stream,
+                control_authenticator: client_authority,
+                identity: connection_identity,
+                connection_id,
+                broker_incarnation,
+                recovered_hello: false,
+                poisoned: false,
+            };
+            assert!(matches!(
+                client.census_page(page_request),
+                Err(BrokerControlClientError::UnexpectedResponse)
+            ));
+            assert!(client.poisoned, "swapped Census status did not poison the stream");
+            server.join().expect("join swapped-status Census fixture");
+        }
+    }
+
+    #[test]
+    fn recovery_census_deadline_classification_restores_socket_timeouts() {
+        let client_authority = control_authenticator(0xcc);
+        let server_authority = control_authenticator(0xcc);
+        let connection_identity = BrokerGuardianConnectionIdentityV1::new(
+            id(6_250),
+            id(6_251),
+            sealed(0xcd),
+            sealed(0xce),
+        )
+        .expect("valid stalled Census connection identity");
+        let (client_stream, mut server_stream) =
+            BlockingUnixStream::pair().expect("create stalled Census socket pair");
+        let original_read_timeout = Duration::from_secs(2);
+        let original_write_timeout = Duration::from_secs(3);
+        client_stream
+            .set_read_timeout(Some(original_read_timeout))
+            .expect("set original stalled Census read timeout");
+        client_stream
+            .set_write_timeout(Some(original_write_timeout))
+            .expect("set original stalled Census write timeout");
+        let server = thread::spawn(move || {
+            let frame = read_blocking_broker_control_frame(
+                &mut server_stream,
+                BROKER_CONTROL_REQUEST_FIXED_BYTES,
+            )
+            .expect("read stalled Census request");
+            let request = decode_broker_control_request(&server_authority, &frame)
+                .expect("decode stalled Census request");
+            assert_eq!(request.header.operation, BrokerControlOperationV1::Census);
+            thread::sleep(Duration::from_millis(100));
+        });
+        let mut client = BrokerControlClientV1 {
+            stream: client_stream,
+            control_authenticator: client_authority,
+            identity: connection_identity,
+            connection_id: id(6_252),
+            broker_incarnation: id(6_253),
+            recovered_hello: false,
+            poisoned: false,
+        };
+        assert!(matches!(
+            client.recovery_census_with_deadline(Duration::from_millis(25)),
+            Err(BrokerControlClientError::CensusCollectionDeadlineExceeded)
+        ));
+        assert!(client.poisoned, "stalled Census exchange did not poison the stream");
+        assert_eq!(
+            client
+                .stream
+                .read_timeout()
+                .expect("read restored Census read timeout"),
+            Some(original_read_timeout)
+        );
+        assert_eq!(
+            client
+                .stream
+                .write_timeout()
+                .expect("read restored Census write timeout"),
+            Some(original_write_timeout)
+        );
+        server.join().expect("join stalled Census fixture");
+    }
+
+    #[test]
+    fn recovery_census_absolute_deadline_rejects_a_drip_fed_partial_frame() {
+        let client_authority = control_authenticator(0xcf);
+        let server_authority = control_authenticator(0xcf);
+        let mux_incarnation = id(6_260);
+        let connection_identity = BrokerGuardianConnectionIdentityV1::new(
+            id(6_261),
+            mux_incarnation,
+            sealed(0xd0),
+            sealed(0xd1),
+        )
+        .expect("valid drip-fed Census connection identity");
+        let connection_id = id(6_262);
+        let broker_incarnation = id(6_263);
+        let (client_stream, mut server_stream) =
+            BlockingUnixStream::pair().expect("create drip-fed Census socket pair");
+        let original_read_timeout = Duration::from_secs(2);
+        let original_write_timeout = Duration::from_secs(3);
+        client_stream
+            .set_read_timeout(Some(original_read_timeout))
+            .expect("set original drip-fed Census read timeout");
+        client_stream
+            .set_write_timeout(Some(original_write_timeout))
+            .expect("set original drip-fed Census write timeout");
+        let client = BrokerControlClientV1 {
+            stream: client_stream,
+            control_authenticator: client_authority,
+            identity: connection_identity,
+            connection_id,
+            broker_incarnation,
+            recovered_hello: false,
+            poisoned: false,
+        };
+        let client_done = Arc::new(AtomicBool::new(false));
+        let client_thread_done = Arc::clone(&client_done);
+        let client_thread = thread::spawn(move || {
+            let mut client = client;
+            let started = Instant::now();
+            let result = client.recovery_census_with_deadline(Duration::from_millis(200));
+            let elapsed = started.elapsed();
+            client_thread_done.store(true, Ordering::Release);
+            (client, result, elapsed)
+        });
+
+        let request_frame = read_blocking_broker_control_frame(
+            &mut server_stream,
+            BROKER_CONTROL_REQUEST_FIXED_BYTES,
+        )
+        .expect("read drip-fed Census request");
+        let request = decode_broker_control_request(&server_authority, &request_frame)
+            .expect("decode drip-fed Census request");
+        let page_request = BrokerCensusPageRequestV1::decode(request.payload())
+            .expect("decode drip-fed Census page request");
+        let page = BrokerCensusPageV1 {
+            snapshot_id: id(6_264),
+            entries: vec![prepared_census_entry(1, mux_incarnation)],
+            next_cursor: None,
+            total_entries: 1,
+        };
+        page.validate_for_request(page_request)
+            .expect("canonical drip-fed Census page");
+        let payload = page.encode().expect("encode drip-fed Census page");
+        let response = BrokerControlResponseV1::new(
+            BrokerControlResponseHeaderV1 {
+                operation: BrokerControlOperationV1::Census,
+                status: BrokerControlResponseStatusV1::Applied,
+                request_id: request.header.request_id,
+                broker_incarnation,
+                guardian_incarnation: request.header.guardian_incarnation,
+                connection_id: request.header.connection_id,
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+                child_identity: None,
+                output_sequence_start: 0,
+                output_sequence_end: 0,
+            },
+            &payload,
+        )
+        .expect("construct drip-fed Census response");
+        let response = encode_broker_control_response(&server_authority, &response)
+            .expect("authenticate drip-fed Census response");
+        let response_bytes = response.as_slice();
+        server_stream
+            .write_all(&response_bytes[..5])
+            .expect("write drip-fed frame prefix and first body byte");
+        let mut written = 5;
+        for byte in &response_bytes[5..] {
+            if client_done.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(15));
+            if client_done.load(Ordering::Acquire) {
+                break;
+            }
+            if server_stream.write_all(&[*byte]).is_err() {
+                break;
+            }
+            written += 1;
+        }
+        assert!(written < response_bytes.len(), "drip fixture completed the frame");
+
+        let (client, result, elapsed) = client_thread.join().expect("join drip-fed Census client");
+        assert!(matches!(
+            result,
+            Err(BrokerControlClientError::CensusCollectionDeadlineExceeded)
+        ));
+        assert!(elapsed < Duration::from_secs(1), "absolute Census deadline was reset");
+        assert!(client.poisoned, "drip-fed Census did not poison the stream");
+        assert_eq!(
+            client
+                .stream
+                .read_timeout()
+                .expect("read restored drip-fed Census read timeout"),
+            Some(original_read_timeout)
+        );
+        assert_eq!(
+            client
+                .stream
+                .write_timeout()
+                .expect("read restored drip-fed Census write timeout"),
+            Some(original_write_timeout)
+        );
     }
 
     #[test]
@@ -14829,6 +16106,86 @@ mod tests {
             fs::read(&retained_token).expect("read retained original token"),
             original_token
         );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn catalog_reconciliation_holds_token_effect_lease_across_head_append() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create reconciliation-effect-lease root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set reconciliation-effect-lease root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path)
+            .expect("create reconciliation-effect-lease Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set reconciliation-effect-lease catalog owner-only");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision reconciliation-effect-lease token");
+        let (secret, mut token_authority) =
+            crate::transport::load_guardian_secret_with_authority(&token_path)
+                .expect("load reconciliation-effect-lease token authority");
+        let authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive reconciliation-effect-lease WAL authority");
+        let identity = recovered_catalog_identity(&authenticator, 0x67);
+        let head_path =
+            spawn_catalog_path.join(broker_spawn_catalog_head_name(identity.journal_id()));
+        let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
+            .expect("open reconciliation-effect-lease catalog");
+        let mut journal = catalog
+            .create_spawn_journal(identity, authenticator.clone())
+            .expect("create reconciliation-effect-lease journal");
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(journal);
+        drop(catalog);
+        let head_before = fs::read(&head_path).expect("read unreconciled effect-lease head");
+        let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path)
+            .expect("reopen reconciliation-effect-lease catalog");
+        let journals = catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("scan reconciliation-effect-lease catalog");
+        let mut admitted = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("admit reconciliation-effect-lease catalog");
+        assert!(admitted.journals[0].status().head_reconciliation_required);
+
+        reconcile_broker_catalog_under_token_authority_with_hook(
+            &mut token_authority,
+            &catalog,
+            &mut admitted,
+            || {
+                assert!(
+                    !crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                        .expect("probe token publication during head reconciliation"),
+                    "cooperative token publication crossed recovered-head append"
+                );
+            },
+        )
+        .expect("reconcile catalog under exact token effect lease");
+        assert!(
+            crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe token publication after head reconciliation"),
+            "head reconciliation retained its token effect lease"
+        );
+        assert_ne!(
+            fs::read(&head_path).expect("read reconciled effect-lease head"),
+            head_before,
+            "head reconciliation did not append its authenticated anchor"
+        );
+        assert!(!admitted.journals[0].status().head_reconciliation_required);
     }
 
     #[test]
