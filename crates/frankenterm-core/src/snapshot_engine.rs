@@ -7008,6 +7008,8 @@ pub struct CheckpointScrollbackArtifact {
 pub struct CheckpointScrollbackArtifactReceipt {
     /// Verified artifact schema.
     pub schema: String,
+    /// Verifier-enforced conservative capability matrix.
+    pub capabilities: CheckpointScrollbackCapabilities,
     /// Exact checkpoint row identity.
     pub checkpoint_id: i64,
     /// Exact checkpoint state witness.
@@ -9349,6 +9351,7 @@ pub fn verify_checkpoint_scrollback_artifact(
     validate_checkpoint_scrollback_payload(&artifact.payload, limits)?;
     Ok(CheckpointScrollbackArtifactReceipt {
         schema: artifact.schema,
+        capabilities: artifact.payload.capabilities,
         checkpoint_id: artifact.payload.checkpoint.checkpoint_id,
         checkpoint_state_hash: artifact.payload.checkpoint.state_hash.clone(),
         created_at_epoch_ms: artifact.payload.created_at_epoch_ms,

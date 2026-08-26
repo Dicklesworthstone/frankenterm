@@ -294,6 +294,254 @@ impl BrokerKernelChildIdentityV1 {
     }
 }
 
+/// Live kernel authority proving that a PID still names the exact spawned
+/// child incarnation whose durable digest is recorded in the Spawn WAL.
+///
+/// Linux retains a pidfd for the lifetime of this value. Other Unix targets
+/// deliberately return [`BrokerChildIncarnationError::Unsupported`]; a PID or
+/// a seconds-resolution process timestamp is not accepted as a substitute.
+pub(crate) struct BrokerVerifiedKernelChildV1 {
+    identity: BrokerKernelChildIdentityV1,
+    #[cfg(target_os = "linux")]
+    _pidfd: rustix::fd::OwnedFd,
+}
+
+impl std::fmt::Debug for BrokerVerifiedKernelChildV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerVerifiedKernelChildV1")
+            .field("process_id", &self.identity.process_id)
+            .field("broker_child_nonce", &"[REDACTED]")
+            .field("kernel_start_identity_digest", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrokerVerifiedKernelChildV1 {
+    #[must_use]
+    pub(crate) const fn identity(&self) -> BrokerKernelChildIdentityV1 {
+        self.identity
+    }
+
+    /// Verify one live child without exposing a raw descriptor or PID-only
+    /// authority. The caller must retain both this value and the child handle
+    /// until the Spawn-observed WAL record is synchronized.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_spawned_child(
+        child: &mut (dyn Child + Send + Sync),
+        broker_child_nonce: Uuid,
+    ) -> Result<Self, BrokerChildIncarnationError> {
+        if broker_child_nonce.is_nil() {
+            return Err(BrokerChildIncarnationError::InvalidIdentity);
+        }
+        if child
+            .try_wait()
+            .map_err(|source| BrokerChildIncarnationError::Io {
+                site: "pre-pidfd-child-status",
+                source,
+            })?
+            .is_some()
+        {
+            return Err(BrokerChildIncarnationError::ChildNotRunning);
+        }
+        let process_id = child
+            .process_id()
+            .ok_or(BrokerChildIncarnationError::InvalidIdentity)?;
+        let raw_pid =
+            i32::try_from(process_id).map_err(|_| BrokerChildIncarnationError::InvalidIdentity)?;
+        let pid = rustix::process::Pid::from_raw(raw_pid)
+            .ok_or(BrokerChildIncarnationError::InvalidIdentity)?;
+        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+            .map_err(|error| BrokerChildIncarnationError::Io {
+                site: "pidfd-open",
+                source: std::io::Error::from(error),
+            })?;
+        let (boot_id, start_ticks, state) = linux_process_birth_identity(process_id)?;
+        if matches!(state, b'Z' | b'X' | b'x') {
+            return Err(BrokerChildIncarnationError::ChildNotRunning);
+        }
+        if child
+            .try_wait()
+            .map_err(|source| BrokerChildIncarnationError::Io {
+                site: "post-pidfd-child-status",
+                source,
+            })?
+            .is_some()
+        {
+            return Err(BrokerChildIncarnationError::ChildNotRunning);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankenterm.guardian-broker.linux-child-incarnation.v1\0");
+        hasher.update(boot_id.as_bytes());
+        hasher.update(process_id.to_le_bytes());
+        hasher.update(start_ticks.to_le_bytes());
+        let identity = BrokerKernelChildIdentityV1 {
+            process_id,
+            broker_child_nonce,
+            kernel_start_identity_digest: hasher.finalize().into(),
+        };
+        identity
+            .validate()
+            .map_err(|_| BrokerChildIncarnationError::InvalidIdentity)?;
+        Ok(Self {
+            identity,
+            _pidfd: pidfd,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn verify_spawned_child(
+        _child: &mut (dyn Child + Send + Sync),
+        _broker_child_nonce: Uuid,
+    ) -> Result<Self, BrokerChildIncarnationError> {
+        Err(BrokerChildIncarnationError::Unsupported)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum BrokerChildIncarnationError {
+    #[error("broker child incarnation identity is invalid")]
+    InvalidIdentity,
+    #[error("broker child exited before its kernel incarnation was verified")]
+    ChildNotRunning,
+    #[error("broker child incarnation verification is unsupported on this Unix target")]
+    Unsupported,
+    #[error("broker child incarnation probe failed at {site}")]
+    Io {
+        site: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("broker child incarnation procfs record is invalid")]
+    InvalidProcfsRecord,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_birth_identity(
+    process_id: u32,
+) -> Result<(Uuid, u64, u8), BrokerChildIncarnationError> {
+    let proc_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open("/proc")
+        .map_err(|source| BrokerChildIncarnationError::Io {
+            site: "procfs-open",
+            source,
+        })?;
+    let filesystem =
+        rustix::fs::fstatfs(&proc_directory).map_err(|error| BrokerChildIncarnationError::Io {
+            site: "procfs-statfs",
+            source: std::io::Error::from(error),
+        })?;
+    if filesystem.f_type != rustix::fs::PROC_SUPER_MAGIC {
+        return Err(BrokerChildIncarnationError::InvalidProcfsRecord);
+    }
+    let pid_name = process_id.to_string();
+    let pid_directory = rustix::fs::openat(
+        &proc_directory,
+        pid_name.as_str(),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| BrokerChildIncarnationError::Io {
+        site: "procfs-pid-open",
+        source: std::io::Error::from(error),
+    })?;
+    let stat_file = rustix::fs::openat(
+        &pid_directory,
+        "stat",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| BrokerChildIncarnationError::Io {
+        site: "procfs-stat-open",
+        source: std::io::Error::from(error),
+    })?;
+    let stat = read_bounded_linux_proc_file(stat_file, 4096, "procfs-stat-read")?;
+    let (state, start_ticks) = parse_linux_proc_stat(&stat)?;
+
+    let boot_id_file = rustix::fs::openat(
+        &proc_directory,
+        "sys/kernel/random/boot_id",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| BrokerChildIncarnationError::Io {
+        site: "procfs-boot-id-open",
+        source: std::io::Error::from(error),
+    })?;
+    let boot_id = read_bounded_linux_proc_file(boot_id_file, 64, "procfs-boot-id-read")?;
+    let boot_id = std::str::from_utf8(trim_ascii_whitespace(&boot_id))
+        .ok()
+        .and_then(|text| Uuid::parse_str(text).ok())
+        .filter(|identity| !identity.is_nil())
+        .ok_or(BrokerChildIncarnationError::InvalidProcfsRecord)?;
+    Ok((boot_id, start_ticks, state))
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_linux_proc_file(
+    file: File,
+    maximum_bytes: usize,
+    site: &'static str,
+) -> Result<Vec<u8>, BrokerChildIncarnationError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(maximum_bytes)
+        .map_err(|_| BrokerChildIncarnationError::InvalidProcfsRecord)?;
+    file.take(
+        u64::try_from(maximum_bytes)
+            .map_err(|_| BrokerChildIncarnationError::InvalidProcfsRecord)?
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|source| BrokerChildIncarnationError::Io { site, source })?;
+    if bytes.is_empty() || bytes.len() > maximum_bytes {
+        return Err(BrokerChildIncarnationError::InvalidProcfsRecord);
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_stat(bytes: &[u8]) -> Result<(u8, u64), BrokerChildIncarnationError> {
+    let closing_parenthesis = bytes
+        .windows(2)
+        .rposition(|window| window == b") ")
+        .ok_or(BrokerChildIncarnationError::InvalidProcfsRecord)?;
+    let mut fields = bytes[closing_parenthesis + 2..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    let state = fields
+        .next()
+        .filter(|field| field.len() == 1)
+        .map(|field| field[0])
+        .ok_or(BrokerChildIncarnationError::InvalidProcfsRecord)?;
+    let start_ticks = fields
+        .nth(18)
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|field| field.parse::<u64>().ok())
+        .filter(|ticks| *ticks != 0)
+        .ok_or(BrokerChildIncarnationError::InvalidProcfsRecord)?;
+    Ok((state, start_ticks))
+}
+
+#[cfg(target_os = "linux")]
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrokerSpawnWalTailV1 {
     Clean,
@@ -663,8 +911,7 @@ fn validate_broker_spawn_file_header(
     expected: BrokerSpawnWalIdentityV1,
     authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
 ) -> Result<[u8; BROKER_SPAWN_WAL_MAC_BYTES], BrokerSpawnWalError> {
-    let (observed, tag) =
-        decode_broker_spawn_file_header(header, magic, authenticator)?;
+    let (observed, tag) = decode_broker_spawn_file_header(header, magic, authenticator)?;
     if observed != expected {
         return Err(BrokerSpawnWalError::IdentityMismatch);
     }
@@ -675,13 +922,7 @@ fn decode_broker_spawn_file_header(
     header: &[u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
     magic: [u8; 8],
     authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
-) -> Result<
-    (
-        BrokerSpawnWalIdentityV1,
-        [u8; BROKER_SPAWN_WAL_MAC_BYTES],
-    ),
-    BrokerSpawnWalError,
-> {
+) -> Result<(BrokerSpawnWalIdentityV1, [u8; BROKER_SPAWN_WAL_MAC_BYTES]), BrokerSpawnWalError> {
     if header[0..8] != magic {
         return Err(BrokerSpawnWalError::InvalidFileMagic);
     }
@@ -1111,9 +1352,7 @@ fn broker_spawn_catalog_head_name(journal_id: Uuid) -> OsString {
     format!("{BROKER_SPAWN_CATALOG_PREFIX}{journal_id}{BROKER_SPAWN_CATALOG_HEAD_SUFFIX}").into()
 }
 
-fn parse_broker_spawn_catalog_name(
-    name: &OsStr,
-) -> Result<(Uuid, bool), BrokerSpawnWalError> {
+fn parse_broker_spawn_catalog_name(name: &OsStr) -> Result<(Uuid, bool), BrokerSpawnWalError> {
     let text = name
         .to_str()
         .ok_or(BrokerSpawnWalError::UnexpectedCatalogEntry)?;
@@ -1172,9 +1411,7 @@ fn validate_broker_spawn_catalog_path(path: &Path) -> Result<(), BrokerSpawnWalE
     Ok(())
 }
 
-fn broker_spawn_file_identity_from_metadata(
-    metadata: &Metadata,
-) -> BrokerSpawnWalFileIdentityV1 {
+fn broker_spawn_file_identity_from_metadata(metadata: &Metadata) -> BrokerSpawnWalFileIdentityV1 {
     BrokerSpawnWalFileIdentityV1 {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -1556,8 +1793,8 @@ impl BrokerSpawnWalCatalogV1 {
     fn scan_pairs(
         &self,
     ) -> Result<BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1>, BrokerSpawnWalError> {
-        let mut directory = rustix::fs::Dir::read_from(&self.directory)
-            .map_err(std::io::Error::from)?;
+        let mut directory =
+            rustix::fs::Dir::read_from(&self.directory).map_err(std::io::Error::from)?;
         let mut pairs = BTreeMap::new();
         let mut observed_entries = 0_usize;
         while let Some(entry) = directory.read() {
@@ -3895,6 +4132,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -4000,6 +4238,14 @@ mod tests {
     fn wal_identity(binding: BrokerGenesisBinding) -> BrokerSpawnWalIdentityV1 {
         BrokerSpawnWalIdentityV1::from_binding(id(900), id(901), binding)
             .expect("valid broker WAL identity")
+    }
+
+    fn private_catalog_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create private broker catalog test directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("set broker catalog test directory owner-only");
+        directory
     }
 
     fn open_new_test_file(path: &std::path::Path) -> File {
