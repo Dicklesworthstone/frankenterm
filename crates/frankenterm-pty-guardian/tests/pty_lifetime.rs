@@ -91,12 +91,7 @@ fn empty_guarded_stop_returns_authenticated_success_before_service_exit() -> any
         handle: Some(handle),
     };
     let mut client = GuardianClient::connect(&socket_path, &token_path, Uuid::new_v4())?;
-    anyhow::ensure!(
-        wait_until(Duration::from_secs(3), || client
-            .guarded_stop(Uuid::new_v4(), Uuid::new_v4())
-            .is_ok()),
-        "replay-wait pane resources were not reclaimed for guarded stop"
-    );
+    client.guarded_stop(Uuid::new_v4(), Uuid::new_v4())?;
     anyhow::ensure!(
         wait_until(Duration::from_secs(3), || service_thread
             .handle
@@ -191,6 +186,18 @@ fn replay_resume_wait_wakes_on_durable_output_and_expires_at_its_deadline() -> a
         ),
         "guardian returned an unexpected replay-wait claim receipt"
     );
+    // Census `next_sequence` is the control-plane mutation sequence, not the
+    // encrypted output-journal sequence. Pin the exact pane segment length so
+    // the wake assertion below observes the durable data-plane boundary.
+    let output_directory = directory.join("guardian-output-v3");
+    anyhow::ensure!(
+        wait_until(Duration::from_secs(2), || {
+            pane_output_segment_size(&output_directory, pane_id).is_some()
+        }),
+        "guardian did not publish the pane output segment before replay"
+    );
+    let initial_segment_bytes = pane_output_segment_size(&output_directory, pane_id)
+        .ok_or_else(|| anyhow::anyhow!("guardian pane output segment disappeared"))?;
 
     let checkpoint_id = GuardianCheckpointIdentityDigest::from_bytes([0x6a; 32])?;
     let emit = thread::spawn({
@@ -234,9 +241,10 @@ fn replay_resume_wait_wakes_on_durable_output_and_expires_at_its_deadline() -> a
     );
     anyhow::ensure!(
         wait_until(Duration::from_secs(2), || {
-            census_entry(&mut client, pane_id).is_some_and(|entry| entry.next_sequence == Some(2))
+            pane_output_segment_size(&output_directory, pane_id)
+                .is_some_and(|bytes| bytes > initial_segment_bytes)
         }),
-        "the replay wake was not backed by sequence-1 durable output"
+        "the replay wake was not backed by a durable output-journal append"
     );
 
     let deadline_started = Instant::now();
@@ -290,7 +298,12 @@ fn replay_resume_wait_wakes_on_durable_output_and_expires_at_its_deadline() -> a
         ),
         "guardian returned an unexpected replay-wait close receipt"
     );
-    client.guarded_stop(Uuid::new_v4(), Uuid::new_v4())?;
+    anyhow::ensure!(
+        wait_until(Duration::from_secs(3), || client
+            .guarded_stop(Uuid::new_v4(), Uuid::new_v4())
+            .is_ok()),
+        "replay-wait pane resources were not reclaimed for guarded stop"
+    );
     service_thread
         .handle
         .take()
@@ -504,6 +517,28 @@ fn census_entry(
         return None;
     };
     entries.into_iter().find(|entry| entry.pane_id == pane_id)
+}
+
+fn pane_output_segment_size(output_directory: &Path, pane_id: Uuid) -> Option<u64> {
+    let prefix = format!("pane-{pane_id}.guardian-");
+    let mut size = None;
+    for entry in std::fs::read_dir(output_directory).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        if !name.starts_with(&prefix) || !name.ends_with(".ftgout") {
+            continue;
+        }
+        if size.is_some() {
+            return None;
+        }
+        let metadata = entry.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        size = Some(metadata.len());
+    }
+    size
 }
 
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
