@@ -2405,9 +2405,8 @@ impl BrokerRecoveredSpawnCatalogV1 {
             .try_reserve_exact(self.journals.len())
             .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
         for journal in &self.journals {
-            entries.push(BrokerCensusEntryV1::from_recovered_status(
-                journal.status(),
-            )?);
+            let status = journal.status();
+            entries.push(BrokerCensusEntryV1::from_recovered_status(&status)?);
         }
         entries.sort_unstable_by(|left, right| {
             left.durable_pane_id
@@ -3176,7 +3175,7 @@ impl BrokerControlServiceV1 {
             )
             .map_err(|_| ());
         };
-        let entry = BrokerCensusEntryV1::from_recovered_status(status).map_err(|_| ())?;
+        let entry = BrokerCensusEntryV1::from_recovered_status(&status).map_err(|_| ())?;
         let encoded = entry.encode().map_err(|_| ())?;
         BrokerControlResponseV1::new(
             self.response_header(
@@ -4553,7 +4552,7 @@ pub struct BrokerCensusEntryV1 {
 
 impl BrokerCensusEntryV1 {
     fn from_recovered_status(
-        status: BrokerSpawnWalStatusV1,
+        status: &BrokerSpawnWalStatusV1,
     ) -> Result<Self, BrokerControlProtocolError> {
         if !matches!(status.tail, BrokerSpawnWalTailV1::Clean) {
             return Err(BrokerControlProtocolError::InvalidShape);
@@ -4924,7 +4923,8 @@ impl BrokerCensusPageV1 {
             .try_reserve_exact(entry_count)
             .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
         for row in encoded[BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES..]
-            .chunks_exact(BROKER_CONTROL_CENSUS_ENTRY_BYTES)
+            .as_chunks::<BROKER_CONTROL_CENSUS_ENTRY_BYTES>()
+            .0
         {
             entries.push(BrokerCensusEntryV1::decode(row)?);
         }
@@ -12921,7 +12921,7 @@ mod tests {
                     authenticator.clone(),
                 );
                 let status = recovered.status();
-                let entry = BrokerCensusEntryV1::from_recovered_status(status)
+                let entry = BrokerCensusEntryV1::from_recovered_status(&status)
                     .expect("classify all-phase recovered Census row");
                 let expected_records = match phase {
                     None => 0,
@@ -13641,6 +13641,134 @@ mod tests {
         assert_eq!(response.header.broker_incarnation, broker_incarnation);
     }
 
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn token_rotation_between_response_enqueue_and_flush_emits_zero_stale_bytes() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create enqueue-flush rotation test root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set enqueue-flush rotation root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create enqueue-flush Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set enqueue-flush Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision enqueue-flush token");
+        let original_token = fs::read(&token_path).expect("read enqueue-flush token");
+        let secret = crate::transport::load_guardian_secret(&token_path)
+            .expect("load enqueue-flush token");
+        let control_authenticator = secret
+            .broker_control_authenticator()
+            .expect("derive enqueue-flush authority");
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path.clone(),
+            spawn_catalog_path,
+            sealed(0xa5),
+            1,
+            Duration::from_millis(5),
+        )
+        .expect("valid enqueue-flush broker config");
+        let mut service = BrokerControlServiceV1::bind(config)
+            .expect("bind enqueue-flush broker service");
+        let mut client = BlockingUnixStream::connect(&socket_path)
+            .expect("connect enqueue-flush client");
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("bound enqueue-flush client read");
+        service
+            .accept_connections()
+            .expect("accept enqueue-flush client");
+        let (&token, connection) = service
+            .connections
+            .iter()
+            .next()
+            .expect("one accepted enqueue-flush connection");
+        let generation = connection.generation;
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Hello,
+                request_id: id(6_184),
+                broker_incarnation: Uuid::nil(),
+                guardian_incarnation: id(6_185),
+                connection_id: id(6_186),
+                mux_incarnation: id(6_187),
+                guardian_build_identity_digest: sealed(0xa6).into_bytes(),
+                mux_build_identity_digest: sealed(0xa7).into_bytes(),
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+            },
+            &[],
+        )
+        .expect("canonical enqueue-flush Hello");
+        let frame = encode_broker_control_request(&control_authenticator, &request)
+            .expect("authenticate enqueue-flush Hello");
+        client
+            .write_all(frame.as_slice())
+            .expect("write enqueue-flush Hello");
+        service
+            .drive_connection_read(token, generation)
+            .expect("queue pre-rotation Hello response");
+        assert!(
+            service
+                .connections
+                .get(&token)
+                .is_some_and(|connection| connection.write_frame.is_some())
+        );
+
+        let retained_token = root.path().join("guardian-retained-enqueue-flush.token");
+        fs::rename(&token_path, &retained_token)
+            .expect("retain pre-rotation enqueue-flush token inode");
+        let mut replacement_token = original_token.clone();
+        replacement_token[0] ^= 0x40;
+        create_private_broker_token_with_bytes(&token_path, &replacement_token);
+        let flush_hook_called = AtomicBool::new(false);
+        assert!(matches!(
+            service.drive_connection_write_with_hook(token, generation, || {
+                flush_hook_called.store(true, Ordering::Release);
+            }),
+            Err(BrokerControlServiceError::Endpoint(
+                GuardianServiceError::FilesystemSecurity(_)
+            ))
+        ));
+        assert!(
+            !flush_hook_called.load(Ordering::Acquire),
+            "stale-authority response reached its flush attempt"
+        );
+        let mut stale_byte = [0_u8; 1];
+        let error = client
+            .read_exact(&mut stale_byte)
+            .expect_err("stale-authority response emitted bytes after token rotation");
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+        assert_eq!(
+            fs::read(&retained_token).expect("read retained enqueue-flush token"),
+            original_token
+        );
+
+        drop(service);
+        assert_eq!(
+            client
+                .read(&mut stale_byte)
+                .expect("observe enqueue-flush connection closure"),
+            0,
+            "service teardown emitted a stale queued response"
+        );
+    }
+
     #[test]
     fn broker_control_authentication_deadline_reclaims_saturated_partial_connections() {
         let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
@@ -13831,7 +13959,7 @@ mod tests {
             .expect("read empty immutable recovery Census");
         assert!(!census.snapshot_id().is_nil());
         assert_eq!(census.total_entries(), 0);
-        assert!(census.entries().is_empty());
+        assert_eq!(census.entries(), []);
         assert_eq!(census.next_cursor(), None);
 
         let rejected_spawn = BrokerControlRequestV1::new(
