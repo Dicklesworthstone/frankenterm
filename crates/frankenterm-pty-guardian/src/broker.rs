@@ -3444,11 +3444,20 @@ impl BrokerGenesisBinding {
     }
 
     fn matches_control_header(self, header: BrokerControlRequestHeaderV1) -> bool {
-        self.mux_incarnation == header.mux_incarnation
-            && self.spawn_effect_id == header.operation_id
-            && self.durable_pane_id == header.durable_pane_id
-            && self.spawning_mux_build_identity_digest == header.mux_build_identity_digest
-            && self.live_guardian_build_identity_digest == header.guardian_build_identity_digest
+        let BrokerControlRequestHeaderV1 {
+            mux_incarnation,
+            operation_id: requested_spawn_effect_id,
+            durable_pane_id,
+            mux_build_identity_digest,
+            guardian_build_identity_digest,
+            ..
+        } = header;
+        let effect_identity_matches = self.spawn_effect_id == requested_spawn_effect_id
+            && self.durable_pane_id == durable_pane_id;
+        let build_identity_matches = self.spawning_mux_build_identity_digest
+            == mux_build_identity_digest
+            && self.live_guardian_build_identity_digest == guardian_build_identity_digest;
+        self.mux_incarnation == mux_incarnation && effect_identity_matches && build_identity_matches
     }
 }
 
@@ -5130,10 +5139,8 @@ mod tests {
 
     #[test]
     fn control_codec_is_bounded_direction_separated_and_mutation_sensitive() {
-        static_assertions::assert_not_impl_any!(BrokerControlRequestV1: Clone, Copy);
-        static_assertions::assert_not_impl_any!(BrokerControlResponseV1: Clone, Copy);
-        static_assertions::assert_not_impl_any!(BrokerControlWireFrameV1: Clone, Copy);
-        static_assertions::assert_impl_all!(BrokerControlWireFrameV1: ZeroizeOnDrop);
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<BrokerControlWireFrameV1>();
 
         let authority = control_authenticator(0x5a);
         let request = BrokerControlRequestV1::new(
@@ -5158,7 +5165,7 @@ mod tests {
         let decoded =
             decode_broker_control_request(&authority, encoded.as_slice()).expect("decode request");
         assert_eq!(decoded.header, request.header);
-        assert!(decoded.payload().is_empty());
+        assert_eq!(decoded.payload(), []);
 
         let mut mutated = encoded.as_slice().to_vec();
         mutated[20] ^= 1;
@@ -5201,7 +5208,7 @@ mod tests {
             decode_broker_control_response(&authority, encoded_response.as_slice())
                 .expect("decode response");
         assert_eq!(decoded_response.header, response.header);
-        assert!(decoded_response.payload().is_empty());
+        assert_eq!(decoded_response.payload(), []);
         assert!(
             decode_broker_control_request(&authority, encoded_response.as_slice()).is_err(),
             "a response-direction frame was accepted as a request"

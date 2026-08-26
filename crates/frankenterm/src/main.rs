@@ -77404,18 +77404,24 @@ async fn run_compatible_client_subprocess(
     );
     let arguments = compatible_client_command_arguments(environment, executable, kind);
     let configuration = compatible_client_config_bytes(socket)?;
-    let workspace = environment.workspace.clone();
-    let run_result = run_cli_blocking_with_cx(cx, "compatible-client subprocess", move || {
-        let mut command = frankenterm_core::runtime_async::process::Command::new("/usr/bin/env");
-        command
-            .args(arguments)
-            .current_dir(workspace)
-            .stdin_limit(64 * 1024)
-            .stdin_bytes(configuration)
-            .stdout_limit(stdout_limit)
-            .stderr_limit(COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES)
-            .kill_on_drop(true);
-        let output = command.output_blocking(timeout).map_err(|error| {
+    let mut command = frankenterm_core::runtime_async::process::Command::new("/usr/bin/env");
+    command
+        .args(arguments)
+        .current_dir(&environment.workspace)
+        .stdin_limit(64 * 1024)
+        .stdin_bytes(configuration)
+        .stdout_limit(stdout_limit)
+        .stderr_limit(COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES)
+        .kill_on_drop(true);
+    let run_result = frankenterm_core::runtime_async::timeout_with_cx(
+        cx,
+        timeout,
+        command.output_with_cx(cx),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("compatible-client subprocess exceeded its wall-clock deadline"))
+    .and_then(|output| {
+        let output = output.map_err(|error| {
             anyhow::anyhow!(
                 "compatible-client subprocess failed before a bounded complete receipt ({:?})",
                 error.kind()
@@ -77433,8 +77439,7 @@ async fn run_compatible_client_subprocess(
             stdout: output.stdout,
             stderr_bytes: output.stderr.len(),
         })
-    })
-    .await;
+    });
 
     let source_revalidation = source.revalidate("compatible client source");
     let snapshot_revalidation = executable.revalidate("private compatible client snapshot");
