@@ -9498,10 +9498,93 @@ fn checkpoint_artifact_existing_target_matches(
     Ok(true)
 }
 
-fn open_or_rewrite_checkpoint_artifact_staging(
+/// Compare a retained staging inode with the exact requested payload prefix.
+///
+/// The return value contains the stable prefix length and its pre-append file
+/// snapshot. `None` means the residue is conflicting or overlong; callers must
+/// preserve it byte-for-byte. Comparison is streaming and bounded by the
+/// already-admitted payload length.
+fn checkpoint_artifact_existing_stage_prefix(
+    parent: &cap_std::fs::Dir,
+    staging: &Path,
+    file: &mut cap_std::fs::File,
+    expected: &[u8],
+) -> Result<Option<(usize, CheckpointArtifactFileSnapshot)>, CheckpointScrollbackArtifactError> {
+    const COMPARE_BUFFER_BYTES: usize = 16 * 1024;
+
+    let expected_len = u64::try_from(expected.len()).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact length does not fit u64".to_string(),
+        )
+    })?;
+    let before = validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(staging)?,
+        &file.metadata()?,
+        None,
+    )?;
+    if before.byte_len > expected_len {
+        let after = validate_checkpoint_artifact_file_metadata(
+            &parent.symlink_metadata(staging)?,
+            &file.metadata()?,
+            Some(before.byte_len),
+        )?;
+        if before != after {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "artifact staging residue changed while it was inspected".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    let prefix_len = usize::try_from(before.byte_len).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "artifact staging length does not fit this platform".to_string(),
+        )
+    })?;
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut buffer = [0_u8; COMPARE_BUFFER_BYTES];
+    let mut offset = 0_usize;
+    let mut exact_prefix = true;
+    while offset < prefix_len {
+        let remaining = prefix_len - offset;
+        let chunk_len = remaining.min(COMPARE_BUFFER_BYTES);
+        let read = file.read(&mut buffer[..chunk_len])?;
+        if read == 0 {
+            exact_prefix = false;
+            break;
+        }
+        let end = offset.checked_add(read).ok_or_else(|| {
+            CheckpointScrollbackArtifactError::ResourceLimit(
+                "artifact staging comparison offset overflow".to_string(),
+            )
+        })?;
+        if buffer[..read] != expected[offset..end] {
+            exact_prefix = false;
+        }
+        offset = end;
+    }
+    let after = validate_checkpoint_artifact_file_metadata(
+        &parent.symlink_metadata(staging)?,
+        &file.metadata()?,
+        Some(before.byte_len),
+    )?;
+    if before != after {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact staging residue changed while it was compared".to_string(),
+        ));
+    }
+    if exact_prefix && offset == prefix_len {
+        Ok(Some((prefix_len, after)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn open_or_resume_checkpoint_artifact_staging(
     parent: &cap_std::fs::Dir,
     staging: &Path,
     bytes: &[u8],
+    fault: CheckpointArtifactPublicationFault,
 ) -> Result<cap_std::fs::File, CheckpointScrollbackArtifactError> {
     let expected_len = u64::try_from(bytes.len()).map_err(|_| {
         CheckpointScrollbackArtifactError::ResourceLimit(
@@ -9529,28 +9612,83 @@ fn open_or_rewrite_checkpoint_artifact_staging(
         }
         Err(error) => return Err(error.into()),
     };
-    validate_checkpoint_artifact_file_metadata(
+    let opened_snapshot = validate_checkpoint_artifact_file_metadata(
         &parent.symlink_metadata(staging)?,
         &file.metadata()?,
-        None,
+        created.then_some(0),
     )?;
 
-    let exact_residue = !created
-        && checkpoint_artifact_open_file_matches_expected(
-            parent, staging, &mut file, bytes, false,
+    let (prefix_len, stable_prefix_snapshot) = if created {
+        (0_usize, opened_snapshot)
+    } else {
+        checkpoint_artifact_existing_stage_prefix(parent, staging, &mut file, bytes)?
+            .ok_or(CheckpointScrollbackArtifactError::StagingConflict)?
+    };
+    if prefix_len == bytes.len() {
+        file.sync_all()?;
+        let synchronized = validate_checkpoint_artifact_file_metadata(
+            &parent.symlink_metadata(staging)?,
+            &file.metadata()?,
+            Some(expected_len),
         )?;
-
-    if !exact_residue {
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(bytes)?;
+        if stable_prefix_snapshot != synchronized {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "artifact staging residue changed while it was synchronized".to_string(),
+            ));
+        }
+        return Ok(file);
     }
+
+    file.seek(SeekFrom::Start(
+        u64::try_from(prefix_len).map_err(|_| {
+            CheckpointScrollbackArtifactError::ResourceLimit(
+                "artifact staging append offset does not fit u64".to_string(),
+            )
+        })?,
+    ))?;
+    let missing = &bytes[prefix_len..];
+    if let Some(partial_len) = fault.partial_staging_append_len(missing.len()) {
+        file.write_all(&missing[..partial_len])?;
+        file.sync_all()?;
+        let partial_total_len = prefix_len.checked_add(partial_len).ok_or_else(|| {
+            CheckpointScrollbackArtifactError::ResourceLimit(
+                "artifact staging partial append length overflow".to_string(),
+            )
+        })?;
+        validate_checkpoint_artifact_file_metadata(
+            &parent.symlink_metadata(staging)?,
+            &file.metadata()?,
+            Some(u64::try_from(partial_total_len).map_err(|_| {
+                CheckpointScrollbackArtifactError::ResourceLimit(
+                    "artifact staging partial length does not fit u64".to_string(),
+                )
+            })?),
+        )?;
+        if checkpoint_artifact_existing_stage_prefix(parent, staging, &mut file, bytes)?
+            .is_none()
+        {
+            return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+                "partially completed artifact staging bytes are not an exact payload prefix"
+                    .to_string(),
+            ));
+        }
+        return Err(CheckpointScrollbackArtifactError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "test interruption after a partial artifact staging append",
+        )));
+    }
+    file.write_all(missing)?;
     file.sync_all()?;
     validate_checkpoint_artifact_file_metadata(
         &parent.symlink_metadata(staging)?,
         &file.metadata()?,
         Some(expected_len),
     )?;
+    if !checkpoint_artifact_open_file_matches_expected(parent, staging, &mut file, bytes, false)? {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "completed artifact staging bytes differ from the requested payload".to_string(),
+        ));
+    }
     Ok(file)
 }
 
@@ -9564,13 +9702,29 @@ enum CheckpointArtifactPublicationOutcome {
 enum CheckpointArtifactPublicationFault {
     None,
     #[cfg(test)]
+    AfterPartialStagingAppend,
+    #[cfg(test)]
     AfterRenameBeforeDirectorySync,
 }
 
 impl CheckpointArtifactPublicationFault {
+    fn partial_staging_append_len(self, missing_len: usize) -> Option<usize> {
+        match self {
+            #[cfg(test)]
+            Self::AfterPartialStagingAppend if missing_len > 1 => {
+                Some((missing_len / 2).clamp(1, missing_len - 1))
+            }
+            Self::None => None,
+            #[cfg(test)]
+            Self::AfterPartialStagingAppend | Self::AfterRenameBeforeDirectorySync => None,
+        }
+    }
+
     fn interrupts_after_rename_before_directory_sync(self) -> bool {
         match self {
             Self::None => false,
+            #[cfg(test)]
+            Self::AfterPartialStagingAppend => false,
             #[cfg(test)]
             Self::AfterRenameBeforeDirectorySync => true,
         }
@@ -9603,7 +9757,7 @@ fn publish_checkpoint_artifact_bytes_with_fault(
 
     let staging_name = checkpoint_artifact_staging_name(&leaf);
     let staging = Path::new(&staging_name);
-    let mut file = open_or_rewrite_checkpoint_artifact_staging(&parent, staging, bytes)?;
+    let mut file = open_or_resume_checkpoint_artifact_staging(&parent, staging, bytes, fault)?;
     match publish_checkpoint_artifact_noreplace(&parent, staging, &leaf) {
         Ok(()) => {}
         Err(CheckpointScrollbackArtifactError::AlreadyExists) => {

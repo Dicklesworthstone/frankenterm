@@ -13523,10 +13523,13 @@ mod tests {
     fn process_command_output_with_cx_cancellation_surfaces_as_interrupted() {
         // Thread-isolated to prevent TLS interference from 25K+ parallel tests.
         run_async_test_isolated(|| async {
+            let artifact_dir = tempfile::tempdir().expect("cancellation settlement tempdir");
+            let pid_path = artifact_dir.path().join("leader.pid");
+            let delayed_marker_path = artifact_dir.path().join("must-not-exist");
             let cx = crate::cx::for_testing();
             let cx_cancel_trigger = cx.clone();
             task::spawn(async move {
-                sleep(Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(250)).await;
                 cx_cancel_trigger.cancel_with(
                     crate::outcome::CancelKind::User,
                     Some("process_command_output_with_cx test cancel"),
@@ -13534,9 +13537,14 @@ mod tests {
             });
 
             let mut cmd = process::Command::new("sh");
-            cmd.arg("-c");
-            cmd.arg("sleep 10");
-            cmd.kill_on_drop(true);
+            cmd.arg("-c")
+                .arg(
+                    "printf '%s' \"$$\" > \"$FT_RUNTIME_COMPAT_PID\"; \
+                     (sleep 2; printf leaked > \"$FT_RUNTIME_COMPAT_MARKER\") & wait",
+                )
+                .env("FT_RUNTIME_COMPAT_PID", &pid_path)
+                .env("FT_RUNTIME_COMPAT_MARKER", &delayed_marker_path)
+                .kill_on_drop(true);
 
             let start = std::time::Instant::now();
             let result = cmd.output_with_cx(&cx).await;
@@ -13550,7 +13558,24 @@ mod tests {
             );
             assert!(
                 elapsed < Duration::from_secs(5),
-                "cancellation should surface promptly (got {elapsed:?}); the 10s sleep would dominate if cx was ignored"
+                "cancellation should surface promptly (got {elapsed:?}); the child would run for two seconds if cx was ignored"
+            );
+
+            let process_id: i64 = std::fs::read_to_string(&pid_path)
+                .expect("child must publish its process id before cancellation")
+                .parse()
+                .expect("published process id must be numeric");
+            let probe = process::send_unix_signal_to_pid(process_id, "0")
+                .expect("process-existence probe must execute");
+            assert!(
+                !probe.success(),
+                "cancelled process leader must already be reaped when the API returns"
+            );
+
+            sleep(Duration::from_millis(1_850)).await;
+            assert!(
+                !delayed_marker_path.exists(),
+                "cancelled process descendants must not survive to perform delayed effects"
             );
         });
     }

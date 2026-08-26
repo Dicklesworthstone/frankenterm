@@ -5,8 +5,9 @@ use clap::{Args, Parser, Subcommand};
 use frankenterm_pty_guardian::AtomicComponentIdentityError;
 #[cfg(unix)]
 use frankenterm_pty_guardian::{
-    GuardianClient, GuardianService, GuardianServiceConfig, ProvisionTokenOutcome,
-    guardian_atomic_component_marker, guardian_runtime_build_identity, provision_guardian_token,
+    BrokerControlServiceConfigV1, BrokerControlServiceV1, GuardianClient, GuardianService,
+    GuardianServiceConfig, ProvisionTokenOutcome, guardian_atomic_component_marker,
+    guardian_runtime_build_identity, provision_guardian_token,
 };
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -36,6 +37,9 @@ enum Command {
     ProvisionToken(TokenArgs),
     /// Stop the guardian only if it currently owns no panes.
     GuardedStop(EndpointArgs),
+    /// Production-disabled same-binary PTY broker process.
+    #[command(name = "broker-serve", hide = true)]
+    BrokerServe(BrokerServeArgs),
 }
 
 #[cfg(unix)]
@@ -86,6 +90,25 @@ struct ServeArgs {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Args)]
+struct BrokerServeArgs {
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+
+    /// Absolute path to an existing owner-only broker Spawn catalog.
+    #[arg(long)]
+    spawn_catalog_path: PathBuf,
+
+    /// Maximum simultaneously connected successor guardians.
+    #[arg(long, default_value_t = 64)]
+    max_connections: usize,
+
+    /// Broker readiness cadence in milliseconds.
+    #[arg(long, default_value_t = 25)]
+    poll_interval_ms: u64,
+}
+
+#[cfg(unix)]
 fn main() -> anyhow::Result<()> {
     retain_guardian_atomic_component_identity()?;
     let args = Cli::parse();
@@ -127,6 +150,18 @@ fn main() -> anyhow::Result<()> {
             )?;
             client.guarded_stop(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())?;
             println!("guardian-stop-accepted");
+        }
+        Command::BrokerServe(args) => {
+            let config = BrokerControlServiceConfigV1::new(
+                args.endpoint.socket_path,
+                args.endpoint.token_path,
+                args.spawn_catalog_path,
+                guardian_runtime_build_identity()?,
+                args.max_connections,
+                Duration::from_millis(args.poll_interval_ms),
+            )?;
+            let mut service = BrokerControlServiceV1::bind(config)?;
+            service.run_forever()?;
         }
     }
     Ok(())

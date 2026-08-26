@@ -98028,6 +98028,65 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
+    fn settled_blocking_effect_observes_pre_cancel_but_awaits_midflight_completion() {
+        run_async_test(async {
+            let pre_cancelled = frankenterm_core::cx::for_testing();
+            pre_cancelled.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("settled effect pre-cancel test"),
+            );
+            let pre_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let closure_started = Arc::clone(&pre_started);
+            let error = run_cli_settled_blocking_effect(
+                &pre_cancelled,
+                "test private artifact publication",
+                move || {
+                    closure_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("pre-cancelled effect must not begin mutation");
+            assert!(
+                error
+                    .to_string()
+                    .contains("before its first filesystem mutation")
+            );
+            assert!(!pre_started.load(std::sync::atomic::Ordering::SeqCst));
+
+            let midflight = frankenterm_core::cx::for_testing();
+            let cancel_trigger = midflight.clone();
+            frankenterm_core::runtime_async::task::spawn(async move {
+                frankenterm_core::runtime_async::sleep(Duration::from_millis(50)).await;
+                cancel_trigger.cancel_with(
+                    frankenterm_core::outcome::CancelKind::User,
+                    Some("settled effect midflight cancellation test"),
+                );
+            });
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let closure_completed = Arc::clone(&completed);
+            let started = Instant::now();
+            let receipt = run_cli_settled_blocking_effect(
+                &midflight,
+                "test private artifact publication",
+                move || {
+                    std::thread::sleep(Duration::from_millis(250));
+                    closure_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(17_u64)
+                },
+            )
+            .await
+            .expect("midflight cancellation must not abandon an admitted effect");
+            assert_eq!(receipt, 17);
+            assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                started.elapsed() >= Duration::from_millis(200),
+                "settled effect boundary returned before its closure completed"
+            );
+        });
+    }
+
+    #[test]
     fn compatible_client_source_receipt_rejects_zero_or_mismatched_authority() {
         let identity = |mode: u32, bytes: u64| {
             serde_json::json!({
@@ -98116,6 +98175,145 @@ recorder_backend = "rusqlite"
                 0o700
             );
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn private_artifact_publication_recovers_every_crash_cut_without_clobbering() {
+        let payload = vec![b'x'; 128 * 1024 + 17];
+        let payload_sha256 = sha256_hex(&payload);
+        let points = [
+            PrivateArtifactPublicationPoint::StageOpened,
+            PrivateArtifactPublicationPoint::StagePrefixWritten,
+            PrivateArtifactPublicationPoint::StageSynchronized,
+            PrivateArtifactPublicationPoint::TargetRenamed,
+            PrivateArtifactPublicationPoint::ParentSynchronized,
+        ];
+        for (index, point) in points.into_iter().enumerate() {
+            let directory = tempfile::tempdir().expect("private artifact crash-cut tempdir");
+            let parent = directory.path().join("private");
+            let path = parent.join(format!("dump-{index}.json"));
+            let stage_name =
+                private_artifact_stage_name(path.file_name().unwrap().as_ref(), &payload_sha256);
+            let stage_path = parent.join(stage_name);
+            let mut injected = false;
+            let error = write_new_private_artifact_with_hook(&path, &payload, |observed| {
+                if observed == point && !injected {
+                    injected = true;
+                    anyhow::bail!("deterministic private artifact crash cut");
+                }
+                Ok(())
+            })
+            .expect_err("selected publication cut must interrupt its first attempt");
+            assert!(error.to_string().contains("crash cut"));
+            assert!(injected, "the selected publication point must be reached");
+
+            match point {
+                PrivateArtifactPublicationPoint::StageOpened
+                | PrivateArtifactPublicationPoint::StagePrefixWritten
+                | PrivateArtifactPublicationPoint::StageSynchronized => {
+                    assert!(
+                        !path.exists(),
+                        "a partial stage must never expose the target"
+                    );
+                    assert!(
+                        stage_path.exists(),
+                        "the deterministic stage must be retained"
+                    );
+                }
+                PrivateArtifactPublicationPoint::TargetRenamed
+                | PrivateArtifactPublicationPoint::ParentSynchronized => {
+                    assert_eq!(
+                        std::fs::read(&path).expect("renamed target remains readable"),
+                        payload
+                    );
+                    assert!(
+                        !stage_path.exists(),
+                        "successful rename moves the exact stage into the target"
+                    );
+                }
+            }
+
+            let retry = write_new_private_artifact(&path, &payload)
+                .expect("same payload retry must converge after every crash cut");
+            assert_eq!(retry.sha256, payload_sha256);
+            assert_eq!(retry.bytes, u64::try_from(payload.len()).unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), payload);
+            assert_eq!(
+                retry.recovered_existing,
+                matches!(
+                    point,
+                    PrivateArtifactPublicationPoint::TargetRenamed
+                        | PrivateArtifactPublicationPoint::ParentSynchronized
+                )
+            );
+            assert!(!stage_path.exists());
+
+            let lost_reply = write_new_private_artifact(&path, &payload)
+                .expect("exact final bytes must reconcile as a lost success reply");
+            assert!(lost_reply.recovered_existing);
+            let conflict = write_new_private_artifact(&path, b"conflicting payload")
+                .expect_err("a different payload must never replace the exact target");
+            assert!(conflict.to_string().contains("never overwritten"));
+            assert_eq!(std::fs::read(&path).unwrap(), payload);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn private_artifact_stages_are_payload_bound_bounded_and_conflict_preserving() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("private artifact stage fixture");
+        let parent = directory.path().join("private");
+        std::fs::create_dir(&parent).expect("create private artifact fixture parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("seal private artifact fixture parent");
+        let path = parent.join("dump.json");
+        let expected = b"expected artifact bytes";
+        let expected_sha256 = sha256_hex(expected);
+        let expected_stage =
+            private_artifact_stage_name(path.file_name().unwrap().as_ref(), &expected_sha256);
+        let other_stage = private_artifact_stage_name(
+            path.file_name().unwrap().as_ref(),
+            &sha256_hex(b"different artifact bytes"),
+        );
+        assert_ne!(
+            expected_stage, other_stage,
+            "stage transaction identity must bind the exact payload digest"
+        );
+
+        let stage_path = parent.join(&expected_stage);
+        std::fs::write(&stage_path, b"conflicting retained prefix")
+            .expect("plant conflicting deterministic stage");
+        std::fs::set_permissions(&stage_path, std::fs::Permissions::from_mode(0o600))
+            .expect("seal conflicting deterministic stage");
+        let conflict = write_new_private_artifact(&path, expected)
+            .expect_err("conflicting retained stage bytes must fail closed");
+        assert!(conflict.to_string().contains("conflicts"));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(&stage_path).unwrap(),
+            b"conflicting retained prefix"
+        );
+
+        for index in 0..PRIVATE_ARTIFACT_MAX_RETAINED_STAGES {
+            let residue = parent.join(format!(
+                "{PRIVATE_ARTIFACT_STAGE_PREFIX}{index:064x}.pending"
+            ));
+            if residue == stage_path {
+                continue;
+            }
+            std::fs::write(&residue, []).expect("plant bounded stage census residue");
+            std::fs::set_permissions(&residue, std::fs::Permissions::from_mode(0o600))
+                .expect("seal bounded stage census residue");
+        }
+        let parent_cap =
+            open_directory_tree_nofollow(&parent).expect("open private stage census parent");
+        assert!(
+            private_artifact_stage_inventory(&parent_cap).is_err(),
+            "more than the retained stage bound must be rejected during streaming census"
+        );
     }
 
     #[cfg(unix)]
@@ -98613,6 +98811,8 @@ recorder_backend = "rusqlite"
             branch.contains("publish_mux_dump_payload(&output_path, dump)"),
             "live session dump must route through the shared durable publication helper"
         );
+        assert!(branch.contains("run_cli_settled_blocking_effect("));
+        assert!(!branch.contains("run_cli_blocking_with_cx("));
 
         let helper_start = source
             .find("fn publish_mux_dump_payload(")
@@ -98658,6 +98858,22 @@ recorder_backend = "rusqlite"
         assert!(helper.contains("output_with_cx_timeout(cx, timeout)"));
         assert!(!helper.contains("timeout_with_cx("));
         assert!(helper.contains("process cleanup settled"));
+    }
+
+    #[test]
+    fn compatible_client_publication_waits_for_settled_effect_receipt() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn run_compatible_client_dump_command(")
+            .expect("compatible-client command remains present");
+        let end = source[start..]
+            .find("\n#[derive(Debug, Clone, Copy)]\nenum JsonSerializationStyle")
+            .map(|offset| start + offset)
+            .expect("JSON serializer follows compatible-client command");
+        let command = &source[start..end];
+        assert!(command.contains("run_cli_settled_blocking_effect("));
+        assert!(!command.contains("run_cli_blocking_with_cx("));
+        assert!(command.contains("publish_mux_dump_payload(&publication_path, payload)"));
     }
 
     #[test]

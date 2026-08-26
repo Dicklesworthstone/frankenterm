@@ -7,19 +7,18 @@
 //! `SCM_RIGHTS` transfer cannot be revoked and socket EOF cannot fence a master
 //! already installed in a predecessor guardian.
 //!
-//! There is deliberately no transport or command-line activation. This module
-//! now contains the authenticated append-only Spawn WAL/head substrate for
-//! Intent, Attempt, observed non-recycled child identity, Query, and reply Ack;
-//! it also projects recovered records into the mux protocol's durable legacy
-//! Spawn fence. The filesystem discovery/revalidation service and OS child
-//! identity verifier are not wired yet, however, and the process-local PTY
-//! typestate still does **not** survive guardian `SIGKILL`. Catalog Genesis
-//! admission below remains durable pre-Spawn intent, never proof that a child
-//! exists. Activation additionally requires a separately spawned same-binary
-//! broker that opens/reconciles this WAL before traffic, sole-master proxy
-//! transport, and a real cross-process crash matrix. The WAL types model the
-//! marker-before-spawn and spawn-success-before-Ack cuts without claiming that
-//! the current service executes those recovery paths.
+//! A hidden same-binary broker subcommand now opens and reconciles the complete
+//! authenticated Spawn catalog before binding its pinned private control
+//! socket. Its bounded event loop authenticates exact guardian, mux, build,
+//! connection, broker-incarnation, and token-derived lineage identities. It
+//! still rejects every PTY effect: the exec-ready child barrier, live WAL
+//! receipts, durable output journal, census, and successor lease rotation must
+//! land before any production selector may start it. The process-local PTY
+//! typestate below therefore still does **not** prove guardian-`SIGKILL`
+//! continuity. Catalog Genesis admission remains durable pre-Spawn intent,
+//! never proof that a child exists, and the current service refuses startup
+//! when it encounters an existing nonempty Spawn lifecycle it cannot yet
+//! reconstruct without ambiguity.
 //!
 //! The ordering enforced here is:
 //!
@@ -1576,6 +1575,7 @@ pub struct BrokerControlClientV1 {
     identity: BrokerGuardianConnectionIdentityV1,
     connection_id: Uuid,
     broker_incarnation: Uuid,
+    recovered_hello: bool,
 }
 
 impl BrokerControlClientV1 {
@@ -1625,6 +1625,7 @@ impl BrokerControlClientV1 {
             identity,
             connection_id,
             broker_incarnation: Uuid::nil(),
+            recovered_hello: false,
         };
         let request = BrokerControlRequestV1::new(
             BrokerControlRequestHeaderV1 {
@@ -1658,12 +1659,18 @@ impl BrokerControlClientV1 {
             return Err(BrokerControlClientError::BrokerLineageMismatch);
         }
         client.broker_incarnation = response.header.broker_incarnation;
+        client.recovered_hello = response.header.status == BrokerControlResponseStatusV1::Recovered;
         Ok(client)
     }
 
     #[must_use]
     pub const fn broker_incarnation(&self) -> Uuid {
         self.broker_incarnation
+    }
+
+    #[must_use]
+    pub const fn recovered_hello(&self) -> bool {
+        self.recovered_hello
     }
 
     fn exchange(
