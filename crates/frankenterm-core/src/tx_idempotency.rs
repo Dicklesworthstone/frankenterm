@@ -3330,21 +3330,28 @@ impl IdempotencyStore {
         plan_id: &str,
         plan_hash: u64,
     ) -> Result<(), IdempotencyError> {
-        let spool = self.durable_spool()?;
-        let entries = spool
-            .dir
+        // Clone the pinned directory capability before applying scan results
+        // to the in-memory catalog. Keeping `&self.durable_spool` alive for
+        // the loop would alias the later, intentional `self.ledgers`
+        // mutations even though those mutations do not affect the capability.
+        let (spool_dir, spool_display_path) = {
+            let spool = self.durable_spool()?;
+            (Arc::clone(&spool.dir), spool.display_path.clone())
+        };
+        let max_ledger_bytes = self.policy.max_ledger_bytes;
+        let entries = spool_dir
             .entries()
             .map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!(
                     "list pinned tx_ledgers directory {}: {err}",
-                    spool.display_path.display()
+                    spool_display_path.display()
                 ),
             })?;
         for entry in entries {
             let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!(
                     "read entry in pinned tx_ledgers directory {}: {err}",
-                    spool.display_path.display()
+                    spool_display_path.display()
                 ),
             })?;
             let name = PathBuf::from(entry.file_name());
@@ -3352,15 +3359,15 @@ impl IdempotencyStore {
                 && let Some(stem) = name.file_stem().and_then(|s| s.to_str())
                 && is_valid_execution_id(stem)
             {
-                let ledger_display = spool.display(&name);
+                let ledger_display = spool_display_path.join(&name);
                 let options = nofollow_open_options(true, false);
-                if let Ok(mut file) = spool.dir.open_with(&name, &options) {
+                if let Ok(mut file) = spool_dir.open_with(&name, &options) {
                     if let Ok(metadata) = file.metadata() {
                         if validate_open_regular_file(&metadata, &ledger_display).is_ok() {
                             if let Ok(contents) = read_bounded_ledger_with_limit(
                                 &mut file,
                                 &ledger_display,
-                                self.policy.max_ledger_bytes,
+                                max_ledger_bytes,
                             ) {
                                 if let Ok(ledger) =
                                     serde_json::from_slice::<TxExecutionLedger>(&contents)
