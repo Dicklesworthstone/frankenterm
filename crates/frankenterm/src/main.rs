@@ -97408,6 +97408,337 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
+    fn compatible_client_batch_requires_exact_untruncated_once_per_pane_results() {
+        let redactor = frankenterm_core::redactor::Redactor::new();
+        let expected = [7, 9];
+        let requested_tail = 1025;
+        let valid = serde_json::json!({
+            "pane_ids": [7, 9],
+            "tail_lines": requested_tail,
+            "escapes_included": false,
+            "results": {
+                "7": {"status": "ok", "text": "seven", "truncated": false, "truncation_info": null},
+                "9": {"status": "ok", "text": "nine", "truncated": false, "truncation_info": null},
+            },
+        });
+        let parse = |value: &serde_json::Value| {
+            serde_json::from_value::<CompatibleClientBatchTextData>(value.clone())
+                .expect("batch fixture matches the frozen schema")
+        };
+        let mut admitted = BTreeMap::new();
+        let mut bytes = 0;
+        consume_compatible_client_batch(
+            parse(&valid),
+            &expected,
+            requested_tail,
+            &redactor,
+            &mut admitted,
+            &mut bytes,
+            1024,
+        )
+        .expect("exact complete batch is admitted");
+        assert_eq!(admitted.keys().copied().collect::<Vec<_>>(), expected);
+        assert_eq!(bytes, 9);
+
+        let rejects = |value: &serde_json::Value| {
+            let mut rejected = BTreeMap::new();
+            let mut rejected_bytes = 0;
+            consume_compatible_client_batch(
+                parse(value),
+                &expected,
+                requested_tail,
+                &redactor,
+                &mut rejected,
+                &mut rejected_bytes,
+                1024,
+            )
+        };
+        let mut truncated = valid.clone();
+        truncated["results"]["7"]["truncated"] = serde_json::json!(true);
+        assert!(rejects(&truncated).is_err());
+
+        let mut wrong_tail = valid.clone();
+        wrong_tail["tail_lines"] = serde_json::json!(requested_tail - 1);
+        assert!(rejects(&wrong_tail).is_err());
+
+        let mut pane_error = valid;
+        pane_error["results"]["9"] = serde_json::json!({
+            "status": "error",
+            "code": "secret-code",
+            "message": "AKIAIOSFODNN7EXAMPLE",
+            "hint": null,
+        });
+        let error = rejects(&pane_error).expect_err("one failed pane invalidates the entire batch");
+        assert!(!error.to_string().contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn compatible_client_topology_fence_uses_raw_domain_before_redaction() {
+        let pane = |domain: &str| CompatibleClientPaneState {
+            pane_id: 7,
+            pane_uuid: Some("00112233445566778899aabbccddeeff".to_string()),
+            tab_id: 8,
+            window_id: 9,
+            domain: domain.to_string(),
+            title: None,
+            cwd: None,
+            observed: true,
+            ignore_reason: None,
+        };
+        let first_secret = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second_secret = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let redactor = frankenterm_core::redactor::Redactor::new();
+        assert_eq!(redactor.redact(first_secret), redactor.redact(second_secret));
+        assert_ne!(
+            compatible_client_raw_topology(&[pane(first_secret)]),
+            compatible_client_raw_topology(&[pane(second_secret)]),
+            "raw identity comparison must detect drift even when redaction collapses both domains"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_client_command_is_hermetic_and_forces_the_private_workspace() {
+        let environment = CompatibleClientEnvironment {
+            root: PathBuf::from("/private/recovery"),
+            empty_path: PathBuf::from("/private/recovery/empty-path"),
+            home: PathBuf::from("/private/recovery/home"),
+            config: PathBuf::from("/private/recovery/config"),
+            data: PathBuf::from("/private/recovery/data"),
+            workspace: PathBuf::from("/private/recovery/workspace"),
+            temp: PathBuf::from("/private/recovery/tmp"),
+            nonexistent_external_cli: PathBuf::from(
+                "/private/recovery/external-wezterm-is-forbidden",
+            ),
+        };
+        let arguments = compatible_client_command_arguments(
+            &environment,
+            Path::new("/private/recovery/pinned-ft-v0.13.0"),
+            CompatibleClientCommandKind::GetText {
+                pane_ids: &[7, 9],
+                requested_tail: 1025,
+            },
+        );
+        let rendered = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.first().map(String::as_str), Some("-i"));
+        assert!(rendered.contains(&"PATH=/private/recovery/empty-path".to_string()));
+        assert!(rendered.contains(&"HOME=/private/recovery/home".to_string()));
+        assert!(rendered.contains(&"XDG_CONFIG_HOME=/private/recovery/config".to_string()));
+        assert!(rendered.contains(&"XDG_DATA_HOME=/private/recovery/data".to_string()));
+        assert!(rendered.contains(&"TMPDIR=/private/recovery/tmp".to_string()));
+        assert!(rendered.contains(
+            &"FT_WEZTERM_CLI=/private/recovery/external-wezterm-is-forbidden".to_string()
+        ));
+        let workspace = rendered
+            .iter()
+            .position(|argument| argument == "--workspace")
+            .expect("workspace flag is explicit");
+        assert_eq!(
+            rendered.get(workspace + 1).map(String::as_str),
+            Some("/private/recovery/workspace")
+        );
+        let robot = rendered
+            .iter()
+            .position(|argument| argument == "robot")
+            .expect("robot subcommand is present");
+        assert_eq!(
+            &rendered[robot..robot + 4],
+            ["robot", "--format", "json", "get-text"]
+        );
+        assert!(rendered.windows(2).any(|pair| pair == ["--panes", "7,9"]));
+        assert!(rendered.windows(2).any(|pair| pair == ["--tail", "1025"]));
+        for hostile in [
+            "WEZTERM_CONFIG_FILE",
+            "FRANKENTERM_CONFIG",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "LUA_PATH",
+            "RUST_LOG",
+        ] {
+            assert!(
+                rendered
+                    .iter()
+                    .all(|argument| !argument.starts_with(&format!("{hostile}="))),
+                "closed env -i allowlist must omit inherited injection knob {hostile}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_client_source_pin_rejects_mutation_symlinks_and_unsafe_modes() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().expect("compatible client pin tempdir");
+        let client = directory.path().join("ft");
+        let bytes = b"#!/bin/sh\nprintf pinned\n";
+        std::fs::write(&client, bytes).expect("write compatible client fixture");
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o500))
+            .expect("seal compatible client fixture");
+        let digest = sha256_hex(bytes);
+        let mut pinned = pin_compatible_client(
+            &client,
+            &digest,
+            u64::try_from(bytes.len()).unwrap(),
+            "test compatible client",
+        )
+        .expect("safe owner-executable client is pinned");
+
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700))
+            .expect("make fixture writable for mutation");
+        std::fs::write(&client, b"#!/bin/sh\nprintf forged\n")
+            .expect("mutate compatible client fixture");
+        assert!(pinned.revalidate("test compatible client").is_err());
+
+        let unsafe_mode = directory.path().join("unsafe-mode-ft");
+        std::fs::write(&unsafe_mode, bytes).expect("write unsafe-mode client fixture");
+        std::fs::set_permissions(&unsafe_mode, std::fs::Permissions::from_mode(0o4001))
+            .expect("set unsupported client mode");
+        assert!(
+            pin_compatible_client(
+                &unsafe_mode,
+                &digest,
+                u64::try_from(bytes.len()).unwrap(),
+                "unsafe-mode compatible client",
+            )
+            .is_err()
+        );
+
+        let alias = directory.path().join("aliased-ft");
+        symlink(&unsafe_mode, &alias).expect("create compatible client symlink fixture");
+        assert!(
+            pin_compatible_client(
+                &alias,
+                &digest,
+                u64::try_from(bytes.len()).unwrap(),
+                "symlinked compatible client",
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_client_subprocess_timeout_and_cancellation_settle_before_return() {
+        run_async_test(async {
+            async fn exercise(
+                cx: &frankenterm_core::cx::Cx,
+                directory: &Path,
+                timeout: Duration,
+            ) -> anyhow::Error {
+                let pid = directory.join("leader.pid");
+                let marker = directory.join("delayed-marker");
+                let arguments = vec![
+                    std::ffi::OsString::from("-i"),
+                    std::ffi::OsString::from(format!("FT_TEST_PID={}", pid.display())),
+                    std::ffi::OsString::from(format!("FT_TEST_MARKER={}", marker.display())),
+                    std::ffi::OsString::from("/bin/sh"),
+                    std::ffi::OsString::from("-c"),
+                    std::ffi::OsString::from(
+                        "printf '%s' \"$$\" > \"$FT_TEST_PID\"; (sleep 1; printf leaked > \"$FT_TEST_MARKER\") & wait",
+                    ),
+                ];
+                execute_bounded_compatible_client_command(
+                    cx,
+                    arguments,
+                    Vec::new(),
+                    directory,
+                    1024,
+                    timeout,
+                )
+                .await
+                .expect_err("long-running compatible client must be interrupted")
+            }
+
+            let timeout_directory = tempfile::tempdir().expect("timeout fixture");
+            let timeout_cx = frankenterm_core::cx::for_testing();
+            let timeout_error = exercise(
+                &timeout_cx,
+                timeout_directory.path(),
+                Duration::from_millis(250),
+            )
+            .await;
+            assert!(timeout_error.to_string().contains("wall-clock deadline"));
+            frankenterm_core::runtime_async::sleep(Duration::from_millis(900)).await;
+            assert!(!timeout_directory.path().join("delayed-marker").exists());
+
+            let cancellation_directory = tempfile::tempdir().expect("cancellation fixture");
+            let cancellation_cx = frankenterm_core::cx::for_testing();
+            let cancellation_trigger = cancellation_cx.clone();
+            frankenterm_core::runtime_async::task::spawn(async move {
+                frankenterm_core::runtime_async::sleep(Duration::from_millis(250)).await;
+                cancellation_trigger.cancel_with(
+                    frankenterm_core::outcome::CancelKind::User,
+                    Some("compatible-client wrapper cancellation test"),
+                );
+            });
+            let cancellation_error = exercise(
+                &cancellation_cx,
+                cancellation_directory.path(),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(cancellation_error.to_string().contains("was cancelled"));
+            frankenterm_core::runtime_async::sleep(Duration::from_millis(900)).await;
+            assert!(!cancellation_directory.path().join("delayed-marker").exists());
+        });
+    }
+
+    #[test]
+    fn compatible_client_source_receipt_rejects_zero_or_mismatched_authority() {
+        let identity = |mode: u32, bytes: u64| {
+            serde_json::json!({
+                "device": 1,
+                "inode": 2,
+                "uid": 501,
+                "gid": 80,
+                "mode": mode,
+                "hard_link_count": 1,
+                "byte_len": bytes,
+                "modified_seconds": 1,
+                "modified_nanoseconds": 2,
+                "changed_seconds": 3,
+                "changed_nanoseconds": 4,
+            })
+        };
+        let mut client = identity(0o500, 20_179_712);
+        client
+            .as_object_mut()
+            .unwrap()
+            .insert("sha256".to_string(), serde_json::json!("1".repeat(64)));
+        let mut source = serde_json::json!({
+            "kind": "live_mux",
+            "ft_version": "0.13.0",
+            "git_hash": "3ebd60566",
+            "capture_transport": COMPATIBLE_CLIENT_DUMP_CAPTURE_TRANSPORT,
+            "backend_constraint": COMPATIBLE_CLIENT_DUMP_BACKEND_CONSTRAINT,
+            "client": client,
+            "mux_socket": {
+                "path_sha256": "2".repeat(64),
+                "identity": identity(0o700, 0),
+            },
+            "recovery_environment": {
+                "retained": true,
+                "path_sha256": "3".repeat(64),
+            },
+        });
+        verify_mux_dump_source_metadata(&source)
+            .expect("exact compatible-client source authority is accepted");
+
+        source["client"]["sha256"] = serde_json::json!("0".repeat(64));
+        assert!(verify_mux_dump_source_metadata(&source).is_err());
+        source["client"]["sha256"] = serde_json::json!("1".repeat(64));
+        source["mux_socket"]["identity"]["uid"] = serde_json::json!(502);
+        assert!(verify_mux_dump_source_metadata(&source).is_err());
+        source["mux_socket"]["identity"]["uid"] = serde_json::json!(501);
+        source["recovery_environment"]["retained"] = serde_json::json!(false);
+        assert!(verify_mux_dump_source_metadata(&source).is_err());
+    }
+
+    #[test]
     fn private_artifact_write_is_verified_and_never_overwrites() {
         let dir = tempfile::tempdir().expect("artifact tempdir");
         let path = dir.path().join("private").join("mux-dump.json");
