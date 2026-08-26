@@ -1795,7 +1795,7 @@ impl BrokerSpawnWalCatalogV1 {
     ) -> Result<BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1>, BrokerSpawnWalError> {
         let mut directory =
             rustix::fs::Dir::read_from(&self.directory).map_err(std::io::Error::from)?;
-        let mut pairs = BTreeMap::new();
+        let mut pairs: BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1> = BTreeMap::new();
         let mut observed_entries = 0_usize;
         while let Some(entry) = directory.read() {
             let entry = entry.map_err(std::io::Error::from)?;
@@ -4443,6 +4443,193 @@ mod tests {
         fn as_fd(&self) -> BorrowedFd<'_> {
             self.fd.as_fd()
         }
+    }
+
+    #[test]
+    fn pinned_catalog_reconciles_wal_ahead_of_head_without_second_spawn_authority() {
+        let directory = private_catalog_directory();
+        let sentinel = directory.path().join("unused-spawn-sentinel");
+        let authority = authority(id(880), id(881), id(882), id(883), 0x81, 0x82);
+        let payload = command_payload("printf unexpected", &sentinel);
+        let identity = wal_identity(binding_for(&payload, &authority));
+        let authenticator = wal_authenticator(0x91);
+        let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open empty pinned broker catalog");
+        let mut journal = catalog
+            .create_spawn_journal(identity, authenticator.clone())
+            .expect("create catalog-managed Spawn WAL");
+        journal
+            .append_intent_and_sync()
+            .expect("synchronize catalog-managed intent");
+        let attempt_id = id(884);
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.begin_spawn_attempt_and_sync(attempt_id),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        assert!(journal.is_poisoned());
+        drop(journal);
+        drop(catalog);
+
+        let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("reopen exact pinned broker catalog");
+        let mut journals = recovered_catalog
+            .recover_all(&authenticator)
+            .expect("authenticate and reconcile complete catalog");
+        assert_eq!(journals.len(), 1);
+        let mut recovered = journals.pop().expect("one recovered journal");
+        let status = recovered.status();
+        assert_eq!(status.identity, identity);
+        assert_eq!(status.phase, Some(BrokerSpawnWalPhaseV1::Attempted));
+        assert_eq!(status.attempt_id, Some(attempt_id));
+        assert!(!status.append_authority_withheld);
+        assert!(!status.head_reconciliation_required);
+        assert!(status.durable_protocol_fence().unwrap().is_some());
+        assert!(matches!(
+            recovered
+                .begin_spawn_attempt_and_sync(attempt_id)
+                .expect("recover exact lost attempt reply"),
+            BrokerSpawnAttemptAdmissionV1::Reconciled(replayed)
+                if replayed.phase == Some(BrokerSpawnWalPhaseV1::Attempted)
+        ));
+    }
+
+    #[test]
+    fn pinned_catalog_rejects_second_owner_unknown_orphan_and_insecure_inode() {
+        let owned_directory = private_catalog_directory();
+        let owner = BrokerSpawnWalCatalogV1::open(owned_directory.path().to_path_buf())
+            .expect("first catalog owner");
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(owned_directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::CatalogAlreadyOwned)
+        ));
+        drop(owner);
+
+        let unknown_directory = private_catalog_directory();
+        let unknown = unknown_directory.path().join("unexpected-state");
+        let unknown_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&unknown)
+            .expect("create unknown catalog entry");
+        drop(unknown_file);
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(unknown_directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::UnexpectedCatalogEntry)
+        ));
+
+        let orphan_directory = private_catalog_directory();
+        let orphan_name = broker_spawn_catalog_wal_name(id(885));
+        let orphan = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(orphan_directory.path().join(orphan_name))
+            .expect("create orphan WAL name");
+        drop(orphan);
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(orphan_directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::IncompleteCatalogPair)
+        ));
+
+        let linked_directory = private_catalog_directory();
+        let sentinel = linked_directory.path().join("unused-spawn-sentinel");
+        let authority = authority(id(886), id(887), id(888), id(889), 0x83, 0x84);
+        let payload = command_payload("printf unexpected", &sentinel);
+        let identity = wal_identity(binding_for(&payload, &authority));
+        let authenticator = wal_authenticator(0x92);
+        let catalog = BrokerSpawnWalCatalogV1::open(linked_directory.path().to_path_buf())
+            .expect("open catalog before link mutation");
+        let journal = catalog
+            .create_spawn_journal(identity, authenticator.clone())
+            .expect("create pair before link mutation");
+        let wal_name = broker_spawn_catalog_wal_name(identity.journal_id());
+        fs::hard_link(
+            linked_directory.path().join(&wal_name),
+            linked_directory.path().join("retained-hard-link-evidence"),
+        )
+        .expect("create hard-link mutation");
+        drop(journal);
+        assert!(matches!(
+            catalog.recover_all(&authenticator),
+            Err(BrokerSpawnWalError::UnexpectedCatalogEntry)
+                | Err(BrokerSpawnWalError::InsecureCatalogIdentity)
+        ));
+
+        let target_directory = private_catalog_directory();
+        let link_parent = private_catalog_directory();
+        let link_path = link_parent.path().join("catalog-link");
+        symlink(target_directory.path(), &link_path).expect("create catalog symlink mutation");
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(link_path),
+            Err(BrokerSpawnWalError::InsecureCatalogIdentity)
+        ));
+    }
+
+    #[test]
+    fn guardian_manifest_enables_only_the_safe_linux_pidfd_process_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(manifest.contains("rustix = { workspace = true, features = [\"process\"] }"));
+        assert!(!manifest.contains("sysinfo.workspace"));
+        assert!(!manifest.contains("passfd.workspace"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_child_incarnation_is_stable_live_and_rejects_reaped_child() {
+        assert_eq!(
+            parse_linux_proc_stat(
+                b"77 (name ) with spaces) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19\n"
+            )
+            .expect("parse process name containing a closing parenthesis"),
+            (b'S', 19)
+        );
+        assert!(parse_linux_proc_stat(b"77 malformed").is_err());
+        assert!(
+            parse_linux_proc_stat(b"77 (name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 0\n")
+                .is_err()
+        );
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open PTY for pidfd child proof");
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("sleep 30");
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn live pidfd test child");
+        drop(pair.slave);
+        let nonce = id(890);
+        let first = BrokerVerifiedKernelChildV1::verify_spawned_child(&mut *child, nonce)
+            .expect("verify exact live child with pidfd");
+        let first_identity = first.identity();
+        assert_eq!(first_identity.process_id(), child.process_id().unwrap());
+        assert_eq!(first_identity.broker_child_nonce(), nonce);
+        assert_ne!(first_identity.kernel_start_identity_digest(), [0; 32]);
+        let second = BrokerVerifiedKernelChildV1::verify_spawned_child(&mut *child, nonce)
+            .expect("repeat exact live child verification");
+        assert_eq!(second.identity(), first_identity);
+        assert!(matches!(
+            BrokerVerifiedKernelChildV1::verify_spawned_child(&mut *child, Uuid::nil()),
+            Err(BrokerChildIncarnationError::InvalidIdentity)
+        ));
+        child.kill().expect("kill pidfd test child");
+        child.wait().expect("reap pidfd test child");
+        assert!(matches!(
+            BrokerVerifiedKernelChildV1::verify_spawned_child(&mut *child, id(891)),
+            Err(BrokerChildIncarnationError::ChildNotRunning)
+        ));
+        drop(pair.master);
     }
 
     #[test]
