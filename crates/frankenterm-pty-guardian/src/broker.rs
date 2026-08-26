@@ -15706,7 +15706,7 @@ mod tests {
             BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
         );
 
-        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered_catalog = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("reopen catalog for two-pass reconciliation test");
         let journals = recovered_catalog
             .scan_all_for_admission(&authenticator)
