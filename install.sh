@@ -21,7 +21,7 @@
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
-#   --no-verify        Skip checksum + signature verification (for testing only)
+#   --no-verify        Skip optional Sigstore verification (SHA-256 remains required)
 #   --offline TARBALL  Skip network entirely; install from local tarball
 #   --force            Force reinstall even if same version is installed
 #   --help             Show this message
@@ -65,7 +65,7 @@ VERIFY=0
 WITH_FONT=0
 FROM_SOURCE=0
 NO_GUM=0
-NO_CHECKSUM=0
+NO_SIGSTORE=0
 FORCE_INSTALL=0
 # macOS GUI app (.app) install. -1 = auto (on for darwin-arm64 prebuilt
 # installs), 0 = disabled (--no-app), 1 = forced (--with-app). APP_DEST
@@ -80,6 +80,7 @@ APP_INSTALLED_PATH=""
 ACTIVE_PROCESS_FAMILY_MANIFEST=""
 ACTIVE_PROCESS_FAMILY_VERIFIER=""
 ACTIVE_ATOMIC_TRANSITION_HELPER=""
+PENDING_PROCESS_FAMILY_GENERATION=""
 OFFLINE_TARBALL=""
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
@@ -1039,6 +1040,308 @@ stable_entrypoint_is_managed() {
     [ "$(readlink "$DEST/$name")" = ".frankenterm-process-family/current/$name" ]
 }
 
+ensure_installer_process_family_root() {
+  python3 - "$DEST" <<'PY'
+import os, stat, sys
+
+destination = os.path.abspath(sys.argv[1])
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+if not nofollow or not directory:
+    raise SystemExit("descriptor-relative nofollow installation is unavailable")
+
+def stable(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+def require_private_directory(metadata, label):
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid() or
+            stat.S_IMODE(metadata.st_mode) & 0o022):
+        raise SystemExit(f"{label} is not one private owner-controlled directory")
+
+def open_or_create(parent_fd, name, label):
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        pass
+    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    fd = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=parent_fd)
+    opened = os.fstat(fd)
+    require_private_directory(opened, label)
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        os.close(fd)
+        raise SystemExit(f"{label} changed while it was opened")
+    os.fchmod(fd, 0o700)
+    os.fsync(fd)
+    return fd, stable(opened)
+
+destination_named = os.stat(destination, follow_symlinks=False)
+destination_fd = os.open(destination, os.O_RDONLY | directory | nofollow | cloexec)
+managed_fd = generations_fd = -1
+try:
+    destination_opened = os.fstat(destination_fd)
+    require_private_directory(destination_opened, "installer destination")
+    if (destination_opened.st_dev, destination_opened.st_ino) != (
+            destination_named.st_dev, destination_named.st_ino):
+        raise SystemExit("installer destination changed while it was opened")
+    managed_fd, managed_before = open_or_create(
+        destination_fd, ".frankenterm-process-family", "managed process-family root")
+    generations_fd, generations_before = open_or_create(
+        managed_fd, "generations", "managed generations root")
+    if os.fstat(generations_fd).st_dev != os.fstat(managed_fd).st_dev:
+        raise SystemExit("managed process-family roots are not on one filesystem")
+    os.fsync(generations_fd)
+    os.fsync(managed_fd)
+    os.fsync(destination_fd)
+    destination_final = os.stat(destination, follow_symlinks=False)
+    managed_final = os.stat(
+        ".frankenterm-process-family", dir_fd=destination_fd, follow_symlinks=False)
+    generations_final = os.stat("generations", dir_fd=managed_fd, follow_symlinks=False)
+    if stable(destination_opened) != stable(destination_final):
+        raise SystemExit("installer destination changed while roots were prepared")
+    if managed_before[:2] != (managed_final.st_dev, managed_final.st_ino):
+        raise SystemExit("managed process-family root detached while prepared")
+    if generations_before[:2] != (generations_final.st_dev, generations_final.st_ino):
+        raise SystemExit("managed generations root detached while prepared")
+finally:
+    if generations_fd >= 0:
+        os.close(generations_fd)
+    if managed_fd >= 0:
+        os.close(managed_fd)
+    os.close(destination_fd)
+PY
+}
+
+inspect_installer_process_family_authority() {
+  python3 - "$DEST" <<'PY'
+import os, re, stat, sys
+
+destination = os.path.abspath(sys.argv[1])
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+if not nofollow or not directory:
+    raise SystemExit("descriptor-relative nofollow inspection is unavailable")
+
+roles = ("ft", "frankenterm-mux-server", "frankenterm-pty-guardian")
+managed_link = {
+    role: f".frankenterm-process-family/current/{role}" for role in roles
+}
+current_pattern = re.compile(r"generations/(?:[0-9a-f]{64}|legacy-[0-9a-f]{64})\Z")
+
+def stable(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+def open_private_directory(path=None, *, parent_fd=None, name=None, label):
+    if path is not None:
+        named = os.stat(path, follow_symlinks=False)
+        fd = os.open(path, os.O_RDONLY | directory | nofollow | cloexec)
+    else:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        fd = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=parent_fd)
+    opened = os.fstat(fd)
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid() or
+            stat.S_IMODE(opened.st_mode) & 0o022 or
+            (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        os.close(fd)
+        raise SystemExit(f"{label} is not one stable private owner-controlled directory")
+    return fd, stable(opened)
+
+def child_snapshot(parent_fd, name, expected_link=None):
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return ("missing",)
+    identity = stable(observed)
+    if stat.S_ISLNK(observed.st_mode):
+        target = os.readlink(name, dir_fd=parent_fd)
+        if ((expected_link is not None and target != expected_link) or
+                observed.st_uid != os.geteuid()):
+            raise SystemExit(f"unsafe or unmanaged symlink at {name}")
+        return ("managed", target, *identity)
+    if stat.S_ISREG(observed.st_mode):
+        if (expected_link is not None and
+                (observed.st_uid != os.geteuid() or observed.st_nlink != 1 or
+                 stat.S_IMODE(observed.st_mode) & 0o022 or
+                 not stat.S_IMODE(observed.st_mode) & 0o111 or
+                 observed.st_size > 512 * 1024 * 1024)):
+            raise SystemExit(f"unsafe direct process-family entrypoint at {name}")
+        return ("direct", *identity)
+    raise SystemExit(f"unsafe process-family namespace entry at {name}")
+
+destination_fd, destination_before = open_private_directory(
+    destination, label="installer destination")
+managed_fd = generations_fd = selected_fd = -1
+try:
+    managed_fd, managed_before = open_private_directory(
+        parent_fd=destination_fd, name=".frankenterm-process-family",
+        label="managed process-family root")
+    generations_fd, generations_before = open_private_directory(
+        parent_fd=managed_fd, name="generations", label="managed generations root")
+    if os.fstat(generations_fd).st_dev != os.fstat(managed_fd).st_dev:
+        raise SystemExit("managed process-family roots are not on one filesystem")
+
+    current = child_snapshot(managed_fd, "current")
+    current_target = ""
+    if current[0] == "managed":
+        current_target = current[1]
+        if not current_pattern.fullmatch(current_target):
+            raise SystemExit("current selector has a non-canonical target")
+        generation_name = current_target.removeprefix("generations/")
+        selected_fd, _ = open_private_directory(
+            parent_fd=generations_fd, name=generation_name,
+            label="selected process-family generation")
+    elif current[0] != "missing":
+        raise SystemExit("current selector is not an exact managed symlink")
+
+    entries = tuple(
+        child_snapshot(destination_fd, role, managed_link[role]) for role in roles
+    )
+    kinds = tuple(entry[0] for entry in entries)
+    if current_target:
+        if kinds != ("managed", "managed", "managed"):
+            raise SystemExit("selected process family lacks three exact managed entrypoints")
+        result = f"managed\t{current_target}"
+    elif all(kind in ("missing", "managed") for kind in kinds):
+        result = "initial"
+    elif kinds == ("direct", "direct", "direct"):
+        result = "legacy"
+    else:
+        raise SystemExit("incomplete or mixed process-family authority")
+
+    if stable(os.fstat(destination_fd)) != destination_before:
+        raise SystemExit("installer destination changed during authority inspection")
+    if stable(os.fstat(managed_fd)) != managed_before:
+        raise SystemExit("managed process-family root changed during authority inspection")
+    if stable(os.fstat(generations_fd)) != generations_before:
+        raise SystemExit("managed generations root changed during authority inspection")
+    if child_snapshot(managed_fd, "current") != current:
+        raise SystemExit("current selector changed during authority inspection")
+    final_entries = tuple(
+        child_snapshot(destination_fd, role, managed_link[role]) for role in roles
+    )
+    if final_entries != entries:
+        raise SystemExit("stable process-family entrypoints changed during inspection")
+    print(result)
+finally:
+    if selected_fd >= 0:
+        os.close(selected_fd)
+    if generations_fd >= 0:
+        os.close(generations_fd)
+    if managed_fd >= 0:
+        os.close(managed_fd)
+    os.close(destination_fd)
+PY
+}
+
+installer_mux_ownership_state() {
+  if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" = 1 ] && \
+     [ -n "${FT_INSTALL_TEST_MUX_OWNERSHIP_STATE:-}" ]; then
+    case "$FT_INSTALL_TEST_MUX_OWNERSHIP_STATE" in
+      active|inactive|ambiguous) printf '%s\n' "$FT_INSTALL_TEST_MUX_OWNERSHIP_STATE" ;;
+      *) return 2 ;;
+    esac
+    return
+  fi
+  python3 - <<'PY'
+import os, pathlib, subprocess, sys
+
+names = {
+    "frankenterm-mux-server",
+    "wezterm-mux-server",
+    "frankenterm-gui",
+    "wezterm-gui",
+}
+truncated = {name[:15] for name in names}
+
+def classify(command):
+    basename = os.path.basename(command.removesuffix(" (deleted)"))
+    if basename in names:
+        return "active"
+    if basename in truncated:
+        return "ambiguous"
+    return "inactive"
+
+if sys.platform.startswith("linux"):
+    proc = pathlib.Path("/proc")
+    if not proc.is_dir():
+        print("ambiguous")
+        raise SystemExit(0)
+    ambiguous = False
+    for process in proc.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.geteuid():
+                continue
+            comm = (process / "comm").read_text(errors="surrogateescape").strip()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, UnicodeError):
+            ambiguous = True
+            continue
+        if comm not in names and comm not in truncated:
+            continue
+        try:
+            outcome = classify(os.readlink(process / "exe"))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            ambiguous = True
+            continue
+        if outcome == "active":
+            print("active")
+            raise SystemExit(0)
+        ambiguous = True
+    print("ambiguous" if ambiguous else "inactive")
+    raise SystemExit(0)
+
+try:
+    observed = subprocess.run(
+        ["ps", "-U", str(os.geteuid()), "-o", "pid=", "-o", "comm="],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, timeout=10,
+    )
+except (OSError, subprocess.SubprocessError):
+    print("ambiguous")
+    raise SystemExit(0)
+if observed.returncode != 0:
+    print("ambiguous")
+    raise SystemExit(0)
+ambiguous = False
+for line in observed.stdout.splitlines():
+    fields = line.strip().split(maxsplit=1)
+    if len(fields) != 2 or not fields[0].isdigit():
+        if line.strip():
+            ambiguous = True
+        continue
+    outcome = classify(fields[1])
+    if outcome == "active":
+        print("active")
+        raise SystemExit(0)
+    ambiguous = ambiguous or outcome == "ambiguous"
+print("ambiguous" if ambiguous else "inactive")
+PY
+}
+
+require_no_live_mux_for_initial_selector() {
+  local state
+  state=$(installer_mux_ownership_state) || state=ambiguous
+  case "$state" in
+    inactive) return 0 ;;
+    active)
+      err "A live FrankenTerm/WezTerm mux owns session state; refusing initial selector creation"
+      ;;
+    *)
+      err "Mux ownership could not be proven inactive; refusing initial selector creation"
+      ;;
+  esac
+  return 1
+}
+
 ensure_staged_symlink() {
   local target="$1" path="$2"
   if [ -L "$path" ]; then
@@ -1089,6 +1392,11 @@ install_process_family() {
   local metadata manifest_id build_id source_revision version target profile feature_contract
   local generation_id generation stage stage_name helper="$ft_source" stage_id txid
 
+  ACTIVE_PROCESS_FAMILY_MANIFEST=""
+  ACTIVE_PROCESS_FAMILY_VERIFIER=""
+  ACTIVE_ATOMIC_TRANSITION_HELPER=""
+  PENDING_PROCESS_FAMILY_GENERATION=""
+
   command -v python3 >/dev/null 2>&1 || {
     err "python3 is required for crash-atomic installation"
     return 1
@@ -1109,8 +1417,7 @@ install_process_family() {
   [ -n "$profile" ] || return 1
   generation_id="${manifest_id#sha256:}"
 
-  mkdir -p "$managed" "$generations" || return 1
-  chmod 0700 "$managed" "$generations" || return 1
+  ensure_installer_process_family_root || return 1
   generation="$generations/$generation_id"
   if [ -e "$generation" ] || [ -L "$generation" ]; then
     [ -d "$generation" ] && [ ! -L "$generation" ] && \
@@ -1152,53 +1459,29 @@ install_process_family() {
   fi
   installer_failpoint after-generation-publish
 
-  local current_target="" selected_generation="" initial_install=0 legacy_migration=0
-  local direct_count=0 missing_count=0 managed_count=0 name
-  if [ -L "$managed/current" ]; then
-    current_target=$(readlink "$managed/current")
-    [[ "$current_target" =~ ^generations/([0-9a-f]{64}|legacy-[0-9a-f]{64})$ ]] || return 1
-    selected_generation="$managed/$current_target"
-    [ -d "$selected_generation" ] && [ ! -L "$selected_generation" ] || return 1
-    if [[ "$current_target" =~ ^generations/[0-9a-f]{64}$ ]]; then
-      verify_canonical_generation "$selected_generation" "" "$verifier_source" || return 1
-    else
-      [ -f "$selected_generation/legacy-family.json" ] || return 1
-      [ "$(legacy_process_family_manifest "$selected_generation" -)" = \
-        "sha256:${current_target##*legacy-}" ] || return 1
-    fi
-  elif [ -e "$managed/current" ]; then
+  local current_target="" selected_generation="" initial_install=0 legacy_owner=0
+  local authority_state name
+  authority_state=$(inspect_installer_process_family_authority) || {
+    err "Process-family selector authority is ambiguous or unsafe"
     return 1
-  fi
-  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-    if stable_entrypoint_is_managed "$name"; then
-      managed_count=$((managed_count + 1))
-    elif [ -f "$DEST/$name" ] && [ ! -L "$DEST/$name" ]; then
-      direct_count=$((direct_count + 1))
-    elif [ ! -e "$DEST/$name" ] && [ ! -L "$DEST/$name" ]; then
-      missing_count=$((missing_count + 1))
-    else
-      err "Unsafe or unmanaged stable entrypoint: $DEST/$name"
-      return 1
-    fi
-  done
-
-  if [ "$direct_count" -eq 0 ] && [ -z "$current_target" ] && \
-     [ $((managed_count + missing_count)) -eq 3 ]; then
-    initial_install=1
-    selected_generation="$generation"
-  elif [ "$missing_count" -ne 0 ]; then
-    err "Incomplete process-family entrypoint inventory; refusing incoherent migration"
-    return 1
-  elif [ "$direct_count" -gt 0 ]; then
-    legacy_migration=1
-    if [ -z "$current_target" ]; then
-      [ "$direct_count" -eq 3 ] && [ "$managed_count" -eq 0 ] || return 1
+  }
+  case "$authority_state" in
+    initial)
+      initial_install=1
+      selected_generation="$generation"
+      ;;
+    legacy)
+      # Preserve a coherent direct-install family as an immutable recovery
+      # generation, but do not replace its entrypoints or manufacture a
+      # selector. Only the future cross-launcher activation transaction may
+      # move that live authority to the candidate.
+      legacy_owner=1
       local legacy_proof="$TMP/legacy-family-proof"
       local legacy_manifest="$TMP/legacy-family.json"
       local legacy_manifest_id legacy_id legacy_stage_name legacy_stage
       mkdir -m 0700 "$legacy_proof" || return 1
       for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-        install -m 0555 "$DEST/$name" "$legacy_proof/$name" || return 1
+        ensure_exact_staged_file "$DEST/$name" "$legacy_proof/$name" 0555 || return 1
       done
       legacy_manifest_id=$(legacy_process_family_manifest "$legacy_proof" "$legacy_manifest") || return 1
       legacy_id="legacy-${legacy_manifest_id#sha256:}"
@@ -1231,20 +1514,27 @@ install_process_family() {
         atomic_path_transition "$helper" "$generations" "$legacy_stage_name" "$legacy_id" \
           "$txid" "$stage_id" missing publish-noreplace || return 1
       fi
-      stage_name=".current-$legacy_id"
-      ensure_staged_symlink "generations/$legacy_id" "$managed/$stage_name" || return 1
-      stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
-      txid=$(atomic_transition_txid "selector-legacy:$DEST:$legacy_id") || return 1
-      atomic_path_transition "$helper" "$managed" "$stage_name" current "$txid" \
-        "$stage_id" missing publish-noreplace || return 1
-      current_target="generations/$legacy_id"
-      installer_failpoint after-legacy-selector
-    elif [[ ! "$current_target" =~ ^generations/legacy-[0-9a-f]{64}$ ]]; then
+      [ "$(inspect_installer_process_family_authority)" = legacy ] || return 1
+      for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
+      done
+      ;;
+    managed$'\t'*)
+      current_target="${authority_state#*$'\t'}"
+      selected_generation="$managed/$current_target"
+      if [[ "$current_target" =~ ^generations/[0-9a-f]{64}$ ]]; then
+        verify_canonical_generation "$selected_generation" "" "$verifier_source" || return 1
+      else
+        [ -f "$selected_generation/legacy-family.json" ] || return 1
+        [ "$(legacy_process_family_manifest "$selected_generation" -)" = \
+          "sha256:${current_target##*legacy-}" ] || return 1
+      fi
+      ;;
+    *)
+      err "Process-family selector authority returned an invalid state"
       return 1
-    fi
-  elif [ "$managed_count" -ne 3 ] || [ -z "$current_target" ]; then
-    return 1
-  fi
+      ;;
+  esac
 
   if [ "$initial_install" -eq 1 ]; then
     publish_stable_entrypoint "$helper" frankenterm-mux-server missing "$selected_generation" || return 1
@@ -1258,6 +1548,15 @@ install_process_family() {
       [ ! -e "$DEST/$name" ] || return 1
     done
     fsync_installer_directory "$DEST" || return 1
+    [ "$(inspect_installer_process_family_authority)" = initial ] || {
+      err "Initial process-family namespace changed before selector publication"
+      return 1
+    }
+    require_no_live_mux_for_initial_selector || return 1
+    [ "$(inspect_installer_process_family_authority)" = initial ] || {
+      err "Initial process-family namespace changed during mux ownership census"
+      return 1
+    }
     stage_name=".current-$generation_id"
     ensure_staged_symlink "generations/$generation_id" "$managed/$stage_name" || return 1
     stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
@@ -1267,41 +1566,40 @@ install_process_family() {
       "$stage_id" missing publish-noreplace || return 1
     current_target="generations/$generation_id"
     installer_failpoint after-initial-selector
-  elif [ "$legacy_migration" -eq 1 ]; then
-    publish_stable_entrypoint "$helper" frankenterm-mux-server legacy "$selected_generation" || return 1
-    installer_failpoint after-mux-entrypoint
-    publish_stable_entrypoint "$helper" frankenterm-pty-guardian legacy "$selected_generation" || return 1
-    installer_failpoint after-guardian-entrypoint
-    publish_stable_entrypoint "$helper" ft legacy "$selected_generation" || return 1
-    installer_failpoint after-ft-entrypoint
   fi
 
-  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-    stable_entrypoint_is_managed "$name" || return 1
-  done
-  installer_failpoint before-selector-switch
-  if [ "$current_target" != "generations/$generation_id" ]; then
-    stage_name=".current-${generation_id}-switch"
-    ensure_staged_symlink "generations/$generation_id" "$managed/$stage_name" || return 1
-    stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
-    local current_id
-    current_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
-    txid=$(atomic_transition_txid "selector-switch:$DEST:$current_target:$generation_id") || return 1
-    atomic_path_transition "$helper" "$managed" "$stage_name" current "$txid" \
-      "$stage_id" "$current_id" exchange || return 1
-    current_target="generations/$generation_id"
+  if [ "$current_target" = "generations/$generation_id" ]; then
+    [ "$(inspect_installer_process_family_authority)" = \
+      $'managed\t'"generations/$generation_id" ] || return 1
+    verify_canonical_generation "$generation" "$version" "$verifier_source" || return 1
+    for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+      stable_entrypoint_is_managed "$name" || return 1
+      cmp "$DEST/$name" "$generation/$name" >/dev/null 2>&1 || return 1
+    done
+    ACTIVE_PROCESS_FAMILY_MANIFEST="$generation/process-family.component-manifest.json"
+    ACTIVE_PROCESS_FAMILY_VERIFIER="$verifier_source"
+    ACTIVE_ATOMIC_TRANSITION_HELPER="$DEST/ft"
+    ok "Installed initial atomic process-family generation $generation_id"
+  else
+    [ "$(inspect_installer_process_family_authority)" = "$authority_state" ] || {
+      err "Existing process-family authority changed while the candidate was published"
+      return 1
+    }
+    if [ "$legacy_owner" -eq 1 ]; then
+      for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
+      done
+    else
+      for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        stable_entrypoint_is_managed "$name" || return 1
+        cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
+      done
+    fi
+    PENDING_PROCESS_FAMILY_GENERATION="$generation_id"
+    ok "Published immutable process-family candidate $generation_id"
+    warn "Activation is pending; the existing process-family selector and live mux were left unchanged"
   fi
-  installer_failpoint after-selector-switch
-  verify_canonical_generation "$managed/$current_target" "$version" "$verifier_source" || return 1
-  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-    stable_entrypoint_is_managed "$name" || return 1
-    cmp "$DEST/$name" "$managed/$current_target/$name" >/dev/null 2>&1 || return 1
-  done
-  ACTIVE_PROCESS_FAMILY_MANIFEST="$managed/$current_target/process-family.component-manifest.json"
-  ACTIVE_PROCESS_FAMILY_VERIFIER="$verifier_source"
-  ACTIVE_ATOMIC_TRANSITION_HELPER="$DEST/ft"
-  ok "Installed atomic process-family generation $generation_id"
-  info "Previous generations and displaced entrypoints were retained for recovery"
+  info "All previous generations and entrypoint authority were retained for recovery"
 }
 
 check_write_permissions() {
@@ -1411,26 +1709,152 @@ maybe_add_path() {
 # Checksum + Sigstore verification
 # ───────────────────────────────────────────────────────────────────────────
 verify_checksum() {
-  local file="$1"; local expected="$2"; local actual=""
-  if [ ! -f "$file" ]; then err "File not found: $file"; return 1; fi
+  local file="$1"; local expected="$2"; local actual="" before="" after=""
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || {
+    err "Expected checksum is not one canonical lowercase SHA-256 digest"
+    return 1
+  }
+  before=$(python3 - "$file" <<'PY'
+import os, stat, sys
+path = sys.argv[1]
+fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+try:
+    observed = os.fstat(fd)
+    named = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or
+            observed.st_size > 16 * 1024 * 1024 * 1024 or
+            (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit("checksum target is not one bounded single-link regular file")
+    print("\t".join(str(value) for value in (
+        observed.st_dev, observed.st_ino, observed.st_size,
+        observed.st_mtime_ns, observed.st_ctime_ns)))
+finally:
+    os.close(fd)
+PY
+  ) || { err "Unsafe checksum target: $file"; return 1; }
   if command -v sha256sum &>/dev/null; then
-    actual=$(sha256sum "$file" | awk '{print $1}')
+    actual=$(sha256sum -- "$file" | awk '{print $1}') || {
+      err "sha256sum failed while reading $file"
+      return 1
+    }
   elif command -v shasum &>/dev/null; then
-    actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    actual=$(shasum -a 256 -- "$file" | awk '{print $1}') || {
+      err "shasum failed while reading $file"
+      return 1
+    }
   else
-    warn "No sha256sum or shasum found; skipping checksum verification"
-    return 0
+    err "No supported SHA-256 utility found (need sha256sum or shasum)"
+    return 1
   fi
+  [[ "$actual" =~ ^[0-9a-f]{64}$ ]] || {
+    err "SHA-256 utility returned a non-canonical digest"
+    return 1
+  }
+  after=$(python3 - "$file" <<'PY'
+import os, stat, sys
+path = sys.argv[1]
+fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+try:
+    observed = os.fstat(fd)
+    named = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or
+            (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit("checksum target changed shape")
+    print("\t".join(str(value) for value in (
+        observed.st_dev, observed.st_ino, observed.st_size,
+        observed.st_mtime_ns, observed.st_ctime_ns)))
+finally:
+    os.close(fd)
+PY
+  ) || { err "Checksum target changed while it was verified"; return 1; }
+  [ "$before" = "$after" ] || {
+    err "Checksum target changed while it was verified"
+    return 1
+  }
   if [ "$actual" != "$expected" ]; then
     err "Checksum verification FAILED"
     err "Expected: $expected"
     err "Got:      $actual"
     err "The downloaded file may be corrupted or tampered with."
-    rm -f "$file"
     return 1
   fi
   ok "Checksum verified: ${actual:0:16}..."
   return 0
+}
+
+read_sha256_sidecar() {
+  local sidecar="$1" expected_name="$2"
+  python3 - "$sidecar" "$expected_name" <<'PY'
+import os, re, stat, sys
+
+path, expected_name = sys.argv[1:]
+fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+try:
+    before = os.fstat(fd)
+    named = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
+            before.st_size > 4096 or
+            (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit("checksum sidecar is not one bounded single-link regular file")
+    payload = os.read(fd, 4097)
+    if len(payload) != before.st_size:
+        raise SystemExit("checksum sidecar changed length while read")
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise SystemExit("checksum sidecar changed while read")
+finally:
+    os.close(fd)
+try:
+    text = payload.decode("ascii")
+except UnicodeDecodeError as error:
+    raise SystemExit("checksum sidecar is not ASCII") from error
+lines = text.splitlines()
+if len(lines) != 1:
+    raise SystemExit("checksum sidecar must contain exactly one record")
+match = re.fullmatch(r"([0-9a-f]{64})(?:[ \t]+\*?([^\r\n]+))?", lines[0])
+if match is None:
+    raise SystemExit("checksum sidecar record is not canonical SHA-256")
+recorded_name = match.group(2)
+if recorded_name is not None and recorded_name != expected_name:
+    raise SystemExit("checksum sidecar names a different archive")
+print(match.group(1))
+PY
+}
+
+verify_archive_checksum_authority() {
+  local archive="$1" archive_name="$2" sidecar=""
+  if [ -n "$CHECKSUM" ]; then
+    [[ "$CHECKSUM" =~ ^[0-9a-f]{64}$ ]] || {
+      err "--checksum must be one canonical lowercase SHA-256 digest"
+      return 1
+    }
+  elif [ -n "$OFFLINE_TARBALL" ]; then
+    sidecar="${OFFLINE_TARBALL}.sha256"
+    [ -f "$sidecar" ] && [ ! -L "$sidecar" ] || {
+      err "Offline archives require --checksum HEX or an adjacent authenticated sidecar"
+      err "Expected sidecar: $sidecar"
+      return 1
+    }
+    CHECKSUM=$(read_sha256_sidecar "$sidecar" "$(basename "$OFFLINE_TARBALL")") || {
+      err "Offline archive checksum sidecar is invalid or names another artifact"
+      return 1
+    }
+    info "Using externally supplied offline checksum sidecar: $sidecar"
+  else
+    [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
+    info "Fetching checksum from $CHECKSUM_URL"
+    if ! curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+        "$CHECKSUM_URL" -o "$TMP/checksum.sha256"; then
+      err "Checksum required and could not be fetched"
+      return 1
+    fi
+    CHECKSUM=$(read_sha256_sidecar "$TMP/checksum.sha256" "$archive_name") || {
+      err "Downloaded checksum sidecar is invalid or names another artifact"
+      return 1
+    }
+  fi
+  verify_checksum "$archive" "$CHECKSUM"
 }
 
 verify_sigstore_bundle() {
