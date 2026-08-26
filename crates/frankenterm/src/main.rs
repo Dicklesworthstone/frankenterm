@@ -109113,6 +109113,8 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
         archive: std::path::PathBuf,
         checksum: String,
         app_id: String,
+        archive_budget: u64,
+        expanded_budget: u64,
     }
 
     #[cfg(unix)]
@@ -109192,6 +109194,9 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             .filter(|value| value.len() == 64)
             .expect("generated app manifest ID")
             .to_string();
+        let inventory_bytes = manifest_value["inventory"]["total_bytes"]
+            .as_u64()
+            .expect("generated app manifest byte inventory");
         let archive = root.join("FrankenTerm-darwin-arm64.app.tar.xz");
         let archived = std::process::Command::new("tar")
             .env("COPYFILE_DISABLE", "1")
@@ -109211,11 +109216,27 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
         let checksum = hex::encode(sha2::Sha256::digest(
             std::fs::read(&archive).expect("read app archive for checksum"),
         ));
+        let safety_margin = 1024 * 1024;
+        let archive_budget = std::fs::metadata(&archive)
+            .expect("read app archive metadata")
+            .len()
+            .checked_add(safety_margin)
+            .expect("bounded app archive fixture budget");
+        let expanded_budget = inventory_bytes
+            .checked_add(
+                std::fs::metadata(&manifest)
+                    .expect("read detached app manifest metadata")
+                    .len(),
+            )
+            .and_then(|bytes| bytes.checked_add(safety_margin))
+            .expect("bounded expanded app fixture budget");
         InstallerTestApp {
             app_root,
             archive,
             checksum,
             app_id,
+            archive_budget,
+            expanded_budget,
         }
     }
 
@@ -109280,11 +109301,13 @@ esac
         let test_path = format!("{}:{inherited_path}", fake_tools.display());
         let failpoint = failpoint.unwrap_or("");
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_SIGSTORE=1\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_SIGSTORE=1\nMAX_APP_ARCHIVE_BYTES={}\nMAX_APP_EXPANDED_BYTES={}\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\n",
             shell_single_quote(&installer.to_string_lossy()),
             shell_single_quote(&destination.to_string_lossy()),
             shell_single_quote(&scratch.to_string_lossy()),
             shell_single_quote(&app_destination.to_string_lossy()),
+            app.archive_budget,
+            app.expanded_budget,
             shell_single_quote(&selected_manifest.to_string_lossy()),
             shell_single_quote(&family.verifier.to_string_lossy()),
             shell_single_quote(
@@ -109556,8 +109579,28 @@ with tarfile.open(path, "w") as archive:
             "archive inventory and extraction must use two bounded streaming passes"
         );
         assert_eq!(extractor.matches("for member in archive:").count(), 2);
+        assert!(extractor.contains("archive_identity != expected_values"));
+        assert!(
+            extractor.contains("archive pathname no longer names the checksum-authenticated inode")
+        );
+        assert!(extractor.contains("archive_before.st_size > max_archive_bytes"));
+        assert!(extractor.contains("first[\"expanded_bytes\"] + free_space_headroom"));
+        assert!(extractor.contains("archive contains a forbidden AppleDouble member"));
         assert!(!extractor.contains("getmembers("));
         assert!(!extractor.contains("extractall("));
+
+        let checksum_start = installer
+            .find("verify_checksum() {")
+            .expect("descriptor-pinned checksum function");
+        let checksum_end = installer[checksum_start..]
+            .find("\n}\n\nread_sha256_sidecar()")
+            .map(|offset| checksum_start + offset)
+            .expect("descriptor-pinned checksum function end");
+        let checksum = &installer[checksum_start..checksum_end];
+        assert!(checksum.contains("fd = os.open(path, flags)"));
+        assert!(checksum.contains("VERIFIED_ARCHIVE_IDENTITY=\"$identity\""));
+        assert!(!checksum.contains("sha256sum"));
+        assert!(!checksum.contains("shasum"));
 
         let release_workflow = include_str!("../../../.github/workflows/release.yml");
         let standalone_archive_start = release_workflow
@@ -109584,6 +109627,30 @@ with tarfile.open(path, "w") as archive:
         assert!(archive_creation < archive_inventory);
         assert!(archive_inventory < exact_count && exact_count < no_appledouble);
         assert_eq!(standalone_archive.matches("grep -Fxq ").count(), 5);
+
+        let app_archive_start = release_workflow
+            .find("# COPYFILE_DISABLE stops bsdtar from emitting ._* AppleDouble sidecars.")
+            .expect("app release archive contract");
+        let app_archive = &release_workflow[app_archive_start..];
+        assert!(
+            app_archive.contains(
+                "test \"$(grep -Fxc 'FrankenTerm.app/' <<<\"$app_archive_entries\")\" = 1"
+            )
+        );
+        assert!(app_archive.contains(
+            "test \"$(grep -Fxc FrankenTerm.app.component-manifest.json <<<\"$app_archive_entries\")\" = 1"
+        ));
+        assert!(app_archive.contains("! grep -E '(^|/)\\._' <<<\"$app_archive_entries\""));
+        let app_checksum = app_archive
+            .find("verify_checksum \"$app_archive\" \"$app_archive_checksum\"")
+            .expect("production app checksum gate");
+        let app_extractor = app_archive
+            .find("extract_authenticated_archive \"$app_archive\" \"$APP_PROBE\" app")
+            .expect("production app extractor gate");
+        let app_verifier = app_archive
+            .find("bash \"../$STANDALONE_STAGING/verify-components.sh\" verify")
+            .expect("post-extraction app component verifier");
+        assert!(app_checksum < app_extractor && app_extractor < app_verifier);
 
         let app_start = installer
             .find("install_macos_app() {")
@@ -109677,11 +109744,8 @@ with tarfile.open(path, "w") as archive:
         std::fs::write(&replacement, b"different replacement pathname bytes")
             .expect("write archive replacement fixture");
         std::fs::create_dir(&extraction_root).expect("create private extraction root");
-        std::fs::set_permissions(
-            &extraction_root,
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .expect("make extraction root private");
+        std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make extraction root private");
         let checksum = hex::encode(sha2::Sha256::digest(
             std::fs::read(&archive).expect("read authenticated archive fixture"),
         ));
@@ -109767,11 +109831,8 @@ fi
             let extraction_root = fixture.path().join(format!("extract-{index}"));
             create_adversarial_installer_archive(&archive, case_name);
             std::fs::create_dir(&extraction_root).expect("create adversarial extraction root");
-            std::fs::set_permissions(
-                &extraction_root,
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .expect("make adversarial extraction root private");
+            std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+                .expect("make adversarial extraction root private");
             let output =
                 run_authenticated_installer_extractor(&installer, &archive, &extraction_root);
             assert!(
@@ -109952,7 +110013,10 @@ fi
                 let receipt = parse_installer_process_family_receipt(&replay.stdout);
                 assert_eq!(receipt["activation"], "pending");
                 assert_eq!(receipt["active_authority"], "legacy-direct");
-                assert_eq!(receipt["active_root"], destination.to_string_lossy().as_ref());
+                assert_eq!(
+                    receipt["active_root"],
+                    destination.to_string_lossy().as_ref()
+                );
                 assert_eq!(receipt["pending_reason"], "cross-launcher-lease-required");
                 assert!(
                     family_bytes_match(&destination, &old_family),
@@ -109979,15 +110043,14 @@ fi
         for (index, (mux_state, pending_reason)) in [
             ("active", "active-mux-owns-session-state"),
             ("ambiguous", "ambiguous-mux-ownership"),
-            (
-                "inactive",
-                "inactive-census-without-shared-launcher-lease",
-            ),
+            ("inactive", "inactive-census-without-shared-launcher-lease"),
         ]
         .into_iter()
         .enumerate()
         {
-            let destination = fixture.path().join(format!("destination-{index}-{mux_state}"));
+            let destination = fixture
+                .path()
+                .join(format!("destination-{index}-{mux_state}"));
             std::fs::create_dir(&destination).expect("create mux-state destination");
             std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
                 .expect("make mux-state destination private");
