@@ -7,7 +7,7 @@ use frankenterm_pty_guardian::AtomicComponentIdentityError;
 use frankenterm_pty_guardian::{
     BrokerControlServiceConfigV1, BrokerControlServiceV1, GuardianClient, GuardianService,
     GuardianServiceConfig, ProvisionTokenOutcome, guardian_atomic_component_marker,
-    guardian_runtime_build_identity, provision_guardian_token,
+    guardian_runtime_build_identity, provision_guardian_token, run_broker_exec_bootstrap,
 };
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -40,6 +40,9 @@ enum Command {
     /// Production-disabled same-binary PTY broker process.
     #[command(name = "broker-serve", hide = true)]
     BrokerServe(BrokerServeArgs),
+    /// Same-binary child held behind one authenticated durable Spawn barrier.
+    #[command(name = "exec-bootstrap", hide = true)]
+    ExecBootstrap(ExecBootstrapArgs),
 }
 
 #[cfg(unix)]
@@ -109,6 +112,18 @@ struct BrokerServeArgs {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Args)]
+struct ExecBootstrapArgs {
+    /// Absolute path to the existing owner-only guardian authentication token.
+    #[arg(long)]
+    token_path: PathBuf,
+
+    /// Canonical content-free identity of the exact durable Spawn attempt.
+    #[arg(long)]
+    identity: String,
+}
+
+#[cfg(unix)]
 fn main() -> anyhow::Result<()> {
     retain_guardian_atomic_component_identity()?;
     let args = Cli::parse();
@@ -162,6 +177,9 @@ fn main() -> anyhow::Result<()> {
             )?;
             let mut service = BrokerControlServiceV1::bind(config)?;
             service.run_forever()?;
+        }
+        Command::ExecBootstrap(args) => {
+            run_broker_exec_bootstrap(&args.token_path, &args.identity)?;
         }
     }
     Ok(())

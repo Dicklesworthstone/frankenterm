@@ -76,7 +76,8 @@ pub mod transport;
 #[cfg(unix)]
 pub use broker::{
     BrokerControlClientError, BrokerControlClientV1, BrokerControlServiceConfigV1,
-    BrokerControlServiceError, BrokerControlServiceV1, BrokerGuardianConnectionIdentityV1,
+    BrokerControlServiceError, BrokerControlServiceV1, BrokerExecBootstrapErrorV1,
+    BrokerGuardianConnectionIdentityV1, run_broker_exec_bootstrap,
 };
 #[cfg(unix)]
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
