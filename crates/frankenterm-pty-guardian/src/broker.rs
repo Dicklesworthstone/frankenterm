@@ -49,17 +49,22 @@ use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
 use mux::guardian_protocol::{
-    GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1, GuardianDurableSpawnFenceV1,
-    GuardianSpawnPayload,
+    GUARDIAN_MAX_PANES, GUARDIAN_MAX_PAYLOAD_BYTES, GuardianBrokerSpawnWalAuthenticatorV1,
+    GuardianDurableSpawnFenceV1, GuardianSpawnPayload,
 };
+use nix::unistd::geteuid;
 #[cfg(test)]
 use portable_pty::ExitStatus;
 use portable_pty::{Child, MasterPty, PollablePtyReader, PtyPair, PtySize, native_pty_system};
 use sha2::{Digest as _, Sha256};
-use std::collections::VecDeque;
-use std::fs::File;
+use std::collections::{BTreeMap, VecDeque};
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::panic::AssertUnwindSafe;
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -89,6 +94,15 @@ const BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES: usize = 88;
 const BROKER_SPAWN_WAL_MAC_BYTES: usize = 32;
 const BROKER_SPAWN_WAL_KEY_ID_BYTES: usize = 8;
 const BROKER_SPAWN_WAL_MAX_RECORDS: u64 = 4;
+const BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES: u64 = BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+    + BROKER_SPAWN_WAL_MAX_RECORDS * BROKER_SPAWN_WAL_RECORD_BYTES_U64;
+const BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES: u64 = BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64
+    + BROKER_SPAWN_WAL_MAX_RECORDS * BROKER_SPAWN_HEAD_RECORD_BYTES_U64;
+const BROKER_SPAWN_CATALOG_LOCK_NAME: &str = ".broker-spawn-catalog.lock.v1";
+const BROKER_SPAWN_CATALOG_PREFIX: &str = "spawn-";
+const BROKER_SPAWN_CATALOG_WAL_SUFFIX: &str = ".wal.v1";
+const BROKER_SPAWN_CATALOG_HEAD_SUFFIX: &str = ".head.v1";
+const BROKER_SPAWN_CATALOG_MAX_ENTRIES: usize = GUARDIAN_MAX_PANES * 2 + 1;
 
 fn is_pty_terminal_eio(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::EIO)
@@ -419,6 +433,35 @@ pub struct BrokerSpawnJournalV1 {
     injected_fault: Option<BrokerSpawnWalInjectedFault>,
 }
 
+/// Pinned, exclusive authority over the bounded broker Spawn-WAL directory.
+///
+/// The directory must already exist as an absolute, normalized, current-user,
+/// owner-only directory. Every name is enumerated through the pinned directory
+/// descriptor; unknown names and incomplete WAL/head pairs fail closed and are
+/// never removed. The retained lock descriptor prevents two broker processes
+/// from reconciling or appending the same catalog concurrently.
+pub(crate) struct BrokerSpawnWalCatalogV1 {
+    directory_path: PathBuf,
+    directory: File,
+    _lock: File,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BrokerSpawnWalCatalogPairV1 {
+    wal_name: Option<OsString>,
+    head_name: Option<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerSpawnWalFileIdentityV1 {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    owner: u32,
+    links: u64,
+    bytes: u64,
+}
+
 /// Opaque proof that the service revalidated the pinned WAL, head, key, and
 /// parent-directory identities after recovery.
 pub(crate) struct BrokerSpawnWalFilesystemRevalidationV1 {
@@ -470,6 +513,20 @@ pub enum BrokerSpawnWalError {
     NotRegularFile,
     #[error("broker Spawn WAL parent descriptor is not a directory")]
     NotDirectory,
+    #[error("broker Spawn WAL catalog path is invalid")]
+    InvalidCatalogPath,
+    #[error("broker Spawn WAL catalog path or descriptor identity is insecure")]
+    InsecureCatalogIdentity,
+    #[error("broker Spawn WAL catalog contains an unknown or noncanonical entry")]
+    UnexpectedCatalogEntry,
+    #[error("broker Spawn WAL catalog is missing one member of a WAL/head pair")]
+    IncompleteCatalogPair,
+    #[error("broker Spawn WAL catalog already has an active process owner")]
+    CatalogAlreadyOwned,
+    #[error("broker Spawn WAL catalog lock is unsupported on this Unix target")]
+    CatalogLockUnsupported,
+    #[error("broker Spawn WAL catalog file name does not match its authenticated identity")]
+    CatalogIdentityMismatch,
     #[error("new broker Spawn WAL or head descriptor is not empty")]
     NewJournalNotEmpty,
     #[error("broker Spawn WAL file header is torn")]
@@ -606,6 +663,25 @@ fn validate_broker_spawn_file_header(
     expected: BrokerSpawnWalIdentityV1,
     authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
 ) -> Result<[u8; BROKER_SPAWN_WAL_MAC_BYTES], BrokerSpawnWalError> {
+    let (observed, tag) =
+        decode_broker_spawn_file_header(header, magic, authenticator)?;
+    if observed != expected {
+        return Err(BrokerSpawnWalError::IdentityMismatch);
+    }
+    Ok(tag)
+}
+
+fn decode_broker_spawn_file_header(
+    header: &[u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
+    magic: [u8; 8],
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<
+    (
+        BrokerSpawnWalIdentityV1,
+        [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    ),
+    BrokerSpawnWalError,
+> {
     if header[0..8] != magic {
         return Err(BrokerSpawnWalError::InvalidFileMagic);
     }
@@ -631,15 +707,12 @@ fn validate_broker_spawn_file_header(
         binding_digest: read_broker_array_32(&header[160..192]),
     };
     observed.validate()?;
-    if observed != expected {
-        return Err(BrokerSpawnWalError::IdentityMismatch);
-    }
     broker_spawn_wal_verify(
         authenticator,
         &header[..BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES],
         &header[192..224],
     )?;
-    Ok(read_broker_array_32(&header[192..224]))
+    Ok((observed, read_broker_array_32(&header[192..224])))
 }
 
 fn encode_broker_spawn_wal_record(
