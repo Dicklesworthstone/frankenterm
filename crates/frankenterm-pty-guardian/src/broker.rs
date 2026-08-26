@@ -11,15 +11,16 @@
 //! admits the complete authenticated Spawn catalog before it may reconcile a
 //! valid crash cut or bind its pinned private control socket. Its bounded event
 //! loop authenticates exact guardian, mux, build, connection,
-//! broker-incarnation, and token-derived lineage identities. It still rejects
-//! every PTY effect: the exec-ready child barrier, live WAL receipts, durable
-//! output journal, census, and successor lease rotation must land before any
-//! production selector may start it. The process-local PTY typestate below
-//! therefore still does **not** prove guardian-`SIGKILL` continuity. Catalog
-//! Genesis admission remains durable pre-Spawn intent, never proof that a child
-//! exists, and the current service refuses startup without reconciling when it
-//! encounters an existing nonempty Spawn lifecycle it cannot yet reconstruct
-//! without ambiguity.
+//! broker-incarnation, and token-derived lineage identities. The same-binary
+//! exec bootstrap and its durable Attempt/SpawnObserved/Release ordering are
+//! implemented below, but the live service still rejects every PTY effect:
+//! activation wiring, startup adoption, durable output replay into census, and
+//! successor lease rotation must land before any production selector may start
+//! it. The process-local PTY typestate below therefore still does **not** prove
+//! guardian-`SIGKILL` continuity. Catalog Genesis admission remains durable
+//! pre-Spawn intent, never proof that a child exists, and the current service
+//! refuses startup without reconciling when it encounters an existing nonempty
+//! Spawn lifecycle it cannot yet reconstruct without ambiguity.
 //!
 //! The ordering enforced here is:
 //!
@@ -28,12 +29,15 @@
 //! 2. open the PTY and reserve one broker-owned master/reader/writer proxy, but
 //!    create no child;
 //! 3. consume the synchronously durable Genesis pre-Spawn intent;
-//! 4. synchronize the broker Spawn Attempt before invoking the one callback,
-//!    then record the verified child identity and reply acknowledgement;
-//! 5. process-locally issue one logical guardian lease;
-//! 6. fence every proxy operation at admission and again immediately before
+//! 4. synchronize the broker Spawn Attempt, start the exact same-binary
+//!    bootstrap, and complete authenticated Ready/Prepare/Prepared without
+//!    granting user-command exec authority;
+//! 5. synchronize the exact verified child identity as SpawnObserved, then
+//!    write the authenticated Release frame exactly once;
+//! 6. process-locally issue one logical guardian lease;
+//! 7. fence every proxy operation at admission and again immediately before
 //!    effect, so rotation invalidates already-queued stale work;
-//! 7. accept a successor only after authenticated connection EOF revoked the
+//! 8. accept a successor only after authenticated connection EOF revoked the
 //!    old logical proxy lease and an exact generation/build-fenced handoff.
 //!
 //! Recovered WAL state can now reconstruct the pure protocol Spawn fence, and
@@ -165,6 +169,30 @@ const BROKER_EXEC_BOOTSTRAP_MAX_FRAME_BYTES: usize =
 const BROKER_EXEC_BOOTSTRAP_IDENTITY_BYTES: usize = 200;
 const BROKER_EXEC_BOOTSTRAP_IDENTITY_HEX_BYTES: usize = BROKER_EXEC_BOOTSTRAP_IDENTITY_BYTES * 2;
 const BROKER_EXEC_BOOTSTRAP_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const BROKER_EXEC_BOOTSTRAP_PTY_HANDOFF_RETRY: Duration = Duration::from_millis(1);
+#[cfg(test)]
+const BROKER_EXEC_BOOTSTRAP_TEST_TOKEN_ENV: &str = "FT_TEST_BROKER_EXEC_BOOTSTRAP_TOKEN";
+#[cfg(test)]
+const BROKER_EXEC_BOOTSTRAP_TEST_IDENTITY_ENV: &str = "FT_TEST_BROKER_EXEC_BOOTSTRAP_IDENTITY";
+#[cfg(test)]
+const BROKER_EXEC_BOOTSTRAP_TEST_DIAGNOSTIC_ENV: &str = "FT_TEST_BROKER_EXEC_BOOTSTRAP_DIAGNOSTIC";
+#[cfg(test)]
+const BROKER_EXEC_BOOTSTRAP_TEST_PREAMBLE_MAX_BYTES: usize = 1_024;
+#[cfg(test)]
+const BROKER_EXEC_BOOTSTRAP_TEST_ENTRY: &str =
+    "broker::tests::broker_exec_bootstrap_subprocess_entry";
+
+#[cfg(test)]
+fn record_broker_exec_bootstrap_test_stage(stage: &str) {
+    let Some(path) = std::env::var_os(BROKER_EXEC_BOOTSTRAP_TEST_DIAGNOSTIC_ENV) else {
+        return;
+    };
+    let Ok(mut diagnostic) = OpenOptions::new().append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(diagnostic, "{stage}");
+    let _ = diagnostic.sync_all();
+}
 
 fn is_pty_terminal_eio(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::EIO)
@@ -282,7 +310,11 @@ impl BrokerExecBootstrapIdentityV1 {
             return Err(BrokerExecBootstrapProtocolErrorV1::InvalidIdentity);
         }
         let mut bytes = [0_u8; BROKER_EXEC_BOOTSTRAP_IDENTITY_BYTES];
-        for (destination, pair) in bytes.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
+        let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+        if !remainder.is_empty() {
+            return Err(BrokerExecBootstrapProtocolErrorV1::InvalidIdentity);
+        }
+        for (destination, pair) in bytes.iter_mut().zip(pairs) {
             let high = lower_hex_nibble(pair[0])
                 .ok_or(BrokerExecBootstrapProtocolErrorV1::InvalidIdentity)?;
             let low = lower_hex_nibble(pair[1])
@@ -770,13 +802,76 @@ impl<'a> BrokerExecBootstrapBrokerIoV1<'a> {
         Ok(())
     }
 
-    fn read_frame_until(
+    /// The Linux PTY master can transiently report `EIO` (mapped to a
+    /// zero-length read by `portable-pty`) between the parent closing its
+    /// inherited slave descriptor and the child completing session/stdio
+    /// setup. Retry only before the first frame byte, only while the exact
+    /// child is still live, and only under the existing total deadline. Once a
+    /// byte is observed, EOF remains terminal so frames cannot be spliced
+    /// across a slave close/reopen boundary.
+    fn read_exact_after_initial_pty_handoff_until(
         &mut self,
+        mut destination: &mut [u8],
+        child: &mut dyn portable_pty::Child,
+        deadline: Instant,
+        site: &'static str,
+    ) -> Result<(), BrokerExecBootstrapErrorV1> {
+        let mut observed_frame_byte = false;
+        while !destination.is_empty() {
+            match self.reader.read(destination) {
+                Ok(0) if !observed_frame_byte => {
+                    match child.try_wait() {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            return Err(BrokerExecBootstrapErrorV1::FrameIo {
+                                site,
+                                source: std::io::Error::new(
+                                    ErrorKind::UnexpectedEof,
+                                    "exec-bootstrap exited before its initial frame",
+                                ),
+                            });
+                        }
+                        Err(source) => {
+                            return Err(BrokerExecBootstrapErrorV1::FrameIo { site, source });
+                        }
+                    }
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|duration| !duration.is_zero())
+                        .ok_or(BrokerExecBootstrapErrorV1::HandshakeTimeout)?;
+                    std::thread::sleep(remaining.min(BROKER_EXEC_BOOTSTRAP_PTY_HANDOFF_RETRY));
+                }
+                Ok(0) => {
+                    return Err(BrokerExecBootstrapErrorV1::FrameIo {
+                        site,
+                        source: std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "exec-bootstrap PTY closed within its initial frame",
+                        ),
+                    });
+                }
+                Ok(read) => {
+                    observed_frame_byte = true;
+                    destination = &mut destination[read..];
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    self.wait_until(BrokerExecBootstrapReadinessV1::Readable, deadline)?;
+                }
+                Err(source) => {
+                    return Err(BrokerExecBootstrapErrorV1::FrameIo { site, source });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_frame_from_header_until(
+        &mut self,
+        header: [u8; BROKER_EXEC_BOOTSTRAP_PAYLOAD_OFFSET],
         deadline: Instant,
         site: &'static str,
     ) -> Result<Zeroizing<Vec<u8>>, BrokerExecBootstrapErrorV1> {
-        let mut header = [0_u8; BROKER_EXEC_BOOTSTRAP_PAYLOAD_OFFSET];
-        self.read_exact_until(&mut header, deadline, site)?;
         let payload_bytes = usize::try_from(read_broker_be_u32(&header[220..224]))
             .map_err(|_| BrokerExecBootstrapErrorV1::Protocol)?;
         let total_bytes = BROKER_EXEC_BOOTSTRAP_FIXED_BYTES
@@ -801,6 +896,58 @@ impl<'a> BrokerExecBootstrapBrokerIoV1<'a> {
             site,
         )?;
         Ok(frame)
+    }
+
+    fn read_frame_until(
+        &mut self,
+        deadline: Instant,
+        site: &'static str,
+    ) -> Result<Zeroizing<Vec<u8>>, BrokerExecBootstrapErrorV1> {
+        let mut header = [0_u8; BROKER_EXEC_BOOTSTRAP_PAYLOAD_OFFSET];
+        self.read_exact_until(&mut header, deadline, site)?;
+        self.complete_frame_from_header_until(header, deadline, site)
+    }
+
+    fn read_initial_frame_until(
+        &mut self,
+        child: &mut dyn portable_pty::Child,
+        deadline: Instant,
+        site: &'static str,
+    ) -> Result<Zeroizing<Vec<u8>>, BrokerExecBootstrapErrorV1> {
+        let mut header = [0_u8; BROKER_EXEC_BOOTSTRAP_PAYLOAD_OFFSET];
+        self.read_exact_after_initial_pty_handoff_until(&mut header, child, deadline, site)?;
+        self.complete_frame_from_header_until(header, deadline, site)
+    }
+
+    #[cfg(test)]
+    fn read_test_harness_initial_frame_until(
+        &mut self,
+        child: &mut dyn portable_pty::Child,
+        deadline: Instant,
+        site: &'static str,
+    ) -> Result<Zeroizing<Vec<u8>>, BrokerExecBootstrapErrorV1> {
+        let mut matched_magic_bytes = 0_usize;
+        for _ in 0..BROKER_EXEC_BOOTSTRAP_TEST_PREAMBLE_MAX_BYTES {
+            let mut byte = [0_u8; 1];
+            self.read_exact_after_initial_pty_handoff_until(&mut byte, child, deadline, site)?;
+            if byte[0] == BROKER_EXEC_BOOTSTRAP_MAGIC[matched_magic_bytes] {
+                matched_magic_bytes += 1;
+                if matched_magic_bytes == BROKER_EXEC_BOOTSTRAP_MAGIC.len() {
+                    let mut header = [0_u8; BROKER_EXEC_BOOTSTRAP_PAYLOAD_OFFSET];
+                    header[..BROKER_EXEC_BOOTSTRAP_MAGIC.len()]
+                        .copy_from_slice(&BROKER_EXEC_BOOTSTRAP_MAGIC);
+                    self.read_exact_until(
+                        &mut header[BROKER_EXEC_BOOTSTRAP_MAGIC.len()..],
+                        deadline,
+                        site,
+                    )?;
+                    return self.complete_frame_from_header_until(header, deadline, site);
+                }
+            } else {
+                matched_magic_bytes = usize::from(byte[0] == BROKER_EXEC_BOOTSTRAP_MAGIC[0]);
+            }
+        }
+        Err(BrokerExecBootstrapErrorV1::Protocol)
     }
 
     fn write_frame_until(
@@ -859,7 +1006,11 @@ fn prepare_broker_exec_command_after_release(
     identity: BrokerExecBootstrapIdentityV1,
     mut validate_authority: impl FnMut() -> Result<(), BrokerExecBootstrapErrorV1>,
 ) -> Result<portable_pty::cmdbuilder::PreparedCommand, BrokerExecBootstrapErrorV1> {
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("protocol-entry");
     validate_authority()?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("protocol-authority-validated-before-ready");
     let ready = encode_broker_exec_bootstrap_frame(
         control_authority,
         identity,
@@ -868,8 +1019,12 @@ fn prepare_broker_exec_command_after_release(
     )
     .map_err(|_| BrokerExecBootstrapErrorV1::Protocol)?;
     write_broker_exec_bootstrap_wire_frame(output, &ready, "ready-write")?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("protocol-ready-written");
 
     let prepare_wire = read_broker_exec_bootstrap_wire_frame(input, "prepare-read")?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("protocol-prepare-read");
     let prepare =
         decode_broker_exec_bootstrap_frame(control_authority, identity, prepare_wire.as_slice())
             .map_err(|_| BrokerExecBootstrapErrorV1::Protocol)?;
@@ -884,6 +1039,8 @@ fn prepare_broker_exec_command_after_release(
     let prepared_command = command
         .prepare_exec_in_place()
         .map_err(|_| BrokerExecBootstrapErrorV1::CommandPreparation)?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("protocol-command-prepared");
     validate_authority()?;
 
     let prepared = encode_broker_exec_bootstrap_frame(
@@ -894,8 +1051,12 @@ fn prepare_broker_exec_command_after_release(
     )
     .map_err(|_| BrokerExecBootstrapErrorV1::Protocol)?;
     write_broker_exec_bootstrap_wire_frame(output, &prepared, "prepared-write")?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("protocol-prepared-written");
 
     let release_wire = read_broker_exec_bootstrap_wire_frame(input, "release-read")?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("protocol-release-read");
     let release =
         decode_broker_exec_bootstrap_frame(control_authority, identity, release_wire.as_slice())
             .map_err(|_| BrokerExecBootstrapErrorV1::Protocol)?;
@@ -927,17 +1088,33 @@ pub fn run_broker_exec_bootstrap(
     if embedded_build.into_bytes() != identity.guardian_build_identity_digest {
         return Err(BrokerExecBootstrapErrorV1::BuildIdentityMismatch);
     }
+    run_broker_exec_bootstrap_with_identity(token_path, identity)
+}
 
+fn run_broker_exec_bootstrap_with_identity(
+    token_path: &Path,
+    identity: BrokerExecBootstrapIdentityV1,
+) -> Result<(), BrokerExecBootstrapErrorV1> {
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("runner-entry");
     let (secret, mut token_authority) = load_guardian_secret_with_authority(token_path)
         .map_err(BrokerExecBootstrapErrorV1::TokenAuthority)?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("runner-secret-loaded");
     let control_authority = secret
         .broker_control_authenticator()
         .map_err(|_| BrokerExecBootstrapErrorV1::AuthenticationAuthority)?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("runner-control-authority-derived");
     token_authority
         .validate()
         .map_err(BrokerExecBootstrapErrorV1::TokenAuthority)?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("runner-token-authority-validated");
 
     let mut terminal = BrokerExecBootstrapTerminalV1::enter_raw()?;
+    #[cfg(test)]
+    record_broker_exec_bootstrap_test_stage("runner-terminal-raw");
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
@@ -2088,8 +2265,9 @@ fn reconcile_broker_catalog_under_token_authority(
 ///
 /// This first executable slice authenticates and fences connections and opens
 /// the complete Spawn catalog before listening. It deliberately rejects every
-/// PTY effect: live child creation is enabled only after the exec barrier and
-/// WAL receipt integration land.
+/// PTY effect: live child creation is enabled only after the landed exec
+/// barrier is wired into this service together with startup adoption, census,
+/// output replay, and successor rotation.
 pub struct BrokerControlServiceV1 {
     poll: Poll,
     events: Events,
@@ -3619,6 +3797,7 @@ pub(crate) enum BrokerDurableExecBarrierCommitV1 {
         reason: BrokerDurableExecBarrierIndeterminateReasonV1,
         retained: Option<BrokerExecBarrierRetainedV1>,
         status: BrokerSpawnWalStatusV1,
+        callback_error: Option<BrokerError>,
     },
 }
 
@@ -3634,6 +3813,14 @@ pub(crate) struct BrokerExecBootstrapLaunchV1 {
     token_path: PathBuf,
     control_authority: GuardianBrokerControlAuthenticatorV1,
     io_timeout: Duration,
+    invocation: BrokerExecBootstrapInvocationV1,
+}
+
+#[derive(Clone, Copy)]
+enum BrokerExecBootstrapInvocationV1 {
+    ProductionCli,
+    #[cfg(test)]
+    UnitTestHarness,
 }
 
 impl BrokerExecBootstrapLaunchV1 {
@@ -3655,7 +3842,24 @@ impl BrokerExecBootstrapLaunchV1 {
             token_path,
             control_authority,
             io_timeout,
+            invocation: BrokerExecBootstrapInvocationV1::ProductionCli,
         })
+    }
+
+    #[cfg(test)]
+    fn for_unit_test(
+        executable_path: PathBuf,
+        token_path: PathBuf,
+        control_authority: GuardianBrokerControlAuthenticatorV1,
+    ) -> Result<Self, BrokerError> {
+        let mut launch = Self::new(
+            executable_path,
+            token_path,
+            control_authority,
+            BROKER_EXEC_BOOTSTRAP_IO_TIMEOUT,
+        )?;
+        launch.invocation = BrokerExecBootstrapInvocationV1::UnitTestHarness;
+        Ok(launch)
     }
 }
 
@@ -3670,24 +3874,52 @@ impl BrokerPendingExecReleaseV1 {
         self.adoption.pane.kernel_child_identity()
     }
 
-    fn release(mut self) -> Result<BrokerAdoptionV1, (Self, BrokerExecBootstrapErrorV1)> {
-        let deadline = match Instant::now().checked_add(self.io_timeout) {
-            Some(deadline) => deadline,
-            None => return Err((self, BrokerExecBootstrapErrorV1::HandshakeTimeout)),
-        };
+    fn release(&mut self) -> Result<(), BrokerExecBootstrapErrorV1> {
+        let deadline = Instant::now()
+            .checked_add(self.io_timeout)
+            .ok_or(BrokerExecBootstrapErrorV1::HandshakeTimeout)?;
         let result = {
             let Some(reader) = self.adoption.pane.proxy_reader.as_deref_mut() else {
-                return Err((self, BrokerExecBootstrapErrorV1::InvalidSequence));
+                return Err(BrokerExecBootstrapErrorV1::InvalidSequence);
             };
             let Some(writer) = self.adoption.pane.proxy_writer.as_deref_mut() else {
-                return Err((self, BrokerExecBootstrapErrorV1::InvalidSequence));
+                return Err(BrokerExecBootstrapErrorV1::InvalidSequence);
             };
             BrokerExecBootstrapBrokerIoV1::new(reader, writer)
                 .and_then(|mut io| io.write_frame_until(&self.release, deadline, "release-write"))
         };
-        match result {
-            Ok(()) => Ok(self.adoption),
-            Err(error) => Err((self, error)),
+        result
+    }
+
+    fn into_adoption(self) -> BrokerAdoptionV1 {
+        self.adoption
+    }
+
+    #[cfg(test)]
+    fn close_broker_pty_and_reap_for_test(self, timeout: Duration) -> std::io::Result<bool> {
+        let BrokerPendingExecReleaseV1 { adoption, .. } = self;
+        let BrokerAdoptionV1 { pane, .. } = adoption;
+        let BrokerAdoptedPaneV1 {
+            broker_master,
+            proxy_reader,
+            proxy_writer,
+            mut child,
+            ..
+        } = pane;
+        drop(proxy_reader);
+        drop(proxy_writer);
+        drop(broker_master);
+        let deadline = Instant::now() + timeout;
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                let _ = child.wait()?;
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
@@ -7812,8 +8044,9 @@ impl BrokerPreparedPaneV1 {
                 return Ok(BrokerDurableExecBarrierCommitV1::Reconciled(status));
             }
         };
+        let mut callback_error = None;
         let execution = attempt.invoke_once(|| {
-            let pending = self.spawn_prepared_exec_bootstrap(
+            match self.spawn_prepared_exec_bootstrap(
                 control,
                 proof,
                 launch,
@@ -7821,30 +8054,39 @@ impl BrokerPreparedPaneV1 {
                 &encoded_identity,
                 prepare,
                 release,
-            )?;
-            let child_identity = pending.kernel_child_identity();
-            Ok::<_, BrokerError>((pending, child_identity))
+            ) {
+                Ok(pending) => {
+                    let child_identity = pending.kernel_child_identity();
+                    Ok((pending, child_identity))
+                }
+                Err(error) => {
+                    callback_error = Some(error);
+                    Err(error)
+                }
+            }
         });
         match execution {
             BrokerSpawnAttemptExecutionV1::EffectSucceeded {
                 value: pending,
                 observation,
             } => match journal.append_spawn_observed_and_sync(*observation) {
-                Ok(spawn_observed) => match pending.release() {
-                    Ok(adoption) => Ok(BrokerDurableExecBarrierCommitV1::Applied {
-                        adoption: Box::new(adoption),
-                        spawn_observed,
-                    }),
-                    Err((pending, _)) => {
-                        Ok(BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate {
+                Ok(spawn_observed) => {
+                    let mut pending = pending;
+                    match pending.release() {
+                        Ok(()) => Ok(BrokerDurableExecBarrierCommitV1::Applied {
+                            adoption: Box::new(pending.into_adoption()),
+                            spawn_observed,
+                        }),
+                        Err(_) => Ok(BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate {
                             reason: BrokerDurableExecBarrierIndeterminateReasonV1::ExecRelease,
                             retained: Some(BrokerExecBarrierRetainedV1::ReleaseIndeterminate(
                                 Box::new(pending),
                             )),
                             status: journal.status(),
-                        })
+                            callback_error: None,
+                        }),
                     }
-                },
+                }
                 Err(_) => Ok(BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate {
                     reason:
                         BrokerDurableExecBarrierIndeterminateReasonV1::SpawnObservationDurability,
@@ -7852,6 +8094,7 @@ impl BrokerPreparedPaneV1 {
                         pending,
                     ))),
                     status: journal.status(),
+                    callback_error: None,
                 }),
             },
             BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate { retained_value } => {
@@ -7861,6 +8104,7 @@ impl BrokerPreparedPaneV1 {
                         BrokerExecBarrierRetainedV1::AwaitingRelease(Box::new(pending))
                     }),
                     status: journal.status(),
+                    callback_error,
                 })
             }
         }
@@ -7895,11 +8139,25 @@ impl BrokerPreparedPaneV1 {
             limits,
         } = self;
         let mut bootstrap = portable_pty::CommandBuilder::new(&launch.executable_path);
-        bootstrap.arg("exec-bootstrap");
-        bootstrap.arg("--token-path");
-        bootstrap.arg(launch.token_path.as_os_str());
-        bootstrap.arg("--identity");
-        bootstrap.arg(encoded_identity);
+        match launch.invocation {
+            BrokerExecBootstrapInvocationV1::ProductionCli => {
+                bootstrap.arg("exec-bootstrap");
+                bootstrap.arg("--token-path");
+                bootstrap.arg(launch.token_path.as_os_str());
+                bootstrap.arg("--identity");
+                bootstrap.arg(encoded_identity);
+            }
+            #[cfg(test)]
+            BrokerExecBootstrapInvocationV1::UnitTestHarness => {
+                let diagnostic_path = launch.token_path.with_extension("bootstrap-error");
+                bootstrap.arg("--quiet");
+                bootstrap.arg("--exact");
+                bootstrap.arg(BROKER_EXEC_BOOTSTRAP_TEST_ENTRY);
+                bootstrap.env(BROKER_EXEC_BOOTSTRAP_TEST_TOKEN_ENV, &launch.token_path);
+                bootstrap.env(BROKER_EXEC_BOOTSTRAP_TEST_IDENTITY_ENV, encoded_identity);
+                bootstrap.env(BROKER_EXEC_BOOTSTRAP_TEST_DIAGNOSTIC_ENV, diagnostic_path);
+            }
+        }
         bootstrap.set_controlling_tty(payload.command().get_controlling_tty());
         drop(payload);
 
@@ -7919,41 +8177,55 @@ impl BrokerPreparedPaneV1 {
             }
         };
 
-        let deadline = Instant::now()
-            .checked_add(launch.io_timeout)
-            .ok_or(BrokerError::ExecBootstrapHandshakeFailed)?;
+        let deadline = Instant::now().checked_add(launch.io_timeout).ok_or(
+            BrokerError::ExecBootstrapHandshakeFailed(
+                BrokerExecBootstrapHandshakeStageV1::Deadline,
+            ),
+        )?;
         let handshake = (|| {
-            let mut io =
-                BrokerExecBootstrapBrokerIoV1::new(&mut *proxy_reader, &mut *proxy_writer)?;
-            let ready_wire = io.read_frame_until(deadline, "ready-read")?;
+            let mut io = BrokerExecBootstrapBrokerIoV1::new(&mut *proxy_reader, &mut *proxy_writer)
+                .map_err(|_| BrokerExecBootstrapHandshakeStageV1::BrokerIoSetup)?;
+            let ready_wire = match launch.invocation {
+                BrokerExecBootstrapInvocationV1::ProductionCli => {
+                    io.read_initial_frame_until(&mut *child, deadline, "ready-read")
+                }
+                #[cfg(test)]
+                BrokerExecBootstrapInvocationV1::UnitTestHarness => {
+                    io.read_test_harness_initial_frame_until(&mut *child, deadline, "ready-read")
+                }
+            }
+            .map_err(|_| BrokerExecBootstrapHandshakeStageV1::ReadyRead)?;
             let ready = decode_broker_exec_bootstrap_frame(
                 &launch.control_authority,
                 identity,
                 ready_wire.as_slice(),
             )
-            .map_err(|_| BrokerExecBootstrapErrorV1::Protocol)?;
+            .map_err(|_| BrokerExecBootstrapHandshakeStageV1::ReadyFrame)?;
             if ready.kind != BrokerExecBootstrapMessageKindV1::Ready {
-                return Err(BrokerExecBootstrapErrorV1::InvalidSequence);
+                return Err(BrokerExecBootstrapHandshakeStageV1::ReadySequence);
             }
             drop(ready);
             drop(ready_wire);
-            io.write_frame_until(&prepare, deadline, "prepare-write")?;
-            let prepared_wire = io.read_frame_until(deadline, "prepared-read")?;
+            io.write_frame_until(&prepare, deadline, "prepare-write")
+                .map_err(|_| BrokerExecBootstrapHandshakeStageV1::PrepareWrite)?;
+            let prepared_wire = io
+                .read_frame_until(deadline, "prepared-read")
+                .map_err(|_| BrokerExecBootstrapHandshakeStageV1::PreparedRead)?;
             let prepared = decode_broker_exec_bootstrap_frame(
                 &launch.control_authority,
                 identity,
                 prepared_wire.as_slice(),
             )
-            .map_err(|_| BrokerExecBootstrapErrorV1::Protocol)?;
+            .map_err(|_| BrokerExecBootstrapHandshakeStageV1::PreparedFrame)?;
             if prepared.kind != BrokerExecBootstrapMessageKindV1::Prepared {
-                return Err(BrokerExecBootstrapErrorV1::InvalidSequence);
+                return Err(BrokerExecBootstrapHandshakeStageV1::PreparedSequence);
             }
             Ok(())
         })();
-        if handshake.is_err() {
+        if let Err(stage) = handshake {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(BrokerError::ExecBootstrapHandshakeFailed);
+            return Err(BrokerError::ExecBootstrapHandshakeFailed(stage));
         }
 
         let kernel_child_identity = verified_kernel_child.identity();
@@ -9260,6 +9532,23 @@ pub enum BrokerSuccessorAttachOutcomeV1 {
     },
 }
 
+/// Content-free stage at which the broker-side exec-bootstrap handshake
+/// failed. The stage is retained after the durable Attempt fence so operators
+/// can distinguish launch, transport, authentication, and ordering faults
+/// without logging terminal or command bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerExecBootstrapHandshakeStageV1 {
+    Deadline,
+    BrokerIoSetup,
+    ReadyRead,
+    ReadyFrame,
+    ReadySequence,
+    PrepareWrite,
+    PreparedRead,
+    PreparedFrame,
+    PreparedSequence,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BrokerError {
     #[error("broker resource capacity is invalid or exhausted")]
@@ -9288,8 +9577,8 @@ pub enum BrokerError {
     ChildSpawnFailed,
     #[error("broker exec-bootstrap launch configuration is invalid")]
     InvalidExecBootstrapLaunch,
-    #[error("broker exec-bootstrap handshake failed before durable child observation")]
-    ExecBootstrapHandshakeFailed,
+    #[error("broker exec-bootstrap handshake failed at {0:?} before durable child observation")]
+    ExecBootstrapHandshakeFailed(BrokerExecBootstrapHandshakeStageV1),
     #[error("broker child did not expose an exact process identity")]
     ChildIdentityUnavailable,
     #[error("conflicting authenticated control EOF quarantined the pane")]
@@ -9406,6 +9695,81 @@ mod tests {
         Uuid::from_u128(value)
     }
 
+    fn record_test_exec_bootstrap_stage(diagnostic: &mut Option<File>, stage: &str) {
+        if let Some(diagnostic) = diagnostic.as_mut() {
+            writeln!(diagnostic, "{stage}").expect("write content-free test bootstrap diagnostic");
+            diagnostic
+                .sync_all()
+                .expect("synchronize test bootstrap diagnostic");
+        }
+    }
+
+    struct InitialZeroPollableReader {
+        stream: BlockingUnixStream,
+        zero_reads_remaining: usize,
+    }
+
+    impl Read for InitialZeroPollableReader {
+        fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
+            if self.zero_reads_remaining != 0 {
+                self.zero_reads_remaining -= 1;
+                return Ok(0);
+            }
+            self.stream.read(destination)
+        }
+    }
+
+    impl AsFd for InitialZeroPollableReader {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.stream.as_fd()
+        }
+    }
+
+    #[test]
+    fn broker_exec_bootstrap_subprocess_entry() {
+        let mut diagnostic =
+            std::env::var_os(BROKER_EXEC_BOOTSTRAP_TEST_DIAGNOSTIC_ENV).map(|path| {
+                OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(path)
+                    .expect("create content-free test bootstrap diagnostic")
+            });
+        record_test_exec_bootstrap_stage(&mut diagnostic, "entry");
+        let Some(token_path) = std::env::var_os(BROKER_EXEC_BOOTSTRAP_TEST_TOKEN_ENV) else {
+            record_test_exec_bootstrap_stage(&mut diagnostic, "missing-token-environment");
+            if diagnostic.is_none() {
+                return;
+            }
+            panic!("test bootstrap token environment is missing");
+        };
+        let encoded_identity = std::env::var(BROKER_EXEC_BOOTSTRAP_TEST_IDENTITY_ENV)
+            .unwrap_or_else(|_| {
+                record_test_exec_bootstrap_stage(&mut diagnostic, "missing-identity-environment");
+                panic!("test bootstrap identity environment is missing");
+            });
+        let identity = BrokerExecBootstrapIdentityV1::decode_cli_identity(&encoded_identity)
+            .unwrap_or_else(|_| {
+                record_test_exec_bootstrap_stage(&mut diagnostic, "invalid-identity-environment");
+                panic!("test bootstrap identity environment is invalid");
+            });
+        record_test_exec_bootstrap_stage(&mut diagnostic, "identity-decoded");
+        if let Err(error) =
+            run_broker_exec_bootstrap_with_identity(Path::new(&token_path), identity)
+        {
+            if let Some(diagnostic) = diagnostic.as_mut() {
+                writeln!(diagnostic, "runner-error: {error:?}")
+                    .expect("write content-free test bootstrap diagnostic");
+                diagnostic
+                    .sync_all()
+                    .expect("synchronize test bootstrap diagnostic");
+            }
+            panic!("test exec bootstrap failed before image replacement: {error}");
+        }
+        unreachable!("successful exec bootstrap replaces the test process image");
+    }
+
     fn sealed(byte: u8) -> SealedAtomicBuildIdentity {
         SealedAtomicBuildIdentity::from_lower_hex(&format!("{byte:02x}").repeat(32))
             .expect("sealed test identity")
@@ -9504,6 +9868,36 @@ mod tests {
             .expect("nonzero guardian test secret")
             .broker_control_authenticator()
             .expect("derive broker control authenticator")
+    }
+
+    fn unit_test_exec_bootstrap_launch(
+        token_path: &Path,
+        secret_byte: u8,
+    ) -> (
+        BrokerExecBootstrapLaunchV1,
+        GuardianBrokerSpawnWalAuthenticatorV1,
+    ) {
+        create_private_broker_token_with_bytes(token_path, &[secret_byte; 32]);
+        let secret = mux::guardian_protocol::GuardianSecret::from_bytes([secret_byte; 32])
+            .expect("nonzero exec-bootstrap test secret");
+        let control_authority = secret
+            .broker_control_authenticator()
+            .expect("derive exec-bootstrap control authority");
+        let wal_authority = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive exec-bootstrap WAL authority");
+        let launch = BrokerExecBootstrapLaunchV1::for_unit_test(
+            std::env::current_exe().expect("resolve current unit-test executable"),
+            token_path.to_path_buf(),
+            control_authority,
+        )
+        .expect("construct unit-test exec-bootstrap launch");
+        (launch, wal_authority)
+    }
+
+    fn unit_test_exec_bootstrap_diagnostic(token_path: &Path) -> String {
+        fs::read_to_string(token_path.with_extension("bootstrap-error"))
+            .unwrap_or_else(|_| "no child diagnostic was published".to_owned())
     }
 
     fn exec_bootstrap_identity(
@@ -10830,6 +11224,64 @@ mod tests {
     }
 
     #[test]
+    fn exec_bootstrap_initial_pty_handoff_retries_bounded_zero_reads_for_live_child() {
+        let payload = command_payload(
+            "printf unused",
+            Path::new("/tmp/frankenterm-exec-bootstrap-unused"),
+        );
+        let connection = authority(id(825), id(826), id(827), id(828), 0x91, 0x92);
+        let identity = exec_bootstrap_identity(&payload, &connection);
+        let control_authority = control_authenticator(0xb7);
+        let ready = encode_broker_exec_bootstrap_frame(
+            &control_authority,
+            identity,
+            BrokerExecBootstrapMessageKindV1::Ready,
+            &[],
+        )
+        .expect("encode transient-handoff Ready response");
+        let (broker_stream, mut bootstrap_stream) =
+            BlockingUnixStream::pair().expect("create transient-handoff socket pair");
+        broker_stream
+            .set_nonblocking(true)
+            .expect("make transient-handoff reader nonblocking");
+        let mut broker_writer = broker_stream
+            .try_clone()
+            .expect("clone transient-handoff broker writer");
+        bootstrap_stream
+            .write_all(ready.as_slice())
+            .expect("seed complete Ready response");
+        let mut reader = InitialZeroPollableReader {
+            stream: broker_stream,
+            zero_reads_remaining: 2,
+        };
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live transient-handoff child");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut io = BrokerExecBootstrapBrokerIoV1::new(&mut reader, &mut broker_writer)
+            .expect("create transient-handoff broker I/O");
+        let observed_wire = io
+            .read_initial_frame_until(&mut child, deadline, "test-initial-handoff-ready")
+            .expect("retry bounded initial PTY handoff reads");
+        let observed = decode_broker_exec_bootstrap_frame(
+            &control_authority,
+            identity,
+            observed_wire.as_slice(),
+        )
+        .expect("authenticate Ready after transient PTY handoff");
+        assert_eq!(observed.kind, BrokerExecBootstrapMessageKindV1::Ready);
+        drop(io);
+        assert_eq!(reader.zero_reads_remaining, 0);
+        child.kill().expect("terminate transient-handoff child");
+        child.wait().expect("reap transient-handoff child");
+    }
+
+    #[test]
     fn exec_bootstrap_eof_before_release_yields_no_exec_authority() {
         let directory = tempfile::Builder::new()
             .prefix("frankenterm-exec-bootstrap-eof-")
@@ -10878,7 +11330,7 @@ mod tests {
                 || Ok(()),
             );
             result_sender
-                .send(result.map(|prepared_command| drop(prepared_command)))
+                .send(result.map(drop))
                 .expect("send EOF child protocol result");
         });
 
@@ -11376,6 +11828,25 @@ mod tests {
             }
         }
         unreachable!("the bounded catalog reopen loop always returns")
+    }
+
+    fn bind_test_service_after_owner_drop(
+        config: &BrokerControlServiceConfigV1,
+    ) -> Result<BrokerControlServiceV1, BrokerControlServiceError> {
+        // Like direct catalog reopen, service bind can race a parallel test's
+        // fork between descriptor inheritance and the pre-exec close sweep.
+        // Retry only that transient inherited-lock classification. Any real
+        // competing owner survives the fixed 100 ms ceiling, and every other
+        // startup error remains immediate and unchanged.
+        for attempt in 0..100 {
+            match BrokerControlServiceV1::bind(config.clone()) {
+                Err(BrokerControlServiceError::SpawnCatalog(
+                    BrokerSpawnWalError::CatalogAlreadyOwned,
+                )) if attempt < 99 => thread::sleep(Duration::from_millis(1)),
+                result => return result,
+            }
+        }
+        unreachable!("the bounded service-bind retry loop always returns")
     }
 
     fn create_private_broker_token_with_bytes(path: &Path, bytes: &[u8]) {
@@ -12228,10 +12699,11 @@ mod tests {
             Duration::from_millis(5),
         )
         .expect("valid lifecycle-refusal service config");
-        assert!(matches!(
-            BrokerControlServiceV1::bind(config),
-            Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported)
-        ));
+        match bind_test_service_after_owner_drop(&config) {
+            Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported) => {}
+            Err(error) => panic!("lifecycle refusal returned the wrong error: {error:?}"),
+            Ok(_) => panic!("lifecycle refusal unexpectedly bound the broker service"),
+        }
         assert_eq!(
             fs::read(&head_path).expect("read lifecycle-refusal head after bind"),
             head_before_refusal,
@@ -13045,6 +13517,226 @@ mod tests {
 
         thread::sleep(Duration::from_millis(50));
         assert!(!sentinel.exists(), "journal rejection spawned a child");
+    }
+
+    #[test]
+    fn durable_exec_barrier_releases_exactly_once_after_synchronized_spawn_observation() {
+        let directory = private_catalog_directory().keep();
+        let token_path = directory.join("broker.token");
+        let sentinel = directory.join("durable-exec-release-count");
+        let (launch, authenticator) = unit_test_exec_bootstrap_launch(&token_path, 0xc5);
+        let authority = authority(id(901), id(902), id(903), id(904), 0xc1, 0xc2);
+        let script = "printf R >>\"$BROKER_SENTINEL\"; IFS= read -r ignored";
+        let payload = command_payload(script, &sentinel);
+        let binding = binding_for(&payload, &authority);
+        let (prepared, control) = prepare_for_test(
+            payload,
+            binding,
+            &authority,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare exec-barrier pane");
+        let output = create_test_output_journal(
+            &directory,
+            binding.durable_pane_id,
+            id(905),
+            GuardianOutputJournalLimits::default(),
+        );
+        let prepared = prepared
+            .bind_fresh_output_journal(output)
+            .expect("bind exec-barrier output journal");
+        let wal_identity =
+            BrokerSpawnWalIdentityV1::from_binding(id(906), authenticator.lineage_id(), binding)
+                .expect("bind exec-barrier WAL identity");
+        let (mut journal, _wal_path, _head_path) =
+            create_test_spawn_journal(&directory, wal_identity, authenticator);
+        let proof = BrokerDurablePreSpawnIntentProof {
+            binding,
+            catalog_candidate_checksum: [0xc3; BROKER_CATALOG_CHECKSUM_BYTES],
+        };
+        let attempt_id = id(907);
+        let (mut pane, child_identity) = match prepared
+            .commit_with_exec_barrier_wal_proof(control, &proof, &mut journal, attempt_id, &launch)
+            .expect("commit Spawn through the durable exec barrier")
+        {
+            BrokerDurableExecBarrierCommitV1::Applied {
+                adoption,
+                spawn_observed,
+            } => {
+                assert_eq!(spawn_observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
+                assert_eq!(spawn_observed.sequence(), 2);
+                let adoption = *adoption;
+                let child_identity = adoption.pane.kernel_child_identity();
+                (adoption.pane, child_identity)
+            }
+            BrokerDurableExecBarrierCommitV1::Reconciled(_) => {
+                panic!("first exec-barrier Spawn reconciled instead of applying")
+            }
+            BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate { callback_error, .. } => {
+                panic!(
+                    "first exec-barrier Spawn became indeterminate: {callback_error:?}; child: {}",
+                    unit_test_exec_bootstrap_diagnostic(&token_path)
+                )
+            }
+        };
+        assert_eq!(journal.status().child_identity, Some(child_identity));
+
+        let retry_payload = command_payload(script, &sentinel);
+        let (retry_prepared, retry_control) = prepare_for_test(
+            retry_payload,
+            binding,
+            &authority,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare exact exec-barrier lost-reply retry");
+        let retry_output = create_test_output_journal(
+            &directory,
+            binding.durable_pane_id,
+            id(908),
+            GuardianOutputJournalLimits::default(),
+        );
+        let retry_prepared = retry_prepared
+            .bind_fresh_output_journal(retry_output)
+            .expect("bind retry output journal");
+        match retry_prepared
+            .commit_with_exec_barrier_wal_proof(
+                retry_control,
+                &proof,
+                &mut journal,
+                attempt_id,
+                &launch,
+            )
+            .expect("query exact exec-barrier lost reply")
+        {
+            BrokerDurableExecBarrierCommitV1::Reconciled(status) => {
+                assert_eq!(status.phase, Some(BrokerSpawnWalPhaseV1::SpawnObserved));
+                assert_eq!(status.child_identity, Some(child_identity));
+            }
+            BrokerDurableExecBarrierCommitV1::Applied { .. } => {
+                panic!("lost exec-barrier reply launched a second child")
+            }
+            BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate { .. } => {
+                panic!("observed exec-barrier Spawn regressed to indeterminate")
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !sentinel.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            fs::read(&sentinel).expect("read exec-barrier sentinel"),
+            b"R",
+            "durable Release or its lost-reply retry executed the user command incorrectly"
+        );
+        pane.terminate_and_wait_for_test();
+    }
+
+    #[test]
+    fn durable_exec_barrier_spawn_observation_crash_cut_withholds_release_and_user_exec() {
+        let directory = private_catalog_directory().keep();
+        let token_path = directory.join("broker.token");
+        let sentinel = directory.join("must-not-exec-before-release");
+        let (launch, authenticator) = unit_test_exec_bootstrap_launch(&token_path, 0xd5);
+        let authority = authority(id(911), id(912), id(913), id(914), 0xd1, 0xd2);
+        let payload = command_payload("printf X >>\"$BROKER_SENTINEL\"", &sentinel);
+        let binding = binding_for(&payload, &authority);
+        let (prepared, control) = prepare_for_test(
+            payload,
+            binding,
+            &authority,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare exec-barrier crash-cut pane");
+        let output = create_test_output_journal(
+            &directory,
+            binding.durable_pane_id,
+            id(915),
+            GuardianOutputJournalLimits::default(),
+        );
+        let prepared = prepared
+            .bind_fresh_output_journal(output)
+            .expect("bind crash-cut output journal");
+        let wal_identity =
+            BrokerSpawnWalIdentityV1::from_binding(id(916), authenticator.lineage_id(), binding)
+                .expect("bind crash-cut WAL identity");
+        let (mut journal, wal_path, head_path) =
+            create_test_spawn_journal(&directory, wal_identity, authenticator.clone());
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHeadForPhase(
+            BrokerSpawnWalPhaseV1::SpawnObserved,
+        ));
+        let proof = BrokerDurablePreSpawnIntentProof {
+            binding,
+            catalog_candidate_checksum: [0xd3; BROKER_CATALOG_CHECKSUM_BYTES],
+        };
+        let pending = match prepared
+            .commit_with_exec_barrier_wal_proof(control, &proof, &mut journal, id(917), &launch)
+            .expect("observation crash cut remains an owned exec-barrier outcome")
+        {
+            BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate {
+                reason,
+                retained: Some(BrokerExecBarrierRetainedV1::AwaitingRelease(pending)),
+                status,
+                callback_error,
+            } => {
+                assert_eq!(
+                    reason,
+                    BrokerDurableExecBarrierIndeterminateReasonV1::SpawnObservationDurability
+                );
+                assert_eq!(status.phase, Some(BrokerSpawnWalPhaseV1::Attempted));
+                assert!(status.spawn_outcome_is_indeterminate());
+                assert_eq!(callback_error, None);
+                *pending
+            }
+            BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate {
+                retained: Some(BrokerExecBarrierRetainedV1::ReleaseIndeterminate(_)),
+                ..
+            } => panic!("observation crash cut attempted authenticated Release"),
+            BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate {
+                retained: None,
+                callback_error,
+                ..
+            } => {
+                panic!(
+                    "observation crash cut dropped the waiting bootstrap: {callback_error:?}; child: {}",
+                    unit_test_exec_bootstrap_diagnostic(&token_path)
+                )
+            }
+            BrokerDurableExecBarrierCommitV1::Applied { .. } => {
+                panic!("injected observation crash cut reported applied")
+            }
+            BrokerDurableExecBarrierCommitV1::Reconciled(_) => {
+                panic!("new observation crash cut reported reconciled")
+            }
+        };
+        let child_identity = pending.kernel_child_identity();
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !sentinel.exists(),
+            "user command executed before authenticated Release"
+        );
+        assert!(
+            pending
+                .close_broker_pty_and_reap_for_test(Duration::from_secs(2))
+                .expect("close broker PTY and reap bootstrap"),
+            "bootstrap did not exit on broker loss before Release"
+        );
+        assert!(
+            !sentinel.exists(),
+            "bootstrap executed the user command after broker loss"
+        );
+        drop(journal);
+
+        let recovered =
+            reopen_test_spawn_journal(&wal_path, &head_path, wal_identity, authenticator);
+        let recovered_status = recovered.status();
+        assert_eq!(
+            recovered_status.phase,
+            Some(BrokerSpawnWalPhaseV1::SpawnObserved)
+        );
+        assert_eq!(recovered_status.child_identity, Some(child_identity));
+        assert!(recovered_status.head_reconciliation_required);
+        assert!(recovered_status.append_authority_withheld);
     }
 
     #[test]
