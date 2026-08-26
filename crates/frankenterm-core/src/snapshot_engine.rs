@@ -7836,9 +7836,7 @@ fn load_checkpoint_capture_gaps(
     Ok(gaps)
 }
 
-fn checkpoint_capture_gap_order(
-    gap: &CheckpointScrollbackCaptureGap,
-) -> (u64, u64, u64, &str) {
+fn checkpoint_capture_gap_order(gap: &CheckpointScrollbackCaptureGap) -> (u64, u64, u64, &str) {
     (
         gap.seq_before,
         gap.seq_after,
@@ -8618,11 +8616,13 @@ fn validate_checkpoint_scrollback_prefix(
         ));
     }
     let expected_sequence_gaps =
-        compute_checkpoint_sequence_gaps(prefix.checkpoint_seq, &prefix.segments).map_err(|_| {
-            CheckpointScrollbackArtifactError::InvalidArtifact(
-                "pane prefix sequence gaps cannot be recomputed".to_string(),
-            )
-        })?;
+        compute_checkpoint_sequence_gaps(prefix.checkpoint_seq, &prefix.segments).map_err(
+            |_| {
+                CheckpointScrollbackArtifactError::InvalidArtifact(
+                    "pane prefix sequence gaps cannot be recomputed".to_string(),
+                )
+            },
+        )?;
     if prefix.sequence_gaps != expected_sequence_gaps
         || (expected_sequence_gaps.is_empty()
             && prefix
@@ -8693,14 +8693,11 @@ fn validate_checkpoint_scrollback_payload(
     caller_limits: CheckpointScrollbackArtifactLimits,
 ) -> Result<(), CheckpointScrollbackArtifactError> {
     let caller_limits = caller_limits.validate()?;
-    let embedded_limits = payload
-        .limits
-        .validate()
-        .map_err(|_| {
-            CheckpointScrollbackArtifactError::InvalidArtifact(
-                "embedded producer limits are invalid".to_string(),
-            )
-        })?;
+    let embedded_limits = payload.limits.validate().map_err(|_| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(
+            "embedded producer limits are invalid".to_string(),
+        )
+    })?;
     if !caller_limits.admits(&embedded_limits) {
         return Err(CheckpointScrollbackArtifactError::ResourceLimit(
             "embedded producer limits exceed verifier limits".to_string(),
@@ -12765,9 +12762,9 @@ mod tests {
             assert_eq!(inventory[0].artifact_sha256, first.artifact_sha256);
 
             let alias_directory = tempfile::TempDir::new().unwrap();
-            let alias_path = alias_directory.path().join(format!(
-                "alias{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
-            ));
+            let alias_path = alias_directory
+                .path()
+                .join(format!("alias{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
             write_private_checkpoint_artifact_test_file(&alias_path, &first_bytes);
             assert!(matches!(
                 inventory_checkpoint_scrollback_artifacts(alias_directory.path(), limits),
@@ -12792,8 +12789,7 @@ mod tests {
                 snapshot.checkpoint_id,
                 limits,
             );
-            let artifact: CheckpointScrollbackArtifact =
-                serde_json::from_slice(&bytes).unwrap();
+            let artifact: CheckpointScrollbackArtifact = serde_json::from_slice(&bytes).unwrap();
 
             assert!(
                 checkpoint_artifact_has_canonical_encoding(
@@ -12896,20 +12892,13 @@ mod tests {
             assert!(!type_error.to_string().contains(secret));
 
             let mut invalid_topology = artifact.clone();
-            invalid_topology.payload.checkpoint.topology_json =
-                format!("{{\"{secret}\":true}}");
+            invalid_topology.payload.checkpoint.topology_json = format!("{{\"{secret}\":true}}");
             invalid_topology.payload.checkpoint.topology_sha256 = checkpoint_artifact_sha256(
-                invalid_topology
-                    .payload
-                    .checkpoint
-                    .topology_json
-                    .as_bytes(),
+                invalid_topology.payload.checkpoint.topology_json.as_bytes(),
             );
-            invalid_topology.payload_sha256 = hash_checkpoint_artifact_json(
-                &invalid_topology.payload,
-                limits.max_artifact_bytes,
-            )
-            .unwrap();
+            invalid_topology.payload_sha256 =
+                hash_checkpoint_artifact_json(&invalid_topology.payload, limits.max_artifact_bytes)
+                    .unwrap();
             let topology_error = verify_checkpoint_scrollback_artifact_bytes_with_hook(
                 serialize_checkpoint_artifact(&invalid_topology, limits.max_artifact_bytes)
                     .unwrap(),
@@ -12921,29 +12910,26 @@ mod tests {
 
             let mut zero_checkpoint = artifact;
             zero_checkpoint.payload.checkpoint.checkpoint_id = 0;
-            zero_checkpoint.payload_sha256 = hash_checkpoint_artifact_json(
-                &zero_checkpoint.payload,
-                limits.max_artifact_bytes,
-            )
-            .unwrap();
+            zero_checkpoint.payload_sha256 =
+                hash_checkpoint_artifact_json(&zero_checkpoint.payload, limits.max_artifact_bytes)
+                    .unwrap();
             assert!(matches!(
                 verify_checkpoint_scrollback_artifact_bytes_with_hook(
-                    serialize_checkpoint_artifact(
-                        &zero_checkpoint,
-                        limits.max_artifact_bytes,
-                    )
-                    .unwrap(),
+                    serialize_checkpoint_artifact(&zero_checkpoint, limits.max_artifact_bytes,)
+                        .unwrap(),
                     limits,
                     || {},
                 ),
                 Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
             ));
-            assert!(checkpoint_scrollback_artifact_file_name(
-                snapshot.checkpoint_at,
-                0,
-                &snapshot.state_hash,
-            )
-            .is_err());
+            assert!(
+                checkpoint_scrollback_artifact_file_name(
+                    snapshot.checkpoint_at,
+                    0,
+                    &snapshot.state_hash,
+                )
+                .is_err()
+            );
         });
     }
 
@@ -13272,10 +13258,8 @@ mod tests {
                     file.seek(SeekFrom::Start(0)).unwrap();
                     file.write_all(&changed_bytes).unwrap();
                     file.sync_all().unwrap();
-                    file.set_times(
-                        std::fs::FileTimes::new().set_modified(streaming_modified),
-                    )
-                    .unwrap();
+                    file.set_times(std::fs::FileTimes::new().set_modified(streaming_modified))
+                        .unwrap();
                 },
             )
             .expect_err("streamed comparisons must bind ctime as well as size and mtime");
@@ -13495,8 +13479,10 @@ mod tests {
                           witness_digit: char,
                           artifact_digit: char,
                           artifact_bytes: u64| {
-            let checkpoint_state_hash =
-                format!("{SNAPSHOT_WITNESS_PREFIX}{}", witness_digit.to_string().repeat(64));
+            let checkpoint_state_hash = format!(
+                "{SNAPSHOT_WITNESS_PREFIX}{}",
+                witness_digit.to_string().repeat(64)
+            );
             let file_name = checkpoint_scrollback_artifact_file_name(
                 created_at_epoch_ms,
                 checkpoint_id,
@@ -13537,10 +13523,8 @@ mod tests {
         ));
 
         let mut alias = entries.clone();
-        alias[1].file_name = PathBuf::from(format!(
-            "alias{}",
-            CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX
-        ));
+        alias[1].file_name =
+            PathBuf::from(format!("alias{}", CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX));
         assert!(matches!(
             plan_checkpoint_scrollback_artifact_retention(&alias, 3, 100, limits),
             Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
@@ -13549,12 +13533,7 @@ mod tests {
         let mut duplicate_artifact = entries.clone();
         duplicate_artifact[2].artifact_sha256 = duplicate_artifact[0].artifact_sha256.clone();
         assert!(matches!(
-            plan_checkpoint_scrollback_artifact_retention(
-                &duplicate_artifact,
-                3,
-                100,
-                limits,
-            ),
+            plan_checkpoint_scrollback_artifact_retention(&duplicate_artifact, 3, 100, limits,),
             Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
         ));
         assert!(matches!(
