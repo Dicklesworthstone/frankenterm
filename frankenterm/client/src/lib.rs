@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod client;
 pub mod discovery;
 pub mod domain;
@@ -129,7 +131,7 @@ impl Drop for MuxTestScope {
 #[cfg(test)]
 mod mux_test_scope_tests {
     use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct DropProbe(Arc<AtomicBool>);

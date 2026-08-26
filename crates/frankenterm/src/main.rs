@@ -63618,6 +63618,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         };
                         run_remote_setup(&host, &options)?;
                     }
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
                     SetupCommands::PublishRemoteGeneration {
                         root,
                         ft_source,
@@ -63657,6 +63658,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             },
                         )?;
                         print!("{}", receipt.canonical_line());
+                    }
+                    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+                    SetupCommands::PublishRemoteGeneration { .. } => {
+                        anyhow::bail!(
+                            "immutable remote generation publication requires Linux GNU renameat2 NOREPLACE/EXCHANGE"
+                        );
                     }
                     SetupCommands::AtomicPathTransition {
                         parent,
@@ -84403,24 +84410,38 @@ fn validate_process_family_byte_receipt(receipt: &ProcessFamilyByteReceipt) -> a
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 const REMOTE_GENERATION_MANIFEST_SCHEMA: &str = "frankenterm.remote-process-family-generation.v3";
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 const REMOTE_GENERATION_MANIFEST_FILE: &str = "manifest.json";
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 const REMOTE_GENERATION_FT_FILE: &str = "ft";
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 const REMOTE_GENERATION_MUX_FILE: &str = "frankenterm-mux-server";
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 const REMOTE_GENERATION_GUARDIAN_FILE: &str = "frankenterm-pty-guardian";
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 const REMOTE_GENERATION_LIFETIME_LEASE_FILE: &str =
     frankenterm_mux_server_impl::generation_lifetime::MANAGED_GENERATION_LIFETIME_LEASE_FILENAME;
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 const REMOTE_GENERATION_MANIFEST_MAX_BYTES: u64 = 16 * 1024;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 const REMOTE_GENERATION_MUTABLE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 const REMOTE_GENERATION_DIRECTORY_MODE: u32 = 0o500;
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 const REMOTE_GENERATION_BINARY_MODE: u32 = 0o500;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 const REMOTE_GENERATION_MANIFEST_MODE: u32 = 0o400;
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 const REMOTE_GENERATION_LIFETIME_LEASE_MODE: u32 =
     frankenterm_mux_server_impl::generation_lifetime::MANAGED_GENERATION_LIFETIME_LEASE_MODE;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 const REMOTE_GENERATION_LOCK_MODE: u32 = 0o600;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const REMOTE_GENERATION_SELECTOR_ARTIFACT_MAX_BYTES: usize = 64;
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 struct RemoteGenerationPublishRequest<'a> {
     root: &'a Path,
     ft_source: &'a Path,
@@ -84460,6 +84481,7 @@ impl RemoteGenerationPublicationReceipt {
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RemoteGenerationBuildIdentity {
     build_id: String,
@@ -84468,6 +84490,7 @@ struct RemoteGenerationBuildIdentity {
     version: String,
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 impl From<&LocalComponentIdentity> for RemoteGenerationBuildIdentity {
     fn from(identity: &LocalComponentIdentity) -> Self {
         Self {
@@ -84479,6 +84502,7 @@ impl From<&LocalComponentIdentity> for RemoteGenerationBuildIdentity {
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RemoteGenerationComponentManifest {
     role: String,
@@ -84489,6 +84513,7 @@ struct RemoteGenerationComponentManifest {
     build_identity: RemoteGenerationBuildIdentity,
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RemoteGenerationLifetimeLeaseManifest {
     filename: String,
@@ -84496,6 +84521,7 @@ struct RemoteGenerationLifetimeLeaseManifest {
     mode: u32,
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RemoteGenerationManifest {
     schema: String,
@@ -84507,6 +84533,7 @@ struct RemoteGenerationManifest {
     lifetime_lease: RemoteGenerationLifetimeLeaseManifest,
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 #[derive(serde::Serialize)]
 struct RemoteGenerationIdMaterial<'a> {
     schema: &'a str,
@@ -84517,6 +84544,7 @@ struct RemoteGenerationIdMaterial<'a> {
     lifetime_lease: &'a RemoteGenerationLifetimeLeaseManifest,
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 impl RemoteGenerationManifest {
     fn from_process_family(family: &ValidatedLocalProcessFamily) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -84648,6 +84676,7 @@ impl RemoteGenerationManifest {
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
 fn validate_remote_generation_component(
     component: &RemoteGenerationComponentManifest,
     expected_role: AtomicComponentRole,
@@ -87084,15 +87113,6 @@ fn publish_remote_process_family_generation(
     revalidate_remote_generation_root(request.root, &root, effective_uid)?;
     revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
     Ok(receipt)
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn publish_remote_process_family_generation(
-    _request: &RemoteGenerationPublishRequest<'_>,
-) -> anyhow::Result<RemoteGenerationPublicationReceipt> {
-    anyhow::bail!(
-        "immutable remote generation publication requires Linux GNU renameat2 NOREPLACE/EXCHANGE"
-    )
 }
 
 fn validate_remote_release_tag(tag: &str) -> anyhow::Result<&str> {

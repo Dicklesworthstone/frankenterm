@@ -15137,7 +15137,7 @@ mod tests {
         let cipher = GuardianOutputCipher::try_from_key_slice(&[0xa5; 32])
             .expect("valid test output cipher");
         let mut journal =
-            GuardianOutputJournal::open(open_new_test_file(&path), identity, cipher, limits)
+            GuardianOutputJournal::create_new(open_new_test_file(&path), identity, cipher, limits)
                 .expect("create encrypted test output journal");
         let parent = File::open(directory).expect("open output journal parent directory");
         journal
@@ -17108,7 +17108,7 @@ mod tests {
                 .expect("valid unactivated output identity");
         let unactivated_cipher = GuardianOutputCipher::try_from_key_slice(&[0xa6; 32])
             .expect("valid unactivated output cipher");
-        let unactivated_journal = GuardianOutputJournal::open(
+        let unactivated_journal = GuardianOutputJournal::create_new(
             open_new_test_file(&temp.path().join("output-unactivated.journal")),
             unactivated_identity,
             unactivated_cipher,
