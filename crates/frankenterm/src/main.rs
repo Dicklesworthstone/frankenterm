@@ -78146,6 +78146,7 @@ fn publish_mux_dump_payload(
         artifact_sha256: verification.artifact_sha256,
         artifact_bytes: verification.artifact_bytes,
         durability: artifact_receipt.durability,
+        recovered_existing: artifact_receipt.recovered_existing,
     })
 }
 
@@ -78980,127 +78981,396 @@ fn require_exact_json_object_keys(
     Ok(())
 }
 
-fn write_new_private_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<PrivateArtifactReceipt> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PRIVATE_ARTIFACT_STAGE_PREFIX: &str = ".ft-private-artifact-";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PRIVATE_ARTIFACT_MAX_RETAINED_STAGES: u64 = 8;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PRIVATE_ARTIFACT_MAX_RETAINED_STAGE_BYTES: u64 =
+    LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES * 2;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn private_artifact_stage_name(target: &Path, expected_sha256: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankenterm-private-artifact-stage-v1\0");
+    hasher.update(target.as_os_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(expected_sha256.as_bytes());
+    format!(
+        "{PRIVATE_ARTIFACT_STAGE_PREFIX}{}.pending",
+        hex::encode(hasher.finalize())
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn private_artifact_stage_inventory(parent: &cap_std::fs::Dir) -> anyhow::Result<(u64, u64)> {
+    use cap_std::fs::PermissionsExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut count = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in parent.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name
+            .as_os_str()
+            .as_bytes()
+            .starts_with(PRIVATE_ARTIFACT_STAGE_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        count = count
+            .checked_add(1)
+            .context("private artifact stage count overflowed")?;
+        anyhow::ensure!(
+            count <= PRIVATE_ARTIFACT_MAX_RETAINED_STAGES,
+            "private artifact staging inventory reached its retained-entry bound"
+        );
+        let metadata = parent.symlink_metadata(Path::new(&name))?;
+        let identity = CompatibleClientNamedIdentity::from_cap(&metadata);
+        anyhow::ensure!(
+            metadata.is_file()
+                && identity.uid == nix::unistd::geteuid().as_raw()
+                && identity.hard_link_count == 1
+                && identity.mode == 0o600
+                && identity.byte_len <= LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            "private artifact staging inventory contains an unsafe entry"
+        );
+        bytes = bytes
+            .checked_add(identity.byte_len)
+            .context("private artifact stage byte count overflowed")?;
+        anyhow::ensure!(
+            bytes <= PRIVATE_ARTIFACT_MAX_RETAINED_STAGE_BYTES,
+            "private artifact staging inventory reached its retained-byte bound"
+        );
+    }
+    Ok((count, bytes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_private_artifact_named_bytes(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    expected: &[u8],
+    expected_sha256: &str,
+    label: &str,
+) -> anyhow::Result<PrivateArtifactReceipt> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = parent
+        .open_with(name, &options)
+        .with_context(|| format!("cannot open {label} without following symlinks"))?;
+    let metadata_before = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {label}"))?;
+    let identity_before = CompatibleClientNamedIdentity::from_cap(&metadata_before);
+    let named_before = parent
+        .symlink_metadata(name)
+        .with_context(|| format!("cannot inspect the named {label}"))?;
+    anyhow::ensure!(
+        metadata_before.is_file()
+            && identity_before == CompatibleClientNamedIdentity::from_cap(&named_before)
+            && identity_before.uid == nix::unistd::geteuid().as_raw()
+            && identity_before.hard_link_count == 1
+            && identity_before.mode == 0o600
+            && identity_before.byte_len == u64::try_from(expected.len()).unwrap_or(u64::MAX),
+        "{label} has unsafe or conflicting metadata"
+    );
+    file.rewind()
+        .with_context(|| format!("cannot rewind {label}"))?;
+    let mut hasher = Sha256::new();
+    let mut offset = 0_usize;
+    let mut buffer = [0_u8; 64 * 1024];
+    while offset < expected.len() {
+        let admitted = (expected.len() - offset).min(buffer.len());
+        let read = file
+            .read(&mut buffer[..admitted])
+            .with_context(|| format!("cannot read {label}"))?;
+        anyhow::ensure!(read > 0, "{label} ended before its declared byte length");
+        let next = offset
+            .checked_add(read)
+            .context("private artifact comparison offset overflowed")?;
+        anyhow::ensure!(
+            buffer[..read] == expected[offset..next],
+            "{label} bytes conflict with the requested artifact"
+        );
+        hasher.update(&buffer[..read]);
+        offset = next;
+    }
+    let mut trailing = [0_u8; 1];
+    anyhow::ensure!(
+        file.read(&mut trailing)
+            .with_context(|| format!("cannot finish reading {label}"))?
+            == 0,
+        "{label} grew beyond its declared byte length"
+    );
+    let persisted_sha256 = hex::encode(hasher.finalize());
+    anyhow::ensure!(
+        persisted_sha256 == expected_sha256,
+        "{label} digest conflicts with the requested artifact"
+    );
+    let metadata_after = file
+        .metadata()
+        .with_context(|| format!("cannot re-inspect {label}"))?;
+    let named_after = parent
+        .symlink_metadata(name)
+        .with_context(|| format!("cannot re-inspect the named {label}"))?;
+    anyhow::ensure!(
+        CompatibleClientNamedIdentity::from_cap(&metadata_after) == identity_before
+            && CompatibleClientNamedIdentity::from_cap(&named_after) == identity_before,
+        "{label} changed identity or bytes while it was verified"
+    );
+    Ok(PrivateArtifactReceipt {
+        bytes: identity_before.byte_len,
+        sha256: persisted_sha256,
+        durability: "file_and_parent_directory_synced",
+        recovered_existing: false,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_new_private_artifact_with_hook<F>(
+    path: &Path,
+    bytes: &[u8],
+    mut hook: F,
+) -> anyhow::Result<PrivateArtifactReceipt>
+where
+    F: FnMut(PrivateArtifactPublicationPoint) -> anyhow::Result<()>,
+{
+    use cap_std::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use rustix::fs::{RenameFlags, renameat_with};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    anyhow::ensure!(
+        u64::try_from(bytes.len()).is_ok_and(|length| length <= LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES),
+        "private artifact exceeds its publication byte bound"
+    );
+    let target = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("private artifact path has no target name"))?;
+    let target_bytes = target.as_os_str().as_bytes();
+    anyhow::ensure!(
+        !target_bytes.starts_with(PRIVATE_ARTIFACT_STAGE_PREFIX.as_bytes())
+            && target_bytes != b".ft-atomic-transition.lock",
+        "private artifact target uses a reserved publication name"
+    );
+    let expected_sha256 = sha256_hex(bytes);
+    let stage_name = private_artifact_stage_name(&target, &expected_sha256);
+    let stage_path = Path::new(&stage_name);
     let (parent, leaf, parent_path) = artifact_parent_and_leaf(path)?;
+    anyhow::ensure!(leaf == target, "private artifact target identity changed");
+    let parent_file = parent
+        .open(".")
+        .context("cannot open the pinned private artifact parent")?
+        .into_std();
+    let _publication_lock = acquire_atomic_path_transition_lock(&parent, &parent_file)?;
+    let (retained_count, retained_bytes) = private_artifact_stage_inventory(&parent)?;
+
+    match parent.symlink_metadata(&leaf) {
+        Ok(_) => {
+            parent_file
+                .sync_all()
+                .context("cannot synchronize a reconciled private artifact parent directory")?;
+            let mut receipt = verify_private_artifact_named_bytes(
+                &parent,
+                &leaf,
+                bytes,
+                &expected_sha256,
+                "existing private artifact target",
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Private artifact {} already exists with conflicting or unsafe bytes; existing files are never overwritten",
+                    path.display()
+                )
+            })?;
+            revalidate_artifact_parent_directory(&parent_path, &parent)?;
+            receipt.recovered_existing = true;
+            return Ok(receipt);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("cannot inspect the private artifact target");
+        }
+    }
+
+    let stage_metadata = match parent.symlink_metadata(stage_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("cannot inspect the private artifact stage"),
+    };
+    let expected_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let projected_count = retained_count
+        .checked_add(u64::from(stage_metadata.is_none()))
+        .context("private artifact projected stage count overflowed")?;
+    let existing_stage_bytes = stage_metadata.as_ref().map_or(0, |metadata| metadata.len());
+    let projected_bytes = retained_bytes
+        .checked_sub(existing_stage_bytes)
+        .and_then(|retained| retained.checked_add(expected_bytes))
+        .context("private artifact projected stage bytes overflowed")?;
+    anyhow::ensure!(
+        projected_count <= PRIVATE_ARTIFACT_MAX_RETAINED_STAGES
+            && projected_bytes <= PRIVATE_ARTIFACT_MAX_RETAINED_STAGE_BYTES,
+        "private artifact staging inventory cannot admit this publication"
+    );
+
     let mut options = cap_std::fs::OpenOptions::new();
     options
         .read(true)
         .write(true)
-        .create_new(true)
-        .follow(FollowSymlinks::No);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt as _;
-
-        options.mode(0o600);
+        .follow(FollowSymlinks::No)
+        .mode(0o600);
+    if stage_metadata.is_none() {
+        options.create_new(true);
     }
-    let mut file = parent.open_with(&leaf, &options).map_err(|err| {
+    let mut stage = parent
+        .open_with(stage_path, &options)
+        .context("cannot open the deterministic private artifact stage")?;
+    if stage_metadata.is_none() {
+        stage
+            .set_permissions(cap_std::fs::Permissions::from_mode(0o600))
+            .context("cannot seal private artifact stage permissions")?;
+    }
+    hook(PrivateArtifactPublicationPoint::StageOpened)?;
+
+    let metadata_before = stage
+        .metadata()
+        .context("cannot inspect the private artifact stage handle")?;
+    let stage_identity_before = CompatibleClientNamedIdentity::from_cap(&metadata_before);
+    let named_before = parent
+        .symlink_metadata(stage_path)
+        .context("cannot inspect the named private artifact stage")?;
+    anyhow::ensure!(
+        metadata_before.is_file()
+            && stage_identity_before == CompatibleClientNamedIdentity::from_cap(&named_before)
+            && stage_identity_before.uid == nix::unistd::geteuid().as_raw()
+            && stage_identity_before.hard_link_count == 1
+            && stage_identity_before.mode == 0o600
+            && stage_identity_before.byte_len <= expected_bytes,
+        "private artifact stage has unsafe metadata"
+    );
+    stage
+        .rewind()
+        .context("cannot rewind the private artifact stage")?;
+    let existing_len = usize::try_from(stage_identity_before.byte_len)
+        .context("private artifact stage length does not fit this platform")?;
+    let mut offset = 0_usize;
+    let mut buffer = [0_u8; 64 * 1024];
+    while offset < existing_len {
+        let admitted = (existing_len - offset).min(buffer.len());
+        let read = stage
+            .read(&mut buffer[..admitted])
+            .context("cannot read the retained private artifact stage")?;
+        anyhow::ensure!(read > 0, "retained private artifact stage ended early");
+        let next = offset
+            .checked_add(read)
+            .context("private artifact stage prefix offset overflowed")?;
+        anyhow::ensure!(
+            buffer[..read] == bytes[offset..next],
+            "retained private artifact stage conflicts with its payload-bound transaction"
+        );
+        offset = next;
+    }
+    let metadata_after_prefix = stage
+        .metadata()
+        .context("cannot re-inspect the private artifact stage prefix")?;
+    let named_after_prefix = parent
+        .symlink_metadata(stage_path)
+        .context("cannot re-inspect the named private artifact stage prefix")?;
+    anyhow::ensure!(
+        CompatibleClientNamedIdentity::from_cap(&metadata_after_prefix) == stage_identity_before
+            && CompatibleClientNamedIdentity::from_cap(&named_after_prefix)
+                == stage_identity_before,
+        "private artifact stage changed while its retained prefix was verified"
+    );
+    stage
+        .seek(std::io::SeekFrom::Start(stage_identity_before.byte_len))
+        .context("cannot seek to the private artifact stage resume offset")?;
+    let mut wrote_prefix = false;
+    while offset < bytes.len() {
+        let next = offset
+            .checked_add((bytes.len() - offset).min(buffer.len()))
+            .context("private artifact stage write offset overflowed")?;
+        stage
+            .write_all(&bytes[offset..next])
+            .context("cannot write the private artifact stage")?;
+        offset = next;
+        if !wrote_prefix {
+            wrote_prefix = true;
+            hook(PrivateArtifactPublicationPoint::StagePrefixWritten)?;
+        }
+    }
+    stage
+        .sync_all()
+        .context("cannot synchronize the private artifact stage")?;
+    verify_private_artifact_named_bytes(
+        &parent,
+        stage_path,
+        bytes,
+        &expected_sha256,
+        "synchronized private artifact stage",
+    )?;
+    hook(PrivateArtifactPublicationPoint::StageSynchronized)?;
+    revalidate_artifact_parent_directory(&parent_path, &parent)?;
+
+    let recovered_existing = match renameat_with(
+        &parent_file,
+        stage_path,
+        &parent_file,
+        &leaf,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            hook(PrivateArtifactPublicationPoint::TargetRenamed)?;
+            false
+        }
+        Err(error) if error == rustix::io::Errno::EXIST => true,
+        Err(error) => {
+            return Err(std::io::Error::from(error))
+                .context("cannot atomically publish the private artifact without replacement");
+        }
+    };
+    parent_file
+        .sync_all()
+        .context("cannot synchronize the private artifact parent after publication")?;
+    hook(PrivateArtifactPublicationPoint::ParentSynchronized)?;
+    let mut receipt = verify_private_artifact_named_bytes(
+        &parent,
+        &leaf,
+        bytes,
+        &expected_sha256,
+        "published private artifact target",
+    )
+    .map_err(|_| {
         anyhow::anyhow!(
-            "Failed to create new artifact {} (existing files are never overwritten): {err}",
-            path.display()
-        )
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|err| anyhow::anyhow!("Failed to persist artifact {}: {err}", path.display()))?;
-    sync_capability_directory(&parent).map_err(|err| {
-        anyhow::anyhow!(
-            "Artifact {} was synchronized, but its directory entry durability could not be confirmed: {err}",
+            "Private artifact {} is bound to conflicting or unsafe bytes; existing files are never overwritten",
             path.display()
         )
     })?;
     revalidate_artifact_parent_directory(&parent_path, &parent)?;
+    receipt.recovered_existing = recovered_existing;
+    Ok(receipt)
+}
 
-    let handle_metadata = file
-        .metadata()
-        .map_err(|err| anyhow::anyhow!("Failed to inspect artifact {}: {err}", path.display()))?;
-    if !handle_metadata.is_file() {
-        anyhow::bail!("Artifact is not a regular file: {}", path.display());
-    }
+fn write_new_private_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<PrivateArtifactReceipt> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        use cap_fs_ext::OsMetadataExt as _;
-
-        let path_metadata = parent.symlink_metadata(&leaf).map_err(|err| {
-            anyhow::anyhow!(
-                "Failed to revalidate artifact name {}: {err}",
-                path.display()
-            )
-        })?;
-        if !path_metadata.is_file()
-            || path_metadata.dev() != handle_metadata.dev()
-            || path_metadata.ino() != handle_metadata.ino()
-            || path_metadata.nlink() != 1
-            || handle_metadata.nlink() != 1
-        {
-            anyhow::bail!(
-                "Artifact name changed identity or acquired another hard link during persistence: {}",
-                path.display()
-            );
-        }
+        return write_new_private_artifact_with_hook(path, bytes, |_| Ok(()));
     }
-    #[cfg(unix)]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        use cap_std::fs::PermissionsExt as _;
-
-        if handle_metadata.permissions().mode() & 0o077 != 0 {
-            anyhow::bail!("Artifact permissions are not private: {}", path.display());
-        }
-    }
-
-    file.rewind()
-        .map_err(|err| anyhow::anyhow!("Failed to verify artifact {}: {err}", path.display()))?;
-    let (persisted_bytes, persisted_sha256) = sha256_reader(&mut file)
-        .map_err(|err| anyhow::anyhow!("Failed to verify artifact {}: {err}", path.display()))?;
-    let expected_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let expected_sha256 = sha256_hex(bytes);
-    if persisted_bytes != expected_bytes || persisted_sha256 != expected_sha256 {
+        let _ = (path, bytes);
         anyhow::bail!(
-            "Artifact verification failed for {}: synchronized bytes differ from the requested artifact",
-            path.display()
+            "private artifact atomic no-replace publication is unsupported on this platform"
         );
     }
-    let handle_metadata_after = file.metadata().map_err(|err| {
-        anyhow::anyhow!(
-            "Failed to re-inspect artifact {} after verification: {err}",
-            path.display()
-        )
-    })?;
-    {
-        use cap_fs_ext::OsMetadataExt as _;
-
-        let path_metadata_after = parent.symlink_metadata(&leaf).map_err(|err| {
-            anyhow::anyhow!(
-                "Failed to revalidate artifact name after verification {}: {err}",
-                path.display()
-            )
-        })?;
-        if !path_metadata_after.is_file()
-            || path_metadata_after.dev() != handle_metadata_after.dev()
-            || path_metadata_after.ino() != handle_metadata_after.ino()
-            || path_metadata_after.nlink() != 1
-            || handle_metadata_after.nlink() != 1
-            || handle_metadata_after.len() != persisted_bytes
-        {
-            anyhow::bail!(
-                "Artifact name changed identity or acquired another hard link during verification: {}",
-                path.display()
-            );
-        }
-    }
-    #[cfg(unix)]
-    {
-        use cap_std::fs::PermissionsExt as _;
-
-        if handle_metadata_after.permissions().mode() & 0o077 != 0 {
-            anyhow::bail!("Artifact permissions are not private: {}", path.display());
-        }
-    }
-    revalidate_artifact_parent_directory(&parent_path, &parent)?;
-    Ok(PrivateArtifactReceipt {
-        bytes: persisted_bytes,
-        sha256: persisted_sha256,
-        durability: "file_and_parent_directory_synced",
-    })
 }
 
 fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8>> {

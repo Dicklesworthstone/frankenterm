@@ -47,8 +47,8 @@
 use crate::SealedAtomicBuildIdentity;
 use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
 use crate::transport::{
-    GuardianServiceError, SocketPathAuthority, bind_private_unix_listener,
-    load_guardian_secret, validate_existing_socket,
+    GuardianServiceError, SocketPathAuthority, bind_private_unix_listener, load_guardian_secret,
+    validate_existing_socket,
 };
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mio::net::{UnixListener, UnixStream};
@@ -794,6 +794,937 @@ fn read_broker_be_u64(bytes: &[u8]) -> u64 {
     let mut value = [0_u8; 8];
     value.copy_from_slice(bytes);
     u64::from_be_bytes(value)
+}
+
+/// Production-disabled configuration for the separately spawned broker
+/// process. The ordinary guardian service never selects this path yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerControlServiceConfigV1 {
+    socket_path: PathBuf,
+    token_path: PathBuf,
+    spawn_catalog_path: PathBuf,
+    broker_build_identity: SealedAtomicBuildIdentity,
+    max_connections: usize,
+    poll_interval: Duration,
+}
+
+impl BrokerControlServiceConfigV1 {
+    pub fn new(
+        socket_path: PathBuf,
+        token_path: PathBuf,
+        spawn_catalog_path: PathBuf,
+        broker_build_identity: SealedAtomicBuildIdentity,
+        max_connections: usize,
+        poll_interval: Duration,
+    ) -> Result<Self, BrokerControlServiceError> {
+        if max_connections == 0 || max_connections > BROKER_CONTROL_MAX_CONNECTIONS {
+            return Err(BrokerControlServiceError::InvalidConfiguration(
+                "max_connections is outside the broker control bound",
+            ));
+        }
+        if poll_interval.is_zero() || poll_interval > BROKER_CONTROL_MAX_POLL_INTERVAL {
+            return Err(BrokerControlServiceError::InvalidConfiguration(
+                "poll_interval must be between one nanosecond and one second",
+            ));
+        }
+        if socket_path == token_path
+            || socket_path == spawn_catalog_path
+            || token_path == spawn_catalog_path
+        {
+            return Err(BrokerControlServiceError::InvalidConfiguration(
+                "broker socket, token, and Spawn catalog paths must differ",
+            ));
+        }
+        Ok(Self {
+            socket_path,
+            token_path,
+            spawn_catalog_path,
+            broker_build_identity,
+            max_connections,
+            poll_interval,
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum BrokerControlServiceError {
+    #[error("invalid broker control service configuration: {0}")]
+    InvalidConfiguration(&'static str),
+    #[error("broker endpoint security initialization failed")]
+    Endpoint(#[from] GuardianServiceError),
+    #[error("broker Spawn catalog recovery failed")]
+    SpawnCatalog(#[from] BrokerSpawnWalError),
+    #[error("broker authentication authority initialization failed")]
+    AuthenticationAuthority,
+    #[error("broker process cannot yet recover an existing live Spawn lifecycle")]
+    ExistingSpawnLifecycleUnsupported,
+    #[error("broker control readiness loop failed at {site}")]
+    Io {
+        site: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl BrokerControlServiceError {
+    fn io(site: &'static str, source: std::io::Error) -> Self {
+        Self::Io { site, source }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum BrokerControlClientError {
+    #[error("broker client endpoint setup failed")]
+    Endpoint(#[from] GuardianServiceError),
+    #[error("broker client I/O failed")]
+    Io(#[from] std::io::Error),
+    #[error("broker client authentication authority initialization failed")]
+    AuthenticationAuthority,
+    #[error("broker client control frame was invalid")]
+    Protocol,
+    #[error("broker returned a response for the wrong request authority")]
+    UnexpectedResponse,
+    #[error("broker build identity did not match the expected generation")]
+    BrokerBuildIdentityMismatch,
+    #[error("broker lineage did not match the persistent token authority")]
+    BrokerLineageMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrokerGuardianConnectionIdentityV1 {
+    guardian_incarnation: Uuid,
+    mux_incarnation: Uuid,
+    guardian_build_identity: SealedAtomicBuildIdentity,
+    mux_build_identity: SealedAtomicBuildIdentity,
+}
+
+impl BrokerGuardianConnectionIdentityV1 {
+    pub fn new(
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        guardian_build_identity: SealedAtomicBuildIdentity,
+        mux_build_identity: SealedAtomicBuildIdentity,
+    ) -> Result<Self, BrokerControlClientError> {
+        if guardian_incarnation.is_nil() || mux_incarnation.is_nil() {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        Ok(Self {
+            guardian_incarnation,
+            mux_incarnation,
+            guardian_build_identity,
+            mux_build_identity,
+        })
+    }
+}
+
+enum BrokerControlReadStateV1 {
+    Prefix {
+        bytes: [u8; 4],
+        filled: usize,
+    },
+    Frame {
+        bytes: Zeroizing<Vec<u8>>,
+        filled: usize,
+    },
+}
+
+impl BrokerControlReadStateV1 {
+    const fn prefix() -> Self {
+        Self::Prefix {
+            bytes: [0; 4],
+            filled: 0,
+        }
+    }
+}
+
+enum BrokerControlReadOutcomeV1 {
+    Pending,
+    Closed,
+    Frame(Zeroizing<Vec<u8>>),
+}
+
+struct BrokerControlConnectionV1 {
+    stream: UnixStream,
+    generation: u64,
+    read_state: BrokerControlReadStateV1,
+    write_frame: Option<BrokerControlWireFrameV1>,
+    write_offset: usize,
+    hello: Option<BrokerControlRequestHeaderV1>,
+}
+
+impl BrokerControlConnectionV1 {
+    fn new(stream: UnixStream, generation: u64) -> Self {
+        Self {
+            stream,
+            generation,
+            read_state: BrokerControlReadStateV1::prefix(),
+            write_frame: None,
+            write_offset: 0,
+            hello: None,
+        }
+    }
+
+    fn read_one(&mut self) -> Result<BrokerControlReadOutcomeV1, std::io::Error> {
+        loop {
+            let state = std::mem::replace(&mut self.read_state, BrokerControlReadStateV1::prefix());
+            match state {
+                BrokerControlReadStateV1::Prefix {
+                    mut bytes,
+                    mut filled,
+                } => match self.stream.read(&mut bytes[filled..]) {
+                    Ok(0) => return Ok(BrokerControlReadOutcomeV1::Closed),
+                    Ok(read) => {
+                        filled = filled.checked_add(read).ok_or_else(|| {
+                            std::io::Error::new(ErrorKind::InvalidData, "broker prefix overflow")
+                        })?;
+                        if filled != bytes.len() {
+                            self.read_state = BrokerControlReadStateV1::Prefix { bytes, filled };
+                            return Ok(BrokerControlReadOutcomeV1::Pending);
+                        }
+                        let announced =
+                            usize::try_from(read_broker_be_u32(&bytes)).map_err(|_| {
+                                std::io::Error::new(
+                                    ErrorKind::InvalidData,
+                                    "broker frame length is not representable",
+                                )
+                            })?;
+                        let total_bytes = announced.checked_add(bytes.len()).ok_or_else(|| {
+                            std::io::Error::new(ErrorKind::InvalidData, "broker frame overflow")
+                        })?;
+                        if !(BROKER_CONTROL_REQUEST_FIXED_BYTES..=BROKER_CONTROL_MAX_FRAME_BYTES)
+                            .contains(&total_bytes)
+                        {
+                            return Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "broker request frame is outside its fixed bound",
+                            ));
+                        }
+                        let mut frame = Zeroizing::new(Vec::new());
+                        frame.try_reserve_exact(total_bytes).map_err(|_| {
+                            std::io::Error::new(
+                                ErrorKind::OutOfMemory,
+                                "broker request allocation failed",
+                            )
+                        })?;
+                        frame.resize(total_bytes, 0);
+                        frame[..bytes.len()].copy_from_slice(&bytes);
+                        self.read_state = BrokerControlReadStateV1::Frame {
+                            bytes: frame,
+                            filled: bytes.len(),
+                        };
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {
+                        self.read_state = BrokerControlReadStateV1::Prefix { bytes, filled };
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        self.read_state = BrokerControlReadStateV1::Prefix { bytes, filled };
+                        return Ok(BrokerControlReadOutcomeV1::Pending);
+                    }
+                    Err(error) => return Err(error),
+                },
+                BrokerControlReadStateV1::Frame {
+                    mut bytes,
+                    mut filled,
+                } => match self.stream.read(&mut bytes[filled..]) {
+                    Ok(0) => return Ok(BrokerControlReadOutcomeV1::Closed),
+                    Ok(read) => {
+                        filled = filled.checked_add(read).ok_or_else(|| {
+                            std::io::Error::new(ErrorKind::InvalidData, "broker frame overflow")
+                        })?;
+                        if filled == bytes.len() {
+                            return Ok(BrokerControlReadOutcomeV1::Frame(bytes));
+                        }
+                        self.read_state = BrokerControlReadStateV1::Frame { bytes, filled };
+                        return Ok(BrokerControlReadOutcomeV1::Pending);
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {
+                        self.read_state = BrokerControlReadStateV1::Frame { bytes, filled };
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        self.read_state = BrokerControlReadStateV1::Frame { bytes, filled };
+                        return Ok(BrokerControlReadOutcomeV1::Pending);
+                    }
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+    }
+
+    fn flush_one(&mut self) -> Result<bool, std::io::Error> {
+        let Some(frame) = self.write_frame.as_ref() else {
+            return Ok(true);
+        };
+        while self.write_offset < frame.as_slice().len() {
+            match self.stream.write(&frame.as_slice()[self.write_offset..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::WriteZero,
+                        "broker response write returned zero",
+                    ));
+                }
+                Ok(written) => {
+                    self.write_offset =
+                        self.write_offset.checked_add(written).ok_or_else(|| {
+                            std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "broker write offset overflow",
+                            )
+                        })?;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        self.write_frame = None;
+        self.write_offset = 0;
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BrokerHelloReceiptV1 {
+    header: BrokerControlRequestHeaderV1,
+    active_connection: Option<(Token, u64)>,
+}
+
+#[derive(Clone, Copy)]
+struct BrokerReadyEventV1 {
+    token: Token,
+    generation: Option<u64>,
+    readable: bool,
+    writable: bool,
+    closed: bool,
+}
+
+/// Separately spawned, single-owner broker control loop.
+///
+/// This first executable slice authenticates and fences connections and opens
+/// the complete Spawn catalog before listening. It deliberately rejects every
+/// PTY effect: live child creation is enabled only after the exec barrier and
+/// WAL receipt integration land.
+pub struct BrokerControlServiceV1 {
+    poll: Poll,
+    events: Events,
+    ready: Vec<BrokerReadyEventV1>,
+    listener: UnixListener,
+    socket_authority: SocketPathAuthority,
+    control_authenticator: GuardianBrokerControlAuthenticatorV1,
+    _spawn_catalog: BrokerSpawnWalCatalogV1,
+    _recovered_journals: Vec<BrokerSpawnJournalV1>,
+    broker_incarnation: Uuid,
+    broker_lineage_id: Uuid,
+    broker_build_identity: SealedAtomicBuildIdentity,
+    connections: HashMap<Token, BrokerControlConnectionV1>,
+    free_connection_tokens: Vec<usize>,
+    hello_receipts: BTreeMap<Uuid, BrokerHelloReceiptV1>,
+    hello_receipt_order: VecDeque<Uuid>,
+    max_hello_receipts: usize,
+    next_connection_generation: u64,
+    poll_interval: Duration,
+    rejected_connections: u64,
+}
+
+impl BrokerControlServiceV1 {
+    pub fn bind(config: BrokerControlServiceConfigV1) -> Result<Self, BrokerControlServiceError> {
+        let secret = load_guardian_secret(&config.token_path)?;
+        let control_authenticator = secret
+            .broker_control_authenticator()
+            .map_err(|_| BrokerControlServiceError::AuthenticationAuthority)?;
+        let spawn_authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .map_err(|_| BrokerControlServiceError::AuthenticationAuthority)?;
+        let broker_lineage_id = spawn_authenticator.lineage_id();
+        let spawn_catalog = BrokerSpawnWalCatalogV1::open(config.spawn_catalog_path)?;
+        let recovered_journals = spawn_catalog.recover_all(&spawn_authenticator)?;
+        if recovered_journals
+            .iter()
+            .any(|journal| journal.status().phase.is_some())
+        {
+            return Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported);
+        }
+
+        let poll = Poll::new().map_err(|error| BrokerControlServiceError::io("poll", error))?;
+        let (mut listener, socket_authority) = bind_private_unix_listener(&config.socket_path)?;
+        poll.registry()
+            .register(
+                &mut listener,
+                BROKER_CONTROL_LISTENER_TOKEN,
+                Interest::READABLE,
+            )
+            .map_err(|error| BrokerControlServiceError::io("listener-register", error))?;
+        let event_capacity = config.max_connections.checked_add(1).ok_or(
+            BrokerControlServiceError::InvalidConfiguration("event capacity overflow"),
+        )?;
+        let events = Events::with_capacity(event_capacity);
+        let mut ready = Vec::new();
+        ready.try_reserve_exact(event_capacity).map_err(|_| {
+            BrokerControlServiceError::InvalidConfiguration("event allocation failed")
+        })?;
+        let mut connections = HashMap::new();
+        connections
+            .try_reserve(config.max_connections)
+            .map_err(|_| {
+                BrokerControlServiceError::InvalidConfiguration("connection map allocation failed")
+            })?;
+        let mut free_connection_tokens = Vec::new();
+        free_connection_tokens
+            .try_reserve_exact(config.max_connections)
+            .map_err(|_| {
+                BrokerControlServiceError::InvalidConfiguration(
+                    "connection token allocation failed",
+                )
+            })?;
+        free_connection_tokens.extend((1..=config.max_connections).rev());
+        let max_hello_receipts = config.max_connections.checked_mul(2).ok_or(
+            BrokerControlServiceError::InvalidConfiguration("Hello receipt capacity overflow"),
+        )?;
+        let mut hello_receipt_order = VecDeque::new();
+        hello_receipt_order
+            .try_reserve(max_hello_receipts)
+            .map_err(|_| {
+                BrokerControlServiceError::InvalidConfiguration("Hello receipt allocation failed")
+            })?;
+        Ok(Self {
+            poll,
+            events,
+            ready,
+            listener,
+            socket_authority,
+            control_authenticator,
+            _spawn_catalog: spawn_catalog,
+            _recovered_journals: recovered_journals,
+            broker_incarnation: Uuid::new_v4(),
+            broker_lineage_id,
+            broker_build_identity: config.broker_build_identity,
+            connections,
+            free_connection_tokens,
+            hello_receipts: BTreeMap::new(),
+            hello_receipt_order,
+            max_hello_receipts,
+            next_connection_generation: 1,
+            poll_interval: config.poll_interval,
+            rejected_connections: 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn incarnation(&self) -> Uuid {
+        self.broker_incarnation
+    }
+
+    #[must_use]
+    pub const fn rejected_connections(&self) -> u64 {
+        self.rejected_connections
+    }
+
+    pub fn run_forever(&mut self) -> Result<(), BrokerControlServiceError> {
+        loop {
+            self.poll_once()?;
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn run_until(&mut self, stop: &AtomicBool) -> Result<(), BrokerControlServiceError> {
+        while !stop.load(Ordering::Acquire) {
+            self.poll_once()?;
+        }
+        Ok(())
+    }
+
+    pub fn poll_once(&mut self) -> Result<(), BrokerControlServiceError> {
+        self.socket_authority.validate()?;
+        match self.poll.poll(&mut self.events, Some(self.poll_interval)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(()),
+            Err(error) => return Err(BrokerControlServiceError::io("readiness-poll", error)),
+        }
+        self.ready.clear();
+        for event in &self.events {
+            let token = event.token();
+            self.ready.push(BrokerReadyEventV1 {
+                token,
+                generation: self
+                    .connections
+                    .get(&token)
+                    .map(|connection| connection.generation),
+                readable: event.is_readable(),
+                writable: event.is_writable(),
+                closed: event.is_error() || event.is_read_closed() || event.is_write_closed(),
+            });
+        }
+        if self
+            .ready
+            .iter()
+            .any(|event| event.token == BROKER_CONTROL_LISTENER_TOKEN && event.readable)
+        {
+            self.accept_connections()?;
+        }
+        for index in 0..self.ready.len() {
+            let event = self.ready[index];
+            if event.token == BROKER_CONTROL_LISTENER_TOKEN {
+                continue;
+            }
+            let Some(generation) = event.generation else {
+                continue;
+            };
+            if !self.connection_matches(event.token, generation) {
+                continue;
+            }
+            if event.writable {
+                self.drive_connection_write(event.token, generation);
+            }
+            if event.readable && self.connection_matches(event.token, generation) {
+                self.drive_connection_read(event.token, generation);
+            }
+            if event.closed && self.connection_matches(event.token, generation) {
+                self.finish_connection(event.token, generation);
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_connections(&mut self) -> Result<(), BrokerControlServiceError> {
+        self.socket_authority.validate()?;
+        loop {
+            let (mut stream, _) = match self.listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.rejected_connections = self.rejected_connections.saturating_add(1);
+                    break;
+                }
+            };
+            self.socket_authority.validate()?;
+            let Some(raw_token) = self.free_connection_tokens.pop() else {
+                self.rejected_connections = self.rejected_connections.saturating_add(1);
+                continue;
+            };
+            let generation = self.next_connection_generation;
+            let Some(next_generation) = generation.checked_add(1) else {
+                self.free_connection_tokens.push(raw_token);
+                self.rejected_connections = self.rejected_connections.saturating_add(1);
+                continue;
+            };
+            let token = Token(raw_token);
+            if self
+                .poll
+                .registry()
+                .register(&mut stream, token, Interest::READABLE)
+                .is_err()
+            {
+                self.free_connection_tokens.push(raw_token);
+                self.rejected_connections = self.rejected_connections.saturating_add(1);
+                continue;
+            }
+            self.next_connection_generation = next_generation;
+            if self
+                .connections
+                .insert(token, BrokerControlConnectionV1::new(stream, generation))
+                .is_some()
+            {
+                return Err(BrokerControlServiceError::InvalidConfiguration(
+                    "connection token collision",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn connection_matches(&self, token: Token, generation: u64) -> bool {
+        self.connections
+            .get(&token)
+            .is_some_and(|connection| connection.generation == generation)
+    }
+
+    fn drive_connection_read(&mut self, token: Token, generation: u64) {
+        let outcome = match self.connections.get_mut(&token) {
+            Some(connection) if connection.generation == generation => connection.read_one(),
+            _ => return,
+        };
+        let frame = match outcome {
+            Ok(BrokerControlReadOutcomeV1::Pending) => return,
+            Ok(BrokerControlReadOutcomeV1::Closed) | Err(_) => {
+                self.finish_connection(token, generation);
+                return;
+            }
+            Ok(BrokerControlReadOutcomeV1::Frame(frame)) => frame,
+        };
+        let request = match decode_broker_control_request(&self.control_authenticator, &frame) {
+            Ok(request) => request,
+            Err(_) => {
+                self.finish_connection(token, generation);
+                return;
+            }
+        };
+        let response = match self.dispatch_request(token, generation, &request) {
+            Ok(response) => response,
+            Err(()) => {
+                self.finish_connection(token, generation);
+                return;
+            }
+        };
+        let encoded = match encode_broker_control_response(&self.control_authenticator, &response) {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                self.finish_connection(token, generation);
+                return;
+            }
+        };
+        let Some(connection) = self.connections.get_mut(&token) else {
+            return;
+        };
+        if connection.generation != generation || connection.write_frame.is_some() {
+            self.finish_connection(token, generation);
+            return;
+        }
+        connection.write_frame = Some(encoded);
+        connection.write_offset = 0;
+        if self
+            .poll
+            .registry()
+            .reregister(&mut connection.stream, token, Interest::WRITABLE)
+            .is_err()
+        {
+            self.finish_connection(token, generation);
+        }
+    }
+
+    fn drive_connection_write(&mut self, token: Token, generation: u64) {
+        let complete = match self.connections.get_mut(&token) {
+            Some(connection) if connection.generation == generation => connection.flush_one(),
+            _ => return,
+        };
+        match complete {
+            Ok(false) => {}
+            Ok(true) => {
+                let Some(connection) = self.connections.get_mut(&token) else {
+                    return;
+                };
+                if self
+                    .poll
+                    .registry()
+                    .reregister(&mut connection.stream, token, Interest::READABLE)
+                    .is_err()
+                {
+                    self.finish_connection(token, generation);
+                }
+            }
+            Err(_) => self.finish_connection(token, generation),
+        }
+    }
+
+    fn dispatch_request(
+        &mut self,
+        token: Token,
+        generation: u64,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        if request.header.operation == BrokerControlOperationV1::Hello {
+            return self.dispatch_hello(token, generation, request);
+        }
+        let Some(hello) = self
+            .connections
+            .get(&token)
+            .filter(|connection| connection.generation == generation)
+            .and_then(|connection| connection.hello)
+        else {
+            return Err(());
+        };
+        if request.header.broker_incarnation != self.broker_incarnation
+            || request.header.guardian_incarnation != hello.guardian_incarnation
+            || request.header.connection_id != hello.connection_id
+            || request.header.mux_incarnation != hello.mux_incarnation
+            || request.header.guardian_build_identity_digest != hello.guardian_build_identity_digest
+            || request.header.mux_build_identity_digest != hello.mux_build_identity_digest
+        {
+            return Err(());
+        }
+        BrokerControlResponseV1::new(
+            self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
+            &[],
+        )
+        .map_err(|_| ())
+    }
+
+    fn dispatch_hello(
+        &mut self,
+        token: Token,
+        generation: u64,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let existing_connection_hello = self
+            .connections
+            .get(&token)
+            .filter(|connection| connection.generation == generation)
+            .and_then(|connection| connection.hello);
+        if existing_connection_hello.is_some_and(|hello| hello != request.header) {
+            return Err(());
+        }
+        let status = self.admit_hello_receipt(token, generation, request.header)?;
+        let Some(connection) = self.connections.get_mut(&token) else {
+            return Err(());
+        };
+        if connection.generation != generation {
+            return Err(());
+        }
+        connection.hello = Some(request.header);
+        let mut payload = [0_u8; BROKER_CONTROL_HELLO_PAYLOAD_BYTES];
+        payload[..32].copy_from_slice(self.broker_build_identity.as_bytes());
+        payload[32..].copy_from_slice(self.broker_lineage_id.as_bytes());
+        BrokerControlResponseV1::new(self.response_header(request.header, status), &payload)
+            .map_err(|_| ())
+    }
+
+    fn admit_hello_receipt(
+        &mut self,
+        token: Token,
+        generation: u64,
+        header: BrokerControlRequestHeaderV1,
+    ) -> Result<BrokerControlResponseStatusV1, ()> {
+        if let Some(receipt) = self.hello_receipts.get_mut(&header.request_id) {
+            if receipt.header != header
+                || receipt
+                    .active_connection
+                    .is_some_and(|active| active != (token, generation))
+            {
+                return Err(());
+            }
+            receipt.active_connection = Some((token, generation));
+            return Ok(BrokerControlResponseStatusV1::Recovered);
+        }
+        if self
+            .hello_receipts
+            .values()
+            .any(|receipt| receipt.header.connection_id == header.connection_id)
+        {
+            return Err(());
+        }
+        while self.hello_receipts.len() >= self.max_hello_receipts {
+            let Some(candidate) = self.hello_receipt_order.pop_front() else {
+                return Err(());
+            };
+            if self
+                .hello_receipts
+                .get(&candidate)
+                .is_some_and(|receipt| receipt.active_connection.is_some())
+            {
+                self.hello_receipt_order.push_back(candidate);
+                return Err(());
+            }
+            self.hello_receipts.remove(&candidate);
+        }
+        self.hello_receipts.insert(
+            header.request_id,
+            BrokerHelloReceiptV1 {
+                header,
+                active_connection: Some((token, generation)),
+            },
+        );
+        self.hello_receipt_order.push_back(header.request_id);
+        Ok(BrokerControlResponseStatusV1::Applied)
+    }
+
+    fn response_header(
+        &self,
+        request: BrokerControlRequestHeaderV1,
+        status: BrokerControlResponseStatusV1,
+    ) -> BrokerControlResponseHeaderV1 {
+        BrokerControlResponseHeaderV1 {
+            operation: request.operation,
+            status,
+            request_id: request.request_id,
+            broker_incarnation: self.broker_incarnation,
+            guardian_incarnation: request.guardian_incarnation,
+            connection_id: request.connection_id,
+            durable_pane_id: request.durable_pane_id,
+            lease_generation: request.lease_generation,
+            operation_id: request.operation_id,
+            child_identity: None,
+            output_sequence_start: 0,
+            output_sequence_end: 0,
+        }
+    }
+
+    fn finish_connection(&mut self, token: Token, generation: u64) {
+        let Some(mut connection) = self.connections.remove(&token) else {
+            return;
+        };
+        if connection.generation != generation {
+            self.connections.insert(token, connection);
+            return;
+        }
+        let _ = self.poll.registry().deregister(&mut connection.stream);
+        if let Some(hello) = connection.hello {
+            if let Some(receipt) = self.hello_receipts.get_mut(&hello.request_id) {
+                if receipt.active_connection == Some((token, generation)) {
+                    receipt.active_connection = None;
+                }
+            }
+        }
+        if token.0 != 0 {
+            self.free_connection_tokens.push(token.0);
+        }
+    }
+}
+
+/// Blocking guardian-side client for the production-disabled broker process.
+pub struct BrokerControlClientV1 {
+    stream: BlockingUnixStream,
+    control_authenticator: GuardianBrokerControlAuthenticatorV1,
+    identity: BrokerGuardianConnectionIdentityV1,
+    connection_id: Uuid,
+    broker_incarnation: Uuid,
+}
+
+impl BrokerControlClientV1 {
+    pub fn connect(
+        socket_path: &Path,
+        token_path: &Path,
+        identity: BrokerGuardianConnectionIdentityV1,
+        expected_broker_build_identity: SealedAtomicBuildIdentity,
+    ) -> Result<Self, BrokerControlClientError> {
+        Self::connect_with_hello_ids(
+            socket_path,
+            token_path,
+            identity,
+            expected_broker_build_identity,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn connect_with_hello_ids(
+        socket_path: &Path,
+        token_path: &Path,
+        identity: BrokerGuardianConnectionIdentityV1,
+        expected_broker_build_identity: SealedAtomicBuildIdentity,
+        hello_request_id: Uuid,
+        connection_id: Uuid,
+    ) -> Result<Self, BrokerControlClientError> {
+        if hello_request_id.is_nil() || connection_id.is_nil() {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        validate_existing_socket(socket_path)?;
+        let secret = load_guardian_secret(token_path)?;
+        let control_authenticator = secret
+            .broker_control_authenticator()
+            .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?;
+        let expected_lineage = secret
+            .broker_spawn_wal_authenticator()
+            .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?
+            .lineage_id();
+        let stream = BlockingUnixStream::connect(socket_path)?;
+        stream.set_read_timeout(Some(BROKER_CONTROL_CLIENT_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(BROKER_CONTROL_CLIENT_IO_TIMEOUT))?;
+        let mut client = Self {
+            stream,
+            control_authenticator,
+            identity,
+            connection_id,
+            broker_incarnation: Uuid::nil(),
+        };
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Hello,
+                request_id: hello_request_id,
+                broker_incarnation: Uuid::nil(),
+                guardian_incarnation: identity.guardian_incarnation,
+                connection_id,
+                mux_incarnation: identity.mux_incarnation,
+                guardian_build_identity_digest: identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: identity.mux_build_identity.into_bytes(),
+                durable_pane_id: Uuid::nil(),
+                lease_generation: 0,
+                operation_id: Uuid::nil(),
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = client.exchange(&request)?;
+        if !matches!(
+            response.header.status,
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+        ) || response.payload().len() != BROKER_CONTROL_HELLO_PAYLOAD_BYTES
+        {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        if response.payload()[..32] != expected_broker_build_identity.into_bytes() {
+            return Err(BrokerControlClientError::BrokerBuildIdentityMismatch);
+        }
+        if response.payload()[32..] != *expected_lineage.as_bytes() {
+            return Err(BrokerControlClientError::BrokerLineageMismatch);
+        }
+        client.broker_incarnation = response.header.broker_incarnation;
+        Ok(client)
+    }
+
+    #[must_use]
+    pub const fn broker_incarnation(&self) -> Uuid {
+        self.broker_incarnation
+    }
+
+    fn exchange(
+        &mut self,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, BrokerControlClientError> {
+        let frame = encode_broker_control_request(&self.control_authenticator, request)
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        self.stream.write_all(frame.as_slice())?;
+        let response_frame = read_blocking_broker_control_frame(
+            &mut self.stream,
+            BROKER_CONTROL_RESPONSE_FIXED_BYTES,
+        )?;
+        let response = decode_broker_control_response(&self.control_authenticator, &response_frame)
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        if response.header.operation != request.header.operation
+            || response.header.request_id != request.header.request_id
+            || response.header.guardian_incarnation != request.header.guardian_incarnation
+            || response.header.connection_id != request.header.connection_id
+            || response.header.durable_pane_id != request.header.durable_pane_id
+            || response.header.lease_generation != request.header.lease_generation
+            || response.header.operation_id != request.header.operation_id
+            || response.header.broker_incarnation.is_nil()
+            || (!self.broker_incarnation.is_nil()
+                && response.header.broker_incarnation != self.broker_incarnation)
+        {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        Ok(response)
+    }
+}
+
+fn read_blocking_broker_control_frame(
+    stream: &mut BlockingUnixStream,
+    minimum_bytes: usize,
+) -> Result<Zeroizing<Vec<u8>>, std::io::Error> {
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix)?;
+    let announced = usize::try_from(read_broker_be_u32(&prefix)).map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "broker frame length is not representable",
+        )
+    })?;
+    let total_bytes = announced.checked_add(prefix.len()).ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "broker frame length overflow")
+    })?;
+    if !(minimum_bytes..=BROKER_CONTROL_MAX_FRAME_BYTES).contains(&total_bytes) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "broker frame is outside its fixed bound",
+        ));
+    }
+    let mut frame = Zeroizing::new(Vec::new());
+    frame.try_reserve_exact(total_bytes).map_err(|_| {
+        std::io::Error::new(ErrorKind::OutOfMemory, "broker frame allocation failed")
+    })?;
+    frame.resize(total_bytes, 0);
+    frame[..prefix.len()].copy_from_slice(&prefix);
+    stream.read_exact(&mut frame[prefix.len()..])?;
+    Ok(frame)
 }
 
 /// Exact identity bound into one broker Spawn WAL and its local head anchor.

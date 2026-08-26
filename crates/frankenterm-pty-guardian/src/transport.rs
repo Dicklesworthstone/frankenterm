@@ -587,8 +587,8 @@ pub(crate) fn bind_private_unix_listener(
             "guardian socket path has no file name",
         ))?;
     require_absent_at(&parent, leaf_name)?;
-    let listener = UnixListener::bind(path)
-        .map_err(|error| GuardianServiceError::io("socket-bind", error))?;
+    let listener =
+        UnixListener::bind(path).map_err(|error| GuardianServiceError::io("socket-bind", error))?;
     chmod_socket_at(&parent, leaf_name)?;
     validate_pinned_private_parent(path, &parent)?;
     let identity = socket_path_identity_at(&parent, leaf_name)?;
@@ -744,8 +744,7 @@ impl GuardianService {
         // all endpoint allocations exist. A post-bind permission or
         // registration failure deliberately leaves the socket in place for
         // operator inspection; this process never unlinks an existing path.
-        let (mut listener, socket_authority) =
-            bind_private_unix_listener(&config.socket_path)?;
+        let (mut listener, socket_authority) = bind_private_unix_listener(&config.socket_path)?;
         poll.registry()
             .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)
             .map_err(|error| GuardianServiceError::io("listener-register", error))?;
