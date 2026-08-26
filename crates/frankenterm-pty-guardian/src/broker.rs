@@ -2054,6 +2054,8 @@ pub enum BrokerControlClientError {
     CensusCapacityUnavailable,
     #[error("broker recovery Census collection exceeded its end-to-end deadline")]
     CensusCollectionDeadlineExceeded,
+    #[error("broker recovery Census collection allocation failed")]
+    CensusCollectionCapacityExhausted,
     #[error("broker client connection is poisoned after an ambiguous exchange")]
     ConnectionPoisoned,
 }
@@ -2856,39 +2858,44 @@ impl BrokerControlServiceV1 {
         };
         let mut token_effect_lease = self.token_authority.acquire_effect_lease()?;
         token_effect_lease.validate()?;
-        let response = match self.dispatch_request(token, generation, &request) {
-            Ok(response) => response,
-            Err(()) => {
+        let outcome = (|| {
+            let response = match self.dispatch_request(token, generation, &request) {
+                Ok(response) => response,
+                Err(()) => {
+                    self.finish_connection(token, generation);
+                    return Ok(());
+                }
+            };
+            let encoded =
+                match encode_broker_control_response(&self.control_authenticator, &response) {
+                    Ok(encoded) => encoded,
+                    Err(_) => {
+                        self.finish_connection(token, generation);
+                        return Ok(());
+                    }
+                };
+            let Some(connection) = self.connections.get_mut(&token) else {
+                return Ok(());
+            };
+            if connection.generation != generation || connection.write_frame.is_some() {
                 self.finish_connection(token, generation);
                 return Ok(());
             }
-        };
-        let encoded = match encode_broker_control_response(&self.control_authenticator, &response) {
-            Ok(encoded) => encoded,
-            Err(_) => {
+            connection.write_frame = Some(encoded);
+            connection.write_offset = 0;
+            if self
+                .poll
+                .registry()
+                .reregister(&mut connection.stream, token, Interest::WRITABLE)
+                .is_err()
+            {
                 self.finish_connection(token, generation);
-                return Ok(());
             }
-        };
-        let Some(connection) = self.connections.get_mut(&token) else {
-            return Ok(());
-        };
-        if connection.generation != generation || connection.write_frame.is_some() {
-            self.finish_connection(token, generation);
-            return Ok(());
-        }
-        connection.write_frame = Some(encoded);
-        connection.write_offset = 0;
-        if self
-            .poll
-            .registry()
-            .reregister(&mut connection.stream, token, Interest::WRITABLE)
-            .is_err()
-        {
-            self.finish_connection(token, generation);
-        }
-        token_effect_lease.validate()?;
-        Ok(())
+            Ok(())
+        })();
+        let lease_validation = token_effect_lease.validate();
+        lease_validation?;
+        outcome
     }
 
     fn drive_connection_write(
@@ -2901,29 +2908,32 @@ impl BrokerControlServiceV1 {
         }
         let mut token_effect_lease = self.token_authority.acquire_effect_lease()?;
         token_effect_lease.validate()?;
-        let complete = match self.connections.get_mut(&token) {
-            Some(connection) if connection.generation == generation => connection.flush_one(),
-            _ => return Ok(()),
-        };
-        match complete {
-            Ok(false) => {}
-            Ok(true) => {
-                let Some(connection) = self.connections.get_mut(&token) else {
-                    return;
-                };
-                if self
-                    .poll
-                    .registry()
-                    .reregister(&mut connection.stream, token, Interest::READABLE)
-                    .is_err()
-                {
-                    self.finish_connection(token, generation);
+        let outcome = (|| {
+            let complete = match self.connections.get_mut(&token) {
+                Some(connection) if connection.generation == generation => connection.flush_one(),
+                _ => return Ok(()),
+            };
+            match complete {
+                Ok(false) => {}
+                Ok(true) => {
+                    if let Some(connection) = self.connections.get_mut(&token) {
+                        if self
+                            .poll
+                            .registry()
+                            .reregister(&mut connection.stream, token, Interest::READABLE)
+                            .is_err()
+                        {
+                            self.finish_connection(token, generation);
+                        }
+                    }
                 }
+                Err(_) => self.finish_connection(token, generation),
             }
-            Err(_) => self.finish_connection(token, generation),
-        }
-        token_effect_lease.validate()?;
-        Ok(())
+            Ok(())
+        })();
+        let lease_validation = token_effect_lease.validate();
+        lease_validation?;
+        outcome
     }
 
     fn dispatch_request(
@@ -3412,6 +3422,135 @@ impl BrokerControlClientV1 {
     #[must_use]
     pub const fn recovered_hello(&self) -> bool {
         self.recovered_hello
+    }
+
+    /// Collect the complete content-free recovery Census from one immutable
+    /// snapshot. The collector uses maximum bounded pages, one end-to-end
+    /// deadline, strict cross-page ordering, and exact snapshot/total
+    /// correlation.
+    pub fn recovery_census(
+        &mut self,
+    ) -> Result<BrokerRecoveryCensusV1, BrokerControlClientError> {
+        self.recovery_census_with_deadline(BROKER_CONTROL_CENSUS_COLLECTION_TIMEOUT)
+    }
+
+    fn recovery_census_with_deadline(
+        &mut self,
+        collection_timeout: Duration,
+    ) -> Result<BrokerRecoveryCensusV1, BrokerControlClientError> {
+        if collection_timeout.is_zero() {
+            return Err(BrokerControlClientError::CensusCollectionDeadlineExceeded);
+        }
+        let deadline = Instant::now()
+            .checked_add(collection_timeout)
+            .ok_or(BrokerControlClientError::CensusCollectionDeadlineExceeded)?;
+        let original_read_timeout = self.stream.read_timeout()?;
+        let original_write_timeout = self.stream.write_timeout()?;
+        let result = self.collect_recovery_census_pages(deadline);
+        let restore_read = self.stream.set_read_timeout(original_read_timeout);
+        let restore_write = self.stream.set_write_timeout(original_write_timeout);
+        if let Err(error) = restore_read.and(restore_write) {
+            self.poisoned = true;
+            return Err(BrokerControlClientError::Io(error));
+        }
+        result
+    }
+
+    fn collect_recovery_census_pages(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<BrokerRecoveryCensusV1, BrokerControlClientError> {
+        let page_capacity = BROKER_CONTROL_MAX_PAYLOAD_BYTES
+            .checked_sub(BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES)
+            .ok_or(BrokerControlClientError::Protocol)?
+            / BROKER_CONTROL_CENSUS_ENTRY_BYTES;
+        let page_capacity = page_capacity.min(GUARDIAN_MAX_PANES);
+        if page_capacity == 0 {
+            return Err(BrokerControlClientError::Protocol);
+        }
+        let page_capacity_u16 = u16::try_from(page_capacity)
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        let page_bytes = u32::try_from(BROKER_CONTROL_MAX_PAYLOAD_BYTES)
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        let maximum_pages = GUARDIAN_MAX_PANES.div_ceil(page_capacity).max(1);
+        let mut snapshot_id = Uuid::nil();
+        let mut cursor = 0_u64;
+        let mut expected_total = None;
+        let mut previous_pane_id: Option<Uuid> = None;
+        let mut entries = Vec::new();
+
+        for _ in 0..maximum_pages {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(BrokerControlClientError::CensusCollectionDeadlineExceeded);
+            }
+            let operation_timeout = remaining.min(BROKER_CONTROL_CLIENT_IO_TIMEOUT);
+            self.stream.set_read_timeout(Some(operation_timeout))?;
+            self.stream.set_write_timeout(Some(operation_timeout))?;
+            let request = BrokerCensusPageRequestV1::new(
+                snapshot_id,
+                cursor,
+                page_capacity_u16,
+                page_bytes,
+            )?;
+            let page = self.census_page(request)?;
+            match expected_total {
+                None => {
+                    snapshot_id = page.snapshot_id();
+                    expected_total = Some(page.total_entries());
+                    let total = usize::try_from(page.total_entries())
+                        .map_err(|_| BrokerControlClientError::Protocol)?;
+                    entries.try_reserve_exact(total).map_err(|_| {
+                        BrokerControlClientError::CensusCollectionCapacityExhausted
+                    })?;
+                }
+                Some(total)
+                    if page.snapshot_id() != snapshot_id || page.total_entries() != total =>
+                {
+                    self.poisoned = true;
+                    return Err(BrokerControlClientError::UnexpectedResponse);
+                }
+                Some(_) => {}
+            }
+            if let (Some(previous), Some(first)) =
+                (previous_pane_id, page.entries().first().copied())
+            {
+                if previous.as_bytes() >= first.durable_pane_id.as_bytes() {
+                    self.poisoned = true;
+                    return Err(BrokerControlClientError::UnexpectedResponse);
+                }
+            }
+            previous_pane_id = page.entries().last().map(|entry| entry.durable_pane_id);
+            entries.extend_from_slice(page.entries());
+            let total = usize::try_from(
+                expected_total.ok_or(BrokerControlClientError::UnexpectedResponse)?,
+            )
+                .map_err(|_| BrokerControlClientError::Protocol)?;
+            if entries.len() > total {
+                self.poisoned = true;
+                return Err(BrokerControlClientError::UnexpectedResponse);
+            }
+            match page.next_cursor() {
+                Some(next_cursor) => cursor = next_cursor,
+                None => {
+                    if entries.len() != total {
+                        self.poisoned = true;
+                        return Err(BrokerControlClientError::UnexpectedResponse);
+                    }
+                    if Instant::now() > deadline {
+                        return Err(
+                            BrokerControlClientError::CensusCollectionDeadlineExceeded,
+                        );
+                    }
+                    return Ok(BrokerRecoveryCensusV1 {
+                        snapshot_id,
+                        entries,
+                    });
+                }
+            }
+        }
+        self.poisoned = true;
+        Err(BrokerControlClientError::UnexpectedResponse)
     }
 
     /// Read one immutable page from the broker's content-free recovery
@@ -4689,6 +4828,26 @@ impl BrokerCensusPageV1 {
             return Err(BrokerControlProtocolError::InvalidIdentity);
         }
         Ok(())
+    }
+}
+
+/// Complete bounded recovery Census collected from one immutable broker
+/// snapshot under a single end-to-end deadline.
+#[derive(Debug, Eq, PartialEq)]
+pub struct BrokerRecoveryCensusV1 {
+    snapshot_id: Uuid,
+    entries: Vec<BrokerCensusEntryV1>,
+}
+
+impl BrokerRecoveryCensusV1 {
+    #[must_use]
+    pub const fn snapshot_id(&self) -> Uuid {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[BrokerCensusEntryV1] {
+        &self.entries
     }
 }
 
@@ -13214,10 +13373,40 @@ mod tests {
         );
         assert_eq!(second_page.next_cursor(), Some(2));
 
-        let replacement_page = first_client
-            .census_page(first_page_request)
-            .expect("replace owner snapshot with a fresh immutable snapshot");
-        assert_ne!(replacement_page.snapshot_id(), original_snapshot_id);
+        let final_page_request = BrokerCensusPageRequestV1::new(
+            original_snapshot_id,
+            2,
+            1,
+            one_row_bytes,
+        )
+        .expect("valid final paginated Census request");
+        let final_page = first_client
+            .census_page(final_page_request)
+            .expect("read final paginated recovery page");
+        assert_eq!(final_page.entries().len(), 1);
+        assert_eq!(
+            final_page.entries()[0].durable_pane_id,
+            third.durable_pane_id()
+        );
+        assert_eq!(final_page.next_cursor(), None);
+
+        let complete_census = first_client
+            .recovery_census()
+            .expect("collect a complete bounded recovery Census");
+        assert_ne!(complete_census.snapshot_id(), original_snapshot_id);
+        assert_eq!(
+            complete_census
+                .entries()
+                .iter()
+                .map(|entry| entry.durable_pane_id)
+                .collect::<Vec<_>>(),
+            vec![
+                first.durable_pane_id(),
+                second.durable_pane_id(),
+                third.durable_pane_id(),
+            ]
+        );
+
         let expired_continuation = BrokerCensusPageRequestV1::new(
             original_snapshot_id,
             2,

@@ -82,6 +82,7 @@ pub use broker::{
     BrokerControlClientError, BrokerControlClientV1, BrokerControlServiceConfigV1,
     BrokerControlServiceError, BrokerControlServiceV1, BrokerExecBootstrapErrorV1,
     BrokerGuardianConnectionIdentityV1, BrokerRecoveredPaneDispositionV1,
+    BrokerRecoveryCensusV1,
     run_broker_exec_bootstrap,
 };
 #[cfg(unix)]
