@@ -2922,7 +2922,7 @@ fn encode_broker_spawn_creation_base85(
 ) -> [u8; BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES] {
     let mut encoded = [0_u8; BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES];
     let (chunks, remainder) = bytes.as_chunks::<4>();
-    debug_assert_eq!(remainder, []);
+    debug_assert!(remainder.is_empty());
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         let mut value = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let encoded_offset = chunk_index * 5;

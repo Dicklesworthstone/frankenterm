@@ -2493,7 +2493,10 @@ impl GuardianReplayTailReader {
                     pending
                 }
             };
+            let replay_wait_budget = guardian_replay_server_wait_budget(request);
+            let replay_started = Instant::now();
             let page = replay_page_with_exact_retry(self.transport.as_mut(), request_id, request)?;
+            let replay_elapsed = replay_started.elapsed();
             validate_replay_page_identity(&page, self.identity)?;
             let snapshot_id = page.header().snapshot_id();
             let snapshot_digest = page.header().snapshot_digest();
@@ -2603,14 +2606,22 @@ impl GuardianReplayTailReader {
                     self.pending_boundary = Some(self.boundary);
                     self.pending_replay = None;
                     self.finish_delivered_page()?;
-                    // The v1 store currently treats wait_millis as a bounded
-                    // client hint rather than a server-held subscription.
-                    // Exponential idle backoff prevents one RPC every 50 ms
-                    // per dormant pane while preserving a fast first wake;
-                    // authenticated output resets the interval immediately.
+                    // New guardians hold Resume until durable output or the
+                    // authenticated wait deadline. Older guardians return an
+                    // empty page immediately. Apply only the portion of the
+                    // exponential client fallback that the bounded server
+                    // wait did not already consume, so rolling upgrades are
+                    // efficient without double-sleeping new peers.
                     let idle_delay = self.idle_poll_interval;
                     self.idle_poll_interval = next_guardian_idle_poll_interval(idle_delay);
-                    thread::sleep(idle_delay);
+                    let remaining_idle_delay = guardian_replay_remaining_idle_delay(
+                        idle_delay,
+                        replay_wait_budget,
+                        replay_elapsed,
+                    );
+                    if !remaining_idle_delay.is_zero() {
+                        thread::sleep(remaining_idle_delay);
+                    }
                 }
                 GuardianReplayPageBodyDelivery::SnapshotExpired {
                     snapshot_id: expired,
@@ -2683,6 +2694,27 @@ fn next_guardian_idle_poll_interval(current: Duration) -> Duration {
     current
         .saturating_mul(2)
         .min(GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL)
+}
+
+fn guardian_replay_server_wait_budget(request: GuardianReplayRequestV1) -> Duration {
+    match request {
+        GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume { .. },
+            wait_millis,
+            ..
+        } => Duration::from_millis(u64::from(wait_millis)),
+        GuardianReplayRequestV1::Open { .. } | GuardianReplayRequestV1::Continue { .. } => {
+            Duration::ZERO
+        }
+    }
+}
+
+fn guardian_replay_remaining_idle_delay(
+    idle_delay: Duration,
+    server_wait_budget: Duration,
+    replay_elapsed: Duration,
+) -> Duration {
+    idle_delay.saturating_sub(replay_elapsed.min(server_wait_budget))
 }
 
 impl Read for GuardianReplayTailReader {
@@ -4625,6 +4657,60 @@ mod tests {
             [50, 100, 200, 400, 800, 1_000, 1_000]
                 .map(Duration::from_millis)
                 .to_vec()
+        );
+    }
+
+    #[test]
+    fn server_held_replay_wait_replaces_only_the_consumed_client_backoff() {
+        let resume = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes([0x61; 32]).unwrap(),
+                next_sequence: 1,
+                previous_record_digest: [0; 32],
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 16,
+            wait_millis: GUARDIAN_MAX_REPLAY_WAIT_MILLIS,
+        };
+        let wait_budget = guardian_replay_server_wait_budget(resume);
+        assert_eq!(wait_budget, Duration::from_millis(1_000));
+        assert_eq!(
+            guardian_replay_remaining_idle_delay(
+                Duration::from_millis(50),
+                wait_budget,
+                Duration::from_millis(20),
+            ),
+            Duration::from_millis(30),
+            "an old or early-returning peer retains the unconsumed client fallback"
+        );
+        assert_eq!(
+            guardian_replay_remaining_idle_delay(
+                Duration::from_millis(50),
+                wait_budget,
+                Duration::from_millis(50),
+            ),
+            Duration::ZERO,
+            "a server-held wait must not be followed by a second idle sleep"
+        );
+
+        let legacy_immediate = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: 4_096,
+            max_records: 16,
+            wait_millis: GUARDIAN_MAX_REPLAY_WAIT_MILLIS,
+        };
+        assert_eq!(
+            guardian_replay_server_wait_budget(legacy_immediate),
+            Duration::ZERO,
+            "only the server-held Resume contract may consume client backoff"
+        );
+        assert_eq!(
+            guardian_replay_remaining_idle_delay(
+                Duration::from_millis(50),
+                Duration::ZERO,
+                Duration::from_secs(1),
+            ),
+            Duration::from_millis(50)
         );
     }
 

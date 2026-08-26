@@ -17,8 +17,8 @@ use mux::guardian_protocol::{
     GuardianDurableSpawnFenceInstallV1, GuardianDurableSpawnFenceV1, GuardianEffectOutcome,
     GuardianEffectTransactionError, GuardianMuxLeaseRetirement, GuardianOperation,
     GuardianPaneState, GuardianProtocolError, GuardianProtocolState, GuardianRejectionCode,
-    GuardianReply, GuardianResizePayload, GuardianResponseEnvelope, GuardianSignal,
-    GuardianSpawnPayload, InputEffectState,
+    GuardianReplayRequestV1, GuardianReplaySelectorV1, GuardianReply, GuardianResizePayload,
+    GuardianResponseEnvelope, GuardianSignal, GuardianSpawnPayload, InputEffectState,
 };
 use portable_pty::{Child, ChildKiller, MasterPty, PollablePtyReader, native_pty_system};
 use std::collections::HashMap;
@@ -97,6 +97,10 @@ pub struct GuardianRuntimeCounters {
     pub replay_worker_disconnects: u64,
     pub replay_worker_panics: u64,
     pub replay_token_authority_failures: u64,
+    pub replay_waits_deferred: u64,
+    pub replay_waits_released_ready: u64,
+    pub replay_waits_released_deadline: u64,
+    pub replay_waits_deadline_authority_busy: u64,
     pub pty_bytes_drained: u64,
     pub pty_bytes_durably_committed: u64,
     pub pty_records_durably_committed: u64,
@@ -260,6 +264,19 @@ pub(crate) enum GuardianRuntimeCheckpointCompletionState {
     Ready(Box<GuardianRuntimeCheckpointCompletion>),
     Empty,
     Disconnected,
+}
+
+/// Read-only readiness decision for one already authenticated Replay request.
+///
+/// `AuthorityInFlight` means the sole protocol authority currently belongs to
+/// a durable worker and no second authority may inspect generation state.
+/// `Pending` is returned only for a valid Resume request whose exact next
+/// sequence is still the guardian's durable output watermark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuardianReplayWaitReadiness {
+    AuthorityInFlight,
+    Immediate,
+    Pending { wait_millis: u16 },
 }
 
 /// Content-free marker returned when the audited checkpoint-storage worker
@@ -1264,6 +1281,78 @@ impl GuardianRuntime {
                 GuardianInputSubmission::CloseRetryably
             }
         }
+    }
+
+    /// Decide whether one authenticated Resume request should be held by the
+    /// readiness loop instead of consuming the sole checkpoint-worker slot.
+    ///
+    /// Invalid, stale, non-Resume, zero-wait, and already-readable requests go
+    /// straight to the worker so it can return the canonical typed outcome.
+    /// A wait is eligible only while the exact requested next sequence remains
+    /// the live pane's durable watermark and the pane can still append output.
+    pub(crate) fn replay_wait_readiness(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> GuardianReplayWaitReadiness {
+        let Some(protocol) = self.protocol.as_ref() else {
+            return GuardianReplayWaitReadiness::AuthorityInFlight;
+        };
+        let Ok(replay) = protocol.preflight_replay(request) else {
+            return GuardianReplayWaitReadiness::Immediate;
+        };
+        let GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume { next_sequence, .. },
+            wait_millis,
+            ..
+        } = replay
+        else {
+            return GuardianReplayWaitReadiness::Immediate;
+        };
+        if wait_millis == 0 {
+            return GuardianReplayWaitReadiness::Immediate;
+        }
+        let Some(pane_id) = request.header().pane_id else {
+            return GuardianReplayWaitReadiness::Immediate;
+        };
+        let Some(pane) = self.panes.get(&pane_id) else {
+            return GuardianReplayWaitReadiness::Immediate;
+        };
+        if pane.output.failed
+            || pane.pty_eof_observed
+            || pane.exit_observed
+            || pane.output.expected_sequence != Some(next_sequence)
+        {
+            GuardianReplayWaitReadiness::Immediate
+        } else {
+            GuardianReplayWaitReadiness::Pending { wait_millis }
+        }
+    }
+
+    pub(crate) fn record_replay_wait_deferred(&mut self) {
+        self.counters.replay_waits_deferred = self.counters.replay_waits_deferred.saturating_add(1);
+    }
+
+    pub(crate) fn record_replay_wait_released_ready(&mut self) {
+        self.counters.replay_waits_released_ready =
+            self.counters.replay_waits_released_ready.saturating_add(1);
+    }
+
+    pub(crate) fn record_replay_wait_released_deadline(&mut self) {
+        self.counters.replay_waits_released_deadline = self
+            .counters
+            .replay_waits_released_deadline
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_replay_wait_deadline_authority_busy(&mut self) {
+        self.counters.replay_waits_deadline_authority_busy = self
+            .counters
+            .replay_waits_deadline_authority_busy
+            .saturating_add(1);
+        self.counters.replay_retryable_capacity_closes = self
+            .counters
+            .replay_retryable_capacity_closes
+            .saturating_add(1);
     }
 
     /// Transfer the one global protocol authority and one owned authenticated
@@ -2580,6 +2669,103 @@ mod tests {
         let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
         let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
         decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
+    fn authenticated_replay_resume_request(
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        next_sequence: u64,
+        wait_millis: u16,
+    ) -> AuthenticatedGuardianRequest {
+        let checkpoint_id =
+            mux::guardian_protocol::GuardianCheckpointIdentityDigest::from_bytes([0x71; 32])
+                .expect("nonzero checkpoint identity");
+        let previous_record_digest = if next_sequence == 1 {
+            [0; 32]
+        } else {
+            [0x72; 32]
+        };
+        let replay = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id,
+                next_sequence,
+                previous_record_digest,
+            },
+            max_plaintext_bytes: 1_024,
+            max_records: 1,
+            wait_millis,
+        };
+        let payload = replay.encode().expect("Replay fixture encodes");
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::Replay,
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                request_id,
+                Some(pane_id),
+                generation,
+                0,
+                None,
+                &payload,
+            ),
+            payload,
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
+    #[test]
+    fn replay_wait_readiness_tracks_exact_durable_watermark_and_protocol_authority() {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(Vec::<u8>::new()));
+        let waiting =
+            authenticated_replay_resume_request(Uuid::from_u128(0x7101), pane_id, 1, 1, 1_000);
+        assert_eq!(
+            runtime.replay_wait_readiness(&waiting),
+            GuardianReplayWaitReadiness::Pending { wait_millis: 1_000 }
+        );
+
+        let zero_wait =
+            authenticated_replay_resume_request(Uuid::from_u128(0x7102), pane_id, 1, 1, 0);
+        assert_eq!(
+            runtime.replay_wait_readiness(&zero_wait),
+            GuardianReplayWaitReadiness::Immediate
+        );
+
+        runtime
+            .panes
+            .get_mut(&pane_id)
+            .expect("claimed pane")
+            .output
+            .expected_sequence = Some(2);
+        assert_eq!(
+            runtime.replay_wait_readiness(&waiting),
+            GuardianReplayWaitReadiness::Immediate,
+            "a durable sequence advance releases the wait"
+        );
+        runtime
+            .panes
+            .get_mut(&pane_id)
+            .expect("claimed pane")
+            .output
+            .expected_sequence = Some(1);
+
+        let protocol = runtime.protocol.take().expect("protocol authority");
+        assert_eq!(
+            runtime.replay_wait_readiness(&waiting),
+            GuardianReplayWaitReadiness::AuthorityInFlight
+        );
+        runtime.protocol = Some(protocol);
+
+        let stale_generation =
+            authenticated_replay_resume_request(Uuid::from_u128(0x7103), pane_id, 2, 1, 1_000);
+        assert_eq!(
+            runtime.replay_wait_readiness(&stale_generation),
+            GuardianReplayWaitReadiness::Immediate,
+            "stale generation must reach the worker's typed rejection"
+        );
     }
 
     #[test]

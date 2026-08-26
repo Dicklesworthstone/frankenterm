@@ -3,8 +3,9 @@
 use crate::output::GuardianOutputPipeline;
 use crate::runtime::{
     GuardianCheckpointRoute, GuardianCheckpointSubmission, GuardianInputRoute,
-    GuardianInputSubmission, GuardianRuntime, GuardianRuntimeCheckpointCompletionState,
-    GuardianRuntimeConfig, GuardianRuntimeCounters, GuardianRuntimeInputCompletionState,
+    GuardianInputSubmission, GuardianReplayWaitReadiness, GuardianRuntime,
+    GuardianRuntimeCheckpointCompletionState, GuardianRuntimeConfig, GuardianRuntimeCounters,
+    GuardianRuntimeInputCompletionState,
 };
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -212,7 +213,85 @@ struct Connection {
     guarded_stop_response: Option<GuardedStopAuthority>,
     pending_input: Option<GuardianInputRoute>,
     pending_checkpoint: Option<GuardianCheckpointRoute>,
+    deferred_replay: Option<DeferredGuardianReplay>,
     accepted_at: Instant,
+}
+
+/// One authenticated replay wait retained outside the capacity-one durable
+/// worker. The exact request and token-effect lease remain owned until output
+/// readiness, the bounded deadline, or connection teardown.
+struct DeferredGuardianReplay {
+    request: Option<AuthenticatedGuardianRequest>,
+    route: GuardianCheckpointRoute,
+    effect_lease: Option<GuardianTokenEffectLease>,
+    deadline: Instant,
+    #[cfg(test)]
+    wipe_probe: Option<Arc<AtomicBool>>,
+}
+
+impl DeferredGuardianReplay {
+    fn new(
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+        effect_lease: GuardianTokenEffectLease,
+        deadline: Instant,
+    ) -> Self {
+        debug_assert_eq!(request.header().request_id, route.request_id);
+        Self {
+            request: Some(request),
+            route,
+            effect_lease: Some(effect_lease),
+            deadline,
+            #[cfg(test)]
+            wipe_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_wipe_probe(&mut self, probe: Arc<AtomicBool>) {
+        self.wipe_probe = Some(probe);
+    }
+
+    fn request(&self) -> Option<&AuthenticatedGuardianRequest> {
+        self.request.as_ref()
+    }
+
+    fn take_submission(
+        &mut self,
+    ) -> Option<(AuthenticatedGuardianRequest, GuardianTokenEffectLease)> {
+        if self.request.is_none() || self.effect_lease.is_none() {
+            return None;
+        }
+        Some((self.request.take()?, self.effect_lease.take()?))
+    }
+}
+
+impl Drop for DeferredGuardianReplay {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.as_mut() {
+            request.zeroize_payload();
+            #[cfg(test)]
+            if let Some(probe) = self.wipe_probe.as_ref() {
+                probe.store(request.payload().is_empty(), Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+fn bounded_replay_poll_timeout(
+    poll_interval: Duration,
+    now: Instant,
+    deadlines: impl Iterator<Item = Instant>,
+) -> Duration {
+    deadlines
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .fold(poll_interval, Duration::min)
+}
+
+fn order_deferred_replays_for_pop(tokens: &mut [(Token, Instant)]) {
+    tokens.sort_unstable_by(|left, right| {
+        right.1.cmp(&left.1).then_with(|| right.0.0.cmp(&left.0.0))
+    });
 }
 
 enum GuardianReadState {
@@ -248,6 +327,7 @@ impl Connection {
             guarded_stop_response: None,
             pending_input: None,
             pending_checkpoint: None,
+            deferred_replay: None,
             accepted_at: Instant::now(),
         }
     }
@@ -819,6 +899,7 @@ pub struct GuardianService {
     secret: GuardianSecret,
     runtime: GuardianRuntime,
     connections: HashMap<Token, Connection>,
+    deferred_replay_tokens: Vec<(Token, Instant)>,
     mux_connections: MuxConnectionTracker,
     free_connection_tokens: Vec<usize>,
     poll_interval: Duration,
@@ -897,6 +978,14 @@ impl GuardianService {
             .map_err(|_| {
                 GuardianServiceError::InvalidConfiguration("connection map allocation failed")
             })?;
+        let mut deferred_replay_tokens = Vec::new();
+        deferred_replay_tokens
+            .try_reserve(config.max_connections)
+            .map_err(|_| {
+                GuardianServiceError::InvalidConfiguration(
+                    "deferred replay token allocation failed",
+                )
+            })?;
         let mux_connections = MuxConnectionTracker::new(config.max_connections)?;
         let events = Events::with_capacity(endpoint_capacity);
 
@@ -922,6 +1011,7 @@ impl GuardianService {
             secret,
             runtime,
             connections,
+            deferred_replay_tokens,
             mux_connections,
             free_connection_tokens,
             poll_interval: config.poll_interval,
@@ -1001,13 +1091,27 @@ impl GuardianService {
         Ok(())
     }
 
+    fn next_poll_timeout(&self, now: Instant) -> Duration {
+        bounded_replay_poll_timeout(
+            self.poll_interval,
+            now,
+            self.connections.values().filter_map(|connection| {
+                connection
+                    .deferred_replay
+                    .as_ref()
+                    .map(|deferred| deferred.deadline)
+            }),
+        )
+    }
+
     pub fn poll_once(&mut self) -> Result<(), GuardianServiceError> {
         if self.lifecycle == GuardianLifecycle::ExitReady {
             return Ok(());
         }
         self.token_authority.validate()?;
         self.socket_authority.validate()?;
-        match self.poll.poll(&mut self.events, Some(self.poll_interval)) {
+        let poll_timeout = self.next_poll_timeout(Instant::now());
+        match self.poll.poll(&mut self.events, Some(poll_timeout)) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(()),
             Err(error) => return Err(GuardianServiceError::io("readiness-poll", error)),
@@ -1067,6 +1171,7 @@ impl GuardianService {
         self.runtime.handle_output_completions();
         self.handle_input_completions();
         self.handle_checkpoint_completions();
+        self.handle_deferred_replays();
         // Authentication deadlines are the finite bound on a pre-disconnect
         // unknown identity. Resolve expired candidates before the final
         // membership recheck so they cannot add an unnecessary extra poll.
@@ -1456,6 +1561,35 @@ impl GuardianService {
                         request.zeroize_payload();
                         return FrameProcessing::Response(response);
                     };
+                    if request.header().operation == GuardianOperation::Replay {
+                        if let GuardianReplayWaitReadiness::Pending { wait_millis } =
+                            self.runtime.replay_wait_readiness(&request)
+                        {
+                            let Some(deadline) = Instant::now()
+                                .checked_add(Duration::from_millis(u64::from(wait_millis)))
+                            else {
+                                request.zeroize_payload();
+                                return FrameProcessing::Close;
+                            };
+                            if connection.deferred_replay.is_some() {
+                                request.zeroize_payload();
+                                return FrameProcessing::Close;
+                            }
+                            let Some(effect_lease) = effect_lease.take() else {
+                                request.zeroize_payload();
+                                return FrameProcessing::Close;
+                            };
+                            connection.pending_checkpoint = Some(route);
+                            connection.deferred_replay = Some(DeferredGuardianReplay::new(
+                                request,
+                                route,
+                                effect_lease,
+                                deadline,
+                            ));
+                            self.runtime.record_replay_wait_deferred();
+                            return FrameProcessing::PendingCheckpoint;
+                        }
+                    }
                     let Some(effect_lease) = effect_lease.take() else {
                         request.zeroize_payload();
                         return FrameProcessing::Close;
@@ -1539,7 +1673,7 @@ impl GuardianService {
                 | GuardianRuntimeCheckpointCompletionState::Disconnected => break,
             };
             let token = completion.route.connection_token;
-            let Some(mut connection) = self.connections.remove(&token) else {
+            let Some(connection) = self.connections.remove(&token) else {
                 // The originating peer disconnected. Protocol restoration and
                 // deferred final-lease retirement already happened before this
                 // routing step; never redirect to a recycled token.
@@ -1553,26 +1687,127 @@ impl GuardianService {
                 self.connections.insert(token, connection);
                 continue;
             }
-            connection.pending_checkpoint = None;
-            let Some(response) = completion.response else {
-                self.finish_connection(token, connection);
+            self.route_checkpoint_response(token, connection, completion.response);
+        }
+    }
+
+    fn route_checkpoint_response(
+        &mut self,
+        token: Token,
+        mut connection: Connection,
+        response: Option<GuardianResponseEnvelope>,
+    ) {
+        connection.pending_checkpoint = None;
+        if connection.deferred_replay.is_some() {
+            self.finish_connection(token, connection);
+            return;
+        }
+        let Some(response) = response else {
+            self.finish_connection(token, connection);
+            return;
+        };
+        let Ok(frame) = encode_guardian_response(&self.secret, &response) else {
+            self.finish_connection(token, connection);
+            return;
+        };
+        connection.write_buf = Some(frame);
+        connection.write_offset = 0;
+        if self
+            .poll
+            .registry()
+            .reregister(&mut connection.stream, token, Interest::WRITABLE)
+            .is_ok()
+        {
+            self.connections.insert(token, connection);
+        } else {
+            self.finish_connection(token, connection);
+        }
+    }
+
+    fn handle_deferred_replays(&mut self) {
+        let now = Instant::now();
+        self.deferred_replay_tokens.clear();
+        for (token, connection) in &self.connections {
+            let Some(deferred) = connection.deferred_replay.as_ref() else {
                 continue;
             };
-            let Ok(frame) = encode_guardian_response(&self.secret, &response) else {
-                self.finish_connection(token, connection);
-                continue;
-            };
-            connection.write_buf = Some(frame);
-            connection.write_offset = 0;
-            if self
-                .poll
-                .registry()
-                .reregister(&mut connection.stream, token, Interest::WRITABLE)
-                .is_ok()
+            let readiness = deferred
+                .request()
+                .map_or(GuardianReplayWaitReadiness::Immediate, |request| {
+                    self.runtime.replay_wait_readiness(request)
+                });
+            if now >= deferred.deadline
+                || matches!(readiness, GuardianReplayWaitReadiness::Immediate)
             {
+                self.deferred_replay_tokens
+                    .push((*token, deferred.deadline));
+            }
+        }
+
+        // Serve the earliest bounded deadline first. HashMap iteration order
+        // must never decide which ready replay owns the capacity-one worker.
+        order_deferred_replays_for_pop(&mut self.deferred_replay_tokens);
+        while let Some((token, _deadline)) = self.deferred_replay_tokens.pop() {
+            let Some(mut connection) = self.connections.remove(&token) else {
+                continue;
+            };
+            let Some(mut deferred) = connection.deferred_replay.take() else {
                 self.connections.insert(token, connection);
-            } else {
+                continue;
+            };
+            let deadline_elapsed = Instant::now() >= deferred.deadline;
+            let readiness = deferred
+                .request()
+                .map_or(GuardianReplayWaitReadiness::Immediate, |request| {
+                    self.runtime.replay_wait_readiness(request)
+                });
+            match readiness {
+                GuardianReplayWaitReadiness::AuthorityInFlight if deadline_elapsed => {
+                    self.runtime.record_replay_wait_deadline_authority_busy();
+                    self.finish_connection(token, connection);
+                    continue;
+                }
+                GuardianReplayWaitReadiness::AuthorityInFlight => {
+                    connection.deferred_replay = Some(deferred);
+                    self.connections.insert(token, connection);
+                    continue;
+                }
+                GuardianReplayWaitReadiness::Pending { .. } if !deadline_elapsed => {
+                    connection.deferred_replay = Some(deferred);
+                    self.connections.insert(token, connection);
+                    continue;
+                }
+                GuardianReplayWaitReadiness::Pending { .. } => {
+                    self.runtime.record_replay_wait_released_deadline();
+                }
+                GuardianReplayWaitReadiness::Immediate => {
+                    self.runtime.record_replay_wait_released_ready();
+                }
+            }
+
+            let route = deferred.route;
+            let Some((request, effect_lease)) = deferred.take_submission() else {
                 self.finish_connection(token, connection);
+                continue;
+            };
+            match self
+                .runtime
+                .submit_checkpoint_with_token_lease(request, route, effect_lease)
+            {
+                GuardianCheckpointSubmission::Pending => {
+                    debug_assert_eq!(connection.pending_checkpoint, Some(route));
+                    self.connections.insert(token, connection);
+                    // The sole protocol authority is now in flight. Remaining
+                    // waits stay owned by their connections until its waker is
+                    // drained or their own deadline closes them retryably.
+                    break;
+                }
+                GuardianCheckpointSubmission::Respond(response) => {
+                    self.route_checkpoint_response(token, connection, Some(response));
+                }
+                GuardianCheckpointSubmission::CloseRetryably => {
+                    self.finish_connection(token, connection);
+                }
             }
         }
     }
@@ -3934,6 +4169,52 @@ mod tests {
         }
     }
 
+    fn authenticated_replay_resume_request(
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        next_sequence: u64,
+        wait_millis: u16,
+    ) -> AuthenticatedGuardianRequest {
+        use mux::guardian_protocol::{GuardianCheckpointIdentityDigest, GuardianReplaySelectorV1};
+
+        let previous_record_digest = if next_sequence == 1 {
+            [0; 32]
+        } else {
+            [0x42; 32]
+        };
+        let replay = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes([0x41; 32])
+                    .expect("nonzero checkpoint identity"),
+                next_sequence,
+                previous_record_digest,
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 16,
+            wait_millis,
+        };
+        let payload = replay.encode().expect("Replay fixture encodes");
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::Replay,
+                Uuid::from_u128(0x4101),
+                Uuid::from_u128(0x4102),
+                request_id,
+                Some(pane_id),
+                generation,
+                0,
+                None,
+                &payload,
+            ),
+            payload,
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES])
+            .expect("test secret is strong");
+        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
     #[test]
     fn completion_token_precedes_the_monotonic_pty_token_range() {
         let max_connections = 64_usize;
@@ -3953,6 +4234,45 @@ mod tests {
             );
         }
         assert_eq!(partition_endpoint_tokens(usize::MAX), None);
+    }
+
+    #[test]
+    fn deferred_replay_deadlines_bound_polling_and_order_capacity_ownership() {
+        let now = Instant::now();
+        let poll_interval = Duration::from_millis(100);
+        assert_eq!(
+            bounded_replay_poll_timeout(poll_interval, now, std::iter::empty()),
+            poll_interval
+        );
+        assert_eq!(
+            bounded_replay_poll_timeout(
+                poll_interval,
+                now,
+                [
+                    now + Duration::from_millis(70),
+                    now + Duration::from_millis(20),
+                ]
+                .into_iter(),
+            ),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            bounded_replay_poll_timeout(
+                poll_interval,
+                now,
+                [now.checked_sub(Duration::from_millis(1)).unwrap()].into_iter(),
+            ),
+            Duration::ZERO,
+            "an elapsed replay deadline must produce an immediate poll"
+        );
+
+        let early = now + Duration::from_millis(20);
+        let late = now + Duration::from_millis(70);
+        let mut ready = vec![(Token(9), late), (Token(7), early), (Token(8), early)];
+        order_deferred_replays_for_pop(&mut ready);
+        assert_eq!(ready.pop(), Some((Token(7), early)));
+        assert_eq!(ready.pop(), Some((Token(8), early)));
+        assert_eq!(ready.pop(), Some((Token(9), late)));
     }
 
     #[test]
@@ -4272,6 +4592,9 @@ mod tests {
         let handle_checkpoint_completions = poll_once_source
             .find("self.handle_checkpoint_completions();")
             .expect("checkpoint authority restoration is wired into poll_once");
+        let handle_deferred_replays = poll_once_source
+            .find("self.handle_deferred_replays();")
+            .expect("deferred replay readiness is wired into poll_once");
         let accept_batch = poll_once_source
             .find("self.accept_connections()?;")
             .expect("listener accept batch is wired into poll_once");
@@ -4310,9 +4633,15 @@ mod tests {
         );
         assert!(accept_batch < connection_event_loop);
         assert!(handle_input_completions < handle_checkpoint_completions);
-        assert!(authentication_expiry > handle_input_completions);
-        assert!(authentication_expiry > handle_checkpoint_completions);
+        assert!(handle_checkpoint_completions < handle_deferred_replays);
+        assert!(handle_deferred_replays < authentication_expiry);
         assert!(retirement_replay > authentication_expiry);
+        assert_eq!(
+            poll_once_source
+                .matches("self.handle_deferred_replays();")
+                .count(),
+            1
+        );
         assert_eq!(
             poll_once_source
                 .matches("self.replay_deferred_mux_retirements();")
@@ -5135,6 +5464,47 @@ mod tests {
         assert!(
             guardian_token_publication_lock_is_available(&token_path).unwrap(),
             "dropping the effect lease did not release publication authority"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn deferred_replay_drop_wipes_payload_and_releases_exact_token_effect_lease() {
+        let (token_path, _original, mut authority) =
+            retained_token_authority_fixture("deferred-replay-effect-lease");
+        let request_id = Uuid::from_u128(0x4201);
+        let request =
+            authenticated_replay_resume_request(request_id, Uuid::from_u128(0x4202), 7, 1, 1_000);
+        let route = GuardianCheckpointRoute::new(Token(7), 11, request_id)
+            .expect("exact deferred route is valid");
+        let effect_lease = authority.acquire_effect_lease().unwrap();
+        let wipe_probe = Arc::new(AtomicBool::new(false));
+        let mut deferred = DeferredGuardianReplay::new(
+            request,
+            route,
+            effect_lease,
+            Instant::now() + Duration::from_secs(1),
+        );
+        deferred.set_wipe_probe(Arc::clone(&wipe_probe));
+
+        assert!(deferred.request().is_some());
+        assert!(
+            !guardian_token_publication_lock_is_available(&token_path).unwrap(),
+            "deferred replay released its token-effect authority before disposition"
+        );
+        drop(deferred);
+        assert!(wipe_probe.load(Ordering::SeqCst));
+        assert!(
+            guardian_token_publication_lock_is_available(&token_path).unwrap(),
+            "connection teardown did not release deferred token-effect authority"
         );
     }
 

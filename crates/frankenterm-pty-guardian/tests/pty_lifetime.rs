@@ -7,7 +7,8 @@ use frankenterm_pty_guardian::{
 };
 use mux::guardian_protocol::{
     GUARDIAN_MAX_CENSUS_BYTES, GuardianCensusPageRequest, GuardianCensusPaneStatus,
-    GuardianRejectionCode, GuardianReply,
+    GuardianCheckpointIdentityDigest, GuardianRejectionCode, GuardianReplayRequestV1,
+    GuardianReplaySelectorV1, GuardianReply,
 };
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
@@ -90,7 +91,12 @@ fn empty_guarded_stop_returns_authenticated_success_before_service_exit() -> any
         handle: Some(handle),
     };
     let mut client = GuardianClient::connect(&socket_path, &token_path, Uuid::new_v4())?;
-    client.guarded_stop(Uuid::new_v4(), Uuid::new_v4())?;
+    anyhow::ensure!(
+        wait_until(Duration::from_secs(3), || client
+            .guarded_stop(Uuid::new_v4(), Uuid::new_v4())
+            .is_ok()),
+        "replay-wait pane resources were not reclaimed for guarded stop"
+    );
     anyhow::ensure!(
         wait_until(Duration::from_secs(3), || service_thread
             .handle
@@ -108,6 +114,189 @@ fn empty_guarded_stop_returns_authenticated_success_before_service_exit() -> any
         socket_path.exists(),
         "guardian must not unlink its socket during guarded stop"
     );
+    Ok(())
+}
+
+#[test]
+fn replay_resume_wait_wakes_on_durable_output_and_expires_at_its_deadline() -> anyhow::Result<()> {
+    let directory = tempfile::Builder::new()
+        .prefix("frankenterm-pty-guardian-replay-wait-")
+        .tempdir_in(secure_test_temp_root()?)?
+        .keep();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    let socket_path = directory.join("guardian.sock");
+    let token_path = directory.join("guardian.token");
+    let emit_path = directory.join("emit.marker");
+    let release_path = directory.join("release.marker");
+    write_new_file(&token_path, &[0x69; 32])?;
+
+    let config = GuardianServiceConfig::new(
+        socket_path.clone(),
+        token_path.clone(),
+        4,
+        4,
+        64 * 1024,
+        256 * 1024,
+        Duration::from_millis(5),
+    )?;
+    let mut service = GuardianService::bind(config)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let abort = Arc::new(AtomicBool::new(false));
+    let service_stop = Arc::clone(&stop);
+    let service_abort = Arc::clone(&abort);
+    let handle =
+        thread::spawn(move || service.run_until_with_test_abort(&service_stop, &service_abort));
+    let mut service_thread = ServiceThread {
+        stop,
+        abort,
+        handle: Some(handle),
+    };
+    let _release_on_failure = ReleaseMarker(release_path.clone());
+
+    let pane_id = Uuid::new_v4();
+    let mut client = GuardianClient::connect(&socket_path, &token_path, Uuid::new_v4())?;
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.arg("-c");
+    command.arg(
+        "while [ ! -e \"$FT_GUARDIAN_EMIT_FILE\" ]; do sleep 0.01; done; \
+         printf wake; \
+         while [ ! -e \"$FT_GUARDIAN_RELEASE_FILE\" ]; do sleep 0.01; done",
+    );
+    command.env("FT_GUARDIAN_EMIT_FILE", &emit_path);
+    command.env("FT_GUARDIAN_RELEASE_FILE", &release_path);
+    anyhow::ensure!(
+        matches!(
+            client.spawn(
+                pane_id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                command,
+                PtySize::default(),
+            )?,
+            GuardianReply::Spawned {
+                pane_id: spawned,
+                generation: 0
+            } if spawned == pane_id
+        ),
+        "guardian returned an unexpected replay-wait spawn receipt"
+    );
+    anyhow::ensure!(
+        matches!(
+            client.claim(pane_id, 0, Uuid::new_v4(), Uuid::new_v4())?,
+            GuardianReply::Claimed {
+                pane_id: claimed,
+                generation: 1,
+                next_sequence: 1
+            } if claimed == pane_id
+        ),
+        "guardian returned an unexpected replay-wait claim receipt"
+    );
+
+    let checkpoint_id = GuardianCheckpointIdentityDigest::from_bytes([0x6a; 32])?;
+    let emit = thread::spawn({
+        let emit_path = emit_path.clone();
+        move || {
+            thread::sleep(Duration::from_millis(75));
+            write_new_file(&emit_path, b"emit")
+        }
+    });
+    let wake_started = Instant::now();
+    let wake_result = client.replay(
+        pane_id,
+        1,
+        Uuid::new_v4(),
+        GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id,
+                next_sequence: 1,
+                previous_record_digest: [0; 32],
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 16,
+            wait_millis: 1_000,
+        },
+    );
+    let wake_elapsed = wake_started.elapsed();
+    emit.join()
+        .map_err(|_| anyhow::anyhow!("replay emit helper panicked"))??;
+    anyhow::ensure!(
+        matches!(
+            wake_result,
+            Err(GuardianClientError::Rejected(
+                GuardianRejectionCode::InvalidRequest
+            ))
+        ),
+        "the synthetic checkpoint must fail only after the durable-output wake"
+    );
+    anyhow::ensure!(
+        wake_elapsed >= Duration::from_millis(25) && wake_elapsed < Duration::from_millis(900),
+        "durable output did not release the server-held replay before its deadline: {wake_elapsed:?}"
+    );
+    anyhow::ensure!(
+        wait_until(Duration::from_secs(2), || {
+            census_entry(&mut client, pane_id).is_some_and(|entry| entry.next_sequence == Some(2))
+        }),
+        "the replay wake was not backed by sequence-1 durable output"
+    );
+
+    let deadline_started = Instant::now();
+    let deadline_result = client.replay(
+        pane_id,
+        1,
+        Uuid::new_v4(),
+        GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id,
+                next_sequence: 2,
+                previous_record_digest: [0x6b; 32],
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 16,
+            wait_millis: 200,
+        },
+    );
+    let deadline_elapsed = deadline_started.elapsed();
+    anyhow::ensure!(
+        matches!(
+            deadline_result,
+            Err(GuardianClientError::Rejected(
+                GuardianRejectionCode::InvalidRequest
+            ))
+        ),
+        "the synthetic checkpoint must reach its canonical rejection at the wait deadline"
+    );
+    anyhow::ensure!(
+        deadline_elapsed >= Duration::from_millis(150) && deadline_elapsed < Duration::from_secs(2),
+        "replay deadline was not bounded by the authenticated wait: {deadline_elapsed:?}"
+    );
+
+    write_new_file(&release_path, b"release")?;
+    anyhow::ensure!(
+        wait_until(Duration::from_secs(3), || {
+            census_status(&mut client, pane_id).is_some_and(|(status, generation)| {
+                status == GuardianCensusPaneStatus::ExitedUnclaimed && generation == 1
+            })
+        }),
+        "replay-wait child did not reach a terminal unclaimed state"
+    );
+    anyhow::ensure!(
+        matches!(
+            client.close(pane_id, 1, 0, Uuid::new_v4(), Uuid::new_v4())?,
+            GuardianReply::MutationApplied {
+                pane_id: closed,
+                generation: 1,
+                sequence: 0
+            } if closed == pane_id
+        ),
+        "guardian returned an unexpected replay-wait close receipt"
+    );
+    client.guarded_stop(Uuid::new_v4(), Uuid::new_v4())?;
+    service_thread
+        .handle
+        .take()
+        .expect("service thread handle remains present")
+        .join()
+        .map_err(|_| anyhow::anyhow!("guardian service thread panicked"))??;
     Ok(())
 }
 
@@ -302,15 +491,19 @@ fn census_status(
     client: &mut GuardianClient,
     pane_id: Uuid,
 ) -> Option<(GuardianCensusPaneStatus, u64)> {
+    census_entry(client, pane_id).map(|entry| (entry.status, entry.generation))
+}
+
+fn census_entry(
+    client: &mut GuardianClient,
+    pane_id: Uuid,
+) -> Option<mux::guardian_protocol::GuardianCensusEntry> {
     let page =
         GuardianCensusPageRequest::new(Uuid::nil(), 0, 16, GUARDIAN_MAX_CENSUS_BYTES).ok()?;
     let GuardianReply::CensusPage { entries, .. } = client.census(page).ok()? else {
         return None;
     };
-    entries
-        .into_iter()
-        .find(|entry| entry.pane_id == pane_id)
-        .map(|entry| (entry.status, entry.generation))
+    entries.into_iter().find(|entry| entry.pane_id == pane_id)
 }
 
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
