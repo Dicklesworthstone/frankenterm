@@ -6,6 +6,7 @@ use crate::output::{
     GuardianPaneInputTransaction, GuardianPaneInputTransactionError, GuardianPaneOutputJournal,
     OUTPUT_RECORD_BYTES,
 };
+use crate::transport::GuardianTokenEffectLease;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mio::Waker;
 use mio::unix::SourceFd;
@@ -81,12 +82,14 @@ pub struct GuardianRuntimeCounters {
     pub input_retryable_capacity_closes: u64,
     pub input_worker_disconnects: u64,
     pub input_worker_panics: u64,
+    pub input_token_authority_failures: u64,
     pub checkpoint_activation_rejections: u64,
     pub checkpoint_transactions_submitted: u64,
     pub checkpoint_transactions_completed: u64,
     pub checkpoint_retryable_capacity_closes: u64,
     pub checkpoint_worker_disconnects: u64,
     pub checkpoint_worker_panics: u64,
+    pub checkpoint_token_authority_failures: u64,
     pub pty_bytes_drained: u64,
     pub pty_bytes_durably_committed: u64,
     pub pty_records_durably_committed: u64,
@@ -332,6 +335,22 @@ impl Drop for OwnedInputRequest {
     }
 }
 
+enum WorkerTokenEffectAuthority {
+    Held(GuardianTokenEffectLease),
+    #[cfg(test)]
+    TestOnlyBypass,
+}
+
+impl WorkerTokenEffectAuthority {
+    fn validate(&mut self) -> bool {
+        match self {
+            Self::Held(lease) => lease.validate().is_ok(),
+            #[cfg(test)]
+            Self::TestOnlyBypass => true,
+        }
+    }
+}
+
 struct InputJob {
     route: GuardianInputRoute,
     pane_id: Uuid,
@@ -339,6 +358,7 @@ struct InputJob {
     writer: Box<dyn Write + Send>,
     journal: GuardianPaneInputJournal,
     request: OwnedInputRequest,
+    token_effect_authority: WorkerTokenEffectAuthority,
 }
 
 struct InputJobExecution {
@@ -355,6 +375,7 @@ struct InputWorkerCompletion {
     response: Option<GuardianResponseEnvelope>,
     disposition: Option<GuardianInputDisposition>,
     worker_panicked: bool,
+    token_authority_failed: bool,
 }
 
 enum InputSubmitError {
@@ -435,6 +456,7 @@ struct CheckpointJob {
     protocol: GuardianProtocolState,
     request: AuthenticatedGuardianRequest,
     journal: Option<GuardianPaneOutputJournal>,
+    token_effect_authority: WorkerTokenEffectAuthority,
 }
 
 struct CheckpointWorkerCompletion {
@@ -442,6 +464,7 @@ struct CheckpointWorkerCompletion {
     protocol: GuardianProtocolState,
     response: Option<GuardianResponseEnvelope>,
     worker_panicked: bool,
+    token_authority_failed: bool,
 }
 
 enum CheckpointSubmitError {
@@ -529,20 +552,26 @@ fn checkpoint_worker(
     completion_waker: Arc<Waker>,
 ) {
     while let Ok(mut job) = jobs.recv() {
-        let execution =
-            catch_guardian_checkpoint_worker_panic(|| execute_checkpoint_job(&store, &mut job));
+        let authority_valid_before = job.token_effect_authority.validate();
+        let execution = authority_valid_before.then(|| {
+            catch_guardian_checkpoint_worker_panic(|| execute_checkpoint_job(&store, &mut job))
+        });
+        let authority_valid_after = job.token_effect_authority.validate();
+        let token_authority_failed = !authority_valid_before || !authority_valid_after;
         // Response correlation validates against the authenticated request, so
         // build it first. Then wipe plaintext before publishing any completion.
         job.request.zeroize_payload();
         let (response, worker_panicked) = match execution {
-            Ok(response) => (response, false),
-            Err(_) => (None, true),
+            Some(Ok(response)) if !token_authority_failed => (response, false),
+            Some(Ok(_)) | None => (None, false),
+            Some(Err(_)) => (None, true),
         };
         let completion = CheckpointWorkerCompletion {
             route: job.route,
             protocol: job.protocol,
             response,
             worker_panicked,
+            token_authority_failed,
         };
         if completions.send(completion).is_err() {
             return;
@@ -637,13 +666,20 @@ fn input_worker(
     completion_waker: Arc<Waker>,
 ) {
     while let Ok(mut job) = jobs.recv() {
-        let execution = catch_guardian_input_worker_panic(|| execute_input_job(&mut job));
+        let authority_valid_before = job.token_effect_authority.validate();
+        let execution = authority_valid_before
+            .then(|| catch_guardian_input_worker_panic(|| execute_input_job(&mut job)));
+        let authority_valid_after = job.token_effect_authority.validate();
+        let token_authority_failed = !authority_valid_before || !authority_valid_after;
         // The catch boundary retains the outer job even if a writer or journal
         // panics.  Wipe plaintext before publishing any content-free result.
         job.request.zeroize_payload();
         let (response, disposition, worker_panicked) = match execution {
-            Ok(execution) => (execution.response, execution.disposition, false),
-            Err(_) => (None, None, true),
+            Some(Ok(execution)) if !token_authority_failed => {
+                (execution.response, execution.disposition, false)
+            }
+            Some(Ok(_)) | None => (None, None, false),
+            Some(Err(_)) => (None, None, true),
         };
         let completion = InputWorkerCompletion {
             route: job.route,
@@ -654,6 +690,7 @@ fn input_worker(
             response,
             disposition,
             worker_panicked,
+            token_authority_failed,
         };
         if completions.send(completion).is_err() {
             return;
@@ -1009,10 +1046,33 @@ impl GuardianRuntime {
     /// Transfer the one global protocol authority and target pane's input
     /// handles to the fixed worker. Saturation closes retryably without a
     /// response; it never fabricates a terminal rejection and never writes.
+    pub(crate) fn submit_input_with_token_lease(
+        &mut self,
+        request: AuthenticatedGuardianRequest,
+        route: GuardianInputRoute,
+        token_effect_lease: GuardianTokenEffectLease,
+    ) -> GuardianInputSubmission {
+        self.submit_input_with_authority(
+            request,
+            route,
+            WorkerTokenEffectAuthority::Held(token_effect_lease),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn submit_input(
         &mut self,
         request: AuthenticatedGuardianRequest,
         route: GuardianInputRoute,
+    ) -> GuardianInputSubmission {
+        self.submit_input_with_authority(request, route, WorkerTokenEffectAuthority::TestOnlyBypass)
+    }
+
+    fn submit_input_with_authority(
+        &mut self,
+        request: AuthenticatedGuardianRequest,
+        route: GuardianInputRoute,
+        token_effect_authority: WorkerTokenEffectAuthority,
     ) -> GuardianInputSubmission {
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut request = OwnedInputRequest::new(request);
@@ -1089,6 +1149,7 @@ impl GuardianRuntime {
             writer,
             journal,
             request,
+            token_effect_authority,
         };
         match self.input_pipeline.try_submit(job) {
             Ok(()) => {
@@ -1119,10 +1180,37 @@ impl GuardianRuntime {
     /// Seal can reach storage only beside the process-local journal authority
     /// for its authenticated pane; Checkpoint adoption consumes its typed
     /// mutation permit on the same worker. Ack and Genesis remain fail-closed.
+    pub(crate) fn submit_checkpoint_with_token_lease(
+        &mut self,
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+        token_effect_lease: GuardianTokenEffectLease,
+    ) -> GuardianCheckpointSubmission {
+        self.submit_checkpoint_with_authority(
+            request,
+            route,
+            WorkerTokenEffectAuthority::Held(token_effect_lease),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn submit_checkpoint(
+        &mut self,
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+    ) -> GuardianCheckpointSubmission {
+        self.submit_checkpoint_with_authority(
+            request,
+            route,
+            WorkerTokenEffectAuthority::TestOnlyBypass,
+        )
+    }
+
+    fn submit_checkpoint_with_authority(
         &mut self,
         mut request: AuthenticatedGuardianRequest,
         route: GuardianCheckpointRoute,
+        token_effect_authority: WorkerTokenEffectAuthority,
     ) -> GuardianCheckpointSubmission {
         if !matches!(
             request.header().operation,
@@ -1162,6 +1250,7 @@ impl GuardianRuntime {
             protocol,
             request,
             journal,
+            token_effect_authority,
         };
         match self.checkpoint_pipeline.try_submit(job) {
             Ok(()) => {
@@ -1252,6 +1341,12 @@ impl GuardianRuntime {
                 }
                 self.counters.input_transactions_completed =
                     self.counters.input_transactions_completed.saturating_add(1);
+                if completion.token_authority_failed {
+                    self.counters.input_token_authority_failures = self
+                        .counters
+                        .input_token_authority_failures
+                        .saturating_add(1);
+                }
                 if completion.worker_panicked {
                     // The outer job bundle survived, but a panic can leave an
                     // inner protocol/journal/writer operation at an unknown
@@ -1315,6 +1410,12 @@ impl GuardianRuntime {
                     .counters
                     .checkpoint_transactions_completed
                     .saturating_add(1);
+                if completion.token_authority_failed {
+                    self.counters.checkpoint_token_authority_failures = self
+                        .counters
+                        .checkpoint_token_authority_failures
+                        .saturating_add(1);
+                }
                 if completion.worker_panicked {
                     self.counters.checkpoint_worker_panics =
                         self.counters.checkpoint_worker_panics.saturating_add(1);
@@ -2898,7 +2999,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing input-worker boundary: {needle}"))
         };
         let worker_boundaries = [
+            worker_boundary("let authority_valid_before"),
             worker_boundary("catch_guardian_input_worker_panic"),
+            worker_boundary("let authority_valid_after"),
             worker_boundary("job.request.zeroize_payload();"),
             worker_boundary("let completion = InputWorkerCompletion"),
             worker_boundary("completions.send(completion)"),
@@ -2943,7 +3046,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing checkpoint-worker boundary: {needle}"))
         };
         let worker_boundaries = [
+            worker_boundary("let authority_valid_before"),
             worker_boundary("catch_guardian_checkpoint_worker_panic"),
+            worker_boundary("let authority_valid_after"),
             worker_boundary("job.request.zeroize_payload();"),
             worker_boundary("let completion = CheckpointWorkerCompletion"),
             worker_boundary("completions.send(completion)"),
@@ -3240,6 +3345,7 @@ mod tests {
                 writer,
                 journal,
                 request,
+                token_effect_authority: WorkerTokenEffectAuthority::TestOnlyBypass,
             }
         }
 
@@ -3322,6 +3428,75 @@ mod tests {
         assert!(rejected_probe.drop_wipe.load(Ordering::SeqCst));
 
         release_tx.send(()).expect("release worker-held job");
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn input_worker_retains_token_effect_lease_through_the_external_write() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(BlockingWriter {
+                calls: Arc::clone(&calls),
+                entered: entered_tx,
+                release: release_rx,
+            }));
+        let token_path = directory.join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision runtime token authority");
+        let (_secret, mut token_authority) =
+            crate::transport::load_guardian_secret_with_authority(&token_path)
+                .expect("load runtime token authority");
+        let request = authenticated_input_request_for(
+            Uuid::from_u128(221),
+            pane_id,
+            Uuid::from_u128(222),
+            b"effect-lease-held",
+        );
+        let route = input_route(17, 1, &request);
+        let lease = token_authority
+            .acquire_effect_lease()
+            .expect("acquire input effect lease");
+        assert!(matches!(
+            runtime.submit_input_with_token_lease(request, route, lease),
+            GuardianInputSubmission::Pending
+        ));
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("input worker reached external write");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe cooperative token publication while write is blocked"),
+            "exclusive token publication crossed the worker-owned effect lease"
+        );
+
+        release_tx.send(()).expect("release input worker write");
+        let completion = wait_for_input_completion(&mut runtime);
+        assert!(completion.response.is_some());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe cooperative token publication after completion")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker completion did not release its token effect lease"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(runtime.counters().input_token_authority_failures, 0);
     }
 
     fn input_reply_state(response: &GuardianResponseEnvelope) -> InputEffectState {

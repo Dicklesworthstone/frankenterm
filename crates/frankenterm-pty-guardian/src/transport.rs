@@ -45,6 +45,8 @@ const MAX_TOTAL_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const TOKEN_PUBLICATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const TOKEN_PUBLICATION_LOCK_RETRY: Duration = Duration::from_millis(10);
 const TOKEN_STAGE_COMMIT_MAGIC: [u8; 4] = *b"FTGC";
 const TOKEN_STAGE_COMMIT_BYTES: usize = TOKEN_STAGE_COMMIT_MAGIC.len() + 32;
 
@@ -559,6 +561,159 @@ impl SocketPathAuthority {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuardianTokenPathIdentity {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    mode: u32,
+    owner: u32,
+    links: u64,
+}
+
+/// Retained descriptor authority over the exact active guardian token.
+///
+/// Loading token bytes once is insufficient for a long-lived service: a
+/// pathname replacement could otherwise leave the listener authenticating
+/// with an authority that new clients can no longer discover. This proof pins
+/// both the owner-only parent and token descriptors, the exact leaf binding,
+/// and the original high-entropy material digest for the service lifetime.
+pub(crate) struct GuardianTokenPathAuthority {
+    parent: File,
+    token: File,
+    token_path: PathBuf,
+    leaf_name: OsString,
+    identity: GuardianTokenPathIdentity,
+    material_digest: [u8; 32],
+}
+
+impl GuardianTokenPathAuthority {
+    pub(crate) fn validate(&mut self) -> Result<(), GuardianServiceError> {
+        validate_guardian_token_authority(
+            &self.parent,
+            &mut self.token,
+            &self.token_path,
+            &self.leaf_name,
+            self.identity,
+            self.material_digest,
+        )
+    }
+
+    pub(crate) fn acquire_effect_lease(
+        &mut self,
+    ) -> Result<GuardianTokenEffectLease, GuardianServiceError> {
+        self.validate()?;
+        let parent = open_private_parent(&self.token_path)?;
+        let retained_parent_metadata = self.parent.metadata().map_err(|error| {
+            GuardianServiceError::io("token-effect-retained-parent-metadata-before-lock", error)
+        })?;
+        let lease_parent_metadata = parent.metadata().map_err(|error| {
+            GuardianServiceError::io("token-effect-lease-parent-metadata-before-lock", error)
+        })?;
+        require_same_object(&retained_parent_metadata, &lease_parent_metadata)?;
+        lock_guardian_token_effect_parent_shared(&parent)
+            .map_err(|error| GuardianServiceError::io("token-effect-parent-lock", error))?;
+        let mut lease = GuardianTokenEffectLease {
+            parent,
+            token: open_private_file_read_at(&self.parent, &self.leaf_name)
+                .map_err(|error| nofollow_open_error("token-effect-open", error))?,
+            token_path: self.token_path.clone(),
+            leaf_name: self.leaf_name.clone(),
+            identity: self.identity,
+            material_digest: self.material_digest,
+            locked: true,
+        };
+        let retained_parent_metadata = self.parent.metadata().map_err(|error| {
+            GuardianServiceError::io("token-effect-retained-parent-metadata-after-lock", error)
+        })?;
+        let lease_parent_metadata = lease.parent.metadata().map_err(|error| {
+            GuardianServiceError::io("token-effect-lease-parent-metadata-after-lock", error)
+        })?;
+        require_same_object(&retained_parent_metadata, &lease_parent_metadata)?;
+        self.validate()?;
+        lease.validate()?;
+        Ok(lease)
+    }
+}
+
+/// Single-use, independently locked token authority retained through one
+/// authenticated effect. Cooperative token publication takes the exclusive
+/// lock on this exact parent, so rotation cannot cross request decode, durable
+/// intent, external mutation, or terminal state publication.
+pub(crate) struct GuardianTokenEffectLease {
+    parent: File,
+    token: File,
+    token_path: PathBuf,
+    leaf_name: OsString,
+    identity: GuardianTokenPathIdentity,
+    material_digest: [u8; 32],
+    locked: bool,
+}
+
+impl GuardianTokenEffectLease {
+    pub(crate) fn validate(&mut self) -> Result<(), GuardianServiceError> {
+        validate_guardian_token_authority(
+            &self.parent,
+            &mut self.token,
+            &self.token_path,
+            &self.leaf_name,
+            self.identity,
+            self.material_digest,
+        )
+    }
+}
+
+impl Drop for GuardianTokenEffectLease {
+    fn drop(&mut self) {
+        if self.locked {
+            let _ = unlock_guardian_token_parent(&self.parent);
+            self.locked = false;
+        }
+    }
+}
+
+fn validate_guardian_token_authority(
+    parent: &File,
+    token: &mut File,
+    token_path: &Path,
+    leaf_name: &OsStr,
+    identity: GuardianTokenPathIdentity,
+    material_digest: [u8; 32],
+) -> Result<(), GuardianServiceError> {
+    validate_pinned_private_parent(token_path, parent)?;
+    let before = token
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("token-authority-metadata-before", error))?;
+    let before_identity = guardian_token_path_identity(&before)?;
+    require_same_guardian_token_path_identity(identity, before_identity)?;
+    require_descriptor_relative_binding(
+        parent,
+        leaf_name,
+        &before,
+        validate_token_metadata,
+        "token-authority-binding-before",
+    )?;
+    if token_material_digest(token)? != material_digest {
+        return Err(GuardianServiceError::FilesystemSecurity(
+            "guardian token material changed after authority was loaded",
+        ));
+    }
+    let after = token
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("token-authority-metadata-after", error))?;
+    let after_identity = guardian_token_path_identity(&after)?;
+    require_same_guardian_token_path_identity(identity, after_identity)?;
+    require_same_guardian_token_path_identity(before_identity, after_identity)?;
+    require_descriptor_relative_binding(
+        parent,
+        leaf_name,
+        &after,
+        validate_token_metadata,
+        "token-authority-binding-after",
+    )?;
+    validate_pinned_private_parent(token_path, parent)
+}
+
 fn preflight_private_unix_listener_path(path: &Path) -> Result<(), GuardianServiceError> {
     validate_absolute_path(path)?;
     validate_private_parent(path)?;
@@ -657,6 +812,7 @@ pub struct GuardianService {
     ready: Vec<ReadyEvent>,
     listener: UnixListener,
     socket_authority: SocketPathAuthority,
+    token_authority: GuardianTokenPathAuthority,
     secret: GuardianSecret,
     runtime: GuardianRuntime,
     connections: HashMap<Token, Connection>,
@@ -674,7 +830,8 @@ impl GuardianService {
         validate_private_parent(&config.socket_path)?;
         validate_private_parent(&config.token_path)?;
         preflight_private_unix_listener_path(&config.socket_path)?;
-        let secret = load_guardian_secret(&config.token_path)?;
+        let (secret, mut token_authority) =
+            load_guardian_secret_with_authority(&config.token_path)?;
 
         let poll = Poll::new().map_err(|error| GuardianServiceError::io("poll-create", error))?;
         // Connection tokens are recycled, while PTY tokens are deliberately
@@ -702,6 +859,7 @@ impl GuardianService {
             Arc::clone(&output_completion_waker),
         )
         .map_err(|_| GuardianServiceError::OutputInitialization)?;
+        token_authority.validate()?;
         let runtime = GuardianRuntime::new(
             poll.registry()
                 .try_clone()
@@ -744,7 +902,9 @@ impl GuardianService {
         // all endpoint allocations exist. A post-bind permission or
         // registration failure deliberately leaves the socket in place for
         // operator inspection; this process never unlinks an existing path.
+        token_authority.validate()?;
         let (mut listener, socket_authority) = bind_private_unix_listener(&config.socket_path)?;
+        token_authority.validate()?;
         poll.registry()
             .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)
             .map_err(|error| GuardianServiceError::io("listener-register", error))?;
@@ -755,6 +915,7 @@ impl GuardianService {
             ready,
             listener,
             socket_authority,
+            token_authority,
             secret,
             runtime,
             connections,
@@ -841,12 +1002,14 @@ impl GuardianService {
         if self.lifecycle == GuardianLifecycle::ExitReady {
             return Ok(());
         }
+        self.token_authority.validate()?;
         self.socket_authority.validate()?;
         match self.poll.poll(&mut self.events, Some(self.poll_interval)) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(()),
             Err(error) => return Err(GuardianServiceError::io("readiness-poll", error)),
         }
+        self.token_authority.validate()?;
 
         self.ready.clear();
         for event in &self.events {
@@ -916,6 +1079,7 @@ impl GuardianService {
     }
 
     fn accept_connections(&mut self) -> Result<(), GuardianServiceError> {
+        self.token_authority.validate()?;
         self.socket_authority.validate()?;
         loop {
             let (mut stream, _) = match self.listener.accept() {
@@ -927,6 +1091,7 @@ impl GuardianService {
                     break;
                 }
             };
+            self.token_authority.validate()?;
             self.socket_authority.validate()?;
             if self.lifecycle != GuardianLifecycle::Running {
                 continue;
@@ -1129,10 +1294,23 @@ impl GuardianService {
         connection: &mut Connection,
         frame: &[u8],
     ) -> FrameProcessing {
+        let Ok(effect_lease) = self.token_authority.acquire_effect_lease() else {
+            self.transport_failures = self.transport_failures.saturating_add(1);
+            return FrameProcessing::Close;
+        };
         let Ok(request) = decode_guardian_request(&self.secret, frame) else {
             return FrameProcessing::Close;
         };
-        self.process_authenticated_frame(token, connection, request)
+        let mut effect_lease = Some(effect_lease);
+        let processing =
+            self.process_authenticated_frame(token, connection, request, &mut effect_lease);
+        if let Some(effect_lease) = effect_lease.as_mut()
+            && effect_lease.validate().is_err()
+        {
+            self.transport_failures = self.transport_failures.saturating_add(1);
+            return FrameProcessing::Close;
+        }
+        processing
     }
 
     fn process_authenticated_frame(
@@ -1140,6 +1318,7 @@ impl GuardianService {
         token: Token,
         connection: &mut Connection,
         mut request: AuthenticatedGuardianRequest,
+        effect_lease: &mut Option<GuardianTokenEffectLease>,
     ) -> FrameProcessing {
         if self.lifecycle.request_fence().is_err() {
             connection.close_after_write = true;
@@ -1236,7 +1415,15 @@ impl GuardianService {
                         request.zeroize_payload();
                         return FrameProcessing::Response(response);
                     };
-                    return match self.runtime.submit_input(request, route) {
+                    let Some(effect_lease) = effect_lease.take() else {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    };
+                    return match self.runtime.submit_input_with_token_lease(
+                        request,
+                        route,
+                        effect_lease,
+                    ) {
                         GuardianInputSubmission::Pending => {
                             connection.pending_input = Some(route);
                             FrameProcessing::PendingInput
@@ -1263,7 +1450,15 @@ impl GuardianService {
                         request.zeroize_payload();
                         return FrameProcessing::Response(response);
                     };
-                    return match self.runtime.submit_checkpoint(request, route) {
+                    let Some(effect_lease) = effect_lease.take() else {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    };
+                    return match self.runtime.submit_checkpoint_with_token_lease(
+                        request,
+                        route,
+                        effect_lease,
+                    ) {
                         GuardianCheckpointSubmission::Pending => {
                             connection.pending_checkpoint = Some(route);
                             FrameProcessing::PendingCheckpoint
@@ -2114,6 +2309,8 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
 ) -> Result<ProvisionTokenOutcome, GuardianServiceError> {
     validate_absolute_path(path)?;
     validate_pinned_private_parent(path, parent_authority)?;
+    let _publication_lease = GuardianTokenPublicationLease::acquire(path, parent_authority)?;
+    validate_pinned_private_parent(path, parent_authority)?;
     let active_name = path
         .file_name()
         .ok_or(GuardianServiceError::InvalidConfiguration(
@@ -2179,6 +2376,65 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
             Ok(ProvisionTokenOutcome::Existing)
         }
         Err(error) => Err(GuardianServiceError::io("token-no-replace-publish", error)),
+    }
+}
+
+/// Exclusive cooperative publication authority for one token parent.
+///
+/// The independently opened descriptor avoids converting a caller-owned
+/// shared lock. Its lifetime covers every absence check, staging mutation,
+/// no-replace publication, directory sync, and final active-token validation.
+struct GuardianTokenPublicationLease {
+    parent: File,
+    locked: bool,
+}
+
+impl GuardianTokenPublicationLease {
+    fn acquire(path: &Path, expected_parent: &File) -> Result<Self, GuardianServiceError> {
+        let parent = open_private_parent(path)?;
+        let expected_parent_metadata = expected_parent.metadata().map_err(|error| {
+            GuardianServiceError::io(
+                "token-publication-expected-parent-metadata-before-lock",
+                error,
+            )
+        })?;
+        let publication_parent_metadata = parent.metadata().map_err(|error| {
+            GuardianServiceError::io(
+                "token-publication-independent-parent-metadata-before-lock",
+                error,
+            )
+        })?;
+        require_same_object(&expected_parent_metadata, &publication_parent_metadata)?;
+        lock_guardian_token_publication_parent_exclusive(&parent)
+            .map_err(|error| GuardianServiceError::io("token-publication-parent-lock", error))?;
+        let expected_parent_metadata = expected_parent.metadata().map_err(|error| {
+            GuardianServiceError::io(
+                "token-publication-expected-parent-metadata-after-lock",
+                error,
+            )
+        })?;
+        let publication_parent_metadata = parent.metadata().map_err(|error| {
+            GuardianServiceError::io(
+                "token-publication-independent-parent-metadata-after-lock",
+                error,
+            )
+        })?;
+        require_same_object(&expected_parent_metadata, &publication_parent_metadata)?;
+        validate_pinned_private_parent(path, expected_parent)?;
+        validate_pinned_private_parent(path, &parent)?;
+        Ok(Self {
+            parent,
+            locked: true,
+        })
+    }
+}
+
+impl Drop for GuardianTokenPublicationLease {
+    fn drop(&mut self) {
+        if self.locked {
+            let _ = unlock_guardian_token_parent(&self.parent);
+            self.locked = false;
+        }
     }
 }
 
@@ -2764,6 +3020,178 @@ fn fill_nonzero_secret(
     target_os = "visionos",
     target_os = "watchos",
 ))]
+fn lock_guardian_token_effect_parent_shared(parent: &File) -> std::io::Result<()> {
+    // This runs on the one Mio readiness thread. Token publication is a
+    // retryable control-plane operation and must never suspend every pane by
+    // holding the parent exclusively, even if that publisher is wedged.
+    rustix::fs::flock(parent, rustix::fs::FlockOperation::NonBlockingLockShared)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn lock_guardian_token_effect_parent_shared(_parent: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "safe guardian token effect locking is unsupported on this Unix target",
+    ))
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn lock_guardian_token_publication_parent_exclusive(parent: &File) -> std::io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(TOKEN_PUBLICATION_LOCK_TIMEOUT)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::TimedOut,
+                "guardian token publication lock deadline overflowed",
+            )
+        })?;
+    lock_guardian_token_publication_parent_exclusive_before(parent, deadline)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn lock_guardian_token_publication_parent_exclusive_before(
+    parent: &File,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    loop {
+        match rustix::fs::flock(parent, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let error = std::io::Error::from(error);
+                if error.kind() != ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "guardian token publication lock acquisition timed out",
+                    ));
+                }
+                std::thread::sleep(TOKEN_PUBLICATION_LOCK_RETRY);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn lock_guardian_token_publication_parent_exclusive(_parent: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "safe guardian token publication locking is unsupported on this Unix target",
+    ))
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn unlock_guardian_token_parent(parent: &File) -> std::io::Result<()> {
+    rustix::fs::flock(parent, rustix::fs::FlockOperation::Unlock).map_err(std::io::Error::from)
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    )
+))]
+pub(crate) fn guardian_token_publication_lock_is_available(
+    token_path: &Path,
+) -> Result<bool, GuardianServiceError> {
+    let parent = open_private_parent(token_path)?;
+    match rustix::fs::flock(
+        &parent,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    ) {
+        Ok(()) => {
+            unlock_guardian_token_parent(&parent).map_err(|error| {
+                GuardianServiceError::io("token-publication-test-unlock", error)
+            })?;
+            Ok(true)
+        }
+        Err(error) => {
+            let error = std::io::Error::from(error);
+            if error.kind() == ErrorKind::WouldBlock {
+                Ok(false)
+            } else {
+                Err(GuardianServiceError::io(
+                    "token-publication-test-lock",
+                    error,
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn unlock_guardian_token_parent(_parent: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "safe guardian token unlocking is unsupported on this Unix target",
+    ))
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
 fn lock_token_stage(file: &std::fs::File) -> std::io::Result<()> {
     rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
         .map_err(std::io::Error::from)
@@ -3175,17 +3603,34 @@ pub(crate) fn validate_existing_socket(path: &Path) -> Result<(), GuardianServic
 }
 
 pub(crate) fn load_guardian_secret(path: &Path) -> Result<GuardianSecret, GuardianServiceError> {
+    let (secret, _authority) = load_guardian_secret_with_authority(path)?;
+    Ok(secret)
+}
+
+pub(crate) fn load_guardian_secret_with_authority(
+    path: &Path,
+) -> Result<(GuardianSecret, GuardianTokenPathAuthority), GuardianServiceError> {
     let parent = open_private_parent(path)?;
     let name = path
         .file_name()
         .ok_or(GuardianServiceError::InvalidConfiguration(
             "guardian token path has no file name",
         ))?;
-    let file = open_private_file_read_at(&parent, name)
+    let mut file = open_private_file_read_at(&parent, name)
         .map_err(|error| nofollow_open_error("token-open", error))?;
-    let secret = load_guardian_secret_from_open_file_at(&parent, name, file)?;
+    let (secret, identity, material_digest) =
+        read_guardian_secret_from_open_file_at(&parent, name, &mut file)?;
     validate_pinned_private_parent(path, &parent)?;
-    Ok(secret)
+    let mut authority = GuardianTokenPathAuthority {
+        parent,
+        token: file,
+        token_path: path.to_path_buf(),
+        leaf_name: name.to_os_string(),
+        identity,
+        material_digest,
+    };
+    authority.validate()?;
+    Ok((secret, authority))
 }
 
 fn load_guardian_secret_from_open_file_at(
@@ -3193,6 +3638,15 @@ fn load_guardian_secret_from_open_file_at(
     name: &OsStr,
     mut file: File,
 ) -> Result<GuardianSecret, GuardianServiceError> {
+    let (secret, _, _) = read_guardian_secret_from_open_file_at(parent, name, &mut file)?;
+    Ok(secret)
+}
+
+fn read_guardian_secret_from_open_file_at(
+    parent: &File,
+    name: &OsStr,
+    file: &mut File,
+) -> Result<(GuardianSecret, GuardianTokenPathIdentity, [u8; 32]), GuardianServiceError> {
     let opened = file
         .metadata()
         .map_err(|error| GuardianServiceError::io("token-opened-metadata", error))?;
@@ -3226,7 +3680,10 @@ fn load_guardian_secret_from_open_file_at(
         validate_token_metadata,
         "token-final-binding-open",
     )?;
-    GuardianSecret::from_bytes(*bytes).map_err(GuardianServiceError::from)
+    let identity = guardian_token_path_identity(&after_open)?;
+    let material_digest = Sha256::digest(bytes.as_slice()).into();
+    let secret = GuardianSecret::from_bytes(*bytes).map_err(GuardianServiceError::from)?;
+    Ok((secret, identity, material_digest))
 }
 
 fn validate_token_metadata(metadata: &Metadata) -> Result<(), GuardianServiceError> {
@@ -3238,6 +3695,32 @@ fn validate_token_metadata(metadata: &Metadata) -> Result<(), GuardianServiceErr
     {
         return Err(GuardianServiceError::FilesystemSecurity(
             "guardian token must be a current-user, mode-0600, single-link 32-byte regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn guardian_token_path_identity(
+    metadata: &Metadata,
+) -> Result<GuardianTokenPathIdentity, GuardianServiceError> {
+    validate_token_metadata(metadata)?;
+    Ok(GuardianTokenPathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+        mode: metadata.mode(),
+        owner: metadata.uid(),
+        links: metadata.nlink(),
+    })
+}
+
+fn require_same_guardian_token_path_identity(
+    expected: GuardianTokenPathIdentity,
+    observed: GuardianTokenPathIdentity,
+) -> Result<(), GuardianServiceError> {
+    if expected != observed {
+        return Err(GuardianServiceError::FilesystemSecurity(
+            "guardian token descriptor identity drifted after authority was loaded",
         ));
     }
     Ok(())
@@ -3275,6 +3758,7 @@ fn require_same_object(left: &Metadata, right: &Metadata) -> Result<(), Guardian
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::SeekFrom;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     fn authority(connection: usize, request: u128, effect: u128) -> GuardedStopAuthority {
@@ -4074,6 +4558,211 @@ mod tests {
 
         assert!(authority.validate().is_err());
         assert!(retained_socket.exists());
+    }
+
+    fn retained_token_authority_fixture(
+        label: &str,
+    ) -> (PathBuf, Vec<u8>, GuardianTokenPathAuthority) {
+        let canonical_temp = crate::canonical_test_temp_root();
+        let prefix = format!("frankenterm-guardian-token-authority-{label}-");
+        let directory = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempdir_in(canonical_temp)
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token_path = directory.join("guardian.token");
+        assert_eq!(
+            provision_guardian_token(&token_path).unwrap(),
+            ProvisionTokenOutcome::Created
+        );
+        let original = std::fs::read(&token_path).unwrap();
+        let (_secret, authority) = load_guardian_secret_with_authority(&token_path).unwrap();
+        (token_path, original, authority)
+    }
+
+    fn create_private_token_with_bytes(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn token_effect_lease_blocks_cooperative_publication_until_drop() {
+        let (token_path, _original, mut authority) =
+            retained_token_authority_fixture("effect-lease");
+        assert!(guardian_token_publication_lock_is_available(&token_path).unwrap());
+
+        let mut lease = authority.acquire_effect_lease().unwrap();
+        lease.validate().unwrap();
+        assert!(
+            !guardian_token_publication_lock_is_available(&token_path).unwrap(),
+            "exclusive token publication crossed a live shared effect lease"
+        );
+
+        drop(lease);
+        assert!(
+            guardian_token_publication_lock_is_available(&token_path).unwrap(),
+            "dropping the effect lease did not release publication authority"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn token_effect_and_publication_lock_acquisition_are_bounded() {
+        let (token_path, _original, mut authority) =
+            retained_token_authority_fixture("bounded-lock-acquisition");
+
+        let effect_lease = authority.acquire_effect_lease().unwrap();
+        let publication_parent = open_private_parent(&token_path).unwrap();
+        let publication_started = Instant::now();
+        let publication_error = lock_guardian_token_publication_parent_exclusive_before(
+            &publication_parent,
+            Instant::now() + Duration::from_millis(30),
+        )
+        .expect_err("exclusive publication cannot cross a live effect lease");
+        assert_eq!(publication_error.kind(), ErrorKind::TimedOut);
+        assert!(publication_started.elapsed() < Duration::from_secs(1));
+        drop(effect_lease);
+
+        rustix::fs::flock(
+            &publication_parent,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .expect("hold exclusive publication authority");
+        let effect_started = Instant::now();
+        let effect_error = match authority.acquire_effect_lease() {
+            Err(GuardianServiceError::Io { site, source }) => {
+                assert_eq!(site, "token-effect-parent-lock");
+                source
+            }
+            Err(other) => panic!("unexpected effect-lease error: {other}"),
+            Ok(_) => panic!("shared effect lease crossed exclusive publication authority"),
+        };
+        assert_eq!(effect_error.kind(), ErrorKind::WouldBlock);
+        assert!(effect_started.elapsed() < Duration::from_secs(1));
+        unlock_guardian_token_parent(&publication_parent)
+            .expect("release exclusive publication authority");
+    }
+
+    #[test]
+    fn retained_token_authority_rejects_different_and_same_byte_pathname_replacement() {
+        for same_bytes in [false, true] {
+            let label = if same_bytes { "same" } else { "different" };
+            let (token_path, original, mut authority) = retained_token_authority_fixture(label);
+            let retained = token_path.with_file_name(format!(
+                "guardian-retained-{label}-{}.token",
+                Uuid::new_v4()
+            ));
+            std::fs::rename(&token_path, &retained).unwrap();
+            let mut replacement = original.clone();
+            if !same_bytes {
+                replacement[0] ^= 0x80;
+            }
+            create_private_token_with_bytes(&token_path, &replacement);
+            assert_ne!(
+                std::fs::symlink_metadata(&retained).unwrap().ino(),
+                std::fs::symlink_metadata(&token_path).unwrap().ino()
+            );
+
+            assert!(matches!(
+                authority.validate(),
+                Err(GuardianServiceError::FilesystemSecurity(_))
+            ));
+            assert_eq!(std::fs::read(&retained).unwrap(), original);
+            assert_eq!(std::fs::read(&token_path).unwrap(), replacement);
+        }
+    }
+
+    #[test]
+    fn retained_token_authority_rejects_content_mode_and_link_drift() {
+        let (content_path, original, mut content_authority) =
+            retained_token_authority_fixture("content");
+        let mut mutated = original.clone();
+        mutated[0] ^= 0x40;
+        let mut content = OpenOptions::new().write(true).open(&content_path).unwrap();
+        content.seek(SeekFrom::Start(0)).unwrap();
+        content.write_all(&mutated).unwrap();
+        content.sync_all().unwrap();
+        assert!(matches!(
+            content_authority.validate(),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
+
+        let (mode_path, _, mut mode_authority) = retained_token_authority_fixture("mode");
+        std::fs::set_permissions(&mode_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            mode_authority.validate(),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
+
+        let (link_path, original, mut link_authority) = retained_token_authority_fixture("link");
+        let retained_link = link_path.with_file_name(format!(
+            "guardian-authority-hard-link-{}.token",
+            Uuid::new_v4()
+        ));
+        std::fs::hard_link(&link_path, &retained_link).unwrap();
+        assert!(matches!(
+            link_authority.validate(),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
+        assert_eq!(std::fs::read(&retained_link).unwrap(), original);
+    }
+
+    #[test]
+    fn token_identity_comparison_rejects_owner_drift_without_privileged_chown() {
+        let (_path, _bytes, authority) = retained_token_authority_fixture("owner-identity");
+        let mut wrong_owner = authority.identity;
+        wrong_owner.owner = wrong_owner.owner.wrapping_add(1);
+        assert!(matches!(
+            require_same_guardian_token_path_identity(authority.identity, wrong_owner),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
+    }
+
+    #[test]
+    fn retained_token_authority_rejects_parent_path_replacement() {
+        let (token_path, original, mut authority) = retained_token_authority_fixture("parent");
+        let parent = token_path.parent().unwrap().to_path_buf();
+        let retained_parent = parent.with_file_name(format!(
+            "guardian-token-authority-retained-parent-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::rename(&parent, &retained_parent).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        create_private_token_with_bytes(&token_path, &original);
+
+        assert!(matches!(
+            authority.validate(),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
+        assert_eq!(
+            std::fs::read(retained_parent.join("guardian.token")).unwrap(),
+            original
+        );
     }
 
     #[test]
