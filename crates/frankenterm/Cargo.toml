@@ -72,6 +72,7 @@ asupersync = { workspace = true, features = ["tls"] }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "user"] }
 rustix.workspace = true
+tempfile.workspace = true
 
 # [round8 Windows port] openssl-sys reaches the `ft` build transitively via
 # frankenterm-ssh -> libssh-rs (config depends on frankenterm-ssh
@@ -144,4 +145,3 @@ jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
 assert_cmd = "2.2.2"
 memchr.workspace = true
 predicates = "3.1.4"
-tempfile = "3.27.0"

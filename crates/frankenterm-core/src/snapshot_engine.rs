@@ -3234,7 +3234,17 @@ impl SnapshotEngine {
         Fut: std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
     {
         match pane_provider().await {
-            Ok(panes) => match self.capture(&panes, trigger).await {
+            Ok(panes) => match self
+                .capture_with_options(
+                    &panes,
+                    trigger,
+                    SnapshotCaptureOptions {
+                        include_scrollback: true,
+                        metadata: None,
+                    },
+                )
+                .await
+            {
                 Ok(result) => {
                     tracing::info!(
                         trigger = ?trigger,
@@ -3348,7 +3358,18 @@ impl SnapshotEngine {
         }
 
         match pane_provider().await {
-            Ok(panes) => match self.capture_with_cx(cx, &panes, trigger).await {
+            Ok(panes) => match self
+                .capture_with_options_with_cx(
+                    cx,
+                    &panes,
+                    trigger,
+                    SnapshotCaptureOptions {
+                        include_scrollback: true,
+                        metadata: None,
+                    },
+                )
+                .await
+            {
                 Ok(result) => {
                     tracing::info!(
                         trigger = ?trigger,
@@ -4173,7 +4194,10 @@ impl SnapshotEngine {
                     cx,
                     panes,
                     SnapshotTrigger::Shutdown,
-                    SnapshotCaptureOptions::default(),
+                    SnapshotCaptureOptions {
+                        include_scrollback: true,
+                        metadata: None,
+                    },
                     Some(&reservation),
                 )
                 .await?;
@@ -6766,6 +6790,9 @@ pub enum CheckpointScrollbackArtifactError {
     /// Offline semantic verification rejected the artifact.
     #[error("invalid checkpoint scrollback artifact: {0}")]
     InvalidArtifact(String),
+    /// A verified or prepared artifact belongs to a different snapshot result.
+    #[error("checkpoint scrollback artifact identity does not match the requested snapshot result")]
+    CheckpointIdentityMismatch,
     /// No-clobber publication found an existing conflicting target.
     #[error("checkpoint scrollback target already exists")]
     AlreadyExists,
@@ -7015,6 +7042,10 @@ pub struct CheckpointScrollbackArtifactReceipt {
     pub capabilities: CheckpointScrollbackCapabilities,
     /// Exact checkpoint row identity.
     pub checkpoint_id: i64,
+    /// Exact parent mux-session identity proven by the artifact payload.
+    pub session_id: String,
+    /// Exact checkpoint role proven by the artifact payload.
+    pub checkpoint_role: String,
     /// Exact checkpoint state witness.
     pub checkpoint_state_hash: String,
     /// Deterministic checkpoint-bound publication timestamp in epoch milliseconds.
@@ -7035,6 +7066,102 @@ pub struct CheckpointScrollbackArtifactReceipt {
     pub complete_pane_count: usize,
     /// Publication durability claim.
     pub durability: &'static str,
+}
+
+/// Expected immutable identity for canonical artifact publication or recovery.
+///
+/// Callers exporting an already-existing checkpoint can build this value from
+/// their bounded verified checkpoint query. Post-capture callers should use
+/// [`Self::from_snapshot_result`] or the `SnapshotResult` convenience API.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CheckpointScrollbackArtifactExpectedIdentity {
+    /// Exact SQLite checkpoint row ID.
+    pub checkpoint_id: i64,
+    /// Exact parent mux-session identity.
+    pub session_id: String,
+    /// Exact checkpoint timestamp in epoch milliseconds.
+    pub checkpoint_at: u64,
+    /// Exact checkpoint role; durable scrollback artifacts currently require `snapshot`.
+    pub checkpoint_role: String,
+    /// Exact verified v2 checkpoint witness.
+    pub checkpoint_state_hash: String,
+    /// Exact checkpoint pane count.
+    pub pane_count: usize,
+}
+
+impl CheckpointScrollbackArtifactExpectedIdentity {
+    /// Build the exact artifact identity returned by a successful live capture.
+    #[must_use]
+    pub fn from_snapshot_result(snapshot: &SnapshotResult) -> Self {
+        Self {
+            checkpoint_id: snapshot.checkpoint_id,
+            session_id: snapshot.session_id.clone(),
+            checkpoint_at: snapshot.checkpoint_at,
+            checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
+            checkpoint_state_hash: snapshot.state_hash.clone(),
+            pane_count: snapshot.pane_count,
+        }
+    }
+}
+
+impl std::fmt::Debug for CheckpointScrollbackArtifactExpectedIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheckpointScrollbackArtifactExpectedIdentity")
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("checkpoint_at", &self.checkpoint_at)
+            .field("checkpoint_role", &self.checkpoint_role)
+            .field("pane_count", &self.pane_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CheckpointScrollbackArtifactReceipt {
+    /// Whether every checkpoint pane has a complete retained scrollback prefix.
+    #[must_use]
+    pub const fn scrollback_complete(&self) -> bool {
+        self.complete_pane_count == self.pane_count
+    }
+
+    /// Number of checkpoint panes with an explicitly incomplete retained prefix.
+    #[must_use]
+    pub const fn incomplete_pane_count(&self) -> usize {
+        self.pane_count.saturating_sub(self.complete_pane_count)
+    }
+}
+
+/// How a canonical checkpoint artifact became durable for this invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointScrollbackArtifactResolution {
+    /// This invocation published the canonical target.
+    Published,
+    /// A prior or concurrent invocation had already published the exact target.
+    RecoveredExisting,
+}
+
+/// Exact result of publishing or recovering one checkpoint artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointScrollbackArtifactPublication {
+    /// Canonical artifact path derived from the requested checkpoint identity.
+    pub path: PathBuf,
+    /// Whether this invocation published or recovered the target.
+    pub resolution: CheckpointScrollbackArtifactResolution,
+    /// Independently verified artifact identity, durability, and coverage truth.
+    pub receipt: CheckpointScrollbackArtifactReceipt,
+}
+
+impl CheckpointScrollbackArtifactPublication {
+    /// Whether every checkpoint pane has a complete retained scrollback prefix.
+    #[must_use]
+    pub const fn scrollback_complete(&self) -> bool {
+        self.receipt.scrollback_complete()
+    }
+
+    /// Number of checkpoint panes with an explicitly incomplete retained prefix.
+    #[must_use]
+    pub const fn incomplete_pane_count(&self) -> usize {
+        self.receipt.incomplete_pane_count()
+    }
 }
 
 /// One verified entry returned by a bounded artifact-directory inventory.
@@ -9793,6 +9920,11 @@ fn publish_checkpoint_artifact_bytes_with_fault(
 struct PreparedCheckpointArtifactPublication {
     bytes: Vec<u8>,
     checkpoint_id: i64,
+    session_id: String,
+    checkpoint_at: u64,
+    checkpoint_role: String,
+    checkpoint_state_hash: String,
+    pane_count: usize,
     payload_sha256: String,
     artifact_sha256: String,
     artifact_bytes: u64,
@@ -9805,6 +9937,11 @@ fn prepare_checkpoint_scrollback_artifact_publication(
 ) -> Result<PreparedCheckpointArtifactPublication, CheckpointScrollbackArtifactError> {
     let payload = build_checkpoint_scrollback_payload(db_path, checkpoint_id, limits)?;
     validate_checkpoint_scrollback_payload(&payload, limits)?;
+    let session_id = payload.checkpoint.session_id.clone();
+    let checkpoint_at = payload.checkpoint.checkpoint_at;
+    let checkpoint_role = payload.checkpoint.checkpoint_role.clone();
+    let checkpoint_state_hash = payload.checkpoint.state_hash.clone();
+    let pane_count = payload.summary.pane_count;
     let payload_sha256 = hash_checkpoint_artifact_json(&payload, limits.max_artifact_bytes)?;
     let artifact = CheckpointScrollbackArtifact {
         schema: CHECKPOINT_SCROLLBACK_ARTIFACT_SCHEMA.to_string(),
@@ -9827,23 +9964,102 @@ fn prepare_checkpoint_scrollback_artifact_publication(
     Ok(PreparedCheckpointArtifactPublication {
         bytes,
         checkpoint_id,
+        session_id,
+        checkpoint_at,
+        checkpoint_role,
+        checkpoint_state_hash,
+        pane_count,
         payload_sha256,
         artifact_sha256,
         artifact_bytes,
     })
 }
 
-fn write_checkpoint_scrollback_artifact_with_hook(
+fn checkpoint_artifact_identity_matches_expected(
+    checkpoint_id: i64,
+    session_id: &str,
+    checkpoint_at: u64,
+    checkpoint_role: &str,
+    checkpoint_state_hash: &str,
+    pane_count: usize,
+    expected: &CheckpointScrollbackArtifactExpectedIdentity,
+) -> bool {
+    checkpoint_id == expected.checkpoint_id
+        && session_id == expected.session_id
+        && checkpoint_at == expected.checkpoint_at
+        && checkpoint_role == expected.checkpoint_role
+        && checkpoint_state_hash == expected.checkpoint_state_hash
+        && pane_count == expected.pane_count
+}
+
+fn require_checkpoint_artifact_identity_matches_expected(
+    checkpoint_id: i64,
+    session_id: &str,
+    checkpoint_at: u64,
+    checkpoint_role: &str,
+    checkpoint_state_hash: &str,
+    pane_count: usize,
+    expected: &CheckpointScrollbackArtifactExpectedIdentity,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    if checkpoint_artifact_identity_matches_expected(
+        checkpoint_id,
+        session_id,
+        checkpoint_at,
+        checkpoint_role,
+        checkpoint_state_hash,
+        pane_count,
+        expected,
+    ) {
+        Ok(())
+    } else {
+        Err(CheckpointScrollbackArtifactError::CheckpointIdentityMismatch)
+    }
+}
+
+fn require_checkpoint_artifact_receipt_matches_expected(
+    receipt: &CheckpointScrollbackArtifactReceipt,
+    expected: &CheckpointScrollbackArtifactExpectedIdentity,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    require_checkpoint_artifact_identity_matches_expected(
+        receipt.checkpoint_id,
+        &receipt.session_id,
+        receipt.created_at_epoch_ms,
+        &receipt.checkpoint_role,
+        &receipt.checkpoint_state_hash,
+        receipt.pane_count,
+        expected,
+    )
+}
+
+fn write_checkpoint_scrollback_artifact_with_hook_and_expected(
     db_path: &str,
     checkpoint_id: i64,
     output_path: &Path,
     limits: CheckpointScrollbackArtifactLimits,
+    expected: Option<&CheckpointScrollbackArtifactExpectedIdentity>,
     after_publication_buffer_drop: impl FnOnce(),
-) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
+) -> Result<
+    (
+        CheckpointScrollbackArtifactReceipt,
+        CheckpointArtifactPublicationOutcome,
+    ),
+    CheckpointScrollbackArtifactError,
+> {
     let limits = limits.validate()?;
     let prepared =
         prepare_checkpoint_scrollback_artifact_publication(db_path, checkpoint_id, limits)?;
-    publish_checkpoint_artifact_bytes(output_path, &prepared.bytes)?;
+    if let Some(expected) = expected {
+        require_checkpoint_artifact_identity_matches_expected(
+            prepared.checkpoint_id,
+            &prepared.session_id,
+            prepared.checkpoint_at,
+            &prepared.checkpoint_role,
+            &prepared.checkpoint_state_hash,
+            prepared.pane_count,
+            expected,
+        )?;
+    }
+    let publication = publish_checkpoint_artifact_bytes(output_path, &prepared.bytes)?;
     let expected_checkpoint_id = prepared.checkpoint_id;
     let expected_payload_sha256 = prepared.payload_sha256;
     let expected_artifact_sha256 = prepared.artifact_sha256;
@@ -9861,8 +10077,29 @@ fn write_checkpoint_scrollback_artifact_with_hook(
             "published artifact reread differs from the constructed source".to_string(),
         ));
     }
+    if let Some(expected) = expected {
+        require_checkpoint_artifact_receipt_matches_expected(&receipt, expected)?;
+    }
     receipt.durability = "file_and_parent_directory_synced_then_offline_verified";
-    Ok(receipt)
+    Ok((receipt, publication))
+}
+
+fn write_checkpoint_scrollback_artifact_with_hook(
+    db_path: &str,
+    checkpoint_id: i64,
+    output_path: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+    after_publication_buffer_drop: impl FnOnce(),
+) -> Result<CheckpointScrollbackArtifactReceipt, CheckpointScrollbackArtifactError> {
+    write_checkpoint_scrollback_artifact_with_hook_and_expected(
+        db_path,
+        checkpoint_id,
+        output_path,
+        limits,
+        None,
+        after_publication_buffer_drop,
+    )
+    .map(|(receipt, _)| receipt)
 }
 
 /// Construct, atomically publish, reread, and independently verify one artifact.
@@ -9940,6 +10177,8 @@ fn verify_checkpoint_scrollback_artifact_bytes_with_hook(
         schema,
         capabilities: payload.capabilities,
         checkpoint_id: payload.checkpoint.checkpoint_id,
+        session_id: payload.checkpoint.session_id.clone(),
+        checkpoint_role: payload.checkpoint.checkpoint_role.clone(),
         checkpoint_state_hash: payload.checkpoint.state_hash.clone(),
         created_at_epoch_ms: payload.created_at_epoch_ms,
         payload_sha256,
@@ -9968,6 +10207,48 @@ pub fn verify_checkpoint_scrollback_artifact(
     verify_checkpoint_scrollback_artifact_bytes_with_hook(bytes, limits, || {})
 }
 
+/// Recover one already-published target without consulting the source database.
+///
+/// The publication lock serializes this durability recovery with cooperating
+/// publishers. A target that exists but is malformed, unsafe, or unverifiable
+/// is an error rather than an invitation to rebuild or overwrite it.
+fn recover_existing_checkpoint_scrollback_artifact(
+    path: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<Option<CheckpointScrollbackArtifactReceipt>, CheckpointScrollbackArtifactError> {
+    let (parent, leaf, parent_path) = match checkpoint_artifact_parent_and_leaf(path, false) {
+        Ok(authority) => authority,
+        Err(CheckpointScrollbackArtifactError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let _publication_lock = acquire_checkpoint_artifact_publication_lock(&parent)?;
+    revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+    match parent.symlink_metadata(&leaf) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let bytes = read_checkpoint_artifact_from_parent_bounded(
+        &parent,
+        &leaf,
+        limits.max_artifact_bytes,
+        true,
+    )?;
+    sync_checkpoint_artifact_directory(&parent)?;
+    revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+    let mut receipt = verify_checkpoint_scrollback_artifact_bytes_with_hook(bytes, limits, || {})?;
+    receipt.durability = "file_and_parent_directory_synced_then_offline_verified";
+    Ok(Some(receipt))
+}
+
 /// Derive the canonical production leaf name for a verified checkpoint identity.
 pub fn checkpoint_scrollback_artifact_file_name(
     checkpoint_at: u64,
@@ -9989,6 +10270,103 @@ pub fn checkpoint_scrollback_artifact_file_name(
     Ok(format!(
         "checkpoint-{checkpoint_at}-{checkpoint_id}-{digest}{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
     ))
+}
+
+/// Publish or recover the canonical durable artifact for an expected identity.
+///
+/// Recovery is attempted before the source database is opened, so retrying a
+/// lost publication reply still succeeds after the source checkpoint or its
+/// scrollback rows are unavailable. An existing target must verify offline and
+/// match the requested checkpoint ID, session ID, timestamp, role, v2 witness,
+/// and pane count.
+/// When no target exists, the same identity is checked against the pinned source
+/// projection before no-clobber publication and again after the independent
+/// reread. The returned receipt exposes complete and incomplete pane coverage;
+/// callers that require a complete export must enforce `scrollback_complete()`.
+pub fn publish_or_recover_checkpoint_scrollback_artifact_for_identity(
+    db_path: &str,
+    expected: &CheckpointScrollbackArtifactExpectedIdentity,
+    artifact_directory: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackArtifactPublication, CheckpointScrollbackArtifactError> {
+    let leaf = checkpoint_scrollback_artifact_file_name(
+        expected.checkpoint_at,
+        expected.checkpoint_id,
+        &expected.checkpoint_state_hash,
+    )?;
+    let path = artifact_directory.join(leaf);
+    publish_or_recover_checkpoint_scrollback_artifact_at_path_for_identity(
+        db_path, expected, &path, limits,
+    )
+}
+
+/// Publish or recover an exact output path for an expected checkpoint identity.
+///
+/// Unlike the canonical-directory API, this accepts an operator-selected leaf
+/// path. It retains the same fail-closed recovery contract: an existing target
+/// is synchronized, verified offline, and matched against all six expected
+/// identity fields before the source database is consulted. An absent target is
+/// matched against the pinned source projection before no-clobber publication
+/// and again after the independent reread.
+pub fn publish_or_recover_checkpoint_scrollback_artifact_at_path_for_identity(
+    db_path: &str,
+    expected: &CheckpointScrollbackArtifactExpectedIdentity,
+    output_path: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackArtifactPublication, CheckpointScrollbackArtifactError> {
+    let limits = limits.validate()?;
+    let path = output_path.to_path_buf();
+
+    if let Some(receipt) = recover_existing_checkpoint_scrollback_artifact(&path, limits)? {
+        require_checkpoint_artifact_receipt_matches_expected(&receipt, expected)?;
+        return Ok(CheckpointScrollbackArtifactPublication {
+            path,
+            resolution: CheckpointScrollbackArtifactResolution::RecoveredExisting,
+            receipt,
+        });
+    }
+
+    let (receipt, outcome) = write_checkpoint_scrollback_artifact_with_hook_and_expected(
+        db_path,
+        expected.checkpoint_id,
+        &path,
+        limits,
+        Some(expected),
+        || {},
+    )?;
+    let resolution = match outcome {
+        CheckpointArtifactPublicationOutcome::Published => {
+            CheckpointScrollbackArtifactResolution::Published
+        }
+        CheckpointArtifactPublicationOutcome::AlreadyApplied => {
+            CheckpointScrollbackArtifactResolution::RecoveredExisting
+        }
+    };
+    Ok(CheckpointScrollbackArtifactPublication {
+        path,
+        resolution,
+        receipt,
+    })
+}
+
+/// Publish or recover the canonical durable artifact for a live capture result.
+///
+/// This convenience wrapper derives the exact expected identity, including the
+/// snapshot role and mux-session binding, then delegates to
+/// [`publish_or_recover_checkpoint_scrollback_artifact_for_identity`].
+pub fn publish_or_recover_checkpoint_scrollback_artifact(
+    db_path: &str,
+    snapshot: &SnapshotResult,
+    artifact_directory: &Path,
+    limits: CheckpointScrollbackArtifactLimits,
+) -> Result<CheckpointScrollbackArtifactPublication, CheckpointScrollbackArtifactError> {
+    let expected = CheckpointScrollbackArtifactExpectedIdentity::from_snapshot_result(snapshot);
+    publish_or_recover_checkpoint_scrollback_artifact_for_identity(
+        db_path,
+        &expected,
+        artifact_directory,
+        limits,
+    )
 }
 
 fn checkpoint_artifact_is_lower_hex_digest(value: &str) -> bool {
@@ -13061,6 +13439,103 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn automatic_and_shutdown_captures_link_durable_scrollback_prefixes() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            install_checkpoint_scrollback_artifact_fixture(
+                db_path.as_str(),
+                1,
+                &["alpha\n", "beta\n", "gamma\n"],
+            );
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let cx = crate::cx::for_testing();
+            let provider = || async { Ok(vec![make_test_pane(1, 24, 80)]) };
+
+            let automatic = engine
+                .capture_from_provider_with_cx(&cx, &provider, SnapshotTrigger::Startup)
+                .await
+                .expect("automatic startup capture must settle");
+            assert_eq!(automatic, SchedulerCaptureOutcome::Captured);
+
+            let (automatic_checkpoint_id, automatic_checkpoint_at, automatic_state_hash) = {
+                let conn = Connection::open(db_path.as_str()).unwrap();
+                let (checkpoint_id, checkpoint_at, state_hash, checkpoint_seq, last_output_at): (
+                    i64,
+                    i64,
+                    String,
+                    Option<i64>,
+                    Option<i64>,
+                ) = conn
+                    .query_row(
+                        "SELECT p.checkpoint_id, c.checkpoint_at, c.state_hash,
+                                p.scrollback_checkpoint_seq, p.last_output_at
+                         FROM mux_pane_state AS p
+                         JOIN session_checkpoints AS c ON c.id = p.checkpoint_id
+                         ORDER BY p.checkpoint_id DESC, p.pane_id ASC
+                         LIMIT 1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(checkpoint_seq, Some(2));
+                assert_eq!(last_output_at, Some(1_002));
+                (
+                    checkpoint_id,
+                    u64::try_from(checkpoint_at).unwrap(),
+                    state_hash,
+                )
+            };
+
+            let automatic_directory = checkpoint_artifact_test_directory();
+            let automatic_path = automatic_directory.path().join(
+                checkpoint_scrollback_artifact_file_name(
+                    automatic_checkpoint_at,
+                    automatic_checkpoint_id,
+                    &automatic_state_hash,
+                )
+                .unwrap(),
+            );
+            let automatic_receipt = write_checkpoint_scrollback_artifact(
+                db_path.as_str(),
+                automatic_checkpoint_id,
+                &automatic_path,
+                CheckpointScrollbackArtifactLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(automatic_receipt.complete_pane_count, 1);
+
+            let shutdown = engine
+                .shutdown_checkpoint_with_cx(
+                    &cx,
+                    &[make_test_pane(1, 30, 100)],
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("shutdown capture must settle");
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let (checkpoint_seq, last_output_at): (Option<i64>, Option<i64>) = conn
+                .query_row(
+                    "SELECT scrollback_checkpoint_seq, last_output_at
+                     FROM mux_pane_state
+                     WHERE checkpoint_id = ?1 AND pane_id = 1",
+                    [shutdown.checkpoint_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(checkpoint_seq, Some(2));
+            assert_eq!(last_output_at, Some(1_002));
+        });
+    }
+
     fn write_private_checkpoint_artifact_test_file(path: &Path, bytes: &[u8]) {
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
@@ -13164,6 +13639,289 @@ mod tests {
                 Err(CheckpointScrollbackArtifactError::InvalidArtifact(ref message))
                     if message.contains("canonical checkpoint leaf")
             ));
+        });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_publish_or_recover_survives_lost_reply_without_source_db() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["alpha\n", "beta\n", "gamma\n"],
+            )
+            .await;
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let directory = checkpoint_artifact_test_directory();
+
+            let published = publish_or_recover_checkpoint_scrollback_artifact(
+                db_path.as_str(),
+                &snapshot,
+                directory.path(),
+                limits,
+            )
+            .unwrap();
+            assert_eq!(
+                published.resolution,
+                CheckpointScrollbackArtifactResolution::Published
+            );
+            assert!(published.scrollback_complete());
+            assert_eq!(published.incomplete_pane_count(), 0);
+            assert_eq!(published.receipt.checkpoint_id, snapshot.checkpoint_id);
+            assert_eq!(published.receipt.session_id, snapshot.session_id);
+            assert_eq!(published.receipt.checkpoint_role, CHECKPOINT_ROLE_SNAPSHOT);
+            assert_eq!(
+                published.receipt.created_at_epoch_ms,
+                snapshot.checkpoint_at
+            );
+            assert_eq!(published.receipt.checkpoint_state_hash, snapshot.state_hash);
+            assert_eq!(published.receipt.pane_count, snapshot.pane_count);
+            let published_bytes = std::fs::read(&published.path).unwrap();
+
+            let unavailable_source = directory.path().join("source-no-longer-available.sqlite");
+            let expected =
+                CheckpointScrollbackArtifactExpectedIdentity::from_snapshot_result(&snapshot);
+            let recovered = publish_or_recover_checkpoint_scrollback_artifact_for_identity(
+                unavailable_source.to_str().unwrap(),
+                &expected,
+                directory.path(),
+                limits,
+            )
+            .unwrap();
+            assert_eq!(
+                recovered.resolution,
+                CheckpointScrollbackArtifactResolution::RecoveredExisting
+            );
+            assert_eq!(recovered.path, published.path);
+            assert_eq!(recovered.receipt, published.receipt);
+            assert_eq!(std::fs::read(&recovered.path).unwrap(), published_bytes);
+            assert!(!unavailable_source.exists());
+        });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_publish_or_recover_at_exact_path_survives_lost_reply() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["alpha\n", "beta\n", "gamma\n"],
+            )
+            .await;
+            let expected =
+                CheckpointScrollbackArtifactExpectedIdentity::from_snapshot_result(&snapshot);
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let directory = checkpoint_artifact_test_directory();
+            let exact_path = directory.path().join("operator-selected-export.json");
+
+            let published = publish_or_recover_checkpoint_scrollback_artifact_at_path_for_identity(
+                db_path.as_str(),
+                &expected,
+                &exact_path,
+                limits,
+            )
+            .unwrap();
+            assert_eq!(published.path, exact_path);
+            assert_eq!(
+                published.resolution,
+                CheckpointScrollbackArtifactResolution::Published
+            );
+            let published_bytes = std::fs::read(&published.path).unwrap();
+
+            let unavailable_source = directory.path().join("must-not-open.sqlite");
+            let recovered = publish_or_recover_checkpoint_scrollback_artifact_at_path_for_identity(
+                unavailable_source.to_str().unwrap(),
+                &expected,
+                &exact_path,
+                limits,
+            )
+            .unwrap();
+            assert_eq!(recovered.path, exact_path);
+            assert_eq!(
+                recovered.resolution,
+                CheckpointScrollbackArtifactResolution::RecoveredExisting
+            );
+            assert_eq!(recovered.receipt, published.receipt);
+            assert_eq!(std::fs::read(&recovered.path).unwrap(), published_bytes);
+            assert!(!unavailable_source.exists());
+        });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_publish_or_recover_at_exact_path_rejects_identity_mismatch() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["zero\n", "one\n", "two\n"],
+            )
+            .await;
+            let expected =
+                CheckpointScrollbackArtifactExpectedIdentity::from_snapshot_result(&snapshot);
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let directory = checkpoint_artifact_test_directory();
+            let exact_path = directory.path().join("operator-selected-export.json");
+            publish_or_recover_checkpoint_scrollback_artifact_at_path_for_identity(
+                db_path.as_str(),
+                &expected,
+                &exact_path,
+                limits,
+            )
+            .unwrap();
+            let published_bytes = std::fs::read(&exact_path).unwrap();
+            let mut mismatch = expected;
+            mismatch.session_id.push_str("-different");
+            let unavailable_source = directory.path().join("must-not-open.sqlite");
+
+            assert!(matches!(
+                publish_or_recover_checkpoint_scrollback_artifact_at_path_for_identity(
+                    unavailable_source.to_str().unwrap(),
+                    &mismatch,
+                    &exact_path,
+                    limits,
+                ),
+                Err(CheckpointScrollbackArtifactError::CheckpointIdentityMismatch)
+            ));
+            assert_eq!(std::fs::read(&exact_path).unwrap(), published_bytes);
+            assert!(!unavailable_source.exists());
+        });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_publish_or_recover_rejects_every_identity_mismatch() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["zero\n", "one\n", "two\n"],
+            )
+            .await;
+            let limits = CheckpointScrollbackArtifactLimits::default();
+            let source_directory = checkpoint_artifact_test_directory();
+            let source = publish_or_recover_checkpoint_scrollback_artifact(
+                db_path.as_str(),
+                &snapshot,
+                source_directory.path(),
+                limits,
+            )
+            .unwrap();
+            let source_bytes = std::fs::read(&source.path).unwrap();
+
+            let expected =
+                CheckpointScrollbackArtifactExpectedIdentity::from_snapshot_result(&snapshot);
+            let mut checkpoint_id_mismatch = expected.clone();
+            checkpoint_id_mismatch.checkpoint_id =
+                checkpoint_id_mismatch.checkpoint_id.checked_add(1).unwrap();
+            let mut session_id_mismatch = expected.clone();
+            session_id_mismatch.session_id.push_str("-different");
+            let mut checkpoint_at_mismatch = expected.clone();
+            checkpoint_at_mismatch.checkpoint_at =
+                checkpoint_at_mismatch.checkpoint_at.checked_add(1).unwrap();
+            let mut checkpoint_role_mismatch = expected.clone();
+            checkpoint_role_mismatch.checkpoint_role = "different".to_string();
+            let mut state_hash_mismatch = expected.clone();
+            let final_hash_byte = state_hash_mismatch.checkpoint_state_hash.len() - 1;
+            let replacement = if state_hash_mismatch.checkpoint_state_hash.ends_with('0') {
+                "1"
+            } else {
+                "0"
+            };
+            state_hash_mismatch
+                .checkpoint_state_hash
+                .replace_range(final_hash_byte.., replacement);
+            let mut pane_count_mismatch = expected.clone();
+            pane_count_mismatch.pane_count = pane_count_mismatch.pane_count.checked_add(1).unwrap();
+
+            for mismatch in [
+                checkpoint_id_mismatch,
+                session_id_mismatch,
+                checkpoint_at_mismatch,
+                checkpoint_role_mismatch,
+                state_hash_mismatch,
+                pane_count_mismatch,
+            ] {
+                let directory = checkpoint_artifact_test_directory();
+                let leaf = checkpoint_scrollback_artifact_file_name(
+                    mismatch.checkpoint_at,
+                    mismatch.checkpoint_id,
+                    &mismatch.checkpoint_state_hash,
+                )
+                .unwrap();
+                let path = directory.path().join(leaf);
+                write_private_checkpoint_artifact_test_file(&path, &source_bytes);
+                let unavailable_source = directory.path().join("must-not-open.sqlite");
+
+                assert!(matches!(
+                    publish_or_recover_checkpoint_scrollback_artifact_for_identity(
+                        unavailable_source.to_str().unwrap(),
+                        &mismatch,
+                        directory.path(),
+                        limits,
+                    ),
+                    Err(CheckpointScrollbackArtifactError::CheckpointIdentityMismatch)
+                ));
+                assert_eq!(std::fs::read(path).unwrap(), source_bytes);
+                assert!(!unavailable_source.exists());
+            }
+
+            let mut source_mismatch = expected;
+            source_mismatch.pane_count = source_mismatch.pane_count.checked_add(1).unwrap();
+            let unpublished_directory = checkpoint_artifact_test_directory();
+            let unpublished_path = unpublished_directory.path().join(
+                checkpoint_scrollback_artifact_file_name(
+                    source_mismatch.checkpoint_at,
+                    source_mismatch.checkpoint_id,
+                    &source_mismatch.checkpoint_state_hash,
+                )
+                .unwrap(),
+            );
+            assert!(matches!(
+                publish_or_recover_checkpoint_scrollback_artifact_for_identity(
+                    db_path.as_str(),
+                    &source_mismatch,
+                    unpublished_directory.path(),
+                    limits,
+                ),
+                Err(CheckpointScrollbackArtifactError::CheckpointIdentityMismatch)
+            ));
+            assert!(
+                !unpublished_path.exists(),
+                "source identity must be checked before canonical publication"
+            );
+        });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_publish_or_recover_exposes_incomplete_prefix_truth() {
+        run_async_test(async {
+            let (_db_file, db_path) = setup_test_db();
+            let snapshot = capture_checkpoint_scrollback_artifact_fixture(
+                db_path.clone(),
+                &["zero\n", "one\n", "two\n"],
+            )
+            .await;
+            Connection::open(db_path.as_str())
+                .unwrap()
+                .execute(
+                    "INSERT INTO output_gaps
+                     (pane_id, seq_before, seq_after, reason, detected_at)
+                     VALUES (1, 0, 1, 'explicit capture loss', 1001)",
+                    [],
+                )
+                .unwrap();
+            let directory = checkpoint_artifact_test_directory();
+
+            let publication = publish_or_recover_checkpoint_scrollback_artifact(
+                db_path.as_str(),
+                &snapshot,
+                directory.path(),
+                CheckpointScrollbackArtifactLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(publication.receipt.pane_count, 1);
+            assert_eq!(publication.receipt.complete_pane_count, 0);
+            assert!(!publication.scrollback_complete());
+            assert_eq!(publication.incomplete_pane_count(), 1);
         });
     }
 

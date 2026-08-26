@@ -1,17 +1,21 @@
 # Session Persistence (Snapshots)
 
 ft’s session persistence system captures terminal-backend mux evidence (current
-bridge: WezTerm) into SQLite snapshots so you can:
+bridge: WezTerm) into SQLite snapshots and can publish a portable, independently
+verified artifact containing the checkpoint plus its retained redacted
+scrollback prefixes. This lets you:
 
 - Inspect the bounded metadata needed to plan a manual reconstruction after an unclean shutdown
 - Preserve evidence before an operator-managed restart
 - Inspect session state and compare pane-ID membership over time
+- Export and verify a no-clobber forensic content artifact without a live mux
 
-Snapshot capture/inspection ships. Restore and restart execution do not: their
-non-dry CLI paths fail closed before process or mux effects. The executable
-restorer is library/test substrate, not a production recovery surface. This
-system is designed for **mux topology + pane metadata**, not full process
-checkpointing.
+Snapshot capture/inspection and portable artifact export/verification ship.
+Restore and restart execution do not: their non-dry CLI paths fail closed
+before process or mux effects. The executable restorer is library/test
+substrate, not a production recovery surface. This system preserves **mux
+topology + pane metadata + a forensic retained scrollback prefix**; it is not
+full process checkpointing.
 
 ## What a snapshot contains
 
@@ -26,6 +30,17 @@ At a high level, a snapshot stores:
   agent continuity was captured.
 - **Dedup/consistency witness**: a versioned, framed SHA-256 `state_hash` so
   identical snapshots can be skipped and persisted projections can be checked
+- **Optional retained scrollback references**: per-pane segment identities and
+  exact durable sequence bounds captured in the same checkpoint transaction.
+  Manual CLI and Robot saves request these references by default. Periodic and
+  shutdown capture paths also request them, so a later export can bind the
+  retained prefixes to the exact checkpoint rather than reading an unbounded
+  moving transcript.
+- **Portable artifact projection**: the verified checkpoint identity and
+  topology, redacted per-pane metadata, ordered durable scrollback segments,
+  explicit gap/completeness facts, bounded aggregate counters, and independent
+  payload/file SHA-256 receipts. `ft snapshot save` and Robot checkpoint save
+  publish this artifact by default after the SQLite checkpoint commits.
 
 The current topology schema v1 sorts numeric tab IDs for deterministic output.
 It does not yet preserve user tab order or an incarnation-scoped active-tab
@@ -36,10 +51,14 @@ What it does **not** (currently) guarantee:
 
 - Restoring interactive in-process state (REPL variables, editor buffers, etc.)
 - Restarting shells, agents, or other foreground processes automatically
-- Restoring historical scrollback or terminal render state, regardless of capture quality
+- Recovering content that was never captured, fell before a declared gap, or
+  was outside the checkpoint's retained durable prefix
+- Restoring terminal parser/render state from the exported scrollback bytes
 - Preserving mux-domain identity, durable app-reopen tab order, titles, exact
   cell geometry, stable active-tab identity, window/workspace placement, or
   full window appearance
+- Preserving a PTY descriptor, child process, shell/editor memory, or running
+  agent merely because an artifact verifies
 
 ## Quick start
 
@@ -70,9 +89,26 @@ Example shape:
   "projection_completeness": "complete",
   "projection_completeness_scope": "persisted_pane_text_budget",
   "verification": "verified_v2",
-  "trigger": "manual"
+  "trigger": "manual",
+  "artifact": {
+    "operation": "save",
+    "path": ".ft/checkpoint-artifacts/checkpoint-…json",
+    "checkpoint_id": 123,
+    "session_id": "sess-…",
+    "checkpoint_role": "snapshot",
+    "scrollback_complete": true,
+    "restore_scope": "forensic_scrollback_and_checkpoint_topology_only",
+    "running_process_continuity": false
+  }
 }
 ```
+
+The one-shot save is ordered as checkpoint capture, durable artifact
+publish-or-recover, offline verification, complete-prefix admission, then clean
+session close. If publication acknowledgement is lost, the checkpoint remains
+open and the error names `ft snapshot export <id>` as the reconciliation path.
+An incomplete artifact is retained for forensics but the save fails rather
+than promoting it to a pre-upgrade recovery checkpoint.
 
 Triggers:
 
@@ -89,6 +125,58 @@ bounded checkpoint metadata. Those labels do not grant the watcher's sticky
 terminal-capture reservation. `startup` maps to `SnapshotTrigger::Startup`;
 the production periodic/intelligent scheduler also uses that trigger for its
 first capture.
+
+### 1a) Export, verify, and inventory portable artifacts
+
+Export an existing checkpoint to the canonical workspace catalog:
+
+```bash
+ft snapshot export latest
+ft snapshot export 123
+```
+
+Or choose one exact new output file:
+
+```bash
+ft snapshot export 123 --output /absolute/private/path/checkpoint-123.json
+```
+
+Existing files are never overwritten. Publication and acknowledgement recovery
+bind six immutable fields: checkpoint ID, parent session ID, checkpoint
+timestamp, checkpoint role, v2 state witness, and pane count. A retry first
+loads those six fields from one SQLite row projection, then verifies the
+existing artifact and requires all six fields to match before any new write. A
+mismatched target fails closed without recapture or replacement. The underlying
+publish-or-recover API also accepts a caller-retained six-field identity and
+can reconcile an exact lost reply before opening SQLite; that is the path used
+by a durable higher-level transaction. The standalone `ft snapshot export`
+command still needs SQLite to resolve its requested checkpoint identity. Use
+`verify-artifact` for database-independent artifact integrity inspection.
+The explicit-path verifier dispatches before config, workspace, SQLite,
+logging, fonts, or mux initialization, so recovery evidence remains inspectable
+when the ordinary runtime state is damaged.
+An explicit `list-artifacts --directory <path>` uses the same pre-initialization
+offline boundary; the default directory form still resolves the configured
+workspace catalog first.
+
+Verify one artifact without opening SQLite, or inventory the bounded canonical
+catalog:
+
+```bash
+ft snapshot verify-artifact /absolute/private/path/checkpoint-123.json
+ft snapshot list-artifacts
+ft snapshot list-artifacts --directory /absolute/private/catalog
+```
+
+The writer uses a private no-follow directory capability, mode 0600 and a
+single link for the final file, create-new publication, file and parent
+directory synchronization, canonical JSON, bounded parsing, and an independent
+reread. Catalog inventory charges every directory entry against its finite
+budget and fails closed if a canonical artifact is corrupt. An artifact with
+an explicit gap remains verifiable but reports `scrollback_complete: false`;
+`ft snapshot export` rejects it by default. `--allow-incomplete` is only an
+operator acknowledgement for forensic salvage and never upgrades its
+continuity capability.
 
 ### 2) List snapshots
 
@@ -838,7 +926,9 @@ captured pane, its initial fingerprint recomputes from the canonical redacted
 pane metadata, and its initial/final topology fingerprints agree. A valid artifact
 can still have `complete: false` when it was deliberately retained with
 `--allow-partial`; verification reports that state rather than promoting it to
-a complete safety gate. Duplicate and unknown JSON members fail closed so
+a complete safety gate. Pass `--require-complete` for any upgrade or recovery
+admission check; it rejects an otherwise intact partial artifact or any nonzero
+capture-error count. Duplicate and unknown JSON members fail closed so
 discarded or hidden bytes cannot coexist with a `redaction_applied` attestation.
 The verifier also reapplies the current canonical redactor to every serialized
 string value and requires the entire artifact to be a redaction fixed point. A writer
@@ -851,6 +941,67 @@ the allocating JSON parse, a zero-retention streaming preflight applies global
 node, map-entry, sequence-entry, decoded-string-byte, and nesting-depth limits,
 preventing a byte-small structural payload from amplifying into an unbounded
 value tree.
+
+#### Exact v0.13 compatible-client bridge
+
+The v0.13.0 release predates `ft session dump`. A newer candidate must not try
+to speak its incompatible wire dialect directly to that old mux. Instead,
+`ft session compatible-client-dump` runs the exact retained v0.13.0 `ft`
+executable as a bounded external client against one explicit live Unix socket:
+
+```bash
+candidate-ft session compatible-client-dump \
+  --client /absolute/path/to/v0.13.0/ft \
+  --expected-client-sha256 <64-lowercase-hex> \
+  --expected-client-bytes <exact-length> \
+  --mux-socket /absolute/path/to/live/gui-socket \
+  --output /absolute/private/path/pre-upgrade.json \
+  --max-panes 1024 \
+  --max-total-bytes 67108864 \
+  --batch-size 8 \
+  --batch-timeout-secs 30 \
+  --max-batch-output-bytes 33554432 \
+  --format json
+```
+
+The bridge requires version `0.13.0` and git identity `3ebd60566`, pins the
+client and socket identities without following symlinks, creates a sterile
+private environment, obtains two state censuses around bounded batches of
+`robot get-text`, and publishes through the ordinary dump verifier. The
+topology contract contains only facts available in the v0.13 Robot projection:
+numeric pane/tab/window IDs, optional pane UUID, and redacted domain. It does
+not claim workspace, geometry, active/zoom, stable mux incarnation, or
+authoritative domain identity.
+
+Before contacting either the old client or mux, an exact-path retry performs an
+offline Query/Ack. The existing complete artifact must match the expected
+client hash/length/version, socket-path digest, and every request bound. Exact
+recovery re-synchronizes and acknowledges the retained artifact; mismatch,
+corruption, or an incomplete capture fails without overwrite or recapture.
+Both fresh and recovered receipts expose a verifier-derived, sorted
+`domain_pane_counts` map. An upgrade coordinator can therefore require named
+domain coverage without trusting producer counters or reparsing unverified
+JSON.
+
+```bash
+candidate-ft session verify-dump /absolute/private/path/pre-upgrade.json \
+  --require-complete \
+  --expect-domain-panes 'ssh:example-a=12' \
+  --expect-domain-panes 'ssh:example-b=16' \
+  --format json
+```
+
+Each expectation is exact, repeatable, bounded, and evaluated only against the
+offline verifier's pane records. `--require-complete` additionally admits only
+a complete zero-error capture. Missing domains, mismatched counts, duplicate
+expectations, zero counts, malformed values, and partial captures fail closed.
+`verify-dump` dispatches before configuration, workspace, database, logging,
+font, or live-mux initialization, so damaged local state cannot block or mutate
+this offline incident-recovery check.
+
+The private sterile environment is retained as reconciliation evidence. A
+successful receipt still declares `forensic_text_export: true`,
+`executable_restore_image: false`, and `production_mux_activation: false`.
 
 The dump is deliberately not accepted as an executable restore image. It does
 not provide an atomic point-in-time content snapshot and does not preserve PTY

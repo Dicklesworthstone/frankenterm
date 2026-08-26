@@ -126,7 +126,7 @@ When both the maximum and minimum advance, use the maintenance window:
    NEW_TAG=vX.Y.Z
    DUMP_PATH="$HOME/.local/share/ft/mux-dumps/pre-upgrade-${NEW_TAG}-$(date +%s).json"
    ~/.local/bin/ft session dump --output "$DUMP_PATH" --format json
-   ~/.local/bin/ft session verify-dump "$DUMP_PATH" --format json
+   ~/.local/bin/ft session verify-dump "$DUMP_PATH" --require-complete --format json
    ```
 
    Both commands must succeed, the dump must report `complete: true`, and the
@@ -135,10 +135,11 @@ When both the maximum and minimum advance, use the maintenance window:
    keep mux-owned PTYs or agents alive.
 
    The v0.15.1 stranded-remote incident predates this dump command. If the
-   installed compatible client does not recognize `session dump`, there is no
-   complete automated artifact to promote: keep the old mux running, capture
-   critical pane text manually through that compatible client where possible,
-   and record the legacy gap. Never describe that fallback as a verified dump.
+   installed compatible client does not recognize `session dump`, keep the old
+   client and mux running and continue with the side-by-side candidate staging
+   below. The candidate has an explicit `compatible-client-dump` bridge for the
+   exact v0.13.0 client; do not replace or launch the desktop app before that
+   bridge has produced a complete verified artifact.
 
 2. **Install the candidate CLI/process-family bytes without replacing the
    running desktop app.** Use the installer from the exact release source
@@ -150,6 +151,51 @@ When both the maximum and minimum advance, use the maintenance window:
    NEW_TAG=vX.Y.Z
    bash install.sh --version "$NEW_TAG" --no-app
    ```
+
+   When the live compatible process is v0.13.0, use the staged candidate to
+   drive the exact retained v0.13.0 CLI through the live GUI mux socket. Pin the
+   old executable by both SHA-256 and byte length and choose a new private
+   output path:
+
+   ```bash
+   CANDIDATE_FT="$HOME/.local/bin/ft"
+   COMPATIBLE_FT="/Applications/FrankenTerm.app/Contents/MacOS/ft"
+   COMPATIBLE_SHA256="$(shasum -a 256 "$COMPATIBLE_FT" | cut -d ' ' -f 1)"
+   COMPATIBLE_BYTES="$(stat -f %z "$COMPATIBLE_FT")"
+   LIVE_MUX_SOCKET="$HOME/.local/share/frankenterm/frankenterm-gui-sock-<pid>"
+   DUMP_PATH="$HOME/.local/share/ft/mux-dumps/pre-upgrade-${NEW_TAG}-$(date +%s).json"
+
+   "$CANDIDATE_FT" session compatible-client-dump \
+     --client "$COMPATIBLE_FT" \
+     --expected-client-sha256 "$COMPATIBLE_SHA256" \
+     --expected-client-bytes "$COMPATIBLE_BYTES" \
+     --mux-socket "$LIVE_MUX_SOCKET" \
+     --output "$DUMP_PATH" \
+     --format json
+   "$CANDIDATE_FT" session verify-dump "$DUMP_PATH" --require-complete --format json
+   ```
+
+   The bridge accepts only v0.13.0 build `3ebd60566`, pins the client and socket
+   file identities, runs the old Robot API in a sterile private environment,
+   batches bounded pane reads between two censuses, reapplies redaction, and
+   publishes through the ordinary no-clobber dump verifier. Its topology is
+   explicitly the limited v0.13 projection: pane, optional pane UUID, tab,
+   window, and redacted domain values. It does not invent workspace, geometry,
+   active/zoom, stable incarnation, or authoritative domain identity.
+
+   Retry with the exact same output path and request bounds after an ambiguous
+   reply. The bridge first performs an offline Query/Ack: an existing complete
+   artifact must match the expected client hash/length/version, mux-socket path
+   digest, and all resource bounds before it is acknowledged without contacting
+   the mux. A mismatch or incomplete artifact is retained and fails closed.
+   The receipt includes verifier-derived `domain_pane_counts`; record and check
+   the expected domain counts before admitting the artifact to any later
+   activation transaction.
+   Enforce those recorded counts offline with repeated
+   `ft session verify-dump <artifact> --require-complete --expect-domain-panes DOMAIN=COUNT`
+   arguments. Missing or mismatched domains fail closed.
+   Success still means redacted forensic text/topology only; the receipt states
+   `executable_restore_image: false` and `production_mux_activation: false`.
 
 3. **Stage each remote process family without restarting its mux.** Repeat for
    every configured domain host using the candidate CLI:
@@ -175,7 +221,12 @@ When both the maximum and minimum advance, use the maintenance window:
 
    Before that download, it also asks the currently installed remote CLI to
    create and verify a complete host-local dump when that legacy release
-   supports the command; a supported dump failure stops staging.
+   supports the command; a supported dump failure stops staging. Some legacy
+   mux hosts have no remote `ft` CLI at all. The resulting
+   `unavailable_no_compatible_cli` or `unavailable_legacy_client` marker permits
+   immutable staging only; it is not dump evidence and cannot authorize a
+   restart. In that topology, the local compatible GUI/client bridge above must
+   capture the reachable remote-domain panes before any later activation.
    It deliberately leaves the `current` selector, `~/.local/bin/ft`, the service
    `ExecStart`, the active mux inode, and its PTYs untouched. An inactive host is
    also left pending: current source has no cross-launcher lifetime lease and

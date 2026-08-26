@@ -53,6 +53,9 @@ use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
+use mux::guardian_output_journal::{
+    GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalTail,
+};
 use mux::guardian_protocol::{
     GUARDIAN_MAC_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_PAYLOAD_BYTES,
     GuardianBrokerControlAuthenticatorV1, GuardianBrokerSpawnWalAuthenticatorV1,
@@ -416,7 +419,7 @@ impl BrokerControlResponseHeaderV1 {
                     && self.output_sequence_start == 0
                     && self.output_sequence_end == 0
                     && payload_bytes == 0
-                    && ((successful && self.lease_generation > 0 && self.child_identity.is_some())
+                    && ((successful && self.lease_generation == 1 && self.child_identity.is_some())
                         || (unsuccessful
                             && self.lease_generation == 0
                             && self.child_identity.is_none()))
@@ -1605,6 +1608,26 @@ pub struct BrokerControlClientV1 {
     recovered_hello: bool,
 }
 
+fn broker_control_response_lease_generation_matches(
+    request: BrokerControlRequestHeaderV1,
+    response: BrokerControlResponseHeaderV1,
+) -> bool {
+    match request.operation {
+        BrokerControlOperationV1::Spawn
+            if matches!(
+                response.status,
+                BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+            ) =>
+        {
+            // Spawn is admitted before any attachment exists, so its request
+            // is necessarily generation zero. A successful response creates
+            // the one initial lease at generation one.
+            response.lease_generation == 1
+        }
+        _ => response.lease_generation == request.lease_generation,
+    }
+}
+
 impl BrokerControlClientV1 {
     pub fn connect(
         socket_path: &Path,
@@ -1713,12 +1736,14 @@ impl BrokerControlClientV1 {
         )?;
         let response = decode_broker_control_response(&self.control_authenticator, &response_frame)
             .map_err(|_| BrokerControlClientError::Protocol)?;
+        let lease_generation_matches =
+            broker_control_response_lease_generation_matches(request.header, response.header);
         if response.header.operation != request.header.operation
             || response.header.request_id != request.header.request_id
             || response.header.guardian_incarnation != request.header.guardian_incarnation
             || response.header.connection_id != request.header.connection_id
             || response.header.durable_pane_id != request.header.durable_pane_id
-            || response.header.lease_generation != request.header.lease_generation
+            || !lease_generation_matches
             || response.header.operation_id != request.header.operation_id
             || response.header.broker_incarnation.is_nil()
             || (!self.broker_incarnation.is_nil()
@@ -4625,6 +4650,96 @@ impl std::fmt::Debug for BrokerControlLeaseV1 {
     }
 }
 
+/// One fresh, activated encrypted output segment bound to a prepared pane.
+///
+/// The broker may expose only the synchronized plaintext prefix. A failed
+/// append is sticky because the on-disk disposition can be ambiguous even
+/// though the bytes already drained from the PTY remain in memory.
+struct BrokerDurableOutputJournalV1 {
+    journal: GuardianOutputJournal,
+    failed: bool,
+}
+
+impl BrokerDurableOutputJournalV1 {
+    fn bind_fresh(
+        journal: GuardianOutputJournal,
+        durable_pane_id: Uuid,
+    ) -> Result<Self, BrokerError> {
+        let identity = journal.identity();
+        if identity.durable_pane_id() != durable_pane_id {
+            return Err(BrokerError::DurableOutputJournalBindingMismatch);
+        }
+        if identity.first_sequence() != 1
+            || identity.predecessor().is_some()
+            || journal.record_count() != 0
+            || journal.cumulative_plaintext_bytes() != 0
+            || journal.next_sequence() != Some(1)
+            || journal.terminal_receipt().is_some()
+        {
+            return Err(BrokerError::DurableOutputJournalNotFresh);
+        }
+        if journal.tail() != GuardianOutputJournalTail::Clean
+            || journal.is_poisoned()
+            || journal.directory_entry_sync_required()
+        {
+            return Err(BrokerError::DurableOutputJournalUnavailable);
+        }
+        Ok(Self {
+            journal,
+            failed: false,
+        })
+    }
+
+    fn append_and_sync(
+        &mut self,
+        output_sequence_start: u64,
+        payload: &[u8],
+    ) -> Result<GuardianOutputAppendReceipt, BrokerError> {
+        if self.failed {
+            return Err(BrokerError::DurableOutputJournalUnavailable);
+        }
+        let Some(expected_record_sequence) = self.journal.next_sequence() else {
+            self.failed = true;
+            return Err(BrokerError::DurableOutputJournalUnavailable);
+        };
+        if self.journal.cumulative_plaintext_bytes() != output_sequence_start
+            || self.journal.tail() != GuardianOutputJournalTail::Clean
+            || self.journal.is_poisoned()
+            || self.journal.directory_entry_sync_required()
+        {
+            self.failed = true;
+            return Err(BrokerError::DurableOutputJournalUnavailable);
+        }
+        let payload_bytes = u32::try_from(payload.len())
+            .map_err(|_| BrokerError::DurableOutputJournalReceiptMismatch)?;
+        let expected_output_sequence_end = output_sequence_start
+            .checked_add(u64::from(payload_bytes))
+            .ok_or(BrokerError::DurableOutputJournalReceiptMismatch)?;
+        let receipt = match self.journal.append_and_sync(payload) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                self.failed = true;
+                return Err(BrokerError::DurableOutputJournalUnavailable);
+            }
+        };
+        let receipt_matches = receipt.segment_id() == self.journal.identity().segment_id()
+            && receipt.sequence() == expected_record_sequence
+            && receipt.payload_bytes() == payload_bytes
+            && receipt.cumulative_plaintext_bytes() == expected_output_sequence_end
+            && self.journal.record_count() == expected_record_sequence
+            && self.journal.cumulative_plaintext_bytes() == expected_output_sequence_end
+            && self.journal.terminal_receipt() == Some(receipt)
+            && self.journal.tail() == GuardianOutputJournalTail::Clean
+            && !self.journal.is_poisoned()
+            && !self.journal.directory_entry_sync_required();
+        if !receipt_matches {
+            self.failed = true;
+            return Err(BrokerError::DurableOutputJournalReceiptMismatch);
+        }
+        Ok(receipt)
+    }
+}
+
 /// Child-free broker typestate after PTY allocation and before durable
 /// adoption.  Dropping or aborting this value cannot leave a user child.
 pub struct BrokerPreparedPaneV1 {
@@ -4633,6 +4748,7 @@ pub struct BrokerPreparedPaneV1 {
     proxy_reader: Box<dyn PollablePtyReader>,
     proxy_writer: Box<dyn Write + Send>,
     output_buffer: VecDeque<u8>,
+    output_journal: Option<BrokerDurableOutputJournalV1>,
     fenced_attachments: VecDeque<BrokerAttachmentIdentityV1>,
     command: portable_pty::CommandBuilder,
     binding: BrokerGenesisBinding,
@@ -4739,6 +4855,7 @@ impl BrokerPreparedPaneV1 {
                 proxy_reader,
                 proxy_writer,
                 output_buffer,
+                output_journal: None,
                 fenced_attachments,
                 command,
                 binding,
@@ -4750,6 +4867,23 @@ impl BrokerPreparedPaneV1 {
             },
             control,
         ))
+    }
+
+    /// Bind one empty, directory-synchronized encrypted output segment before
+    /// the child can exist. Binding is one-way; a mismatched or previously
+    /// used segment drops the child-free prepared reservation fail-closed.
+    pub(crate) fn bind_fresh_output_journal(
+        mut self,
+        journal: GuardianOutputJournal,
+    ) -> Result<Self, BrokerError> {
+        if self.output_journal.is_some() {
+            return Err(BrokerError::DurableOutputJournalAlreadyBound);
+        }
+        self.output_journal = Some(BrokerDurableOutputJournalV1::bind_fresh(
+            journal,
+            self.binding.durable_pane_id,
+        )?);
+        Ok(self)
     }
 
     #[must_use]
@@ -4793,6 +4927,9 @@ impl BrokerPreparedPaneV1 {
         control: BrokerControlLeaseV1,
         permit: GuardianPublishedGenesisAdmissionPermitV1,
     ) -> Result<BrokerAdoptionV1, BrokerError> {
+        if self.output_journal.is_none() {
+            return Err(BrokerError::DurableOutputJournalRequired);
+        }
         let proof = BrokerDurablePreSpawnIntentProof::from_permit(permit);
         self.commit_with_proof(control, &proof)
     }
@@ -4851,6 +4988,7 @@ impl BrokerPreparedPaneV1 {
             proxy_reader: Some(self.proxy_reader),
             proxy_writer: Some(self.proxy_writer),
             output_buffer: self.output_buffer,
+            output_journal: self.output_journal,
             fenced_attachments: self.fenced_attachments,
             child,
             child_identity,
@@ -4936,6 +5074,7 @@ enum BrokerLeaseState {
     },
     Quarantined {
         reason: BrokerQuarantineReasonV1,
+        generation: u64,
         attachment_may_be_open: bool,
     },
     FinalTerminalEof {
@@ -5054,6 +5193,9 @@ pub struct BrokerOutputPumpReceiptV1 {
     pub output_sequence_end: u64,
     pub bytes_drained: usize,
     pub buffered_bytes: usize,
+    /// Encrypted journal record synchronized before this prefix became
+    /// deliverable. `None` is limited to the process-local test substrate.
+    pub durable_journal_sequence: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5091,6 +5233,7 @@ pub struct BrokerAdoptedPaneV1 {
     proxy_reader: Option<Box<dyn PollablePtyReader>>,
     proxy_writer: Option<Box<dyn Write + Send>>,
     output_buffer: VecDeque<u8>,
+    output_journal: Option<BrokerDurableOutputJournalV1>,
     fenced_attachments: VecDeque<BrokerAttachmentIdentityV1>,
     child: Box<dyn Child + Send + Sync>,
     child_identity: BrokerChildIdentityV1,
@@ -5234,10 +5377,35 @@ impl BrokerAdoptedPaneV1 {
     ///
     /// The separately spawned broker's event loop must call this whenever the
     /// PTY is readable, including while no guardian lease is active. Filling
-    /// the fixed store stops reads and intentionally backpressures the child;
-    /// production continuity additionally requires the durable output journal
-    /// before this in-memory foundation can be activated.
+    /// the fixed store stops reads and intentionally backpressures the child.
+    /// A bound journal is always synchronized before its byte prefix advances;
+    /// `None` remains only for the process-local test substrate.
     pub fn pump_ready_output(&mut self) -> Result<BrokerOutputPumpOutcomeV1, BrokerError> {
+        self.pump_ready_output_inner(false)
+    }
+
+    /// Production-shaped output drain that refuses to read without a fresh
+    /// encrypted journal bound before Spawn.
+    pub(crate) fn pump_ready_output_durably(
+        &mut self,
+    ) -> Result<BrokerOutputPumpOutcomeV1, BrokerError> {
+        self.pump_ready_output_inner(true)
+    }
+
+    fn pump_ready_output_inner(
+        &mut self,
+        require_durable_journal: bool,
+    ) -> Result<BrokerOutputPumpOutcomeV1, BrokerError> {
+        if require_durable_journal && self.output_journal.is_none() {
+            return Err(BrokerError::DurableOutputJournalRequired);
+        }
+        if self
+            .output_journal
+            .as_ref()
+            .is_some_and(|journal| journal.failed)
+        {
+            return Err(BrokerError::DurableOutputJournalUnavailable);
+        }
         if let Some(state) = self.output_terminal {
             return Ok(BrokerOutputPumpOutcomeV1::TerminalDrained(
                 self.output_terminal_receipt(state, false),
@@ -5283,17 +5451,27 @@ impl BrokerAdoptedPaneV1 {
         let bytes_drained_u64 =
             u64::try_from(bytes_drained).map_err(|_| BrokerError::ProxyCapacityExhausted)?;
         let output_sequence_start = self.next_output_sequence;
-        self.output_buffer.extend(&chunk[..bytes_drained]);
-        self.next_output_sequence = self
-            .next_output_sequence
+        let output_sequence_end = output_sequence_start
             .checked_add(bytes_drained_u64)
             .ok_or(BrokerError::ProxyCapacityExhausted)?;
+        self.output_buffer.extend(&chunk[..bytes_drained]);
+        let durable_journal_sequence = if let Some(journal) = self.output_journal.as_mut() {
+            Some(
+                journal
+                    .append_and_sync(output_sequence_start, &chunk[..bytes_drained])?
+                    .sequence(),
+            )
+        } else {
+            None
+        };
+        self.next_output_sequence = output_sequence_end;
         Ok(BrokerOutputPumpOutcomeV1::Drained(
             BrokerOutputPumpReceiptV1 {
                 output_sequence_start,
                 output_sequence_end: self.next_output_sequence,
                 bytes_drained,
                 buffered_bytes: self.output_buffer.len(),
+                durable_journal_sequence,
             },
         ))
     }
@@ -5666,8 +5844,8 @@ impl BrokerAdoptedPaneV1 {
                 last_handoff_id: Some(last_handoff_id),
             } if last_handoff_id == authority.handoff_id
                 && attachment.owner == authority.successor
-                && attachment.lease_generation
-                    == authority.predecessor.lease_generation.saturating_add(1) =>
+                && authority.predecessor.lease_generation.checked_add(1)
+                    == Some(attachment.lease_generation) =>
             {
                 Ok(BrokerSuccessorAttachOutcomeV1::RecoveredExistingLease {
                     attachment: BrokerPtyAttachmentV1 {
@@ -5784,8 +5962,10 @@ impl BrokerAdoptedPaneV1 {
     }
 
     fn quarantine(&mut self, reason: BrokerQuarantineReasonV1, attachment_may_be_open: bool) {
+        let generation = self.current_generation();
         self.lease = BrokerLeaseState::Quarantined {
             reason,
+            generation,
             attachment_may_be_open,
         };
     }
@@ -5802,7 +5982,7 @@ impl BrokerAdoptedPaneV1 {
             BrokerLeaseState::AwaitingSuccessor {
                 next_generation, ..
             } => next_generation,
-            BrokerLeaseState::Quarantined { .. } => self.completed_successor_handoffs as u64,
+            BrokerLeaseState::Quarantined { generation, .. } => generation,
             BrokerLeaseState::FinalTerminalEof { generation, .. } => generation,
             BrokerLeaseState::FinalTerminalEofPending { generation, .. } => generation,
         }
@@ -5983,6 +6163,18 @@ pub enum BrokerError {
     OutputBufferFull,
     #[error("broker output buffer sequence invariant failed")]
     OutputBufferInvariant,
+    #[error("durable broker output requires an encrypted journal bound before Spawn")]
+    DurableOutputJournalRequired,
+    #[error("durable broker output journal is already bound")]
+    DurableOutputJournalAlreadyBound,
+    #[error("durable broker output journal belongs to a different pane")]
+    DurableOutputJournalBindingMismatch,
+    #[error("durable broker output journal is not a fresh initial segment")]
+    DurableOutputJournalNotFresh,
+    #[error("durable broker output journal is unavailable and requires reconciliation")]
+    DurableOutputJournalUnavailable,
+    #[error("durable broker output journal returned an inconsistent append receipt")]
+    DurableOutputJournalReceiptMismatch,
     #[error("requested proxy output is older than the retained sequence window")]
     ProxyOutputGap,
     #[error("proxy output acknowledgement is outside the delivered prefix")]
@@ -6002,6 +6194,9 @@ pub enum BrokerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mux::guardian_output_journal::{
+        GuardianOutputCipher, GuardianOutputJournalLimits, GuardianOutputSegmentIdentity,
+    };
     use std::fs;
     use std::fs::OpenOptions;
     use std::io::Read;
@@ -6223,7 +6418,7 @@ mod tests {
             encode_broker_control_response(&authority, &response).expect("encode response");
         assert_eq!(
             encoded_response.as_slice().len(),
-            BROKER_CONTROL_RESPONSE_FIXED_BYTES
+            BROKER_CONTROL_RESPONSE_FIXED_BYTES + BROKER_CONTROL_HELLO_PAYLOAD_BYTES
         );
         let decoded_response =
             decode_broker_control_response(&authority, encoded_response.as_slice())
@@ -6322,6 +6517,70 @@ mod tests {
             broker_child_nonce: id(712),
             kernel_start_identity_digest: [0x73; 32],
         };
+        let spawn_request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Spawn,
+                request_id: id(719),
+                broker_incarnation: id(705),
+                guardian_incarnation: id(702),
+                connection_id: id(703),
+                mux_incarnation: id(704),
+                guardian_build_identity_digest: [0x71; 32],
+                mux_build_identity_digest: [0x72; 32],
+                durable_pane_id: id(707),
+                lease_generation: 0,
+                operation_id: id(720),
+            },
+            &[0x01],
+        )
+        .expect("canonical generation-zero Spawn request");
+        let applied_spawn = BrokerControlResponseV1::new(
+            BrokerControlResponseHeaderV1 {
+                operation: BrokerControlOperationV1::Spawn,
+                status: BrokerControlResponseStatusV1::Applied,
+                request_id: spawn_request.header.request_id,
+                broker_incarnation: id(705),
+                guardian_incarnation: spawn_request.header.guardian_incarnation,
+                connection_id: spawn_request.header.connection_id,
+                durable_pane_id: spawn_request.header.durable_pane_id,
+                lease_generation: 1,
+                operation_id: spawn_request.header.operation_id,
+                child_identity: Some(child_identity),
+                output_sequence_start: 0,
+                output_sequence_end: 0,
+            },
+            &[],
+        )
+        .expect("successful Spawn creates exactly generation one");
+        assert!(broker_control_response_lease_generation_matches(
+            spawn_request.header,
+            applied_spawn.header,
+        ));
+        assert!(matches!(
+            BrokerControlResponseV1::new(
+                BrokerControlResponseHeaderV1 {
+                    lease_generation: 2,
+                    ..applied_spawn.header
+                },
+                &[],
+            ),
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+        let rejected_spawn = BrokerControlResponseV1::new(
+            BrokerControlResponseHeaderV1 {
+                status: BrokerControlResponseStatusV1::Rejected,
+                lease_generation: 0,
+                child_identity: None,
+                ..applied_spawn.header
+            },
+            &[],
+        )
+        .expect("rejected Spawn preserves request generation zero");
+        assert!(broker_control_response_lease_generation_matches(
+            spawn_request.header,
+            rejected_spawn.header,
+        ));
+
         let forged_rejected_write = BrokerControlResponseV1::new(
             BrokerControlResponseHeaderV1 {
                 operation: BrokerControlOperationV1::Write,
@@ -6726,6 +6985,27 @@ mod tests {
             .sync_parent_directory_and_activate(&parent)
             .expect("activate broker Spawn WAL directory entries");
         (journal, wal_path, head_path)
+    }
+
+    fn create_test_output_journal(
+        directory: &std::path::Path,
+        durable_pane_id: Uuid,
+        segment_id: Uuid,
+        limits: GuardianOutputJournalLimits,
+    ) -> GuardianOutputJournal {
+        let path = directory.join(format!("output-{segment_id}.journal"));
+        let identity = GuardianOutputSegmentIdentity::new(durable_pane_id, segment_id, 1, None)
+            .expect("valid initial output segment identity");
+        let cipher = GuardianOutputCipher::try_from_key_slice(&[0xa5; 32])
+            .expect("valid test output cipher");
+        let mut journal =
+            GuardianOutputJournal::open(open_new_test_file(&path), identity, cipher, limits)
+                .expect("create encrypted test output journal");
+        let parent = File::open(directory).expect("open output journal parent directory");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate output journal directory entry");
+        journal
     }
 
     fn reopen_test_spawn_journal(
@@ -7396,6 +7676,11 @@ mod tests {
                 BrokerQuarantineReasonV1::ConflictingSuccessorHandoff
             )
         );
+        assert_eq!(
+            pane.status().lease_generation,
+            2,
+            "quarantine lost the already-reserved successor generation"
+        );
 
         let retry = BrokerSuccessorHandoffAuthorityV1 {
             broker_incarnation: id(41),
@@ -7415,6 +7700,331 @@ mod tests {
     }
 
     #[test]
+    fn active_handoff_quarantine_preserves_initial_lease_generation() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(91), id(92), id(93), id(94), 0x81, 0x82);
+        let payload = command_payload("IFS= read -r ignored", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let (prepared, control) =
+            prepare_for_test(payload, binding, &auth, BrokerResourceLimitsV1::default())
+                .expect("prepare active quarantine pane");
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, binding).expect("commit active quarantine pane");
+        let successor = authority(id(91), id(95), id(96), id(97), 0x83, 0x84);
+        let invalid = BrokerSuccessorHandoffAuthorityV1 {
+            broker_incarnation: id(98),
+            durable_pane_id: binding.durable_pane_id,
+            spawn_effect_id: binding.spawn_effect_id,
+            handoff_id: id(99),
+            predecessor: attachment.identity(),
+            successor: successor.owner,
+        };
+        assert_eq!(
+            pane.attach_successor(invalid).err(),
+            Some(BrokerError::ConflictingSuccessorHandoff)
+        );
+        assert_eq!(
+            pane.status().lease_generation,
+            1,
+            "active quarantine fabricated generation zero"
+        );
+        assert_eq!(
+            pane.status().lifecycle,
+            BrokerPaneLifecycleV1::Quarantined(
+                BrokerQuarantineReasonV1::ConflictingSuccessorHandoff
+            )
+        );
+        pane.terminate_and_wait_for_test();
+    }
+
+    #[test]
+    fn durable_output_binding_rejects_wrong_used_or_unactivated_segment_before_spawn() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("must-not-spawn");
+        let auth = authority(id(101), id(102), id(103), id(104), 0x91, 0x92);
+        let make_payload = || command_payload("printf x >>\"$BROKER_SENTINEL\"", &sentinel);
+        let binding = binding_for(&make_payload(), &auth);
+
+        let (wrong_prepared, _wrong_control) = prepare_for_test(
+            make_payload(),
+            binding,
+            &auth,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare wrong-journal pane");
+        let wrong_journal = create_test_output_journal(
+            temp.path(),
+            id(105),
+            id(106),
+            GuardianOutputJournalLimits::default(),
+        );
+        assert!(matches!(
+            wrong_prepared.bind_fresh_output_journal(wrong_journal),
+            Err(BrokerError::DurableOutputJournalBindingMismatch)
+        ));
+
+        let (used_prepared, _used_control) = prepare_for_test(
+            make_payload(),
+            binding,
+            &auth,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare used-journal pane");
+        let mut used_journal = create_test_output_journal(
+            temp.path(),
+            binding.durable_pane_id,
+            id(107),
+            GuardianOutputJournalLimits::default(),
+        );
+        used_journal
+            .append_and_sync(b"prior")
+            .expect("seed used output journal");
+        assert!(matches!(
+            used_prepared.bind_fresh_output_journal(used_journal),
+            Err(BrokerError::DurableOutputJournalNotFresh)
+        ));
+
+        let (unactivated_prepared, _unactivated_control) = prepare_for_test(
+            make_payload(),
+            binding,
+            &auth,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare unactivated-journal pane");
+        let unactivated_identity =
+            GuardianOutputSegmentIdentity::new(binding.durable_pane_id, id(108), 1, None)
+                .expect("valid unactivated output identity");
+        let unactivated_cipher = GuardianOutputCipher::try_from_key_slice(&[0xa6; 32])
+            .expect("valid unactivated output cipher");
+        let unactivated_journal = GuardianOutputJournal::open(
+            open_new_test_file(&temp.path().join("output-unactivated.journal")),
+            unactivated_identity,
+            unactivated_cipher,
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize unactivated output journal");
+        assert!(matches!(
+            unactivated_prepared.bind_fresh_output_journal(unactivated_journal),
+            Err(BrokerError::DurableOutputJournalUnavailable)
+        ));
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(!sentinel.exists(), "journal rejection spawned a child");
+    }
+
+    #[test]
+    fn durable_output_is_synchronized_and_recoverable_before_proxy_delivery() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(111), id(112), id(113), id(114), 0x93, 0x94);
+        let payload = command_payload("printf journaled", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let limits =
+            BrokerResourceLimitsV1::with_proxy_bounds(GUARDIAN_MAX_PAYLOAD_BYTES, 1, 32, 32)
+                .expect("valid durable output bounds");
+        let (prepared, control) =
+            prepare_for_test(payload, binding, &auth, limits).expect("prepare durable output pane");
+        let journal = create_test_output_journal(
+            temp.path(),
+            binding.durable_pane_id,
+            id(115),
+            GuardianOutputJournalLimits {
+                max_record_bytes: 32,
+                max_log_bytes: 4 * 1024,
+                max_records: 8,
+            },
+        );
+        let prepared = prepared
+            .bind_fresh_output_journal(journal)
+            .expect("bind fresh durable output journal");
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, binding).expect("commit durable output pane");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pumps = Vec::new();
+        while pane.status().output_sequence < 9 {
+            match pane.pump_ready_output_durably() {
+                Ok(BrokerOutputPumpOutcomeV1::Drained(receipt)) => pumps.push(receipt),
+                Ok(BrokerOutputPumpOutcomeV1::TerminalDrained(receipt)) => {
+                    panic!("PTY became terminal before durable output: {receipt:?}")
+                }
+                Err(BrokerError::ProxyWouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("durable output pump failed: {error}"),
+            }
+        }
+        assert_eq!(pane.status().output_sequence, 9);
+        assert!(!pumps.is_empty());
+        for (index, pump) in pumps.iter().enumerate() {
+            assert_eq!(
+                pump.durable_journal_sequence,
+                Some(u64::try_from(index).expect("record index fits u64") + 1)
+            );
+        }
+
+        {
+            let durable = pane
+                .output_journal
+                .as_ref()
+                .expect("adopted pane retained output journal");
+            assert_eq!(
+                durable.journal.record_count(),
+                u64::try_from(pumps.len()).expect("record count fits u64")
+            );
+            assert_eq!(durable.journal.cumulative_plaintext_bytes(), 9);
+            let mut cursor = durable
+                .journal
+                .recovery_cursor(1, 32)
+                .expect("open authenticated output recovery cursor");
+            let mut recovered = Vec::new();
+            let mut recovered_records = 0_u64;
+            while let Some(record) = cursor
+                .next_record()
+                .expect("recover synchronized output record")
+            {
+                recovered_records += 1;
+                let recovered_receipt = record
+                    .into_authenticated_delivery()
+                    .expect("promote authenticated output")
+                    .write_all_bounded(&mut recovered, 32)
+                    .expect("deliver authenticated recovered output");
+                assert_eq!(recovered_receipt.sequence(), recovered_records);
+            }
+            assert_eq!(recovered_records, durable.journal.record_count());
+            assert_eq!(recovered, b"journaled");
+        }
+
+        let permit = pane
+            .admit_proxy_read(&attachment, 9)
+            .expect("admit journaled output delivery");
+        let mut delivered = [0_u8; 9];
+        let receipt = pane
+            .execute_proxy_read(permit, &mut delivered)
+            .expect("deliver synchronized output prefix");
+        assert_eq!(&delivered, b"journaled");
+        let ack = pane
+            .admit_proxy_output_ack(&attachment, receipt.output_sequence_end)
+            .expect("admit synchronized output acknowledgement");
+        pane.execute_proxy_output_ack(ack)
+            .expect("commit synchronized output acknowledgement");
+        assert_eq!(pane.resource_usage().buffered_output_bytes, 0);
+        assert!(
+            pane.wait_for_test()
+                .expect("wait for output child")
+                .success()
+        );
+    }
+
+    #[test]
+    fn durable_output_append_failure_is_sticky_and_never_exposes_undurable_tail() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(121), id(122), id(123), id(124), 0x95, 0x96);
+        let payload = command_payload("printf abcdefgh", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let limits = BrokerResourceLimitsV1::with_proxy_bounds(GUARDIAN_MAX_PAYLOAD_BYTES, 1, 4, 8)
+            .expect("valid bounded durable output limits");
+        let (prepared, control) = prepare_for_test(payload, binding, &auth, limits)
+            .expect("prepare capacity-fenced output pane");
+        let journal = create_test_output_journal(
+            temp.path(),
+            binding.durable_pane_id,
+            id(125),
+            GuardianOutputJournalLimits {
+                max_record_bytes: 4,
+                max_log_bytes: 4 * 1024,
+                max_records: 1,
+            },
+        );
+        let prepared = prepared
+            .bind_fresh_output_journal(journal)
+            .expect("bind capacity-fenced output journal");
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, binding).expect("commit capacity-fenced pane");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            match pane.pump_ready_output_durably() {
+                Ok(BrokerOutputPumpOutcomeV1::Drained(receipt)) => break receipt,
+                Ok(BrokerOutputPumpOutcomeV1::TerminalDrained(receipt)) => {
+                    panic!("PTY became terminal before first durable record: {receipt:?}")
+                }
+                Err(BrokerError::ProxyWouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("first durable output pump failed: {error}"),
+            }
+        };
+        assert_eq!(first.durable_journal_sequence, Some(1));
+        assert!(first.bytes_drained > 0 && first.bytes_drained <= 4);
+        let durable_end = first.output_sequence_end;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match pane.pump_ready_output_durably() {
+                Err(BrokerError::DurableOutputJournalUnavailable) => break,
+                Err(BrokerError::ProxyWouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(BrokerOutputPumpOutcomeV1::TerminalDrained(receipt)) => {
+                    panic!("PTY became terminal before journal capacity fence: {receipt:?}")
+                }
+                Ok(BrokerOutputPumpOutcomeV1::Drained(receipt)) => {
+                    panic!("second journal record bypassed max_records=1: {receipt:?}")
+                }
+                Err(error) => panic!("unexpected durable journal failure: {error}"),
+            }
+        }
+        assert_eq!(pane.status().output_sequence, durable_end);
+        assert!(pane.resource_usage().buffered_output_bytes > first.bytes_drained);
+        let durable = pane
+            .output_journal
+            .as_ref()
+            .expect("retained failed durable journal");
+        assert!(durable.failed);
+        assert_eq!(durable.journal.record_count(), 1);
+        assert_eq!(durable.journal.cumulative_plaintext_bytes(), durable_end);
+        assert_eq!(
+            pane.pump_ready_output_durably(),
+            Err(BrokerError::DurableOutputJournalUnavailable),
+            "a sticky journal failure resumed PTY reads"
+        );
+
+        let durable_bytes = usize::try_from(durable_end).expect("bounded durable byte count");
+        let permit = pane
+            .admit_proxy_read(&attachment, durable_bytes)
+            .expect("admit durable prefix only");
+        let mut delivered = [0_u8; 4];
+        let read = pane
+            .execute_proxy_read(permit, &mut delivered)
+            .expect("deliver durable prefix only");
+        assert_eq!(&delivered[..read.bytes_read], &b"abcdefgh"[..durable_bytes]);
+        let ack = pane
+            .admit_proxy_output_ack(&attachment, read.output_sequence_end)
+            .expect("admit durable-prefix acknowledgement");
+        pane.execute_proxy_output_ack(ack)
+            .expect("acknowledge durable prefix");
+        assert!(pane.resource_usage().buffered_output_bytes > 0);
+        let no_durable_bytes = pane
+            .admit_proxy_read(&attachment, 1)
+            .expect("admit query past durable prefix");
+        assert_eq!(
+            pane.execute_proxy_read(no_durable_bytes, &mut [0_u8; 1]),
+            Err(BrokerError::ProxyWouldBlock),
+            "undurable buffered tail became guardian-visible"
+        );
+        pane.terminate_and_wait_for_test();
+    }
+
+    #[test]
     fn output_read_replays_lost_reply_and_ack_releases_bounded_window() {
         let temp = tempfile::tempdir().expect("test directory");
         let sentinel = temp.path().join("unused");
@@ -7429,6 +8039,10 @@ mod tests {
             mut pane,
             attachment,
         } = commit_for_test(prepared, control, binding).expect("commit bounded output pane");
+        assert_eq!(
+            pane.pump_ready_output_durably(),
+            Err(BrokerError::DurableOutputJournalRequired)
+        );
 
         while pane.resource_usage().buffered_output_bytes < limits.max_buffered_output_bytes() {
             let _ = pump_until_drained(&mut pane);

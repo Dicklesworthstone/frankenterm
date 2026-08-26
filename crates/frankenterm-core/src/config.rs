@@ -6197,6 +6197,12 @@ impl WorkspaceLayout {
         self.ft_dir.join("recordings")
     }
 
+    /// Directory for portable, offline-verifiable checkpoint/scrollback artifacts.
+    #[must_use]
+    pub fn checkpoint_artifacts_dir(&self) -> PathBuf {
+        self.ft_dir.join("checkpoint-artifacts")
+    }
+
     /// Ensure workspace directories exist and are writable
     pub fn ensure_directories(&self) -> crate::Result<()> {
         ensure_dir(&self.ft_dir)?;
@@ -7043,6 +7049,12 @@ disabled_rules = ["codex.usage_warning"]
         assert!(layout.lock_path.ends_with("watch.lock"));
         assert!(layout.ipc_socket_path.ends_with("ipc.sock"));
         assert!(layout.log_path.ends_with("ft-watch.log"));
+        assert_eq!(
+            layout.checkpoint_artifacts_dir(),
+            PathBuf::from("workspace-root")
+                .join(".ft")
+                .join("checkpoint-artifacts")
+        );
     }
 
     // ─── br-ft-at5kq: storage.db_path workspace containment ──────────

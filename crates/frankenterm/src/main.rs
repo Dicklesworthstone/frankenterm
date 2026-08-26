@@ -1434,9 +1434,12 @@ SEE ALSO:
         command: BackupCommands,
     },
 
-    /// Session snapshot commands (save, restore, list, inspect, diff, delete)
+    /// Session snapshot commands, including portable artifact export and verification
     #[command(after_help = r#"EXAMPLES:
     ft snapshot save                  Capture current session state
+    ft snapshot export latest         Export and verify portable scrollback
+    ft snapshot verify-artifact PATH  Verify an artifact without the database
+    ft snapshot list-artifacts        Verify the workspace artifact catalog
     ft snapshot list                  Show recent snapshots
     ft snapshot inspect <id>          Detailed view of a snapshot
     ft snapshot restore <id> --dry-run  Inspect bounded restore metadata only
@@ -5273,8 +5276,14 @@ enum RobotCheckpointCommands {
         #[arg(long)]
         label: Option<String>,
 
-        /// Include scrollback content (larger but more complete)
-        #[arg(long)]
+        /// Include durable scrollback content; pass `--include-scrollback=false` only for metadata-only capture
+        #[arg(
+            long,
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
         include_scrollback: bool,
 
         /// Specific pane IDs to checkpoint (comma-separated; empty = all)
@@ -7725,6 +7734,45 @@ enum SnapshotCommands {
         format: String,
     },
 
+    /// Export a snapshot and its retained scrollback as a portable verified artifact
+    Export {
+        /// Snapshot ID or "latest" for the most recent snapshot
+        snapshot_id: String,
+
+        /// Exact output file; defaults to the canonical workspace artifact path
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Permit an artifact whose durable scrollback prefix is incomplete
+        #[arg(long)]
+        allow_incomplete: bool,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Verify a portable checkpoint/scrollback artifact without opening the database
+    VerifyArtifact {
+        /// Exact artifact file to verify
+        path: PathBuf,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Inventory and verify the bounded workspace artifact catalog
+    ListArtifacts {
+        /// Artifact directory; defaults to .ft/checkpoint-artifacts
+        #[arg(long)]
+        directory: Option<PathBuf>,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
     /// Inspect a bounded restore descriptor; execution is currently unavailable
     Restore {
         /// Snapshot ID or "latest" for most recent
@@ -8022,6 +8070,14 @@ enum SessionCommands {
     VerifyDump {
         /// Dump artifact to verify
         path: PathBuf,
+
+        /// Require a complete zero-error capture, not merely an intact partial artifact
+        #[arg(long)]
+        require_complete: bool,
+
+        /// Require an exact verified redacted domain pane count (`DOMAIN=COUNT`); repeatable
+        #[arg(long = "expect-domain-panes", value_name = "DOMAIN=COUNT")]
+        expect_domain_panes: Vec<String>,
 
         /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
@@ -23764,11 +23820,17 @@ fn resolve_checkpoint_id(
     }
 }
 
-fn load_checkpoint_identity(
+#[derive(Debug)]
+struct LoadedCheckpointIdentity {
+    identity: frankenterm_core::snapshot_engine::SnapshotCheckpointIdentity,
+    pane_count: usize,
+}
+
+fn load_checkpoint_identity_with_pane_count(
     db_path: &str,
     checkpoint_id: i64,
     scope: CheckpointResolveScope,
-) -> anyhow::Result<Option<frankenterm_core::snapshot_engine::SnapshotCheckpointIdentity>> {
+) -> anyhow::Result<Option<LoadedCheckpointIdentity>> {
     let conn = open_cli_read_only_connection(db_path)?;
     let role_predicate = match scope {
         CheckpointResolveScope::Snapshot => "AND checkpoint_role = 'snapshot'",
@@ -23794,6 +23856,10 @@ fn load_checkpoint_identity(
                         WHEN typeof(state_hash) = 'text'
                          AND length(CAST(state_hash AS BLOB)) BETWEEN 1 AND ?4
                         THEN state_hash
+                    END,
+                    CASE
+                        WHEN typeof(pane_count) = 'integer' AND pane_count >= 0
+                        THEN pane_count
                     END
              FROM session_checkpoints
              WHERE id = ?1 {role_predicate}"
@@ -23810,11 +23876,12 @@ fn load_checkpoint_identity(
                 row.get::<_, Option<i64>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         },
     );
     match row {
-        Ok((session_id, checkpoint_at, checkpoint_role, state_hash)) => {
+        Ok((session_id, checkpoint_at, checkpoint_role, state_hash, pane_count)) => {
             let session_id = robot_checkpoint_required_bounded_text(
                 session_id,
                 "session_id",
@@ -23836,19 +23903,37 @@ fn load_checkpoint_identity(
                 "state_hash",
                 MAX_ROBOT_CHECKPOINT_STATE_HASH_BYTES,
             )?;
-            Ok(Some(
-                frankenterm_core::snapshot_engine::SnapshotCheckpointIdentity {
+            let pane_count = pane_count
+                .ok_or_else(|| anyhow::anyhow!("checkpoint identity has invalid pane_count"))
+                .and_then(|value| {
+                    usize::try_from(value)
+                        .map_err(|_| anyhow::anyhow!("checkpoint pane_count exceeds usize"))
+                })?;
+            Ok(Some(LoadedCheckpointIdentity {
+                identity: frankenterm_core::snapshot_engine::SnapshotCheckpointIdentity {
                     checkpoint_id,
                     session_id,
                     checkpoint_at,
                     checkpoint_role,
                     state_hash,
                 },
-            ))
+                pane_count,
+            }))
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn load_checkpoint_identity(
+    db_path: &str,
+    checkpoint_id: i64,
+    scope: CheckpointResolveScope,
+) -> anyhow::Result<Option<frankenterm_core::snapshot_engine::SnapshotCheckpointIdentity>> {
+    Ok(
+        load_checkpoint_identity_with_pane_count(db_path, checkpoint_id, scope)?
+            .map(|loaded| loaded.identity),
+    )
 }
 
 fn robot_checkpoint_error_response(
@@ -24532,7 +24617,16 @@ fn robot_checkpoint_save_response(
     label: Option<&str>,
     include_scrollback: bool,
     scrollback_coverage: RobotCheckpointScrollbackCoverage,
+    artifact: Option<&frankenterm_core::snapshot_engine::CheckpointScrollbackArtifactPublication>,
 ) -> serde_json::Value {
+    let artifact_payload = artifact.map(|publication| {
+        checkpoint_artifact_receipt_json(
+            "robot.checkpoint.save",
+            &publication.path,
+            &publication.receipt,
+        )
+    });
+    let scrollback_complete = artifact.is_some_and(|publication| publication.scrollback_complete());
     serde_json::json!({
         "family": "checkpoint",
         "action": "save",
@@ -24554,9 +24648,15 @@ fn robot_checkpoint_save_response(
         "verification": "verified_v2",
         "scrollback_requested": include_scrollback,
         "scrollback_included": scrollback_coverage.any(),
-        "scrollback_complete": scrollback_coverage.all(),
-        "scrollback_completeness_scope": "pane_coverage",
+        "scrollback_complete": scrollback_complete,
+        "scrollback_completeness_scope": if artifact.is_some() {
+            "durable_zero_based_contiguous_checkpoint_prefix_without_capture_gaps"
+        } else {
+            "not_requested"
+        },
         "scrollback_panes": scrollback_coverage.panes_with_scrollback,
+        "scrollback_reference_coverage_complete": scrollback_coverage.all(),
+        "artifact": artifact_payload,
         "created_at": result.checkpoint_at,
         "trigger": "manual",
         "audit_receipt": {
@@ -25515,25 +25615,15 @@ async fn robot_checkpoint_save_data(
         })
         .await;
 
-    engine
-        .close_after_checkpoint_with_cx(&cx, &result)
-        .await
-        .map_err(|err| {
-            robot_checkpoint_internal_error_response(
-                ROBOT_ERR_STORAGE,
-                "robot checkpoint session close",
-                "Checkpoint committed, but one-shot session close failed.",
-                Some("Reconcile the committed checkpoint before retrying this save.".to_string()),
-                &err,
-                elapsed_ms,
-            )
-        })?;
     let scrollback_coverage = scrollback_verification.map_err(|err| {
         robot_checkpoint_internal_error_response(
             ROBOT_ERR_STORAGE,
             "robot checkpoint scrollback verification",
-            "Checkpoint committed and closed, but scrollback verification failed.",
-            None,
+            "Checkpoint committed, but scrollback reference verification failed.",
+            Some(format!(
+                "Reconcile checkpoint {} before retrying this save.",
+                result.checkpoint_id
+            )),
             &err,
             elapsed_ms,
         )
@@ -25547,11 +25637,77 @@ async fn robot_checkpoint_save_data(
         )));
     }
 
+    let artifact_publication = if include_scrollback {
+        let artifact_db_path = db_path.clone();
+        let artifact_snapshot = result.clone();
+        let artifact_directory = layout.checkpoint_artifacts_dir();
+        let publication = run_cli_settled_blocking_effect(
+            &cx,
+            "robot checkpoint artifact publication",
+            move || {
+                Ok(frankenterm_core::snapshot_engine::publish_or_recover_checkpoint_scrollback_artifact(
+                    &artifact_db_path,
+                    &artifact_snapshot,
+                    &artifact_directory,
+                    frankenterm_core::snapshot_engine::CheckpointScrollbackArtifactLimits::default(),
+                )?)
+            },
+        )
+        .await
+        .map_err(|err| {
+            robot_checkpoint_internal_error_response(
+                ROBOT_ERR_STORAGE,
+                "robot checkpoint artifact publication",
+                "Checkpoint committed, but its portable scrollback artifact was not acknowledged.",
+                Some(format!(
+                    "Reconcile with `ft snapshot export {}` before retrying this save.",
+                    result.checkpoint_id
+                )),
+                &err,
+                elapsed_ms,
+            )
+        })?;
+        if !publication.scrollback_complete() {
+            return Err(Box::new(robot_checkpoint_error_response(
+                ROBOT_ERR_STORAGE,
+                format!(
+                    "Checkpoint {} and its verified artifact were retained, but {} of {} pane scrollback prefixes are incomplete.",
+                    result.checkpoint_id,
+                    publication.incomplete_pane_count(),
+                    publication.receipt.pane_count
+                ),
+                Some(
+                    "Treat this artifact as forensic salvage only; do not admit it for a lossless mux upgrade."
+                        .to_string(),
+                ),
+                elapsed_ms,
+            )));
+        }
+        Some(publication)
+    } else {
+        None
+    };
+
+    engine
+        .close_after_checkpoint_with_cx(&cx, &result)
+        .await
+        .map_err(|err| {
+            robot_checkpoint_internal_error_response(
+                ROBOT_ERR_STORAGE,
+                "robot checkpoint session close",
+                "Checkpoint committed, but one-shot session close failed.",
+                Some("Reconcile the committed checkpoint before retrying this save.".to_string()),
+                &err,
+                elapsed_ms,
+            )
+        })?;
+
     Ok(robot_checkpoint_save_response(
         &result,
         label.as_deref(),
         include_scrollback,
         scrollback_coverage,
+        artifact_publication.as_ref(),
     ))
 }
 
@@ -44308,6 +44464,44 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             format,
         )
         .await?;
+        return Ok(());
+    }
+
+    // Offline dump verification is also an incident-recovery surface. Keep it
+    // independent of user config, workspace databases, logging setup, fonts,
+    // and every live mux path so damaged local state cannot block or mutate a
+    // retained safety-artifact check.
+    if let Some(Commands::Session {
+        command:
+            SessionCommands::VerifyDump {
+                path,
+                require_complete,
+                expect_domain_panes,
+                format,
+            },
+    }) = command.as_ref()
+    {
+        run_verify_mux_dump_command(path, *require_complete, expect_domain_panes, format)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Snapshot {
+        command: SnapshotCommands::VerifyArtifact { path, format },
+    }) = command.as_ref()
+    {
+        run_verify_checkpoint_scrollback_artifact_command(cx, path, format).await?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Snapshot {
+        command:
+            SnapshotCommands::ListArtifacts {
+                directory: Some(directory),
+                format,
+            },
+    }) = command.as_ref()
+    {
+        run_list_checkpoint_scrollback_artifacts_command(cx, directory, false, format).await?;
         return Ok(());
     }
 
@@ -74664,6 +74858,201 @@ fn print_migration_plan(plan: &MigrationPlan) {
     }
 }
 
+fn checkpoint_artifact_receipt_json(
+    operation: &'static str,
+    path: &Path,
+    receipt: &frankenterm_core::snapshot_engine::CheckpointScrollbackArtifactReceipt,
+) -> serde_json::Value {
+    let scrollback_complete = receipt.scrollback_complete();
+    serde_json::json!({
+        "ok": true,
+        "operation": operation,
+        "path": path.display().to_string(),
+        "schema": receipt.schema,
+        "checkpoint_id": receipt.checkpoint_id,
+        "session_id": receipt.session_id,
+        "checkpoint_role": receipt.checkpoint_role,
+        "checkpoint_state_hash": receipt.checkpoint_state_hash,
+        "created_at_epoch_ms": receipt.created_at_epoch_ms,
+        "payload_sha256": receipt.payload_sha256,
+        "artifact_sha256": receipt.artifact_sha256,
+        "artifact_bytes": receipt.artifact_bytes,
+        "pane_count": receipt.pane_count,
+        "complete_pane_count": receipt.complete_pane_count,
+        "scrollback_complete": scrollback_complete,
+        "segment_count": receipt.segment_count,
+        "content_bytes": receipt.content_bytes,
+        "durability": receipt.durability,
+        "capabilities": receipt.capabilities,
+        "restore_scope": "forensic_scrollback_and_checkpoint_topology_only",
+        "running_process_continuity": false,
+    })
+}
+
+fn print_checkpoint_artifact_receipt_plain(
+    heading: &str,
+    path: &Path,
+    receipt: &frankenterm_core::snapshot_engine::CheckpointScrollbackArtifactReceipt,
+) {
+    println!("{heading}");
+    println!("  Path:                 {}", path.display());
+    println!("  Checkpoint:           {}", receipt.checkpoint_id);
+    println!("  Session:              {}", receipt.session_id);
+    println!("  Checkpoint role:      {}", receipt.checkpoint_role);
+    println!("  Artifact SHA-256:     {}", receipt.artifact_sha256);
+    println!("  Payload SHA-256:      {}", receipt.payload_sha256);
+    println!("  Artifact bytes:       {}", receipt.artifact_bytes);
+    println!("  Panes:                {}", receipt.pane_count);
+    println!(
+        "  Complete pane prefix: {}/{}",
+        receipt.complete_pane_count, receipt.pane_count
+    );
+    println!("  Segments:             {}", receipt.segment_count);
+    println!("  Scrollback bytes:     {}", receipt.content_bytes);
+    println!("  Durability:           {}", receipt.durability);
+    println!("  Recovery scope:       forensic scrollback and checkpoint topology only");
+    println!("  Running processes:    not preserved by this artifact");
+}
+
+async fn run_verify_checkpoint_scrollback_artifact_command(
+    cx: &frankenterm_core::cx::Cx,
+    path: &Path,
+    format: &str,
+) -> anyhow::Result<()> {
+    use frankenterm_core::snapshot_engine::{
+        CheckpointScrollbackArtifactLimits, verify_checkpoint_scrollback_artifact,
+    };
+
+    let output_format = resolve_snapshot_session_output_format(format);
+    let verification_path = path.to_path_buf();
+    let receipt =
+        match run_cli_blocking_with_cx(cx, "snapshot artifact offline verification", move || {
+            Ok(verify_checkpoint_scrollback_artifact(
+                &verification_path,
+                CheckpointScrollbackArtifactLimits::default(),
+            )?)
+        })
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                trace_bounded_cli_internal_error("snapshot artifact offline verification", &error);
+                emit_snapshot_session_error(
+                    output_format,
+                    "snapshot_artifact_verification_failed",
+                    "Snapshot artifact offline verification failed.",
+                )?;
+                std::process::exit(1);
+            }
+        };
+    let payload = checkpoint_artifact_receipt_json("verify", path, &receipt);
+    if !print_snapshot_session_structured_output(&payload, output_format)? {
+        print_checkpoint_artifact_receipt_plain(
+            "Snapshot artifact verified offline",
+            path,
+            &receipt,
+        );
+    }
+    Ok(())
+}
+
+async fn run_list_checkpoint_scrollback_artifacts_command(
+    cx: &frankenterm_core::cx::Cx,
+    artifact_directory: &Path,
+    allow_missing_catalog: bool,
+    format: &str,
+) -> anyhow::Result<()> {
+    use frankenterm_core::snapshot_engine::{
+        CheckpointScrollbackArtifactLimits, inventory_checkpoint_scrollback_artifacts,
+    };
+
+    let output_format = resolve_snapshot_session_output_format(format);
+    let inventory_directory = artifact_directory.to_path_buf();
+    let entries =
+        match run_cli_blocking_with_cx(cx, "snapshot artifact catalog inventory", move || {
+            if allow_missing_catalog
+                && std::fs::symlink_metadata(&inventory_directory)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Ok(Vec::new());
+            }
+            Ok(inventory_checkpoint_scrollback_artifacts(
+                &inventory_directory,
+                CheckpointScrollbackArtifactLimits::default(),
+            )?)
+        })
+        .await
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                trace_bounded_cli_internal_error("snapshot artifact catalog inventory", &error);
+                emit_snapshot_session_error(
+                    output_format,
+                    "snapshot_artifact_inventory_failed",
+                    "Snapshot artifact catalog inventory or verification failed.",
+                )?;
+                std::process::exit(1);
+            }
+        };
+    let artifact_rows = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "file_name": entry.file_name.display().to_string(),
+                "path": artifact_directory.join(&entry.file_name).display().to_string(),
+                "created_at_epoch_ms": entry.created_at_epoch_ms,
+                "checkpoint_id": entry.checkpoint_id,
+                "checkpoint_state_hash": entry.checkpoint_state_hash,
+                "artifact_bytes": entry.artifact_bytes,
+                "artifact_sha256": entry.artifact_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+        total.checked_add(entry.artifact_bytes)
+    });
+    let Some(total_bytes) = total_bytes else {
+        emit_snapshot_session_error(
+            output_format,
+            "snapshot_artifact_inventory_failed",
+            "Snapshot artifact catalog byte count overflowed.",
+        )?;
+        std::process::exit(1);
+    };
+    let payload = serde_json::json!({
+        "ok": true,
+        "operation": "list_artifacts",
+        "directory": artifact_directory.display().to_string(),
+        "count": artifact_rows.len(),
+        "total_bytes": total_bytes,
+        "artifacts": artifact_rows,
+        "verification": "every listed artifact verified offline",
+    });
+    if !print_snapshot_session_structured_output(&payload, output_format)? {
+        println!(
+            "Checkpoint artifact catalog: {}",
+            artifact_directory.display()
+        );
+        if entries.is_empty() {
+            println!("  No artifacts found.");
+        } else {
+            println!("Checkpoint\tBytes\tSHA-256\tFile");
+            for entry in &entries {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    entry.checkpoint_id,
+                    entry.artifact_bytes,
+                    entry.artifact_sha256,
+                    entry.file_name.display()
+                );
+            }
+            println!("Verified artifacts: {}", entries.len());
+            println!("Total bytes: {total_bytes}");
+        }
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Snapshot command handler
 // =============================================================================
@@ -74731,7 +75120,7 @@ async fn handle_snapshot_command(
                 None => None,
             };
 
-            let engine = SnapshotEngine::new(db_path, config.snapshots.clone());
+            let engine = SnapshotEngine::new(Arc::clone(&db_path), config.snapshots.clone());
 
             // Get current pane list
             let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
@@ -74771,7 +75160,7 @@ async fn handle_snapshot_command(
                     &panes,
                     snap_trigger,
                     SnapshotCaptureOptions {
-                        include_scrollback: false,
+                        include_scrollback: true,
                         metadata: Some(serde_json::json!({
                             "cli_snapshot": {
                                 "requested_trigger": requested_trigger,
@@ -74783,6 +75172,74 @@ async fn handle_snapshot_command(
                 .await
             {
                 Ok(result) => {
+                    let artifact_db_path = Arc::clone(&db_path);
+                    let artifact_directory = layout.checkpoint_artifacts_dir();
+                    let artifact_snapshot = result.clone();
+                    let artifact_publication = match run_cli_settled_blocking_effect(
+                        &cx,
+                        "snapshot automatic artifact publication",
+                        move || {
+                            Ok(frankenterm_core::snapshot_engine::publish_or_recover_checkpoint_scrollback_artifact(
+                                artifact_db_path.as_str(),
+                                &artifact_snapshot,
+                                &artifact_directory,
+                                frankenterm_core::snapshot_engine::CheckpointScrollbackArtifactLimits::default(),
+                            )?)
+                        },
+                    )
+                    .await
+                    {
+                        Ok(publication) => publication,
+                        Err(error) => {
+                            trace_bounded_cli_internal_error(
+                                "snapshot automatic artifact publication",
+                                &error,
+                            );
+                            if !print_snapshot_session_structured_output(
+                                &serde_json::json!({
+                                    "ok": false,
+                                    "error_code": "snapshot_artifact_publication_failed",
+                                    "error": "Snapshot committed, but its portable scrollback artifact was not acknowledged.",
+                                    "checkpoint_id": result.checkpoint_id,
+                                    "session_id": redact_single_line_for_output(&result.session_id),
+                                    "checkpoint_reconciliation_required": true,
+                                    "recovery_command": format!("ft snapshot export {}", result.checkpoint_id),
+                                }),
+                                output_format,
+                            )? {
+                                eprintln!(
+                                    "Snapshot #{} committed, but portable artifact publication was not acknowledged; reconcile with `ft snapshot export {}` before retrying.",
+                                    result.checkpoint_id, result.checkpoint_id
+                                );
+                            }
+                            std::process::exit(1);
+                        }
+                    };
+                    if !artifact_publication.scrollback_complete() {
+                        let mut payload = checkpoint_artifact_receipt_json(
+                            "save",
+                            &artifact_publication.path,
+                            &artifact_publication.receipt,
+                        );
+                        payload["ok"] = serde_json::json!(false);
+                        payload["error_code"] = serde_json::json!("incomplete_scrollback_prefix");
+                        payload["error"] = serde_json::json!(
+                            "Snapshot and verified artifact were retained, but one or more pane scrollback prefixes are incomplete."
+                        );
+                        payload["checkpoint_reconciliation_required"] = serde_json::json!(true);
+                        if !print_snapshot_session_structured_output(&payload, output_format)? {
+                            print_checkpoint_artifact_receipt_plain(
+                                "Snapshot artifact retained with incomplete scrollback",
+                                &artifact_publication.path,
+                                &artifact_publication.receipt,
+                            );
+                            eprintln!(
+                                "Snapshot #{} was not admitted as a complete recovery checkpoint.",
+                                result.checkpoint_id
+                            );
+                        }
+                        std::process::exit(1);
+                    }
                     if let Err(error) = engine.close_after_checkpoint_with_cx(&cx, &result).await {
                         trace_bounded_cli_internal_error("snapshot session close", &error);
                         if !print_snapshot_session_structured_output(
@@ -74819,6 +75276,11 @@ async fn handle_snapshot_command(
                         "projection_completeness_scope": "persisted_pane_text_budget",
                         "verification": "verified_v2",
                         "trigger": requested_trigger,
+                        "artifact": checkpoint_artifact_receipt_json(
+                            "save",
+                            &artifact_publication.path,
+                            &artifact_publication.receipt,
+                        ),
                     });
                     if !print_snapshot_session_structured_output(&resp, output_format)? {
                         println!("Snapshot saved");
@@ -74835,6 +75297,14 @@ async fn handle_snapshot_command(
                         );
                         println!("  Truncated panes:     {}", result.truncated_pane_count);
                         println!("  Verification:        verified_v2");
+                        println!(
+                            "  Artifact:            {}",
+                            artifact_publication.path.display()
+                        );
+                        println!(
+                            "  Artifact SHA-256:     {}",
+                            artifact_publication.receipt.artifact_sha256
+                        );
                     }
                 }
                 Err(e) => {
@@ -74847,6 +75317,205 @@ async fn handle_snapshot_command(
                     std::process::exit(1);
                 }
             }
+        }
+
+        SnapshotCommands::Export {
+            snapshot_id,
+            output,
+            allow_incomplete,
+            format,
+        } => {
+            use frankenterm_core::snapshot_engine::{
+                CheckpointScrollbackArtifactExpectedIdentity, CheckpointScrollbackArtifactLimits,
+                checkpoint_scrollback_artifact_file_name,
+                publish_or_recover_checkpoint_scrollback_artifact_at_path_for_identity,
+            };
+
+            let output_format = resolve_snapshot_session_output_format(&format);
+            let requested_snapshot_id = snapshot_id.clone();
+            let resolution_db_path = Arc::clone(&db_path);
+            let resolved = run_cli_blocking_with_cx(
+                &cx,
+                "snapshot artifact checkpoint resolution",
+                move || {
+                    Ok(resolve_checkpoint_id(
+                        resolution_db_path.as_str(),
+                        &requested_snapshot_id,
+                        CheckpointResolveScope::Snapshot,
+                    ))
+                },
+            )
+            .await;
+            let checkpoint_id = match resolved {
+                Ok(Ok(checkpoint_id)) => checkpoint_id,
+                Ok(Err(error)) => {
+                    let (error_code, message) = checkpoint_resolve_cli_contract(&error);
+                    if matches!(
+                        error,
+                        CheckpointResolveError::Database(_)
+                            | CheckpointResolveError::InvalidStoredRole { .. }
+                    ) {
+                        trace_bounded_cli_internal_error(
+                            "snapshot artifact checkpoint resolution",
+                            &error,
+                        );
+                    }
+                    emit_snapshot_session_error(output_format, error_code, message)?;
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    trace_bounded_cli_internal_error(
+                        "snapshot artifact checkpoint resolution boundary",
+                        &error,
+                    );
+                    emit_snapshot_session_error(
+                        output_format,
+                        "checkpoint_resolution_failed",
+                        "Snapshot checkpoint resolution failed.",
+                    )?;
+                    std::process::exit(1);
+                }
+            };
+
+            let identity_db_path = Arc::clone(&db_path);
+            let identity =
+                match run_cli_blocking_with_cx(&cx, "snapshot artifact identity load", move || {
+                    load_checkpoint_identity_with_pane_count(
+                        identity_db_path.as_str(),
+                        checkpoint_id,
+                        CheckpointResolveScope::Snapshot,
+                    )
+                })
+                .await
+                {
+                    Ok(Some(identity)) => identity,
+                    Ok(None) => {
+                        emit_snapshot_session_error(
+                            output_format,
+                            "snapshot_not_found",
+                            "The requested snapshot was not found.",
+                        )?;
+                        std::process::exit(1);
+                    }
+                    Err(error) => {
+                        trace_bounded_cli_internal_error("snapshot artifact identity load", &error);
+                        emit_snapshot_session_error(
+                            output_format,
+                            "checkpoint_resolution_failed",
+                            "Snapshot checkpoint resolution failed.",
+                        )?;
+                        std::process::exit(1);
+                    }
+                };
+            let expected_identity = CheckpointScrollbackArtifactExpectedIdentity {
+                checkpoint_id: identity.identity.checkpoint_id,
+                session_id: identity.identity.session_id.clone(),
+                checkpoint_at: identity.identity.checkpoint_at,
+                checkpoint_role: identity.identity.checkpoint_role.clone(),
+                checkpoint_state_hash: identity.identity.state_hash.clone(),
+                pane_count: identity.pane_count,
+            };
+            let artifact_path = match output {
+                Some(path) => path,
+                None => {
+                    let file_name = match checkpoint_scrollback_artifact_file_name(
+                        expected_identity.checkpoint_at,
+                        expected_identity.checkpoint_id,
+                        &expected_identity.checkpoint_state_hash,
+                    ) {
+                        Ok(file_name) => file_name,
+                        Err(error) => {
+                            trace_bounded_cli_internal_error(
+                                "snapshot artifact canonical path",
+                                &error,
+                            );
+                            emit_snapshot_session_error(
+                                output_format,
+                                "invalid_checkpoint_identity",
+                                "Snapshot identity cannot form a canonical artifact path.",
+                            )?;
+                            std::process::exit(1);
+                        }
+                    };
+                    layout.checkpoint_artifacts_dir().join(file_name)
+                }
+            };
+            let publication_db_path = Arc::clone(&db_path);
+            let publication_path = artifact_path.clone();
+            let publication_identity = expected_identity;
+            let publication = match run_cli_settled_blocking_effect(
+                &cx,
+                "snapshot artifact publication",
+                move || {
+                    Ok(
+                        publish_or_recover_checkpoint_scrollback_artifact_at_path_for_identity(
+                            publication_db_path.as_str(),
+                            &publication_identity,
+                            &publication_path,
+                            CheckpointScrollbackArtifactLimits::default(),
+                        )?,
+                    )
+                },
+            )
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    trace_bounded_cli_internal_error("snapshot artifact publication", &error);
+                    emit_snapshot_session_error(
+                        output_format,
+                        "snapshot_artifact_publication_failed",
+                        "Snapshot artifact publication or offline verification failed.",
+                    )?;
+                    std::process::exit(1);
+                }
+            };
+            let scrollback_complete = publication.scrollback_complete();
+            let mut payload =
+                checkpoint_artifact_receipt_json("export", &publication.path, &publication.receipt);
+            if !scrollback_complete && !allow_incomplete {
+                payload["ok"] = serde_json::json!(false);
+                payload["error_code"] = serde_json::json!("incomplete_scrollback_prefix");
+                payload["error"] = serde_json::json!(
+                    "The verified artifact was retained, but one or more pane scrollback prefixes are incomplete."
+                );
+                if !print_snapshot_session_structured_output(&payload, output_format)? {
+                    print_checkpoint_artifact_receipt_plain(
+                        "Snapshot artifact retained with incomplete scrollback",
+                        &publication.path,
+                        &publication.receipt,
+                    );
+                    eprintln!(
+                        "Pre-upgrade admission failed: pass --allow-incomplete only for forensic salvage."
+                    );
+                }
+                std::process::exit(1);
+            }
+            if !print_snapshot_session_structured_output(&payload, output_format)? {
+                print_checkpoint_artifact_receipt_plain(
+                    "Snapshot artifact exported and verified",
+                    &publication.path,
+                    &publication.receipt,
+                );
+            }
+        }
+
+        SnapshotCommands::VerifyArtifact { path, format } => {
+            run_verify_checkpoint_scrollback_artifact_command(&cx, &path, &format).await?;
+        }
+
+        SnapshotCommands::ListArtifacts { directory, format } => {
+            let artifact_directory = directory
+                .clone()
+                .unwrap_or_else(|| layout.checkpoint_artifacts_dir());
+            let allow_missing_catalog = directory.is_none();
+            run_list_checkpoint_scrollback_artifacts_command(
+                &cx,
+                &artifact_directory,
+                allow_missing_catalog,
+                &format,
+            )
+            .await?;
         }
 
         SnapshotCommands::List {
@@ -76062,6 +76731,7 @@ async fn handle_session_command(
                 "complete": published.complete,
                 "path": output_path.display().to_string(),
                 "pane_count": published.pane_count,
+                "domain_pane_counts": &published.domain_pane_counts,
                 "error_count": published.error_count,
                 "payload_sha256": &published.payload_sha256,
                 "artifact_sha256": &published.artifact_sha256,
@@ -76075,6 +76745,7 @@ async fn handle_session_command(
                 println!("  File:     {}", output_path.display());
                 println!("  Complete: {}", published.complete);
                 println!("  Panes:    {}", published.pane_count);
+                println!("  Domain panes: {:?}", published.domain_pane_counts);
                 println!("  Errors:   {}", published.error_count);
                 println!("  Payload SHA-256:  {}", published.payload_sha256);
                 println!("  Artifact SHA-256: {}", published.artifact_sha256);
@@ -76097,35 +76768,13 @@ async fn handle_session_command(
             unreachable!("compatible-client dump is dispatched before config initialization")
         }
 
-        SessionCommands::VerifyDump { path, format } => {
-            let output_format = resolve_session_orphan_output_format(&format);
-            let receipt = verify_mux_dump_artifact(&path)?;
-            let result = serde_json::json!({
-                "ok": true,
-                "action": "verify_dump",
-                "path": path.display().to_string(),
-                "schema": &receipt.schema,
-                "payload_sha256": &receipt.payload_sha256,
-                "artifact_sha256": &receipt.artifact_sha256,
-                "artifact_bytes": receipt.artifact_bytes,
-                "capture_complete": receipt.capture_complete,
-                "executable_restore_image": receipt.executable_restore_image,
-                "pane_count": receipt.pane_count,
-                "error_count": receipt.error_count,
-                "content_bytes": receipt.content_bytes,
-            });
-            if !print_snapshot_session_structured_output(&result, output_format)? {
-                println!("Mux content dump verified");
-                println!("  File:             {}", path.display());
-                println!("  Schema:           {}", receipt.schema);
-                println!("  Capture complete: {}", receipt.capture_complete);
-                println!("  Panes:            {}", receipt.pane_count);
-                println!("  Errors:           {}", receipt.error_count);
-                println!("  Content bytes:    {}", receipt.content_bytes);
-                println!("  Payload SHA-256:  {}", receipt.payload_sha256);
-                println!("  Artifact SHA-256: {}", receipt.artifact_sha256);
-                println!("  Restore image:    {}", receipt.executable_restore_image);
-            }
+        SessionCommands::VerifyDump {
+            path,
+            require_complete,
+            expect_domain_panes,
+            format,
+        } => {
+            run_verify_mux_dump_command(&path, require_complete, &expect_domain_panes, &format)?;
         }
 
         SessionCommands::ListDurable {
@@ -76653,6 +77302,7 @@ const COMPATIBLE_CLIENT_DUMP_MAX_STATE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES: usize = 1024 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES: usize = 16 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_CLIENT_BYTES: u64 = 256 * 1024 * 1024;
+const COMPATIBLE_CLIENT_DUMP_MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 4_096;
 const COMPATIBLE_CLIENT_DUMP_VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const COMPATIBLE_CLIENT_DUMP_CAPTURE_TRANSPORT: &str = "pinned_v0_13_robot_double_census_v1";
 const COMPATIBLE_CLIENT_DUMP_BACKEND_CONSTRAINT: &str =
@@ -76694,8 +77344,30 @@ struct MuxDumpVerificationReceipt {
     capture_complete: bool,
     executable_restore_image: bool,
     pane_count: usize,
+    domain_pane_counts: BTreeMap<String, usize>,
     error_count: usize,
     content_bytes: usize,
+    compatible_client: Option<VerifiedCompatibleClientDumpContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedCompatibleClientSourceMetadata {
+    client_sha256: String,
+    client_bytes: u64,
+    client_version: String,
+    client_git_hash: String,
+    mux_socket_path_sha256: String,
+    recovery_environment_path_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedCompatibleClientDumpContract {
+    source: VerifiedCompatibleClientSourceMetadata,
+    max_panes: usize,
+    max_total_bytes: usize,
+    batch_size: usize,
+    batch_timeout_ms: u64,
+    max_batch_output_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -76715,9 +77387,10 @@ struct CompatibleClientDumpRequest {
 #[derive(Debug)]
 struct CompatibleClientDumpReceipt {
     path: PathBuf,
-    recovery_environment_path: PathBuf,
+    recovery_environment_path: Option<PathBuf>,
     recovery_environment_path_sha256: String,
     pane_count: usize,
+    domain_pane_counts: BTreeMap<String, usize>,
     content_bytes: usize,
     payload_sha256: String,
     artifact_sha256: String,
@@ -76731,12 +77404,16 @@ struct CompatibleClientDumpReceipt {
     stderr_warning_commands: usize,
     stderr_bytes: usize,
     total_deadline_ms: u128,
+    durability: &'static str,
+    recovered_existing: bool,
+    reconciled_without_mux_contact: bool,
 }
 
 #[derive(Debug)]
 struct PublishedMuxDumpReceipt {
     complete: bool,
     pane_count: usize,
+    domain_pane_counts: BTreeMap<String, usize>,
     error_count: usize,
     content_bytes: usize,
     payload_sha256: String,
@@ -76765,24 +77442,6 @@ struct CompatibleClientNamedIdentity {
 
 #[cfg(unix)]
 impl CompatibleClientNamedIdentity {
-    fn from_std(metadata: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            mode: metadata.permissions().mode() & 0o7777,
-            hard_link_count: metadata.nlink(),
-            byte_len: metadata.len(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
-        }
-    }
-
     fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
         use cap_fs_ext::OsMetadataExt as _;
         use cap_std::fs::PermissionsExt as _;
@@ -76977,6 +77636,61 @@ fn compatible_client_path_parts(path: &Path, label: &str) -> anyhow::Result<(Pat
         .ok_or_else(|| anyhow::anyhow!("{label} has no parent directory"))?
         .to_path_buf();
     Ok((parent, leaf))
+}
+
+#[cfg(unix)]
+fn compatible_client_batch_timeout_ms(
+    request: &CompatibleClientDumpRequest,
+) -> anyhow::Result<u64> {
+    u64::try_from(request.batch_timeout.as_millis())
+        .map_err(|_| anyhow::anyhow!("compatible-client batch timeout does not fit milliseconds"))
+}
+
+#[cfg(unix)]
+fn validate_compatible_client_dump_request(
+    request: &CompatibleClientDumpRequest,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_canonical_lowercase_sha256(&request.expected_client_sha256)
+            && request
+                .expected_client_sha256
+                .bytes()
+                .any(|byte| byte != b'0'),
+        "compatible client expected SHA-256 is not a canonical non-zero digest"
+    );
+    anyhow::ensure!(
+        request.expected_client_bytes > 0
+            && request.expected_client_bytes <= COMPATIBLE_CLIENT_DUMP_MAX_CLIENT_BYTES,
+        "compatible client expected byte length is outside the supported bound"
+    );
+    anyhow::ensure!(
+        (1..=COMPATIBLE_CLIENT_DUMP_MAX_PANES).contains(&request.max_panes),
+        "--max-panes must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_PANES}"
+    );
+    anyhow::ensure!(
+        (1..=LIVE_MUX_DUMP_MAX_TOTAL_BYTES).contains(&request.max_total_bytes),
+        "--max-total-bytes must be in 1..={LIVE_MUX_DUMP_MAX_TOTAL_BYTES}"
+    );
+    anyhow::ensure!(
+        (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE).contains(&request.batch_size),
+        "--batch-size must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE}"
+    );
+    anyhow::ensure!(
+        !request.batch_timeout.is_zero()
+            && request.batch_timeout <= COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT,
+        "--batch-timeout-secs must be in 1..={} seconds",
+        COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT.as_secs()
+    );
+    anyhow::ensure!(
+        (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES)
+            .contains(&request.max_batch_output_bytes),
+        "--max-batch-output-bytes must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES}"
+    );
+    let _ = compatible_client_path_parts(&request.client, "compatible client source")?;
+    let _ = compatible_client_path_parts(&request.mux_socket, "compatible mux socket")?;
+    let _ = compatible_client_path_parts(&request.output, "compatible-client dump output")?;
+    let _ = compatible_client_batch_timeout_ms(request)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -77620,6 +78334,12 @@ fn validate_compatible_client_state(
                 && pane.domain.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES,
             "compatible-client census contains invalid domain metadata"
         );
+        anyhow::ensure!(
+            pane.pane_uuid
+                .as_deref()
+                .is_none_or(|value| !value.is_empty()),
+            "compatible-client census contains an empty pane UUID"
+        );
         for value in [
             pane.pane_uuid.as_deref(),
             pane.title.as_deref(),
@@ -77657,6 +78377,94 @@ fn compatible_client_raw_topology(
             domain: pane.domain.clone(),
         })
         .collect()
+}
+
+#[derive(Serialize)]
+struct CompatibleClientProjectedPaneTopology<'a> {
+    pane_id: u64,
+    pane_uuid: Option<std::borrow::Cow<'a, str>>,
+    tab_id: u64,
+    window_id: u64,
+    domain_name: std::borrow::Cow<'a, str>,
+}
+
+fn hash_compatible_client_projected_topology(
+    topology: &[CompatibleClientProjectedPaneTopology<'_>],
+) -> anyhow::Result<String> {
+    let (_bytes, fingerprint) = hash_json_bounded(
+        &topology,
+        LIVE_MUX_DUMP_MAX_TOPOLOGY_BYTES,
+        JsonSerializationStyle::Compact,
+    )
+    .context(
+        "Failed to fingerprint compatible-client projected topology within its safety limit",
+    )?;
+    Ok(fingerprint)
+}
+
+fn compatible_client_projected_topology_fingerprint(
+    panes: &[CompatibleClientPaneState],
+    redactor: &frankenterm_core::redactor::Redactor,
+) -> anyhow::Result<String> {
+    let mut topology = panes
+        .iter()
+        .map(|pane| CompatibleClientProjectedPaneTopology {
+            pane_id: pane.pane_id,
+            pane_uuid: pane
+                .pane_uuid
+                .as_deref()
+                .map(|value| std::borrow::Cow::Owned(redactor.redact(value))),
+            tab_id: pane.tab_id,
+            window_id: pane.window_id,
+            domain_name: std::borrow::Cow::Owned(redactor.redact(&pane.domain)),
+        })
+        .collect::<Vec<_>>();
+    topology.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
+    hash_compatible_client_projected_topology(&topology)
+}
+
+fn compatible_client_projected_topology_fingerprint_from_records(
+    pane_records: &[serde_json::Value],
+) -> anyhow::Result<String> {
+    let mut topology = Vec::with_capacity(pane_records.len());
+    for pane_record in pane_records {
+        let pane = pane_record
+            .get("pane")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Compatible-client topology pane metadata is missing")
+            })?;
+        let required_u64 = |field: &'static str| {
+            pane.get(field)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Compatible-client topology field {field} is invalid")
+                })
+        };
+        let pane_uuid = match pane.get("pane_uuid") {
+            Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if !value.is_empty() => {
+                Some(std::borrow::Cow::Borrowed(value.as_str()))
+            }
+            _ => anyhow::bail!("Compatible-client topology pane_uuid is invalid"),
+        };
+        topology.push(CompatibleClientProjectedPaneTopology {
+            pane_id: required_u64("pane_id")?,
+            pane_uuid,
+            tab_id: required_u64("tab_id")?,
+            window_id: required_u64("window_id")?,
+            domain_name: std::borrow::Cow::Borrowed(
+                pane.get("domain_name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Compatible-client topology domain_name is invalid")
+                    })?,
+            ),
+        });
+    }
+    topology.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
+    hash_compatible_client_projected_topology(&topology)
 }
 
 fn account_compatible_client_subprocess(
@@ -77793,29 +78601,7 @@ async fn capture_compatible_client_dump(
 ) -> anyhow::Result<CompatibleClientCapture> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    anyhow::ensure!(
-        (1..=COMPATIBLE_CLIENT_DUMP_MAX_PANES).contains(&request.max_panes),
-        "--max-panes must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_PANES}"
-    );
-    anyhow::ensure!(
-        (1..=LIVE_MUX_DUMP_MAX_TOTAL_BYTES).contains(&request.max_total_bytes),
-        "--max-total-bytes must be in 1..={LIVE_MUX_DUMP_MAX_TOTAL_BYTES}"
-    );
-    anyhow::ensure!(
-        (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE).contains(&request.batch_size),
-        "--batch-size must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE}"
-    );
-    anyhow::ensure!(
-        !request.batch_timeout.is_zero()
-            && request.batch_timeout <= COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT,
-        "--batch-timeout-secs must be in 1..={} seconds",
-        COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT.as_secs()
-    );
-    anyhow::ensure!(
-        (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES)
-            .contains(&request.max_batch_output_bytes),
-        "--max-batch-output-bytes must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES}"
-    );
+    validate_compatible_client_dump_request(request)?;
     let requested_tail = request
         .max_total_bytes
         .checked_add(1)
@@ -77970,6 +78756,11 @@ async fn capture_compatible_client_dump(
 
     let mut domains = BTreeSet::new();
     let mut pane_records = Vec::with_capacity(census_a.len());
+    let topology_sha256 = compatible_client_projected_topology_fingerprint(&census_a, &redactor)?;
+    anyhow::ensure!(
+        topology_sha256 == compatible_client_projected_topology_fingerprint(&census_b, &redactor)?,
+        "compatible-client projected pane topology changed between censuses"
+    );
     for pane in &census_a {
         let text = pane_text.remove(&pane.pane_id).ok_or_else(|| {
             anyhow::anyhow!("compatible-client pane outcome is missing after exact accounting")
@@ -77980,16 +78771,13 @@ async fn capture_compatible_client_dump(
         pane_records.push(serde_json::json!({
             "pane": {
                 "pane_id": pane.pane_id,
+                "pane_uuid": pane.pane_uuid.as_deref().map(|value| redactor.redact(value)),
                 "tab_id": pane.tab_id,
                 "window_id": pane.window_id,
                 "domain_id": null,
                 "domain_name": domain_name,
-                "domain_identity_authority": if pane.domain == "local" {
-                    "defaulted_local_without_domain_authority"
-                } else {
-                    "inferred_from_cwd_uri_authority"
-                },
-                "identity_stability": "mux_incarnation_local_ephemeral",
+                "domain_identity_authority": "v0_13_robot_state_domain_field",
+                "identity_stability": "v0_13_projected_ephemeral_no_incarnation_authority",
                 "workspace": null,
                 "rows": 0,
                 "cols": 0,
@@ -78018,7 +78806,11 @@ async fn capture_compatible_client_dump(
         pane_text.is_empty(),
         "compatible-client pane outcome inventory is inconsistent"
     );
-    let topology_sha256 = mux_dump_topology_fingerprint_from_records(&pane_records)?;
+    anyhow::ensure!(
+        compatible_client_projected_topology_fingerprint_from_records(&pane_records)?
+            == topology_sha256,
+        "compatible-client pane records do not preserve the projected topology fingerprint"
+    );
     let mut initial_pane_ids = pane_ids;
     initial_pane_ids.sort_unstable();
     let source_identity = compatible_client_identity_value(&source.identity, Some(&source.sha256));
@@ -78044,10 +78836,10 @@ async fn capture_compatible_client_dump(
         },
         "complete": true,
         "completeness_semantics": {
-            "meaning": "every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing",
+            "meaning": "every initially listed v0.13 robot-state pane was read within limits and a second census matched pane_id, optional pane_uuid, tab_id, window_id, and raw domain; no authoritative mux incarnation or topology revision was available",
             "point_in_time_content_snapshot": false,
             "pane_content_consistency": "sequential_best_effort_non_atomic",
-            "topology_consistency": "double_list_fingerprint",
+            "topology_consistency": "v0_13_robot_state_double_census_projected_fields",
         },
         "capabilities": {
             "forensic_text_export": true,
@@ -78063,6 +78855,9 @@ async fn capture_compatible_client_dump(
         "limits": {
             "max_panes": request.max_panes,
             "max_total_bytes": request.max_total_bytes,
+            "batch_size": request.batch_size,
+            "batch_timeout_ms": compatible_client_batch_timeout_ms(request)?,
+            "max_batch_output_bytes": request.max_batch_output_bytes,
         },
         "summary": {
             "panes_listed_initial": census_a.len(),
@@ -78073,14 +78868,17 @@ async fn capture_compatible_client_dump(
             "domains": domains,
         },
         "topology_fence": {
-            "kind": "double_list_fingerprint",
-            "fingerprint_scope": "pane_tab_window_redacted_domain_workspace_geometry_active_zoom",
+            "kind": "v0_13_robot_state_double_census",
+            "fingerprint_scope": "pane_id_optional_redacted_pane_uuid_tab_id_window_id_redacted_domain",
             "initial_pane_ids": initial_pane_ids,
             "initial_sha256": &topology_sha256,
             "final_sha256": &topology_sha256,
             "stable": true,
             "mux_session_incarnation": null,
             "authoritative_topology_revision": null,
+            "authoritative_topology": false,
+            "authoritative_mux_incarnation": false,
+            "pane_id_aba_excluded": false,
         },
         "panes": pane_records,
         "errors": [],
@@ -78176,6 +78974,7 @@ fn publish_mux_dump_payload(
     Ok(PublishedMuxDumpReceipt {
         complete,
         pane_count,
+        domain_pane_counts: verification.domain_pane_counts,
         error_count,
         content_bytes: verification.content_bytes,
         payload_sha256,
@@ -78186,12 +78985,231 @@ fn publish_mux_dump_payload(
     })
 }
 
+#[cfg(unix)]
+fn locate_compatible_client_recovery_environment(
+    output_path: &Path,
+    expected_path_sha256: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    use cap_fs_ext::OsMetadataExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let (parent, _leaf, parent_path) = open_artifact_parent_and_leaf(output_path)?;
+    let mut entries_seen = 0usize;
+    let mut match_path = None;
+    for entry in parent.entries()? {
+        let entry = entry?;
+        entries_seen = entries_seen
+            .checked_add(1)
+            .context("compatible-client recovery directory census overflowed")?;
+        anyhow::ensure!(
+            entries_seen <= COMPATIBLE_CLIENT_DUMP_MAX_RECOVERY_DIRECTORY_ENTRIES,
+            "compatible-client recovery directory census exceeded its entry bound"
+        );
+        let name = entry.file_name();
+        if !name
+            .as_os_str()
+            .as_bytes()
+            .starts_with(b".frankenterm-compatible-client-")
+        {
+            continue;
+        }
+        let candidate = parent_path.join(&name);
+        if sha256_hex(candidate.as_os_str().as_bytes()) != expected_path_sha256 {
+            continue;
+        }
+        let metadata = parent
+            .symlink_metadata(Path::new(&name))
+            .context("Failed to inspect the retained compatible-client recovery environment")?;
+        let mode = CompatibleClientNamedIdentity::from_cap(&metadata).mode;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == nix::unistd::geteuid().as_raw()
+                && mode & 0o077 == 0,
+            "compatible-client recovery environment matching the artifact receipt is unsafe"
+        );
+        anyhow::ensure!(
+            match_path.replace(candidate).is_none(),
+            "compatible-client recovery environment receipt matched more than one directory"
+        );
+    }
+    revalidate_artifact_parent_directory(&parent_path, &parent)?;
+    Ok(match_path)
+}
+
+#[cfg(unix)]
+fn reconcile_existing_compatible_client_dump(
+    request: &CompatibleClientDumpRequest,
+) -> anyhow::Result<Option<CompatibleClientDumpReceipt>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    validate_compatible_client_dump_request(request)?;
+    match fs::symlink_metadata(&request.output) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context(
+                "Failed to inspect the compatible-client dump target for lost-reply recovery",
+            );
+        }
+        Ok(_) => {}
+    }
+
+    let verification = verify_mux_dump_artifact(&request.output).with_context(|| {
+        format!(
+            "Compatible-client dump target {} already exists but is not an offline-verified artifact; existing files are never overwritten",
+            request.output.display()
+        )
+    })?;
+    anyhow::ensure!(
+        verification.capture_complete && verification.error_count == 0,
+        "Compatible-client dump target {} is not a complete compatible-client safety artifact; existing files are never overwritten",
+        request.output.display()
+    );
+    let contract = verification.compatible_client.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Compatible-client dump target {} was produced by a different capture source; existing files are never overwritten",
+            request.output.display()
+        )
+    })?;
+    let requested_socket_path_sha256 = sha256_hex(request.mux_socket.as_os_str().as_bytes());
+    let requested_batch_timeout_ms = compatible_client_batch_timeout_ms(request)?;
+    anyhow::ensure!(
+        contract.source.client_sha256 == request.expected_client_sha256
+            && contract.source.client_bytes == request.expected_client_bytes
+            && contract.source.client_version == COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION
+            && contract.source.client_git_hash == COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH
+            && contract.source.mux_socket_path_sha256 == requested_socket_path_sha256
+            && contract.max_panes == request.max_panes
+            && contract.max_total_bytes == request.max_total_bytes
+            && contract.batch_size == request.batch_size
+            && contract.batch_timeout_ms == requested_batch_timeout_ms
+            && contract.max_batch_output_bytes == request.max_batch_output_bytes,
+        "Compatible-client dump target {} is bound to a different client, socket, or request bound; existing files are never overwritten",
+        request.output.display()
+    );
+
+    let persisted =
+        read_private_artifact_bounded(&request.output, LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES)?;
+    let durable = write_new_private_artifact(&request.output, &persisted).with_context(|| {
+        format!(
+            "Failed to durably acknowledge the existing compatible-client dump {} without replacement",
+            request.output.display()
+        )
+    })?;
+    anyhow::ensure!(
+        durable.recovered_existing
+            && durable.sha256 == verification.artifact_sha256
+            && durable.bytes == verification.artifact_bytes,
+        "Compatible-client dump changed while its lost-reply receipt was reconciled"
+    );
+    let recovery_environment_path = locate_compatible_client_recovery_environment(
+        &request.output,
+        &contract.source.recovery_environment_path_sha256,
+    )?;
+    Ok(Some(CompatibleClientDumpReceipt {
+        path: request.output.clone(),
+        recovery_environment_path,
+        recovery_environment_path_sha256: contract.source.recovery_environment_path_sha256.clone(),
+        pane_count: verification.pane_count,
+        domain_pane_counts: verification.domain_pane_counts,
+        content_bytes: verification.content_bytes,
+        payload_sha256: verification.payload_sha256,
+        artifact_sha256: verification.artifact_sha256,
+        artifact_bytes: verification.artifact_bytes,
+        client_sha256: contract.source.client_sha256.clone(),
+        client_bytes: contract.source.client_bytes,
+        client_version: contract.source.client_version.clone(),
+        client_git_hash: contract.source.client_git_hash.clone(),
+        mux_socket_path_sha256: contract.source.mux_socket_path_sha256.clone(),
+        subprocess_count: 0,
+        stderr_warning_commands: 0,
+        stderr_bytes: 0,
+        total_deadline_ms: 0,
+        durability: "file_and_parent_directory_synced",
+        recovered_existing: true,
+        reconciled_without_mux_contact: true,
+    }))
+}
+
+fn emit_compatible_client_dump_receipt(
+    receipt: &CompatibleClientDumpReceipt,
+    output_format: SnapshotSessionOutputFormat,
+) -> anyhow::Result<()> {
+    let recovery_environment_path = receipt
+        .recovery_environment_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let result = serde_json::json!({
+        "ok": true,
+        "action": "compatible_client_dump",
+        "path": receipt.path.display().to_string(),
+        "pane_count": receipt.pane_count,
+        "domain_pane_counts": &receipt.domain_pane_counts,
+        "content_bytes": receipt.content_bytes,
+        "payload_sha256": &receipt.payload_sha256,
+        "artifact_sha256": &receipt.artifact_sha256,
+        "artifact_bytes": receipt.artifact_bytes,
+        "client_sha256": &receipt.client_sha256,
+        "client_bytes": receipt.client_bytes,
+        "client_version": &receipt.client_version,
+        "client_git_hash": &receipt.client_git_hash,
+        "mux_socket_path_sha256": &receipt.mux_socket_path_sha256,
+        "subprocess_count": receipt.subprocess_count,
+        "stderr_warning_commands": receipt.stderr_warning_commands,
+        "stderr_bytes": receipt.stderr_bytes,
+        "total_deadline_ms": receipt.total_deadline_ms,
+        "durability": receipt.durability,
+        "publication_recovered_existing": receipt.recovered_existing,
+        "reconciled_without_mux_contact": receipt.reconciled_without_mux_contact,
+        "redaction_applied": true,
+        "forensic_text_export": true,
+        "executable_restore_image": false,
+        "retained_recovery_environment": receipt.recovery_environment_path.is_some(),
+        "recovery_environment_path": recovery_environment_path,
+        "recovery_environment_path_sha256": &receipt.recovery_environment_path_sha256,
+        "production_mux_activation": false,
+    });
+    if !print_snapshot_session_structured_output(&result, output_format)? {
+        println!("Compatible-client mux content dump written and verified");
+        println!("  File:                 {}", receipt.path.display());
+        println!("  Panes:                {}", receipt.pane_count);
+        println!("  Domain panes:         {:?}", receipt.domain_pane_counts);
+        println!("  Content bytes:        {}", receipt.content_bytes);
+        println!("  Payload SHA-256:      {}", receipt.payload_sha256);
+        println!("  Artifact SHA-256:     {}", receipt.artifact_sha256);
+        println!(
+            "  Client:               {} ({})",
+            receipt.client_version, receipt.client_git_hash
+        );
+        println!("  Client SHA-256:       {}", receipt.client_sha256);
+        println!(
+            "  Publication recovered existing: {}",
+            receipt.recovered_existing
+        );
+        if let Some(path) = &receipt.recovery_environment_path {
+            println!("  Recovery environment: {}", path.display());
+        } else {
+            println!("  Recovery environment: not currently retained");
+        }
+        println!("  Content:              redacted forensic text only");
+        println!("  Executable restore:   false");
+        println!("  Mux activation:       disabled");
+    }
+    Ok(())
+}
+
 async fn run_compatible_client_dump_command(
     cx: &frankenterm_core::cx::Cx,
     request: CompatibleClientDumpRequest,
     format: &str,
 ) -> anyhow::Result<()> {
     let output_format = resolve_session_orphan_output_format(format);
+    #[cfg(unix)]
+    {
+        validate_compatible_client_dump_request(&request)?;
+        if let Some(receipt) = reconcile_existing_compatible_client_dump(&request)? {
+            return emit_compatible_client_dump_receipt(&receipt, output_format);
+        }
+    }
     let capture = capture_compatible_client_dump(cx, &request).await?;
     let output_path = request.output;
     let CompatibleClientCapture {
@@ -78228,9 +79246,10 @@ async fn run_compatible_client_dump_command(
     );
     let receipt = CompatibleClientDumpReceipt {
         path: output_path,
-        recovery_environment_path,
+        recovery_environment_path: Some(recovery_environment_path),
         recovery_environment_path_sha256,
         pane_count: published.pane_count,
+        domain_pane_counts: published.domain_pane_counts,
         content_bytes: published.content_bytes,
         payload_sha256: published.payload_sha256,
         artifact_sha256: published.artifact_sha256,
@@ -78244,65 +79263,16 @@ async fn run_compatible_client_dump_command(
         stderr_warning_commands,
         stderr_bytes,
         total_deadline_ms,
+        durability: published.durability,
+        recovered_existing: published.recovered_existing,
+        reconciled_without_mux_contact: false,
     };
-    let result = serde_json::json!({
-        "ok": true,
-        "action": "compatible_client_dump",
-        "path": receipt.path.display().to_string(),
-        "pane_count": receipt.pane_count,
-        "content_bytes": receipt.content_bytes,
-        "payload_sha256": &receipt.payload_sha256,
-        "artifact_sha256": &receipt.artifact_sha256,
-        "artifact_bytes": receipt.artifact_bytes,
-        "client_sha256": &receipt.client_sha256,
-        "client_bytes": receipt.client_bytes,
-        "client_version": &receipt.client_version,
-        "client_git_hash": &receipt.client_git_hash,
-        "mux_socket_path_sha256": &receipt.mux_socket_path_sha256,
-        "subprocess_count": receipt.subprocess_count,
-        "stderr_warning_commands": receipt.stderr_warning_commands,
-        "stderr_bytes": receipt.stderr_bytes,
-        "total_deadline_ms": receipt.total_deadline_ms,
-        "durability": published.durability,
-        "publication_recovered_existing": published.recovered_existing,
-        "redaction_applied": true,
-        "forensic_text_export": true,
-        "executable_restore_image": false,
-        "retained_recovery_environment": true,
-        "recovery_environment_path": receipt.recovery_environment_path.display().to_string(),
-        "recovery_environment_path_sha256": &receipt.recovery_environment_path_sha256,
-        "production_mux_activation": false,
-    });
-    if !print_snapshot_session_structured_output(&result, output_format).with_context(|| {
+    emit_compatible_client_dump_receipt(&receipt, output_format).with_context(|| {
         format!(
             "compatible-client dump was verified, but output rendering failed; retained recovery environment: {}",
             retained_environment_path.display()
         )
-    })? {
-        println!("Compatible-client mux content dump written and verified");
-        println!("  File:                 {}", receipt.path.display());
-        println!("  Panes:                {}", receipt.pane_count);
-        println!("  Content bytes:        {}", receipt.content_bytes);
-        println!("  Payload SHA-256:      {}", receipt.payload_sha256);
-        println!("  Artifact SHA-256:     {}", receipt.artifact_sha256);
-        println!(
-            "  Client:               {} ({})",
-            receipt.client_version, receipt.client_git_hash
-        );
-        println!("  Client SHA-256:       {}", receipt.client_sha256);
-        println!(
-            "  Publication recovered existing: {}",
-            published.recovered_existing
-        );
-        println!(
-            "  Recovery environment: {}",
-            receipt.recovery_environment_path.display()
-        );
-        println!("  Content:              redacted forensic text only");
-        println!("  Executable restore:   false");
-        println!("  Mux activation:       disabled");
-    }
-    Ok(())
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -79048,7 +80018,6 @@ fn private_artifact_stage_name(target: &Path, expected_sha256: &str) -> String {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn private_artifact_stage_inventory(parent: &cap_std::fs::Dir) -> anyhow::Result<(u64, u64)> {
-    use cap_std::fs::PermissionsExt as _;
     use std::os::unix::ffi::OsStrExt as _;
 
     let mut count = 0_u64;
@@ -79643,7 +80612,9 @@ fn require_compatible_client_identity_receipt(
     Ok((uid, gid, byte_len))
 }
 
-fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result<()> {
+fn verify_mux_dump_source_metadata(
+    source: &serde_json::Value,
+) -> anyhow::Result<Option<VerifiedCompatibleClientSourceMetadata>> {
     let object = source
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Mux dump source metadata is not an object"))?;
@@ -79665,7 +80636,7 @@ fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result
                     .is_some_and(|value| !value.is_empty()),
             "Mux dump source identity metadata is invalid"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     require_exact_json_object_keys(
@@ -79698,13 +80669,16 @@ fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result
                 == Some(COMPATIBLE_CLIENT_DUMP_BACKEND_CONSTRAINT),
         "Mux dump compatible-client source contract is invalid"
     );
-    let (client_uid, _client_gid, _client_bytes) = require_compatible_client_identity_receipt(
-        source
-            .get("client")
-            .ok_or_else(|| anyhow::anyhow!("Mux dump compatible-client identity is missing"))?,
-        true,
-        "compatible client",
-    )?;
+    let client = source
+        .get("client")
+        .ok_or_else(|| anyhow::anyhow!("Mux dump compatible-client identity is missing"))?;
+    let (client_uid, _client_gid, client_bytes) =
+        require_compatible_client_identity_receipt(client, true, "compatible client")?;
+    let client_sha256 = client
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump compatible-client SHA-256 is missing"))?
+        .to_string();
     let socket = source
         .get("mux_socket")
         .and_then(serde_json::Value::as_object)
@@ -79760,6 +80734,111 @@ fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result
             && recovery_path_sha256.bytes().any(|byte| byte != b'0'),
         "Mux dump recovery environment retention receipt is invalid"
     );
+    Ok(Some(VerifiedCompatibleClientSourceMetadata {
+        client_sha256,
+        client_bytes,
+        client_version: COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION.to_string(),
+        client_git_hash: COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH.to_string(),
+        mux_socket_path_sha256: path_sha256.to_string(),
+        recovery_environment_path_sha256: recovery_path_sha256.to_string(),
+    }))
+}
+
+fn require_expected_mux_dump_domain_pane_counts(
+    verified: &BTreeMap<String, usize>,
+    expected_arguments: &[String],
+) -> anyhow::Result<()> {
+    let mut expected = BTreeMap::new();
+    for argument in expected_arguments {
+        let (domain, count) = argument.rsplit_once('=').ok_or_else(|| {
+            anyhow::anyhow!(
+                "Expected domain pane count {argument:?} must use the exact DOMAIN=COUNT form"
+            )
+        })?;
+        anyhow::ensure!(
+            !domain.is_empty()
+                && domain.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES
+                && !domain.chars().any(char::is_control),
+            "Expected mux dump domain {domain:?} is empty, oversized, or contains control characters"
+        );
+        let count = count.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("Expected mux dump pane count in {argument:?} is not an integer")
+        })?;
+        anyhow::ensure!(
+            (1..=LIVE_MUX_DUMP_MAX_PANES).contains(&count),
+            "Expected mux dump pane count for {domain:?} is outside 1..={LIVE_MUX_DUMP_MAX_PANES}"
+        );
+        anyhow::ensure!(
+            expected.insert(domain.to_string(), count).is_none(),
+            "Expected mux dump domain {domain:?} was supplied more than once"
+        );
+    }
+    for (domain, expected_count) in expected {
+        let verified_count = verified.get(&domain).copied().unwrap_or(0);
+        anyhow::ensure!(
+            verified_count == expected_count,
+            "Mux dump verified {verified_count} pane(s) for domain {domain:?}, expected exactly {expected_count}"
+        );
+    }
+    Ok(())
+}
+
+fn require_complete_mux_dump_when_requested(
+    capture_complete: bool,
+    error_count: usize,
+    require_complete: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !require_complete || (capture_complete && error_count == 0),
+        "Mux dump is structurally valid but incomplete; a complete zero-error artifact was required"
+    );
+    Ok(())
+}
+
+fn run_verify_mux_dump_command(
+    path: &Path,
+    require_complete: bool,
+    expect_domain_panes: &[String],
+    format: &str,
+) -> anyhow::Result<()> {
+    let output_format = resolve_session_orphan_output_format(format);
+    let receipt = verify_mux_dump_artifact(path)?;
+    require_complete_mux_dump_when_requested(
+        receipt.capture_complete,
+        receipt.error_count,
+        require_complete,
+    )?;
+    require_expected_mux_dump_domain_pane_counts(&receipt.domain_pane_counts, expect_domain_panes)?;
+    let result = serde_json::json!({
+        "ok": true,
+        "action": "verify_dump",
+        "path": path.display().to_string(),
+        "schema": &receipt.schema,
+        "payload_sha256": &receipt.payload_sha256,
+        "artifact_sha256": &receipt.artifact_sha256,
+        "artifact_bytes": receipt.artifact_bytes,
+        "capture_complete": receipt.capture_complete,
+        "required_complete": require_complete,
+        "executable_restore_image": receipt.executable_restore_image,
+        "pane_count": receipt.pane_count,
+        "domain_pane_counts": &receipt.domain_pane_counts,
+        "error_count": receipt.error_count,
+        "content_bytes": receipt.content_bytes,
+    });
+    if !print_snapshot_session_structured_output(&result, output_format)? {
+        println!("Mux content dump verified");
+        println!("  File:             {}", path.display());
+        println!("  Schema:           {}", receipt.schema);
+        println!("  Capture complete: {}", receipt.capture_complete);
+        println!("  Required complete: {}", require_complete);
+        println!("  Panes:            {}", receipt.pane_count);
+        println!("  Domain panes:     {:?}", receipt.domain_pane_counts);
+        println!("  Errors:           {}", receipt.error_count);
+        println!("  Content bytes:    {}", receipt.content_bytes);
+        println!("  Payload SHA-256:  {}", receipt.payload_sha256);
+        println!("  Artifact SHA-256: {}", receipt.artifact_sha256);
+        println!("  Restore image:    {}", receipt.executable_restore_image);
+    }
     Ok(())
 }
 
@@ -79861,7 +80940,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     {
         anyhow::bail!("Mux dump source identity metadata is invalid");
     }
-    verify_mux_dump_source_metadata(
+    let compatible_client_source = verify_mux_dump_source_metadata(
         payload
             .get("source")
             .ok_or_else(|| anyhow::anyhow!("Mux dump source metadata is missing"))?,
@@ -79879,12 +80958,19 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         ],
         "completeness metadata",
     )?;
+    let compatible_client_semantics = compatible_client_source.is_some();
     let required_completeness_semantics = [
         (
             "/completeness_semantics/meaning",
-            serde_json::json!(
-                "every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing"
-            ),
+            if compatible_client_semantics {
+                serde_json::json!(
+                    "every initially listed v0.13 robot-state pane was read within limits and a second census matched pane_id, optional pane_uuid, tab_id, window_id, and raw domain; no authoritative mux incarnation or topology revision was available"
+                )
+            } else {
+                serde_json::json!(
+                    "every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing"
+                )
+            },
         ),
         (
             "/completeness_semantics/point_in_time_content_snapshot",
@@ -79896,7 +80982,11 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         ),
         (
             "/completeness_semantics/topology_consistency",
-            serde_json::json!("double_list_fingerprint"),
+            if compatible_client_semantics {
+                serde_json::json!("v0_13_robot_state_double_census_projected_fields")
+            } else {
+                serde_json::json!("double_list_fingerprint")
+            },
         ),
     ];
     for (pointer, expected) in required_completeness_semantics {
@@ -79915,7 +81005,21 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .get("limits")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("Mux dump limits are missing"))?;
-    require_exact_json_object_keys(limits, &["max_panes", "max_total_bytes"], "limits")?;
+    if compatible_client_semantics {
+        require_exact_json_object_keys(
+            limits,
+            &[
+                "max_panes",
+                "max_total_bytes",
+                "batch_size",
+                "batch_timeout_ms",
+                "max_batch_output_bytes",
+            ],
+            "compatible-client limits",
+        )?;
+    } else {
+        require_exact_json_object_keys(limits, &["max_panes", "max_total_bytes"], "limits")?;
+    }
     require_exact_json_object_keys(
         payload
             .get("capabilities")
@@ -79937,7 +81041,13 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .get("max_panes")
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| (1..=LIVE_MUX_DUMP_MAX_PANES).contains(value))
+        .filter(|value| {
+            if compatible_client_semantics {
+                (1..=COMPATIBLE_CLIENT_DUMP_MAX_PANES).contains(value)
+            } else {
+                (1..=LIVE_MUX_DUMP_MAX_PANES).contains(value)
+            }
+        })
         .ok_or_else(|| anyhow::anyhow!("Mux dump max_panes is outside the supported bounds"))?;
     let max_total_bytes = limits
         .get("max_total_bytes")
@@ -79947,6 +81057,50 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .ok_or_else(|| {
             anyhow::anyhow!("Mux dump max_total_bytes is outside the supported bounds")
         })?;
+    let compatible_client = match compatible_client_source {
+        Some(source) => {
+            let batch_size = limits
+                .get("batch_size")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE).contains(value))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Mux dump compatible-client batch_size is outside the supported bounds"
+                    )
+                })?;
+            let batch_timeout_ms = limits
+                .get("batch_timeout_ms")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|value| {
+                    *value > 0
+                        && u128::from(*value)
+                            <= COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT.as_millis()
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Mux dump compatible-client batch_timeout_ms is outside the supported bounds")
+                })?;
+            let max_batch_output_bytes = limits
+                .get("max_batch_output_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| {
+                    (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES).contains(value)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Mux dump compatible-client max_batch_output_bytes is outside the supported bounds")
+                })?;
+            Some(VerifiedCompatibleClientDumpContract {
+                source,
+                max_panes,
+                max_total_bytes,
+                batch_size,
+                batch_timeout_ms,
+                max_batch_output_bytes,
+            })
+        }
+        None => None,
+    };
     let panes = payload
         .get("panes")
         .and_then(serde_json::Value::as_array)
@@ -79963,6 +81117,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .ok_or_else(|| anyhow::anyhow!("Mux dump errors array is missing"))?;
     let mut pane_ids = std::collections::HashSet::with_capacity(panes.len());
     let mut captured_domains = BTreeSet::new();
+    let mut domain_pane_counts = BTreeMap::new();
     let mut content_bytes = 0usize;
     for pane_record in panes {
         let pane_record_object = pane_record
@@ -79973,30 +81128,58 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             .get("pane")
             .and_then(serde_json::Value::as_object)
             .ok_or_else(|| anyhow::anyhow!("Mux dump pane metadata is missing"))?;
+        let pane_keys = [
+            "pane_id",
+            "tab_id",
+            "window_id",
+            "domain_id",
+            "domain_name",
+            "domain_identity_authority",
+            "identity_stability",
+            "workspace",
+            "rows",
+            "cols",
+            "title",
+            "cwd",
+            "tty_name",
+            "cursor_x",
+            "cursor_y",
+            "cursor_visibility",
+            "left_col",
+            "top_row",
+            "is_active",
+            "is_zoomed",
+        ];
+        let compatible_pane_keys = [
+            "pane_id",
+            "pane_uuid",
+            "tab_id",
+            "window_id",
+            "domain_id",
+            "domain_name",
+            "domain_identity_authority",
+            "identity_stability",
+            "workspace",
+            "rows",
+            "cols",
+            "title",
+            "cwd",
+            "tty_name",
+            "cursor_x",
+            "cursor_y",
+            "cursor_visibility",
+            "left_col",
+            "top_row",
+            "is_active",
+            "is_zoomed",
+        ];
         require_exact_json_object_keys(
             pane,
-            &[
-                "pane_id",
-                "tab_id",
-                "window_id",
-                "domain_id",
-                "domain_name",
-                "domain_identity_authority",
-                "identity_stability",
-                "workspace",
-                "rows",
-                "cols",
-                "title",
-                "cwd",
-                "tty_name",
-                "cursor_x",
-                "cursor_y",
-                "cursor_visibility",
-                "left_col",
-                "top_row",
-                "is_active",
-                "is_zoomed",
-            ],
+            if compatible_client_semantics {
+                &compatible_pane_keys
+            } else {
+                &pane_keys
+            },
             "pane metadata",
         )?;
         let pane_id = pane
@@ -80026,19 +81209,43 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} domain_name is invalid"))?;
         captured_domains.insert(domain_name);
-        if !matches!(
+        let domain_pane_count = domain_pane_counts
+            .entry(domain_name.to_string())
+            .or_insert(0_usize);
+        *domain_pane_count = domain_pane_count.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("Mux dump domain pane count overflow for {domain_name:?}")
+        })?;
+        let identity_metadata_valid = if compatible_client_semantics {
             pane.get("domain_identity_authority")
-                .and_then(serde_json::Value::as_str),
-            Some(
-                "authoritative_domain_name"
-                    | "inferred_from_cwd_uri_authority"
-                    | "defaulted_local_without_domain_authority"
-            )
-        ) || pane
-            .get("identity_stability")
-            .and_then(serde_json::Value::as_str)
-            != Some("mux_incarnation_local_ephemeral")
-        {
+                .and_then(serde_json::Value::as_str)
+                == Some("v0_13_robot_state_domain_field")
+                && pane
+                    .get("identity_stability")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("v0_13_projected_ephemeral_no_incarnation_authority")
+                && match pane.get("pane_uuid") {
+                    Some(serde_json::Value::Null) => true,
+                    Some(serde_json::Value::String(value)) => {
+                        !value.is_empty()
+                            && value.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES
+                    }
+                    _ => false,
+                }
+        } else {
+            matches!(
+                pane.get("domain_identity_authority")
+                    .and_then(serde_json::Value::as_str),
+                Some(
+                    "authoritative_domain_name"
+                        | "inferred_from_cwd_uri_authority"
+                        | "defaulted_local_without_domain_authority"
+                )
+            ) && pane
+                .get("identity_stability")
+                .and_then(serde_json::Value::as_str)
+                == Some("mux_incarnation_local_ephemeral")
+        };
+        if !identity_metadata_valid {
             anyhow::bail!("Mux dump pane {pane_id} identity metadata is invalid");
         }
         for field in ["workspace", "title", "cwd", "tty_name"] {
@@ -80085,6 +81292,24 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             {
                 anyhow::bail!("Mux dump pane {pane_id} {field} is invalid");
             }
+        }
+        if compatible_client_semantics
+            && (pane.get("domain_id") != Some(&serde_json::Value::Null)
+                || pane.get("workspace") != Some(&serde_json::Value::Null)
+                || pane.get("rows").and_then(serde_json::Value::as_u64) != Some(0)
+                || pane.get("cols").and_then(serde_json::Value::as_u64) != Some(0)
+                || pane.get("tty_name") != Some(&serde_json::Value::Null)
+                || pane.get("cursor_x") != Some(&serde_json::Value::Null)
+                || pane.get("cursor_y") != Some(&serde_json::Value::Null)
+                || pane.get("cursor_visibility") != Some(&serde_json::Value::Null)
+                || pane.get("left_col") != Some(&serde_json::Value::Null)
+                || pane.get("top_row") != Some(&serde_json::Value::Null)
+                || pane.get("is_active").and_then(serde_json::Value::as_bool) != Some(false)
+                || pane.get("is_zoomed").and_then(serde_json::Value::as_bool) != Some(false))
+        {
+            anyhow::bail!(
+                "Mux dump compatible-client pane {pane_id} fabricates unavailable topology metadata"
+            );
         }
         let content = pane_record
             .get("content")
@@ -80320,6 +81545,10 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .ok_or_else(|| {
             anyhow::anyhow!("Mux dump initial pane count is missing or exceeds max_panes")
         })?;
+    anyhow::ensure!(
+        !compatible_client_semantics || initial_pane_count > 0,
+        "Mux dump compatible-client census must contain at least one pane"
+    );
     if panes.len() > initial_pane_count {
         anyhow::bail!("Mux dump captured more panes than its initial topology listed");
     }
@@ -80366,26 +81595,65 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .get("topology_fence")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("Mux dump topology fence is missing"))?;
+    let direct_topology_keys = [
+        "kind",
+        "fingerprint_scope",
+        "initial_pane_ids",
+        "initial_sha256",
+        "final_sha256",
+        "stable",
+        "mux_session_incarnation",
+        "authoritative_topology_revision",
+    ];
+    let compatible_topology_keys = [
+        "kind",
+        "fingerprint_scope",
+        "initial_pane_ids",
+        "initial_sha256",
+        "final_sha256",
+        "stable",
+        "mux_session_incarnation",
+        "authoritative_topology_revision",
+        "authoritative_topology",
+        "authoritative_mux_incarnation",
+        "pane_id_aba_excluded",
+    ];
     require_exact_json_object_keys(
         topology,
-        &[
-            "kind",
-            "fingerprint_scope",
-            "initial_pane_ids",
-            "initial_sha256",
-            "final_sha256",
-            "stable",
-            "mux_session_incarnation",
-            "authoritative_topology_revision",
-        ],
+        if compatible_client_semantics {
+            &compatible_topology_keys
+        } else {
+            &direct_topology_keys
+        },
         "topology fence",
     )?;
-    if topology.get("kind").and_then(serde_json::Value::as_str) != Some("double_list_fingerprint")
-        || topology
-            .get("fingerprint_scope")
-            .and_then(serde_json::Value::as_str)
-            != Some("pane_tab_window_redacted_domain_workspace_geometry_active_zoom")
-    {
+    let topology_contract_valid = if compatible_client_semantics {
+        topology.get("kind").and_then(serde_json::Value::as_str)
+            == Some("v0_13_robot_state_double_census")
+            && topology
+                .get("fingerprint_scope")
+                .and_then(serde_json::Value::as_str)
+                == Some("pane_id_optional_redacted_pane_uuid_tab_id_window_id_redacted_domain")
+            && topology
+                .get("authoritative_topology")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            && topology
+                .get("authoritative_mux_incarnation")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            && topology
+                .get("pane_id_aba_excluded")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+    } else {
+        topology.get("kind").and_then(serde_json::Value::as_str) == Some("double_list_fingerprint")
+            && topology
+                .get("fingerprint_scope")
+                .and_then(serde_json::Value::as_str)
+                == Some("pane_tab_window_redacted_domain_workspace_geometry_active_zoom")
+    };
+    if !topology_contract_valid {
         anyhow::bail!("Mux dump topology fence kind or scope is unsupported");
     }
     let initial_pane_ids = topology
@@ -80422,7 +81690,11 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .filter(|value| is_canonical_lowercase_sha256(value))
         .ok_or_else(|| anyhow::anyhow!("Mux dump initial topology checksum is invalid"))?;
     if capture_complete {
-        let recomputed_topology_sha256 = mux_dump_topology_fingerprint_from_records(panes)?;
+        let recomputed_topology_sha256 = if compatible_client_semantics {
+            compatible_client_projected_topology_fingerprint_from_records(panes)?
+        } else {
+            mux_dump_topology_fingerprint_from_records(panes)?
+        };
         if recomputed_topology_sha256 != initial_topology_sha256 {
             anyhow::bail!(
                 "Mux dump initial topology checksum does not match its canonical redacted pane metadata"
@@ -80536,8 +81808,10 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         capture_complete,
         executable_restore_image,
         pane_count: panes.len(),
+        domain_pane_counts,
         error_count: errors.len(),
         content_bytes,
+        compatible_client,
     })
 }
 
@@ -87110,7 +88384,7 @@ elif "$compatible_ft" session dump --help >/dev/null 2>&1; then
   stamp=$(date +%Y%m%d%H%M%S)
   dump="$HOME/.local/share/ft/mux-dumps/pre-upgrade-$stamp-$$.json"
   "$compatible_ft" session dump --output "$dump" --format json >/dev/null
-  "$compatible_ft" session verify-dump "$dump" --format json >/dev/null
+  "$compatible_ft" session verify-dump "$dump" --require-complete --format json >/dev/null
   printf 'FT_PREUPGRADE_DUMP=verified path=%s\n' "$dump"
 else
   printf 'FT_PREUPGRADE_DUMP=unavailable_legacy_client\n'
@@ -91389,6 +92663,49 @@ mod tests {
     }
 
     #[test]
+    fn robot_checkpoint_save_defaults_to_durable_scrollback_with_explicit_metadata_only_escape() {
+        let defaulted = Cli::try_parse_from(["ft", "robot", "checkpoint", "save"])
+            .expect("robot checkpoint save defaults parse");
+        let Some(Commands::Robot {
+            command: Some(RobotCommands::Checkpoint { command }),
+            ..
+        }) = defaulted.command.map(|command| *command)
+        else {
+            panic!("expected robot checkpoint save command");
+        };
+        let RobotCheckpointCommands::Save {
+            include_scrollback, ..
+        } = command
+        else {
+            panic!("expected robot checkpoint save command");
+        };
+        assert!(include_scrollback);
+
+        let metadata_only = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "checkpoint",
+            "save",
+            "--include-scrollback=false",
+        ])
+        .expect("explicit metadata-only checkpoint syntax parses");
+        let Some(Commands::Robot {
+            command: Some(RobotCommands::Checkpoint { command }),
+            ..
+        }) = metadata_only.command.map(|command| *command)
+        else {
+            panic!("expected robot checkpoint save command");
+        };
+        let RobotCheckpointCommands::Save {
+            include_scrollback, ..
+        } = command
+        else {
+            panic!("expected robot checkpoint save command");
+        };
+        assert!(!include_scrollback);
+    }
+
+    #[test]
     fn robot_checkpoint_save_response_reports_exact_projection_metrics_and_normalized_trigger() {
         let secret = [
             "sk-ant-api03-",
@@ -91415,6 +92732,7 @@ mod tests {
                 pane_rows: 2,
                 panes_with_scrollback: 1,
             },
+            None,
         );
 
         assert_eq!(response["trigger"].as_str(), Some("manual"));
@@ -91436,9 +92754,14 @@ mod tests {
         assert_eq!(response["scrollback_complete"].as_bool(), Some(false));
         assert_eq!(
             response["scrollback_completeness_scope"].as_str(),
-            Some("pane_coverage")
+            Some("not_requested")
         );
         assert_eq!(response["scrollback_panes"].as_u64(), Some(1));
+        assert_eq!(
+            response["scrollback_reference_coverage_complete"].as_bool(),
+            Some(false)
+        );
+        assert!(response["artifact"].is_null());
         let encoded = serde_json::to_string(&response).expect("serialize save response");
         assert!(!encoded.contains(&secret));
         assert!(!encoded.contains('\u{202e}'));
@@ -93610,6 +94933,159 @@ mod tests {
             Cli::try_parse_from(["ft", "snapshot", "restore", "latest", "--launch-agents"])
                 .is_err(),
             "snapshot restore must not advertise an unavailable process-launch action"
+        );
+    }
+
+    #[test]
+    fn snapshot_artifact_subcommands_parse_explicit_paths_and_safety_flags() {
+        let export = Cli::try_parse_from([
+            "ft",
+            "snapshot",
+            "export",
+            "latest",
+            "--output",
+            "/private/checkpoint.json",
+            "--allow-incomplete",
+            "--format",
+            "json",
+        ])
+        .expect("snapshot artifact export syntax parses");
+        let Some(Commands::Snapshot { command }) = export.command.map(|command| *command) else {
+            panic!("expected snapshot command");
+        };
+        let SnapshotCommands::Export {
+            snapshot_id,
+            output,
+            allow_incomplete,
+            format,
+        } = command
+        else {
+            panic!("expected snapshot export command");
+        };
+        assert_eq!(snapshot_id, "latest");
+        assert_eq!(output, Some(PathBuf::from("/private/checkpoint.json")));
+        assert!(allow_incomplete);
+        assert_eq!(format, "json");
+
+        let verify = Cli::try_parse_from([
+            "ft",
+            "snapshot",
+            "verify-artifact",
+            "/private/checkpoint.json",
+            "--format",
+            "toon",
+        ])
+        .expect("snapshot artifact verification syntax parses");
+        let Some(Commands::Snapshot { command }) = verify.command.map(|command| *command) else {
+            panic!("expected snapshot command");
+        };
+        let SnapshotCommands::VerifyArtifact { path, format } = command else {
+            panic!("expected snapshot artifact verification command");
+        };
+        assert_eq!(path, PathBuf::from("/private/checkpoint.json"));
+        assert_eq!(format, "toon");
+
+        let list = Cli::try_parse_from([
+            "ft",
+            "snapshot",
+            "list-artifacts",
+            "--directory",
+            "/private/catalog",
+        ])
+        .expect("snapshot artifact inventory syntax parses");
+        let Some(Commands::Snapshot { command }) = list.command.map(|command| *command) else {
+            panic!("expected snapshot command");
+        };
+        let SnapshotCommands::ListArtifacts { directory, format } = command else {
+            panic!("expected snapshot artifact inventory command");
+        };
+        assert_eq!(directory, Some(PathBuf::from("/private/catalog")));
+        assert_eq!(format, "auto");
+    }
+
+    #[test]
+    fn snapshot_artifact_verification_dispatches_before_config_and_workspace_loading() {
+        let source = include_str!("main.rs");
+        let dispatch_start = source
+            .find("let command = command.map(|b| *b);")
+            .expect("unboxed command dispatch remains present");
+        let config_load = source[dispatch_start..]
+            .find("frankenterm_core::config::Config::load_with_overrides(")
+            .map(|offset| dispatch_start + offset)
+            .expect("config loading remains present");
+        let pre_config_dispatch = &source[dispatch_start..config_load];
+        assert!(pre_config_dispatch.contains("SnapshotCommands::VerifyArtifact"));
+        assert!(pre_config_dispatch.contains("run_verify_checkpoint_scrollback_artifact_command("));
+        assert!(pre_config_dispatch.contains("SnapshotCommands::ListArtifacts"));
+        assert!(pre_config_dispatch.contains("run_list_checkpoint_scrollback_artifacts_command("));
+
+        let helper_start = source
+            .find("async fn run_verify_checkpoint_scrollback_artifact_command(")
+            .expect("offline checkpoint artifact helper remains present");
+        let helper_end = source[helper_start..]
+            .find("\n// =============================================================================")
+            .map(|offset| helper_start + offset)
+            .expect("snapshot command section follows verifier helper");
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("verify_checkpoint_scrollback_artifact("));
+        for forbidden in ["Config::", "workspace", "MuxInterface", "list_panes"] {
+            assert!(
+                !helper.contains(forbidden),
+                "offline checkpoint verifier unexpectedly depends on {forbidden}"
+            );
+        }
+
+        let list_helper_start = source
+            .find("async fn run_list_checkpoint_scrollback_artifacts_command(")
+            .expect("offline checkpoint artifact catalog helper remains present");
+        let list_helper_end = source[list_helper_start..]
+            .find("\n// =============================================================================")
+            .map(|offset| list_helper_start + offset)
+            .expect("snapshot command section follows catalog helper");
+        let list_helper = &source[list_helper_start..list_helper_end];
+        assert!(list_helper.contains("inventory_checkpoint_scrollback_artifacts("));
+        for forbidden in ["Config::", "workspace", "MuxInterface", "list_panes"] {
+            assert!(
+                !list_helper.contains(forbidden),
+                "offline checkpoint catalog unexpectedly depends on {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_artifact_identity_load_binds_exact_pane_count() {
+        let (db_path, conn, _dir) = setup_session_show_test_db();
+        insert_session_for_session_show_test(&conn, "sess-artifact-identity", false);
+        let checkpoint_id =
+            insert_checkpoint_for_session_show_test(&conn, "sess-artifact-identity", 4_242, 3);
+
+        let loaded = load_checkpoint_identity_with_pane_count(
+            &db_path,
+            checkpoint_id,
+            CheckpointResolveScope::Snapshot,
+        )
+        .expect("load checkpoint artifact identity")
+        .expect("checkpoint exists");
+        assert_eq!(loaded.identity.checkpoint_id, checkpoint_id);
+        assert_eq!(loaded.identity.session_id, "sess-artifact-identity");
+        assert_eq!(loaded.identity.checkpoint_at, 4_242);
+        assert_eq!(loaded.identity.checkpoint_role, "snapshot");
+        assert_eq!(loaded.pane_count, 3);
+
+        conn.execute(
+            "UPDATE session_checkpoints SET pane_count = 'not-a-count' WHERE id = ?1",
+            [checkpoint_id],
+        )
+        .expect("plant non-integer pane count");
+        assert!(
+            load_checkpoint_identity_with_pane_count(
+                &db_path,
+                checkpoint_id,
+                CheckpointResolveScope::Snapshot,
+            )
+            .expect_err("non-integer pane count must fail closed")
+            .to_string()
+            .contains("invalid pane_count")
         );
     }
 
@@ -97684,6 +99160,301 @@ recorder_backend = "rusqlite"
         assert_eq!(format, "json");
     }
 
+    #[cfg(unix)]
+    fn compatible_client_test_request(output: PathBuf) -> CompatibleClientDumpRequest {
+        CompatibleClientDumpRequest {
+            client: PathBuf::from("/definitely-not-contacted/frankenterm-v0.13.0-ft"),
+            expected_client_sha256: "1".repeat(64),
+            expected_client_bytes: 20_179_712,
+            mux_socket: PathBuf::from("/definitely-not-contacted/frankenterm-gui.sock"),
+            output,
+            max_panes: 16,
+            max_total_bytes: 1_024,
+            batch_size: 7,
+            batch_timeout: Duration::from_secs(41),
+            max_batch_output_bytes: 2_097_152,
+        }
+    }
+
+    #[cfg(unix)]
+    fn compatible_client_test_identity(mode: u32, bytes: u64) -> serde_json::Value {
+        serde_json::json!({
+            "device": 1,
+            "inode": 2,
+            "uid": nix::unistd::geteuid().as_raw(),
+            "gid": 80,
+            "mode": mode,
+            "hard_link_count": 1,
+            "byte_len": bytes,
+            "modified_seconds": 1,
+            "modified_nanoseconds": 2,
+            "changed_seconds": 3,
+            "changed_nanoseconds": 4,
+        })
+    }
+
+    #[cfg(unix)]
+    fn compatible_client_test_payload(request: &CompatibleClientDumpRequest) -> serde_json::Value {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut client = compatible_client_test_identity(0o500, request.expected_client_bytes);
+        client.as_object_mut().unwrap().insert(
+            "sha256".to_string(),
+            serde_json::json!(&request.expected_client_sha256),
+        );
+        let panes = vec![serde_json::json!({
+            "pane": {
+                "pane_id": 1,
+                "pane_uuid": "00112233445566778899aabbccddeeff",
+                "tab_id": 2,
+                "window_id": 3,
+                "domain_id": null,
+                "domain_name": "ssh:trj",
+                "domain_identity_authority": "v0_13_robot_state_domain_field",
+                "identity_stability": "v0_13_projected_ephemeral_no_incarnation_authority",
+                "workspace": null,
+                "rows": 0,
+                "cols": 0,
+                "title": "shell",
+                "cwd": "file:///tmp",
+                "tty_name": null,
+                "cursor_x": null,
+                "cursor_y": null,
+                "cursor_visibility": null,
+                "left_col": null,
+                "top_row": null,
+                "is_active": false,
+                "is_zoomed": false,
+            },
+            "content": {
+                "encoding": "utf-8",
+                "redaction_applied": true,
+                "bytes": 6,
+                "lines": 1,
+                "sha256": sha256_hex(b"hello\n"),
+                "text": "hello\n",
+            },
+        })];
+        let topology_sha256 = compatible_client_projected_topology_fingerprint_from_records(&panes)
+            .expect("hash compatible-client topology fixture");
+        serde_json::json!({
+            "schema_version": 1,
+            "created_at_epoch_ms": 1,
+            "source": {
+                "kind": "live_mux",
+                "ft_version": COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION,
+                "git_hash": COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH,
+                "capture_transport": COMPATIBLE_CLIENT_DUMP_CAPTURE_TRANSPORT,
+                "backend_constraint": COMPATIBLE_CLIENT_DUMP_BACKEND_CONSTRAINT,
+                "client": client,
+                "mux_socket": {
+                    "path_sha256": sha256_hex(request.mux_socket.as_os_str().as_bytes()),
+                    "identity": compatible_client_test_identity(0o700, 0),
+                },
+                "recovery_environment": {
+                    "retained": true,
+                    "path_sha256": "3".repeat(64),
+                },
+            },
+            "complete": true,
+            "completeness_semantics": {
+                "meaning": "every initially listed v0.13 robot-state pane was read within limits and a second census matched pane_id, optional pane_uuid, tab_id, window_id, and raw domain; no authoritative mux incarnation or topology revision was available",
+                "point_in_time_content_snapshot": false,
+                "pane_content_consistency": "sequential_best_effort_non_atomic",
+                "topology_consistency": "v0_13_robot_state_double_census_projected_fields",
+            },
+            "capabilities": {
+                "forensic_text_export": true,
+                "bounded_topology_metadata": true,
+                "executable_restore_image": false,
+                "terminal_parser_render_state": false,
+                "pty_descriptor_state": false,
+                "process_memory_state": false,
+                "running_process_continuity": false,
+                "stable_cross_restart_pane_identity": false,
+            },
+            "redaction_applied": true,
+            "limits": {
+                "max_panes": request.max_panes,
+                "max_total_bytes": request.max_total_bytes,
+                "batch_size": request.batch_size,
+                "batch_timeout_ms": compatible_client_batch_timeout_ms(request).unwrap(),
+                "max_batch_output_bytes": request.max_batch_output_bytes,
+            },
+            "summary": {
+                "panes_listed_initial": 1,
+                "panes_listed_final": 1,
+                "panes_captured": 1,
+                "content_bytes": 6,
+                "capture_errors": 0,
+                "domains": ["ssh:trj"],
+            },
+            "topology_fence": {
+                "kind": "v0_13_robot_state_double_census",
+                "fingerprint_scope": "pane_id_optional_redacted_pane_uuid_tab_id_window_id_redacted_domain",
+                "initial_pane_ids": [1],
+                "initial_sha256": &topology_sha256,
+                "final_sha256": &topology_sha256,
+                "stable": true,
+                "mux_session_incarnation": null,
+                "authoritative_topology_revision": null,
+                "authoritative_topology": false,
+                "authoritative_mux_incarnation": false,
+                "pane_id_aba_excluded": false,
+            },
+            "panes": panes,
+            "errors": [],
+        })
+    }
+
+    #[cfg(unix)]
+    fn write_compatible_client_test_artifact(path: &Path, payload: serde_json::Value) {
+        let (_payload_bytes, payload_sha256) = hash_json_bounded(
+            &payload,
+            LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            JsonSerializationStyle::Compact,
+        )
+        .expect("hash compatible-client fixture payload");
+        let envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
+            "payload_sha256": payload_sha256,
+            "payload": payload,
+        });
+        let mut bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+        bytes.push(b'\n');
+        write_new_private_artifact(path, &bytes).expect("write compatible-client test artifact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_client_existing_target_query_ack_is_idempotent_and_bound_before_contact() {
+        let directory = tempfile::tempdir().expect("compatible-client reconciliation tempdir");
+        let output = directory.path().join("private").join("mux-dump.json");
+        let request = compatible_client_test_request(output.clone());
+        validate_compatible_client_dump_request(&request).expect("valid test request");
+        write_compatible_client_test_artifact(&output, compatible_client_test_payload(&request));
+        let original = std::fs::read(&output).expect("read original compatible-client artifact");
+
+        let first = reconcile_existing_compatible_client_dump(&request)
+            .expect("first lost-reply query succeeds")
+            .expect("existing compatible-client artifact is acknowledged");
+        let second = reconcile_existing_compatible_client_dump(&request)
+            .expect("repeated lost-reply query succeeds")
+            .expect("existing compatible-client artifact remains acknowledged");
+        assert!(first.recovered_existing && second.recovered_existing);
+        assert!(first.reconciled_without_mux_contact && second.reconciled_without_mux_contact);
+        assert_eq!(first.subprocess_count, 0);
+        assert_eq!(second.subprocess_count, 0);
+        assert_eq!(
+            first.domain_pane_counts,
+            BTreeMap::from([("ssh:trj".to_string(), 1)])
+        );
+        assert_eq!(second.domain_pane_counts, first.domain_pane_counts);
+        assert_eq!(first.artifact_sha256, second.artifact_sha256);
+        assert_eq!(std::fs::read(&output).unwrap(), original);
+
+        let mut mismatches = Vec::new();
+        let mut wrong_sha = request.clone();
+        wrong_sha.expected_client_sha256 = "2".repeat(64);
+        mismatches.push(wrong_sha);
+        let mut wrong_bytes = request.clone();
+        wrong_bytes.expected_client_bytes += 1;
+        mismatches.push(wrong_bytes);
+        let mut wrong_socket = request.clone();
+        wrong_socket.mux_socket = PathBuf::from("/definitely-not-contacted/other.sock");
+        mismatches.push(wrong_socket);
+        let mut wrong_max_panes = request.clone();
+        wrong_max_panes.max_panes += 1;
+        mismatches.push(wrong_max_panes);
+        let mut wrong_total = request.clone();
+        wrong_total.max_total_bytes += 1;
+        mismatches.push(wrong_total);
+        let mut wrong_batch = request.clone();
+        wrong_batch.batch_size += 1;
+        mismatches.push(wrong_batch);
+        let mut wrong_timeout = request.clone();
+        wrong_timeout.batch_timeout += Duration::from_secs(1);
+        mismatches.push(wrong_timeout);
+        let mut wrong_stdout = request.clone();
+        wrong_stdout.max_batch_output_bytes += 1;
+        mismatches.push(wrong_stdout);
+        for mismatch in mismatches {
+            let error = reconcile_existing_compatible_client_dump(&mismatch)
+                .expect_err("a mismatched request must fail no-clobber");
+            assert!(
+                error
+                    .to_string()
+                    .contains("different client, socket, or request bound")
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_client_topology_contract_rejects_unavailable_or_overclaimed_authority() {
+        let directory = tempfile::tempdir().expect("compatible topology contract tempdir");
+        let base = directory.path().join("private");
+        let request = compatible_client_test_request(base.join("valid.json"));
+        let payload = compatible_client_test_payload(&request);
+        write_compatible_client_test_artifact(&request.output, payload.clone());
+        let receipt = verify_mux_dump_artifact(&request.output)
+            .expect("source-honest compatible-client topology is accepted");
+        assert!(receipt.compatible_client.is_some());
+        assert_eq!(
+            receipt.domain_pane_counts,
+            BTreeMap::from([("ssh:trj".to_string(), 1)])
+        );
+
+        let overclaim_path = base.join("overclaim.json");
+        let mut overclaim = payload.clone();
+        overclaim["topology_fence"]["fingerprint_scope"] =
+            serde_json::json!("pane_tab_window_redacted_domain_workspace_geometry_active_zoom");
+        write_compatible_client_test_artifact(&overclaim_path, overclaim);
+        assert!(
+            verify_mux_dump_artifact(&overclaim_path)
+                .expect_err("compatible-client scope must not claim unavailable fields")
+                .to_string()
+                .contains("kind or scope")
+        );
+
+        let fabricated_path = base.join("fabricated-geometry.json");
+        let mut fabricated = payload.clone();
+        fabricated["panes"][0]["pane"]["rows"] = serde_json::json!(1);
+        write_compatible_client_test_artifact(&fabricated_path, fabricated);
+        assert!(
+            verify_mux_dump_artifact(&fabricated_path)
+                .expect_err("compatible-client geometry placeholders are not topology evidence")
+                .to_string()
+                .contains("fabricates unavailable topology metadata")
+        );
+
+        let wrong_domain_authority_path = base.join("wrong-domain-authority.json");
+        let mut wrong_domain_authority = payload.clone();
+        wrong_domain_authority["panes"][0]["pane"]["domain_identity_authority"] =
+            serde_json::json!("inferred_from_cwd_uri_authority");
+        write_compatible_client_test_artifact(&wrong_domain_authority_path, wrong_domain_authority);
+        assert!(
+            verify_mux_dump_artifact(&wrong_domain_authority_path)
+                .expect_err("v0.13 state domain must not be mislabeled as cwd inference")
+                .to_string()
+                .contains("identity metadata")
+        );
+
+        let uuid_drift_path = base.join("uuid-drift.json");
+        let mut uuid_drift = payload;
+        uuid_drift["panes"][0]["pane"]["pane_uuid"] =
+            serde_json::json!("ffeeddccbbaa99887766554433221100");
+        write_compatible_client_test_artifact(&uuid_drift_path, uuid_drift);
+        assert!(
+            verify_mux_dump_artifact(&uuid_drift_path)
+                .expect_err("optional pane_uuid participates in the projected topology digest")
+                .to_string()
+                .contains("canonical redacted pane metadata")
+        );
+    }
+
     #[test]
     fn compatible_client_version_and_robot_receipts_are_exact_and_content_free_on_rejection() {
         let version = parse_compatible_client_version(b"ft 0.13.0 (3ebd60566)\n")
@@ -98172,8 +99943,12 @@ recorder_backend = "rusqlite"
                 "path_sha256": "3".repeat(64),
             },
         });
-        verify_mux_dump_source_metadata(&source)
-            .expect("exact compatible-client source authority is accepted");
+        let verified = verify_mux_dump_source_metadata(&source)
+            .expect("exact compatible-client source authority is accepted")
+            .expect("compatible source metadata produces a recovery contract");
+        assert_eq!(verified.client_sha256, "1".repeat(64));
+        assert_eq!(verified.client_bytes, 20_179_712);
+        assert_eq!(verified.mux_socket_path_sha256, "2".repeat(64));
 
         source["client"]["sha256"] = serde_json::json!("0".repeat(64));
         assert!(verify_mux_dump_source_metadata(&source).is_err());
@@ -98573,6 +100348,10 @@ recorder_backend = "rusqlite"
         assert_eq!(receipt.payload_sha256, payload_sha256);
         assert!(receipt.capture_complete);
         assert!(!receipt.executable_restore_image);
+        assert_eq!(
+            receipt.domain_pane_counts,
+            BTreeMap::from([("local".to_string(), 1)])
+        );
         assert_eq!(receipt.pane_count, 1);
         assert_eq!(receipt.error_count, 0);
         assert_eq!(receipt.content_bytes, 6);
@@ -98967,13 +100746,20 @@ recorder_backend = "rusqlite"
             .map(|offset| start + offset)
             .expect("JSON serializer follows compatible-client command");
         let command = &source[start..end];
+        let reconcile = command
+            .find("reconcile_existing_compatible_client_dump(&request)")
+            .expect("lost-reply query remains in the command path");
+        let capture = command
+            .find("capture_compatible_client_dump(cx, &request)")
+            .expect("fresh capture remains in the command path");
+        assert!(
+            reconcile < capture,
+            "existing-target Query/Ack must finish before any compatible client can contact the mux"
+        );
         assert!(command.contains("run_cli_settled_blocking_effect("));
         assert!(!command.contains("run_cli_blocking_with_cx("));
         assert!(command.contains("publish_mux_dump_payload(&publication_path, payload)"));
-        assert!(
-            command.contains("\"publication_recovered_existing\": published.recovered_existing")
-        );
-        assert!(command.contains("Publication recovered existing: {}"));
+        assert!(command.contains("emit_compatible_client_dump_receipt(&receipt, output_format)"));
     }
 
     #[test]
@@ -98983,6 +100769,11 @@ recorder_backend = "rusqlite"
             "session",
             "verify-dump",
             "/tmp/mux-dump.json",
+            "--require-complete",
+            "--expect-domain-panes",
+            "ssh:trj=12",
+            "--expect-domain-panes",
+            "ssh:csd=16",
             "--format",
             "json",
         ])
@@ -98990,11 +100781,92 @@ recorder_backend = "rusqlite"
         let Some(Commands::Session { command }) = cli.command.map(|command| *command) else {
             panic!("expected session command");
         };
-        let SessionCommands::VerifyDump { path, format } = command else {
+        let SessionCommands::VerifyDump {
+            path,
+            require_complete,
+            expect_domain_panes,
+            format,
+        } = command
+        else {
             panic!("expected verify-dump subcommand");
         };
         assert_eq!(path, PathBuf::from("/tmp/mux-dump.json"));
+        assert!(require_complete);
+        assert_eq!(
+            expect_domain_panes,
+            vec!["ssh:trj=12".to_string(), "ssh:csd=16".to_string()]
+        );
         assert_eq!(format, "json");
+    }
+
+    #[test]
+    fn session_verify_dump_dispatches_before_config_workspace_and_mux_initialization() {
+        let source = include_str!("main.rs");
+        let dispatch_start = source
+            .find("let command = command.map(|b| *b);")
+            .expect("unboxed command dispatch remains present");
+        let config_load = source[dispatch_start..]
+            .find("frankenterm_core::config::Config::load_with_overrides(")
+            .map(|offset| dispatch_start + offset)
+            .expect("config loading remains present");
+        let pre_config_dispatch = &source[dispatch_start..config_load];
+        assert!(pre_config_dispatch.contains("SessionCommands::VerifyDump"));
+        assert!(pre_config_dispatch.contains("run_verify_mux_dump_command("));
+
+        let helper_start = source
+            .find("fn run_verify_mux_dump_command(")
+            .expect("offline dump verifier command helper remains present");
+        let helper_end = source[helper_start..]
+            .find("\nfn verify_mux_dump_artifact(")
+            .map(|offset| helper_start + offset)
+            .expect("artifact verifier follows offline command helper");
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("verify_mux_dump_artifact(path)?"));
+        for forbidden in ["Config::", "workspace", "connect", "MuxInterface"] {
+            assert!(
+                !helper.contains(forbidden),
+                "offline verify-dump helper unexpectedly depends on {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn mux_dump_domain_pane_preconditions_are_exact_bounded_and_unambiguous() {
+        let verified = BTreeMap::from([("ssh:trj".to_string(), 12), ("ssh:csd".to_string(), 16)]);
+        require_expected_mux_dump_domain_pane_counts(
+            &verified,
+            &["ssh:trj=12".to_string(), "ssh:csd=16".to_string()],
+        )
+        .expect("exact verified domain pane counts pass");
+
+        for invalid in [
+            vec!["ssh:trj=11".to_string()],
+            vec!["ssh:missing=1".to_string()],
+            vec!["ssh:trj=12".to_string(), "ssh:trj=12".to_string()],
+            vec!["ssh:trj=0".to_string()],
+            vec!["ssh:trj=not-a-count".to_string()],
+            vec!["missing-separator".to_string()],
+        ] {
+            assert!(
+                require_expected_mux_dump_domain_pane_counts(&verified, &invalid).is_err(),
+                "invalid domain pane precondition unexpectedly passed: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mux_dump_complete_precondition_rejects_partial_and_inconsistent_receipts() {
+        require_complete_mux_dump_when_requested(true, 0, true)
+            .expect("complete zero-error receipt passes the precondition");
+        require_complete_mux_dump_when_requested(false, 1, false)
+            .expect("partial artifacts remain available for forensic integrity checks");
+        for (capture_complete, error_count) in [(false, 0), (false, 1), (true, 1)] {
+            assert!(
+                require_complete_mux_dump_when_requested(capture_complete, error_count, true)
+                    .is_err(),
+                "incomplete or inconsistent receipt unexpectedly passed: complete={capture_complete}, errors={error_count}"
+            );
+        }
     }
 
     #[test]
@@ -104459,6 +106331,10 @@ log_level = "debug"
             .position(|command| command == installer)
             .unwrap();
         assert!(dump_position < installer_position);
+        assert!(
+            dump.contains("session verify-dump \"$dump\" --require-complete"),
+            "pre-upgrade artifact admission must reject an intact partial dump"
+        );
         assert!(installer.contains("$HOME/.cache/frankenterm/releases/v0.15.2-"));
         assert!(!installer.contains("--dest \"$HOME/.local/bin\""));
         let pending = commands
