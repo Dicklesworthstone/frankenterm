@@ -5165,7 +5165,7 @@ mod tests {
         let decoded =
             decode_broker_control_request(&authority, encoded.as_slice()).expect("decode request");
         assert_eq!(decoded.header, request.header);
-        assert_eq!(decoded.payload(), []);
+        assert_eq!(decoded.payload(), &[] as &[u8]);
 
         let mut mutated = encoded.as_slice().to_vec();
         mutated[20] ^= 1;
@@ -5208,7 +5208,7 @@ mod tests {
             decode_broker_control_response(&authority, encoded_response.as_slice())
                 .expect("decode response");
         assert_eq!(decoded_response.header, response.header);
-        assert_eq!(decoded_response.payload(), []);
+        assert_eq!(decoded_response.payload(), &[] as &[u8]);
         assert!(
             decode_broker_control_request(&authority, encoded_response.as_slice()).is_err(),
             "a response-direction frame was accepted as a request"
