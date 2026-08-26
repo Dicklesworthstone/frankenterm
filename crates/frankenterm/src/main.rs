@@ -108938,6 +108938,8 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             .arg("verifier:offline-verifier:verify-components.sh")
             .arg("--source-match")
             .arg("verify-components.sh=scripts/atomic-component-manifest.sh")
+            .arg("--input")
+            .arg("font.payload=crates/frankenterm/assets/Pragmasevka_NF.zip.zst")
             .output()
             .expect("execute installer family manifest generator");
         assert!(
@@ -109391,6 +109393,43 @@ with tarfile.open(path, "w") as archive:
         member.linkname = "/tmp"
         archive.addfile(member)
         add_file(archive, "FrankenTerm.app.component-manifest.json", b"{}")
+    elif case_name == "app-valid":
+        add_directory(archive, "FrankenTerm.app")
+        add_file(archive, "FrankenTerm.app/Contents.txt", b"authenticated app payload")
+        add_file(archive, "FrankenTerm.app.component-manifest.json", b"{}")
+    elif case_name == "oversized-pax":
+        member = tarfile.TarInfo("pax-extension")
+        member.type = tarfile.XHDTYPE
+        member.size = 1024 * 1024 + 1
+        archive.addfile(member, io.BytesIO(b"x" * member.size))
+    elif case_name == "oversized-gnu-longname":
+        member = tarfile.TarInfo("gnu-long-name-extension")
+        member.type = tarfile.GNUTYPE_LONGNAME
+        member.size = 1024 * 1024 + 1
+        archive.addfile(member, io.BytesIO(b"x" * member.size))
+    elif case_name in ("font-valid", "font-valid-replacement"):
+        for name in (
+            "pragmasevka-nf-regular.ttf",
+            "pragmasevka-nf-bold.ttf",
+            "pragmasevka-nf-italic.ttf",
+            "pragmasevka-nf-bolditalic.ttf",
+        ):
+            suffix = "replacement" if case_name == "font-valid-replacement" else "authenticated"
+            add_file(archive, name, (name + ":" + suffix + "\n").encode("ascii"))
+    elif case_name == "font-traversal":
+        add_file(archive, "../pragmasevka-nf-regular.ttf")
+    elif case_name == "font-symlink":
+        member = tarfile.TarInfo("pragmasevka-nf-regular.ttf")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "/tmp/font"
+        archive.addfile(member)
+    elif case_name == "font-unexpected":
+        add_file(archive, "unexpected-font.ttf")
+    elif case_name == "many-app-entries":
+        add_directory(archive, "FrankenTerm.app")
+        for index in range(2048):
+            add_file(archive, "FrankenTerm.app/member-%04d-%s" % (index, "x" * 48))
+        add_file(archive, "FrankenTerm.app.component-manifest.json", b"{}")
     else:
         raise SystemExit("unknown adversarial archive case")
 "#;
@@ -109409,10 +109448,160 @@ with tarfile.open(path, "w") as archive:
     }
 
     #[cfg(unix)]
+    fn create_zstd_adversarial_installer_archive(path: &Path, case_name: &str) {
+        let source_tar = path.with_extension("source.tar");
+        create_adversarial_installer_archive(&source_tar, case_name);
+        let zstd = installer_test_command_path("zstd").expect("real zstd test dependency");
+        let output = std::process::Command::new(zstd)
+            .arg("-q")
+            .arg("-f")
+            .arg("-o")
+            .arg(path)
+            .arg(&source_tar)
+            .output()
+            .expect("compress adversarial installer archive with zstd");
+        assert!(
+            output.status.success(),
+            "failed to zstd-compress {case_name} archive: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_xz_memory_declaration_installer_archive(path: &Path) {
+        let program = r#"
+import binascii
+import io
+import lzma
+import struct
+import sys
+import tarfile
+
+path = sys.argv[1]
+payload = io.BytesIO()
+with tarfile.open(fileobj=payload, mode="w") as archive:
+    root = tarfile.TarInfo("FrankenTerm.app")
+    root.type = tarfile.DIRTYPE
+    root.mode = 0o755
+    archive.addfile(root)
+    manifest = tarfile.TarInfo("FrankenTerm.app.component-manifest.json")
+    manifest.mode = 0o644
+    manifest.size = 2
+    archive.addfile(manifest, io.BytesIO(b"{}"))
+
+compressed = bytearray(lzma.compress(
+    payload.getvalue(),
+    format=lzma.FORMAT_XZ,
+    filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1024 * 1024}],
+))
+if compressed[12:16] != b"\x02\x00\x21\x01":
+    raise SystemExit("unexpected single-filter xz block header")
+# LZMA2 property 30 declares a 128 MiB dictionary. The payload was encoded
+# with a 1 MiB dictionary, so changing only the declaration and its block-
+# header CRC yields a small valid stream that must hit the production 64 MiB
+# decoder limit without allocating 128 MiB in the test producer.
+compressed[16] = 30
+compressed[17:21] = struct.pack("<I", binascii.crc32(compressed[12:17]) & 0xffffffff)
+with open(path, "wb") as output:
+    output.write(compressed)
+"#;
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(program)
+            .arg(path)
+            .output()
+            .expect("create xz memory-declaration archive");
+        assert!(
+            output.status.success(),
+            "failed to create xz memory-declaration archive: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_valid_process_family_xz_archive(path: &Path, manifest_name: &str) {
+        let program = r#"
+import io
+import sys
+import tarfile
+
+path, manifest_name = sys.argv[1:]
+with tarfile.open(path, "w:xz") as archive:
+    for name in (
+        "ft",
+        "frankenterm-mux-server",
+        "frankenterm-pty-guardian",
+        "verify-components.sh",
+        manifest_name,
+    ):
+        payload = (name + "\n").encode("ascii")
+        member = tarfile.TarInfo(name)
+        member.mode = 0o755 if name != manifest_name else 0o644
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+"#;
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(program)
+            .arg(path)
+            .arg(manifest_name)
+            .output()
+            .expect("create valid process-family xz archive");
+        assert!(
+            output.status.success(),
+            "failed to create valid process-family xz archive: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn run_authenticated_process_family_extractor(
+        installer: &Path,
+        archive: &Path,
+        extraction_root: &Path,
+        manifest_name: &str,
+    ) -> std::process::Output {
+        use sha2::Digest as _;
+
+        let checksum = hex::encode(sha2::Sha256::digest(
+            std::fs::read(archive).expect("read process-family archive"),
+        ));
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nverify_checksum {} {}\nextract_authenticated_archive {} {} process-family {} \"$VERIFIED_ARCHIVE_IDENTITY\"\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&checksum),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&extraction_root.to_string_lossy()),
+            shell_single_quote(manifest_name),
+        );
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute production process-family extractor")
+    }
+
+    #[cfg(unix)]
     fn run_authenticated_installer_extractor(
         installer: &Path,
         archive: &Path,
         extraction_root: &Path,
+    ) -> std::process::Output {
+        run_authenticated_installer_extractor_with_metadata_bound(
+            installer,
+            archive,
+            extraction_root,
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    fn run_authenticated_installer_extractor_with_metadata_bound(
+        installer: &Path,
+        archive: &Path,
+        extraction_root: &Path,
+        retained_metadata_bytes: Option<usize>,
     ) -> std::process::Output {
         use sha2::Digest as _;
 
@@ -109427,11 +109616,253 @@ with tarfile.open(path, "w") as archive:
             shell_single_quote(&archive.to_string_lossy()),
             shell_single_quote(&extraction_root.to_string_lossy()),
         );
+        let mut command = std::process::Command::new("bash");
+        command.arg("-c").arg(script);
+        if let Some(limit) = retained_metadata_bytes {
+            command
+                .env("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES", "1")
+                .env(
+                    "FT_INSTALL_TEST_MAX_RETAINED_METADATA_BYTES",
+                    limit.to_string(),
+                );
+        }
+        command
+            .output()
+            .expect("execute production authenticated extractor")
+    }
+
+    #[cfg(unix)]
+    fn write_installer_fake_descriptor_zstd(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::write(
+            path,
+            r#"#!/bin/sh
+set -eu
+descriptor=""
+for argument in "$@"; do
+  case "$argument" in
+    /dev/fd/[0-9]*) descriptor=$argument ;;
+  esac
+done
+test -n "$descriptor"
+if test -n "${ATTACK_FONT_ARCHIVE:-}" && test ! -e "$ATTACK_MARKER"; then
+  mv "$ATTACK_FONT_ARCHIVE" "$RETAINED_FONT_ARCHIVE"
+  cp "$REPLACEMENT_FONT_ARCHIVE" "$ATTACK_FONT_ARCHIVE"
+  printf x > "$ATTACK_MARKER"
+fi
+exec "$REAL_ZSTD" "$@"
+"#,
+        )
+        .expect("write descriptor-fed fake zstd");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+            .expect("make descriptor-fed fake zstd executable");
+    }
+
+    #[cfg(unix)]
+    fn run_authenticated_font_extractor(
+        installer: &Path,
+        archive: &Path,
+        extraction_root: &Path,
+        fake_tools: &Path,
+        replacement: Option<(&Path, &Path, &Path)>,
+    ) -> std::process::Output {
+        use sha2::Digest as _;
+
+        let checksum = hex::encode(sha2::Sha256::digest(
+            std::fs::read(archive).expect("read authenticated font archive"),
+        ));
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nverify_checksum {} {}\nextract_authenticated_archive {} {} font - \"$VERIFIED_ARCHIVE_IDENTITY\"\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&checksum),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&extraction_root.to_string_lossy()),
+        );
+        let inherited_path = std::env::var("PATH").expect("test PATH");
+        let real_zstd = installer_test_command_path("zstd").expect("real zstd test dependency");
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:{inherited_path}", fake_tools.display()))
+            .env("REAL_ZSTD", real_zstd);
+        if let Some((replacement_archive, retained_archive, marker)) = replacement {
+            command
+                .env("ATTACK_FONT_ARCHIVE", archive)
+                .env("REPLACEMENT_FONT_ARCHIVE", replacement_archive)
+                .env("RETAINED_FONT_ARCHIVE", retained_archive)
+                .env("ATTACK_MARKER", marker);
+        }
+        command
+            .output()
+            .expect("execute production authenticated font extractor")
+    }
+
+    #[cfg(unix)]
+    fn run_authenticated_real_zstd_font_extractor(
+        installer: &Path,
+        archive: &Path,
+        extraction_root: &Path,
+    ) -> std::process::Output {
+        use sha2::Digest as _;
+
+        let checksum = hex::encode(sha2::Sha256::digest(
+            std::fs::read(archive).expect("read real-zstd font archive"),
+        ));
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nverify_checksum {} {}\nextract_authenticated_archive {} {} font - \"$VERIFIED_ARCHIVE_IDENTITY\"\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&checksum),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&extraction_root.to_string_lossy()),
+        );
         std::process::Command::new("bash")
             .arg("-c")
             .arg(script)
             .output()
-            .expect("execute production authenticated extractor")
+            .expect("execute production real-zstd font extractor")
+    }
+
+    #[cfg(unix)]
+    fn installer_test_command_exists(name: &str) -> bool {
+        std::process::Command::new(name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn installer_test_command_path(name: &str) -> Option<std::path::PathBuf> {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v \"$1\"")
+            .arg("installer-test-command-path")
+            .arg(name)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = std::str::from_utf8(&output.stdout).ok()?.trim();
+        (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+    }
+
+    #[cfg(unix)]
+    fn materialize_installer_test_published_family(
+        parent: &Path,
+        family: &InstallerTestFamily,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(parent).expect("create published family fixture parent");
+        let published = parent.join(&family.generation_id);
+        std::fs::create_dir(&published).expect("create published family fixture root");
+        for name in [
+            "ft",
+            "frankenterm-mux-server",
+            "frankenterm-pty-guardian",
+            "verify-components.sh",
+            "process-family.component-manifest.json",
+        ] {
+            std::fs::copy(family.root.join(name), published.join(name))
+                .expect("copy published family fixture member");
+        }
+        published
+    }
+
+    #[cfg(unix)]
+    fn write_installer_fake_font_download_tool(directory: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::create_dir_all(directory).expect("create fake font download directory");
+        let curl = directory.join("curl");
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+set -eu
+if test "${1:-}" = --help; then
+  printf '%s\n' '     --max-filesize <bytes>  Maximum file size to download'
+  exit 0
+fi
+cat "$FAKE_FONT_ARCHIVE"
+"#,
+        )
+        .expect("write fake font curl");
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o555))
+            .expect("make fake font curl executable");
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn run_installer_font_function(
+        installer: &Path,
+        published_family: &Path,
+        verifier: &Path,
+        font_archive: &Path,
+        data_root: &Path,
+        scratch: &Path,
+        fake_tools: &Path,
+        failpoint: Option<&str>,
+        mutate_stage: bool,
+    ) -> std::process::Output {
+        std::fs::create_dir_all(scratch).expect("create font installer scratch");
+        std::fs::create_dir_all(data_root).expect("create font installer data root");
+        let archive_budget = std::fs::metadata(font_archive)
+            .expect("read font archive metadata")
+            .len()
+            .checked_add(1024 * 1024)
+            .expect("bounded font archive test budget");
+        let failpoint = failpoint.unwrap_or("");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nTMP={}\nQUIET=1\nHAS_GUM=0\nOS=linux\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nXDG_DATA_HOME={}\nOFFLINE_TARBALL=\nPUBLISHED_PROCESS_FAMILY_ROOT={}\nPUBLISHED_PROCESS_FAMILY_VERSION=0.15.2\nPUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY={}\nMAX_FONT_ARCHIVE_BYTES={}\nMAX_FONT_EXPANDED_BYTES=268435456\nINSTALLER_FREE_SPACE_HEADROOM_BYTES=0\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_MUTATE_FONT_STAGE={}\ninstall_pragmasevka\nprintf 'FONT_RESULT=%s\\n' \"$FONT_INSTALLED_PATH\"\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&scratch.to_string_lossy()),
+            shell_single_quote(&data_root.to_string_lossy()),
+            shell_single_quote(&published_family.to_string_lossy()),
+            shell_single_quote(&verifier.to_string_lossy()),
+            archive_budget,
+            if failpoint.is_empty() && !mutate_stage {
+                "0"
+            } else {
+                "1"
+            },
+            shell_single_quote(failpoint),
+            if mutate_stage { "1" } else { "0" },
+        );
+        let inherited_path = std::env::var("PATH").expect("test PATH");
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:{inherited_path}", fake_tools.display()))
+            .env("FAKE_FONT_ARCHIVE", font_archive)
+            .output()
+            .expect("execute production font installer function")
+    }
+
+    #[cfg(unix)]
+    fn plant_installer_old_font_tree(data_root: &Path, marker: &[u8]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let target = data_root.join("fonts/pragmasevka");
+        std::fs::create_dir_all(&target).expect("create prior font tree");
+        for name in [
+            "pragmasevka-nf-regular.ttf",
+            "pragmasevka-nf-bold.ttf",
+            "pragmasevka-nf-italic.ttf",
+            "pragmasevka-nf-bolditalic.ttf",
+        ] {
+            let path = target.join(name);
+            std::fs::write(&path, [marker, name.as_bytes()].concat())
+                .expect("write prior font fixture");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+                .expect("seal prior font fixture");
+        }
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o555))
+            .expect("seal prior font tree");
+        target
     }
 
     #[test]
@@ -109700,6 +110131,10 @@ with tarfile.open(path, "w") as archive:
             "--entry executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian"
         ));
         assert!(
+            source_build
+                .contains("--input font.payload=crates/frankenterm/assets/Pragmasevka_NF.zip.zst")
+        );
+        assert!(
             source_build.contains("-p frankenterm-pty-guardian --bin frankenterm-pty-guardian")
         );
         assert!(!source_build.contains("install_process_family \"$bin\" \"$mux_bin\""));
@@ -109822,6 +110257,14 @@ fi
             ),
             ("duplicate", "archive contains a duplicate member name"),
             ("absolute-symlink", "archive contains an absolute symlink"),
+            (
+                "oversized-pax",
+                "tar PAX extension header exceeds its per-member bound",
+            ),
+            (
+                "oversized-gnu-longname",
+                "tar GNU long-name extension header exceeds its per-member bound",
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -109855,6 +110298,916 @@ fi
                 "traversal archive escaped its extraction root"
             );
         }
+    }
+
+    #[cfg(all(unix, target_os = "macos"))]
+    #[test]
+    fn installer_macos_accepts_a_valid_bounded_process_family_xz_archive() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create macOS extractor success fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let manifest_name = "fixture.component-manifest.json";
+        let archive = fixture.path().join("fixture-process-family.tar.xz");
+        let extraction_root = fixture.path().join("extract");
+        create_valid_process_family_xz_archive(&archive, manifest_name);
+        std::fs::create_dir(&extraction_root).expect("create macOS extraction root");
+        std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make macOS extraction root private");
+
+        let output = run_authenticated_process_family_extractor(
+            &installer,
+            &archive,
+            &extraction_root,
+            manifest_name,
+        );
+        assert!(
+            output.status.success(),
+            "valid macOS production extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let names = std::fs::read_dir(&extraction_root)
+            .expect("read macOS extraction inventory")
+            .map(|entry| entry.expect("read macOS extraction entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "ft",
+            "frankenterm-mux-server",
+            "frankenterm-pty-guardian",
+            "verify-components.sh",
+            manifest_name,
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_streaming_tar_rejects_nonzero_post_eot_trailers() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create tar trailer fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let archive = fixture.path().join("app-with-trailer.tar");
+        let extraction_root = fixture.path().join("extract");
+        create_adversarial_installer_archive(&archive, "app-valid");
+        let mut output_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&archive)
+            .expect("open authenticated archive for trailer fixture");
+        output_file
+            .write_all(b"NONZERO-AUTHENTICATED-TRAILER")
+            .expect("append nonzero tar trailer");
+        output_file.sync_all().expect("sync tar trailer fixture");
+        std::fs::create_dir(&extraction_root).expect("create trailer extraction root");
+        std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make trailer extraction root private");
+
+        let output = run_authenticated_installer_extractor(&installer, &archive, &extraction_root);
+        assert!(!output.status.success(), "nonzero tar trailer was accepted");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("tar stream contains a nonzero post-EOT trailer"),
+            "trailer rejection lacked its exact diagnosis: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_dir(&extraction_root)
+                .expect("inspect trailer extraction root")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_streaming_tar_bounds_retained_member_metadata_before_extraction() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create retained-metadata fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let archive = fixture.path().join("many-members.tar");
+        let extraction_root = fixture.path().join("extract");
+        create_adversarial_installer_archive(&archive, "many-app-entries");
+        std::fs::create_dir(&extraction_root).expect("create retained-metadata extraction root");
+        std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make retained-metadata extraction root private");
+
+        let output = run_authenticated_installer_extractor_with_metadata_bound(
+            &installer,
+            &archive,
+            &extraction_root,
+            Some(2048),
+        );
+        assert!(
+            !output.status.success(),
+            "archive exceeded the test retained-metadata bound without rejection"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("archive exceeds its retained-metadata bound"),
+            "metadata-bound rejection lacked its exact diagnosis: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_dir(&extraction_root)
+                .expect("inspect retained-metadata extraction root")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_streaming_tar_clears_parser_member_cache_across_high_entry_archive() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create high-entry extractor fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let archive = fixture.path().join("high-entry-app.tar");
+        let extraction_root = fixture.path().join("extract");
+        create_adversarial_installer_archive(&archive, "many-app-entries");
+        std::fs::create_dir(&extraction_root).expect("create high-entry extraction root");
+        std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make high-entry extraction root private");
+
+        let output = run_authenticated_installer_extractor(&installer, &archive, &extraction_root);
+        assert!(
+            output.status.success(),
+            "bounded high-entry production extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_dir(extraction_root.join("FrankenTerm.app"))
+                .expect("inspect high-entry extracted application")
+                .count(),
+            2048,
+            "high-entry production extraction lost or duplicated members"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_xz_decoder_rejects_oversized_dictionary_declarations_before_extraction() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create xz decoder-bound fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let archive = fixture.path().join("oversized-dictionary.tar.xz");
+        let extraction_root = fixture.path().join("extract");
+        create_xz_memory_declaration_installer_archive(&archive);
+        std::fs::create_dir(&extraction_root).expect("create xz extraction root");
+        std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make xz extraction root private");
+
+        let output = run_authenticated_installer_extractor(&installer, &archive, &extraction_root);
+        assert!(
+            !output.status.success(),
+            "oversized xz dictionary declaration unexpectedly passed the production extractor"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("xz decoder rejected the archive memory declaration or stream"),
+            "xz decoder rejection did not identify its finite memory contract: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_dir(&extraction_root)
+                .expect("inspect xz extraction root")
+                .count(),
+            0,
+            "xz decoder wrote files before rejecting its dictionary declaration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_font_extractor_rejects_paths_symlinks_and_noncanonical_inventory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !installer_test_command_exists("zstd") {
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("create font archive-attack fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let fake_tools = fixture.path().join("tools");
+        std::fs::create_dir(&fake_tools).expect("create fake font tool directory");
+        write_installer_fake_descriptor_zstd(&fake_tools.join("zstd"));
+
+        for (index, (case_name, expected_error)) in [
+            ("font-traversal", "archive contains an unsafe member name"),
+            (
+                "font-symlink",
+                "font archive contains an unexpected or non-regular member",
+            ),
+            (
+                "font-unexpected",
+                "font archive contains an unexpected or non-regular member",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let archive = fixture.path().join(format!("{index}-{case_name}.tar.zst"));
+            let extraction_root = fixture.path().join(format!("extract-font-{index}"));
+            create_zstd_adversarial_installer_archive(&archive, case_name);
+            std::fs::create_dir(&extraction_root).expect("create font extraction root");
+            std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+                .expect("make font extraction root private");
+            let output = run_authenticated_font_extractor(
+                &installer,
+                &archive,
+                &extraction_root,
+                &fake_tools,
+                None,
+            );
+            assert!(
+                !output.status.success(),
+                "{case_name} font archive unexpectedly passed the production extractor"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected_error),
+                "{case_name} font rejection did not report {expected_error:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_dir(&extraction_root)
+                    .expect("inspect rejected font extraction root")
+                    .count(),
+                0,
+                "{case_name} font archive wrote bytes before rejection"
+            );
+            assert!(
+                !fixture.path().join("pragmasevka-nf-regular.ttf").exists(),
+                "font traversal escaped its private extraction root"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_font_extractor_pins_authenticated_descriptor_across_path_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !installer_test_command_exists("zstd") {
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("create font descriptor-race fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let fake_tools = fixture.path().join("tools");
+        std::fs::create_dir(&fake_tools).expect("create descriptor-race fake tools");
+        write_installer_fake_descriptor_zstd(&fake_tools.join("zstd"));
+        let archive = fixture.path().join("authenticated-font.tar.zst");
+        let replacement = fixture.path().join("replacement-font.tar.zst");
+        let retained = fixture.path().join("retained-authenticated-font.tar.zst");
+        let marker = fixture.path().join("font-path-replaced");
+        let extraction_root = fixture.path().join("extract");
+        create_zstd_adversarial_installer_archive(&archive, "font-valid");
+        create_zstd_adversarial_installer_archive(&replacement, "font-valid-replacement");
+        let authenticated_bytes = std::fs::read(&archive).expect("read authenticated font bytes");
+        let replacement_bytes = std::fs::read(&replacement).expect("read replacement font bytes");
+        std::fs::create_dir(&extraction_root).expect("create font descriptor extraction root");
+        std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make font descriptor extraction root private");
+
+        let output = run_authenticated_font_extractor(
+            &installer,
+            &archive,
+            &extraction_root,
+            &fake_tools,
+            Some((&replacement, &retained, &marker)),
+        );
+        assert!(
+            !output.status.success(),
+            "font pathname replacement unexpectedly passed authenticated extraction"
+        );
+        assert!(
+            marker.is_file(),
+            "fake zstd did not replace the font pathname"
+        );
+        assert_eq!(
+            std::fs::read(&retained).expect("read retained authenticated font archive"),
+            authenticated_bytes
+        );
+        assert_eq!(
+            std::fs::read(&archive).expect("read replacement font pathname"),
+            replacement_bytes
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("archive pathname no longer names the checksum-authenticated inode"),
+            "font descriptor-race rejection lacked its identity diagnosis: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_dir(&extraction_root)
+                .expect("inspect font descriptor extraction root")
+                .count(),
+            0,
+            "font pathname replacement wrote files before identity revalidation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_real_zstd_font_extraction_accepts_one_frame_and_rejects_extra_frames() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !installer_test_command_exists("zstd") {
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("create real-zstd font fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let archive = repository.join("crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
+        let extraction_root = fixture.path().join("extract-valid");
+        std::fs::create_dir(&extraction_root).expect("create valid real-zstd extraction root");
+        std::fs::set_permissions(&extraction_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make valid real-zstd extraction root private");
+        let accepted =
+            run_authenticated_real_zstd_font_extractor(&installer, &archive, &extraction_root);
+        assert!(
+            accepted.status.success(),
+            "valid single-frame font payload failed production extraction: {}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&accepted.stdout).starts_with("FT_FONT_TREE_RECEIPT_V1="),
+            "valid font extraction did not emit its exact content receipt"
+        );
+        assert_eq!(
+            std::fs::read_dir(&extraction_root)
+                .expect("inspect valid font extraction")
+                .count(),
+            4
+        );
+
+        let authenticated = std::fs::read(&archive).expect("read one-frame font payload");
+        let concatenated = fixture.path().join("concatenated-font.zst");
+        let mut concatenated_bytes = authenticated.clone();
+        concatenated_bytes.extend_from_slice(&authenticated);
+        std::fs::write(&concatenated, concatenated_bytes)
+            .expect("write concatenated font frame fixture");
+        let concatenated_root = fixture.path().join("extract-concatenated");
+        std::fs::create_dir(&concatenated_root).expect("create concatenated-frame extraction root");
+        std::fs::set_permissions(&concatenated_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make concatenated-frame extraction root private");
+        let rejected = run_authenticated_real_zstd_font_extractor(
+            &installer,
+            &concatenated,
+            &concatenated_root,
+        );
+        assert!(
+            !rejected.status.success(),
+            "concatenated zstd frames were accepted"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("zstd archive contains a concatenated frame or compressed trailer")
+        );
+
+        let skippable = fixture.path().join("skippable-font.zst");
+        std::fs::copy(&archive, &skippable).expect("copy skippable-frame fixture base");
+        let mut skippable_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&skippable)
+            .expect("open skippable-frame fixture");
+        skippable_file
+            .write_all(&0x184D_2A50_u32.to_le_bytes())
+            .and_then(|()| skippable_file.write_all(&0_u32.to_le_bytes()))
+            .expect("append empty zstd skippable frame");
+        skippable_file
+            .sync_all()
+            .expect("sync skippable-frame fixture");
+        let skippable_root = fixture.path().join("extract-skippable");
+        std::fs::create_dir(&skippable_root).expect("create skippable extraction root");
+        std::fs::set_permissions(&skippable_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make skippable extraction root private");
+        let rejected =
+            run_authenticated_real_zstd_font_extractor(&installer, &skippable, &skippable_root);
+        assert!(
+            !rejected.status.success(),
+            "zstd skippable frame was accepted"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("zstd skippable frames are forbidden")
+        );
+    }
+
+    #[test]
+    fn installer_optional_font_pipeline_uses_manifest_receipt_and_safe_publication() {
+        let installer = include_str!("../../../install.sh");
+        let start = installer
+            .find("install_pragmasevka() {")
+            .expect("optional font installer");
+        let end = installer[start..]
+            .find("\n}\n\n# ───────────────────────────────────────────────────────────────────────────\n# macOS GUI app")
+            .map(|relative| start + relative)
+            .expect("optional font installer end");
+        let font = &installer[start..end];
+        let receipt = font
+            .find("process_family_input_receipt")
+            .expect("authenticated manifest font receipt");
+        let download = font
+            .find("download_https_bounded")
+            .expect("bounded font download");
+        let checksum = font
+            .find("verify_checksum")
+            .expect("font checksum verification");
+        let extraction = font
+            .find("extract_authenticated_archive")
+            .expect("bounded font extraction");
+        let scan_receipt = font
+            .find("font_identity\" scan")
+            .expect("authenticated inner-tree receipt scan");
+        let direct_stage = font
+            .find("prepare_font_generation_stage")
+            .expect("private sibling generation stage");
+        let seal = font
+            .find("seal_font_generation_stage")
+            .expect("exact font receipt seal");
+        let publication = font
+            .find("atomic_path_transition")
+            .expect("atomic font generation publication");
+        assert!(receipt < download);
+        assert!(download < checksum);
+        assert!(checksum < scan_receipt);
+        assert!(scan_receipt < direct_stage);
+        assert!(direct_stage < extraction);
+        assert!(extraction < seal);
+        assert!(seal < publication);
+        assert!(!font.contains("zstd -dc \"$TMP/pragmasevka.zip.zst\" | tar"));
+        assert!(font.contains("font - \"$font_identity\""));
+        assert!(!font.contains("ensure_exact_staged_tree \"$font_stage\" \"$font_dir\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_font_publication_atomically_replaces_and_retains_changed_generation() {
+        if !installer_test_command_exists("zstd") {
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("create font replacement fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let font_archive = repository.join("crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"d".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let published =
+            materialize_installer_test_published_family(&fixture.path().join("published"), &family);
+        let fake_tools = fixture.path().join("tools");
+        write_installer_fake_font_download_tool(&fake_tools);
+        let data_root = fixture.path().join("data");
+        let old_target = plant_installer_old_font_tree(&data_root, b"old-generation:");
+        let old_regular = std::fs::read(old_target.join("pragmasevka-nf-regular.ttf"))
+            .expect("read prior regular font");
+
+        let output = run_installer_font_function(
+            &installer,
+            &published,
+            &family.verifier,
+            &font_archive,
+            &data_root,
+            &fixture.path().join("scratch"),
+            &fake_tools,
+            None,
+            false,
+        );
+        assert!(
+            output.status.success(),
+            "authenticated font replacement failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("FONT_RESULT={}", old_target.display()))
+        );
+        assert_ne!(
+            std::fs::read(old_target.join("pragmasevka-nf-regular.ttf"))
+                .expect("read published regular font"),
+            old_regular,
+            "changed authenticated generation did not replace the old font tree"
+        );
+        let retained_old = std::fs::read_dir(data_root.join("fonts"))
+            .expect("inspect retained font generations")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pragmasevka-")
+            })
+            .any(|entry| {
+                std::fs::read(entry.path().join("pragmasevka-nf-regular.ttf"))
+                    .is_ok_and(|bytes| bytes == old_regular)
+            });
+        assert!(
+            retained_old,
+            "atomic exchange did not retain the prior font generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_font_stage_mutation_cannot_reach_the_public_tree() {
+        if !installer_test_command_exists("zstd") {
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("create font mutation fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let font_archive = repository.join("crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"e".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let published =
+            materialize_installer_test_published_family(&fixture.path().join("published"), &family);
+        let fake_tools = fixture.path().join("tools");
+        write_installer_fake_font_download_tool(&fake_tools);
+        let data_root = fixture.path().join("data");
+        let target = plant_installer_old_font_tree(&data_root, b"rollback-generation:");
+        let before = std::fs::read(target.join("pragmasevka-nf-regular.ttf"))
+            .expect("read rollback font before mutation attack");
+
+        let output = run_installer_font_function(
+            &installer,
+            &published,
+            &family.verifier,
+            &font_archive,
+            &data_root,
+            &fixture.path().join("scratch"),
+            &fake_tools,
+            None,
+            true,
+        );
+        assert!(
+            output.status.success(),
+            "font mutation rejection did not fail safely: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(target.join("pragmasevka-nf-regular.ttf"))
+                .expect("read public font after mutation attack"),
+            before,
+            "mutated private stage reached the public font tree"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("generation failed exact receipt sealing")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_font_crash_before_publication_preserves_old_tree_and_resumes() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if !installer_test_command_exists("zstd") {
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("create font crash fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let font_archive = repository.join("crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"f".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let published =
+            materialize_installer_test_published_family(&fixture.path().join("published"), &family);
+        let fake_tools = fixture.path().join("tools");
+        write_installer_fake_font_download_tool(&fake_tools);
+        let data_root = fixture.path().join("data");
+        let target = plant_installer_old_font_tree(&data_root, b"pre-crash-generation:");
+        let before =
+            std::fs::read(target.join("pragmasevka-nf-regular.ttf")).expect("read pre-crash font");
+
+        let interrupted = run_installer_font_function(
+            &installer,
+            &published,
+            &family.verifier,
+            &font_archive,
+            &data_root,
+            &fixture.path().join("scratch-interrupted"),
+            &fake_tools,
+            Some("before-font-publication"),
+            false,
+        );
+        assert_eq!(
+            interrupted.status.signal(),
+            Some(9),
+            "font publication failpoint did not stop at its intended cut: {}",
+            String::from_utf8_lossy(&interrupted.stderr)
+        );
+        assert_eq!(
+            std::fs::read(target.join("pragmasevka-nf-regular.ttf"))
+                .expect("read public font after crash"),
+            before,
+            "pre-publication crash changed the public font tree"
+        );
+
+        let replay = run_installer_font_function(
+            &installer,
+            &published,
+            &family.verifier,
+            &font_archive,
+            &data_root,
+            &fixture.path().join("scratch-replay"),
+            &fake_tools,
+            None,
+            false,
+        );
+        assert!(
+            replay.status.success(),
+            "font publication replay failed: {}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert_ne!(
+            std::fs::read(target.join("pragmasevka-nf-regular.ttf"))
+                .expect("read replayed public font"),
+            before,
+            "font replay did not publish the authenticated generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_bounded_download_refuses_open_time_symlink_replacement_without_overwrite() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create bounded-download race fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let fake_tools = fixture.path().join("tools");
+        std::fs::create_dir(&fake_tools).expect("create bounded-download fake tools");
+        let fake_curl = fake_tools.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+set -eu
+if test "${1:-}" = --help; then
+  ln -s "$ATTACK_VICTIM" "$ATTACK_OUTPUT"
+  printf '%s\n' '     --max-filesize <bytes>  Maximum file size to download'
+  exit 0
+fi
+printf x > "$TRANSFER_MARKER"
+printf '%s' 'attacker-controlled download bytes'
+"#,
+        )
+        .expect("write bounded-download fake curl");
+        std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o555))
+            .expect("make bounded-download fake curl executable");
+
+        let download_root = fixture.path().join("downloads");
+        std::fs::create_dir(&download_root).expect("create bounded-download root");
+        std::fs::set_permissions(&download_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make bounded-download root private");
+        let output_path = download_root.join("payload");
+        let victim = fixture.path().join("victim");
+        let victim_bytes = b"must not be overwritten\n";
+        std::fs::write(&victim, victim_bytes).expect("write bounded-download victim");
+        let transfer_marker = fixture.path().join("transfer-invoked");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nINSTALLER_FREE_SPACE_HEADROOM_BYTES=0\nif download_https_bounded https://example.invalid/payload {} 4096 10; then\n  exit 91\nfi\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&output_path.to_string_lossy()),
+        );
+        let inherited_path = std::env::var("PATH").expect("test PATH");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:{inherited_path}", fake_tools.display()))
+            .env("ATTACK_OUTPUT", &output_path)
+            .env("ATTACK_VICTIM", &victim)
+            .env("TRANSFER_MARKER", &transfer_marker)
+            .output()
+            .expect("execute bounded-download open-time race proof");
+        assert!(
+            output.status.success(),
+            "open-time pathname replacement was not rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("read bounded-download victim"),
+            victim_bytes
+        );
+        assert!(
+            std::fs::symlink_metadata(&output_path)
+                .expect("inspect injected output symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !transfer_marker.exists(),
+            "curl transfer ran after the output pathname was replaced"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_sigstore_verifies_pinned_descriptors_and_fails_closed_on_path_replacement() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create Sigstore descriptor-race fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let fake_tools = fixture.path().join("tools");
+        std::fs::create_dir(&fake_tools).expect("create Sigstore fake tools");
+        let fake_curl = fake_tools.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+set -eu
+if test "${1:-}" = --help; then
+  printf '%s\n' '     --max-filesize <bytes>  Maximum file size to download'
+  exit 0
+fi
+printf '%s' 'signed bundle bytes'
+"#,
+        )
+        .expect("write Sigstore fake curl");
+        std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o555))
+            .expect("make Sigstore fake curl executable");
+        let fake_cosign = fake_tools.join("cosign");
+        std::fs::write(
+            &fake_cosign,
+            r#"#!/bin/sh
+set -eu
+bundle_descriptor=""
+archive_descriptor=""
+while test "$#" -gt 0; do
+  case "$1" in
+    verify-blob) ;;
+    --bundle)
+      shift
+      bundle_descriptor=$1
+      ;;
+    --certificate-identity-regexp|--certificate-oidc-issuer)
+      shift
+      ;;
+    *) archive_descriptor=$1 ;;
+  esac
+  shift
+done
+case "$archive_descriptor" in /dev/fd/[0-9]*) ;; *) exit 71 ;; esac
+case "$bundle_descriptor" in /dev/fd/[0-9]*) ;; *) exit 72 ;; esac
+mv "$ATTACK_ARCHIVE" "$RETAINED_ARCHIVE"
+cp "$ARCHIVE_REPLACEMENT" "$ATTACK_ARCHIVE"
+mv "$ATTACK_BUNDLE" "$RETAINED_BUNDLE"
+printf '%s' 'replacement bundle bytes' > "$ATTACK_BUNDLE"
+cp "$archive_descriptor" "$ARCHIVE_CAPTURE"
+cp "$bundle_descriptor" "$BUNDLE_CAPTURE"
+cmp "$ARCHIVE_CAPTURE" "$RETAINED_ARCHIVE"
+! cmp "$ARCHIVE_CAPTURE" "$ATTACK_ARCHIVE"
+cmp "$BUNDLE_CAPTURE" "$RETAINED_BUNDLE"
+! cmp "$BUNDLE_CAPTURE" "$ATTACK_BUNDLE"
+printf x > "$COSIGN_MARKER"
+"#,
+        )
+        .expect("write descriptor-aware fake cosign");
+        std::fs::set_permissions(&fake_cosign, std::fs::Permissions::from_mode(0o555))
+            .expect("make descriptor-aware fake cosign executable");
+
+        let scratch = fixture.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("create Sigstore scratch directory");
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .expect("make Sigstore scratch private");
+        let archive = fixture.path().join("archive");
+        let archive_replacement = fixture.path().join("archive-replacement");
+        let retained_archive = fixture.path().join("archive-authenticated");
+        let archive_capture = fixture.path().join("archive-cosign-capture");
+        let authenticated_bytes = b"checksum-authenticated bytes\n";
+        std::fs::write(&archive, authenticated_bytes).expect("write Sigstore archive fixture");
+        std::fs::write(&archive_replacement, b"swapped archive bytes\n")
+            .expect("write Sigstore archive replacement");
+        let checksum = hex::encode(sha2::Sha256::digest(authenticated_bytes));
+        let bundle = scratch.join("archive.sigstore.json");
+        let retained_bundle = fixture.path().join("bundle-authenticated");
+        let bundle_capture = fixture.path().join("bundle-cosign-capture");
+        let cosign_marker = fixture.path().join("cosign-invoked");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nTMP={}\nINSTALLER_FREE_SPACE_HEADROOM_BYTES=0\nverify_checksum {} {}\nif verify_sigstore_bundle {} https://example.invalid/archive; then\n  exit 91\nfi\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&scratch.to_string_lossy()),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&checksum),
+            shell_single_quote(&archive.to_string_lossy()),
+        );
+        let inherited_path = std::env::var("PATH").expect("test PATH");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:{inherited_path}", fake_tools.display()))
+            .env("ATTACK_ARCHIVE", &archive)
+            .env("ARCHIVE_REPLACEMENT", &archive_replacement)
+            .env("RETAINED_ARCHIVE", &retained_archive)
+            .env("ARCHIVE_CAPTURE", &archive_capture)
+            .env("ATTACK_BUNDLE", &bundle)
+            .env("RETAINED_BUNDLE", &retained_bundle)
+            .env("BUNDLE_CAPTURE", &bundle_capture)
+            .env("COSIGN_MARKER", &cosign_marker)
+            .output()
+            .expect("execute Sigstore descriptor-race proof");
+        assert!(
+            output.status.success(),
+            "Sigstore pathname replacement was not rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(cosign_marker.is_file(), "fake cosign did not run");
+        assert_eq!(
+            std::fs::read(&archive_capture).expect("read cosign archive capture"),
+            authenticated_bytes
+        );
+        assert_eq!(
+            std::fs::read(&bundle_capture).expect("read cosign bundle capture"),
+            b"signed bundle bytes"
+        );
+        assert_eq!(
+            std::fs::read(&archive).expect("read swapped archive pathname"),
+            b"swapped archive bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(&bundle).expect("read swapped bundle pathname"),
+            b"replacement bundle bytes"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("checksum-authenticated archive changed during Sigstore verification")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_sigstore_child_is_killed_at_its_finite_wall_clock_bound() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create Sigstore timeout fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let fake_tools = fixture.path().join("tools");
+        std::fs::create_dir(&fake_tools).expect("create Sigstore timeout fake tools");
+        let fake_curl = fake_tools.join("curl");
+        std::fs::write(
+            &fake_curl,
+            b"#!/bin/sh\nset -eu\nif test \"${1:-}\" = --help; then printf '%s\\n' ' --max-filesize <bytes>'; exit 0; fi\nprintf '%s' 'bounded bundle'\n",
+        )
+        .expect("write timeout fake curl");
+        std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o555))
+            .expect("make timeout fake curl executable");
+        let fake_cosign = fake_tools.join("cosign");
+        std::fs::write(&fake_cosign, b"#!/bin/sh\nset -eu\nsleep 5\n")
+            .expect("write blocking fake cosign");
+        std::fs::set_permissions(&fake_cosign, std::fs::Permissions::from_mode(0o555))
+            .expect("make blocking fake cosign executable");
+        let scratch = fixture.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("create Sigstore timeout scratch");
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .expect("make Sigstore timeout scratch private");
+        let archive = fixture.path().join("archive");
+        let archive_bytes = b"checksum-authenticated timeout fixture\n";
+        std::fs::write(&archive, archive_bytes).expect("write timeout archive fixture");
+        let checksum = hex::encode(sha2::Sha256::digest(archive_bytes));
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nTMP={}\nINSTALLER_FREE_SPACE_HEADROOM_BYTES=0\nverify_checksum {} {}\nif verify_sigstore_bundle {} https://example.invalid/archive; then exit 91; fi\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&scratch.to_string_lossy()),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&checksum),
+            shell_single_quote(&archive.to_string_lossy()),
+        );
+        let inherited_path = std::env::var("PATH").expect("test PATH");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:{inherited_path}", fake_tools.display()))
+            .env("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES", "1")
+            .env("FT_INSTALL_TEST_COSIGN_TIMEOUT_SECONDS", "1")
+            .output()
+            .expect("execute Sigstore timeout proof");
+        assert!(
+            output.status.success(),
+            "Sigstore timeout did not fail closed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Sigstore verifier exceeded its finite wall-clock bound"),
+            "Sigstore timeout lacked its exact diagnosis: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]

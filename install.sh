@@ -83,6 +83,7 @@ ACTIVE_ATOMIC_TRANSITION_HELPER=""
 PENDING_PROCESS_FAMILY_GENERATION=""
 PUBLISHED_PROCESS_FAMILY_VERSION=""
 PUBLISHED_PROCESS_FAMILY_ROOT=""
+PUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY=""
 PROCESS_FAMILY_ACTIVATION_STATE=""
 PROCESS_FAMILY_ACTIVE_AUTHORITY=""
 PROCESS_FAMILY_ACTIVE_ROOT=""
@@ -409,8 +410,47 @@ download_https_bounded() {
   if [ "$retry" -eq 1 ]; then
     curl_args+=(--retry 3 --retry-delay 2 --retry-connrefused)
   fi
-  curl ${curl_args[@]+"${curl_args[@]}"} \
-    ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$url" -o "$output" || return 1
+  # curl's pathname-based -o open would leave a same-UID replacement window
+  # between the absence check above and the transfer. Open the output exactly
+  # once with O_EXCL|O_NOFOLLOW, then give curl only that inherited stdout
+  # descriptor. A pathname replacement can make publication fail, but it can
+  # neither redirect authenticated bytes nor make curl overwrite another file.
+  if ! python3 - "$output" "$max_bytes" curl \
+    ${curl_args[@]+"${curl_args[@]}"} \
+    ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$url" <<'PY'
+import os, stat, subprocess, sys
+
+output_path, maximum_raw, *command = sys.argv[1:]
+maximum = int(maximum_raw)
+flags = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+    getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+fd = os.open(output_path, flags, 0o600)
+returncode = 1
+try:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise SystemExit("download output descriptor is not one single-link regular file")
+    try:
+        completed = subprocess.run(command, check=False, stdout=fd, close_fds=True)
+    except OSError as error:
+        raise SystemExit(f"could not execute bounded curl transfer: {error}") from error
+    os.fsync(fd)
+    after = os.fstat(fd)
+    named = os.stat(output_path, follow_symlinks=False)
+    if ((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or
+            after.st_nlink != 1 or after.st_size > maximum or
+            (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit("download output identity or byte bound changed during transfer")
+    returncode = completed.returncode
+finally:
+    os.close(fd)
+raise SystemExit(returncode)
+PY
+  then
+    return 1
+  fi
   verify_bounded_download_file "$output" "$max_bytes"
 }
 
@@ -1534,6 +1574,7 @@ install_process_family() {
   PENDING_PROCESS_FAMILY_GENERATION=""
   PUBLISHED_PROCESS_FAMILY_VERSION=""
   PUBLISHED_PROCESS_FAMILY_ROOT=""
+  PUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY=""
   PROCESS_FAMILY_ACTIVATION_STATE=""
   PROCESS_FAMILY_ACTIVE_AUTHORITY=""
   PROCESS_FAMILY_ACTIVE_ROOT=""
@@ -1561,6 +1602,7 @@ install_process_family() {
   [ -n "$version" ] || return 1
   [[ "$inventory_bytes" =~ ^[0-9]+$ ]] || return 1
   PUBLISHED_PROCESS_FAMILY_VERSION="$version"
+  PUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY="$verifier_source"
   generation_id="${manifest_id#sha256:}"
 
   ensure_installer_process_family_root || return 1
@@ -2048,8 +2090,389 @@ verify_archive_checksum_authority() {
   verify_checksum "$archive" "$CHECKSUM"
 }
 
+process_family_input_receipt() {
+  local manifest="$1" role="$2" expected_path="$3" max_bytes="$4" expected_id="$5"
+  python3 - "$manifest" "$role" "$expected_path" "$max_bytes" "$expected_id" <<'PY'
+import hashlib, json, os, re, stat, sys
+
+manifest_path, expected_role, expected_path, maximum_bytes_text, expected_id = sys.argv[1:]
+try:
+    maximum_bytes = int(maximum_bytes_text)
+except ValueError as error:
+    raise SystemExit("input receipt byte bound is malformed") from error
+if maximum_bytes <= 0 or str(maximum_bytes) != maximum_bytes_text:
+    raise SystemExit("input receipt byte bound is non-canonical")
+if re.fullmatch(r"[0-9a-f]{64}", expected_id) is None:
+    raise SystemExit("expected process-family manifest identity is non-canonical")
+
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+if not nofollow:
+    raise SystemExit("descriptor-relative nofollow manifest reads are unavailable")
+fd = os.open(manifest_path, os.O_RDONLY | nofollow | cloexec)
+try:
+    before = os.fstat(fd)
+    named_before = os.stat(manifest_path, follow_symlinks=False)
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
+            before.st_size > 64 * 1024 * 1024 or
+            (before.st_dev, before.st_ino) != (named_before.st_dev, named_before.st_ino)):
+        raise SystemExit("process-family manifest is not one bounded single-link regular file")
+    chunks = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            raise SystemExit("process-family manifest truncated while read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise SystemExit("process-family manifest grew while read")
+    after = os.fstat(fd)
+    named_after = os.stat(manifest_path, follow_symlinks=False)
+    if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+         before.st_ctime_ns) !=
+        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+         after.st_ctime_ns) or
+        (after.st_dev, after.st_ino) != (named_after.st_dev, named_after.st_ino)):
+        raise SystemExit("process-family manifest changed while its input receipt was read")
+finally:
+    os.close(fd)
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise SystemExit("process-family manifest contains a duplicate JSON key")
+        value[key] = item
+    return value
+
+try:
+    manifest = json.loads(b"".join(chunks).decode("utf-8"), object_pairs_hook=unique_object)
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit("process-family manifest is not canonical UTF-8 JSON") from error
+if not isinstance(manifest, dict) or manifest.get("schema_version") != "ft.atomic_component_manifest.v1":
+    raise SystemExit("process-family manifest has an unexpected schema")
+claimed_id = manifest.get("manifest_id")
+content = dict(manifest)
+content.pop("manifest_id", None)
+actual_id = "sha256:" + hashlib.sha256(json.dumps(
+    content,
+    ensure_ascii=False,
+    separators=(",", ":"),
+    sort_keys=True,
+).encode("utf-8")).hexdigest()
+if claimed_id != f"sha256:{expected_id}" or actual_id != claimed_id:
+    raise SystemExit("process-family manifest no longer matches its immutable generation identity")
+inputs = manifest.get("inputs")
+if not isinstance(inputs, list) or len(inputs) > 10_000:
+    raise SystemExit("process-family manifest input catalog is not bounded")
+matches = []
+for record in inputs:
+    if not isinstance(record, dict) or set(record) != {"bytes", "path", "role", "sha256"}:
+        raise SystemExit("process-family manifest has a malformed input receipt")
+    if record.get("role") == expected_role:
+        matches.append(record)
+if len(matches) != 1:
+    raise SystemExit("process-family manifest lacks one exact font payload receipt")
+record = matches[0]
+if record["path"] != expected_path:
+    raise SystemExit("process-family manifest font receipt names an unexpected source path")
+byte_count = record["bytes"]
+digest = record["sha256"]
+if (type(byte_count) is not int or byte_count <= 0 or byte_count > maximum_bytes or
+        not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+    raise SystemExit("process-family manifest font receipt exceeds its canonical bounds")
+print(f"{digest}\t{byte_count}")
+PY
+}
+
+prepare_font_generation_stage() {
+  local parent="$1" stage_name="$2"
+  python3 - "$parent" "$stage_name" <<'PY'
+import os, re, stat, sys
+
+parent_path, stage_name = sys.argv[1:]
+if re.fullmatch(r"\.pragmasevka-[0-9a-f]{64}\.installing(?:-[0-9]{1,3})?", stage_name) is None:
+    raise SystemExit("font generation stage name is non-canonical")
+expected = {
+    "pragmasevka-nf-regular.ttf",
+    "pragmasevka-nf-bold.ttf",
+    "pragmasevka-nf-italic.ttf",
+    "pragmasevka-nf-bolditalic.ttf",
+}
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+if not nofollow or not directory:
+    raise SystemExit("descriptor-relative nofollow font staging is unavailable")
+parent_named = os.stat(parent_path, follow_symlinks=False)
+parent_fd = os.open(parent_path, os.O_RDONLY | directory | nofollow | cloexec)
+stage_fd = -1
+try:
+    parent_opened = os.fstat(parent_fd)
+    if (not stat.S_ISDIR(parent_opened.st_mode) or
+            parent_opened.st_uid != os.geteuid() or
+            stat.S_IMODE(parent_opened.st_mode) & 0o022 or
+            (parent_opened.st_dev, parent_opened.st_ino) !=
+            (parent_named.st_dev, parent_named.st_ino)):
+        raise SystemExit("font stage parent is not one private owner-controlled directory")
+    try:
+        os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        pass
+    stage_named = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+    stage_fd = os.open(
+        stage_name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=parent_fd)
+    stage_opened = os.fstat(stage_fd)
+    if (not stat.S_ISDIR(stage_opened.st_mode) or
+            stage_opened.st_uid != os.geteuid() or
+            stat.S_IMODE(stage_opened.st_mode) not in (0o700, 0o555) or
+            (stage_opened.st_dev, stage_opened.st_ino) !=
+            (stage_named.st_dev, stage_named.st_ino)):
+        raise SystemExit("retained font stage is not one resumable private directory")
+    os.fchmod(stage_fd, 0o700)
+    names = []
+    with os.scandir(stage_fd) as entries:
+        for entry in entries:
+            names.append(entry.name)
+    if len(names) > len(expected) or any(name not in expected for name in names):
+        raise SystemExit("retained font stage has a noncanonical inventory")
+    for name in names:
+        named = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+        fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=stage_fd)
+        try:
+            opened = os.fstat(fd)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid() or
+                    opened.st_nlink != 1 or opened.st_size > 1024 * 1024 * 1024 or
+                    stat.S_IMODE(opened.st_mode) not in (0o600, 0o444) or
+                    (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                raise SystemExit("retained font stage contains an unsafe file")
+        finally:
+            os.close(fd)
+    os.fsync(stage_fd)
+    os.fsync(parent_fd)
+    parent_final = os.stat(parent_path, follow_symlinks=False)
+    if (parent_opened.st_dev, parent_opened.st_ino) != (
+            parent_final.st_dev, parent_final.st_ino):
+        raise SystemExit("font stage parent detached while prepared")
+finally:
+    if stage_fd >= 0:
+        os.close(stage_fd)
+    os.close(parent_fd)
+PY
+}
+
+verify_font_tree_receipt() {
+  local root="$1" receipt="$2" require_sealed="${3:-0}"
+  python3 - "$root" "$receipt" "$require_sealed" <<'PY'
+import base64, binascii, hashlib, json, os, re, stat, sys
+
+root_path, receipt, require_sealed_text = sys.argv[1:]
+if require_sealed_text not in ("0", "1"):
+    raise SystemExit("font receipt seal requirement is invalid")
+require_sealed = require_sealed_text == "1"
+prefix = "FT_FONT_TREE_RECEIPT_V1="
+if not receipt.startswith(prefix) or "\n" in receipt or "\r" in receipt:
+    raise SystemExit("font tree receipt envelope is malformed")
+encoded = receipt[len(prefix):]
+try:
+    payload = base64.b64decode(encoded, altchars=b"-_", validate=True)
+except (ValueError, binascii.Error) as error:
+    raise SystemExit("font tree receipt is not canonical base64url") from error
+if base64.urlsafe_b64encode(payload).decode("ascii") != encoded:
+    raise SystemExit("font tree receipt base64url is non-canonical")
+try:
+    expected_records = json.loads(payload.decode("utf-8"))
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit("font tree receipt payload is not canonical JSON") from error
+expected_names = {
+    "pragmasevka-nf-regular.ttf",
+    "pragmasevka-nf-bold.ttf",
+    "pragmasevka-nf-italic.ttf",
+    "pragmasevka-nf-bolditalic.ttf",
+}
+if (not isinstance(expected_records, list) or len(expected_records) != 4 or
+        json.dumps(expected_records, separators=(",", ":"), sort_keys=True).encode("utf-8") !=
+        payload):
+    raise SystemExit("font tree receipt payload is non-canonical")
+seen = set()
+for record in expected_records:
+    if not isinstance(record, dict) or set(record) != {"bytes", "path", "sha256"}:
+        raise SystemExit("font tree receipt record is malformed")
+    name = record["path"]
+    byte_count = record["bytes"]
+    digest = record["sha256"]
+    if (name not in expected_names or name in seen or type(byte_count) is not int or
+            byte_count <= 0 or byte_count > 1024 * 1024 * 1024 or
+            not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+        raise SystemExit("font tree receipt record exceeds its exact contract")
+    seen.add(name)
+if seen != expected_names:
+    raise SystemExit("font tree receipt does not name the exact font inventory")
+
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+root_named = os.stat(root_path, follow_symlinks=False)
+root_fd = os.open(root_path, os.O_RDONLY | directory | nofollow | cloexec)
+try:
+    root_before = os.fstat(root_fd)
+    root_mode = stat.S_IMODE(root_before.st_mode)
+    if (not stat.S_ISDIR(root_before.st_mode) or root_before.st_uid != os.geteuid() or
+            root_mode not in ((0o555,) if require_sealed else (0o700, 0o555)) or
+            (root_before.st_dev, root_before.st_ino) != (root_named.st_dev, root_named.st_ino)):
+        raise SystemExit("font tree root is not one stable owner-controlled directory")
+    with os.scandir(root_fd) as entries:
+        names = sorted(entry.name for entry in entries)
+    if set(names) != expected_names or len(names) != 4:
+        raise SystemExit("font tree does not contain its exact four-file inventory")
+    actual_records = []
+    for name in names:
+        named_before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=root_fd)
+        try:
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or
+                    before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o444 or
+                    before.st_size <= 0 or before.st_size > 1024 * 1024 * 1024 or
+                    (before.st_dev, before.st_ino) != (named_before.st_dev, named_before.st_ino)):
+                raise SystemExit("font tree contains an unsafe or unsealed file")
+            digest = hashlib.sha256()
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise SystemExit("font tree file truncated while read")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if os.read(fd, 1):
+                raise SystemExit("font tree file grew while read")
+            after = os.fstat(fd)
+            named_after = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                 before.st_ctime_ns) !=
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                 after.st_ctime_ns) or
+                (after.st_dev, after.st_ino) != (named_after.st_dev, named_after.st_ino)):
+                raise SystemExit("font tree file changed while its receipt was verified")
+            actual_records.append({
+                "bytes": before.st_size,
+                "path": name,
+                "sha256": digest.hexdigest(),
+            })
+        finally:
+            os.close(fd)
+    if actual_records != expected_records:
+        raise SystemExit("font tree differs from its authenticated exact receipt")
+    root_after = os.fstat(root_fd)
+    root_named_after = os.stat(root_path, follow_symlinks=False)
+    if ((root_before.st_dev, root_before.st_ino, root_before.st_mtime_ns,
+         root_before.st_ctime_ns) !=
+        (root_after.st_dev, root_after.st_ino, root_after.st_mtime_ns,
+         root_after.st_ctime_ns) or
+        (root_after.st_dev, root_after.st_ino) !=
+        (root_named_after.st_dev, root_named_after.st_ino)):
+        raise SystemExit("font tree root changed while its receipt was verified")
+finally:
+    os.close(root_fd)
+PY
+}
+
+seal_font_generation_stage() {
+  local root="$1" receipt="$2"
+  verify_font_tree_receipt "$root" "$receipt" 0 || return 1
+  python3 - "$root" <<'PY'
+import os, stat, sys
+path = sys.argv[1]
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+named = os.stat(path, follow_symlinks=False)
+fd = os.open(path, os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0))
+try:
+    opened = os.fstat(fd)
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid() or
+            stat.S_IMODE(opened.st_mode) not in (0o700, 0o555) or
+            (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit("font generation stage changed before sealing")
+    os.fchmod(fd, 0o555)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+parent = os.path.dirname(os.path.abspath(path))
+parent_fd = os.open(parent, os.O_RDONLY | directory | nofollow)
+try:
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+  verify_font_tree_receipt "$root" "$receipt" 1
+}
+
+select_font_generation_stage() {
+  local parent="$1" archive_digest="$2" receipt="$3"
+  local index name path mode
+  for ((index=0; index<256; index++)); do
+    name=".pragmasevka-${archive_digest}.installing"
+    [ "$index" -eq 0 ] || name="${name}-${index}"
+    path="$parent/$name"
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+    if [ -d "$path" ] && [ ! -L "$path" ]; then
+      if verify_font_tree_receipt "$path" "$receipt" 1 >/dev/null 2>&1; then
+        printf '%s\n' "$name"
+        return 0
+      fi
+      mode=$(installer_stage_mode "$path" 2>/dev/null || true)
+      if [ "$mode" = 0700 ]; then
+        # A deterministic private partial is the only residue eligible for
+        # prefix-resume. Conflicting bytes fail closed in the extractor.
+        printf '%s\n' "$name"
+        return 0
+      fi
+    fi
+  done
+  err "Retained font rollback generations exhausted the bounded 256-stage catalog"
+  return 1
+}
+
+installer_test_mutate_font_stage() {
+  local root="$1"
+  if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" = 1 ] &&
+      [ "${FT_INSTALL_TEST_ENABLE_FAILPOINTS:-0}" = 1 ] &&
+      [ "${FT_INSTALL_TEST_MUTATE_FONT_STAGE:-0}" = 1 ]; then
+    python3 - "$root" <<'PY'
+import os, stat, sys
+root = sys.argv[1]
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+root_fd = os.open(root, os.O_RDONLY | directory | nofollow)
+fd = -1
+try:
+    name = "pragmasevka-nf-regular.ttf"
+    fd = os.open(name, os.O_RDONLY | nofollow, dir_fd=root_fd)
+    observed = os.fstat(fd)
+    if not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid():
+        raise SystemExit("test mutation target is unsafe")
+    os.fchmod(fd, 0o600)
+    os.close(fd)
+    fd = os.open(name, os.O_RDWR | nofollow, dir_fd=root_fd)
+    os.lseek(fd, 0, os.SEEK_END)
+    os.write(fd, b"test-only-mutation")
+    os.fsync(fd)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    os.close(root_fd)
+PY
+  fi
+}
+
 extract_authenticated_archive() {
   local archive="$1" root="$2" kind="$3" manifest_name="$4" expected_identity="${5:-}"
+  local archive_action="${6:-extract}"
   local max_archive_bytes max_expanded_bytes
   case "$kind" in
     process-family)
@@ -2060,30 +2483,115 @@ extract_authenticated_archive() {
       max_archive_bytes="$MAX_APP_ARCHIVE_BYTES"
       max_expanded_bytes="$MAX_APP_EXPANDED_BYTES"
       ;;
+    font)
+      max_archive_bytes="$MAX_FONT_ARCHIVE_BYTES"
+      max_expanded_bytes="$MAX_FONT_EXPANDED_BYTES"
+      ;;
     *) return 1 ;;
   esac
   [ -n "$expected_identity" ] || {
     err "Authenticated archive identity receipt is absent"
     return 1
   }
+  case "$archive_action" in
+    extract) ;;
+    scan)
+      [ "$kind" = font ] || {
+        err "Archive scan-only mode is reserved for authenticated font receipts"
+        return 1
+      }
+      ;;
+    *) return 1 ;;
+  esac
   python3 - "$archive" "$root" "$kind" "$manifest_name" "$expected_identity" \
     "$max_archive_bytes" "$max_expanded_bytes" \
-    "$INSTALLER_FREE_SPACE_HEADROOM_BYTES" <<'PY'
-import hashlib, os, posixpath, stat, sys, tarfile
+    "$INSTALLER_FREE_SPACE_HEADROOM_BYTES" "$archive_action" <<'PY'
+import base64, hashlib, json, lzma, os, posixpath, resource, stat, subprocess, sys, tarfile
 
 archive_path, root_path, archive_kind, manifest_name, expected_identity = sys.argv[1:6]
 max_archive_bytes, max_expanded_bytes, free_space_headroom = map(int, sys.argv[6:9])
-if archive_kind not in ("process-family", "app"):
+archive_action = sys.argv[9]
+if archive_kind not in ("process-family", "app", "font"):
     raise SystemExit("unknown authenticated archive kind")
+if archive_action not in ("extract", "scan") or (
+        archive_action == "scan" and archive_kind != "font"):
+    raise SystemExit("invalid authenticated archive action")
 
-MAX_ENTRIES = 1_000_000
-MAX_NAME_BYTES = 64 * 1024 * 1024
+if archive_kind == "font":
+    MAX_ENTRIES = 4096
+    MAX_NAME_BYTES = 1024 * 1024
+else:
+    MAX_ENTRIES = 1_000_000
+    MAX_NAME_BYTES = 64 * 1024 * 1024
 MAX_LINK_BYTES = 4096
+MAX_EXTENSION_MEMBER_BYTES = 1024 * 1024
+MAX_EXTENSION_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_XZ_DECODER_MEMORY_BYTES = 64 * 1024 * 1024
+MAX_PARSER_ADDRESS_SPACE_BYTES = 1024 * 1024 * 1024
+MIN_PARSER_ADDRESS_SPACE_BYTES = 128 * 1024 * 1024
+MAX_PARSER_CPU_SECONDS = 1800
+MAX_IO_CHUNK_BYTES = 1024 * 1024
+MAX_RETAINED_METADATA_BYTES = 256 * 1024 * 1024
+MAX_ZSTD_BLOCKS = 1_000_000
+if (os.environ.get("FT_INSTALL_TEST_LIBRARY_ONLY") == "1" and
+        os.environ.get("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES") == "1"):
+    override = os.environ.get("FT_INSTALL_TEST_MAX_RETAINED_METADATA_BYTES")
+    if override is not None:
+        try:
+            MAX_RETAINED_METADATA_BYTES = int(override)
+        except ValueError as error:
+            raise SystemExit("test metadata bound is malformed") from error
+        if MAX_RETAINED_METADATA_BYTES <= 0:
+            raise SystemExit("test metadata bound must be positive")
+MAX_TAR_STREAM_BYTES = (
+    max_expanded_bytes + MAX_ENTRIES * 1024 + MAX_EXTENSION_TOTAL_BYTES + 1024
+)
+EXPECTED_FONT_FILES = {
+    "pragmasevka-nf-regular.ttf",
+    "pragmasevka-nf-bold.ttf",
+    "pragmasevka-nf-italic.ttf",
+    "pragmasevka-nf-bolditalic.ttf",
+}
 nofollow = getattr(os, "O_NOFOLLOW", 0)
 directory = getattr(os, "O_DIRECTORY", 0)
 cloexec = getattr(os, "O_CLOEXEC", 0)
 if not nofollow or not directory:
     raise SystemExit("descriptor-relative nofollow extraction is unavailable")
+
+def enforce_finite_soft_limit(resource_id, maximum, minimum, label):
+    try:
+        soft, hard = resource.getrlimit(resource_id)
+        candidates = [maximum]
+        if soft != resource.RLIM_INFINITY:
+            candidates.append(soft)
+        if hard != resource.RLIM_INFINITY:
+            candidates.append(hard)
+        target = min(candidates)
+        if target < minimum:
+            raise SystemExit(f"{label} limit is too small for bounded extraction")
+        resource.setrlimit(resource_id, (target, hard))
+        observed, _ = resource.getrlimit(resource_id)
+    except (AttributeError, OSError, ValueError) as error:
+        raise SystemExit(f"cannot enforce the finite {label} extraction limit") from error
+    if observed == resource.RLIM_INFINITY or observed > maximum:
+        raise SystemExit(f"finite {label} extraction limit did not take effect")
+
+if not hasattr(resource, "RLIMIT_CPU"):
+    raise SystemExit("finite parser CPU limits are unavailable")
+# Darwin exposes RLIMIT_AS through Python but the kernel rejects attempts to
+# lower it with EINVAL.  The parser therefore relies on the explicit stream,
+# entry, name, extension, retained-metadata, and decompressor bounds below on
+# macOS.  Platforms that implement RLIMIT_AS keep the additional kernel fence.
+if sys.platform != "darwin":
+    if not hasattr(resource, "RLIMIT_AS"):
+        raise SystemExit("finite parser address-space limits are unavailable")
+    enforce_finite_soft_limit(
+        resource.RLIMIT_AS,
+        MAX_PARSER_ADDRESS_SPACE_BYTES,
+        MIN_PARSER_ADDRESS_SPACE_BYTES,
+        "parser address-space",
+    )
+enforce_finite_soft_limit(resource.RLIMIT_CPU, MAX_PARSER_CPU_SECONDS, 1, "parser CPU")
 try:
     expected_values = tuple(int(value) for value in expected_identity.split(":"))
 except ValueError as error:
@@ -2091,6 +2599,238 @@ except ValueError as error:
 if (len(expected_values) != 5 or
         ":".join(str(value) for value in expected_values) != expected_identity):
     raise SystemExit("authenticated archive identity receipt is non-canonical")
+
+class BoundedTarInfo(tarfile.TarInfo):
+    def _charge_extension(self, archive, label):
+        if self.size < 0 or self.size > MAX_EXTENSION_MEMBER_BYTES:
+            raise SystemExit(f"tar {label} extension header exceeds its per-member bound")
+        used = getattr(archive, "_ft_extension_bytes", 0) + self.size
+        if used > MAX_EXTENSION_TOTAL_BYTES:
+            raise SystemExit("tar extension headers exceed their cumulative bound")
+        setattr(archive, "_ft_extension_bytes", used)
+
+    def _proc_pax(self, archive):
+        self._charge_extension(archive, "PAX")
+        return super()._proc_pax(archive)
+
+    def _proc_gnulong(self, archive):
+        self._charge_extension(archive, "GNU long-name")
+        return super()._proc_gnulong(archive)
+
+    def _proc_sparse(self, archive):
+        raise SystemExit("tar sparse extension headers are forbidden")
+
+class BoundedPlainReader:
+    def __init__(self, source, maximum):
+        self.source = source
+        self.maximum = maximum
+        self.total = 0
+        self.closed = False
+
+    def _charge(self, payload):
+        self.total += len(payload)
+        if self.total > self.maximum:
+            raise SystemExit("decompressed tar stream exceeds its finite byte bound")
+        return payload
+
+    def read(self, size=-1):
+        if self.closed:
+            return b""
+        if size is None or size < 0:
+            size = MAX_IO_CHUNK_BYTES
+        if size == 0:
+            return b""
+        size = min(size, MAX_IO_CHUNK_BYTES, self.maximum - self.total + 1)
+        return self._charge(self.source.read(max(size, 1)))
+
+    def finish(self):
+        while True:
+            trailing = self.read(MAX_IO_CHUNK_BYTES)
+            if not trailing:
+                break
+            if trailing.strip(b"\0"):
+                raise SystemExit("tar stream contains a nonzero post-EOT trailer")
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.source.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _error_type, _error, _traceback):
+        self.close()
+
+class BoundedXzReader:
+    def __init__(self, source, maximum):
+        self.source = source
+        self.maximum = maximum
+        self.total = 0
+        self.closed = False
+        self.finished = False
+        try:
+            self.decoder = lzma.LZMADecompressor(
+                format=lzma.FORMAT_XZ,
+                memlimit=MAX_XZ_DECODER_MEMORY_BYTES,
+            )
+        except (lzma.LZMAError, TypeError) as error:
+            raise SystemExit("cannot establish the finite xz decoder memory limit") from error
+
+    def _finalize_decoder(self):
+        if self.decoder.unused_data or self.source.read(1):
+            raise SystemExit("xz archive contains a concatenated stream or trailing bytes")
+        self.finished = True
+
+    def read(self, size=-1):
+        if self.closed or self.finished:
+            return b""
+        if size is None or size < 0:
+            size = MAX_IO_CHUNK_BYTES
+        if size == 0:
+            return b""
+        requested = min(size, MAX_IO_CHUNK_BYTES)
+        while True:
+            if self.decoder.eof:
+                self._finalize_decoder()
+                return b""
+            compressed = b""
+            if self.decoder.needs_input:
+                compressed = self.source.read(MAX_IO_CHUNK_BYTES)
+                if not compressed:
+                    raise SystemExit("xz archive ended before its decoder reached end-of-stream")
+            remaining = self.maximum - self.total
+            try:
+                payload = self.decoder.decompress(
+                    compressed,
+                    max_length=max(1, min(requested, remaining + 1)),
+                )
+            except lzma.LZMAError as error:
+                raise SystemExit(
+                    "xz decoder rejected the archive memory declaration or stream"
+                ) from error
+            if payload:
+                self.total += len(payload)
+                if self.total > self.maximum:
+                    raise SystemExit("decompressed tar stream exceeds its finite byte bound")
+                return payload
+
+    def finish(self):
+        while True:
+            trailing = self.read(MAX_IO_CHUNK_BYTES)
+            if not trailing:
+                break
+            if trailing.strip(b"\0"):
+                raise SystemExit("tar stream contains a nonzero post-EOT trailer")
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.source.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _error_type, _error, _traceback):
+        self.close()
+
+class BoundedZstdReader(BoundedPlainReader):
+    def __init__(self, process, maximum):
+        if process.stdout is None:
+            raise SystemExit("bounded zstd decoder has no output descriptor")
+        super().__init__(process.stdout, maximum)
+        self.process = process
+        self.process_finished = False
+
+    def finish(self):
+        super().finish()
+        self.source.close()
+        status = self.process.wait()
+        self.process_finished = True
+        if status != 0:
+            raise SystemExit("zstd decoder rejected the font archive or its memory bound")
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.source.close()
+        if not self.process_finished:
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+            self.process_finished = True
+
+def pread_exact(fd, offset, length, label):
+    payload = bytearray()
+    while len(payload) < length:
+        chunk = os.pread(fd, length - len(payload), offset + len(payload))
+        if not chunk:
+            raise SystemExit(f"zstd frame is truncated while reading {label}")
+        payload.extend(chunk)
+    return bytes(payload)
+
+def require_one_canonical_zstd_frame(fd, archive_size):
+    # Zstandard frame format: one standard frame, no skippable frames, no
+    # concatenation, and no compressed trailer.  Parsing only framing lengths
+    # keeps memory constant; zstd remains the authority for compressed blocks.
+    if archive_size < 6:
+        raise SystemExit("zstd archive is too short for one canonical frame")
+    magic = int.from_bytes(pread_exact(fd, 0, 4, "magic"), "little")
+    if 0x184D2A50 <= magic <= 0x184D2A5F:
+        raise SystemExit("zstd skippable frames are forbidden")
+    if magic != 0xFD2FB528:
+        raise SystemExit("font archive is not one canonical zstd frame")
+    offset = 4
+    descriptor = pread_exact(fd, offset, 1, "frame descriptor")[0]
+    offset += 1
+    if descriptor & 0x18:
+        raise SystemExit("zstd frame uses reserved or unused descriptor bits")
+    frame_content_size_flag = descriptor >> 6
+    single_segment = bool(descriptor & 0x20)
+    checksum = bool(descriptor & 0x04)
+    dictionary_flag = descriptor & 0x03
+    if not single_segment:
+        pread_exact(fd, offset, 1, "window descriptor")
+        offset += 1
+    dictionary_size = (0, 1, 2, 4)[dictionary_flag]
+    content_size_size = (1 if single_segment else 0, 2, 4, 8)[frame_content_size_flag]
+    header_tail = dictionary_size + content_size_size
+    pread_exact(fd, offset, header_tail, "frame header")
+    offset += header_tail
+    blocks = 0
+    while True:
+        blocks += 1
+        if blocks > MAX_ZSTD_BLOCKS:
+            raise SystemExit("zstd frame exceeds its finite block-count bound")
+        header = int.from_bytes(pread_exact(fd, offset, 3, "block header"), "little")
+        offset += 3
+        last_block = bool(header & 1)
+        block_type = (header >> 1) & 0x03
+        block_size = header >> 3
+        if block_type == 3:
+            raise SystemExit("zstd frame contains a reserved block type")
+        payload_size = 1 if block_type == 1 else block_size
+        if payload_size > archive_size - offset:
+            raise SystemExit("zstd frame block exceeds the authenticated archive")
+        offset += payload_size
+        if last_block:
+            break
+    if checksum:
+        pread_exact(fd, offset, 4, "content checksum")
+        offset += 4
+    if offset != archive_size:
+        trailing_magic = None
+        if archive_size - offset >= 4:
+            trailing_magic = int.from_bytes(os.pread(fd, 4, offset), "little")
+        if trailing_magic is not None and 0x184D2A50 <= trailing_magic <= 0x184D2A5F:
+            raise SystemExit("zstd skippable frames are forbidden")
+        raise SystemExit("zstd archive contains a concatenated frame or compressed trailer")
 
 archive_fd = os.open(archive_path, os.O_RDONLY | nofollow | cloexec)
 root_fd = -1
@@ -2108,17 +2848,58 @@ try:
     )
     if archive_identity != expected_values:
         raise SystemExit("archive pathname no longer names the checksum-authenticated inode")
+    if archive_kind == "font":
+        require_one_canonical_zstd_frame(archive_fd, archive_before.st_size)
 
-    root_named = os.stat(root_path, follow_symlinks=False)
-    root_fd = os.open(root_path, os.O_RDONLY | directory | nofollow | cloexec)
-    root_before = os.fstat(root_fd)
-    if (not stat.S_ISDIR(root_before.st_mode) or root_before.st_uid != os.geteuid() or
-            stat.S_IMODE(root_before.st_mode) & 0o077 or
-            (root_before.st_dev, root_before.st_ino) != (root_named.st_dev, root_named.st_ino)):
-        raise SystemExit("archive extraction root is not one private owner-controlled directory")
-    with os.scandir(root_fd) as entries:
-        if next(entries, None) is not None:
+    def assert_archive_identity():
+        opened = os.fstat(archive_fd)
+        try:
+            named = os.stat(archive_path, follow_symlinks=False)
+        except OSError as error:
+            raise SystemExit(
+                "archive pathname no longer names the checksum-authenticated inode"
+            ) from error
+        current = (
+            opened.st_dev, opened.st_ino, opened.st_size,
+            opened.st_mtime_ns, opened.st_ctime_ns,
+        )
+        if (current != archive_identity or
+                (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+            raise SystemExit("archive pathname no longer names the checksum-authenticated inode")
+
+    root_before = None
+    if archive_action == "extract":
+        root_named = os.stat(root_path, follow_symlinks=False)
+        root_fd = os.open(root_path, os.O_RDONLY | directory | nofollow | cloexec)
+        root_before = os.fstat(root_fd)
+        if (not stat.S_ISDIR(root_before.st_mode) or root_before.st_uid != os.geteuid() or
+                stat.S_IMODE(root_before.st_mode) & 0o077 or
+                (root_before.st_dev, root_before.st_ino) !=
+                (root_named.st_dev, root_named.st_ino)):
+            raise SystemExit("archive extraction root is not one private owner-controlled directory")
+        retained_names = []
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                retained_names.append(entry.name)
+        if archive_kind != "font" and retained_names:
             raise SystemExit("archive extraction root is not empty")
+        if archive_kind == "font":
+            if len(retained_names) > len(EXPECTED_FONT_FILES):
+                raise SystemExit("retained font stage exceeds its exact inventory")
+            for name in retained_names:
+                if name not in EXPECTED_FONT_FILES:
+                    raise SystemExit("retained font stage contains an unexpected entry")
+                named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                opened_fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=root_fd)
+                try:
+                    opened = os.fstat(opened_fd)
+                    if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid() or
+                            opened.st_nlink != 1 or opened.st_size > max_expanded_bytes or
+                            stat.S_IMODE(opened.st_mode) not in (0o600, 0o444) or
+                            (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                        raise SystemExit("retained font stage contains an unsafe file")
+                finally:
+                    os.close(opened_fd)
 
     def canonical_type(member):
         if member.isfile() and not member.issparse():
@@ -2138,6 +2919,9 @@ try:
         state["name_bytes"] += len(encoded_name)
         if state["name_bytes"] > MAX_NAME_BYTES:
             raise SystemExit("archive exceeds its name-byte bound")
+        state["retained_metadata_bytes"] += len(encoded_name) + 256
+        if state["retained_metadata_bytes"] > MAX_RETAINED_METADATA_BYTES:
+            raise SystemExit("archive exceeds its retained-metadata bound")
         normalized = posixpath.normpath(name)
         if (name != normalized or name.startswith("/") or
                 normalized in ("", ".", "..") or normalized.startswith("../")):
@@ -2155,13 +2939,15 @@ try:
             }
             if name not in expected or member_type != "file":
                 raise SystemExit("process-family archive contains an unexpected member")
-        else:
+        elif archive_kind == "app":
             if name == manifest_name:
                 if member_type != "file":
                     raise SystemExit("detached app manifest is not one regular file")
                 state["detached"] += 1
             elif name != "FrankenTerm.app" and not name.startswith("FrankenTerm.app/"):
                 raise SystemExit("app archive contains an unexpected top-level member")
+        elif name not in EXPECTED_FONT_FILES or member_type != "file":
+            raise SystemExit("font archive contains an unexpected or non-regular member")
 
         linkname = ""
         if member_type == "file":
@@ -2181,6 +2967,7 @@ try:
                 raise SystemExit("app archive symlink escapes the application bundle")
 
         state["types"][name] = member_type
+        state["sizes"][name] = member.size
         digest = state["digest"]
         for value in (name, member_type, str(member.size), linkname, str(member.mode & 0o7777)):
             encoded = value.encode("utf-8", "surrogateescape")
@@ -2204,31 +2991,108 @@ try:
             }
             if set(state["types"]) != expected:
                 raise SystemExit("process-family archive lacks its exact five-file inventory")
-        elif (state["detached"] != 1 or
+        elif archive_kind == "app" and (state["detached"] != 1 or
               state["types"].get("FrankenTerm.app") != "directory"):
             raise SystemExit("app archive lacks its exact root and detached manifest")
+        elif archive_kind == "font" and set(state["types"]) != EXPECTED_FONT_FILES:
+            raise SystemExit("font archive lacks its exact four-file inventory")
 
     def new_state():
         return {
             "entries": 0,
             "name_bytes": 0,
+            "retained_metadata_bytes": 0,
             "expanded_bytes": 0,
             "detached": 0,
             "types": {},
+            "sizes": {},
+            "file_receipts": {},
             "digest": hashlib.sha256(),
         }
 
+    def hash_member_payload(archive, member, state):
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit("archive regular file has no readable payload")
+        digest = hashlib.sha256()
+        remaining = member.size
+        while remaining:
+            chunk = source.read(min(MAX_IO_CHUNK_BYTES, remaining))
+            if not chunk:
+                raise SystemExit("archive regular file is truncated")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if source.read(1):
+            raise SystemExit("archive regular file exceeds its declared size")
+        state["file_receipts"][member.name] = digest.hexdigest()
+
+    def encoded_font_receipt(state):
+        if (archive_kind != "font" or
+                set(state["file_receipts"]) != EXPECTED_FONT_FILES):
+            raise SystemExit("font archive lacks one content receipt per exact font file")
+        records = [
+            {
+                "bytes": state["sizes"][name],
+                "path": name,
+                "sha256": state["file_receipts"][name],
+            }
+            for name in sorted(EXPECTED_FONT_FILES)
+        ]
+        payload = json.dumps(records, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return "FT_FONT_TREE_RECEIPT_V1=" + base64.urlsafe_b64encode(payload).decode("ascii")
+
     def streaming_archive():
         os.lseek(archive_fd, 0, os.SEEK_SET)
-        return os.fdopen(os.dup(archive_fd), "rb", closefd=True)
+        if archive_kind == "font":
+            if not os.path.isdir("/dev/fd"):
+                raise SystemExit("descriptor-backed zstd input is unavailable")
+            source_fd = os.dup(archive_fd)
+            try:
+                process = subprocess.Popen(
+                    ["zstd", "-dc", "-M64M", f"/dev/fd/{source_fd}"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    pass_fds=(source_fd,),
+                )
+            except (OSError, ValueError) as error:
+                raise SystemExit("cannot start the bounded descriptor-fed zstd decoder") from error
+            finally:
+                os.close(source_fd)
+            return BoundedZstdReader(process, MAX_TAR_STREAM_BYTES)
+
+        raw = os.fdopen(os.dup(archive_fd), "rb", closefd=True)
+        magic = raw.read(6)
+        raw.seek(0, os.SEEK_SET)
+        if magic == b"\xfd7zXZ\x00":
+            return BoundedXzReader(raw, MAX_TAR_STREAM_BYTES)
+        return BoundedPlainReader(raw, MAX_TAR_STREAM_BYTES)
 
     first = new_state()
+    assert_archive_identity()
     with streaming_archive() as raw:
-        with tarfile.open(fileobj=raw, mode="r|*") as archive:
+        with tarfile.open(
+                fileobj=raw, mode="r|", bufsize=512, tarinfo=BoundedTarInfo) as archive:
             for member in archive:
                 validate_member(member, first)
+                if archive_kind == "font" and first["types"][member.name] == "file":
+                    hash_member_payload(archive, member, first)
+                if len(archive.members) > 1:
+                    raise SystemExit("tar parser retained more than one streamed member")
+                archive.members.clear()
+        raw.finish()
     finish_scan(first)
     first_fingerprint = first["digest"].digest()
+    assert_archive_identity()
+    if archive_action == "scan":
+        print(encoded_font_receipt(first))
+        raise SystemExit(0)
+    # Both pass inventories coexist until the extraction comparison completes.
+    # Refuse before writing anything unless two equal inventories fit within the
+    # one aggregate retained-metadata budget.
+    if first["retained_metadata_bytes"] > MAX_RETAINED_METADATA_BYTES // 2:
+        raise SystemExit("archive exceeds its aggregate two-pass retained-metadata bound")
     filesystem = os.fstatvfs(root_fd)
     available = filesystem.f_bavail * filesystem.f_frsize
     required = first["expanded_bytes"] + free_space_headroom
@@ -2269,6 +3133,7 @@ try:
     def extract_member(archive, member, member_type):
         parent_fd, leaf = open_parent(member.name)
         output_fd = -1
+        content_digest = None
         try:
             if member_type == "directory":
                 try:
@@ -2289,59 +3154,149 @@ try:
                 os.symlink(member.linkname, leaf, dir_fd=parent_fd)
                 os.fsync(parent_fd)
             else:
-                output_fd = os.open(
-                    leaf,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
-                    0o600,
-                    dir_fd=parent_fd,
-                )
                 source = archive.extractfile(member)
                 if source is None:
                     raise SystemExit("archive regular file has no readable payload")
+                if archive_kind == "font":
+                    try:
+                        output_fd = os.open(
+                            leaf,
+                            os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                            0o600,
+                            dir_fd=parent_fd,
+                        )
+                        os.fsync(parent_fd)
+                    except FileExistsError:
+                        output_fd = os.open(
+                            leaf, os.O_RDONLY | nofollow | cloexec, dir_fd=parent_fd)
+                        retained = os.fstat(output_fd)
+                        named = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                        retained_mode = stat.S_IMODE(retained.st_mode)
+                        if (not stat.S_ISREG(retained.st_mode) or
+                                retained.st_uid != os.geteuid() or retained.st_nlink != 1 or
+                                retained.st_size > member.size or
+                                retained_mode not in (0o600, 0o444) or
+                                (retained.st_dev, retained.st_ino) !=
+                                (named.st_dev, named.st_ino) or
+                                (retained_mode == 0o444 and retained.st_size != member.size)):
+                            raise SystemExit("retained font file is not one safe exact prefix")
+                        if retained_mode == 0o600:
+                            os.close(output_fd)
+                            output_fd = os.open(
+                                leaf, os.O_RDWR | nofollow | cloexec, dir_fd=parent_fd)
+                            reopened = os.fstat(output_fd)
+                            named_reopened = os.stat(
+                                leaf, dir_fd=parent_fd, follow_symlinks=False)
+                            if (not stat.S_ISREG(reopened.st_mode) or
+                                    reopened.st_uid != os.geteuid() or reopened.st_nlink != 1 or
+                                    stat.S_IMODE(reopened.st_mode) != 0o600 or
+                                    (reopened.st_dev, reopened.st_ino, reopened.st_size,
+                                     reopened.st_mtime_ns, reopened.st_ctime_ns) !=
+                                    (retained.st_dev, retained.st_ino, retained.st_size,
+                                     retained.st_mtime_ns, retained.st_ctime_ns) or
+                                    (reopened.st_dev, reopened.st_ino) !=
+                                    (named_reopened.st_dev, named_reopened.st_ino)):
+                                raise SystemExit("retained font file changed while reopening")
+                else:
+                    output_fd = os.open(
+                        leaf,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                target_before = os.fstat(output_fd)
+                existing_size = target_before.st_size if archive_kind == "font" else 0
+                os.lseek(output_fd, 0, os.SEEK_SET)
+                digest = hashlib.sha256()
                 remaining = member.size
+                offset = 0
                 while remaining:
-                    chunk = source.read(min(1024 * 1024, remaining))
+                    chunk = source.read(min(MAX_IO_CHUNK_BYTES, remaining))
                     if not chunk:
                         raise SystemExit("archive regular file is truncated")
-                    view = memoryview(chunk)
+                    digest.update(chunk)
+                    retained_width = min(len(chunk), max(0, existing_size - offset))
+                    if retained_width:
+                        retained_chunk = os.read(output_fd, retained_width)
+                        if retained_chunk != chunk[:retained_width]:
+                            raise SystemExit("retained font file is not an exact archive prefix")
+                    view = memoryview(chunk)[retained_width:]
                     while view:
                         written = os.write(output_fd, view)
                         if written <= 0:
                             raise SystemExit("archive extraction write made no progress")
                         view = view[written:]
+                    offset += len(chunk)
                     remaining -= len(chunk)
                 if source.read(1):
                     raise SystemExit("archive regular file exceeds its declared size")
-                os.fchmod(output_fd, 0o555 if member.mode & 0o111 else 0o444)
-                os.fsync(output_fd)
+                content_digest = digest.hexdigest()
+                if archive_kind == "font":
+                    os.fsync(output_fd)
+                    target_before_readback = os.fstat(output_fd)
+                    os.lseek(output_fd, 0, os.SEEK_SET)
+                    retained_digest = hashlib.sha256()
+                    retained_bytes = 0
+                    while True:
+                        chunk = os.read(output_fd, MAX_IO_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        retained_bytes += len(chunk)
+                        if retained_bytes > member.size:
+                            raise SystemExit("completed font file has an unexpected suffix")
+                        retained_digest.update(chunk)
+                    target_after_readback = os.fstat(output_fd)
+                    named_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                    if (retained_bytes != member.size or
+                            retained_digest.hexdigest() != content_digest or
+                            (target_before_readback.st_dev, target_before_readback.st_ino,
+                             target_before_readback.st_size, target_before_readback.st_mtime_ns,
+                             target_before_readback.st_ctime_ns) !=
+                            (target_after_readback.st_dev, target_after_readback.st_ino,
+                             target_after_readback.st_size, target_after_readback.st_mtime_ns,
+                             target_after_readback.st_ctime_ns) or
+                            (target_after_readback.st_dev, target_after_readback.st_ino) !=
+                            (named_after.st_dev, named_after.st_ino)):
+                        raise SystemExit("completed font file failed exact descriptor readback")
+                    if stat.S_IMODE(target_after_readback.st_mode) != 0o444:
+                        os.fchmod(output_fd, 0o444)
+                        os.fsync(output_fd)
+                else:
+                    os.fchmod(output_fd, 0o555 if member.mode & 0o111 else 0o444)
+                    os.fsync(output_fd)
                 os.fsync(parent_fd)
         finally:
             if output_fd >= 0:
                 os.close(output_fd)
             os.close(parent_fd)
+        return content_digest
 
     second = new_state()
+    assert_archive_identity()
     with streaming_archive() as raw:
-        with tarfile.open(fileobj=raw, mode="r|*") as archive:
+        with tarfile.open(
+                fileobj=raw, mode="r|", bufsize=512, tarinfo=BoundedTarInfo) as archive:
             for member in archive:
                 validate_member(member, second)
                 expected_type = first["types"].get(member.name)
                 if expected_type != second["types"][member.name]:
                     raise SystemExit("archive metadata changed between bounded passes")
-                extract_member(archive, member, expected_type)
+                content_digest = extract_member(archive, member, expected_type)
+                if archive_kind == "font":
+                    second["file_receipts"][member.name] = content_digest
+                if len(archive.members) > 1:
+                    raise SystemExit("tar parser retained more than one streamed member")
+                archive.members.clear()
+        raw.finish()
     finish_scan(second)
-    if second["types"] != first["types"] or second["digest"].digest() != first_fingerprint:
+    if (second["types"] != first["types"] or
+            second["sizes"] != first["sizes"] or
+            second["digest"].digest() != first_fingerprint or
+            (archive_kind == "font" and
+             second["file_receipts"] != first["file_receipts"])):
         raise SystemExit("archive inventory changed between bounded passes")
 
-    archive_after = os.fstat(archive_fd)
-    archive_named_after = os.stat(archive_path, follow_symlinks=False)
-    if (archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
-        archive_before.st_mtime_ns, archive_before.st_ctime_ns) != (
-        archive_after.st_dev, archive_after.st_ino, archive_after.st_size,
-        archive_after.st_mtime_ns, archive_after.st_ctime_ns) or (
-        archive_after.st_dev, archive_after.st_ino) != (
-        archive_named_after.st_dev, archive_named_after.st_ino):
-        raise SystemExit("authenticated archive changed during extraction")
+    assert_archive_identity()
     root_after = os.fstat(root_fd)
     root_named_after = os.stat(root_path, follow_symlinks=False)
     if (root_before.st_dev, root_before.st_ino) != (root_after.st_dev, root_after.st_ino) or (
@@ -2349,6 +3304,8 @@ try:
             root_named_after.st_dev, root_named_after.st_ino):
         raise SystemExit("archive extraction root changed during extraction")
     os.fsync(root_fd)
+    if archive_kind == "font":
+        print(encoded_font_receipt(second))
 finally:
     if root_fd >= 0:
         os.close(root_fd)
@@ -2357,7 +3314,8 @@ PY
 }
 
 verify_sigstore_bundle() {
-  local file="$1"; local artifact_url="$2"
+  local file="$1" artifact_url="$2" expected_identity="${3:-$VERIFIED_ARCHIVE_IDENTITY}"
+  local cosign_path cosign_timeout=120
   if ! command -v cosign &>/dev/null; then
     warn "cosign not found; skipping signature verification"
     warn "Install cosign for stronger authenticity checks: https://docs.sigstore.dev/cosign/installation/"
@@ -2376,11 +3334,146 @@ verify_sigstore_bundle() {
     warn "Sigstore bundle not found at $bundle_url; skipping signature verification"
     return 0
   fi
-  if ! cosign verify-blob \
-      --bundle "$bundle_file" \
-      --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
-      --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
-      "$file"; then
+  [ -n "$expected_identity" ] || {
+    err "Sigstore verification lacks the checksum-authenticated archive identity"
+    return 1
+  }
+  cosign_path=$(command -v cosign) || return 1
+  if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" = 1 ] &&
+      [ "${FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES:-0}" = 1 ] &&
+      [ -n "${FT_INSTALL_TEST_COSIGN_TIMEOUT_SECONDS:-}" ]; then
+    cosign_timeout="$FT_INSTALL_TEST_COSIGN_TIMEOUT_SECONDS"
+  fi
+  [[ "$cosign_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
+  # Both inputs reach cosign through inherited descriptors. Reopening either
+  # pathname would let a same-UID replacement make the checksum, signature,
+  # and extractor authenticate different bytes.
+  if ! python3 - "$file" "$expected_identity" "$bundle_file" "$cosign_path" \
+      "$COSIGN_IDENTITY_RE" "$COSIGN_OIDC_ISSUER" "$cosign_timeout" <<'PY'
+import os, resource, signal, stat, subprocess, sys
+
+archive_path, expected_raw, bundle_path, cosign, identity, issuer, timeout_text = sys.argv[1:]
+timeout_seconds = int(timeout_text)
+try:
+    expected = tuple(int(value) for value in expected_raw.split(":"))
+except ValueError as error:
+    raise SystemExit("checksum-authenticated archive identity is malformed") from error
+if len(expected) != 5 or ":".join(str(value) for value in expected) != expected_raw:
+    raise SystemExit("checksum-authenticated archive identity is non-canonical")
+
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+archive_fd = bundle_fd = -1
+try:
+    archive_fd = os.open(archive_path, flags)
+    bundle_fd = os.open(bundle_path, flags)
+    archive_before = os.fstat(archive_fd)
+    bundle_before = os.fstat(bundle_fd)
+    archive_named = os.stat(archive_path, follow_symlinks=False)
+    bundle_named = os.stat(bundle_path, follow_symlinks=False)
+    archive_observed = (
+        archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
+        archive_before.st_mtime_ns, archive_before.st_ctime_ns,
+    )
+    if (not stat.S_ISREG(archive_before.st_mode) or archive_before.st_nlink != 1 or
+            archive_observed != expected or
+            (archive_before.st_dev, archive_before.st_ino) !=
+            (archive_named.st_dev, archive_named.st_ino)):
+        raise SystemExit("Sigstore archive is not the checksum-authenticated inode")
+    if (not stat.S_ISREG(bundle_before.st_mode) or bundle_before.st_nlink != 1 or
+            bundle_before.st_size > 16 * 1024 * 1024 or
+            (bundle_before.st_dev, bundle_before.st_ino) !=
+            (bundle_named.st_dev, bundle_named.st_ino)):
+        raise SystemExit("Sigstore bundle is not one bounded single-link regular file")
+
+    archive_descriptor = f"/dev/fd/{archive_fd}"
+    bundle_descriptor = f"/dev/fd/{bundle_fd}"
+    if not os.path.exists(archive_descriptor) or not os.path.exists(bundle_descriptor):
+        raise SystemExit("descriptor-backed Sigstore verification is unavailable")
+
+    def constrain_verifier_child():
+        def finite_limit(resource_id, maximum, minimum):
+            soft, hard = resource.getrlimit(resource_id)
+            candidates = [maximum]
+            if soft != resource.RLIM_INFINITY:
+                candidates.append(soft)
+            if hard != resource.RLIM_INFINITY:
+                candidates.append(hard)
+            target = min(candidates)
+            if target < minimum:
+                raise OSError("inherited verifier resource limit is too small")
+            resource.setrlimit(resource_id, (target, hard))
+        finite_limit(resource.RLIMIT_CPU, timeout_seconds + 5, 1)
+        if sys.platform != "darwin" and hasattr(resource, "RLIMIT_AS"):
+            finite_limit(resource.RLIMIT_AS, 4 * 1024 * 1024 * 1024, 256 * 1024 * 1024)
+        if hasattr(resource, "RLIMIT_FSIZE"):
+            finite_limit(resource.RLIMIT_FSIZE, 64 * 1024 * 1024, 1024 * 1024)
+        if hasattr(resource, "RLIMIT_NOFILE"):
+            finite_limit(resource.RLIMIT_NOFILE, 256, 32)
+
+    verifier = None
+    try:
+        verifier = subprocess.Popen(
+            [
+                cosign, "verify-blob", "--bundle", bundle_descriptor,
+                "--certificate-identity-regexp", identity,
+                "--certificate-oidc-issuer", issuer, archive_descriptor,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(archive_fd, bundle_fd),
+            preexec_fn=constrain_verifier_child,
+            start_new_session=True,
+        )
+        try:
+            returncode = verifier.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            try:
+                os.killpg(verifier.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            verifier.wait()
+            raise SystemExit(
+                "Sigstore verifier exceeded its finite wall-clock bound"
+            ) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        if verifier is not None and verifier.poll() is None:
+            try:
+                os.killpg(verifier.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            verifier.wait()
+        raise SystemExit(
+            "Sigstore verifier could not establish its child resource contract"
+        ) from error
+    archive_after = os.fstat(archive_fd)
+    bundle_after = os.fstat(bundle_fd)
+    archive_named_after = os.stat(archive_path, follow_symlinks=False)
+    bundle_named_after = os.stat(bundle_path, follow_symlinks=False)
+    if archive_observed != (
+            archive_after.st_dev, archive_after.st_ino, archive_after.st_size,
+            archive_after.st_mtime_ns, archive_after.st_ctime_ns,
+    ) or (archive_after.st_dev, archive_after.st_ino) != (
+            archive_named_after.st_dev, archive_named_after.st_ino,
+    ):
+        raise SystemExit("checksum-authenticated archive changed during Sigstore verification")
+    if (bundle_before.st_dev, bundle_before.st_ino, bundle_before.st_size,
+        bundle_before.st_mtime_ns, bundle_before.st_ctime_ns) != (
+            bundle_after.st_dev, bundle_after.st_ino, bundle_after.st_size,
+            bundle_after.st_mtime_ns, bundle_after.st_ctime_ns,
+    ) or (bundle_after.st_dev, bundle_after.st_ino) != (
+            bundle_named_after.st_dev, bundle_named_after.st_ino,
+    ):
+        raise SystemExit("Sigstore bundle changed during verification")
+    raise SystemExit(returncode)
+finally:
+    if bundle_fd >= 0:
+        os.close(bundle_fd)
+    if archive_fd >= 0:
+        os.close(archive_fd)
+PY
+  then
     return 1
   fi
   ok "Signature verified (cosign)"
@@ -2398,29 +3491,54 @@ install_pragmasevka() {
     warn "Install the font manually from your distro / Homebrew if needed."
     return 0
   fi
-  # FrankenTerm bundles Pragmasevka NF v1.7.0 in its repo at
-  # crates/frankenterm/assets/Pragmasevka_NF.zip.zst. Despite the
-  # `.zip.zst` filename, the inner payload is a TAR archive (built
-  # that way by scripts/create-macos-bundle.sh — see
-  # `zstd -dc … | /usr/bin/tar -xf -` there). We use `tar -xf` after
-  # zstd-decompression for parity.
+  # The process-family manifest is inside the checksum-authenticated release
+  # archive and records the exact SHA-256 and byte count of this repository
+  # payload. That immutable generation receipt, not the mutable download URL,
+  # is the authority for the optional font archive.
   local font_url="https://raw.githubusercontent.com/${OWNER}/${REPO}/${VERSION}/crates/frankenterm/assets/Pragmasevka_NF.zip.zst"
-  local font_dir=""
+  local font_dir="" font_parent="" font_stage="" font_stage_name=""
+  local font_manifest="$PUBLISHED_PROCESS_FAMILY_ROOT/process-family.component-manifest.json"
+  local font_receipt="" font_checksum="" font_bytes="" font_identity=""
+  local downloaded_bytes="" tree_receipt="" extracted_receipt=""
+  local helper="" stage_id="" target_id="" txid="" operation=""
   case "$OS" in
     linux)  font_dir="${XDG_DATA_HOME:-$HOME/.local/share}/fonts/pragmasevka" ;;
     darwin) font_dir="$HOME/Library/Fonts/pragmasevka" ;;
     *)      warn "Unknown OS for font install; skipping"; return 0 ;;
   esac
   command -v zstd >/dev/null 2>&1 || { warn "zstd not found; skipping font install (install with: brew install zstd | apt install zstd)"; return 0; }
-  command -v tar  >/dev/null 2>&1 || { warn "tar not found; skipping font install"; return 0; }
-  # install_pragmasevka is best-effort — a mkdir failure (locked-down
-  # system, ENOSPC, etc.) must not abort the whole installer. Wrap with
-  # a graceful return so the user still gets a successful ft install.
-  if ! mkdir -p "$font_dir" 2>/dev/null; then
-    warn "Could not create font dir $font_dir; skipping font install"
+  if [ -z "$PUBLISHED_PROCESS_FAMILY_ROOT" ] ||
+      [ -z "$PUBLISHED_PROCESS_FAMILY_VERSION" ] ||
+      [ -z "$PUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY" ] ||
+      ! verify_canonical_generation "$PUBLISHED_PROCESS_FAMILY_ROOT" \
+        "$PUBLISHED_PROCESS_FAMILY_VERSION" \
+        "$PUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY"; then
+    warn "Authenticated process-family receipt unavailable; skipping font install"
     return 0
   fi
-  if ! require_transfer_capacity "$TMP" "$font_dir" \
+  font_receipt=$(process_family_input_receipt \
+    "$font_manifest" \
+    font.payload \
+    crates/frankenterm/assets/Pragmasevka_NF.zip.zst \
+    "$MAX_FONT_ARCHIVE_BYTES" \
+    "${PUBLISHED_PROCESS_FAMILY_ROOT##*/}") || {
+      warn "Authenticated font payload receipt is invalid; skipping font install"
+      return 0
+    }
+  IFS=$'\t' read -r font_checksum font_bytes <<<"$font_receipt"
+  [[ "$font_checksum" =~ ^[0-9a-f]{64}$ ]] && [[ "$font_bytes" =~ ^[0-9]+$ ]] || {
+    warn "Authenticated font payload receipt is malformed; skipping font install"
+    return 0
+  }
+
+  font_parent="${font_dir%/*}"
+  # Font installation is best-effort, but every mutation remains staged and
+  # exact. A failure can skip the font; it cannot weaken the ft installation.
+  if ! mkdir -p "$font_parent" 2>/dev/null; then
+    warn "Could not create font parent $font_parent; skipping font install"
+    return 0
+  fi
+  if ! require_transfer_capacity "$TMP" "$font_parent" \
       "$MAX_FONT_ARCHIVE_BYTES" "$MAX_FONT_EXPANDED_BYTES" \
       "Pragmasevka font"; then
     warn "Insufficient bounded capacity for Pragmasevka; skipping font install"
@@ -2432,15 +3550,111 @@ install_pragmasevka() {
     warn "Pragmasevka payload download failed; skipping font install"
     return 0
   fi
-  if ! zstd -dc "$TMP/pragmasevka.zip.zst" | tar -xf - -C "$font_dir" 2>/dev/null; then
-    warn "Pragmasevka payload extraction failed; skipping"
+  if ! verify_checksum "$TMP/pragmasevka.zip.zst" "$font_checksum"; then
+    warn "Pragmasevka payload authentication failed; skipping font install"
+    return 0
+  fi
+  font_identity="$VERIFIED_ARCHIVE_IDENTITY"
+  downloaded_bytes="${font_identity#*:}"
+  downloaded_bytes="${downloaded_bytes#*:}"
+  downloaded_bytes="${downloaded_bytes%%:*}"
+  if [ "$downloaded_bytes" != "$font_bytes" ]; then
+    warn "Pragmasevka payload size differs from its authenticated receipt; skipping"
+    return 0
+  fi
+  tree_receipt=$(extract_authenticated_archive \
+    "$TMP/pragmasevka.zip.zst" "$font_parent" font - "$font_identity" scan) || {
+      warn "Pragmasevka payload failed authenticated receipt derivation; skipping"
+      return 0
+    }
+  [[ "$tree_receipt" == FT_FONT_TREE_RECEIPT_V1=* ]] &&
+      [[ "$tree_receipt" != *$'\n'* ]] || {
+    warn "Pragmasevka payload returned a malformed tree receipt; skipping"
+    return 0
+  }
+
+  if [ -d "$font_dir" ] && [ ! -L "$font_dir" ] &&
+      verify_font_tree_receipt "$font_dir" "$tree_receipt" 1; then
+    ok "Pragmasevka NF already matches its authenticated generation at $font_dir"
+    FONT_INSTALLED_PATH="$font_dir"
+    return 0
+  fi
+  if { [ -e "$font_dir" ] || [ -L "$font_dir" ]; } &&
+      { [ ! -d "$font_dir" ] || [ -L "$font_dir" ]; }; then
+    warn "Refusing to replace non-directory or symlink font target at $font_dir"
+    return 0
+  fi
+
+  font_stage_name=$(select_font_generation_stage \
+    "$font_parent" "$font_checksum" "$tree_receipt") || {
+      warn "No bounded private Pragmasevka generation stage is available; skipping"
+      return 0
+    }
+  font_stage="$font_parent/$font_stage_name"
+  if ! prepare_font_generation_stage "$font_parent" "$font_stage_name"; then
+    warn "Could not prepare a private resumable Pragmasevka generation; skipping"
+    return 0
+  fi
+  extracted_receipt=$(extract_authenticated_archive \
+    "$TMP/pragmasevka.zip.zst" "$font_stage" font - "$font_identity" extract) || {
+      warn "Pragmasevka payload failed bounded authenticated extraction; skipping"
+      return 0
+    }
+  if [ "$extracted_receipt" != "$tree_receipt" ]; then
+    warn "Pragmasevka extraction receipt differs from its authenticated scan; skipping"
+    return 0
+  fi
+  installer_failpoint after-font-extraction
+  installer_test_mutate_font_stage "$font_stage" || return 0
+  if ! seal_font_generation_stage "$font_stage" "$tree_receipt" ||
+      ! fsync_installer_tree "$font_stage" ||
+      ! verify_font_tree_receipt "$font_stage" "$tree_receipt" 1; then
+    warn "Pragmasevka generation failed exact receipt sealing; skipping"
+    return 0
+  fi
+
+  helper="$PUBLISHED_PROCESS_FAMILY_ROOT/ft"
+  stage_id=$(atomic_path_content_id "$helper" "$font_parent" "$font_stage_name") || {
+    warn "Pragmasevka generation lacks one sealed atomic content identity; skipping"
+    return 0
+  }
+  # This second receipt check followed by the atomic helper's stage-content-ID
+  # check closes the final same-UID mutation window before the namespace move.
+  verify_font_tree_receipt "$font_stage" "$tree_receipt" 1 || return 0
+  if [ -e "$font_dir" ]; then
+    [ -d "$font_dir" ] && [ ! -L "$font_dir" ] || return 0
+    target_id=$(atomic_path_content_id "$helper" "$font_parent" "$(basename "$font_dir")") || return 0
+    operation=exchange
+  else
+    target_id=missing
+    operation=publish-noreplace
+  fi
+  txid=$(atomic_transition_txid \
+    "font-generation:$font_parent:$font_stage_name:$font_checksum:$target_id") || return 0
+  installer_failpoint before-font-publication
+  if ! atomic_path_transition "$helper" "$font_parent" "$font_stage_name" \
+      "$(basename "$font_dir")" "$txid" "$stage_id" "$target_id" "$operation"; then
+    warn "Pragmasevka atomic generation publication failed; prior font tree was retained"
+    return 0
+  fi
+  installer_failpoint after-font-publication
+  if ! verify_font_tree_receipt "$font_dir" "$tree_receipt" 1; then
+    warn "Published Pragmasevka generation failed its exact post-publication receipt"
+    [ "$operation" = exchange ] &&
+      warn "The prior font generation remains retained at $font_stage"
     return 0
   fi
   ok "Pragmasevka NF installed to $font_dir"
+  if [ "$operation" = exchange ]; then
+    info "Previous Pragmasevka generation preserved at $font_stage"
+  fi
   FONT_INSTALLED_PATH="$font_dir"
   if [ "$OS" = "linux" ] && command -v fc-cache >/dev/null 2>&1; then
-    run_with_spinner "Refreshing font cache" fc-cache -f "$font_dir" || true
-    ok "Font cache refreshed"
+    if run_with_spinner "Refreshing font cache" fc-cache -f "$font_dir"; then
+      ok "Font cache refreshed"
+    else
+      warn "Font files installed, but font cache refresh failed"
+    fi
   fi
 }
 
@@ -2843,6 +4057,7 @@ build_from_source() {
       --entry executable:pty-guardian:frankenterm-pty-guardian:frankenterm-pty-guardian \
       --entry verifier:offline-verifier:verify-components.sh \
       --source-match verify-components.sh=scripts/atomic-component-manifest.sh \
+      --input font.payload=crates/frankenterm/assets/Pragmasevka_NF.zip.zst \
       || ! bash "$atomic_tool" verify \
       --root "$proof_root" \
       --manifest "$proof_manifest"; then
@@ -3144,7 +4359,7 @@ else
     exit 1
   }
   if [ "$NO_SIGSTORE" -eq 0 ] && [ -n "$URL" ]; then
-    verify_sigstore_bundle "$TMP/$TAR" "$URL" || {
+    verify_sigstore_bundle "$TMP/$TAR" "$URL" "$VERIFIED_ARCHIVE_IDENTITY" || {
       err "Signature verification failed"
       exit 1
     }
