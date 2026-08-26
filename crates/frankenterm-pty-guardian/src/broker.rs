@@ -9755,8 +9755,8 @@ impl BrokerPreparedPaneV1 {
             output_terminal: None,
             lease: BrokerLeaseState::Active {
                 attachment: attachment_identity,
-                last_handoff_id: None,
             },
+            applied_handoff: None,
         };
         Ok(BrokerPendingExecReleaseV1 {
             adoption: BrokerAdoptionV1 { pane, attachment },
@@ -9893,8 +9893,8 @@ impl BrokerPreparedPaneV1 {
             output_terminal: None,
             lease: BrokerLeaseState::Active {
                 attachment: attachment_identity,
-                last_handoff_id: None,
             },
+            applied_handoff: None,
         };
         Ok(BrokerAdoptionV1 { pane, attachment })
     }
@@ -9971,10 +9971,29 @@ pub struct BrokerAdoptionV1 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerAppliedSuccessorHandoffV1 {
+    handoff_id: Uuid,
+    predecessor: BrokerAttachmentIdentityV1,
+    successor: BrokerAttachmentIdentityV1,
+}
+
+impl BrokerAppliedSuccessorHandoffV1 {
+    fn matches_retry(
+        self,
+        authority: &BrokerSuccessorHandoffAuthorityV1,
+        active_attachment: BrokerAttachmentIdentityV1,
+    ) -> bool {
+        self.handoff_id == authority.handoff_id
+            && self.predecessor == authority.predecessor
+            && self.successor == active_attachment
+            && self.successor.owner == authority.successor
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrokerLeaseState {
     Active {
         attachment: BrokerAttachmentIdentityV1,
-        last_handoff_id: Option<Uuid>,
     },
     AwaitingSuccessor {
         predecessor: BrokerAttachmentIdentityV1,
@@ -10153,6 +10172,7 @@ pub struct BrokerAdoptedPaneV1 {
     current_lease_output_cursor: u64,
     output_terminal: Option<BrokerOutputTerminalState>,
     lease: BrokerLeaseState,
+    applied_handoff: Option<BrokerAppliedSuccessorHandoffV1>,
 }
 
 impl BrokerAdoptedPaneV1 {
@@ -10755,13 +10775,10 @@ impl BrokerAdoptedPaneV1 {
         }
 
         match self.lease {
-            BrokerLeaseState::Active {
-                attachment,
-                last_handoff_id: Some(last_handoff_id),
-            } if last_handoff_id == authority.handoff_id
-                && attachment.owner == authority.successor
-                && authority.predecessor.lease_generation.checked_add(1)
-                    == Some(attachment.lease_generation) =>
+            BrokerLeaseState::Active { attachment }
+                if self
+                    .applied_handoff
+                    .is_some_and(|handoff| handoff.matches_retry(&authority, attachment)) =>
             {
                 Ok(BrokerSuccessorAttachOutcomeV1::RecoveredExistingLease {
                     attachment: BrokerPtyAttachmentV1 {
@@ -10798,10 +10815,12 @@ impl BrokerAdoptedPaneV1 {
                     .completed_successor_handoffs
                     .checked_add(1)
                     .ok_or(BrokerError::HandoffCapacityExhausted)?;
-                self.lease = BrokerLeaseState::Active {
-                    attachment,
-                    last_handoff_id: Some(authority.handoff_id),
-                };
+                self.applied_handoff = Some(BrokerAppliedSuccessorHandoffV1 {
+                    handoff_id: authority.handoff_id,
+                    predecessor: authority.predecessor,
+                    successor: attachment,
+                });
+                self.lease = BrokerLeaseState::Active { attachment };
                 self.current_lease_output_cursor = self.buffer_start_sequence;
                 Ok(BrokerSuccessorAttachOutcomeV1::Attached(
                     BrokerPtyAttachmentV1 {
@@ -16752,6 +16771,123 @@ mod tests {
         );
         assert_eq!(pane.child_identity().process_id, child_identity.process_id);
         assert_eq!(pane.status().completed_successor_handoffs, 1);
+    }
+
+    #[test]
+    fn applied_successor_handoff_retry_binds_the_exact_predecessor_identity() {
+        let predecessor_owner = authority(id(201), id(202), id(203), id(204), 0x31, 0x32).owner;
+        let successor_owner = authority(id(201), id(205), id(206), id(207), 0x33, 0x34).owner;
+        let predecessor = BrokerAttachmentIdentityV1 {
+            broker_incarnation: id(201),
+            durable_pane_id: id(208),
+            spawn_effect_id: id(209),
+            attachment_id: id(210),
+            owner: predecessor_owner,
+            lease_generation: 7,
+        };
+        let successor = BrokerAttachmentIdentityV1 {
+            broker_incarnation: id(201),
+            durable_pane_id: id(208),
+            spawn_effect_id: id(209),
+            attachment_id: id(211),
+            owner: successor_owner,
+            lease_generation: 8,
+        };
+        let handoff_id = id(212);
+        let applied = BrokerAppliedSuccessorHandoffV1 {
+            handoff_id,
+            predecessor,
+            successor,
+        };
+        let authority_for = |predecessor| BrokerSuccessorHandoffAuthorityV1 {
+            broker_incarnation: id(201),
+            durable_pane_id: id(208),
+            spawn_effect_id: id(209),
+            handoff_id,
+            predecessor,
+            successor: successor_owner,
+        };
+        assert!(applied.matches_retry(&authority_for(predecessor), successor));
+
+        let mut mutations = [predecessor; 9];
+        mutations[0].broker_incarnation = id(213);
+        mutations[1].durable_pane_id = id(214);
+        mutations[2].spawn_effect_id = id(215);
+        mutations[3].attachment_id = id(216);
+        mutations[4].owner.guardian_incarnation = id(217);
+        mutations[5].owner.connection_id = id(218);
+        mutations[6].owner.mux_incarnation = id(219);
+        mutations[7].owner.mux_build_identity_digest[0] ^= 0x80;
+        mutations[8].lease_generation = 6;
+        for mutation in mutations {
+            assert!(
+                !applied.matches_retry(&authority_for(mutation), successor),
+                "mutated predecessor recovered an already-applied handoff"
+            );
+        }
+
+        let mut mutated_active = successor;
+        mutated_active.attachment_id = id(220);
+        assert!(!applied.matches_retry(&authority_for(predecessor), mutated_active));
+    }
+
+    #[test]
+    fn same_generation_predecessor_mutation_cannot_recover_a_live_successor_lease() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(221), id(222), id(223), id(224), 0x41, 0x42);
+        let payload = command_payload("IFS= read -r ignored", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let (prepared, control) =
+            prepare_for_test(payload, binding, &auth, BrokerResourceLimitsV1::default())
+                .expect("prepare pane for predecessor mutation test");
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, binding).expect("commit pane");
+        let predecessor = attachment.identity();
+        pane.observe_authenticated_control_eof(
+            BrokerAuthenticatedControlEofV1::from_authenticated_transport_close(predecessor),
+        )
+        .expect("fence predecessor");
+
+        let successor = authority(id(221), id(225), id(226), id(227), 0x43, 0x44);
+        let handoff_id = id(228);
+        let first = BrokerSuccessorHandoffAuthorityV1 {
+            broker_incarnation: id(221),
+            durable_pane_id: binding.durable_pane_id,
+            spawn_effect_id: binding.spawn_effect_id,
+            handoff_id,
+            predecessor,
+            successor: successor.owner,
+        };
+        assert!(matches!(
+            pane.attach_successor(first),
+            Ok(BrokerSuccessorAttachOutcomeV1::Attached(_))
+        ));
+
+        let mut mutated_predecessor = predecessor;
+        mutated_predecessor.attachment_id = id(229);
+        let forged_retry = BrokerSuccessorHandoffAuthorityV1 {
+            broker_incarnation: id(221),
+            durable_pane_id: binding.durable_pane_id,
+            spawn_effect_id: binding.spawn_effect_id,
+            handoff_id,
+            predecessor: mutated_predecessor,
+            successor: successor.owner,
+        };
+        assert_eq!(
+            pane.attach_successor(forged_retry).err(),
+            Some(BrokerError::ConflictingSuccessorHandoff)
+        );
+        assert_eq!(pane.status().completed_successor_handoffs, 1);
+        assert_eq!(
+            pane.status().lifecycle,
+            BrokerPaneLifecycleV1::Quarantined(
+                BrokerQuarantineReasonV1::ConflictingSuccessorHandoff
+            )
+        );
+        pane.terminate_and_wait_for_test();
     }
 
     #[test]
