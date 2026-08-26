@@ -9147,6 +9147,7 @@ fn publish_checkpoint_artifact_noreplace(
     checkpoint_artifact_noreplace_unsupported()
 }
 
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
 fn checkpoint_artifact_noreplace_unsupported() -> Result<(), CheckpointScrollbackArtifactError> {
     Err(CheckpointScrollbackArtifactError::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -9722,8 +9723,13 @@ pub fn inventory_checkpoint_scrollback_artifacts(
         if !file_name_utf8.ends_with(CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX) {
             continue;
         }
-        let path = directory.join(&file_name);
-        let receipt = verify_checkpoint_scrollback_artifact(&path, limits)?;
+        let bytes = read_checkpoint_artifact_from_parent_bounded(
+            &pinned,
+            Path::new(file_name.as_os_str()),
+            limits.max_artifact_bytes,
+            false,
+        )?;
+        let receipt = verify_checkpoint_scrollback_artifact_bytes_with_hook(bytes, limits, || {})?;
         artifacts.push(CheckpointScrollbackInventoryEntry {
             file_name: PathBuf::from(file_name),
             created_at_epoch_ms: receipt.created_at_epoch_ms,
