@@ -8909,9 +8909,11 @@ fn validate_checkpoint_artifact_parent_for_new_child(
     Ok(())
 }
 
-/// The directory containing artifact, lock, and staging names is a private
+/// The directory containing artifact, lock, and staging names is an integrity
 /// authority, not merely a traversal component. Refuse existing directories
 /// that another effective user owns or that group/other users can modify.
+/// Group/other read and traversal bits are permitted; artifact confidentiality
+/// is enforced by the create-new `0600` file authority instead.
 fn validate_checkpoint_artifact_final_directory_authority(
     directory: &cap_std::fs::Dir,
 ) -> std::io::Result<()> {
@@ -12904,6 +12906,19 @@ mod tests {
         file.sync_all().unwrap();
     }
 
+    /// macOS exposes `/tmp` and `/var` through symlinks, while the artifact
+    /// authority deliberately refuses every symlinked path component. Keep
+    /// these tests under the physical checkout directory so they exercise the
+    /// same no-follow chain on Linux and macOS instead of failing at the test
+    /// harness's ambient temporary-directory alias.
+    fn checkpoint_artifact_test_directory() -> tempfile::TempDir {
+        let physical_checkout = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        tempfile::Builder::new()
+            .prefix(".ft-checkpoint-artifact-test-")
+            .tempdir_in(physical_checkout)
+            .unwrap()
+    }
+
     #[test]
     fn checkpoint_scrollback_artifact_roundtrip_retry_and_false_capabilities() {
         run_async_test(async {
@@ -12914,7 +12929,7 @@ mod tests {
             )
             .await;
             let limits = CheckpointScrollbackArtifactLimits::default();
-            let directory = tempfile::TempDir::new().unwrap();
+            let directory = checkpoint_artifact_test_directory();
             let leaf = checkpoint_scrollback_artifact_file_name(
                 snapshot.checkpoint_at,
                 snapshot.checkpoint_id,
@@ -12970,7 +12985,7 @@ mod tests {
             assert_eq!(inventory.len(), 1);
             assert_eq!(inventory[0].artifact_sha256, first.artifact_sha256);
 
-            let alias_directory = tempfile::TempDir::new().unwrap();
+            let alias_directory = checkpoint_artifact_test_directory();
             let alias_path = alias_directory
                 .path()
                 .join(format!("alias{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
@@ -13046,7 +13061,7 @@ mod tests {
             assert!(admitted_bytes_dropped.get());
             assert_eq!(receipt.checkpoint_id, snapshot.checkpoint_id);
 
-            let publication_directory = tempfile::TempDir::new().unwrap();
+            let publication_directory = checkpoint_artifact_test_directory();
             let publication_path = publication_directory.path().join(format!(
                 "phase-order{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
             ));
@@ -13318,7 +13333,7 @@ mod tests {
                 bytes.clone(),
             ];
             for residue in residues {
-                let directory = tempfile::TempDir::new().unwrap();
+                let directory = checkpoint_artifact_test_directory();
                 let path = directory
                     .path()
                     .join(format!("fixture{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
@@ -13338,7 +13353,7 @@ mod tests {
                 );
             }
 
-            let lost_reply_directory = tempfile::TempDir::new().unwrap();
+            let lost_reply_directory = checkpoint_artifact_test_directory();
             let lost_reply_path = lost_reply_directory
                 .path()
                 .join(format!("lost-reply{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
@@ -13376,7 +13391,7 @@ mod tests {
     fn checkpoint_scrollback_directory_authority_rejects_writable_final_and_ancestor() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let final_directory = tempfile::TempDir::new().unwrap();
+        let final_directory = checkpoint_artifact_test_directory();
         std::fs::set_permissions(
             final_directory.path(),
             std::fs::Permissions::from_mode(0o770),
@@ -13402,7 +13417,7 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::PermissionDenied
         ));
 
-        let ancestor_root = tempfile::TempDir::new().unwrap();
+        let ancestor_root = checkpoint_artifact_test_directory();
         let writable_parent = ancestor_root.path().join("peer-writable-parent");
         std::fs::create_dir(&writable_parent).unwrap();
         std::fs::set_permissions(&writable_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -13435,7 +13450,7 @@ mod tests {
             "unsafe ancestry must be rejected before creating a directory"
         );
 
-        let sticky_root = tempfile::TempDir::new().unwrap();
+        let sticky_root = checkpoint_artifact_test_directory();
         let sticky_parent = sticky_root.path().join("sticky-shared-parent");
         std::fs::create_dir(&sticky_parent).unwrap();
         std::fs::set_permissions(&sticky_parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
@@ -13470,7 +13485,7 @@ mod tests {
                 snapshot.checkpoint_id,
                 limits,
             );
-            let directory = tempfile::TempDir::new().unwrap();
+            let directory = checkpoint_artifact_test_directory();
             let leaf = format!("mutation{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}");
             let path = directory.path().join(&leaf);
             publish_checkpoint_artifact_bytes(&path, &bytes).unwrap();
@@ -13518,7 +13533,7 @@ mod tests {
                 Err(CheckpointScrollbackArtifactError::AlreadyExists)
             ));
 
-            let streaming_directory = tempfile::TempDir::new().unwrap();
+            let streaming_directory = checkpoint_artifact_test_directory();
             let streaming_leaf = format!("streaming{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}");
             let streaming_path = streaming_directory.path().join(&streaming_leaf);
             publish_checkpoint_artifact_bytes(&streaming_path, &bytes).unwrap();
@@ -13563,7 +13578,7 @@ mod tests {
 
     #[test]
     fn checkpoint_scrollback_unsupported_noreplace_is_side_effect_free() {
-        let directory = tempfile::TempDir::new().unwrap();
+        let directory = checkpoint_artifact_test_directory();
         let staging = directory.path().join("staging");
         let target = directory.path().join("target");
         write_private_checkpoint_artifact_test_file(&staging, b"staging-bytes");
@@ -13605,7 +13620,7 @@ mod tests {
             let mutated_bytes =
                 serialize_checkpoint_artifact(&content_mutation, limits.max_artifact_bytes)
                     .unwrap();
-            let mutated_directory = tempfile::TempDir::new().unwrap();
+            let mutated_directory = checkpoint_artifact_test_directory();
             let mutated_path = mutated_directory.path().join(format!(
                 "content-mutation{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
             ));
@@ -13681,7 +13696,7 @@ mod tests {
             let redaction_bytes =
                 serialize_checkpoint_artifact(&redaction_mutation, limits.max_artifact_bytes)
                     .unwrap();
-            let redaction_directory = tempfile::TempDir::new().unwrap();
+            let redaction_directory = checkpoint_artifact_test_directory();
             let redaction_path = redaction_directory.path().join(format!(
                 "redaction-mutation{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
             ));
@@ -13702,7 +13717,7 @@ mod tests {
             let capability_bytes =
                 serialize_checkpoint_artifact(&capability_mutation, limits.max_artifact_bytes)
                     .unwrap();
-            let capability_directory = tempfile::TempDir::new().unwrap();
+            let capability_directory = checkpoint_artifact_test_directory();
             let capability_path = capability_directory.path().join(format!(
                 "capability-mutation{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
             ));
@@ -13724,7 +13739,7 @@ mod tests {
                 Err(CheckpointScrollbackArtifactError::ResourceLimit(_))
             ));
 
-            let bounded_directory = tempfile::TempDir::new().unwrap();
+            let bounded_directory = checkpoint_artifact_test_directory();
             let bounded_path = bounded_directory
                 .path()
                 .join(format!("bounded{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"));
@@ -13753,7 +13768,7 @@ mod tests {
 
     #[test]
     fn checkpoint_scrollback_inventory_and_retention_are_bounded_and_prefix_ordered() {
-        let directory = tempfile::TempDir::new().unwrap();
+        let directory = checkpoint_artifact_test_directory();
         write_private_checkpoint_artifact_test_file(&directory.path().join("junk-a"), b"a");
         write_private_checkpoint_artifact_test_file(&directory.path().join("junk-b"), b"b");
         let mut one_entry_limits = CheckpointScrollbackArtifactLimits::default();
