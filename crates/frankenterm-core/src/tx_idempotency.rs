@@ -1645,17 +1645,30 @@ struct ProofBarrierGuard {
     _lock_file: File,
 }
 
+/// Global spool catalog lock guard.
+///
+/// Serializes durable ledger creation and global capacity enforcement across all processes.
+///
+/// # Canonical Lock Hierarchy & Ordering:
+/// 1. `SpoolCatalogLock` (`plan_locks/spool_catalog.lock`): Acquired FIRST for operations that
+///    allocate global active ledger capacity or perform cross-plan catalog sweeps.
+/// 2. `PlanLock` (`plan_locks/<digest>.catalog.lock`): Acquired SECOND for plan-wide operations
+///    (e.g., creating a ledger or retiring matching ledgers for a plan).
+/// 3. `ExecutionLock` (`execution_locks/<execution_id>.lock`): Acquired THIRD for per-execution operations
+///    (sorted lexicographically when acquiring multiple execution locks).
+/// 4. `ProofBarrier` / `KeyLock` (`key_locks/<key_hash>.lock`): Acquired FOURTH for individual step reservations/outcomes.
+#[derive(Debug)]
+pub struct DurableSpoolCatalogLockGuard {
+    _lock_dir: Arc<Dir>,
+    _lock_name: PathBuf,
+    _spool_display: PathBuf,
+    _lock_file: File,
+}
+
 /// Canonical plan/catalog lock guard.
 ///
 /// Ensures serialized ledger creation, retirement, and recovery across processes for a given
 /// `(plan_id, plan_hash)` tuple.
-///
-/// # Canonical Lock Hierarchy & Ordering:
-/// 1. `PlanLock` (`plan_locks/<digest>.catalog.lock`): Acquired FIRST for plan-wide operations
-///    (e.g., creating a ledger or retiring matching ledgers for a plan).
-/// 2. `ExecutionLock` (`execution_locks/<execution_id>.lock`): Acquired SECOND for per-execution operations
-///    (sorted lexicographically when acquiring multiple execution locks).
-/// 3. `ProofBarrier` / `KeyLock` (`key_locks/<key_hash>.lock`): Acquired THIRD for individual step reservations/outcomes.
 #[derive(Debug)]
 pub struct DurablePlanLockGuard {
     _lock_dir: Arc<Dir>,
@@ -3271,6 +3284,109 @@ fn plan_lock_name(plan_id: &str, plan_hash: u64) -> PathBuf {
 }
 
 impl IdempotencyStore {
+    fn acquire_spool_catalog_lock(&self) -> Result<DurableSpoolCatalogLockGuard, IdempotencyError> {
+        let spool = self.durable_spool()?;
+        let lock_name = PathBuf::from("spool_catalog.lock");
+        let lock_display = spool.display_path.join(PLAN_LOCK_DIR_NAME).join(&lock_name);
+        let options = lock_open_options();
+        let lock_file = spool
+            .plan_lock_dir
+            .open_with(&lock_name, &options)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "open spool catalog lock {} without following symlinks: {err}",
+                    lock_display.display()
+                ),
+            })?;
+        let metadata = lock_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "inspect spool catalog lock {}: {err}",
+                    lock_display.display()
+                ),
+            })?;
+        validate_open_regular_file(&metadata, &lock_display)?;
+        let lock_file = lock_file.into_std();
+        match try_lock_with_grace(|| FileExt::try_lock_exclusive(&lock_file)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(IdempotencyError::SpoolCatalogMutationInProgress);
+            }
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "acquire spool catalog lock {}: {err}",
+                        lock_display.display()
+                    ),
+                });
+            }
+        }
+        validate_pinned_file_entry(&spool.plan_lock_dir, &lock_name, &lock_file, &lock_display)?;
+        Ok(DurableSpoolCatalogLockGuard {
+            _lock_dir: Arc::clone(&spool.plan_lock_dir),
+            _lock_name: lock_name,
+            _spool_display: spool.display_path.clone(),
+            _lock_file: lock_file,
+        })
+    }
+
+    fn rescan_all_active_ledgers(&mut self) -> Result<usize, IdempotencyError> {
+        let (spool_dir, spool_display_path) = {
+            let spool = self.durable_spool()?;
+            (Arc::clone(&spool.dir), spool.display_path.clone())
+        };
+        let max_ledger_bytes = self.policy.max_ledger_bytes;
+        let entries = spool_dir
+            .entries()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "list pinned tx_ledgers directory {}: {err}",
+                    spool_display_path.display()
+                ),
+            })?;
+        let mut on_disk_active: HashMap<String, TxExecutionLedger> = HashMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "read entry in pinned tx_ledgers directory {}: {err}",
+                    spool_display_path.display()
+                ),
+            })?;
+            let name = PathBuf::from(entry.file_name());
+            if name.extension().and_then(|ext| ext.to_str()) == Some("json")
+                && let Some(stem) = name.file_stem().and_then(|s| s.to_str())
+                && is_valid_execution_id(stem)
+            {
+                let ledger_display = spool_display_path.join(&name);
+                let options = nofollow_open_options(true, false);
+                if let Ok(mut file) = spool_dir.open_with(&name, &options) {
+                    if let Ok(metadata) = file.metadata() {
+                        if validate_open_regular_file(&metadata, &ledger_display).is_ok() {
+                            if let Ok(contents) = read_bounded_ledger_with_limit(
+                                &mut file,
+                                &ledger_display,
+                                max_ledger_bytes,
+                            ) {
+                                if let Ok(ledger) =
+                                    serde_json::from_slice::<TxExecutionLedger>(&contents)
+                                {
+                                    if ledger.verify_chain().chain_intact
+                                        && !ledger.phase().is_terminal()
+                                    {
+                                        on_disk_active.insert(stem.to_string(), ledger);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.ledgers = on_disk_active;
+        Ok(self.ledgers.len())
+    }
+
     fn acquire_plan_catalog_lock(
         &self,
         plan_id: &str,
@@ -4032,6 +4148,11 @@ impl IdempotencyStore {
         execution_id: &str,
         plan: &TxPlan,
     ) -> Result<(), IdempotencyError> {
+        let _spool_lock = if self.is_durable() {
+            Some(self.acquire_spool_catalog_lock()?)
+        } else {
+            None
+        };
         let _plan_lock = if self.is_durable() {
             Some(self.acquire_plan_catalog_lock(&plan.plan_id, plan.plan_hash)?)
         } else {
@@ -4042,15 +4163,17 @@ impl IdempotencyStore {
         } else {
             None
         };
-        if self.is_durable() {
-            self.rescan_spool_for_matching_ledgers(&plan.plan_id, plan.plan_hash)?;
-        }
+        let active_count = if self.is_durable() {
+            self.rescan_all_active_ledgers()?
+        } else {
+            self.ledgers.len()
+        };
         if self.ledgers.contains_key(execution_id) {
             return Err(IdempotencyError::DuplicateExecution {
                 key: execution_id.to_string(),
             });
         }
-        if self.ledgers.len() >= self.policy.max_active_ledgers {
+        if active_count >= self.policy.max_active_ledgers {
             return Err(IdempotencyError::ActiveLedgerLimitExceeded {
                 max_active_ledgers: self.policy.max_active_ledgers,
             });
@@ -4806,6 +4929,9 @@ pub enum IdempotencyError {
 
     #[error("idempotency reservation already in progress for key {key}")]
     ReservationInProgress { key: String },
+
+    #[error("spool catalog mutation already in progress")]
+    SpoolCatalogMutationInProgress,
 
     #[error("plan mutation already in progress for plan {plan_id} ({plan_hash:016x})")]
     PlanMutationInProgress { plan_id: String, plan_hash: u64 },
@@ -8492,6 +8618,94 @@ mod tests {
             .expect("create superseding execution");
         assert_eq!(store_2.active_count(), 1);
         assert!(store_2.get_ledger("exec-superseding").is_some());
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_active_ledger_capacity_enforced_across_processes_at_n_minus_one() {
+        let ft_dir = durable_test_dir("capacity-enforced-cross-proc");
+        let policy = IdempotencyPolicy {
+            max_active_ledgers: 2,
+            ..IdempotencyPolicy::default()
+        };
+        let mut store_1 = IdempotencyStore::open(&ft_dir, policy.clone()).expect("open store 1");
+        let mut store_2 = IdempotencyStore::open(&ft_dir, policy.clone()).expect("open store 2");
+
+        let plan_0 = make_plan(1);
+        let plan_1 = make_plan(2);
+        let plan_2 = make_plan(3);
+
+        // Store 1 creates first active ledger (1 of 2 active)
+        store_1
+            .create_ledger("exec-cap-0", &plan_0)
+            .expect("create exec 0");
+        store_1
+            .transition_phase("exec-cap-0", TxPhase::Preparing)
+            .expect("transition exec 0");
+
+        // Store 1 creates second active ledger (2 of 2 active -> capacity full)
+        store_1
+            .create_ledger("exec-cap-1", &plan_1)
+            .expect("create exec 1");
+        store_1
+            .transition_phase("exec-cap-1", TxPhase::Preparing)
+            .expect("transition exec 1");
+
+        // Store 2 attempts to create a 3rd active ledger -> must fail closed with ActiveLedgerLimitExceeded
+        let err = store_2
+            .create_ledger("exec-cap-2", &plan_2)
+            .expect_err("create must exceed max active ledgers");
+        assert!(matches!(
+            err,
+            IdempotencyError::ActiveLedgerLimitExceeded {
+                max_active_ledgers: 2
+            }
+        ));
+
+        // Reopening store 3 must succeed without failing closed because exactly 2 active ledgers exist on disk
+        let store_3 = IdempotencyStore::open(&ft_dir, policy).expect("reopen store 3");
+        assert_eq!(store_3.active_count(), 2);
+        assert!(store_3.get_ledger("exec-cap-0").is_some());
+        assert!(store_3.get_ledger("exec-cap-1").is_some());
+        assert!(store_3.get_ledger("exec-cap-2").is_none());
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn concurrent_spool_catalog_lock_serializes_capacity_reservations() {
+        let ft_dir = durable_test_dir("spool-lock-serialization");
+        let plan = make_plan(2);
+        let store_1 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 1");
+        let mut store_2 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 2");
+
+        // Store 1 acquires the spool catalog lock
+        let spool_lock = store_1
+            .acquire_spool_catalog_lock()
+            .expect("acquire spool catalog lock");
+
+        // Store 2 attempts to create a ledger while the spool lock is held
+        let err = store_2
+            .create_ledger("exec-spool-blocked", &plan)
+            .expect_err("create must be blocked by spool catalog lock");
+        assert!(matches!(
+            err,
+            IdempotencyError::SpoolCatalogMutationInProgress
+        ));
+
+        // Store 1 drops the spool catalog lock
+        drop(spool_lock);
+
+        // Store 2 can now create the ledger
+        store_2
+            .create_ledger("exec-spool-blocked", &plan)
+            .expect("create ledger succeeds after spool lock released");
+        assert!(store_2.get_ledger("exec-spool-blocked").is_some());
 
         let _ = std::fs::remove_dir_all(&ft_dir);
     }
