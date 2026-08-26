@@ -7304,6 +7304,160 @@ mod tests {
     }
 
     #[test]
+    fn recovered_catalog_admission_accepts_valid_distinct_journals() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa1);
+        let first = recovered_catalog_identity(&authenticator, 1);
+        let second = recovered_catalog_identity(&authenticator, 2);
+        let (_catalog, journals) = recover_header_only_catalog_journals(
+            directory.path(),
+            &[first, second],
+            &authenticator,
+        );
+
+        let admitted = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("admit distinct recovered identities");
+        assert_eq!(admitted.journals.len(), 2);
+        assert_eq!(admitted.by_journal_id.len(), 2);
+        assert_eq!(admitted.by_durable_pane_id.len(), 2);
+        assert_eq!(admitted.by_spawn_effect_id.len(), 2);
+        assert_eq!(admitted.by_origin_request_id.len(), 2);
+        assert!(!admitted.contains_spawn_lifecycle());
+        for identity in [first, second] {
+            let journal_index = *admitted
+                .by_journal_id
+                .get(&identity.journal_id())
+                .expect("journal identity index");
+            assert_eq!(
+                admitted.by_durable_pane_id.get(&identity.durable_pane_id()),
+                Some(&journal_index)
+            );
+            assert_eq!(
+                admitted.by_spawn_effect_id.get(&identity.spawn_effect_id()),
+                Some(&journal_index)
+            );
+            assert_eq!(
+                admitted
+                    .by_origin_request_id
+                    .get(&identity.origin_request_id()),
+                Some(&journal_index)
+            );
+            assert_eq!(admitted.journals[journal_index].identity(), identity);
+        }
+    }
+
+    #[test]
+    fn recovered_catalog_admission_rejects_wrong_authenticated_lineage() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa2);
+        let mut identity = recovered_catalog_identity(&authenticator, 3);
+        identity.broker_lineage_id = id(6_003);
+        assert_ne!(identity.broker_lineage_id(), authenticator.lineage_id());
+        let (_catalog, journals) =
+            recover_header_only_catalog_journals(directory.path(), &[identity], &authenticator);
+
+        assert!(matches!(
+            BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator),
+            Err(BrokerSpawnWalError::RecoveredCatalogLineageMismatch)
+        ));
+    }
+
+    #[test]
+    fn recovered_catalog_admission_rejects_duplicate_journal_id() {
+        let first_directory = private_catalog_directory();
+        let second_directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa3);
+        let first = recovered_catalog_identity(&authenticator, 4);
+        let mut second = recovered_catalog_identity(&authenticator, 5);
+        second.journal_id = first.journal_id();
+        assert_ne!(first.durable_pane_id(), second.durable_pane_id());
+        assert_ne!(first.spawn_effect_id(), second.spawn_effect_id());
+        assert_ne!(first.origin_request_id(), second.origin_request_id());
+
+        let (_first_catalog, mut journals) = recover_header_only_catalog_journals(
+            first_directory.path(),
+            &[first],
+            &authenticator,
+        );
+        let (_second_catalog, mut second_journals) = recover_header_only_catalog_journals(
+            second_directory.path(),
+            &[second],
+            &authenticator,
+        );
+        journals.append(&mut second_journals);
+        assert!(matches!(
+            BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateJournalId)
+        ));
+    }
+
+    #[test]
+    fn recovered_catalog_admission_rejects_duplicate_durable_pane_id() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa4);
+        let first = recovered_catalog_identity(&authenticator, 6);
+        let mut second = recovered_catalog_identity(&authenticator, 7);
+        second.durable_pane_id = first.durable_pane_id();
+        assert_ne!(first.journal_id(), second.journal_id());
+        assert_ne!(first.spawn_effect_id(), second.spawn_effect_id());
+        assert_ne!(first.origin_request_id(), second.origin_request_id());
+        let (_catalog, journals) = recover_header_only_catalog_journals(
+            directory.path(),
+            &[first, second],
+            &authenticator,
+        );
+
+        assert!(matches!(
+            BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateDurablePaneId)
+        ));
+    }
+
+    #[test]
+    fn recovered_catalog_admission_rejects_duplicate_spawn_effect_id() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa5);
+        let first = recovered_catalog_identity(&authenticator, 8);
+        let mut second = recovered_catalog_identity(&authenticator, 9);
+        second.spawn_effect_id = first.spawn_effect_id();
+        assert_ne!(first.journal_id(), second.journal_id());
+        assert_ne!(first.durable_pane_id(), second.durable_pane_id());
+        assert_ne!(first.origin_request_id(), second.origin_request_id());
+        let (_catalog, journals) = recover_header_only_catalog_journals(
+            directory.path(),
+            &[first, second],
+            &authenticator,
+        );
+
+        assert!(matches!(
+            BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateSpawnEffectId)
+        ));
+    }
+
+    #[test]
+    fn recovered_catalog_admission_rejects_duplicate_origin_request_id() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa6);
+        let first = recovered_catalog_identity(&authenticator, 10);
+        let mut second = recovered_catalog_identity(&authenticator, 11);
+        second.origin_request_id = first.origin_request_id();
+        assert_ne!(first.journal_id(), second.journal_id());
+        assert_ne!(first.durable_pane_id(), second.durable_pane_id());
+        assert_ne!(first.spawn_effect_id(), second.spawn_effect_id());
+        let (_catalog, journals) = recover_header_only_catalog_journals(
+            directory.path(),
+            &[first, second],
+            &authenticator,
+        );
+
+        assert!(matches!(
+            BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateOriginRequestId)
+        ));
+    }
+
+    #[test]
     fn pinned_catalog_reconciles_wal_ahead_of_head_without_second_spawn_authority() {
         let directory = private_catalog_directory();
         let sentinel = directory.path().join("unused-spawn-sentinel");

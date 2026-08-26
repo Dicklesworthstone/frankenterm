@@ -1857,6 +1857,275 @@ verify_archive_checksum_authority() {
   verify_checksum "$archive" "$CHECKSUM"
 }
 
+extract_authenticated_archive() {
+  local archive="$1" root="$2" kind="$3" manifest_name="$4"
+  python3 - "$archive" "$root" "$kind" "$manifest_name" <<'PY'
+import hashlib, os, posixpath, stat, sys, tarfile
+
+archive_path, root_path, archive_kind, manifest_name = sys.argv[1:]
+if archive_kind not in ("process-family", "app"):
+    raise SystemExit("unknown authenticated archive kind")
+
+MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024
+MAX_ENTRIES = 1_000_000
+MAX_NAME_BYTES = 64 * 1024 * 1024
+MAX_EXPANDED_BYTES = 16 * 1024 * 1024 * 1024
+MAX_LINK_BYTES = 4096
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+if not nofollow or not directory:
+    raise SystemExit("descriptor-relative nofollow extraction is unavailable")
+
+archive_fd = os.open(archive_path, os.O_RDONLY | nofollow | cloexec)
+root_fd = -1
+try:
+    archive_before = os.fstat(archive_fd)
+    archive_named = os.stat(archive_path, follow_symlinks=False)
+    if (not stat.S_ISREG(archive_before.st_mode) or archive_before.st_nlink != 1 or
+            archive_before.st_size > MAX_ARCHIVE_BYTES or
+            (archive_before.st_dev, archive_before.st_ino) !=
+            (archive_named.st_dev, archive_named.st_ino)):
+        raise SystemExit("authenticated archive is not one bounded single-link regular file")
+
+    root_named = os.stat(root_path, follow_symlinks=False)
+    root_fd = os.open(root_path, os.O_RDONLY | directory | nofollow | cloexec)
+    root_before = os.fstat(root_fd)
+    if (not stat.S_ISDIR(root_before.st_mode) or root_before.st_uid != os.geteuid() or
+            stat.S_IMODE(root_before.st_mode) & 0o077 or
+            (root_before.st_dev, root_before.st_ino) != (root_named.st_dev, root_named.st_ino)):
+        raise SystemExit("archive extraction root is not one private owner-controlled directory")
+    with os.scandir(root_fd) as entries:
+        if next(entries, None) is not None:
+            raise SystemExit("archive extraction root is not empty")
+
+    def canonical_type(member):
+        if member.isfile() and not member.issparse():
+            return "file"
+        if member.isdir():
+            return "directory"
+        if member.issym():
+            return "symlink"
+        raise SystemExit("archive contains a hard link, sparse file, or special file")
+
+    def validate_member(member, state):
+        state["entries"] += 1
+        if state["entries"] > MAX_ENTRIES:
+            raise SystemExit("archive exceeds its entry bound")
+        name = member.name
+        encoded_name = name.encode("utf-8", "surrogateescape")
+        state["name_bytes"] += len(encoded_name)
+        if state["name_bytes"] > MAX_NAME_BYTES:
+            raise SystemExit("archive exceeds its name-byte bound")
+        normalized = posixpath.normpath(name)
+        if (name != normalized or name.startswith("/") or
+                normalized in ("", ".", "..") or normalized.startswith("../")):
+            raise SystemExit("archive contains an unsafe member name")
+        if name in state["types"]:
+            raise SystemExit("archive contains a duplicate member name")
+
+        member_type = canonical_type(member)
+        if archive_kind == "process-family":
+            expected = {
+                "ft", "frankenterm-mux-server", "frankenterm-pty-guardian",
+                "verify-components.sh", manifest_name,
+            }
+            if name not in expected or member_type != "file":
+                raise SystemExit("process-family archive contains an unexpected member")
+        else:
+            if name == manifest_name:
+                if member_type != "file":
+                    raise SystemExit("detached app manifest is not one regular file")
+                state["detached"] += 1
+            elif name != "FrankenTerm.app" and not name.startswith("FrankenTerm.app/"):
+                raise SystemExit("app archive contains an unexpected top-level member")
+
+        linkname = ""
+        if member_type == "file":
+            if member.size < 0:
+                raise SystemExit("archive member has a negative size")
+            state["expanded_bytes"] += member.size
+            if state["expanded_bytes"] > MAX_EXPANDED_BYTES:
+                raise SystemExit("archive exceeds its expanded-byte bound")
+        elif member_type == "symlink":
+            linkname = member.linkname
+            if len(linkname.encode("utf-8", "surrogateescape")) > MAX_LINK_BYTES:
+                raise SystemExit("archive symlink target exceeds its bound")
+            if posixpath.isabs(linkname):
+                raise SystemExit("archive contains an absolute symlink")
+            target = posixpath.normpath(posixpath.join(posixpath.dirname(name), linkname))
+            if target != "FrankenTerm.app" and not target.startswith("FrankenTerm.app/"):
+                raise SystemExit("app archive symlink escapes the application bundle")
+
+        state["types"][name] = member_type
+        digest = state["digest"]
+        for value in (name, member_type, str(member.size), linkname, str(member.mode & 0o7777)):
+            encoded = value.encode("utf-8", "surrogateescape")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+
+    def finish_scan(state):
+        if not state["types"]:
+            raise SystemExit("archive has an empty inventory")
+        for name in state["types"]:
+            parent = posixpath.dirname(name)
+            while parent not in ("", "."):
+                parent_type = state["types"].get(parent)
+                if parent_type is not None and parent_type != "directory":
+                    raise SystemExit("archive member descends through a non-directory member")
+                parent = posixpath.dirname(parent)
+        if archive_kind == "process-family":
+            expected = {
+                "ft", "frankenterm-mux-server", "frankenterm-pty-guardian",
+                "verify-components.sh", manifest_name,
+            }
+            if set(state["types"]) != expected:
+                raise SystemExit("process-family archive lacks its exact five-file inventory")
+        elif (state["detached"] != 1 or
+              state["types"].get("FrankenTerm.app") != "directory"):
+            raise SystemExit("app archive lacks its exact root and detached manifest")
+
+    def new_state():
+        return {
+            "entries": 0,
+            "name_bytes": 0,
+            "expanded_bytes": 0,
+            "detached": 0,
+            "types": {},
+            "digest": hashlib.sha256(),
+        }
+
+    def streaming_archive():
+        os.lseek(archive_fd, 0, os.SEEK_SET)
+        return os.fdopen(os.dup(archive_fd), "rb", closefd=True)
+
+    first = new_state()
+    with streaming_archive() as raw:
+        with tarfile.open(fileobj=raw, mode="r|*") as archive:
+            for member in archive:
+                validate_member(member, first)
+    finish_scan(first)
+    first_fingerprint = first["digest"].digest()
+
+    def open_parent(name):
+        parts = name.split("/")
+        parent_fd = os.dup(root_fd)
+        prefix = []
+        try:
+            for component in parts[:-1]:
+                prefix.append(component)
+                try:
+                    os.mkdir(component, 0o700, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except FileExistsError:
+                    pass
+                named = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+                child_fd = os.open(
+                    component, os.O_RDONLY | directory | nofollow | cloexec,
+                    dir_fd=parent_fd,
+                )
+                opened = os.fstat(child_fd)
+                if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid() or
+                        (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                    os.close(child_fd)
+                    raise SystemExit("archive extraction parent changed type or identity")
+                os.close(parent_fd)
+                parent_fd = child_fd
+            return parent_fd, parts[-1]
+        except BaseException:
+            os.close(parent_fd)
+            raise
+
+    def extract_member(archive, member, member_type):
+        parent_fd, leaf = open_parent(member.name)
+        output_fd = -1
+        try:
+            if member_type == "directory":
+                try:
+                    os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except FileExistsError:
+                    pass
+                named = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                output_fd = os.open(
+                    leaf, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=parent_fd)
+                opened = os.fstat(output_fd)
+                if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid() or
+                        (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                    raise SystemExit("archive directory changed type or identity")
+                os.fchmod(output_fd, 0o700)
+                os.fsync(output_fd)
+            elif member_type == "symlink":
+                os.symlink(member.linkname, leaf, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            else:
+                output_fd = os.open(
+                    leaf,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                source = archive.extractfile(member)
+                if source is None:
+                    raise SystemExit("archive regular file has no readable payload")
+                remaining = member.size
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise SystemExit("archive regular file is truncated")
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(output_fd, view)
+                        if written <= 0:
+                            raise SystemExit("archive extraction write made no progress")
+                        view = view[written:]
+                    remaining -= len(chunk)
+                if source.read(1):
+                    raise SystemExit("archive regular file exceeds its declared size")
+                os.fchmod(output_fd, 0o555 if member.mode & 0o111 else 0o444)
+                os.fsync(output_fd)
+                os.fsync(parent_fd)
+        finally:
+            if output_fd >= 0:
+                os.close(output_fd)
+            os.close(parent_fd)
+
+    second = new_state()
+    with streaming_archive() as raw:
+        with tarfile.open(fileobj=raw, mode="r|*") as archive:
+            for member in archive:
+                validate_member(member, second)
+                expected_type = first["types"].get(member.name)
+                if expected_type != second["types"][member.name]:
+                    raise SystemExit("archive metadata changed between bounded passes")
+                extract_member(archive, member, expected_type)
+    finish_scan(second)
+    if second["types"] != first["types"] or second["digest"].digest() != first_fingerprint:
+        raise SystemExit("archive inventory changed between bounded passes")
+
+    archive_after = os.fstat(archive_fd)
+    archive_named_after = os.stat(archive_path, follow_symlinks=False)
+    if (archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
+        archive_before.st_mtime_ns, archive_before.st_ctime_ns) != (
+        archive_after.st_dev, archive_after.st_ino, archive_after.st_size,
+        archive_after.st_mtime_ns, archive_after.st_ctime_ns) or (
+        archive_after.st_dev, archive_after.st_ino) != (
+        archive_named_after.st_dev, archive_named_after.st_ino):
+        raise SystemExit("authenticated archive changed during extraction")
+    root_after = os.fstat(root_fd)
+    root_named_after = os.stat(root_path, follow_symlinks=False)
+    if (root_before.st_dev, root_before.st_ino) != (root_after.st_dev, root_after.st_ino) or (
+            root_after.st_dev, root_after.st_ino) != (
+            root_named_after.st_dev, root_named_after.st_ino):
+        raise SystemExit("archive extraction root changed during extraction")
+    os.fsync(root_fd)
+finally:
+    if root_fd >= 0:
+        os.close(root_fd)
+    os.close(archive_fd)
+PY
+}
+
 verify_sigstore_bundle() {
   local file="$1"; local artifact_url="$2"
   if ! command -v cosign &>/dev/null; then
@@ -2028,12 +2297,8 @@ PY
   fi
 
   # The detached manifest and verifier are meaningful only when rooted in the
-  # release archive checksum. --no-verify therefore disables app publication;
-  # it never silently downgrades the app-family binding proof.
-  if [ "$NO_CHECKSUM" -eq 1 ]; then
-    warn "Skipping FrankenTerm.app because --no-verify removes its external trust root"
-    return 0
-  fi
+  # externally fetched release archive checksum. Optional Sigstore verification
+  # may be disabled, but SHA-256 authentication is never bypassed.
   local app_sum=""
   if curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
       "${app_url}.sha256" -o "$TMP/app.sha256" 2>/dev/null; then
@@ -2051,56 +2316,8 @@ PY
   # not permission to let tar interpret an attacker-controlled namespace.
   extraction_root="$TMP/app-package"
   mkdir -m 0700 "$extraction_root" || return 0
-  if ! python3 - "$tmp_app_tar" "$extraction_root" <<'PY'
-import os, posixpath, stat, sys, tarfile
-
-archive_path, root = sys.argv[1:]
-with tarfile.open(archive_path, "r:xz") as archive:
-    members = archive.getmembers()
-    if not members or len(members) > 1_000_000:
-        raise SystemExit("app archive has an invalid bounded inventory")
-    names, symlinks = set(), set()
-    name_bytes = total_bytes = 0
-    detached = 0
-    for member in members:
-        name = member.name
-        normalized = posixpath.normpath(name)
-        name_bytes += len(name.encode("utf-8", "surrogateescape"))
-        if (name != normalized or name.startswith("/") or normalized in ("", ".", "..") or
-                normalized.startswith("../") or name_bytes > 64 * 1024 * 1024 or name in names):
-            raise SystemExit("app archive contains an unsafe or duplicate member name")
-        names.add(name)
-        if name == "FrankenTerm.app.component-manifest.json":
-            detached += 1
-            if not member.isfile():
-                raise SystemExit("detached app manifest is not one regular file")
-        elif name != "FrankenTerm.app" and not name.startswith("FrankenTerm.app/"):
-            raise SystemExit("app archive contains an unexpected top-level member")
-        if member.isfile():
-            total_bytes += member.size
-            if total_bytes > 16 * 1024 * 1024 * 1024:
-                raise SystemExit("app archive exceeds its decompressed byte bound")
-        elif member.isdir():
-            pass
-        elif member.issym():
-            if posixpath.isabs(member.linkname):
-                raise SystemExit("app archive contains an absolute symlink")
-            target = posixpath.normpath(posixpath.join(posixpath.dirname(name), member.linkname))
-            if target != "FrankenTerm.app" and not target.startswith("FrankenTerm.app/"):
-                raise SystemExit("app archive symlink escapes the app bundle")
-            symlinks.add(name)
-        else:
-            raise SystemExit("app archive contains a hard link or special file")
-    if detached != 1:
-        raise SystemExit("app archive must contain one detached component manifest")
-    for name in names:
-        parent = posixpath.dirname(name)
-        while parent not in ("", "."):
-            if parent in symlinks:
-                raise SystemExit("app archive member descends through an archived symlink")
-            parent = posixpath.dirname(parent)
-    archive.extractall(root, members=members)
-PY
+  if ! extract_authenticated_archive "$tmp_app_tar" "$extraction_root" app \
+      FrankenTerm.app.component-manifest.json
   then
     warn "FrankenTerm.app archive namespace failed validation; skipping GUI app install"
     return 0
@@ -2423,7 +2640,7 @@ Options:
   --from-source      Build from source (slow; requires Rust + git)
   --quiet, -q        Suppress non-error output
   --no-gum           Disable gum formatting even if available
-  --no-verify        Skip checksum + signature verification (for testing only)
+  --no-verify        Skip optional Sigstore verification (SHA-256 remains required)
   --offline TARBALL  Install from local tarball; skip all network calls
   --force            Force reinstall even if same version is installed
   --artifact-url URL Override artifact URL (e.g. custom mirror)
@@ -2459,7 +2676,7 @@ while [ $# -gt 0 ]; do
     --from-source) FROM_SOURCE=1; shift ;;
     --quiet|-q) QUIET=1; shift ;;
     --no-gum) NO_GUM=1; shift ;;
-    --no-verify) NO_CHECKSUM=1; shift ;;
+    --no-verify) NO_SIGSTORE=1; shift ;;
     --offline) require_option_value "$1" "${2:-}"; OFFLINE_TARBALL="$2"; shift 2 ;;
     --force) FORCE_INSTALL=1; shift ;;
     --artifact-url) require_option_value "$1" "${2:-}"; ARTIFACT_URL="$2"; shift 2 ;;

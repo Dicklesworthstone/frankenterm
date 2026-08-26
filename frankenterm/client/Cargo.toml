@@ -30,6 +30,7 @@ promise.workspace = true
 rangeset.workspace = true
 ratelim.workspace = true
 rayon.workspace = true
+shlex.workspace = true
 termwiz.workspace = true
 thiserror.workspace = true
 umask.workspace = true
