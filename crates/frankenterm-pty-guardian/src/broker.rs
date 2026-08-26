@@ -1100,6 +1100,88 @@ struct BrokerReadyEventV1 {
     closed: bool,
 }
 
+/// Fail-closed admission of the complete recovered Spawn catalog.
+///
+/// The four indexes are constructed before the broker begins listening, so a
+/// recovered journal can never be retained without a unique durable identity
+/// in every namespace used by future Query/Ack and pane admission paths.
+struct BrokerRecoveredSpawnCatalogV1 {
+    journals: Vec<BrokerSpawnJournalV1>,
+    by_journal_id: HashMap<Uuid, usize>,
+    by_durable_pane_id: HashMap<Uuid, usize>,
+    by_spawn_effect_id: HashMap<Uuid, usize>,
+    by_origin_request_id: HashMap<Uuid, usize>,
+}
+
+impl BrokerRecoveredSpawnCatalogV1 {
+    fn admit(
+        journals: Vec<BrokerSpawnJournalV1>,
+        authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<Self, BrokerSpawnWalError> {
+        let capacity = journals.len();
+        let mut by_journal_id = HashMap::new();
+        let mut by_durable_pane_id = HashMap::new();
+        let mut by_spawn_effect_id = HashMap::new();
+        let mut by_origin_request_id = HashMap::new();
+        for index in [
+            &mut by_journal_id,
+            &mut by_durable_pane_id,
+            &mut by_spawn_effect_id,
+            &mut by_origin_request_id,
+        ] {
+            index
+                .try_reserve(capacity)
+                .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        }
+
+        let expected_lineage_id = authenticator.lineage_id();
+        for (journal_index, journal) in journals.iter().enumerate() {
+            let identity = journal.identity();
+            if identity.broker_lineage_id() != expected_lineage_id {
+                return Err(BrokerSpawnWalError::RecoveredCatalogLineageMismatch);
+            }
+            if by_journal_id
+                .insert(identity.journal_id(), journal_index)
+                .is_some()
+            {
+                return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateJournalId);
+            }
+            if by_durable_pane_id
+                .insert(identity.durable_pane_id(), journal_index)
+                .is_some()
+            {
+                return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateDurablePaneId);
+            }
+            if by_spawn_effect_id
+                .insert(identity.spawn_effect_id(), journal_index)
+                .is_some()
+            {
+                return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateSpawnEffectId);
+            }
+            if by_origin_request_id
+                .insert(identity.origin_request_id(), journal_index)
+                .is_some()
+            {
+                return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateOriginRequestId);
+            }
+        }
+
+        Ok(Self {
+            journals,
+            by_journal_id,
+            by_durable_pane_id,
+            by_spawn_effect_id,
+            by_origin_request_id,
+        })
+    }
+
+    fn contains_spawn_lifecycle(&self) -> bool {
+        self.journals
+            .iter()
+            .any(|journal| journal.status().phase.is_some())
+    }
+}
+
 /// Separately spawned, single-owner broker control loop.
 ///
 /// This first executable slice authenticates and fences connections and opens
@@ -1114,7 +1196,7 @@ pub struct BrokerControlServiceV1 {
     socket_authority: SocketPathAuthority,
     control_authenticator: GuardianBrokerControlAuthenticatorV1,
     _spawn_catalog: BrokerSpawnWalCatalogV1,
-    _recovered_journals: Vec<BrokerSpawnJournalV1>,
+    _recovered_catalog: BrokerRecoveredSpawnCatalogV1,
     broker_incarnation: Uuid,
     broker_lineage_id: Uuid,
     broker_build_identity: SealedAtomicBuildIdentity,
@@ -1141,10 +1223,9 @@ impl BrokerControlServiceV1 {
         let broker_lineage_id = spawn_authenticator.lineage_id();
         let spawn_catalog = BrokerSpawnWalCatalogV1::open(config.spawn_catalog_path)?;
         let recovered_journals = spawn_catalog.recover_all(&spawn_authenticator)?;
-        if recovered_journals
-            .iter()
-            .any(|journal| journal.status().phase.is_some())
-        {
+        let recovered_catalog =
+            BrokerRecoveredSpawnCatalogV1::admit(recovered_journals, &spawn_authenticator)?;
+        if recovered_catalog.contains_spawn_lifecycle() {
             return Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported);
         }
 
@@ -1198,7 +1279,7 @@ impl BrokerControlServiceV1 {
             socket_authority,
             control_authenticator,
             _spawn_catalog: spawn_catalog,
-            _recovered_journals: recovered_journals,
+            _recovered_catalog: recovered_catalog,
             broker_incarnation: Uuid::new_v4(),
             broker_lineage_id,
             broker_build_identity: config.broker_build_identity,
@@ -2453,6 +2534,16 @@ pub enum BrokerSpawnWalError {
     CatalogLockUnsupported,
     #[error("broker Spawn WAL catalog file name does not match its authenticated identity")]
     CatalogIdentityMismatch,
+    #[error("recovered broker Spawn WAL lineage does not match the active broker lineage")]
+    RecoveredCatalogLineageMismatch,
+    #[error("recovered broker Spawn catalog contains a duplicate journal identity")]
+    RecoveredCatalogDuplicateJournalId,
+    #[error("recovered broker Spawn catalog contains a duplicate durable pane identity")]
+    RecoveredCatalogDuplicateDurablePaneId,
+    #[error("recovered broker Spawn catalog contains a duplicate Spawn effect identity")]
+    RecoveredCatalogDuplicateSpawnEffectId,
+    #[error("recovered broker Spawn catalog contains a duplicate origin request identity")]
+    RecoveredCatalogDuplicateOriginRequestId,
     #[error("new broker Spawn WAL or head descriptor is not empty")]
     NewJournalNotEmpty,
     #[error("broker Spawn WAL file header is torn")]
@@ -6350,6 +6441,48 @@ mod tests {
     fn wal_identity(binding: BrokerGenesisBinding) -> BrokerSpawnWalIdentityV1 {
         BrokerSpawnWalIdentityV1::from_binding(id(900), id(901), binding)
             .expect("valid broker WAL identity")
+    }
+
+    fn recovered_catalog_identity(
+        authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+        seed: u8,
+    ) -> BrokerSpawnWalIdentityV1 {
+        assert_ne!(seed, 0, "catalog identity seed must be nonzero");
+        let ordinal = u128::from(seed);
+        BrokerSpawnWalIdentityV1 {
+            journal_id: id(1_000 + ordinal),
+            broker_lineage_id: authenticator.lineage_id(),
+            mux_incarnation: id(2_000 + ordinal),
+            durable_pane_id: id(3_000 + ordinal),
+            spawn_effect_id: id(4_000 + ordinal),
+            origin_request_id: id(5_000 + ordinal),
+            spawn_payload_bytes: u64::from(seed),
+            spawn_payload_digest: [seed; 32],
+            binding_digest: [seed.wrapping_add(0x40); 32],
+        }
+    }
+
+    fn recover_header_only_catalog_journals(
+        directory: &std::path::Path,
+        identities: &[BrokerSpawnWalIdentityV1],
+        authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> (BrokerSpawnWalCatalogV1, Vec<BrokerSpawnJournalV1>) {
+        let catalog = BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
+            .expect("open empty catalog for header-only journal creation");
+        for identity in identities {
+            let journal = catalog
+                .create_spawn_journal(*identity, authenticator.clone())
+                .expect("create header-only catalog journal");
+            drop(journal);
+        }
+        drop(catalog);
+
+        let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
+            .expect("reopen catalog for admission recovery");
+        let journals = recovered_catalog
+            .recover_all(authenticator)
+            .expect("recover authenticated header-only catalog journals");
+        (recovered_catalog, journals)
     }
 
     #[test]
