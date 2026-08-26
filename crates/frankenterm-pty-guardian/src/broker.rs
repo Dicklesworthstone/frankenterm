@@ -7,18 +7,19 @@
 //! `SCM_RIGHTS` transfer cannot be revoked and socket EOF cannot fence a master
 //! already installed in a predecessor guardian.
 //!
-//! A hidden same-binary broker subcommand now opens and reconciles the complete
-//! authenticated Spawn catalog before binding its pinned private control
-//! socket. Its bounded event loop authenticates exact guardian, mux, build,
-//! connection, broker-incarnation, and token-derived lineage identities. It
-//! still rejects every PTY effect: the exec-ready child barrier, live WAL
-//! receipts, durable output journal, census, and successor lease rotation must
-//! land before any production selector may start it. The process-local PTY
-//! typestate below therefore still does **not** prove guardian-`SIGKILL`
-//! continuity. Catalog Genesis admission remains durable pre-Spawn intent,
-//! never proof that a child exists, and the current service refuses startup
-//! when it encounters an existing nonempty Spawn lifecycle it cannot yet
-//! reconstruct without ambiguity.
+//! A hidden same-binary broker subcommand now read-only scans and uniquely
+//! admits the complete authenticated Spawn catalog before it may reconcile a
+//! valid crash cut or bind its pinned private control socket. Its bounded event
+//! loop authenticates exact guardian, mux, build, connection,
+//! broker-incarnation, and token-derived lineage identities. It still rejects
+//! every PTY effect: the exec-ready child barrier, live WAL receipts, durable
+//! output journal, census, and successor lease rotation must land before any
+//! production selector may start it. The process-local PTY typestate below
+//! therefore still does **not** prove guardian-`SIGKILL` continuity. Catalog
+//! Genesis admission remains durable pre-Spawn intent, never proof that a child
+//! exists, and the current service refuses startup without reconciling when it
+//! encounters an existing nonempty Spawn lifecycle it cannot yet reconstruct
+//! without ambiguity.
 //!
 //! The ordering enforced here is:
 //!
@@ -811,6 +812,18 @@ pub struct BrokerControlServiceConfigV1 {
     poll_interval: Duration,
 }
 
+fn broker_control_path_is_normalized_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path.file_name().is_some()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+}
+
+fn broker_endpoint_overlaps_catalog(endpoint: &Path, catalog: &Path) -> bool {
+    endpoint.starts_with(catalog) || catalog.starts_with(endpoint)
+}
+
 impl BrokerControlServiceConfigV1 {
     pub fn new(
         socket_path: PathBuf,
@@ -830,12 +843,27 @@ impl BrokerControlServiceConfigV1 {
                 "poll_interval must be between one nanosecond and one second",
             ));
         }
+        if !broker_control_path_is_normalized_absolute(&socket_path)
+            || !broker_control_path_is_normalized_absolute(&token_path)
+            || !broker_control_path_is_normalized_absolute(&spawn_catalog_path)
+        {
+            return Err(BrokerControlServiceError::InvalidConfiguration(
+                "broker socket, token, and Spawn catalog paths must be normalized absolute paths",
+            ));
+        }
         if socket_path == token_path
             || socket_path == spawn_catalog_path
             || token_path == spawn_catalog_path
         {
             return Err(BrokerControlServiceError::InvalidConfiguration(
                 "broker socket, token, and Spawn catalog paths must differ",
+            ));
+        }
+        if broker_endpoint_overlaps_catalog(&socket_path, &spawn_catalog_path)
+            || broker_endpoint_overlaps_catalog(&token_path, &spawn_catalog_path)
+        {
+            return Err(BrokerControlServiceError::InvalidConfiguration(
+                "broker socket and token paths must not contain or be contained by the Spawn catalog path",
             ));
         }
         Ok(Self {
@@ -1176,6 +1204,10 @@ impl BrokerRecoveredSpawnCatalogV1 {
     }
 
     fn contains_spawn_lifecycle(&self) -> bool {
+        debug_assert_eq!(self.by_journal_id.len(), self.journals.len());
+        debug_assert_eq!(self.by_durable_pane_id.len(), self.journals.len());
+        debug_assert_eq!(self.by_spawn_effect_id.len(), self.journals.len());
+        debug_assert_eq!(self.by_origin_request_id.len(), self.journals.len());
         self.journals
             .iter()
             .any(|journal| journal.status().phase.is_some())
@@ -1222,22 +1254,15 @@ impl BrokerControlServiceV1 {
             .map_err(|_| BrokerControlServiceError::AuthenticationAuthority)?;
         let broker_lineage_id = spawn_authenticator.lineage_id();
         let spawn_catalog = BrokerSpawnWalCatalogV1::open(config.spawn_catalog_path)?;
-        let recovered_journals = spawn_catalog.recover_all(&spawn_authenticator)?;
-        let recovered_catalog =
+        let recovered_journals = spawn_catalog.scan_all_for_admission(&spawn_authenticator)?;
+        let mut recovered_catalog =
             BrokerRecoveredSpawnCatalogV1::admit(recovered_journals, &spawn_authenticator)?;
         if recovered_catalog.contains_spawn_lifecycle() {
             return Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported);
         }
+        spawn_catalog.reconcile_admitted_and_activate(&mut recovered_catalog)?;
 
         let poll = Poll::new().map_err(|error| BrokerControlServiceError::io("poll", error))?;
-        let (mut listener, socket_authority) = bind_private_unix_listener(&config.socket_path)?;
-        poll.registry()
-            .register(
-                &mut listener,
-                BROKER_CONTROL_LISTENER_TOKEN,
-                Interest::READABLE,
-            )
-            .map_err(|error| BrokerControlServiceError::io("listener-register", error))?;
         let event_capacity = config.max_connections.checked_add(1).ok_or(
             BrokerControlServiceError::InvalidConfiguration("event capacity overflow"),
         )?;
@@ -1271,6 +1296,19 @@ impl BrokerControlServiceV1 {
             .map_err(|_| {
                 BrokerControlServiceError::InvalidConfiguration("Hello receipt allocation failed")
             })?;
+
+        // Bind only after catalog policy and every avoidable fallible
+        // allocation have succeeded. A post-bind permission or registration
+        // failure deliberately retains the exact socket for operator evidence;
+        // ordinary allocation failure must not manufacture a stale endpoint.
+        let (mut listener, socket_authority) = bind_private_unix_listener(&config.socket_path)?;
+        poll.registry()
+            .register(
+                &mut listener,
+                BROKER_CONTROL_LISTENER_TOKEN,
+                Interest::READABLE,
+            )
+            .map_err(|error| BrokerControlServiceError::io("listener-register", error))?;
         Ok(Self {
             poll,
             events,
@@ -2477,6 +2515,22 @@ pub(crate) struct BrokerSpawnWalFilesystemRevalidationV1 {
     observed_head_bytes: u64,
 }
 
+/// Fully preflighted, allocation-free plan for one recovered journal.
+///
+/// Catalog recovery prepares every plan before applying the first one, so a
+/// deterministic failure in a later journal cannot partially reconcile an
+/// earlier journal's durable head.
+struct BrokerSpawnWalRecoveryActivationV1 {
+    authority: BrokerSpawnWalFilesystemRevalidationV1,
+    head: Option<BrokerSpawnWalHeadReconciliationV1>,
+}
+
+struct BrokerSpawnWalHeadReconciliationV1 {
+    encoded: [u8; BROKER_SPAWN_HEAD_RECORD_BYTES],
+    projected_head_bytes: u64,
+    head_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+}
+
 /// Nonduplicable authority to invoke one Spawn callback after durable Attempt.
 #[must_use = "a durable broker Spawn attempt permit must be consumed exactly once"]
 pub struct BrokerSpawnAttemptPermitV1 {
@@ -3447,12 +3501,15 @@ impl BrokerSpawnWalCatalogV1 {
         Ok(journal)
     }
 
-    /// Authenticate, revalidate, and reconcile every complete catalog pair.
+    /// Authenticate and revalidate every complete catalog pair without
+    /// granting append authority or writing either durable file.
     ///
     /// Unknown names, half-pairs, replaced inodes, torn records, key rotation,
-    /// and catalog drift all fail the entire startup before any caller can
-    /// install a partial set of durable Spawn fences.
-    pub(crate) fn recover_all(
+    /// and catalog drift all fail the entire scan before any caller can admit a
+    /// partial set of durable Spawn fences. Cross-journal uniqueness and
+    /// lifecycle policy must be decided before
+    /// [`Self::reconcile_admitted_and_activate`] is called.
+    fn scan_all_for_admission(
         &self,
         authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
     ) -> Result<Vec<BrokerSpawnJournalV1>, BrokerSpawnWalError> {
@@ -3494,11 +3551,13 @@ impl BrokerSpawnWalCatalogV1 {
             if identity.journal_id != *journal_id {
                 return Err(BrokerSpawnWalError::CatalogIdentityMismatch);
             }
-            recovered.push((
-                wal_name.clone(),
-                head_name.clone(),
-                BrokerSpawnJournalV1::open(wal, head, identity, authenticator.clone())?,
-            ));
+            let journal = BrokerSpawnJournalV1::open(wal, head, identity, authenticator.clone())?;
+            // A torn physical tail is preserved by `open`, but it is never an
+            // admissible catalog member. Reject it in this read-only pass so
+            // later lifecycle policy cannot mask the precise corruption and
+            // no earlier WAL-ahead member is reconciled first.
+            journal.require_healthy_for_recovery()?;
+            recovered.push((wal_name.clone(), head_name.clone(), journal));
         }
         if self.scan_pairs()? != pairs {
             return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
@@ -3508,7 +3567,58 @@ impl BrokerSpawnWalCatalogV1 {
         journals
             .try_reserve_exact(recovered.len())
             .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
-        for (wal_name, head_name, mut journal) in recovered {
+        for (wal_name, head_name, journal) in recovered {
+            revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &wal_name,
+                &journal.wal,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+            )?;
+            revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &head_name,
+                &journal.head,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+            )?;
+            journals.push(journal);
+        }
+        if self.scan_pairs()? != pairs {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+        self.validate_pinned_directory()?;
+        Ok(journals)
+    }
+
+    /// Revalidate and reconcile a catalog only after complete cross-journal
+    /// admission and caller-owned lifecycle policy have succeeded.
+    ///
+    /// A valid WAL-ahead crash cut may append one authenticated local-head
+    /// record. No durable write occurs before this explicit transition.
+    fn reconcile_admitted_and_activate(
+        &self,
+        admitted: &mut BrokerRecoveredSpawnCatalogV1,
+    ) -> Result<(), BrokerSpawnWalError> {
+        self.validate_pinned_directory()?;
+        let pairs = self.scan_pairs()?;
+        if pairs.len() != admitted.journals.len()
+            || admitted
+                .journals
+                .iter()
+                .any(|journal| !pairs.contains_key(&journal.identity().journal_id()))
+        {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+
+        let mut activations = Vec::new();
+        activations
+            .try_reserve_exact(admitted.journals.len())
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        for journal in &admitted.journals {
+            let journal_id = journal.identity().journal_id();
+            let wal_name = broker_spawn_catalog_wal_name(journal_id);
+            let head_name = broker_spawn_catalog_head_name(journal_id);
             let wal_identity = revalidate_open_broker_spawn_catalog_file(
                 &self.directory,
                 &wal_name,
@@ -3528,7 +3638,35 @@ impl BrokerSpawnWalCatalogV1 {
                 wal_identity.bytes,
                 head_identity.bytes,
             )?;
-            journal.reconcile_recovered_head_and_activate(authority)?;
+            activations.push(journal.preflight_recovered_head_activation(authority)?);
+        }
+        if self.scan_pairs()? != pairs {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+        self.validate_pinned_directory()?;
+
+        // Every deterministic/global validation, conversion, fixed-size
+        // encoding, and allocation completed in the read-only pass above. No
+        // multi-file atomic transaction exists: later descriptor drift or I/O
+        // can still fail after an earlier head was reconciled, and a short or
+        // ambiguously synchronized write can leave a partial current head.
+        // Reconciliation is append-only, preserves that evidence, and fails
+        // closed; all-or-nothing recovery across I/O faults remains pending.
+        for (journal, activation) in admitted.journals.iter_mut().zip(activations) {
+            journal.apply_recovered_head_activation(activation)?;
+        }
+
+        for journal in &admitted.journals {
+            let journal_id = journal.identity().journal_id();
+            let wal_name = broker_spawn_catalog_wal_name(journal_id);
+            let head_name = broker_spawn_catalog_head_name(journal_id);
+            revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &wal_name,
+                &journal.wal,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+            )?;
             revalidate_open_broker_spawn_catalog_file(
                 &self.directory,
                 &head_name,
@@ -3536,10 +3674,11 @@ impl BrokerSpawnWalCatalogV1 {
                 BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
                 BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
             )?;
-            journals.push(journal);
         }
-        self.validate_pinned_directory()?;
-        Ok(journals)
+        if self.scan_pairs()? != pairs {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+        self.validate_pinned_directory()
     }
 
     fn validate_pinned_directory(&self) -> Result<(), BrokerSpawnWalError> {
@@ -3665,7 +3804,7 @@ impl BrokerSpawnJournalV1 {
         })
     }
 
-    /// Authenticate and reconcile an existing WAL/head pair without granting
+    /// Authenticate and recover an existing WAL/head pair without granting
     /// append authority.
     ///
     /// A complete WAL may be exactly one record ahead of its local head: that
@@ -3801,6 +3940,14 @@ impl BrokerSpawnJournalV1 {
         &mut self,
         authority: BrokerSpawnWalFilesystemRevalidationV1,
     ) -> Result<(), BrokerSpawnWalError> {
+        let activation = self.preflight_recovered_head_activation(authority)?;
+        self.apply_recovered_head_activation(activation)
+    }
+
+    fn preflight_recovered_head_activation(
+        &self,
+        authority: BrokerSpawnWalFilesystemRevalidationV1,
+    ) -> Result<BrokerSpawnWalRecoveryActivationV1, BrokerSpawnWalError> {
         self.require_healthy_for_recovery()?;
         if authority.identity != self.identity {
             return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
@@ -3814,13 +3961,18 @@ impl BrokerSpawnJournalV1 {
         if descriptor_lengths != authoritative_lengths {
             return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
         }
-        if self.head_reconciliation_required {
+        let head = if self.head_reconciliation_required {
             let record = self
                 .records
                 .last()
                 .copied()
                 .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
-            let expected_sequence = u64::try_from(self.records.len() - 1)
+            let terminal_index = self
+                .records
+                .len()
+                .checked_sub(1)
+                .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
+            let expected_sequence = u64::try_from(terminal_index)
                 .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
             if record.receipt.sequence != expected_sequence {
                 return Err(BrokerSpawnWalError::SequenceMismatch);
@@ -3832,28 +3984,65 @@ impl BrokerSpawnJournalV1 {
                 record.receipt.record_mac,
                 self.terminal_head_mac,
             )?;
-            let result = (|| -> std::io::Result<()> {
-                self.head.seek(SeekFrom::Start(self.committed_head_bytes))?;
-                self.head.write_all(&encoded)?;
-                self.head.sync_all()
-            })();
-            if let Err(error) = result {
-                self.poisoned = true;
-                return Err(BrokerSpawnWalError::Io(error));
-            }
-            let head_mac = read_broker_array_32(&encoded[88..120]);
-            self.committed_head_bytes = self
+            let projected_head_bytes = self
                 .committed_head_bytes
                 .checked_add(BROKER_SPAWN_HEAD_RECORD_BYTES_U64)
                 .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
-            self.terminal_head_mac = head_mac;
-            let terminal = self
-                .records
-                .last_mut()
-                .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
-            terminal.receipt.head_mac = head_mac;
-            terminal.receipt.committed_head_bytes = self.committed_head_bytes;
-            self.head_reconciliation_required = false;
+            let head_mac = read_broker_array_32(&encoded[88..120]);
+            Some(BrokerSpawnWalHeadReconciliationV1 {
+                encoded,
+                projected_head_bytes,
+                head_mac,
+            })
+        } else {
+            None
+        };
+        Ok(BrokerSpawnWalRecoveryActivationV1 { authority, head })
+    }
+
+    fn apply_recovered_head_activation(
+        &mut self,
+        activation: BrokerSpawnWalRecoveryActivationV1,
+    ) -> Result<(), BrokerSpawnWalError> {
+        self.require_healthy_for_recovery()?;
+        if activation.authority.identity != self.identity {
+            return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
+        }
+        let authoritative_lengths = (
+            activation.authority.observed_wal_bytes,
+            activation.authority.observed_head_bytes,
+        );
+        let recovered_lengths = (self.committed_wal_bytes, self.committed_head_bytes);
+        if authoritative_lengths != recovered_lengths {
+            return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
+        }
+        let descriptor_lengths = (self.wal.metadata()?.len(), self.head.metadata()?.len());
+        if descriptor_lengths != authoritative_lengths {
+            return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
+        }
+        match (self.head_reconciliation_required, activation.head) {
+            (true, Some(head)) => {
+                let terminal = self
+                    .records
+                    .last_mut()
+                    .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
+                let result = (|| -> std::io::Result<()> {
+                    self.head.seek(SeekFrom::Start(self.committed_head_bytes))?;
+                    self.head.write_all(&head.encoded)?;
+                    self.head.sync_all()
+                })();
+                if let Err(error) = result {
+                    self.poisoned = true;
+                    return Err(BrokerSpawnWalError::Io(error));
+                }
+                self.committed_head_bytes = head.projected_head_bytes;
+                self.terminal_head_mac = head.head_mac;
+                terminal.receipt.head_mac = head.head_mac;
+                terminal.receipt.committed_head_bytes = self.committed_head_bytes;
+                self.head_reconciliation_required = false;
+            }
+            (false, None) => {}
+            _ => return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch),
         }
         self.recovery_append_authority_withheld = false;
         Ok(())
@@ -6480,7 +6669,7 @@ mod tests {
         let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
             .expect("reopen catalog for admission recovery");
         let journals = recovered_catalog
-            .recover_all(authenticator)
+            .scan_all_for_admission(authenticator)
             .expect("recover authenticated header-only catalog journals");
         (recovered_catalog, journals)
     }
@@ -6789,6 +6978,68 @@ mod tests {
             forged_leased_query,
             Err(BrokerControlProtocolError::InvalidShape)
         ));
+    }
+
+    #[test]
+    fn broker_control_config_rejects_non_normalized_or_catalog_overlapping_endpoints() {
+        let root = crate::canonical_test_temp_root().join("broker-control-config-path-contract");
+        let catalog = root.join("spawn-catalog");
+        let socket = root.join("broker.sock");
+        let token = root.join("guardian.token");
+        let config = |socket_path, token_path, spawn_catalog_path| {
+            BrokerControlServiceConfigV1::new(
+                socket_path,
+                token_path,
+                spawn_catalog_path,
+                sealed(0xa0),
+                4,
+                Duration::from_millis(5),
+            )
+        };
+
+        assert!(config(socket.clone(), token.clone(), catalog.clone()).is_ok());
+        assert!(
+            config(
+                root.join("spawn-catalog.sock"),
+                token.clone(),
+                catalog.clone()
+            )
+            .is_ok(),
+            "component-based containment confused a sibling path prefix"
+        );
+        for rejected in [
+            config(catalog.join("broker.sock"), token.clone(), catalog.clone()),
+            config(
+                socket.clone(),
+                catalog.join("guardian.token"),
+                catalog.clone(),
+            ),
+            config(
+                root.join("socket-parent"),
+                token.clone(),
+                root.join("socket-parent").join("spawn-catalog"),
+            ),
+            config(
+                socket.clone(),
+                root.join("token-parent"),
+                root.join("token-parent").join("spawn-catalog"),
+            ),
+            config(
+                PathBuf::from("relative-broker.sock"),
+                token.clone(),
+                catalog.clone(),
+            ),
+            config(
+                root.join("nested").join("..").join("broker.sock"),
+                token.clone(),
+                catalog.clone(),
+            ),
+        ] {
+            assert!(matches!(
+                rejected,
+                Err(BrokerControlServiceError::InvalidConfiguration(_))
+            ));
+        }
     }
 
     #[test]
@@ -7374,11 +7625,8 @@ mod tests {
         assert_ne!(first.spawn_effect_id(), second.spawn_effect_id());
         assert_ne!(first.origin_request_id(), second.origin_request_id());
 
-        let (_first_catalog, mut journals) = recover_header_only_catalog_journals(
-            first_directory.path(),
-            &[first],
-            &authenticator,
-        );
+        let (_first_catalog, mut journals) =
+            recover_header_only_catalog_journals(first_directory.path(), &[first], &authenticator);
         let (_second_catalog, mut second_journals) = recover_header_only_catalog_journals(
             second_directory.path(),
             &[second],
@@ -7458,13 +7706,297 @@ mod tests {
     }
 
     #[test]
+    fn rejected_duplicate_catalog_does_not_reconcile_a_wal_ahead_head() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa7);
+        let first = recovered_catalog_identity(&authenticator, 12);
+        let mut second = recovered_catalog_identity(&authenticator, 13);
+        second.durable_pane_id = first.durable_pane_id();
+        let first_head_path = directory
+            .path()
+            .join(broker_spawn_catalog_head_name(first.journal_id()));
+
+        let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open catalog for rejected-admission crash cut");
+        let mut first_journal = catalog
+            .create_spawn_journal(first, authenticator.clone())
+            .expect("create first catalog journal");
+        first_journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            first_journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        let second_journal = catalog
+            .create_spawn_journal(second, authenticator.clone())
+            .expect("create conflicting second catalog journal");
+        drop(first_journal);
+        drop(second_journal);
+        drop(catalog);
+        let first_head_before_rejection =
+            fs::read(&first_head_path).expect("read unreconciled first head");
+        assert_eq!(
+            u64::try_from(first_head_before_rejection.len()).expect("first head length"),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        );
+
+        let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("reopen conflicting catalog without mutation");
+        let journals = recovered_catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("purely scan conflicting catalog");
+        assert!(matches!(
+            BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateDurablePaneId)
+        ));
+        assert_eq!(
+            fs::read(&first_head_path).expect("read rejected unreconciled first head"),
+            first_head_before_rejection,
+            "catalog rejection changed bytes in a WAL-ahead head"
+        );
+    }
+
+    #[test]
+    fn later_invalid_catalog_pair_does_not_reconcile_an_earlier_wal_ahead_head() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa9);
+        let first = recovered_catalog_identity(&authenticator, 15);
+        let second = recovered_catalog_identity(&authenticator, 16);
+        let first_head_path = directory
+            .path()
+            .join(broker_spawn_catalog_head_name(first.journal_id()));
+        let second_head_path = directory
+            .path()
+            .join(broker_spawn_catalog_head_name(second.journal_id()));
+
+        let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open catalog for two-pass reconciliation test");
+        let mut first_journal = catalog
+            .create_spawn_journal(first, authenticator.clone())
+            .expect("create first catalog journal");
+        first_journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            first_journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        let second_journal = catalog
+            .create_spawn_journal(second, authenticator.clone())
+            .expect("create later catalog journal");
+        drop(first_journal);
+        drop(second_journal);
+        drop(catalog);
+
+        let first_head_before_activation =
+            fs::read(&first_head_path).expect("read first head before activation");
+        assert_eq!(
+            u64::try_from(first_head_before_activation.len()).expect("first head length"),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        );
+
+        let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("reopen catalog for two-pass reconciliation test");
+        let journals = recovered_catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("purely scan both valid catalog pairs");
+        let mut admitted = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("admit both unique catalog pairs");
+        assert_eq!(admitted.journals[0].identity(), first);
+        assert!(admitted.journals[0].status().head_reconciliation_required);
+
+        let mut later_head = OpenOptions::new()
+            .append(true)
+            .open(&second_head_path)
+            .expect("open later head for planted length drift");
+        later_head
+            .write_all(&[0x5a])
+            .expect("plant later head length drift");
+        later_head.sync_all().expect("synchronize planted drift");
+        drop(later_head);
+
+        assert!(matches!(
+            recovered_catalog.reconcile_admitted_and_activate(&mut admitted),
+            Err(BrokerSpawnWalError::FilesystemRevalidationMismatch)
+        ));
+        assert_eq!(
+            fs::read(&first_head_path).expect("read first head after rejected activation"),
+            first_head_before_activation,
+            "a later invalid pair changed bytes in the earlier WAL-ahead head"
+        );
+        assert!(admitted.journals[0].status().head_reconciliation_required);
+        assert!(admitted.journals[0].status().append_authority_withheld);
+    }
+
+    #[test]
+    fn later_torn_lifecycle_tail_is_rejected_before_reconciliation_or_socket_bind() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create broker torn-catalog root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set torn-catalog root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create torn Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set torn Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision torn-catalog token");
+        let secret =
+            crate::transport::load_guardian_secret(&token_path).expect("load torn-catalog token");
+        let authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive torn-catalog WAL authority");
+        let first = recovered_catalog_identity(&authenticator, 17);
+        let second = recovered_catalog_identity(&authenticator, 18);
+        let first_head_path =
+            spawn_catalog_path.join(broker_spawn_catalog_head_name(first.journal_id()));
+        let second_wal_path =
+            spawn_catalog_path.join(broker_spawn_catalog_wal_name(second.journal_id()));
+
+        let catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
+            .expect("open catalog for torn-tail admission test");
+        let mut first_journal = catalog
+            .create_spawn_journal(first, authenticator.clone())
+            .expect("create first WAL-ahead journal");
+        first_journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            first_journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        let mut second_journal = catalog
+            .create_spawn_journal(second, authenticator)
+            .expect("create later torn journal");
+        second_journal
+            .append_intent_and_sync()
+            .expect("commit later lifecycle prefix");
+        drop(first_journal);
+        drop(second_journal);
+        drop(catalog);
+
+        let first_head_before =
+            fs::read(&first_head_path).expect("read first head before rejected bind");
+        let second_wal_before_tail = fs::metadata(&second_wal_path)
+            .expect("read second WAL metadata before torn tail")
+            .len();
+        let mut external = OpenOptions::new()
+            .append(true)
+            .open(&second_wal_path)
+            .expect("open later WAL for torn tail");
+        external
+            .write_all(&BROKER_SPAWN_WAL_RECORD_MAGIC[..3])
+            .expect("append later incomplete WAL tail");
+        external.sync_all().expect("synchronize later torn tail");
+        drop(external);
+
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path,
+            spawn_catalog_path,
+            sealed(0xaa),
+            4,
+            Duration::from_millis(5),
+        )
+        .expect("valid torn-catalog service config");
+        assert!(matches!(
+            BrokerControlServiceV1::bind(config),
+            Err(BrokerControlServiceError::SpawnCatalog(
+                BrokerSpawnWalError::IncompleteTail
+            ))
+        ));
+        assert_eq!(
+            fs::read(&first_head_path).expect("read first head after rejected bind"),
+            first_head_before,
+            "a later torn member reconciled the earlier WAL-ahead head"
+        );
+        assert_eq!(
+            fs::metadata(&second_wal_path)
+                .expect("read retained torn WAL metadata")
+                .len(),
+            second_wal_before_tail + 3,
+            "pure admission scan changed the retained torn-tail evidence"
+        );
+        assert!(
+            !socket_path.exists(),
+            "torn catalog bound a broker socket before rejection"
+        );
+    }
+
+    #[test]
+    fn broker_service_refuses_recovered_lifecycle_before_head_reconciliation_or_socket_bind() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create broker lifecycle-refusal root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set lifecycle-refusal root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create lifecycle-refusal Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set lifecycle-refusal Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision lifecycle-refusal token");
+        let secret = crate::transport::load_guardian_secret(&token_path)
+            .expect("load lifecycle-refusal token");
+        let authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive lifecycle-refusal WAL authority");
+        let identity = recovered_catalog_identity(&authenticator, 14);
+        let head_path =
+            spawn_catalog_path.join(broker_spawn_catalog_head_name(identity.journal_id()));
+        let catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
+            .expect("open lifecycle-refusal catalog");
+        let mut journal = catalog
+            .create_spawn_journal(identity, authenticator)
+            .expect("create lifecycle-refusal journal");
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(journal);
+        drop(catalog);
+        let head_before_refusal =
+            fs::read(&head_path).expect("read lifecycle-refusal head before bind");
+        assert_eq!(
+            u64::try_from(head_before_refusal.len()).expect("lifecycle-refusal head length"),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        );
+
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path,
+            spawn_catalog_path,
+            sealed(0xa8),
+            4,
+            Duration::from_millis(5),
+        )
+        .expect("valid lifecycle-refusal service config");
+        assert!(matches!(
+            BrokerControlServiceV1::bind(config),
+            Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported)
+        ));
+        assert_eq!(
+            fs::read(&head_path).expect("read lifecycle-refusal head after bind"),
+            head_before_refusal,
+            "unsupported lifecycle changed durable head bytes before refusal"
+        );
+        assert!(
+            !socket_path.exists(),
+            "unsupported lifecycle bound a broker socket before refusal"
+        );
+    }
+
+    #[test]
     fn pinned_catalog_reconciles_wal_ahead_of_head_without_second_spawn_authority() {
         let directory = private_catalog_directory();
         let sentinel = directory.path().join("unused-spawn-sentinel");
         let authority = authority(id(880), id(881), id(882), id(883), 0x81, 0x82);
         let payload = command_payload("printf unexpected", &sentinel);
-        let identity = wal_identity(binding_for(&payload, &authority));
         let authenticator = wal_authenticator(0x91);
+        let identity = BrokerSpawnWalIdentityV1::from_binding(
+            id(900),
+            authenticator.lineage_id(),
+            binding_for(&payload, &authority),
+        )
+        .expect("valid token-lineage broker WAL identity");
         let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("open empty pinned broker catalog");
         let mut journal = catalog
@@ -7485,11 +8017,16 @@ mod tests {
 
         let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("reopen exact pinned broker catalog");
-        let mut journals = recovered_catalog
-            .recover_all(&authenticator)
-            .expect("authenticate and reconcile complete catalog");
-        assert_eq!(journals.len(), 1);
-        let mut recovered = journals.pop().expect("one recovered journal");
+        let journals = recovered_catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("authenticate complete catalog before admission");
+        let mut admitted = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("admit the complete unique catalog before reconciliation");
+        recovered_catalog
+            .reconcile_admitted_and_activate(&mut admitted)
+            .expect("reconcile the admitted complete catalog");
+        assert_eq!(admitted.journals.len(), 1);
+        let mut recovered = admitted.journals.pop().expect("one recovered journal");
         let status = recovered.status();
         assert_eq!(status.identity, identity);
         assert_eq!(status.phase, Some(BrokerSpawnWalPhaseV1::Attempted));
@@ -7566,7 +8103,7 @@ mod tests {
         .expect("create hard-link mutation");
         drop(journal);
         assert!(matches!(
-            catalog.recover_all(&authenticator),
+            catalog.scan_all_for_admission(&authenticator),
             Err(BrokerSpawnWalError::UnexpectedCatalogEntry
                 | BrokerSpawnWalError::InsecureCatalogIdentity)
         ));

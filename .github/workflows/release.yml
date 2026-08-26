@@ -373,10 +373,14 @@ jobs:
             --root "$STAGING" \
             --manifest "$MANIFEST"
 
-          tar -C "$STAGING" -cJf "dist/${{ matrix.asset }}.tar.xz" \
+          # macOS bsdtar otherwise synthesizes ._* AppleDouble members that
+          # violate the installer's exact five-member archive contract.
+          COPYFILE_DISABLE=1 tar -C "$STAGING" -cJf "dist/${{ matrix.asset }}.tar.xz" \
             ft frankenterm-mux-server frankenterm-pty-guardian verify-components.sh \
             "${{ matrix.asset }}.component-manifest.json"
           archive_entries="$(tar -tJf "dist/${{ matrix.asset }}.tar.xz")"
+          test "$(wc -l <<<"$archive_entries" | tr -d '[:space:]')" = 5
+          ! grep -E '(^|/)\._' <<<"$archive_entries"
           grep -Fxq ft <<<"$archive_entries"
           grep -Fxq frankenterm-mux-server <<<"$archive_entries"
           grep -Fxq frankenterm-pty-guardian <<<"$archive_entries"
@@ -385,21 +389,42 @@ jobs:
           archive_checksum="$(shasum -a 256 "dist/${{ matrix.asset }}.tar.xz" | awk '{print $1}')"
           install_probe="$RUNNER_TEMP/frankenterm-release-install-${{ matrix.asset }}"
           mkdir "$install_probe"
-          bash install.sh \
+          install_output="$(bash install.sh \
             --offline "dist/${{ matrix.asset }}.tar.xz" \
             --checksum "$archive_checksum" \
             --dest "$install_probe" \
             --no-app \
             --no-gum \
-            --quiet
-          cmp "$STAGING/ft" "$install_probe/ft"
+            --quiet)"
+          printf '%s\n' "$install_output"
+          candidate_root="$(python3 - "$install_probe" "$install_output" <<'PY'
+          import json, os, re, sys
+
+          destination, output = sys.argv[1:]
+          prefix = "FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1="
+          records = [line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)]
+          if len(records) != 1:
+              raise SystemExit("installer did not emit one exact process-family receipt")
+          receipt = json.loads(records[0])
+          generation = receipt.get("candidate_generation", "")
+          expected_root = os.path.join(
+              os.path.abspath(destination), ".frankenterm-process-family", "generations", generation,
+          )
+          if (receipt.get("activation") != "pending" or
+                  re.fullmatch(r"[0-9a-f]{64}", generation) is None or
+                  receipt.get("candidate_root") != expected_root):
+              raise SystemExit("release probe received an unsafe or activated candidate receipt")
+          print(expected_root)
+          PY
+          )"
+          cmp "$STAGING/ft" "$candidate_root/ft"
           cmp "$STAGING/frankenterm-mux-server" \
-            "$install_probe/frankenterm-mux-server"
+            "$candidate_root/frankenterm-mux-server"
           cmp "$STAGING/frankenterm-pty-guardian" \
-            "$install_probe/frankenterm-pty-guardian"
-          "$install_probe/ft" --version
-          "$install_probe/frankenterm-mux-server" --version
-          "$install_probe/frankenterm-pty-guardian" --version
+            "$candidate_root/frankenterm-pty-guardian"
+          "$candidate_root/ft" --version
+          "$candidate_root/frankenterm-mux-server" --version
+          "$candidate_root/frankenterm-pty-guardian" --version
           cd dist
           shasum -a 256 "${{ matrix.asset }}.tar.xz" > "${{ matrix.asset }}.tar.xz.sha256"
 
@@ -488,11 +513,23 @@ jobs:
             FrankenTerm.app FrankenTerm.app.component-manifest.json
           cd ../dist
           app_archive_entries="$(tar -tJf FrankenTerm-darwin-arm64.app.tar.xz)"
-          grep -Fxq FrankenTerm.app <<<"$app_archive_entries"
-          grep -Fxq FrankenTerm.app.component-manifest.json <<<"$app_archive_entries"
+          test "$(grep -Fxc 'FrankenTerm.app/' <<<"$app_archive_entries")" = 1
+          test "$(grep -Fxc FrankenTerm.app.component-manifest.json <<<"$app_archive_entries")" = 1
+          ! grep -E '(^|/)\._' <<<"$app_archive_entries"
           APP_PROBE="$RUNNER_TEMP/frankenterm-release-app-install"
-          mkdir "$APP_PROBE"
-          tar -xJf FrankenTerm-darwin-arm64.app.tar.xz -C "$APP_PROBE"
+          mkdir -m 0700 "$APP_PROBE"
+          app_archive="$PWD/FrankenTerm-darwin-arm64.app.tar.xz"
+          app_archive_checksum="$(shasum -a 256 "$app_archive" | awk '{print $1}')"
+          export FT_INSTALL_TEST_LIBRARY_ONLY=1
+          # Source and execute the exact production checksum/extractor seam.
+          # This release gate must not substitute raw tar extraction for the
+          # descriptor-pinned namespace policy used by end users.
+          source "$GITHUB_WORKSPACE/install.sh"
+          QUIET=1
+          HAS_GUM=0
+          verify_checksum "$app_archive" "$app_archive_checksum"
+          extract_authenticated_archive "$app_archive" "$APP_PROBE" app \
+            FrankenTerm.app.component-manifest.json "$VERIFIED_ARCHIVE_IDENTITY"
           bash "../$STANDALONE_STAGING/verify-components.sh" verify \
             --root "$APP_PROBE/FrankenTerm.app" \
             --manifest "$APP_PROBE/FrankenTerm.app.component-manifest.json"

@@ -87208,11 +87208,30 @@ validate_destination() {{
   test "$(stat -c %u -- "$destination")" = "$(id -u)" || return 1
   test "$(stat -c %a -- "$destination")" = 700 || return 1
 }}
+select_component_root() {{
+  generations="$destination/.frankenterm-process-family/generations"
+  test -d "$generations" && test ! -L "$generations" || return 1
+  component_root=""
+  component_count=0
+  for candidate in "$generations"/*; do
+    test -e "$candidate" || continue
+    candidate_name=${{candidate##*/}}
+    test "${{#candidate_name}}" = 64 || continue
+    case "$candidate_name" in *[!0-9a-f]*) continue ;; esac
+    test -d "$candidate" && test ! -L "$candidate" || return 1
+    test "$(stat -c %u -- "$candidate")" = "$(id -u)" || return 1
+    test "$(stat -c %a -- "$candidate")" = 555 || return 1
+    component_root="$candidate"
+    component_count=$((component_count + 1))
+  done
+  test "$component_count" = 1
+}}
 emit_receipt() {{
   validate_destination || return 1
-  ft_path="$destination/ft"
-  mux_path="$destination/frankenterm-mux-server"
-  guardian_path="$destination/frankenterm-pty-guardian"
+  select_component_root || return 1
+  ft_path="$component_root/ft"
+  mux_path="$component_root/frankenterm-mux-server"
+  guardian_path="$component_root/frankenterm-pty-guardian"
   test -f "$ft_path" && test ! -L "$ft_path" || return 1
   test -f "$mux_path" && test ! -L "$mux_path" || return 1
   test -f "$guardian_path" && test ! -L "$guardian_path" || return 1
@@ -87225,9 +87244,9 @@ emit_receipt() {{
   ft_mode=$(stat -c %a -- "$ft_path") || return 1
   mux_mode=$(stat -c %a -- "$mux_path") || return 1
   guardian_mode=$(stat -c %a -- "$guardian_path") || return 1
-  test "$ft_mode" = 500 || test "$ft_mode" = 755 || return 1
-  test "$mux_mode" = 500 || test "$mux_mode" = 755 || return 1
-  test "$guardian_mode" = 500 || test "$guardian_mode" = 755 || return 1
+  test "$ft_mode" = 500 || test "$ft_mode" = 555 || test "$ft_mode" = 755 || return 1
+  test "$mux_mode" = 500 || test "$mux_mode" = 555 || test "$mux_mode" = 755 || return 1
+  test "$guardian_mode" = 500 || test "$guardian_mode" = 555 || test "$guardian_mode" = 755 || return 1
   ft_bytes=$(stat -c %s -- "$ft_path") || return 1
   mux_bytes=$(stat -c %s -- "$mux_path") || return 1
   guardian_bytes=$(stat -c %s -- "$guardian_path") || return 1
@@ -108651,7 +108670,10 @@ log_level = "debug"
         assert!(command.contains("install-v0.15.2-0123456789abcdef0123456789abcdef-$$"));
         assert!(command.contains("mkdir \"$destination\""));
         assert!(command.contains("FT_RELEASE_COMPONENT_RECEIPT_V2=v0.15.2"));
-        assert!(command.contains("$destination/frankenterm-pty-guardian"));
+        assert!(command.contains("$component_root/frankenterm-pty-guardian"));
+        assert!(command.contains("select_component_root"));
+        assert!(command.contains("test \"$component_count\" = 1"));
+        assert!(command.contains("test \"$guardian_mode\" = 555"));
         assert!(command.contains("stat -c %s"));
         assert!(command.contains("sha256sum"));
     }
@@ -108681,11 +108703,12 @@ while test "$#" -gt 0; do
 done
 test "$saw_force" = 1
 test -n "$destination"
-mkdir -p "$destination"
-printf '#!/bin/sh\nexit 0\n' > "$destination/ft"
-printf '#!/bin/sh\nexit 0\n' > "$destination/frankenterm-mux-server"
-printf '#!/bin/sh\nexit 0\n' > "$destination/frankenterm-pty-guardian"
-chmod 0755 "$destination/ft" "$destination/frankenterm-mux-server" "$destination/frankenterm-pty-guardian"
+generation="$destination/.frankenterm-process-family/generations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+mkdir -p "$generation"
+printf '#!/bin/sh\nexit 0\n' > "$generation/ft"
+printf '#!/bin/sh\nexit 0\n' > "$generation/frankenterm-mux-server"
+printf '#!/bin/sh\nexit 0\n' > "$generation/frankenterm-pty-guardian"
+chmod 0555 "$generation/ft" "$generation/frankenterm-mux-server" "$generation/frankenterm-pty-guardian" "$generation"
 "#,
         )
         .expect("write fake release installer");
@@ -108948,11 +108971,31 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
         scratch: &Path,
         failpoint: Option<&str>,
     ) -> std::process::Output {
+        run_installer_family_function_with_mux_state(
+            installer,
+            family,
+            destination,
+            scratch,
+            failpoint,
+            "inactive",
+        )
+    }
+
+    #[cfg(unix)]
+    fn run_installer_family_function_with_mux_state(
+        installer: &Path,
+        family: &InstallerTestFamily,
+        destination: &Path,
+        scratch: &Path,
+        failpoint: Option<&str>,
+        mux_state: &str,
+    ) -> std::process::Output {
         std::fs::create_dir_all(destination).expect("create installer destination");
         std::fs::create_dir_all(scratch).expect("create installer shell scratch");
         let failpoint = failpoint.unwrap_or("");
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\ninstall_process_family {} {} {} {} {}\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_MUX_OWNERSHIP_STATE={}\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\ninstall_process_family {} {} {} {} {}\nemit_process_family_receipt\n",
+            shell_single_quote(mux_state),
             shell_single_quote(&installer.to_string_lossy()),
             shell_single_quote(&destination.to_string_lossy()),
             shell_single_quote(&scratch.to_string_lossy()),
@@ -108974,6 +109017,37 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             .arg(script)
             .output()
             .expect("execute production installer family function")
+    }
+
+    #[cfg(unix)]
+    fn parse_installer_process_family_receipt(stdout: &[u8]) -> serde_json::Value {
+        let stdout = std::str::from_utf8(stdout).expect("installer receipt is UTF-8");
+        let prefix = "FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=";
+        let records = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "installer must emit one exact receipt");
+        serde_json::from_str(records[0]).expect("installer receipt is canonical JSON")
+    }
+
+    #[cfg(unix)]
+    fn activate_installer_test_generation(destination: &Path, family: &InstallerTestFamily) {
+        use std::os::unix::fs::symlink;
+
+        let managed = destination.join(".frankenterm-process-family");
+        symlink(
+            Path::new("generations").join(&family.generation_id),
+            managed.join("current"),
+        )
+        .expect("plant managed test selector");
+        for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+            symlink(
+                Path::new(".frankenterm-process-family/current").join(name),
+                destination.join(name),
+            )
+            .expect("plant managed test entrypoint");
+        }
     }
 
     #[cfg(unix)]
@@ -109120,6 +109194,7 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             .to_string();
         let archive = root.join("FrankenTerm-darwin-arm64.app.tar.xz");
         let archived = std::process::Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
             .arg("-cJf")
             .arg(&archive)
             .arg("-C")
@@ -109154,6 +109229,10 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             &curl,
             r#"#!/bin/sh
 set -eu
+if test "${1:-}" = --help; then
+  printf '%s\n' '     --max-filesize <bytes>  Maximum file size to download'
+  exit 0
+fi
 output=""
 url=""
 while test "$#" -gt 0; do
@@ -109201,14 +109280,20 @@ esac
         let test_path = format!("{}:{inherited_path}", fake_tools.display());
         let failpoint = failpoint.unwrap_or("");
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_CHECKSUM=0\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_SIGSTORE=1\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\n",
             shell_single_quote(&installer.to_string_lossy()),
             shell_single_quote(&destination.to_string_lossy()),
             shell_single_quote(&scratch.to_string_lossy()),
             shell_single_quote(&app_destination.to_string_lossy()),
             shell_single_quote(&selected_manifest.to_string_lossy()),
             shell_single_quote(&family.verifier.to_string_lossy()),
-            shell_single_quote(&destination.join("ft").to_string_lossy()),
+            shell_single_quote(
+                &destination
+                    .join(".frankenterm-process-family/generations")
+                    .join(&family.generation_id)
+                    .join("ft")
+                    .to_string_lossy()
+            ),
             if failpoint.is_empty() && tree_fail_after_files.is_none() {
                 "0"
             } else {
@@ -109221,14 +109306,114 @@ esac
             .arg("-c")
             .arg(script)
             .env("PATH", test_path)
+            .env("COPYFILE_DISABLE", "1")
             .env("FAKE_APP_ARCHIVE", &app.archive)
             .env("FAKE_APP_CHECKSUM", &app.checksum)
             .output()
             .expect("execute production installer app function")
     }
 
+    #[cfg(unix)]
+    fn create_adversarial_installer_archive(path: &Path, case_name: &str) {
+        let program = r#"
+import io
+import sys
+import tarfile
+
+path, case_name = sys.argv[1:]
+
+def add_directory(archive, name):
+    member = tarfile.TarInfo(name)
+    member.type = tarfile.DIRTYPE
+    member.mode = 0o755
+    archive.addfile(member)
+
+def add_file(archive, name, payload=b"x"):
+    member = tarfile.TarInfo(name)
+    member.mode = 0o644
+    member.size = len(payload)
+    archive.addfile(member, io.BytesIO(payload))
+
+with tarfile.open(path, "w") as archive:
+    if case_name == "traversal":
+        add_file(archive, "../escaped")
+    elif case_name == "appledouble":
+        add_directory(archive, "FrankenTerm.app")
+        add_file(archive, "FrankenTerm.app/Contents/._Info.plist")
+        add_file(archive, "FrankenTerm.app.component-manifest.json", b"{}")
+    elif case_name == "symlink-ancestor":
+        add_directory(archive, "FrankenTerm.app")
+        member = tarfile.TarInfo("FrankenTerm.app/Contents")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "."
+        archive.addfile(member)
+        add_file(archive, "FrankenTerm.app/Contents/payload")
+        add_file(archive, "FrankenTerm.app.component-manifest.json", b"{}")
+    elif case_name == "hardlink":
+        add_directory(archive, "FrankenTerm.app")
+        add_file(archive, "FrankenTerm.app/original")
+        member = tarfile.TarInfo("FrankenTerm.app/hardlink")
+        member.type = tarfile.LNKTYPE
+        member.linkname = "FrankenTerm.app/original"
+        archive.addfile(member)
+        add_file(archive, "FrankenTerm.app.component-manifest.json", b"{}")
+    elif case_name == "duplicate":
+        add_directory(archive, "FrankenTerm.app")
+        add_file(archive, "FrankenTerm.app/duplicate", b"first")
+        add_file(archive, "FrankenTerm.app/duplicate", b"second")
+        add_file(archive, "FrankenTerm.app.component-manifest.json", b"{}")
+    elif case_name == "absolute-symlink":
+        add_directory(archive, "FrankenTerm.app")
+        member = tarfile.TarInfo("FrankenTerm.app/escape")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "/tmp"
+        archive.addfile(member)
+        add_file(archive, "FrankenTerm.app.component-manifest.json", b"{}")
+    else:
+        raise SystemExit("unknown adversarial archive case")
+"#;
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(program)
+            .arg(path)
+            .arg(case_name)
+            .output()
+            .expect("create adversarial installer archive");
+        assert!(
+            output.status.success(),
+            "failed to create {case_name} archive: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn run_authenticated_installer_extractor(
+        installer: &Path,
+        archive: &Path,
+        extraction_root: &Path,
+    ) -> std::process::Output {
+        use sha2::Digest as _;
+
+        let checksum = hex::encode(sha2::Sha256::digest(
+            std::fs::read(archive).expect("read adversarial archive"),
+        ));
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nverify_checksum {} {}\nextract_authenticated_archive {} {} app FrankenTerm.app.component-manifest.json \"$VERIFIED_ARCHIVE_IDENTITY\"\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&checksum),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&extraction_root.to_string_lossy()),
+        );
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute production authenticated extractor")
+    }
+
     #[test]
-    fn top_level_installer_seals_and_switches_one_exact_triplet_generation() {
+    fn top_level_installer_seals_and_publishes_one_exact_triplet_generation() {
         let installer = include_str!("../../../install.sh");
         let active_start = installer
             .find("install_process_family() {")
@@ -109254,32 +109439,46 @@ esac
         assert!(active.contains("stage_name=\".generation-${generation_id}.installing\""));
         assert!(!active.contains("stage_name=\".generation-${generation_id}.installing-$$\""));
         assert!(active.contains("validate_installer_stage_inventory \"$stage\" generation"));
-        let mux_entry = active
-            .find("publish_stable_entrypoint \"$helper\" frankenterm-mux-server")
-            .expect("mux entrypoint");
-        let guardian_entry = active
-            .find("publish_stable_entrypoint \"$helper\" frankenterm-pty-guardian")
-            .expect("guardian entrypoint");
-        let ft_entry = active
-            .find("publish_stable_entrypoint \"$helper\" ft")
-            .expect("ft entrypoint");
-        let selector_switch = active
-            .find("\"$stage_id\" \"$current_id\" exchange")
-            .expect("single selector exchange");
-        assert!(
-            mux_entry < guardian_entry && guardian_entry < ft_entry && ft_entry < selector_switch
-        );
-        let initial_selector = active
-            .find("installer_failpoint before-initial-selector")
-            .expect("first-install selector boundary");
-        assert!(ft_entry < initial_selector);
+        let inactive_mux_census = active
+            .find("require_no_live_mux_for_initial_selector")
+            .expect("fail-closed initial-selector mux census");
+        let pending_boundary = active
+            .find("installer_failpoint before-pending-publication-receipt")
+            .expect("pending-candidate receipt boundary");
+        let pending_receipt = active
+            .find("PENDING_PROCESS_FAMILY_GENERATION=\"$generation_id\"")
+            .expect("pending-candidate receipt");
+        assert!(inactive_mux_census < pending_boundary && pending_boundary < pending_receipt);
+        assert!(active.contains(
+            "Activation is pending; the existing process-family selector and live mux were left unchanged"
+        ));
+        assert!(active.contains("Only the future cross-launcher activation transaction may"));
+        assert!(active.contains("installer_failpoint after-legacy-recovery-publish"));
+        assert!(!active.contains("publish_stable_entrypoint"));
+        assert!(!active.contains("before-initial-selector"));
+        assert!(!active.contains("after-initial-selector"));
+        assert!(!active.contains("before-selector-switch"));
+        assert!(!active.contains("after-selector-switch"));
+        assert!(!active.contains(" exchange"));
         assert!(active.contains("[ ! -e \"$DEST/$name\" ] || return 1"));
-        assert!(active.contains("fsync_installer_directory \"$DEST\""));
-        assert!(active.contains("A first-install retry may encounter an exact managed link"));
         assert!(active.contains(
             "verify_canonical_generation \"$generation\" \"$version\" \"$verifier_source\""
         ));
-        assert!(active.contains("Previous generations and displaced entrypoints were retained"));
+        assert!(active.contains(
+            "All previous generations and entrypoint authority were retained for recovery"
+        ));
+
+        let census_start = installer
+            .find("require_no_live_mux_for_initial_selector() {")
+            .expect("initial-selector census gate");
+        let census_end = installer[census_start..]
+            .find("\n}\n\nensure_staged_symlink()")
+            .map(|offset| census_start + offset)
+            .expect("initial-selector census gate end");
+        let census = &installer[census_start..census_end];
+        assert!(census.contains("inactive-census-without-shared-launcher-lease"));
+        assert!(census.contains("A process census is evidence, not an exclusion primitive"));
+        assert!(census.trim_end().ends_with("return 1"));
 
         assert!(installer.contains("fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"));
         assert!(installer.contains("The permanent lock inode is never unlinked"));
@@ -109304,6 +109503,87 @@ esac
             .find("install_process_family \"$BIN\" \"$MUX_BIN\" \"$GUARDIAN_BIN\"")
             .expect("offline archive triplet installation");
         assert!(offline_verification < offline_install);
+        assert!(installer.contains("--no-verify) NO_SIGSTORE=1; shift ;;"));
+        assert!(!installer.contains("NO_CHECKSUM"));
+        assert!(installer.contains(
+            "Existing ft path detected; it will not be executed before authenticated family verification"
+        ));
+        assert!(!installer.contains("current=$(\"$DEST/ft\" --version"));
+        assert!(!installer.contains("RESOLVED_VERSION=$(\"$DEST/ft\" --version"));
+        assert!(installer.contains("RESOLVED_VERSION=\"ft $PUBLISHED_PROCESS_FAMILY_VERSION\""));
+        assert!(
+            installer.contains("ensure_exact_staged_file \"$OFFLINE_TARBALL\" \"$TMP/$TAR\" 0400")
+        );
+        assert!(!installer.contains("cp \"$OFFLINE_TARBALL\" \"$TMP/$TAR\""));
+
+        let prebuilt_start = installer
+            .find("# The archive-provided verifier is executable code")
+            .expect("externally authenticated prebuilt install path");
+        let prebuilt_end = installer[prebuilt_start..]
+            .find("\n  BIN=\"$PACKAGE_ROOT/ft\"")
+            .map(|offset| prebuilt_start + offset)
+            .expect("prebuilt component-verification boundary");
+        let prebuilt = &installer[prebuilt_start..prebuilt_end];
+        let checksum_authority = prebuilt
+            .find("verify_archive_checksum_authority \"$TMP/$TAR\" \"$TAR\"")
+            .expect("mandatory external SHA-256 authority");
+        assert!(installer.contains("--proto '=https' --proto-redir '=https' --max-time 30"));
+        let streaming_extraction = prebuilt
+            .find("extract_authenticated_archive \"$TMP/$TAR\" \"$PACKAGE_ROOT\" process-family")
+            .expect("bounded authenticated archive extraction");
+        let component_verification = prebuilt
+            .find("bash \"$COMPONENT_VERIFIER\" verify")
+            .expect("post-extraction component verification");
+        assert!(checksum_authority < streaming_extraction);
+        assert!(streaming_extraction < component_verification);
+        assert!(!prebuilt.contains("tar -x"));
+        assert!(!prebuilt.contains("tar xf"));
+        assert!(!prebuilt.contains("tar xJf"));
+
+        let extractor_start = installer
+            .find("extract_authenticated_archive() {")
+            .expect("authenticated extractor function");
+        let extractor_end = installer[extractor_start..]
+            .find("\n}\n\nverify_sigstore_bundle()")
+            .map(|offset| extractor_start + offset)
+            .expect("authenticated extractor function end");
+        let extractor = &installer[extractor_start..extractor_end];
+        assert_eq!(
+            extractor
+                .matches("tarfile.open(fileobj=raw, mode=\"r|*\")")
+                .count(),
+            2,
+            "archive inventory and extraction must use two bounded streaming passes"
+        );
+        assert_eq!(extractor.matches("for member in archive:").count(), 2);
+        assert!(!extractor.contains("getmembers("));
+        assert!(!extractor.contains("extractall("));
+
+        let release_workflow = include_str!("../../../.github/workflows/release.yml");
+        let standalone_archive_start = release_workflow
+            .find("# macOS bsdtar otherwise synthesizes ._* AppleDouble members")
+            .expect("standalone release archive contract");
+        let standalone_archive_end = release_workflow[standalone_archive_start..]
+            .find("\n\n      - name: Bundle + checksum macOS .app")
+            .map(|offset| standalone_archive_start + offset)
+            .expect("standalone release archive contract end");
+        let standalone_archive =
+            &release_workflow[standalone_archive_start..standalone_archive_end];
+        let archive_creation = standalone_archive
+            .find("COPYFILE_DISABLE=1 tar -C \"$STAGING\" -cJf")
+            .expect("AppleDouble-disabled standalone archive creation");
+        let archive_inventory = standalone_archive
+            .find("archive_entries=\"$(tar -tJf")
+            .expect("standalone archive inventory");
+        let exact_count = standalone_archive
+            .find("test \"$(wc -l <<<\"$archive_entries\" | tr -d '[:space:]')\" = 5")
+            .expect("exact five-entry standalone archive assertion");
+        let no_appledouble = standalone_archive
+            .find("! grep -E '(^|/)\\._' <<<\"$archive_entries\"")
+            .expect("AppleDouble rejection assertion");
+        assert!(archive_creation < archive_inventory);
+        assert!(archive_inventory < exact_count && exact_count < no_appledouble);
+        assert_eq!(standalone_archive.matches("grep -Fxq ").count(), 5);
 
         let app_start = installer
             .find("install_macos_app() {")
@@ -109402,16 +109682,10 @@ esac
         );
 
         let initial_failpoints = [
-            ("after-generation-publish", false),
-            ("after-mux-entrypoint", false),
-            ("after-guardian-entrypoint", false),
-            ("after-ft-entrypoint", false),
-            ("before-initial-selector", false),
-            ("after-initial-selector", true),
-            ("before-selector-switch", true),
-            ("after-selector-switch", true),
+            "after-generation-publish",
+            "before-pending-publication-receipt",
         ];
-        for (index, (failpoint, activated)) in initial_failpoints.into_iter().enumerate() {
+        for (index, failpoint) in initial_failpoints.into_iter().enumerate() {
             let destination = fixture.path().join(format!("initial-{index}-{failpoint}"));
             std::fs::create_dir(&destination).expect("create initial-install destination");
             std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
@@ -109438,14 +109712,7 @@ esac
                     std::fs::read(new_family.root.join(name)).expect("read source family member")
                 );
             }
-            if activated {
-                assert!(
-                    family_bytes_match(&destination, &new_family),
-                    "{failpoint} exposed anything except the complete new family"
-                );
-            } else {
-                assert_initial_family_is_uniformly_unavailable(&destination);
-            }
+            assert_initial_family_is_uniformly_unavailable(&destination);
             assert!(
                 installer_residue_count(&destination) <= 1,
                 "{failpoint} leaked an unbounded or forked installer stage"
@@ -109466,21 +109733,29 @@ esac
                     "initial-install retry after {failpoint} failed: {}",
                     String::from_utf8_lossy(&replay.stderr)
                 );
-                assert!(family_bytes_match(&destination, &new_family));
+                let receipt = parse_installer_process_family_receipt(&replay.stdout);
+                assert_eq!(receipt["activation"], "pending");
+                assert_eq!(receipt["active_authority"], "none");
+                assert!(receipt["active_root"].is_null());
+                assert_eq!(
+                    receipt["pending_reason"],
+                    "inactive-census-without-shared-launcher-lease"
+                );
+                assert_eq!(
+                    receipt["candidate_generation"],
+                    new_family.generation_id.as_str()
+                );
+                assert_initial_family_is_uniformly_unavailable(&destination);
                 assert!(installer_residue_count(&destination) <= 1);
             }
         }
 
         let legacy_failpoints = [
-            ("after-generation-publish", false),
-            ("after-legacy-selector", false),
-            ("after-mux-entrypoint", false),
-            ("after-guardian-entrypoint", false),
-            ("after-ft-entrypoint", false),
-            ("before-selector-switch", false),
-            ("after-selector-switch", true),
+            "after-generation-publish",
+            "after-legacy-recovery-publish",
+            "before-pending-publication-receipt",
         ];
-        for (index, (failpoint, activated)) in legacy_failpoints.into_iter().enumerate() {
+        for (index, failpoint) in legacy_failpoints.into_iter().enumerate() {
             let destination = fixture.path().join(format!("legacy-{index}-{failpoint}"));
             std::fs::create_dir(&destination).expect("create legacy-install destination");
             std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
@@ -109508,14 +109783,21 @@ esac
                 String::from_utf8_lossy(&interrupted.stderr)
             );
             assert!(
-                if activated {
-                    family_bytes_match(&destination, &new_family)
-                } else {
-                    family_bytes_match(&destination, &old_family)
-                },
-                "legacy failpoint {failpoint} exposed a mixed process family"
+                family_bytes_match(&destination, &old_family),
+                "legacy failpoint {failpoint} changed the live process family"
             );
             assert!(installer_residue_count(&destination) <= 4);
+            let candidate = destination
+                .join(".frankenterm-process-family/generations")
+                .join(&new_family.generation_id);
+            for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+                assert_eq!(
+                    std::fs::read(candidate.join(name))
+                        .expect("read immutable pending candidate member"),
+                    std::fs::read(new_family.root.join(name))
+                        .expect("read source candidate member")
+                );
+            }
 
             for retry in 0..2 {
                 let replay = run_installer_family_function(
@@ -109530,9 +109812,177 @@ esac
                     "legacy retry after {failpoint} failed: {}",
                     String::from_utf8_lossy(&replay.stderr)
                 );
-                assert!(family_bytes_match(&destination, &new_family));
+                let receipt = parse_installer_process_family_receipt(&replay.stdout);
+                assert_eq!(receipt["activation"], "pending");
+                assert_eq!(receipt["active_authority"], "legacy-direct");
+                assert_eq!(receipt["active_root"], destination.to_string_lossy().as_ref());
+                assert_eq!(receipt["pending_reason"], "cross-launcher-lease-required");
+                assert!(
+                    family_bytes_match(&destination, &old_family),
+                    "legacy retry activated a candidate without the cross-launcher transaction"
+                );
                 assert!(installer_residue_count(&destination) <= 4);
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_initial_selector_refuses_active_ambiguous_and_unleased_inactive_states() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create mux-state refusal fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"f".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        for (index, (mux_state, pending_reason)) in [
+            ("active", "active-mux-owns-session-state"),
+            ("ambiguous", "ambiguous-mux-ownership"),
+            (
+                "inactive",
+                "inactive-census-without-shared-launcher-lease",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = fixture.path().join(format!("destination-{index}-{mux_state}"));
+            std::fs::create_dir(&destination).expect("create mux-state destination");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make mux-state destination private");
+            let output = run_installer_family_function_with_mux_state(
+                &installer,
+                &family,
+                &destination,
+                &fixture.path().join(format!("scratch-{index}")),
+                None,
+                mux_state,
+            );
+            assert!(
+                output.status.success(),
+                "{mux_state} candidate publication failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let receipt = parse_installer_process_family_receipt(&output.stdout);
+            assert_eq!(receipt["activation"], "pending");
+            assert_eq!(receipt["active_authority"], "none");
+            assert!(receipt["active_root"].is_null());
+            assert_eq!(receipt["pending_reason"], pending_reason);
+            assert_eq!(
+                receipt["candidate_generation"],
+                family.generation_id.as_str()
+            );
+            assert_initial_family_is_uniformly_unavailable(&destination);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_publishes_candidate_without_changing_existing_selector() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let fixture = tempfile::tempdir().expect("create managed-selector fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let old_family = create_installer_test_family(
+            &fixture.path().join("old-family"),
+            &"d".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let candidate_family = create_installer_test_family(
+            &fixture.path().join("candidate-family"),
+            &"e".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let destination = fixture.path().join("bin");
+        std::fs::create_dir(&destination).expect("create managed-selector destination");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make managed-selector destination private");
+
+        let installed = run_installer_family_function(
+            &installer,
+            &old_family,
+            &destination,
+            &fixture.path().join("initial-install"),
+            None,
+        );
+        assert!(
+            installed.status.success(),
+            "initial managed family install failed: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let initial_receipt = parse_installer_process_family_receipt(&installed.stdout);
+        assert_eq!(initial_receipt["activation"], "pending");
+        assert_eq!(initial_receipt["active_authority"], "none");
+        assert_initial_family_is_uniformly_unavailable(&destination);
+        activate_installer_test_generation(&destination, &old_family);
+        assert!(family_bytes_match(&destination, &old_family));
+        let selector = destination.join(".frankenterm-process-family/current");
+        let old_selector = std::fs::read_link(&selector).expect("read initial selector");
+        assert_eq!(
+            old_selector,
+            Path::new("generations").join(&old_family.generation_id)
+        );
+
+        let interrupted = run_installer_family_function(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("candidate-interrupted"),
+            Some("before-pending-publication-receipt"),
+        );
+        assert_eq!(
+            interrupted.status.signal(),
+            Some(9),
+            "pending-publication failpoint did not kill at its boundary: {}",
+            String::from_utf8_lossy(&interrupted.stderr)
+        );
+        assert_eq!(
+            std::fs::read_link(&selector).expect("read selector after candidate publication"),
+            old_selector
+        );
+        assert!(family_bytes_match(&destination, &old_family));
+
+        let candidate_generation = destination
+            .join(".frankenterm-process-family/generations")
+            .join(&candidate_family.generation_id);
+        for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+            assert_eq!(
+                std::fs::read(candidate_generation.join(name))
+                    .expect("read published candidate member"),
+                std::fs::read(candidate_family.root.join(name))
+                    .expect("read source candidate member")
+            );
+        }
+
+        for retry in 0..2 {
+            let replay = run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &destination,
+                &fixture.path().join(format!("candidate-retry-{retry}")),
+                None,
+            );
+            assert!(
+                replay.status.success(),
+                "pending-candidate retry failed: {}",
+                String::from_utf8_lossy(&replay.stderr)
+            );
+            let receipt = parse_installer_process_family_receipt(&replay.stdout);
+            assert_eq!(receipt["activation"], "pending");
+            assert_eq!(receipt["active_authority"], "managed-selector");
+            assert_eq!(receipt["pending_reason"], "cross-launcher-lease-required");
+            assert_eq!(
+                std::fs::read_link(&selector).expect("read unchanged selector after retry"),
+                old_selector
+            );
+            assert!(family_bytes_match(&destination, &old_family));
         }
     }
 
@@ -109627,6 +110077,10 @@ esac
             "standalone app-test family failed to install: {}",
             String::from_utf8_lossy(&installed.stderr)
         );
+        let receipt = parse_installer_process_family_receipt(&installed.stdout);
+        assert_eq!(receipt["activation"], "pending");
+        activate_installer_test_generation(&destination, &family);
+        assert!(family_bytes_match(&destination, &family));
         let app = create_installer_test_app(&fixture.path().join("app-release"), &build_id, target);
         let fake_tools = fixture.path().join("fake-app-tools");
         write_installer_fake_download_tools(&fake_tools);

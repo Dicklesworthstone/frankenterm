@@ -1534,7 +1534,7 @@ impl std::fmt::Debug for GuardianCheckpointEffectIdentity {
             .debug_struct("GuardianCheckpointEffectIdentity")
             .field("pane_id", &self.pane_id)
             .field("mux_incarnation", &self.mux_incarnation)
-            .field("request_id", &self.request_id)
+            .field("request_id", &"[REDACTED]")
             .field("generation", &self.generation)
             .field("sequence", &self.sequence)
             .field("effect_id", &self.effect_id)
@@ -1622,6 +1622,98 @@ pub struct GuardianCheckpointCatalogAdoptionPermitV1 {
     identity: GuardianCheckpointEffectIdentity,
 }
 
+/// Opaque, single-use seed for one protected durable catalog-adoption record.
+///
+/// Only consuming a protocol-issued catalog permit can create this value. In
+/// particular, the canonical Checkpoint request identity remains unavailable
+/// on the permit's borrowed surface: the durable publisher can bind it only by
+/// taking ownership of the already-authorized mutation.
+#[must_use = "catalog adoption evidence seeds must be consumed by the protected publisher"]
+pub struct GuardianCheckpointCatalogAdoptionEvidenceSeedV1 {
+    identity: GuardianCheckpointEffectIdentity,
+}
+
+impl std::fmt::Debug for GuardianCheckpointCatalogAdoptionEvidenceSeedV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointCatalogAdoptionEvidenceSeedV1")
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+impl GuardianCheckpointCatalogAdoptionEvidenceSeedV1 {
+    #[must_use]
+    pub const fn pane_id(&self) -> Uuid {
+        self.identity.pane_id
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(&self) -> Uuid {
+        self.identity.mux_incarnation
+    }
+
+    #[must_use]
+    pub const fn canonical_request_id(&self) -> Uuid {
+        self.identity.request_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.identity.generation
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.identity.sequence
+    }
+
+    #[must_use]
+    pub const fn effect_id(&self) -> Uuid {
+        self.identity.effect_id
+    }
+
+    #[must_use]
+    pub const fn checkpoint_identity_digest(&self) -> [u8; 32] {
+        self.identity.intent.checkpoint_identity().into_bytes()
+    }
+
+    #[must_use]
+    pub const fn output_boundary_identity_digest(&self) -> [u8; 32] {
+        self.identity.intent.output_boundary_identity().into_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_for_test(
+        pane_id: Uuid,
+        mux_incarnation: Uuid,
+        canonical_request_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        effect_id: Uuid,
+        intent: GuardianCheckpointIntent,
+    ) -> Self {
+        assert!(!pane_id.is_nil());
+        assert!(!mux_incarnation.is_nil());
+        assert!(!canonical_request_id.is_nil());
+        assert!(generation > 0);
+        assert!(sequence > 0);
+        assert!(!effect_id.is_nil());
+        let permit = GuardianCheckpointCatalogAdoptionPermitV1 {
+            identity: GuardianCheckpointEffectIdentity {
+                pane_id,
+                mux_incarnation,
+                request_id: canonical_request_id,
+                generation,
+                sequence,
+                effect_id,
+                intent,
+            },
+        };
+        permit.into_evidence_seed()
+    }
+}
+
 impl std::fmt::Debug for GuardianCheckpointCatalogAdoptionPermitV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1632,6 +1724,16 @@ impl std::fmt::Debug for GuardianCheckpointCatalogAdoptionPermitV1 {
 }
 
 impl GuardianCheckpointCatalogAdoptionPermitV1 {
+    /// Consume this publication capability and reveal the canonical request
+    /// identity only inside an opaque evidence seed. Later retry aliases do
+    /// not yet exist at this boundary and are deliberately not fabricated.
+    #[must_use]
+    pub fn into_evidence_seed(self) -> GuardianCheckpointCatalogAdoptionEvidenceSeedV1 {
+        GuardianCheckpointCatalogAdoptionEvidenceSeedV1 {
+            identity: self.identity,
+        }
+    }
+
     #[must_use]
     pub const fn pane_id(&self) -> Uuid {
         self.identity.pane_id
@@ -1670,6 +1772,10 @@ impl GuardianCheckpointCatalogAdoptionPermitV1 {
 }
 
 static_assertions::assert_not_impl_any!(GuardianCheckpointCatalogAdoptionPermitV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(
+    GuardianCheckpointCatalogAdoptionEvidenceSeedV1: Clone,
+    Copy
+);
 
 /// Authenticated checkpoint receipt. `OutcomeIndeterminate` is terminal for
 /// blind retry and is encoded under a distinct response status.
@@ -12849,6 +12955,7 @@ mod tests {
 
         let checkpoint = checkpoint_request(id(1), id(2), id(3), 1, 1, 60, 61, 0x41, 0x52);
         let identity = checkpoint_effect_identity(&checkpoint);
+        let canonical_request_debug = format!("{:?}", identity.request_id);
         let permit = GuardianCheckpointCatalogAdoptionPermitV1 { identity };
         let receipt = GuardianCheckpointReceipt::from_identity(
             identity,
@@ -12861,7 +12968,23 @@ mod tests {
         ] {
             assert!(!diagnostic.contains(&checkpoint_debug));
             assert!(!diagnostic.contains(&output_boundary_debug));
+            assert!(!diagnostic.contains(&canonical_request_debug));
         }
+        let evidence_seed = permit.into_evidence_seed();
+        let evidence_seed_debug = format!("{evidence_seed:?}");
+        assert!(!evidence_seed_debug.contains(&canonical_request_debug));
+        assert!(evidence_seed_debug.contains("[REDACTED]"));
+        assert_eq!(evidence_seed.pane_id(), identity.pane_id);
+        assert_eq!(evidence_seed.mux_incarnation(), identity.mux_incarnation);
+        assert_eq!(evidence_seed.canonical_request_id(), identity.request_id);
+        assert_eq!(evidence_seed.generation(), identity.generation);
+        assert_eq!(evidence_seed.sequence(), identity.sequence);
+        assert_eq!(evidence_seed.effect_id(), identity.effect_id);
+        assert_eq!(evidence_seed.checkpoint_identity_digest(), checkpoint_bytes);
+        assert_eq!(
+            evidence_seed.output_boundary_identity_digest(),
+            output_boundary_bytes
+        );
 
         let mut protocol_v1 = encode_guardian_request(&secret(), &checkpoint).unwrap();
         protocol_v1[8..10].copy_from_slice(&1_u16.to_be_bytes());
@@ -13830,9 +13953,12 @@ mod tests {
         assert_eq!(state, before_output_boundary_mismatch);
 
         let attempts_before_reconciliation = invocations.get();
+        let reconciled_canonical_request_id = std::cell::Cell::new(None);
         let committed = state
-            .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
+            .apply_checkpoint_transactionally(&authenticated_alias, |permit| {
                 invocations.set(invocations.get() + 1);
+                let evidence_seed = permit.into_evidence_seed();
+                reconciled_canonical_request_id.set(Some(evidence_seed.canonical_request_id()));
                 Ok::<(), &str>(())
             })
             .unwrap();
@@ -13840,13 +13966,15 @@ mod tests {
             committed.disposition(),
             GuardianCheckpointDisposition::Committed
         );
+        assert_eq!(reconciled_canonical_request_id.get(), Some(id(8)));
+        assert_ne!(reconciled_canonical_request_id.get(), Some(id(10)));
         assert_eq!(invocations.get(), attempts_before_reconciliation + 1);
         assert_eq!(
             state.mark_checkpoint_committed(identity).unwrap(),
             committed
         );
         let committed_alias = state
-            .apply_checkpoint_transactionally(&authenticated_alias, |_| {
+            .apply_checkpoint_transactionally(&authenticated_checkpoint, |_| {
                 invocations.set(invocations.get() + 1);
                 Ok::<(), &str>(())
             })

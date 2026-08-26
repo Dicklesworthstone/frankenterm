@@ -51,6 +51,9 @@ const RECORD_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-record.v3\0";
 const PLAINTEXT_DELIVERY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-output-plaintext-delivery.v3\0";
 const RECORD_AAD_DOMAIN: &[u8] = b"frankenterm.guardian-output-aead.v3\0";
+const REPLAY_STABLE_CATALOG_ADOPTION_NONCE_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-catalog-adoption-nonce.v1\0";
+const REPLAY_STABLE_CATALOG_ADOPTION_NONCE_DERIVATION_VERSION: u32 = 1;
 const SCROLLBACK_ROW_AEAD_DOMAIN: &[u8] = b"frankenterm.scrollback-row-aead.v3\0";
 const SCROLLBACK_ROW_RECORD_PREFIX: &str = "ftsl3e:";
 const SCROLLBACK_ROW_FORMAT_VERSION: u32 = 3;
@@ -977,6 +980,58 @@ impl GuardianOutputCipher {
             nonce_bytes.zeroize();
             return Err(GuardianOutputJournalError::EntropyUnavailable);
         }
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|_| GuardianOutputJournalError::EncryptionFailed)?;
+        Ok((nonce_bytes, ciphertext))
+    }
+
+    /// Seal the one replay-stable catalog-adoption evidence envelope.
+    ///
+    /// Unlike generic guardian metadata, an adoption candidate must reproduce
+    /// byte-identical ciphertext after a crash so a durable `.staging` prefix
+    /// can be authenticated and completed. The nonce is therefore the first
+    /// 192 bits of a frozen SHA-256 transcript over this method's domain and
+    /// derivation version, the key ID, the complete length-prefixed AAD, and
+    /// the length plus SHA-256 digest of the exact inner plaintext passed to
+    /// XChaCha20-Poly1305. The checkpoint AAD itself carries the checkpoint
+    /// record format/version and the complete canonical adoption context.
+    ///
+    /// For one key, a different AAD/plaintext pair can reuse a nonce only by
+    /// colliding in that 192-bit SHA-256 prefix (about 2^96 generic birthday
+    /// work, far beyond this bounded catalog) or by first colliding the
+    /// plaintext SHA-256 digest. Repeating the exact pair intentionally repeats
+    /// the complete envelope. This narrow crate-private primitive must not be
+    /// generalized to caller-selected records; ordinary metadata and output
+    /// records continue to use fresh random nonces.
+    pub(crate) fn seal_replay_stable_catalog_adoption_metadata(
+        &self,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<([u8; NONCE_BYTES], Vec<u8>), GuardianOutputJournalError> {
+        let aad_bytes =
+            u64::try_from(aad.len()).map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+        let plaintext_bytes = u64::try_from(plaintext.len())
+            .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+        let plaintext_digest: [u8; 32] = Sha256::digest(plaintext).into();
+        let mut nonce_hasher = Sha256::new();
+        nonce_hasher.update(REPLAY_STABLE_CATALOG_ADOPTION_NONCE_DOMAIN);
+        nonce_hasher.update(REPLAY_STABLE_CATALOG_ADOPTION_NONCE_DERIVATION_VERSION.to_le_bytes());
+        nonce_hasher.update(self.key_id);
+        nonce_hasher.update(aad_bytes.to_le_bytes());
+        nonce_hasher.update(aad);
+        nonce_hasher.update(plaintext_bytes.to_le_bytes());
+        nonce_hasher.update(plaintext_digest);
+        let nonce_digest: [u8; 32] = nonce_hasher.finalize().into();
+        let mut nonce_bytes = [0_u8; NONCE_BYTES];
+        nonce_bytes.copy_from_slice(&nonce_digest[..NONCE_BYTES]);
         let ciphertext = self
             .cipher
             .encrypt(
@@ -3176,6 +3231,58 @@ mod tests {
     fn cipher() -> GuardianOutputCipher {
         GuardianOutputCipher::try_from_key_slice(&[0x71; 32])
             .expect("fixture encryption key is valid")
+    }
+
+    #[test]
+    fn replay_stable_catalog_adoption_metadata_repeats_exactly_and_separates_inputs() {
+        let cipher = cipher();
+        let aad = b"checkpoint-stage-v3:catalog-adoption:complete-context";
+        let plaintext = b"catalog-adoption-inner-envelope-v1:complete-binding";
+        let (first_nonce, first_ciphertext) = cipher
+            .seal_replay_stable_catalog_adoption_metadata(plaintext, aad)
+            .expect("seal first replay-stable adoption envelope");
+        let (retry_nonce, retry_ciphertext) = cipher
+            .seal_replay_stable_catalog_adoption_metadata(plaintext, aad)
+            .expect("retry the exact replay-stable adoption envelope");
+        assert_eq!(retry_nonce, first_nonce);
+        assert_eq!(retry_ciphertext, first_ciphertext);
+        assert_eq!(
+            cipher
+                .open_guardian_metadata(&first_nonce, &first_ciphertext, aad)
+                .expect("open replay-stable adoption envelope")
+                .as_slice(),
+            plaintext
+        );
+
+        for index in 0..aad.len() {
+            let mut changed_aad = aad.to_vec();
+            changed_aad[index] ^= 1;
+            let (changed_nonce, _) = cipher
+                .seal_replay_stable_catalog_adoption_metadata(plaintext, &changed_aad)
+                .expect("seal adoption envelope with one changed AAD byte");
+            assert_ne!(
+                changed_nonce, first_nonce,
+                "AAD byte {index} was not nonce-bound"
+            );
+        }
+        for index in 0..plaintext.len() {
+            let mut changed_plaintext = plaintext.to_vec();
+            changed_plaintext[index] ^= 1;
+            let (changed_nonce, _) = cipher
+                .seal_replay_stable_catalog_adoption_metadata(&changed_plaintext, aad)
+                .expect("seal adoption envelope with one changed plaintext byte");
+            assert_ne!(
+                changed_nonce, first_nonce,
+                "plaintext byte {index} was not nonce-bound"
+            );
+        }
+
+        let other_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
+            .expect("construct distinct adoption key fixture");
+        let (other_key_nonce, _) = other_cipher
+            .seal_replay_stable_catalog_adoption_metadata(plaintext, aad)
+            .expect("seal adoption envelope under distinct key identity");
+        assert_ne!(other_key_nonce, first_nonce);
     }
 
     fn scrollback_identity() -> GuardianScrollbackRowIdentity {

@@ -60,8 +60,6 @@ const MAX_RPC_READINESS_PUBLICATIONS: usize = 64;
 const MAX_RPC_READINESS_WAITERS: usize = 64;
 const MUX_RPC_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 const TOPOLOGY_FENCE_MIN_CODEC_VERSION: usize = 49;
-const MANAGED_REMOTE_FT_PATH: &str =
-    "$HOME/.local/share/frankenterm/process-family/current/ft";
 const CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES: usize = 4 * 1024;
 const CLIENT_OUTBOUND_NONINTERACTIVE_SLOTS: usize = 4_096;
 const CLIENT_OUTBOUND_RESERVED_SLOTS: usize = 64;
@@ -8386,30 +8384,23 @@ impl Reconnectable {
         }
     }
 
-    /// Build one remote `ft cli` command without bypassing the managed
-    /// process-family selector.
+    /// Build one command for the remote WezTerm-compatible CLI.
     ///
     /// `remote_wezterm_path` retains its upstream configuration name, but in
-    /// FrankenTerm it names the remote CLI executable. An explicit path is
-    /// POSIX-shell quoted because the SSH transport executes a command string.
-    /// With no explicit override, prefer the immutable generation selected by
-    /// the remote installer, then a legacy `ft` in `PATH`, and finally upstream
-    /// `wezterm` for hosts that have not installed FrankenTerm yet.
-    fn build_remote_cli_command(
+    /// FrankenTerm it names a binary that implements the inherited `cli`
+    /// grammar. An explicit path is POSIX-shell quoted because the SSH
+    /// transport executes a command string. The standalone `ft` binary does
+    /// not implement that grammar, so the implicit path must remain the
+    /// actually supported `wezterm` executable until a first-party headless
+    /// proxy is implemented and proven.
+    fn build_remote_wezterm_cli_command(
         remote_wezterm_path: &Option<String>,
         cli_args: &str,
     ) -> anyhow::Result<String> {
-        if let Some(path) = remote_wezterm_path.as_deref() {
-            let executable = shlex::try_quote(path)
-                .context("remote_wezterm_path contains a byte that cannot be shell quoted")?;
-            return Ok(format!("{executable} cli {cli_args}"));
-        }
-
-        Ok(format!(
-            "if test -x \"{MANAGED_REMOTE_FT_PATH}\"; then exec \"{MANAGED_REMOTE_FT_PATH}\" cli {cli_args}; \
-             elif command -v ft >/dev/null 2>&1; then exec ft cli {cli_args}; \
-             else exec wezterm cli {cli_args}; fi"
-        ))
+        let path = remote_wezterm_path.as_deref().unwrap_or("wezterm");
+        let executable = shlex::try_quote(path)
+            .context("remote_wezterm_path contains a byte that cannot be shell quoted")?;
+        Ok(format!("exec {executable} cli {cli_args}"))
     }
 
     fn build_ssh_proxy_command(
@@ -8425,14 +8416,12 @@ impl Reconnectable {
             } else {
                 "--prefer-mux --no-auto-start proxy"
             };
-            Self::build_remote_cli_command(remote_wezterm_path, cli_args)
+            Self::build_remote_wezterm_cli_command(remote_wezterm_path, cli_args)
         }
     }
 
-    fn build_tls_creds_command(
-        remote_wezterm_path: &Option<String>,
-    ) -> anyhow::Result<String> {
-        Self::build_remote_cli_command(remote_wezterm_path, "tlscreds")
+    fn build_tls_creds_command(remote_wezterm_path: &Option<String>) -> anyhow::Result<String> {
+        Self::build_remote_wezterm_cli_command(remote_wezterm_path, "tlscreds")
     }
 
     fn should_retry_tls_bootstrap_after_reuse_error(err: &anyhow::Error) -> bool {
@@ -16378,25 +16367,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_cli_default_prefers_managed_selector_before_legacy_paths() {
-        let command = Reconnectable::build_remote_cli_command(&None, "--version")
-            .expect("build managed remote command");
+    fn remote_cli_default_uses_only_the_implemented_wezterm_cli() {
+        let command = Reconnectable::build_remote_wezterm_cli_command(&None, "--version")
+            .expect("build remote WezTerm CLI command");
 
-        let managed = format!("test -x \"{MANAGED_REMOTE_FT_PATH}\"");
-        let managed_exec = format!("exec \"{MANAGED_REMOTE_FT_PATH}\" cli --version");
-        assert!(command.contains(&managed));
-        assert!(command.contains(&managed_exec));
-        assert!(command.contains("command -v ft >/dev/null 2>&1"));
-        assert!(command.contains("exec ft cli --version"));
-        assert!(command.contains("exec wezterm cli --version"));
-
-        let managed_offset = command.find(&managed_exec).expect("managed command");
-        let ft_offset = command.find("exec ft cli --version").expect("ft fallback");
-        let wezterm_offset = command
-            .find("exec wezterm cli --version")
-            .expect("wezterm fallback");
-        assert!(managed_offset < ft_offset);
-        assert!(ft_offset < wezterm_offset);
+        assert_eq!(command, "exec wezterm cli --version");
+        assert!(!command.contains("/current/ft"));
+        assert!(!command.contains("exec ft cli"));
     }
 
     /// ft-7f2om: the IncompatibleVersionError Display impl must surface
@@ -17249,37 +17226,42 @@ mod tests {
 
     #[test]
     fn ssh_proxy_command_uses_initial_proxy_launch_by_default() {
-        let cmd = Reconnectable::build_ssh_proxy_command(
-            &Some("/opt/wezterm".to_string()),
-            None,
-            true,
-        )
-        .expect("build initial proxy command");
-        assert_eq!(cmd, "/opt/wezterm cli --prefer-mux proxy");
+        let cmd = Reconnectable::build_ssh_proxy_command(&None, None, true)
+            .expect("build initial proxy command");
+        assert_eq!(cmd, "exec wezterm cli --prefer-mux proxy");
+        assert!(!cmd.contains("/current/ft"));
+        assert!(!cmd.contains("exec ft cli"));
     }
 
     #[test]
     fn ssh_proxy_command_disables_auto_start_on_reconnect() {
         let cmd = Reconnectable::build_ssh_proxy_command(&None, None, false)
             .expect("build reconnect proxy command");
-        assert!(cmd.contains(&format!(
-            "exec \"{MANAGED_REMOTE_FT_PATH}\" cli --prefer-mux --no-auto-start proxy"
-        )));
-        assert!(cmd.contains("exec ft cli --prefer-mux --no-auto-start proxy"));
-        assert!(cmd.contains("exec wezterm cli --prefer-mux --no-auto-start proxy"));
+        assert_eq!(cmd, "exec wezterm cli --prefer-mux --no-auto-start proxy");
+        assert!(!cmd.contains("/current/ft"));
+        assert!(!cmd.contains("exec ft cli"));
     }
 
     #[test]
     fn tls_creds_command_uses_remote_wezterm_path_when_present() {
         let cmd = Reconnectable::build_tls_creds_command(&Some("/usr/bin/wezterm".to_string()))
             .expect("build tls credentials command");
-        assert_eq!(cmd, "/usr/bin/wezterm cli tlscreds");
+        assert_eq!(cmd, "exec /usr/bin/wezterm cli tlscreds");
+    }
+
+    #[test]
+    fn tls_creds_command_defaults_to_the_implemented_wezterm_cli() {
+        let cmd = Reconnectable::build_tls_creds_command(&None)
+            .expect("build default TLS credentials command");
+        assert_eq!(cmd, "exec wezterm cli tlscreds");
+        assert!(!cmd.contains("/current/ft"));
+        assert!(!cmd.contains("exec ft cli"));
     }
 
     #[test]
     fn explicit_remote_cli_path_is_shell_quoted() {
         let cmd = Reconnectable::build_ssh_proxy_command(
-            &Some("/opt/Franken Term/ft;false".to_string()),
+            &Some("/opt/Franken Term/wezterm;false".to_string()),
             None,
             true,
         )
@@ -17287,19 +17269,18 @@ mod tests {
 
         assert_eq!(
             cmd,
-            "'/opt/Franken Term/ft;false' cli --prefer-mux proxy"
+            "exec '/opt/Franken Term/wezterm;false' cli --prefer-mux proxy"
         );
     }
 
     #[test]
     fn explicit_remote_cli_path_rejects_nul() {
-        let error = Reconnectable::build_tls_creds_command(&Some("/opt/ft\0suffix".to_string()))
-            .expect_err("NUL cannot be represented in a remote shell command");
+        let error =
+            Reconnectable::build_tls_creds_command(&Some("/opt/wezterm\0suffix".to_string()))
+                .expect_err("NUL cannot be represented in a remote shell command");
 
         assert!(
-            error
-                .to_string()
-                .contains("cannot be shell quoted"),
+            error.to_string().contains("cannot be shell quoted"),
             "unexpected error: {error}"
         );
     }

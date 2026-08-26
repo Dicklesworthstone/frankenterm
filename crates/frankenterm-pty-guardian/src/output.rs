@@ -12,16 +12,19 @@
 use crate::transport::provision_guardian_token_in_pinned_parent;
 use mio::Waker;
 use mux::guardian_checkpoint::{
-    GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES,
-    GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES, GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES,
-    GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES, GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES,
-    GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointBoundaryError,
-    GuardianCheckpointCandidateIdentityV1, GuardianCheckpointCipher, GuardianCheckpointCipherError,
-    GuardianCheckpointOrderedChunkSetBuilderV1, GuardianCheckpointOrderedChunkSetIdentityV1,
-    GuardianCheckpointStageBindingV1, GuardianCheckpointStageRecordContextV1,
-    GuardianCheckpointStageRecordKindV1, GuardianCheckpointStageScopeV1,
-    GuardianCheckpointStageSealIntentV1, GuardianCheckpointValidatedManifestAuthorityV1,
-    GuardianEncryptedCheckpointStageRecordV1, GuardianGenesisReservationIdentityV1,
+    GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES,
+    GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+    GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES, GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+    GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES, GuardianCheckpointArtifactDescriptorV1,
+    GuardianCheckpointBoundaryError, GuardianCheckpointCandidateIdentityV1,
+    GuardianCheckpointCatalogAdoptionBindingV1, GuardianCheckpointCatalogAdoptionEvidenceV1,
+    GuardianCheckpointCatalogPredecessorBindingV1, GuardianCheckpointCipher,
+    GuardianCheckpointCipherError, GuardianCheckpointOrderedChunkSetBuilderV1,
+    GuardianCheckpointOrderedChunkSetIdentityV1, GuardianCheckpointStageBindingV1,
+    GuardianCheckpointStageRecordContextV1, GuardianCheckpointStageRecordKindV1,
+    GuardianCheckpointStageScopeV1, GuardianCheckpointStageSealIntentV1,
+    GuardianCheckpointValidatedManifestAuthorityV1, GuardianEncryptedCheckpointStageRecordV1,
+    GuardianGenesisReservationIdentityV1,
 };
 use mux::guardian_input_journal::{
     GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
@@ -36,9 +39,9 @@ use mux::guardian_output_journal::{
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
-    GuardianCheckpointCatalogAdoptionPermitV1, GuardianCheckpointDescriptorV1,
-    GuardianCheckpointPolicyExpiryReceiptV1, GuardianCheckpointReceipt,
-    GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1,
+    GuardianCheckpointCatalogAdoptionEvidenceSeedV1, GuardianCheckpointCatalogAdoptionPermitV1,
+    GuardianCheckpointDescriptorV1, GuardianCheckpointPolicyExpiryReceiptV1,
+    GuardianCheckpointReceipt, GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1,
     GuardianCheckpointStageKindV1, GuardianCheckpointStageReplyV1,
     GuardianCheckpointStageRequestV1, GuardianEffectTransactionError, GuardianProtocolError,
     GuardianProtocolState, GuardianReply,
@@ -91,9 +94,9 @@ const CHECKPOINT_STAGE_EXPIRY_PLAINTEXT_BYTES: usize = 376;
 const CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES: u64 = 296;
 const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize = 1_027;
 const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = 268_740_576;
-// Phase A has no deletion or ACK-backed reclamation. Keep this deliberately
-// finite; whole-fleet activation remains disabled until the catalog layer can
-// retain one proven generation per pane without exhausting this quarantine.
+// Production Stage, catalog publication, and Query use this bounded retention
+// today. Phase A has no deletion or ACK-backed reclamation, so keep the limit
+// deliberately finite while checkpoint ACK and upgrade activation stay off.
 const CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS: usize = 8;
 const CHECKPOINT_STAGE_MAX_FILES: usize = 8_216;
 const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_924_608;
@@ -101,21 +104,31 @@ const CHECKPOINT_CATALOG_FILE_PREFIX: &str = "checkpoint-catalog-";
 const CHECKPOINT_CATALOG_CANDIDATE_SUFFIX: &str = ".ftgccandidate";
 const CHECKPOINT_CATALOG_MARKER_SUFFIX: &str = ".ftgccommit";
 const CHECKPOINT_CATALOG_STAGING_SUFFIX: &str = ".staging";
-const CHECKPOINT_CATALOG_CANDIDATE_MAGIC: [u8; 8] = *b"FTGCC002";
-const CHECKPOINT_CATALOG_MARKER_MAGIC: [u8; 8] = *b"FTGCM002";
-const CHECKPOINT_CATALOG_VERSION: u32 = 2;
+const CHECKPOINT_CATALOG_LEGACY_CANDIDATE_MAGIC: [u8; 8] = *b"FTGCC002";
+const CHECKPOINT_CATALOG_LEGACY_MARKER_MAGIC: [u8; 8] = *b"FTGCM002";
+const CHECKPOINT_CATALOG_LEGACY_VERSION: u32 = 2;
+const CHECKPOINT_CATALOG_CANDIDATE_MAGIC: [u8; 8] = *b"FTGCC003";
+const CHECKPOINT_CATALOG_MARKER_MAGIC: [u8; 8] = *b"FTGCM003";
+const CHECKPOINT_CATALOG_VERSION: u32 = 3;
 const CHECKPOINT_CATALOG_HEADER_BYTES: usize = 568;
 const CHECKPOINT_CATALOG_MARKER_BODY_BYTES: usize = 312;
 const CHECKPOINT_CATALOG_MARKER_BYTES: usize =
     CHECKPOINT_CATALOG_MARKER_BODY_BYTES + OUTPUT_MANIFEST_CHECKSUM_BYTES;
-const CHECKPOINT_CATALOG_CHECKSUM_DOMAIN: &[u8] =
+const CHECKPOINT_CATALOG_LEGACY_CHECKSUM_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-catalog-candidate.v2\0";
-const CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN: &[u8] =
+const CHECKPOINT_CATALOG_LEGACY_MARKER_CHECKSUM_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-catalog-marker.v2\0";
+const CHECKPOINT_CATALOG_CHECKSUM_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-catalog-candidate.v3\0";
+const CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-catalog-marker.v3\0";
 const CHECKPOINT_CATALOG_GENESIS_CANDIDATE_ID_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-catalog-genesis-candidate-id.v1\0";
 const CHECKPOINT_CATALOG_CANDIDATE_ID_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-catalog-candidate-id.v1\0";
+    b"frankenterm.guardian-checkpoint-catalog-candidate-id.v2\0";
+const CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES: u64 =
+    GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES as u64
+        + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES;
 const CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS: usize = 8;
 // One immutable candidate and marker per retained member, plus one bounded
 // crash candidate per generation. No reclamation is performed in this phase.
@@ -127,7 +140,8 @@ const CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES: u64 = GUARDIAN_MAX_CHECKPOINT_BYTE
     + CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES as u64
     + CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES as u64
     + CHECKPOINT_CATALOG_HEADER_BYTES as u64
-    + OUTPUT_MANIFEST_CHECKSUM_BYTES as u64;
+    + OUTPUT_MANIFEST_CHECKSUM_BYTES as u64
+    + CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES;
 const CHECKPOINT_CATALOG_MAX_RELEVANT_BYTES: u64 =
     CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES * 16 + CHECKPOINT_CATALOG_MARKER_BYTES as u64 * 8;
 
@@ -609,14 +623,92 @@ struct CheckpointCatalogGenesisReservationBinding {
     upload_id: Uuid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointCatalogFormat {
+    LegacyV2,
+    ProtectedV3,
+}
+
+impl CheckpointCatalogFormat {
+    fn from_candidate_header(
+        magic: [u8; 8],
+        version: u32,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        match (magic, version) {
+            (CHECKPOINT_CATALOG_LEGACY_CANDIDATE_MAGIC, CHECKPOINT_CATALOG_LEGACY_VERSION) => {
+                Ok(Self::LegacyV2)
+            }
+            (CHECKPOINT_CATALOG_CANDIDATE_MAGIC, CHECKPOINT_CATALOG_VERSION) => {
+                Ok(Self::ProtectedV3)
+            }
+            _ => Err(GuardianCheckpointStageStoreError::Poisoned),
+        }
+    }
+
+    fn from_marker_header(
+        magic: [u8; 8],
+        version: u32,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        match (magic, version) {
+            (CHECKPOINT_CATALOG_LEGACY_MARKER_MAGIC, CHECKPOINT_CATALOG_LEGACY_VERSION) => {
+                Ok(Self::LegacyV2)
+            }
+            (CHECKPOINT_CATALOG_MARKER_MAGIC, CHECKPOINT_CATALOG_VERSION) => Ok(Self::ProtectedV3),
+            _ => Err(GuardianCheckpointStageStoreError::Poisoned),
+        }
+    }
+
+    const fn candidate_magic(self) -> [u8; 8] {
+        match self {
+            Self::LegacyV2 => CHECKPOINT_CATALOG_LEGACY_CANDIDATE_MAGIC,
+            Self::ProtectedV3 => CHECKPOINT_CATALOG_CANDIDATE_MAGIC,
+        }
+    }
+
+    const fn marker_magic(self) -> [u8; 8] {
+        match self {
+            Self::LegacyV2 => CHECKPOINT_CATALOG_LEGACY_MARKER_MAGIC,
+            Self::ProtectedV3 => CHECKPOINT_CATALOG_MARKER_MAGIC,
+        }
+    }
+
+    const fn version(self) -> u32 {
+        match self {
+            Self::LegacyV2 => CHECKPOINT_CATALOG_LEGACY_VERSION,
+            Self::ProtectedV3 => CHECKPOINT_CATALOG_VERSION,
+        }
+    }
+
+    const fn candidate_checksum_domain(self) -> &'static [u8] {
+        match self {
+            Self::LegacyV2 => CHECKPOINT_CATALOG_LEGACY_CHECKSUM_DOMAIN,
+            Self::ProtectedV3 => CHECKPOINT_CATALOG_CHECKSUM_DOMAIN,
+        }
+    }
+
+    const fn marker_checksum_domain(self) -> &'static [u8] {
+        match self {
+            Self::LegacyV2 => CHECKPOINT_CATALOG_LEGACY_MARKER_CHECKSUM_DOMAIN,
+            Self::ProtectedV3 => CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN,
+        }
+    }
+
+    const fn authorizes_scope(self, scope: CheckpointCatalogScope) -> bool {
+        matches!(self, Self::ProtectedV3) || matches!(scope, CheckpointCatalogScope::Genesis { .. })
+    }
+}
+
 struct CheckpointCatalogCandidate {
+    format: CheckpointCatalogFormat,
     metadata: CheckpointCatalogMetadata,
     records: Vec<GuardianEncryptedCheckpointStageRecordV1>,
     checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    adoption_evidence: Option<GuardianEncryptedCheckpointStageRecordV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CheckpointCatalogMarker {
+    format: CheckpointCatalogFormat,
     identity: CheckpointCatalogIdentity,
     predecessor_generation: Option<u64>,
     predecessor_candidate_id: Uuid,
@@ -634,6 +726,7 @@ struct CheckpointCatalogMarker {
 
 #[derive(Clone)]
 struct PublishedCheckpointCatalogMember {
+    format: CheckpointCatalogFormat,
     metadata: CheckpointCatalogMetadata,
     candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
     candidate_path: PathBuf,
@@ -2083,17 +2176,18 @@ impl GuardianCheckpointStageStore {
         })
     }
 
-    /// Storage-only catalog publication seam. Production routing remains
-    /// disabled until the mutation-sequenced Checkpoint transaction supplies
-    /// the non-forgeable adoption permit required by the next tranche.
+    /// Publish an exact sealed Stage upload under the mutation-sequenced,
+    /// non-forgeable Checkpoint adoption permit. This is an active production
+    /// storage path; it does not enable checkpoint ACK or upgrade activation.
     #[allow(dead_code)]
     pub(crate) fn publish_sealed_catalog_member(
         &self,
         request: &GuardianCheckpointStageRequestV1,
         permit: GuardianCheckpointCatalogAdoptionPermitV1,
     ) -> Result<(), GuardianCheckpointStageStoreError> {
+        let seed = permit.into_evidence_seed();
         self.with_exclusive_directory(|inner| {
-            checkpoint_catalog_publish_sealed_stage(inner, request, &permit).map(|_| ())
+            checkpoint_catalog_publish_sealed_stage(inner, request, seed).map(|_| ())
         })
     }
 
@@ -2104,9 +2198,11 @@ impl GuardianCheckpointStageStore {
         &self,
         permit: GuardianCheckpointCatalogAdoptionPermitV1,
     ) -> Result<(), GuardianCheckpointStageStoreError> {
-        let pane_id = permit.pane_id();
-        let generation = permit.generation();
-        let intent = permit.intent();
+        let seed = permit.into_evidence_seed();
+        let pane_id = seed.pane_id();
+        let generation = seed.generation();
+        let checkpoint_identity = seed.checkpoint_identity_digest();
+        let boundary_identity = seed.output_boundary_identity_digest();
         self.with_exclusive_directory(|inner| {
             let census = checkpoint_stage_census(inner)?;
             let expected_scope = CheckpointStagePathScope::Pane {
@@ -2132,8 +2228,8 @@ impl GuardianCheckpointStageStore {
                 if shape.key() != entry.key {
                     return Err(GuardianCheckpointStageStoreError::Poisoned);
                 }
-                if shape.descriptor.checkpoint_id() != intent.checkpoint_identity()
-                    || shape.descriptor.boundary_id() != intent.output_boundary_identity()
+                if shape.descriptor.checkpoint_id().into_bytes() != checkpoint_identity
+                    || shape.descriptor.boundary_id().into_bytes() != boundary_identity
                 {
                     continue;
                 }
@@ -2163,7 +2259,7 @@ impl GuardianCheckpointStageStore {
                 )?);
             }
             let request = selected.ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
-            checkpoint_catalog_publish_sealed_stage(inner, &request, &permit).map(|_| ())
+            checkpoint_catalog_publish_sealed_stage(inner, &request, seed).map(|_| ())
         })
     }
 
@@ -2268,7 +2364,12 @@ impl GuardianCheckpointStageStore {
                 .published
                 .iter()
                 .rev()
-                .find(|member| member.metadata.replay_semantics_id == replay_semantics_id)
+                .find(|member| {
+                    member
+                        .format
+                        .authorizes_scope(member.metadata.identity.scope)
+                        && member.metadata.replay_semantics_id == replay_semantics_id
+                })
                 .map(|member| member.metadata.checkpoint_id))
         })
     }
@@ -2291,7 +2392,12 @@ impl GuardianCheckpointStageStore {
             Ok(scan
                 .published
                 .iter()
-                .find(|member| member.metadata.checkpoint_id == checkpoint_id)
+                .find(|member| {
+                    member
+                        .format
+                        .authorizes_scope(member.metadata.identity.scope)
+                        && member.metadata.checkpoint_id == checkpoint_id
+                })
                 .map(|member| member.metadata.checkpoint_id))
         })
     }
@@ -6133,7 +6239,7 @@ fn checkpoint_catalog_candidate_id(
     generation: u64,
     predecessor: Option<CheckpointCatalogPredecessor>,
     shape: &CheckpointStageRequestShape,
-    permit: &GuardianCheckpointCatalogAdoptionPermitV1,
+    seed: &GuardianCheckpointCatalogAdoptionEvidenceSeedV1,
 ) -> Uuid {
     let mut hasher = Sha256::new();
     hasher.update(CHECKPOINT_CATALOG_CANDIDATE_ID_DOMAIN);
@@ -6159,11 +6265,12 @@ fn checkpoint_catalog_candidate_id(
     hasher.update(shape.chunk_bytes.to_le_bytes());
     hasher.update(shape.total_chunks.to_le_bytes());
     hasher.update(shape.total_bytes.to_le_bytes());
-    hasher.update(permit.pane_id().as_bytes());
-    hasher.update(permit.mux_incarnation().as_bytes());
-    hasher.update(permit.generation().to_le_bytes());
-    hasher.update(permit.sequence().to_le_bytes());
-    hasher.update(permit.effect_id().as_bytes());
+    hasher.update(seed.pane_id().as_bytes());
+    hasher.update(seed.mux_incarnation().as_bytes());
+    hasher.update(seed.canonical_request_id().as_bytes());
+    hasher.update(seed.generation().to_le_bytes());
+    hasher.update(seed.sequence().to_le_bytes());
+    hasher.update(seed.effect_id().as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let mut uuid_bytes = [0_u8; 16];
     uuid_bytes.copy_from_slice(&digest[..16]);
@@ -6291,9 +6398,12 @@ fn checkpoint_catalog_validate_metadata(
     Ok(())
 }
 
-fn checkpoint_catalog_encode_candidate(
+fn checkpoint_catalog_encode_candidate_base(
     candidate: &mut CheckpointCatalogCandidate,
 ) -> Result<Vec<u8>, GuardianCheckpointStageStoreError> {
+    if candidate.format != CheckpointCatalogFormat::ProtectedV3 {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
     checkpoint_catalog_validate_metadata(&candidate.metadata)?;
     let expected_records = usize::try_from(candidate.metadata.chunk_count)
         .ok()
@@ -6326,8 +6436,8 @@ fn checkpoint_catalog_encode_candidate(
     encoded
         .try_reserve_exact(total_bytes)
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
-    encoded.extend_from_slice(&CHECKPOINT_CATALOG_CANDIDATE_MAGIC);
-    encoded.extend_from_slice(&CHECKPOINT_CATALOG_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&candidate.format.candidate_magic());
+    encoded.extend_from_slice(&candidate.format.version().to_le_bytes());
     encoded.push(metadata.identity.scope.tag());
     encoded.push(u8::from(metadata.predecessor.is_some()));
     encoded.extend_from_slice(&[0; 2]);
@@ -6375,7 +6485,15 @@ fn checkpoint_catalog_encode_candidate(
     } else {
         encoded.extend_from_slice(&[0; 120]);
     }
-    encoded.extend_from_slice(&[0; 12]);
+    let evidence_record_bytes = match metadata.identity.scope {
+        CheckpointCatalogScope::Pane { .. } => {
+            u32::try_from(CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES)
+                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
+        }
+        CheckpointCatalogScope::Genesis { .. } => 0,
+    };
+    encoded.extend_from_slice(&evidence_record_bytes.to_le_bytes());
+    encoded.extend_from_slice(&[0; 8]);
     if encoded.len() != CHECKPOINT_CATALOG_HEADER_BYTES {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
@@ -6383,10 +6501,51 @@ fn checkpoint_catalog_encode_candidate(
         encoded.extend_from_slice(&record.fixed_header());
         encoded.extend_from_slice(record.ciphertext());
     }
-    candidate.checksum = checkpoint_catalog_checksum(CHECKPOINT_CATALOG_CHECKSUM_DOMAIN, &encoded);
+    candidate.checksum =
+        checkpoint_catalog_checksum(candidate.format.candidate_checksum_domain(), &encoded);
     encoded.extend_from_slice(&candidate.checksum);
     if encoded.len() != total_bytes {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(encoded)
+}
+
+fn checkpoint_catalog_encode_candidate(
+    candidate: &mut CheckpointCatalogCandidate,
+) -> Result<Vec<u8>, GuardianCheckpointStageStoreError> {
+    let mut encoded = checkpoint_catalog_encode_candidate_base(candidate)?;
+    match (
+        candidate.metadata.identity.scope,
+        &candidate.adoption_evidence,
+    ) {
+        (CheckpointCatalogScope::Pane { .. }, Some(evidence)) => {
+            let evidence_bytes = GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES
+                .checked_add(evidence.ciphertext_bytes())
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+            if u64::try_from(evidence_bytes).ok()
+                != Some(CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES)
+                || evidence.plaintext_bytes() != GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            encoded
+                .try_reserve_exact(evidence_bytes)
+                .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+            debug_assert!(
+                encoded.capacity().saturating_sub(encoded.len()) >= evidence_bytes,
+                "fallible reserve must cover the complete fixed evidence record"
+            );
+            encoded.extend_from_slice(&evidence.fixed_header());
+            encoded.extend_from_slice(evidence.ciphertext());
+        }
+        (CheckpointCatalogScope::Genesis { .. }, None) => {}
+        _ => return Err(GuardianCheckpointStageStoreError::Poisoned),
+    }
+    if u64::try_from(encoded.len())
+        .ok()
+        .is_none_or(|bytes| bytes == 0 || bytes > CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES)
+    {
+        return Err(GuardianCheckpointStageStoreError::Capacity);
     }
     Ok(encoded)
 }
@@ -6401,27 +6560,9 @@ fn checkpoint_catalog_decode_candidate(
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let checksum_offset = bytes
-        .len()
-        .checked_sub(OUTPUT_MANIFEST_CHECKSUM_BYTES)
-        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
-    let mut checksum = [0; OUTPUT_MANIFEST_CHECKSUM_BYTES];
-    checksum.copy_from_slice(&bytes[checksum_offset..]);
-    if !checkpoint_bytes_match(
-        &checksum,
-        &checkpoint_catalog_checksum(
-            CHECKPOINT_CATALOG_CHECKSUM_DOMAIN,
-            &bytes[..checksum_offset],
-        ),
-    ) {
-        return Err(GuardianCheckpointStageStoreError::Poisoned);
-    }
     let mut decoder = ManifestDecoder::new(&bytes[..CHECKPOINT_CATALOG_HEADER_BYTES]);
-    if decoder.take::<8>()? != CHECKPOINT_CATALOG_CANDIDATE_MAGIC
-        || decoder.u32()? != CHECKPOINT_CATALOG_VERSION
-    {
-        return Err(GuardianCheckpointStageStoreError::Poisoned);
-    }
+    let format =
+        CheckpointCatalogFormat::from_candidate_header(decoder.take::<8>()?, decoder.u32()?)?;
     let scope_tag = decoder.take::<1>()?[0];
     let predecessor_present = decoder.take::<1>()?[0];
     if decoder.take::<2>()? != [0; 2] {
@@ -6460,10 +6601,56 @@ fn checkpoint_catalog_decode_candidate(
     let predecessor_checksum = decoder.take::<32>()?;
     let predecessor_checkpoint_id = decoder.take::<32>()?;
     let predecessor_boundary_id = decoder.take::<32>()?;
-    if decoder.take::<12>()? != [0; 12]
-        || decoder.offset != CHECKPOINT_CATALOG_HEADER_BYTES
-        || CHECKPOINT_CATALOG_HEADER_BYTES.checked_add(record_bytes) != Some(checksum_offset)
+    let evidence_record_bytes = match format {
+        CheckpointCatalogFormat::LegacyV2 => {
+            if decoder.take::<12>()? != [0; 12] {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            0
+        }
+        CheckpointCatalogFormat::ProtectedV3 => {
+            let evidence_record_bytes = usize::try_from(decoder.u32()?)
+                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+            if decoder.take::<8>()? != [0; 8] {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            evidence_record_bytes
+        }
+    };
+    if decoder.offset != CHECKPOINT_CATALOG_HEADER_BYTES {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let expected_evidence_record_bytes = match (format, scope) {
+        (CheckpointCatalogFormat::ProtectedV3, CheckpointCatalogScope::Pane { .. }) => {
+            usize::try_from(CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES)
+                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
+        }
+        (
+            CheckpointCatalogFormat::LegacyV2,
+            CheckpointCatalogScope::Pane { .. } | CheckpointCatalogScope::Genesis { .. },
+        )
+        | (CheckpointCatalogFormat::ProtectedV3, CheckpointCatalogScope::Genesis { .. }) => 0,
+    };
+    let checksum_offset = CHECKPOINT_CATALOG_HEADER_BYTES
+        .checked_add(record_bytes)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let evidence_offset = checksum_offset
+        .checked_add(OUTPUT_MANIFEST_CHECKSUM_BYTES)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    if evidence_record_bytes != expected_evidence_record_bytes
+        || evidence_offset.checked_add(evidence_record_bytes) != Some(bytes.len())
     {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let mut checksum = [0; OUTPUT_MANIFEST_CHECKSUM_BYTES];
+    checksum.copy_from_slice(&bytes[checksum_offset..evidence_offset]);
+    if !checkpoint_bytes_match(
+        &checksum,
+        &checkpoint_catalog_checksum(
+            format.candidate_checksum_domain(),
+            &bytes[..checksum_offset],
+        ),
+    ) {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     let predecessor = match predecessor_present {
@@ -6565,10 +6752,44 @@ fn checkpoint_catalog_decode_candidate(
     if offset != checksum_offset {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
+    let adoption_evidence = if evidence_record_bytes == 0 {
+        None
+    } else {
+        let header_end = evidence_offset
+            .checked_add(GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES)
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        let header = bytes
+            .get(evidence_offset..header_end)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        let ciphertext_bytes =
+            GuardianEncryptedCheckpointStageRecordV1::persisted_ciphertext_bytes(
+                header,
+                GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES,
+            )
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+        if header_end.checked_add(ciphertext_bytes) != Some(bytes.len()) {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        let mut ciphertext = Vec::new();
+        ciphertext
+            .try_reserve_exact(ciphertext_bytes)
+            .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+        ciphertext.extend_from_slice(&bytes[header_end..]);
+        Some(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                header,
+                ciphertext,
+                GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES,
+            )
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?,
+        )
+    };
     Ok(CheckpointCatalogCandidate {
+        format,
         metadata,
         records,
         checksum,
+        adoption_evidence,
     })
 }
 
@@ -6586,6 +6807,7 @@ fn checkpoint_catalog_marker_for_candidate(
             )
         });
     CheckpointCatalogMarker {
+        format: candidate.format,
         identity: candidate.metadata.identity,
         predecessor_generation,
         predecessor_candidate_id,
@@ -6604,8 +6826,8 @@ fn checkpoint_catalog_marker_for_candidate(
 
 fn checkpoint_catalog_encode_marker(marker: &CheckpointCatalogMarker) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(CHECKPOINT_CATALOG_MARKER_BYTES);
-    encoded.extend_from_slice(&CHECKPOINT_CATALOG_MARKER_MAGIC);
-    encoded.extend_from_slice(&CHECKPOINT_CATALOG_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&marker.format.marker_magic());
+    encoded.extend_from_slice(&marker.format.version().to_le_bytes());
     encoded.push(marker.identity.scope.tag());
     encoded.push(u8::from(marker.predecessor_generation.is_some()));
     encoded.extend_from_slice(&[0; 2]);
@@ -6625,7 +6847,7 @@ fn checkpoint_catalog_encode_marker(marker: &CheckpointCatalogMarker) -> Vec<u8>
     encoded.extend_from_slice(marker.adoption_effect_id.as_bytes());
     encoded.extend_from_slice(&marker.adoption_sequence.to_le_bytes());
     debug_assert_eq!(encoded.len(), CHECKPOINT_CATALOG_MARKER_BODY_BYTES);
-    let checksum = checkpoint_catalog_checksum(CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN, &encoded);
+    let checksum = checkpoint_catalog_checksum(marker.format.marker_checksum_domain(), &encoded);
     encoded.extend_from_slice(&checksum);
     encoded
 }
@@ -6636,17 +6858,13 @@ fn checkpoint_catalog_decode_marker(
     if bytes.len() != CHECKPOINT_CATALOG_MARKER_BYTES {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
+    let mut decoder = ManifestDecoder::new(&bytes[..CHECKPOINT_CATALOG_MARKER_BODY_BYTES]);
+    let format = CheckpointCatalogFormat::from_marker_header(decoder.take::<8>()?, decoder.u32()?)?;
     let expected = checkpoint_catalog_checksum(
-        CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN,
+        format.marker_checksum_domain(),
         &bytes[..CHECKPOINT_CATALOG_MARKER_BODY_BYTES],
     );
     if !checkpoint_bytes_match(&expected, &bytes[CHECKPOINT_CATALOG_MARKER_BODY_BYTES..]) {
-        return Err(GuardianCheckpointStageStoreError::Poisoned);
-    }
-    let mut decoder = ManifestDecoder::new(&bytes[..CHECKPOINT_CATALOG_MARKER_BODY_BYTES]);
-    if decoder.take::<8>()? != CHECKPOINT_CATALOG_MARKER_MAGIC
-        || decoder.u32()? != CHECKPOINT_CATALOG_VERSION
-    {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     let scope_tag = decoder.take::<1>()?[0];
@@ -6714,6 +6932,7 @@ fn checkpoint_catalog_decode_marker(
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     Ok(CheckpointCatalogMarker {
+        format,
         identity,
         predecessor_generation,
         predecessor_candidate_id,
@@ -6925,6 +7144,92 @@ fn checkpoint_catalog_validate_candidate_records(
     Ok(())
 }
 
+fn checkpoint_catalog_adoption_binding(
+    candidate: &CheckpointCatalogCandidate,
+) -> Result<GuardianCheckpointCatalogAdoptionBindingV1, GuardianCheckpointStageStoreError> {
+    let metadata = candidate.metadata;
+    let CheckpointCatalogScope::Pane { pane_id } = metadata.identity.scope else {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    };
+    let predecessor = metadata
+        .predecessor
+        .map(|predecessor| {
+            GuardianCheckpointCatalogPredecessorBindingV1::new(
+                predecessor.generation,
+                predecessor.candidate_id,
+                predecessor.candidate_checksum,
+                predecessor.checkpoint_id,
+                predecessor.boundary_id,
+            )
+        })
+        .transpose()?;
+    GuardianCheckpointCatalogAdoptionBindingV1::from_catalog_parts(
+        pane_id,
+        metadata.capture_generation,
+        metadata.adoption_mux_incarnation,
+        metadata.adoption_effect_id,
+        metadata.adoption_sequence,
+        metadata.identity.generation,
+        metadata.identity.candidate_id,
+        candidate.checksum,
+        predecessor,
+        metadata.upload_id,
+        metadata.completion_id,
+        metadata.checkpoint_id,
+        metadata.boundary_id,
+        metadata.terminal_payload_digest,
+        metadata.total_bytes,
+        metadata.chunk_count,
+        metadata.replay_semantics_id,
+        metadata.rows,
+        metadata.cols,
+    )
+    .map_err(Into::into)
+}
+
+fn checkpoint_catalog_recover_adoption_evidence(
+    inner: &GuardianCheckpointStageStoreInner,
+    candidate: &CheckpointCatalogCandidate,
+) -> Result<GuardianCheckpointCatalogAdoptionEvidenceV1, GuardianCheckpointStageStoreError> {
+    let binding = checkpoint_catalog_adoption_binding(candidate)?;
+    let evidence = candidate
+        .adoption_evidence
+        .as_ref()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    inner
+        .cipher
+        .inspect_catalog_adoption_evidence(&binding, evidence)
+        .map_err(Into::into)
+}
+
+fn checkpoint_catalog_recover_adoption_evidence_with_seed(
+    inner: &GuardianCheckpointStageStoreInner,
+    candidate: &CheckpointCatalogCandidate,
+    seed: GuardianCheckpointCatalogAdoptionEvidenceSeedV1,
+) -> Result<GuardianCheckpointCatalogAdoptionEvidenceV1, GuardianCheckpointStageStoreError> {
+    let binding = checkpoint_catalog_adoption_binding(candidate)?;
+    let evidence = candidate
+        .adoption_evidence
+        .as_ref()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    inner
+        .cipher
+        .inspect_catalog_adoption_evidence_with_seed(seed, &binding, evidence)
+        .map_err(Into::into)
+}
+
+fn checkpoint_catalog_seal_adoption_evidence(
+    inner: &GuardianCheckpointStageStoreInner,
+    candidate: &CheckpointCatalogCandidate,
+    seed: GuardianCheckpointCatalogAdoptionEvidenceSeedV1,
+) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointStageStoreError> {
+    let binding = checkpoint_catalog_adoption_binding(candidate)?;
+    inner
+        .cipher
+        .seal_catalog_adoption_evidence(seed, &binding)
+        .map_err(Into::into)
+}
+
 fn checkpoint_catalog_marker_matches_candidate(
     marker: &CheckpointCatalogMarker,
     candidate: &CheckpointCatalogCandidate,
@@ -6956,6 +7261,10 @@ fn checkpoint_catalog_validate_chain(
         if Some(member.metadata.identity.scope) != expected_scope
             || member.metadata.predecessor != expected_predecessor
             || previous.is_none() != (member.metadata.identity.generation == 1)
+            || previous.is_some_and(|prior| {
+                prior.format == CheckpointCatalogFormat::ProtectedV3
+                    && member.format == CheckpointCatalogFormat::LegacyV2
+            })
             || previous.is_some_and(|prior| {
                 prior.metadata.identity.generation.checked_add(1)
                     != Some(member.metadata.identity.generation)
@@ -7133,8 +7442,25 @@ fn checkpoint_catalog_scan(
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
         checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
+        match (candidate.format, candidate.metadata.identity.scope) {
+            (CheckpointCatalogFormat::ProtectedV3, CheckpointCatalogScope::Pane { .. }) => {
+                drop(checkpoint_catalog_recover_adoption_evidence(
+                    inner, &candidate,
+                )?);
+            }
+            (
+                CheckpointCatalogFormat::LegacyV2,
+                CheckpointCatalogScope::Pane { .. } | CheckpointCatalogScope::Genesis { .. },
+            )
+            | (CheckpointCatalogFormat::ProtectedV3, CheckpointCatalogScope::Genesis { .. }) => {
+                if candidate.adoption_evidence.is_some() {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+            }
+        }
         candidate_entry.published = true;
         published.push(PublishedCheckpointCatalogMember {
+            format: candidate.format,
             metadata: candidate.metadata,
             candidate_checksum: candidate.checksum,
             candidate_path: candidate_entry.path.clone(),
@@ -7243,24 +7569,22 @@ fn checkpoint_catalog_candidate_from_sealed_stage(
     request: &GuardianCheckpointStageRequestV1,
     identity: CheckpointCatalogIdentity,
     predecessor: Option<CheckpointCatalogPredecessor>,
-    permit: &GuardianCheckpointCatalogAdoptionPermitV1,
+    seed: &GuardianCheckpointCatalogAdoptionEvidenceSeedV1,
 ) -> Result<CheckpointCatalogCandidate, GuardianCheckpointStageStoreError> {
     if request.kind() != GuardianCheckpointStageKindV1::Seal {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
     let shape = CheckpointStageRequestShape::from_request(request)?;
-    let intent = permit.intent();
     if !matches!(identity.scope, CheckpointCatalogScope::Pane { .. })
         || CheckpointCatalogScope::from_stage_scope(shape.path_scope) != identity.scope
-        || permit.pane_id() != identity.scope.identity()
-        || permit.generation() != shape.descriptor.capture_generation()
-        || permit.mux_incarnation().is_nil()
-        || permit.sequence() == 0
-        || permit.effect_id().is_nil()
-        || intent.checkpoint_identity().into_bytes()
-            != shape.descriptor.checkpoint_id().into_bytes()
-        || intent.output_boundary_identity().into_bytes()
-            != shape.descriptor.boundary_id().into_bytes()
+        || seed.pane_id() != identity.scope.identity()
+        || seed.generation() != shape.descriptor.capture_generation()
+        || seed.mux_incarnation().is_nil()
+        || seed.canonical_request_id().is_nil()
+        || seed.sequence() == 0
+        || seed.effect_id().is_nil()
+        || seed.checkpoint_identity_digest() != shape.descriptor.checkpoint_id().into_bytes()
+        || seed.output_boundary_identity_digest() != shape.descriptor.boundary_id().into_bytes()
     {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
@@ -7276,6 +7600,7 @@ fn checkpoint_catalog_candidate_from_sealed_stage(
     shape.descriptor.validate_canonical_payload(&payload)?;
     let records = checkpoint_catalog_stage_records(inner, &census, &shape, &inspection)?;
     let candidate = CheckpointCatalogCandidate {
+        format: CheckpointCatalogFormat::ProtectedV3,
         metadata: CheckpointCatalogMetadata {
             identity,
             predecessor,
@@ -7290,9 +7615,9 @@ fn checkpoint_catalog_candidate_from_sealed_stage(
             replay_semantics_id: shape.descriptor.replay_semantics_id(),
             rows: shape.descriptor.rows(),
             cols: shape.descriptor.cols(),
-            adoption_mux_incarnation: permit.mux_incarnation(),
-            adoption_effect_id: permit.effect_id(),
-            adoption_sequence: permit.sequence(),
+            adoption_mux_incarnation: seed.mux_incarnation(),
+            adoption_effect_id: seed.effect_id(),
+            adoption_sequence: seed.sequence(),
             genesis_durable_pane_id: Uuid::nil(),
             genesis_origin_request_id: Uuid::nil(),
             genesis_spawn_payload_bytes: 0,
@@ -7304,6 +7629,7 @@ fn checkpoint_catalog_candidate_from_sealed_stage(
         },
         records,
         checksum: [0; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+        adoption_evidence: None,
     };
     checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
     Ok(candidate)
@@ -7370,6 +7696,7 @@ fn checkpoint_catalog_candidate_from_genesis_stage(
     shape.descriptor.validate_canonical_payload(&payload)?;
     let records = checkpoint_catalog_stage_records(inner, &census, &shape, &inspection)?;
     let candidate = CheckpointCatalogCandidate {
+        format: CheckpointCatalogFormat::ProtectedV3,
         metadata: CheckpointCatalogMetadata {
             identity,
             predecessor: None,
@@ -7400,6 +7727,7 @@ fn checkpoint_catalog_candidate_from_genesis_stage(
         },
         records,
         checksum: [0; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+        adoption_evidence: None,
     };
     checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
     Ok(candidate)
@@ -7954,7 +8282,7 @@ fn checkpoint_catalog_publish_genesis_stage(
 fn checkpoint_catalog_publish_sealed_stage(
     inner: &GuardianCheckpointStageStoreInner,
     request: &GuardianCheckpointStageRequestV1,
-    permit: &GuardianCheckpointCatalogAdoptionPermitV1,
+    seed: GuardianCheckpointCatalogAdoptionEvidenceSeedV1,
 ) -> Result<PublishedCheckpointCatalogMember, GuardianCheckpointStageStoreError> {
     if request.kind() != GuardianCheckpointStageKindV1::Seal {
         return Err(GuardianCheckpointStageStoreError::Conflict);
@@ -7969,13 +8297,32 @@ fn checkpoint_catalog_publish_sealed_stage(
         if existing.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
             && existing.metadata.boundary_id == shape.descriptor.boundary_id().into_bytes()
             && existing.metadata.upload_id == shape.upload_id
-            && existing.metadata.adoption_mux_incarnation == permit.mux_incarnation()
-            && existing.metadata.adoption_effect_id == permit.effect_id()
-            && existing.metadata.adoption_sequence == permit.sequence()
+            && existing.metadata.adoption_mux_incarnation == seed.mux_incarnation()
+            && existing.metadata.adoption_effect_id == seed.effect_id()
+            && existing.metadata.adoption_sequence == seed.sequence()
+            && existing.format == CheckpointCatalogFormat::ProtectedV3
         {
             if !scan.unpublished_candidates.is_empty() || !scan.staged_files.is_empty() {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
+            let existing_bytes = checkpoint_catalog_read_file(
+                inner,
+                &existing.candidate_path,
+                existing.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let recovered_candidate = checkpoint_catalog_decode_candidate(&existing_bytes)?;
+            if recovered_candidate.metadata != existing.metadata
+                || recovered_candidate.checksum != existing.candidate_checksum
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            checkpoint_catalog_validate_candidate_records(inner, &recovered_candidate)?;
+            drop(checkpoint_catalog_recover_adoption_evidence_with_seed(
+                inner,
+                &recovered_candidate,
+                seed,
+            )?);
             checkpoint_catalog_resync_file(
                 inner,
                 &existing.candidate_path,
@@ -8025,7 +8372,7 @@ fn checkpoint_catalog_publish_sealed_stage(
             generation,
             predecessor,
             &shape,
-            permit,
+            &seed,
         ),
     };
     let candidate_path =
@@ -8050,9 +8397,43 @@ fn checkpoint_catalog_publish_sealed_stage(
         request,
         identity,
         predecessor,
-        permit,
+        &seed,
     )?;
-    let encoded_candidate = checkpoint_catalog_encode_candidate(&mut candidate)?;
+    let encoded_base = checkpoint_catalog_encode_candidate_base(&mut candidate)?;
+    let (mut candidate, encoded_candidate) = match &candidate_plan {
+        CheckpointCatalogGenesisCandidatePlan::Create => {
+            candidate.adoption_evidence = Some(checkpoint_catalog_seal_adoption_evidence(
+                inner, &candidate, seed,
+            )?);
+            let encoded_candidate = checkpoint_catalog_encode_candidate(&mut candidate)?;
+            if encoded_candidate.get(..encoded_base.len()) != Some(encoded_base.as_slice()) {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            (candidate, encoded_candidate)
+        }
+        CheckpointCatalogGenesisCandidatePlan::Reuse(existing) => {
+            let existing_bytes = checkpoint_catalog_read_file(
+                inner,
+                &existing.path,
+                existing.file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let recovered_candidate = checkpoint_catalog_decode_candidate(&existing_bytes)?;
+            if existing_bytes.get(..encoded_base.len()) != Some(encoded_base.as_slice())
+                || recovered_candidate.metadata != candidate.metadata
+                || recovered_candidate.checksum != candidate.checksum
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            checkpoint_catalog_validate_candidate_records(inner, &recovered_candidate)?;
+            drop(checkpoint_catalog_recover_adoption_evidence_with_seed(
+                inner,
+                &recovered_candidate,
+                seed,
+            )?);
+            (recovered_candidate, existing_bytes)
+        }
+    };
     let marker = checkpoint_catalog_marker_for_candidate(&candidate);
     let encoded_marker = checkpoint_catalog_encode_marker(&marker);
     let (added_files, added_bytes) = checkpoint_catalog_genesis_added_resources(
@@ -8072,13 +8453,24 @@ fn checkpoint_catalog_publish_sealed_stage(
     {
         return Err(GuardianCheckpointStageStoreError::Capacity);
     }
-    let candidate_file_identity = checkpoint_catalog_publish_file(
-        inner,
-        &candidate_path,
-        &encoded_candidate,
-        "checkpoint-catalog-candidate-write",
-        "checkpoint-catalog-candidate-sync",
-    )?;
+    let candidate_file_identity = match &candidate_plan {
+        CheckpointCatalogGenesisCandidatePlan::Create => checkpoint_catalog_publish_file(
+            inner,
+            &candidate_path,
+            &encoded_candidate,
+            "checkpoint-catalog-candidate-write",
+            "checkpoint-catalog-candidate-sync",
+        )?,
+        CheckpointCatalogGenesisCandidatePlan::Reuse(existing) => {
+            checkpoint_catalog_resync_file(
+                inner,
+                &existing.path,
+                existing.file_identity,
+                "checkpoint-catalog-candidate-retry-sync",
+            )?;
+            existing.file_identity
+        }
+    };
     let marker_path = checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Marker)?;
     let marker_file_identity = checkpoint_catalog_publish_file(
         inner,
@@ -8127,7 +8519,17 @@ fn checkpoint_catalog_publish_sealed_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+    use frankenterm_term::{
+        RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
+    };
     use mio::{Poll, Token};
+    use mux::guardian_protocol::{
+        GuardianCheckpointIntent, GuardianEffectOutcome, GuardianOperation,
+        GuardianRequestEnvelope, GuardianRequestHeader, GuardianSecret, GuardianSpawnPayload,
+        decode_guardian_request, encode_guardian_request,
+    };
+    use portable_pty::{CommandBuilder, PtySize};
     use std::fs::hard_link;
     use std::io::{Seek, SeekFrom};
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -8247,6 +8649,472 @@ mod tests {
         );
         hasher.update(payload);
         hasher.finalize().into()
+    }
+
+    #[derive(Debug)]
+    struct CatalogCheckpointConfig;
+
+    impl TerminalConfiguration for CatalogCheckpointConfig {
+        fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+            frankenterm_term::color::ColorPalette::default()
+        }
+    }
+
+    fn checkpoint_catalog_test_terminal(content: &[u8]) -> RecoveryTerminalCheckpointV2 {
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(CatalogCheckpointConfig),
+            "FrankenTerm",
+            "guardian-catalog-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(content);
+        terminal
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .expect("capture canonical catalog checkpoint fixture")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_catalog_authenticate_request(
+        operation: GuardianOperation,
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        request_id: Uuid,
+        pane_id: Option<Uuid>,
+        generation: u64,
+        sequence: u64,
+        effect_id: Option<Uuid>,
+        payload: Zeroizing<Vec<u8>>,
+    ) -> Result<AuthenticatedGuardianRequest, GuardianProtocolError> {
+        let request = GuardianRequestEnvelope::from_zeroizing_payload(
+            GuardianRequestHeader::new(
+                operation,
+                guardian_incarnation,
+                mux_incarnation,
+                request_id,
+                pane_id,
+                generation,
+                sequence,
+                effect_id,
+                &payload,
+            ),
+            payload,
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; 32])?;
+        let frame = encode_guardian_request(&secret, &request)?;
+        decode_guardian_request(&secret, &frame)
+    }
+
+    fn checkpoint_catalog_claimed_protocol_state(
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        pane_id: Uuid,
+    ) -> Result<GuardianProtocolState, Box<dyn std::error::Error>> {
+        let mut state = GuardianProtocolState::new(guardian_incarnation)?;
+        let spawn_payload = GuardianSpawnPayload::new(
+            CommandBuilder::new("guardian-catalog-fixture"),
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+            },
+        )?
+        .encode()?;
+        let spawn = checkpoint_catalog_authenticate_request(
+            GuardianOperation::Spawn,
+            guardian_incarnation,
+            mux_incarnation,
+            Uuid::from_u128(0xca01),
+            Some(pane_id),
+            0,
+            0,
+            Some(Uuid::from_u128(0xca02)),
+            spawn_payload,
+        )?;
+        state.apply_effect_transactionally(&spawn, |_| GuardianEffectOutcome::<()>::Applied)?;
+        let claim = checkpoint_catalog_authenticate_request(
+            GuardianOperation::Claim,
+            guardian_incarnation,
+            mux_incarnation,
+            Uuid::from_u128(0xca03),
+            Some(pane_id),
+            0,
+            0,
+            Some(Uuid::from_u128(0xca04)),
+            Zeroizing::new(Vec::new()),
+        )?;
+        state.apply_effect_transactionally(&claim, |_| GuardianEffectOutcome::<()>::Applied)?;
+        Ok(state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_catalog_test_adoption_request(
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        effect_id: Uuid,
+        intent: GuardianCheckpointIntent,
+    ) -> Result<AuthenticatedGuardianRequest, GuardianProtocolError> {
+        let mut payload = Zeroizing::new(Vec::new());
+        payload.extend_from_slice(&intent.encode());
+        checkpoint_catalog_authenticate_request(
+            GuardianOperation::Checkpoint,
+            guardian_incarnation,
+            mux_incarnation,
+            request_id,
+            Some(pane_id),
+            generation,
+            sequence,
+            Some(effect_id),
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_catalog_issue_test_adoption_seed(
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        effect_id: Uuid,
+        intent: GuardianCheckpointIntent,
+    ) -> Result<GuardianCheckpointCatalogAdoptionEvidenceSeedV1, Box<dyn std::error::Error>> {
+        let mut state = checkpoint_catalog_claimed_protocol_state(
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+        )?;
+        let request = checkpoint_catalog_test_adoption_request(
+            guardian_incarnation,
+            mux_incarnation,
+            request_id,
+            pane_id,
+            generation,
+            sequence,
+            effect_id,
+            intent,
+        )?;
+        let mut seed = None;
+        let receipt = state.apply_checkpoint_transactionally(&request, |permit| {
+            seed = Some(permit.into_evidence_seed());
+            Ok::<(), ()>(())
+        })?;
+        if receipt.disposition() != mux::guardian_protocol::GuardianCheckpointDisposition::Committed
+        {
+            return Err("test adoption seed transaction did not commit".into());
+        }
+        match seed {
+            Some(seed) => Ok(seed),
+            None => Err("test adoption transaction did not issue its single-use seed".into()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_catalog_publish_test_adoption(
+        store: &GuardianCheckpointStageStore,
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        effect_id: Uuid,
+        intent: GuardianCheckpointIntent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = checkpoint_catalog_claimed_protocol_state(
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+        )?;
+        let request = checkpoint_catalog_test_adoption_request(
+            guardian_incarnation,
+            mux_incarnation,
+            request_id,
+            pane_id,
+            generation,
+            sequence,
+            effect_id,
+            intent,
+        )?;
+        let receipt = state.apply_checkpoint_transactionally(&request, |permit| {
+            store.publish_checkpoint_catalog_adoption(permit)
+        })?;
+        if receipt.disposition() != mux::guardian_protocol::GuardianCheckpointDisposition::Committed
+        {
+            return Err("test catalog adoption publication did not commit".into());
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_catalog_test_record_stage_request(
+        kind: GuardianCheckpointStageKindV1,
+        pane_id: Uuid,
+        generation: u64,
+        upload_id: Uuid,
+        terminal: &RecoveryTerminalCheckpointV2,
+        receipt: GuardianOutputAppendReceipt,
+        chunk_bytes: u32,
+        chunk: Option<(u32, &[u8])>,
+    ) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError> {
+        let canonical_payload = terminal.canonical_payload();
+        let total_bytes = u64::try_from(canonical_payload.len())
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let total_chunks = u32::try_from(total_bytes.div_ceil(u64::from(chunk_bytes)))
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let parser_stream_bytes = terminal.parser_stream_bytes();
+        let replay_identity = mux::guardian_checkpoint::current_replay_identity_digest();
+
+        let terminal_digest = checkpoint_test_terminal_digest(canonical_payload);
+        let mut boundary_hasher = Sha256::new();
+        boundary_hasher.update(b"frankenterm.guardian-checkpoint-output-boundary-identity.v1\0");
+        boundary_hasher.update(2_u32.to_le_bytes());
+        boundary_hasher.update(pane_id.as_bytes());
+        boundary_hasher.update(receipt.segment_id().as_bytes());
+        boundary_hasher.update(receipt.sequence().to_le_bytes());
+        boundary_hasher.update(receipt.record_digest());
+        boundary_hasher.update(receipt.committed_log_bytes().to_le_bytes());
+        boundary_hasher.update(receipt.cumulative_plaintext_bytes().to_le_bytes());
+        let boundary_digest: [u8; 32] = boundary_hasher.finalize().into();
+
+        let mut checkpoint_hasher = Sha256::new();
+        checkpoint_hasher.update(b"frankenterm.guardian-checkpoint-artifact-identity.v1\0");
+        checkpoint_hasher.update(boundary_digest);
+        checkpoint_hasher.update(parser_stream_bytes.to_le_bytes());
+        checkpoint_hasher.update(replay_identity);
+        checkpoint_hasher.update(24_u32.to_le_bytes());
+        checkpoint_hasher.update(80_u32.to_le_bytes());
+        checkpoint_hasher.update(total_bytes.to_le_bytes());
+        checkpoint_hasher.update(terminal_digest);
+        let checkpoint_digest: [u8; 32] = checkpoint_hasher.finalize().into();
+
+        let trailing_bytes = chunk.map_or(0, |(_, bytes)| 48 + bytes.len());
+        let mut wire = Zeroizing::new(Vec::new());
+        wire.try_reserve_exact(
+            CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
+                .checked_add(trailing_bytes)
+                .ok_or(GuardianProtocolError::PayloadTooLarge)?,
+        )
+        .map_err(|_| GuardianProtocolError::PayloadTooLarge)?;
+        wire.resize(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES, 0);
+        wire[..4].copy_from_slice(b"GCS1");
+        wire[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        wire[6] = match kind {
+            GuardianCheckpointStageKindV1::Begin => 1,
+            GuardianCheckpointStageKindV1::Chunk => 2,
+            GuardianCheckpointStageKindV1::Seal => 3,
+            GuardianCheckpointStageKindV1::Query => 4,
+            GuardianCheckpointStageKindV1::Ack => {
+                return Err(GuardianProtocolError::InvalidOperationPayload);
+            }
+        };
+        wire[8] = 1;
+        wire[16..32].copy_from_slice(pane_id.as_bytes());
+        wire[32..40].copy_from_slice(&generation.to_be_bytes());
+        wire[40..56].copy_from_slice(upload_id.as_bytes());
+        wire[56..88].copy_from_slice(&checkpoint_digest);
+        wire[88..120].copy_from_slice(&boundary_digest);
+        wire[120..128].copy_from_slice(&generation.to_be_bytes());
+        wire[128..160].copy_from_slice(&replay_identity);
+        wire[160..164].copy_from_slice(&24_u32.to_be_bytes());
+        wire[164..168].copy_from_slice(&80_u32.to_be_bytes());
+        wire[168..176].copy_from_slice(&total_bytes.to_be_bytes());
+        wire[176..208].copy_from_slice(&terminal_digest);
+        wire[208..224].copy_from_slice(pane_id.as_bytes());
+        wire[224] = 2;
+        wire[248..264].copy_from_slice(receipt.segment_id().as_bytes());
+        wire[264..272].copy_from_slice(&receipt.sequence().to_be_bytes());
+        wire[272..304].copy_from_slice(&receipt.record_digest());
+        wire[304..312].copy_from_slice(&receipt.committed_log_bytes().to_be_bytes());
+        wire[312..320].copy_from_slice(&receipt.cumulative_plaintext_bytes().to_be_bytes());
+        wire[320..328].copy_from_slice(&parser_stream_bytes.to_be_bytes());
+        wire[328..332].copy_from_slice(&chunk_bytes.to_be_bytes());
+        wire[332..336].copy_from_slice(&total_chunks.to_be_bytes());
+        if let Some((index, bytes)) = chunk {
+            let offset = u64::from(index)
+                .checked_mul(u64::from(chunk_bytes))
+                .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+            let chunk_digest: [u8; 32] = Sha256::digest(bytes).into();
+            wire.extend_from_slice(&index.to_be_bytes());
+            wire.extend_from_slice(&offset.to_be_bytes());
+            wire.extend_from_slice(&chunk_digest);
+            wire.extend_from_slice(
+                &u32::try_from(bytes.len())
+                    .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?
+                    .to_be_bytes(),
+            );
+            wire.extend_from_slice(bytes);
+        }
+        GuardianCheckpointStageRequestV1::decode(&wire)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_catalog_stage_and_publish(
+        pipeline: &GuardianOutputPipeline,
+        store: &GuardianCheckpointStageStore,
+        journal: &GuardianPaneOutputJournal,
+        state: &mut GuardianProtocolState,
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        identity_base: u128,
+        appended_output: &[u8],
+        complete_terminal_output: &[u8],
+    ) -> Result<([u8; 32], [u8; 32]), Box<dyn std::error::Error>> {
+        let receipt = durable_commit(pipeline, pane_id, journal, appended_output)?;
+        let terminal = checkpoint_catalog_test_terminal(complete_terminal_output);
+        if terminal.parser_stream_bytes() != receipt.cumulative_plaintext_bytes() {
+            return Err("catalog fixture parser/output watermark mismatch".into());
+        }
+        let upload_id = Uuid::from_u128(identity_base);
+        let chunk_bytes = 1_024_u32;
+        let begin = checkpoint_catalog_test_record_stage_request(
+            GuardianCheckpointStageKindV1::Begin,
+            pane_id,
+            generation,
+            upload_id,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
+        )?;
+        let checkpoint_id = begin.checkpoint_id().into_bytes();
+        let boundary_id = begin.boundary_id().into_bytes();
+        let replay_semantics_id = begin.descriptor().replay_semantics_id();
+        store.apply_begin(&begin)?;
+        for (index, bytes) in terminal
+            .canonical_payload()
+            .chunks(usize::try_from(chunk_bytes)?)
+            .enumerate()
+        {
+            store.apply_chunk(checkpoint_catalog_test_record_stage_request(
+                GuardianCheckpointStageKindV1::Chunk,
+                pane_id,
+                generation,
+                upload_id,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                Some((u32::try_from(index)?, bytes)),
+            )?)?;
+        }
+
+        let seal = checkpoint_catalog_test_record_stage_request(
+            GuardianCheckpointStageKindV1::Seal,
+            pane_id,
+            generation,
+            upload_id,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
+        )?;
+        let authenticated_seal = checkpoint_catalog_authenticate_request(
+            GuardianOperation::CheckpointStage,
+            guardian_incarnation,
+            mux_incarnation,
+            Uuid::from_u128(identity_base + 1),
+            Some(pane_id),
+            generation,
+            0,
+            None,
+            seal.into_zeroizing_payload()?,
+        )?;
+        let seal_permit = state.preflight_checkpoint_seal(&authenticated_seal)?;
+        store.apply_runtime_seal(seal_permit, journal)?;
+
+        let intent = GuardianCheckpointIntent::new(begin.checkpoint_id(), begin.boundary_id());
+        let mut adoption_payload = Zeroizing::new(Vec::new());
+        adoption_payload.extend_from_slice(&intent.encode());
+        let adoption = checkpoint_catalog_authenticate_request(
+            GuardianOperation::Checkpoint,
+            guardian_incarnation,
+            mux_incarnation,
+            Uuid::from_u128(identity_base + 2),
+            Some(pane_id),
+            generation,
+            sequence,
+            Some(Uuid::from_u128(identity_base + 3)),
+            adoption_payload,
+        )?;
+        state.apply_checkpoint_transactionally(&adoption, |permit| {
+            store.publish_checkpoint_catalog_adoption(permit)
+        })?;
+        Ok((checkpoint_id, replay_semantics_id))
+    }
+
+    fn checkpoint_catalog_rewrite_protected_member_as_legacy_fixture(
+        inner: &GuardianCheckpointStageStoreInner,
+        member: &PublishedCheckpointCatalogMember,
+    ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        if member.format != CheckpointCatalogFormat::ProtectedV3 {
+            return Err("fixture source member is not protected v3".into());
+        }
+        let mut candidate_bytes = std::fs::read(&member.candidate_path)?;
+        let evidence_bytes = usize::try_from(CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES)?;
+        let legacy_len = candidate_bytes
+            .len()
+            .checked_sub(evidence_bytes)
+            .ok_or("protected candidate is shorter than its evidence record")?;
+        candidate_bytes.truncate(legacy_len);
+        candidate_bytes[..8].copy_from_slice(&CHECKPOINT_CATALOG_LEGACY_CANDIDATE_MAGIC);
+        candidate_bytes[8..12].copy_from_slice(&CHECKPOINT_CATALOG_LEGACY_VERSION.to_le_bytes());
+        candidate_bytes[CHECKPOINT_CATALOG_HEADER_BYTES - 12..CHECKPOINT_CATALOG_HEADER_BYTES]
+            .fill(0);
+        let checksum_offset = candidate_bytes
+            .len()
+            .checked_sub(OUTPUT_MANIFEST_CHECKSUM_BYTES)
+            .ok_or("legacy candidate checksum offset")?;
+        let checksum = checkpoint_catalog_checksum(
+            CHECKPOINT_CATALOG_LEGACY_CHECKSUM_DOMAIN,
+            &candidate_bytes[..checksum_offset],
+        );
+        candidate_bytes[checksum_offset..].copy_from_slice(&checksum);
+        let decoded = checkpoint_catalog_decode_candidate(&candidate_bytes)?;
+        if decoded.format != CheckpointCatalogFormat::LegacyV2
+            || decoded.metadata != member.metadata
+            || decoded.adoption_evidence.is_some()
+        {
+            return Err("converted legacy candidate is not exact".into());
+        }
+        let marker_bytes =
+            checkpoint_catalog_encode_marker(&checkpoint_catalog_marker_for_candidate(&decoded));
+        let decoded_marker = checkpoint_catalog_decode_marker(&marker_bytes)?;
+        if decoded_marker.format != CheckpointCatalogFormat::LegacyV2
+            || decoded_marker.identity != member.metadata.identity
+            || decoded_marker.candidate_checksum != checksum
+        {
+            return Err("converted legacy marker is not exact".into());
+        }
+
+        let mut candidate_file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&member.candidate_path)?;
+        candidate_file.write_all(&candidate_bytes)?;
+        candidate_file.sync_all()?;
+        let mut marker_file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&member.marker_path)?;
+        marker_file.write_all(&marker_bytes)?;
+        marker_file.sync_all()?;
+        inner.directory.sync_all()?;
+        Ok((candidate_bytes, marker_bytes))
     }
 
     fn checkpoint_test_genesis_request(
@@ -8433,6 +9301,7 @@ mod tests {
             CheckpointCatalogScope::Genesis { spawn_effect_id } => (spawn_effect_id, 0),
         };
         CheckpointCatalogMarker {
+            format: CheckpointCatalogFormat::ProtectedV3,
             identity,
             predecessor_generation: None,
             predecessor_candidate_id: Uuid::nil(),
@@ -8769,6 +9638,266 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_catalog_publication_resumes_every_adoption_evidence_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for case in 0_u128..7 {
+            let directory_prefix = format!("ft-guardian-catalog-evidence-prefix-{case}-");
+            let (_directory, _poll, pipeline) =
+                pipeline_with_policy(&directory_prefix, OutputSegmentPolicy::production())?;
+            let store = pipeline.checkpoint_stage_store();
+            let identity_base = 0xc4_0000_u128
+                .checked_add(case.checked_mul(0x100).ok_or("case identity overflow")?)
+                .ok_or("case identity overflow")?;
+            let guardian_incarnation = Uuid::from_u128(identity_base + 1);
+            let mux_incarnation = Uuid::from_u128(identity_base + 2);
+            let pane_id = Uuid::from_u128(identity_base + 3);
+            let generation = 1;
+            let sequence = 1;
+            let upload_id = Uuid::from_u128(identity_base + 4);
+            let seal_request_id = Uuid::from_u128(identity_base + 5);
+            let adoption_request_id = Uuid::from_u128(identity_base + 6);
+            let adoption_effect_id = Uuid::from_u128(identity_base + 7);
+
+            let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+            let receipt = durable_commit(&pipeline, pane_id, &journal, b"stable-evidence")?;
+            let terminal = checkpoint_catalog_test_terminal(b"stable-evidence");
+            assert_eq!(
+                terminal.parser_stream_bytes(),
+                receipt.cumulative_plaintext_bytes()
+            );
+            let chunk_bytes = 1_024_u32;
+            let begin = checkpoint_catalog_test_record_stage_request(
+                GuardianCheckpointStageKindV1::Begin,
+                pane_id,
+                generation,
+                upload_id,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                None,
+            )?;
+            store.apply_begin(&begin)?;
+            for (index, bytes) in terminal
+                .canonical_payload()
+                .chunks(usize::try_from(chunk_bytes)?)
+                .enumerate()
+            {
+                store.apply_chunk(checkpoint_catalog_test_record_stage_request(
+                    GuardianCheckpointStageKindV1::Chunk,
+                    pane_id,
+                    generation,
+                    upload_id,
+                    &terminal,
+                    receipt,
+                    chunk_bytes,
+                    Some((u32::try_from(index)?, bytes)),
+                )?)?;
+            }
+            let seal_for_preflight = checkpoint_catalog_test_record_stage_request(
+                GuardianCheckpointStageKindV1::Seal,
+                pane_id,
+                generation,
+                upload_id,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                None,
+            )?;
+            let authenticated_seal = checkpoint_catalog_authenticate_request(
+                GuardianOperation::CheckpointStage,
+                guardian_incarnation,
+                mux_incarnation,
+                seal_request_id,
+                Some(pane_id),
+                generation,
+                0,
+                None,
+                seal_for_preflight.into_zeroizing_payload()?,
+            )?;
+            let seal_state = checkpoint_catalog_claimed_protocol_state(
+                guardian_incarnation,
+                mux_incarnation,
+                pane_id,
+            )?;
+            let seal_permit = seal_state.preflight_checkpoint_seal(&authenticated_seal)?;
+            store.apply_runtime_seal(seal_permit, &journal)?;
+
+            let seal = checkpoint_catalog_test_record_stage_request(
+                GuardianCheckpointStageKindV1::Seal,
+                pane_id,
+                generation,
+                upload_id,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                None,
+            )?;
+            let intent = GuardianCheckpointIntent::new(begin.checkpoint_id(), begin.boundary_id());
+            let first_seed = checkpoint_catalog_issue_test_adoption_seed(
+                guardian_incarnation,
+                mux_incarnation,
+                adoption_request_id,
+                pane_id,
+                generation,
+                sequence,
+                adoption_effect_id,
+                intent,
+            )?;
+            let second_seed = checkpoint_catalog_issue_test_adoption_seed(
+                guardian_incarnation,
+                mux_incarnation,
+                adoption_request_id,
+                pane_id,
+                generation,
+                sequence,
+                adoption_effect_id,
+                intent,
+            )?;
+            let shape = CheckpointStageRequestShape::from_request(&seal)?;
+            let scope = CheckpointCatalogScope::Pane { pane_id };
+            let first_candidate_id =
+                checkpoint_catalog_candidate_id(scope, 1, None, &shape, &first_seed);
+            let second_candidate_id =
+                checkpoint_catalog_candidate_id(scope, 1, None, &shape, &second_seed);
+            assert_eq!(second_candidate_id, first_candidate_id);
+            let identity = CheckpointCatalogIdentity {
+                scope,
+                generation: 1,
+                candidate_id: first_candidate_id,
+            };
+            let mut first_candidate = checkpoint_catalog_candidate_from_sealed_stage(
+                &store.inner,
+                &seal,
+                identity,
+                None,
+                &first_seed,
+            )?;
+            let first_base = checkpoint_catalog_encode_candidate_base(&mut first_candidate)?;
+            first_candidate.adoption_evidence = Some(checkpoint_catalog_seal_adoption_evidence(
+                &store.inner,
+                &first_candidate,
+                first_seed,
+            )?);
+            let first_encoded = checkpoint_catalog_encode_candidate(&mut first_candidate)?;
+
+            let mut second_candidate = checkpoint_catalog_candidate_from_sealed_stage(
+                &store.inner,
+                &seal,
+                identity,
+                None,
+                &second_seed,
+            )?;
+            let second_base = checkpoint_catalog_encode_candidate_base(&mut second_candidate)?;
+            second_candidate.adoption_evidence = Some(checkpoint_catalog_seal_adoption_evidence(
+                &store.inner,
+                &second_candidate,
+                second_seed,
+            )?);
+            let second_encoded = checkpoint_catalog_encode_candidate(&mut second_candidate)?;
+            assert_eq!(second_base, first_base);
+            assert_eq!(second_encoded, first_encoded);
+
+            let evidence_record_bytes =
+                usize::try_from(CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES)?;
+            let base_bytes = first_base.len();
+            assert_eq!(
+                first_encoded.len(),
+                base_bytes
+                    .checked_add(evidence_record_bytes)
+                    .ok_or("protected candidate length overflow")?
+            );
+            let complete_header = base_bytes
+                .checked_add(GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES)
+                .ok_or("complete evidence header prefix overflow")?;
+            let evidence_ciphertext_bytes = evidence_record_bytes
+                .checked_sub(GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES)
+                .ok_or("evidence record has no ciphertext")?;
+            let prefix_bytes = match case {
+                0 => base_bytes,
+                1 => base_bytes
+                    .checked_add(1)
+                    .ok_or("first evidence prefix overflow")?,
+                2 => base_bytes
+                    .checked_add(GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES / 2)
+                    .ok_or("middle evidence header prefix overflow")?,
+                3 => complete_header,
+                4 => complete_header
+                    .checked_add(1)
+                    .ok_or("first evidence ciphertext prefix overflow")?,
+                5 => complete_header
+                    .checked_add(evidence_ciphertext_bytes / 2)
+                    .ok_or("middle evidence ciphertext prefix overflow")?,
+                6 => first_encoded.len(),
+                _ => unreachable!("bounded evidence crash case"),
+            };
+            let canonical = checkpoint_catalog_path(
+                &store.inner,
+                identity,
+                CheckpointCatalogPathRole::Candidate,
+            )?;
+            let staging = checkpoint_catalog_staging_path(&store.inner, &canonical)?;
+            let mut torn = create_private_file_new_at(
+                &store.inner.directory,
+                &store.inner.directory_path,
+                &staging,
+            )?;
+            torn.write_all(&first_encoded[..prefix_bytes])?;
+            torn.sync_all()?;
+            store.inner.directory.sync_all()?;
+
+            checkpoint_catalog_publish_test_adoption(
+                &store,
+                guardian_incarnation,
+                mux_incarnation,
+                adoption_request_id,
+                pane_id,
+                generation,
+                sequence,
+                adoption_effect_id,
+                intent,
+            )?;
+            assert_eq!(std::fs::read(&canonical)?, second_encoded);
+            assert!(matches!(
+                std::fs::symlink_metadata(&staging),
+                Err(error) if error.kind() == ErrorKind::NotFound
+            ));
+
+            let first_scan = checkpoint_catalog_scan(&store.inner, scope)?;
+            assert_eq!(first_scan.published.len(), 1);
+            assert!(first_scan.unpublished_candidates.is_empty());
+            assert!(first_scan.staged_files.is_empty());
+            assert_eq!(first_scan.relevant_files, 2);
+            let published = &first_scan.published[0];
+            assert_eq!(published.metadata.identity, identity);
+            assert_eq!(published.candidate_path, canonical);
+            let marker_before_retry = std::fs::read(&published.marker_path)?;
+
+            checkpoint_catalog_publish_test_adoption(
+                &store,
+                guardian_incarnation,
+                mux_incarnation,
+                adoption_request_id,
+                pane_id,
+                generation,
+                sequence,
+                adoption_effect_id,
+                intent,
+            )?;
+            let recovered = checkpoint_catalog_scan(&store.inner, scope)?;
+            assert_eq!(recovered.published.len(), 1);
+            assert!(recovered.unpublished_candidates.is_empty());
+            assert!(recovered.staged_files.is_empty());
+            assert_eq!(recovered.relevant_files, 2);
+            assert_eq!(std::fs::read(&canonical)?, second_encoded);
+            assert_eq!(
+                std::fs::read(&recovered.published[0].marker_path)?,
+                marker_before_retry
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn checkpoint_catalog_publication_quarantines_non_prefix_staging_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
@@ -8996,6 +10125,169 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_catalog_v2_pair_is_classified_preserved_and_never_authorizes_pane_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-legacy-v2-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian_incarnation = Uuid::from_u128(0xc901);
+        let mux_incarnation = Uuid::from_u128(0xc902);
+        let pane_id = Uuid::from_u128(0xc903);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+        )?;
+        let scope = CheckpointCatalogScope::Pane { pane_id };
+
+        let (first_checkpoint_id, replay_semantics_id) = checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+            generation,
+            1,
+            0xcb00,
+            b"one",
+            b"one",
+        )?;
+        let protected = checkpoint_catalog_scan(&store.inner, scope)?;
+        assert_eq!(protected.published.len(), 1);
+        assert_eq!(
+            protected.published[0].format,
+            CheckpointCatalogFormat::ProtectedV3
+        );
+        let protected_first = protected.published[0].clone();
+        let (legacy_candidate_bytes, legacy_marker_bytes) =
+            checkpoint_catalog_rewrite_protected_member_as_legacy_fixture(
+                &store.inner,
+                &protected_first,
+            )?;
+
+        let legacy = checkpoint_catalog_scan(&store.inner, scope)?;
+        assert_eq!(legacy.published.len(), 1);
+        let legacy_first = &legacy.published[0];
+        assert_eq!(legacy_first.format, CheckpointCatalogFormat::LegacyV2);
+        assert!(!legacy_first.format.authorizes_scope(scope));
+        assert_eq!(
+            std::fs::read(&legacy_first.candidate_path)?,
+            legacy_candidate_bytes
+        );
+        assert_eq!(
+            std::fs::read(&legacy_first.marker_path)?,
+            legacy_marker_bytes
+        );
+        let stage_scope = CheckpointStagePathScope::Pane {
+            pane_id,
+            generation,
+        };
+        assert_eq!(
+            store.exact_catalog_member(stage_scope, first_checkpoint_id)?,
+            None,
+            "legacy metadata and SHA fields cannot synthesize Pane recovery authority"
+        );
+        assert_eq!(
+            store.latest_compatible_catalog_member(stage_scope, replay_semantics_id)?,
+            None,
+            "legacy Pane entries remain readable but are never recovery-selectable"
+        );
+
+        let (second_checkpoint_id, second_replay_semantics_id) =
+            checkpoint_catalog_stage_and_publish(
+                &pipeline,
+                &store,
+                &journal,
+                &mut state,
+                guardian_incarnation,
+                mux_incarnation,
+                pane_id,
+                generation,
+                2,
+                0xcc00,
+                b"-two",
+                b"one-two",
+            )?;
+        let upgraded = checkpoint_catalog_scan(&store.inner, scope)?;
+        assert_eq!(upgraded.published.len(), 2);
+        assert_eq!(
+            upgraded.published[0].format,
+            CheckpointCatalogFormat::LegacyV2
+        );
+        assert_eq!(
+            upgraded.published[1].format,
+            CheckpointCatalogFormat::ProtectedV3
+        );
+        assert_eq!(
+            std::fs::read(&upgraded.published[0].candidate_path)?,
+            legacy_candidate_bytes
+        );
+        assert_eq!(
+            std::fs::read(&upgraded.published[0].marker_path)?,
+            legacy_marker_bytes
+        );
+        assert_eq!(
+            store.exact_catalog_member(stage_scope, first_checkpoint_id)?,
+            None
+        );
+        assert_eq!(
+            store.exact_catalog_member(stage_scope, second_checkpoint_id)?,
+            Some(second_checkpoint_id)
+        );
+        assert_eq!(
+            store.latest_compatible_catalog_member(stage_scope, second_replay_semantics_id)?,
+            Some(second_checkpoint_id),
+            "a protected v3 successor is recovery-selectable across a legacy predecessor"
+        );
+
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+            generation,
+            3,
+            0xcd00,
+            b"-three",
+            b"one-two-three",
+        )?;
+        let before_downgrade = checkpoint_catalog_scan(&store.inner, scope)?;
+        assert_eq!(before_downgrade.published.len(), 3);
+        let protected_third = before_downgrade.published[2].clone();
+        checkpoint_catalog_rewrite_protected_member_as_legacy_fixture(
+            &store.inner,
+            &protected_third,
+        )?;
+        let retained_bytes = before_downgrade
+            .published
+            .iter()
+            .flat_map(|member| [&member.candidate_path, &member.marker_path])
+            .map(|path| Ok((path.clone(), std::fs::read(path)?)))
+            .collect::<Result<Vec<_>, std::io::Error>>()?;
+        assert!(matches!(
+            checkpoint_catalog_scan(&store.inner, scope),
+            Err(GuardianCheckpointStageStoreError::Poisoned)
+        ));
+        for (path, bytes) in retained_bytes {
+            assert_eq!(
+                std::fs::read(path)?,
+                bytes,
+                "a rejected v3-to-v2 downgrade must not mutate any catalog artifact"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn checkpoint_catalog_genesis_marker_rejects_nonzero_sequence_and_wrong_spawn() {
         let spawn_effect_id = Uuid::from_u128(0xe301);
         let identity = CheckpointCatalogIdentity {
@@ -9164,6 +10456,7 @@ mod tests {
             expected_len: Some(1),
         };
         let first = PublishedCheckpointCatalogMember {
+            format: CheckpointCatalogFormat::ProtectedV3,
             metadata,
             candidate_checksum: [0x71; 32],
             candidate_path: PathBuf::from("genesis-candidate-one"),
@@ -9221,6 +10514,7 @@ mod tests {
             expected_len: Some(1),
         };
         PublishedCheckpointCatalogMember {
+            format: CheckpointCatalogFormat::ProtectedV3,
             metadata: CheckpointCatalogMetadata {
                 identity: CheckpointCatalogIdentity {
                     scope,
@@ -9359,7 +10653,14 @@ mod tests {
             + u64::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES).expect("candidate bytes")
             + u64::try_from(CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES).expect("seal bytes")
             + u64::try_from(CHECKPOINT_CATALOG_HEADER_BYTES).expect("catalog header bytes")
-            + u64::try_from(OUTPUT_MANIFEST_CHECKSUM_BYTES).expect("catalog checksum bytes");
+            + u64::try_from(OUTPUT_MANIFEST_CHECKSUM_BYTES).expect("catalog checksum bytes")
+            + CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES;
+        assert_eq!(
+            CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES,
+            u64::from(GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES)
+                + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES
+        );
+        assert!(include_str!("output.rs").contains(".try_reserve_exact(evidence_bytes)"));
         assert_eq!(
             CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
             expected_catalog_candidate_bytes

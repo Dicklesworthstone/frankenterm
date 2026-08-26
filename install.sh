@@ -81,6 +81,15 @@ ACTIVE_PROCESS_FAMILY_MANIFEST=""
 ACTIVE_PROCESS_FAMILY_VERIFIER=""
 ACTIVE_ATOMIC_TRANSITION_HELPER=""
 PENDING_PROCESS_FAMILY_GENERATION=""
+PUBLISHED_PROCESS_FAMILY_VERSION=""
+PUBLISHED_PROCESS_FAMILY_ROOT=""
+PROCESS_FAMILY_ACTIVATION_STATE=""
+PROCESS_FAMILY_ACTIVE_AUTHORITY=""
+PROCESS_FAMILY_ACTIVE_ROOT=""
+PROCESS_FAMILY_PENDING_REASON=""
+INITIAL_SELECTOR_HOLD_REASON=""
+VERIFIED_ARCHIVE_IDENTITY=""
+FONT_INSTALLED_PATH=""
 OFFLINE_TARBALL=""
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
@@ -90,6 +99,18 @@ COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubuserconten
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/ft-install.lock"
 HARDCODED_FALLBACK_VERSION="v0.2.0"
+
+# Download and extraction resource contracts. These are deliberately finite
+# and are enforced both before transfer and again through descriptor-pinned
+# post-download/extraction checks. The app allowance includes its bundled
+# browser runtime; the standalone triplet has a substantially smaller budget.
+MAX_PROCESS_ARCHIVE_BYTES=1073741824
+MAX_PROCESS_EXPANDED_BYTES=4294967296
+MAX_APP_ARCHIVE_BYTES=4294967296
+MAX_APP_EXPANDED_BYTES=17179869184
+MAX_FONT_ARCHIVE_BYTES=268435456
+MAX_FONT_EXPANDED_BYTES=1073741824
+INSTALLER_FREE_SPACE_HEADROOM_BYTES=67108864
 
 # Cleanup state. The permanent lock inode is never unlinked; a Python holder
 # owns its kernel advisory lock until the shell closes the control FIFO.
@@ -305,23 +326,115 @@ resolve_version() {
 # ───────────────────────────────────────────────────────────────────────────
 # Preflight
 # ───────────────────────────────────────────────────────────────────────────
-check_disk_space() {
-  # 100MB headroom. The atomic Unix archive contains ft plus the matching mux
-  # server and PTY guardian; download, extraction, staged install, and preserved
-  # previous binaries can coexist briefly under $TMP and $DEST.
-  local min_kb=102400
-  local path="$DEST"
-  [ ! -d "$path" ] && path=$(dirname "$path")
-  if command -v df >/dev/null 2>&1; then
-    local avail_kb
-    avail_kb=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}')
-    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$min_kb" ]; then
-      err "Insufficient disk space in $path (need at least 100MB)"
-      exit 1
-    fi
-  else
-    warn "df not found; skipping disk space check"
+require_filesystem_capacity() {
+  local path="$1" required_bytes="$2" label="$3"
+  [[ "$required_bytes" =~ ^[0-9]+$ ]] || {
+    err "Invalid byte budget for $label"
+    return 1
+  }
+  if ! python3 - "$path" "$required_bytes" "$label" <<'PY'
+import os, stat, sys
+
+path, required_raw, label = sys.argv[1:]
+required = int(required_raw)
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    observed = os.fstat(fd)
+    named = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISDIR(observed.st_mode) or
+            (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit(f"{label} capacity root is not one stable nofollow directory")
+    filesystem = os.fstatvfs(fd)
+    available = filesystem.f_bavail * filesystem.f_frsize
+    if available < required:
+        raise SystemExit(
+            f"{label} has {available} free bytes but requires {required} bounded bytes"
+        )
+finally:
+    os.close(fd)
+PY
+  then
+    err "Insufficient or unsafe filesystem capacity for $label at $path"
+    return 1
   fi
+}
+
+verify_bounded_download_file() {
+  local path="$1" max_bytes="$2"
+  python3 - "$path" "$max_bytes" <<'PY'
+import os, stat, sys
+
+path, maximum_raw = sys.argv[1:]
+maximum = int(maximum_raw)
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+fd = os.open(path, flags)
+try:
+    observed = os.fstat(fd)
+    named = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or
+            observed.st_size > maximum or
+            (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit("download did not produce one bounded single-link regular file")
+finally:
+    os.close(fd)
+PY
+}
+
+download_https_bounded() {
+  local url="$1" output="$2" max_bytes="$3" max_time="$4" retry="${5:-0}"
+  local output_parent required_bytes
+  case "$url" in
+    https://*) ;;
+    *)
+      err "Remote download authority must use HTTPS: $url"
+      return 1
+      ;;
+  esac
+  [[ "$max_bytes" =~ ^[0-9]+$ ]] && [[ "$max_time" =~ ^[0-9]+$ ]] || return 1
+  [ ! -e "$output" ] && [ ! -L "$output" ] || {
+    err "Refusing to overwrite a retained download path: $output"
+    return 1
+  }
+  if ! curl --help all 2>/dev/null | LC_ALL=C grep -Fq -- '--max-filesize'; then
+    err "curl cannot enforce --max-filesize; refusing an unbounded download"
+    return 1
+  fi
+  output_parent=$(dirname "$output") || return 1
+  required_bytes=$((max_bytes + INSTALLER_FREE_SPACE_HEADROOM_BYTES))
+  require_filesystem_capacity "$output_parent" "$required_bytes" "temporary download" || return 1
+
+  local curl_args=(-fsSL --proto '=https' --proto-redir '=https'
+    --max-filesize "$max_bytes" --max-time "$max_time")
+  if [ "$retry" -eq 1 ]; then
+    curl_args+=(--retry 3 --retry-delay 2 --retry-connrefused)
+  fi
+  curl ${curl_args[@]+"${curl_args[@]}"} \
+    ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$url" -o "$output" || return 1
+  verify_bounded_download_file "$output" "$max_bytes"
+}
+
+require_transfer_capacity() {
+  local temporary_root="$1" destination_root="$2" archive_bytes="$3"
+  local expanded_bytes="$4" label="$5" temporary_bytes destination_bytes
+  [[ "$archive_bytes" =~ ^[0-9]+$ ]] && [[ "$expanded_bytes" =~ ^[0-9]+$ ]] || {
+    err "Invalid transfer budget for $label"
+    return 1
+  }
+  temporary_bytes=$((archive_bytes + expanded_bytes + INSTALLER_FREE_SPACE_HEADROOM_BYTES))
+  destination_bytes=$((expanded_bytes + INSTALLER_FREE_SPACE_HEADROOM_BYTES))
+  require_filesystem_capacity "$temporary_root" "$temporary_bytes" \
+    "$label temporary workspace" || return 1
+  require_filesystem_capacity "$destination_root" "$destination_bytes" \
+    "$label destination" || return 1
+}
+
+check_disk_space() {
+  # Exact package sizes are checked after authentication. This first fence
+  # guarantees enough room for manifests and an atomic publication without
+  # assuming that TMP and DEST share one filesystem.
+  require_filesystem_capacity "$DEST" "$INSTALLER_FREE_SPACE_HEADROOM_BYTES" \
+    "installation destination" || exit 1
 }
 
 process_family_manifest_metadata() {
@@ -378,7 +491,15 @@ if family_kind == "app":
     }
 if executables != expected:
     raise SystemExit("component manifest has the wrong exact executable role inventory")
-print("\t".join([manifest["manifest_id"], *(identity[key] for key in keys)]))
+inventory = manifest.get("inventory")
+if (not isinstance(inventory, dict) or
+        not isinstance(inventory.get("total_bytes"), int) or
+        isinstance(inventory.get("total_bytes"), bool) or
+        inventory["total_bytes"] < 0 or inventory["total_bytes"] > 16 * 1024 * 1024 * 1024):
+    raise SystemExit("component manifest has an invalid bounded byte inventory")
+print("\t".join([
+    manifest["manifest_id"], *(identity[key] for key in keys), str(inventory["total_bytes"]),
+]))
 PY
 }
 
@@ -1018,13 +1139,14 @@ PY
 
 verify_canonical_generation() {
   local generation="$1" expected_version="${2:-}" verifier_authority="${3:-}"
-  local metadata manifest_id build_id source_revision version target profile feature_contract manifest
+  local metadata manifest_id build_id source_revision version target profile feature_contract inventory_bytes manifest
   manifest="$generation/process-family.component-manifest.json"
   [ -f "$verifier_authority" ] && [ ! -L "$verifier_authority" ] || return 1
   [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 1
   bash "$verifier_authority" verify --root "$generation" --manifest "$manifest" >/dev/null || return 1
   metadata=$(process_family_manifest_metadata "$manifest" triplet) || return 1
-  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract <<<"$metadata"
+  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract inventory_bytes <<<"$metadata"
+  [[ "$inventory_bytes" =~ ^[0-9]+$ ]] || return 1
   [ "$(basename "$generation")" = "${manifest_id#sha256:}" ] || return 1
   if [ -n "$expected_version" ]; then
     [ "$version" = "${expected_version#v}" ] || [ "$version" = "$expected_version" ] || return 1
@@ -1099,7 +1221,10 @@ try:
     managed_final = os.stat(
         ".frankenterm-process-family", dir_fd=destination_fd, follow_symlinks=False)
     generations_final = os.stat("generations", dir_fd=managed_fd, follow_symlinks=False)
-    if stable(destination_opened) != stable(destination_final):
+    if (destination_opened.st_dev, destination_opened.st_ino,
+        destination_opened.st_uid, stat.S_IMODE(destination_opened.st_mode)) != (
+        destination_final.st_dev, destination_final.st_ino,
+        destination_final.st_uid, stat.S_IMODE(destination_final.st_mode)):
         raise SystemExit("installer destination changed while roots were prepared")
     if managed_before[:2] != (managed_final.st_dev, managed_final.st_ino):
         raise SystemExit("managed process-family root detached while prepared")
@@ -1190,7 +1315,7 @@ try:
         current_target = current[1]
         if not current_pattern.fullmatch(current_target):
             raise SystemExit("current selector has a non-canonical target")
-        generation_name = current_target.removeprefix("generations/")
+        generation_name = current_target[len("generations/"):]
         selected_fd, _ = open_private_directory(
             parent_fd=generations_fd, name=generation_name,
             label="selected process-family generation")
@@ -1258,7 +1383,9 @@ names = {
 truncated = {name[:15] for name in names}
 
 def classify(command):
-    basename = os.path.basename(command.removesuffix(" (deleted)"))
+    if command.endswith(" (deleted)"):
+        command = command[:-len(" (deleted)")]
+    basename = os.path.basename(command)
     if basename in names:
         return "active"
     if basename in truncated:
@@ -1329,16 +1456,25 @@ PY
 
 require_no_live_mux_for_initial_selector() {
   local state
+  INITIAL_SELECTOR_HOLD_REASON=""
   state=$(installer_mux_ownership_state) || state=ambiguous
   case "$state" in
-    inactive) return 0 ;;
+    inactive)
+      INITIAL_SELECTOR_HOLD_REASON="inactive-census-without-shared-launcher-lease"
+      warn "Mux census is inactive, but no launcher-shared lease proves that state remains inactive"
+      ;;
     active)
+      INITIAL_SELECTOR_HOLD_REASON="active-mux-owns-session-state"
       err "A live FrankenTerm/WezTerm mux owns session state; refusing initial selector creation"
       ;;
     *)
+      INITIAL_SELECTOR_HOLD_REASON="ambiguous-mux-ownership"
       err "Mux ownership could not be proven inactive; refusing initial selector creation"
       ;;
   esac
+  # A process census is evidence, not an exclusion primitive. Until every GUI,
+  # CLI, and mux launcher participates in one lease, this function must never
+  # authorize selector publication, including after an inactive observation.
   return 1
 }
 
@@ -1389,13 +1525,20 @@ install_process_family() {
   local manifest_source="$4" verifier_source="$5"
   local managed="$DEST/.frankenterm-process-family"
   local generations="$DEST/.frankenterm-process-family/generations"
-  local metadata manifest_id build_id source_revision version target profile feature_contract
+  local metadata manifest_id build_id source_revision version target profile feature_contract inventory_bytes
   local generation_id generation stage stage_name helper="$ft_source" stage_id txid
 
   ACTIVE_PROCESS_FAMILY_MANIFEST=""
   ACTIVE_PROCESS_FAMILY_VERIFIER=""
   ACTIVE_ATOMIC_TRANSITION_HELPER=""
   PENDING_PROCESS_FAMILY_GENERATION=""
+  PUBLISHED_PROCESS_FAMILY_VERSION=""
+  PUBLISHED_PROCESS_FAMILY_ROOT=""
+  PROCESS_FAMILY_ACTIVATION_STATE=""
+  PROCESS_FAMILY_ACTIVE_AUTHORITY=""
+  PROCESS_FAMILY_ACTIVE_ROOT=""
+  PROCESS_FAMILY_PENDING_REASON=""
+  INITIAL_SELECTOR_HOLD_REASON=""
 
   command -v python3 >/dev/null 2>&1 || {
     err "python3 is required for crash-atomic installation"
@@ -1413,8 +1556,11 @@ install_process_family() {
       return 1
     }
   metadata=$(process_family_manifest_metadata "$manifest_source" triplet) || return 1
-  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract <<<"$metadata"
+  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract inventory_bytes <<<"$metadata"
   [ -n "$profile" ] || return 1
+  [ -n "$version" ] || return 1
+  [[ "$inventory_bytes" =~ ^[0-9]+$ ]] || return 1
+  PUBLISHED_PROCESS_FAMILY_VERSION="$version"
   generation_id="${manifest_id#sha256:}"
 
   ensure_installer_process_family_root || return 1
@@ -1423,6 +1569,9 @@ install_process_family() {
     [ -d "$generation" ] && [ ! -L "$generation" ] && \
       verify_canonical_generation "$generation" "$version" "$verifier_source" || return 1
   else
+    require_filesystem_capacity "$generations" \
+      "$((inventory_bytes + INSTALLER_FREE_SPACE_HEADROOM_BYTES))" \
+      "immutable process-family generation" || return 1
     # The deterministic stage is a durable retry address. A kill at any
     # prefix is resumed only when every retained member is an exact byte match;
     # malformed residue is preserved and fails closed instead of allocating an
@@ -1458,6 +1607,7 @@ install_process_family() {
     verify_canonical_generation "$generation" "$version" "$verifier_source" || return 1
   fi
   installer_failpoint after-generation-publish
+  PUBLISHED_PROCESS_FAMILY_ROOT="$generation"
 
   local current_target="" selected_generation="" initial_install=0 legacy_owner=0
   local authority_state name
@@ -1469,6 +1619,8 @@ install_process_family() {
     initial)
       initial_install=1
       selected_generation="$generation"
+      require_no_live_mux_for_initial_selector || true
+      [ -n "$INITIAL_SELECTOR_HOLD_REASON" ] || return 1
       ;;
     legacy)
       # Preserve a coherent direct-install family as an immutable recovery
@@ -1514,6 +1666,7 @@ install_process_family() {
         atomic_path_transition "$helper" "$generations" "$legacy_stage_name" "$legacy_id" \
           "$txid" "$stage_id" missing publish-noreplace || return 1
       fi
+      installer_failpoint after-legacy-recovery-publish
       [ "$(inspect_installer_process_family_authority)" = legacy ] || return 1
       for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
         cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
@@ -1536,38 +1689,6 @@ install_process_family() {
       ;;
   esac
 
-  if [ "$initial_install" -eq 1 ]; then
-    publish_stable_entrypoint "$helper" frankenterm-mux-server missing "$selected_generation" || return 1
-    installer_failpoint after-mux-entrypoint
-    publish_stable_entrypoint "$helper" frankenterm-pty-guardian missing "$selected_generation" || return 1
-    installer_failpoint after-guardian-entrypoint
-    publish_stable_entrypoint "$helper" ft missing "$selected_generation" || return 1
-    installer_failpoint after-ft-entrypoint
-    for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-      stable_entrypoint_is_managed "$name" || return 1
-      [ ! -e "$DEST/$name" ] || return 1
-    done
-    fsync_installer_directory "$DEST" || return 1
-    [ "$(inspect_installer_process_family_authority)" = initial ] || {
-      err "Initial process-family namespace changed before selector publication"
-      return 1
-    }
-    require_no_live_mux_for_initial_selector || return 1
-    [ "$(inspect_installer_process_family_authority)" = initial ] || {
-      err "Initial process-family namespace changed during mux ownership census"
-      return 1
-    }
-    stage_name=".current-$generation_id"
-    ensure_staged_symlink "generations/$generation_id" "$managed/$stage_name" || return 1
-    stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage_name") || return 1
-    txid=$(atomic_transition_txid "selector-initial:$DEST:$generation_id") || return 1
-    installer_failpoint before-initial-selector
-    atomic_path_transition "$helper" "$managed" "$stage_name" current "$txid" \
-      "$stage_id" missing publish-noreplace || return 1
-    current_target="generations/$generation_id"
-    installer_failpoint after-initial-selector
-  fi
-
   if [ "$current_target" = "generations/$generation_id" ]; then
     [ "$(inspect_installer_process_family_authority)" = \
       $'managed\t'"generations/$generation_id" ] || return 1
@@ -1579,27 +1700,101 @@ install_process_family() {
     ACTIVE_PROCESS_FAMILY_MANIFEST="$generation/process-family.component-manifest.json"
     ACTIVE_PROCESS_FAMILY_VERIFIER="$verifier_source"
     ACTIVE_ATOMIC_TRANSITION_HELPER="$DEST/ft"
-    ok "Installed initial atomic process-family generation $generation_id"
+    PROCESS_FAMILY_ACTIVATION_STATE="current"
+    PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
+    PROCESS_FAMILY_ACTIVE_ROOT="$generation"
+    ok "Verified current atomic process-family generation $generation_id"
   else
     [ "$(inspect_installer_process_family_authority)" = "$authority_state" ] || {
       err "Existing process-family authority changed while the candidate was published"
       return 1
     }
-    if [ "$legacy_owner" -eq 1 ]; then
+    if [ "$initial_install" -eq 1 ]; then
+      for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        if [ -L "$DEST/$name" ]; then
+          stable_entrypoint_is_managed "$name" && [ ! -e "$DEST/$name" ] || return 1
+        else
+          [ ! -e "$DEST/$name" ] || return 1
+        fi
+      done
+      PROCESS_FAMILY_ACTIVE_AUTHORITY="none"
+      PROCESS_FAMILY_ACTIVE_ROOT=""
+      PROCESS_FAMILY_PENDING_REASON="$INITIAL_SELECTOR_HOLD_REASON"
+    elif [ "$legacy_owner" -eq 1 ]; then
       for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
         cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
       done
+      PROCESS_FAMILY_ACTIVE_AUTHORITY="legacy-direct"
+      PROCESS_FAMILY_ACTIVE_ROOT="$DEST"
+      PROCESS_FAMILY_PENDING_REASON="cross-launcher-lease-required"
     else
       for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
         stable_entrypoint_is_managed "$name" || return 1
         cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1 || return 1
       done
+      PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
+      PROCESS_FAMILY_ACTIVE_ROOT="$selected_generation"
+      PROCESS_FAMILY_PENDING_REASON="cross-launcher-lease-required"
     fi
+    installer_failpoint before-pending-publication-receipt
     PENDING_PROCESS_FAMILY_GENERATION="$generation_id"
+    PROCESS_FAMILY_ACTIVATION_STATE="pending"
     ok "Published immutable process-family candidate $generation_id"
     warn "Activation is pending; the existing process-family selector and live mux were left unchanged"
   fi
   info "All previous generations and entrypoint authority were retained for recovery"
+}
+
+emit_process_family_receipt() {
+  python3 - "$PROCESS_FAMILY_ACTIVATION_STATE" "$PROCESS_FAMILY_ACTIVE_AUTHORITY" \
+    "$PROCESS_FAMILY_ACTIVE_ROOT" "$PROCESS_FAMILY_PENDING_REASON" \
+    "$PENDING_PROCESS_FAMILY_GENERATION" "$PUBLISHED_PROCESS_FAMILY_ROOT" \
+    "$PUBLISHED_PROCESS_FAMILY_VERSION" <<'PY'
+import json, os, re, sys
+
+(
+    activation, active_authority, active_root, pending_reason,
+    generation, candidate_root, version,
+) = sys.argv[1:]
+if activation not in ("current", "pending"):
+    raise SystemExit("process-family activation receipt has an invalid state")
+if active_authority not in ("none", "legacy-direct", "managed-selector"):
+    raise SystemExit("process-family activation receipt has an invalid authority")
+if activation == "pending" and re.fullmatch(r"[0-9a-f]{64}", generation) is None:
+    raise SystemExit("pending process-family receipt has an invalid generation")
+if activation == "current" and generation:
+    raise SystemExit("current process-family receipt unexpectedly names a pending generation")
+if activation == "pending" and not pending_reason:
+    raise SystemExit("pending process-family receipt lacks its precise hold reason")
+if activation == "current" and pending_reason:
+    raise SystemExit("current process-family receipt unexpectedly names a pending reason")
+if any(ord(character) < 0x20 for character in pending_reason):
+    raise SystemExit("process-family activation receipt has an invalid pending reason")
+if active_authority == "none":
+    if active_root:
+        raise SystemExit("absent process-family authority unexpectedly names an active root")
+    active_root_value = None
+else:
+    if not active_root:
+        raise SystemExit("process-family authority lacks its active root")
+    active_root_value = os.path.abspath(active_root)
+if not version or any(ord(character) < 0x20 for character in version):
+    raise SystemExit("process-family activation receipt has an invalid version")
+candidate_root = os.path.abspath(candidate_root)
+payload = {
+    "activation": activation,
+    "active_authority": active_authority,
+    "active_root": active_root_value,
+    "candidate_generation": generation or os.path.basename(candidate_root),
+    "candidate_root": candidate_root,
+    "candidate_version": version,
+    "pending_reason": pending_reason or None,
+    "schema_version": "frankenterm.install.process-family-receipt.v1",
+}
+print("FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=" + json.dumps(
+    payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+))
+PY
 }
 
 check_write_permissions() {
@@ -1618,10 +1813,8 @@ check_write_permissions() {
 }
 
 check_existing_install() {
-  if [ -x "$DEST/ft" ]; then
-    local current
-    current=$("$DEST/ft" --version 2>/dev/null | head -1 || echo "")
-    [ -n "$current" ] && info "Existing ft detected: $current"
+  if [ -e "$DEST/ft" ] || [ -L "$DEST/ft" ]; then
+    info "Existing ft path detected; it will not be executed before authenticated family verification"
   fi
 }
 
@@ -1709,68 +1902,51 @@ maybe_add_path() {
 # Checksum + Sigstore verification
 # ───────────────────────────────────────────────────────────────────────────
 verify_checksum() {
-  local file="$1"; local expected="$2"; local actual="" before="" after=""
+  local file="$1" expected="$2" proof="" actual="" identity=""
+  VERIFIED_ARCHIVE_IDENTITY=""
   [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || {
     err "Expected checksum is not one canonical lowercase SHA-256 digest"
     return 1
   }
-  before=$(python3 - "$file" <<'PY'
-import os, stat, sys
+  proof=$(python3 - "$file" <<'PY'
+import hashlib, os, stat, sys
+
 path = sys.argv[1]
-fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+fd = os.open(path, flags)
 try:
-    observed = os.fstat(fd)
-    named = os.stat(path, follow_symlinks=False)
-    if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or
-            observed.st_size > 16 * 1024 * 1024 * 1024 or
-            (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)):
+    before = os.fstat(fd)
+    named_before = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
+            before.st_size > 4 * 1024 * 1024 * 1024 or
+            (before.st_dev, before.st_ino) != (named_before.st_dev, named_before.st_ino)):
         raise SystemExit("checksum target is not one bounded single-link regular file")
-    print("\t".join(str(value) for value in (
-        observed.st_dev, observed.st_ino, observed.st_size,
-        observed.st_mtime_ns, observed.st_ctime_ns)))
+    digest = hashlib.sha256()
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            raise SystemExit("checksum target truncated while hashed")
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise SystemExit("checksum target grew while hashed")
+    after = os.fstat(fd)
+    named_after = os.stat(path, follow_symlinks=False)
+    identity = (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns,
+    )
+    if identity != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+    ) or (after.st_dev, after.st_ino) != (named_after.st_dev, named_after.st_ino):
+        raise SystemExit("checksum target changed while hashed through its authority descriptor")
+    print(f"{digest.hexdigest()}\t" + ":".join(str(value) for value in identity))
 finally:
     os.close(fd)
 PY
-  ) || { err "Unsafe checksum target: $file"; return 1; }
-  if command -v sha256sum &>/dev/null; then
-    actual=$(sha256sum -- "$file" | awk '{print $1}') || {
-      err "sha256sum failed while reading $file"
-      return 1
-    }
-  elif command -v shasum &>/dev/null; then
-    actual=$(shasum -a 256 -- "$file" | awk '{print $1}') || {
-      err "shasum failed while reading $file"
-      return 1
-    }
-  else
-    err "No supported SHA-256 utility found (need sha256sum or shasum)"
-    return 1
-  fi
-  [[ "$actual" =~ ^[0-9a-f]{64}$ ]] || {
-    err "SHA-256 utility returned a non-canonical digest"
-    return 1
-  }
-  after=$(python3 - "$file" <<'PY'
-import os, stat, sys
-path = sys.argv[1]
-fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
-try:
-    observed = os.fstat(fd)
-    named = os.stat(path, follow_symlinks=False)
-    if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or
-            (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)):
-        raise SystemExit("checksum target changed shape")
-    print("\t".join(str(value) for value in (
-        observed.st_dev, observed.st_ino, observed.st_size,
-        observed.st_mtime_ns, observed.st_ctime_ns)))
-finally:
-    os.close(fd)
-PY
-  ) || { err "Checksum target changed while it was verified"; return 1; }
-  [ "$before" = "$after" ] || {
-    err "Checksum target changed while it was verified"
-    return 1
-  }
+  ) || { err "Unsafe or unstable checksum target: $file"; return 1; }
+  IFS=$'\t' read -r actual identity <<<"$proof"
+  [[ "$actual" =~ ^[0-9a-f]{64}$ ]] && [ -n "$identity" ] || return 1
   if [ "$actual" != "$expected" ]; then
     err "Checksum verification FAILED"
     err "Expected: $expected"
@@ -1778,6 +1954,7 @@ PY
     err "The downloaded file may be corrupted or tampered with."
     return 1
   fi
+  VERIFIED_ARCHIVE_IDENTITY="$identity"
   ok "Checksum verified: ${actual:0:16}..."
   return 0
 }
@@ -1796,9 +1973,17 @@ try:
             before.st_size > 4096 or
             (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)):
         raise SystemExit("checksum sidecar is not one bounded single-link regular file")
-    payload = os.read(fd, 4097)
-    if len(payload) != before.st_size:
-        raise SystemExit("checksum sidecar changed length while read")
+    chunks = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(fd, min(4097, remaining))
+        if not chunk:
+            raise SystemExit("checksum sidecar truncated while read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise SystemExit("checksum sidecar grew while read")
+    payload = b"".join(chunks)
     after = os.fstat(fd)
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
             after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
@@ -1843,9 +2028,15 @@ verify_archive_checksum_authority() {
     info "Using externally supplied offline checksum sidecar: $sidecar"
   else
     [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
+    case "$CHECKSUM_URL" in
+      https://*) ;;
+      *)
+        err "Remote checksum authority must use HTTPS; pass --checksum for an out-of-band digest"
+        return 1
+        ;;
+    esac
     info "Fetching checksum from $CHECKSUM_URL"
-    if ! curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
-        "$CHECKSUM_URL" -o "$TMP/checksum.sha256"; then
+    if ! download_https_bounded "$CHECKSUM_URL" "$TMP/checksum.sha256" 4096 30; then
       err "Checksum required and could not be fetched"
       return 1
     fi
@@ -1858,24 +2049,48 @@ verify_archive_checksum_authority() {
 }
 
 extract_authenticated_archive() {
-  local archive="$1" root="$2" kind="$3" manifest_name="$4"
-  python3 - "$archive" "$root" "$kind" "$manifest_name" <<'PY'
+  local archive="$1" root="$2" kind="$3" manifest_name="$4" expected_identity="${5:-}"
+  local max_archive_bytes max_expanded_bytes
+  case "$kind" in
+    process-family)
+      max_archive_bytes="$MAX_PROCESS_ARCHIVE_BYTES"
+      max_expanded_bytes="$MAX_PROCESS_EXPANDED_BYTES"
+      ;;
+    app)
+      max_archive_bytes="$MAX_APP_ARCHIVE_BYTES"
+      max_expanded_bytes="$MAX_APP_EXPANDED_BYTES"
+      ;;
+    *) return 1 ;;
+  esac
+  [ -n "$expected_identity" ] || {
+    err "Authenticated archive identity receipt is absent"
+    return 1
+  }
+  python3 - "$archive" "$root" "$kind" "$manifest_name" "$expected_identity" \
+    "$max_archive_bytes" "$max_expanded_bytes" \
+    "$INSTALLER_FREE_SPACE_HEADROOM_BYTES" <<'PY'
 import hashlib, os, posixpath, stat, sys, tarfile
 
-archive_path, root_path, archive_kind, manifest_name = sys.argv[1:]
+archive_path, root_path, archive_kind, manifest_name, expected_identity = sys.argv[1:6]
+max_archive_bytes, max_expanded_bytes, free_space_headroom = map(int, sys.argv[6:9])
 if archive_kind not in ("process-family", "app"):
     raise SystemExit("unknown authenticated archive kind")
 
-MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024
 MAX_ENTRIES = 1_000_000
 MAX_NAME_BYTES = 64 * 1024 * 1024
-MAX_EXPANDED_BYTES = 16 * 1024 * 1024 * 1024
 MAX_LINK_BYTES = 4096
 nofollow = getattr(os, "O_NOFOLLOW", 0)
 directory = getattr(os, "O_DIRECTORY", 0)
 cloexec = getattr(os, "O_CLOEXEC", 0)
 if not nofollow or not directory:
     raise SystemExit("descriptor-relative nofollow extraction is unavailable")
+try:
+    expected_values = tuple(int(value) for value in expected_identity.split(":"))
+except ValueError as error:
+    raise SystemExit("authenticated archive identity receipt is malformed") from error
+if (len(expected_values) != 5 or
+        ":".join(str(value) for value in expected_values) != expected_identity):
+    raise SystemExit("authenticated archive identity receipt is non-canonical")
 
 archive_fd = os.open(archive_path, os.O_RDONLY | nofollow | cloexec)
 root_fd = -1
@@ -1883,10 +2098,16 @@ try:
     archive_before = os.fstat(archive_fd)
     archive_named = os.stat(archive_path, follow_symlinks=False)
     if (not stat.S_ISREG(archive_before.st_mode) or archive_before.st_nlink != 1 or
-            archive_before.st_size > MAX_ARCHIVE_BYTES or
+            archive_before.st_size > max_archive_bytes or
             (archive_before.st_dev, archive_before.st_ino) !=
             (archive_named.st_dev, archive_named.st_ino)):
         raise SystemExit("authenticated archive is not one bounded single-link regular file")
+    archive_identity = (
+        archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
+        archive_before.st_mtime_ns, archive_before.st_ctime_ns,
+    )
+    if archive_identity != expected_values:
+        raise SystemExit("archive pathname no longer names the checksum-authenticated inode")
 
     root_named = os.stat(root_path, follow_symlinks=False)
     root_fd = os.open(root_path, os.O_RDONLY | directory | nofollow | cloexec)
@@ -1921,6 +2142,8 @@ try:
         if (name != normalized or name.startswith("/") or
                 normalized in ("", ".", "..") or normalized.startswith("../")):
             raise SystemExit("archive contains an unsafe member name")
+        if any(component.startswith("._") for component in name.split("/")):
+            raise SystemExit("archive contains a forbidden AppleDouble member")
         if name in state["types"]:
             raise SystemExit("archive contains a duplicate member name")
 
@@ -1945,7 +2168,7 @@ try:
             if member.size < 0:
                 raise SystemExit("archive member has a negative size")
             state["expanded_bytes"] += member.size
-            if state["expanded_bytes"] > MAX_EXPANDED_BYTES:
+            if state["expanded_bytes"] > max_expanded_bytes:
                 raise SystemExit("archive exceeds its expanded-byte bound")
         elif member_type == "symlink":
             linkname = member.linkname
@@ -2006,6 +2229,13 @@ try:
                 validate_member(member, first)
     finish_scan(first)
     first_fingerprint = first["digest"].digest()
+    filesystem = os.fstatvfs(root_fd)
+    available = filesystem.f_bavail * filesystem.f_frsize
+    required = first["expanded_bytes"] + free_space_headroom
+    if available < required:
+        raise SystemExit(
+            f"archive extraction requires {required} free bytes but only {available} are available"
+        )
 
     def open_parent(name):
         parts = name.split("/")
@@ -2142,7 +2372,7 @@ verify_sigstore_bundle() {
   [ -z "$bundle_url" ] && bundle_url="${artifact_url}.sigstore.json"
   local bundle_file
   bundle_file="$TMP/$(basename "$bundle_url")"
-  if ! curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$bundle_url" -o "$bundle_file" 2>/dev/null; then
+  if ! download_https_bounded "$bundle_url" "$bundle_file" 16777216 30 2>/dev/null; then
     warn "Sigstore bundle not found at $bundle_url; skipping signature verification"
     return 0
   fi
@@ -2161,6 +2391,7 @@ verify_sigstore_bundle() {
 # Optional: Pragmasevka Nerd Font install
 # ───────────────────────────────────────────────────────────────────────────
 install_pragmasevka() {
+  FONT_INSTALLED_PATH=""
   # --offline promises no network; honour that for the font too.
   if [ -n "$OFFLINE_TARBALL" ]; then
     warn "Skipping --with-font in --offline mode (no network)."
@@ -2189,8 +2420,15 @@ install_pragmasevka() {
     warn "Could not create font dir $font_dir; skipping font install"
     return 0
   fi
+  if ! require_transfer_capacity "$TMP" "$font_dir" \
+      "$MAX_FONT_ARCHIVE_BYTES" "$MAX_FONT_EXPANDED_BYTES" \
+      "Pragmasevka font"; then
+    warn "Insufficient bounded capacity for Pragmasevka; skipping font install"
+    return 0
+  fi
   info "Fetching Pragmasevka NF from $font_url"
-  if ! curl -fsSL --max-time 60 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$font_url" -o "$TMP/pragmasevka.zip.zst"; then
+  if ! download_https_bounded "$font_url" "$TMP/pragmasevka.zip.zst" \
+      "$MAX_FONT_ARCHIVE_BYTES" 60 1; then
     warn "Pragmasevka payload download failed; skipping font install"
     return 0
   fi
@@ -2199,6 +2437,7 @@ install_pragmasevka() {
     return 0
   fi
   ok "Pragmasevka NF installed to $font_dir"
+  FONT_INSTALLED_PATH="$font_dir"
   if [ "$OS" = "linux" ] && command -v fc-cache >/dev/null 2>&1; then
     run_with_spinner "Refreshing font cache" fc-cache -f "$font_dir" || true
     ok "Font cache refreshed"
@@ -2241,10 +2480,11 @@ should_install_app() {
 }
 
 install_macos_app() {
-  local app_url dest tmp_app_tar extraction_root extracted_app app_manifest
+  local app_url dest tmp_app_tar app_archive_identity extraction_root extracted_app app_manifest
   local target_app staged_app app_metadata standalone_metadata app_manifest_id app_id
   local app_build app_source app_version app_target app_profile app_features
-  local _family_manifest_id family_build family_source family_version family_target family_profile family_features
+  local app_inventory_bytes _family_manifest_id family_build family_source family_version
+  local family_target family_profile family_features family_inventory_bytes
   local stage_id target_id txid operation retained_manifest manifest_store manifest_stage
   app_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${APP_ASSET}"
 
@@ -2286,12 +2526,18 @@ PY
     warn "App destination cannot provide descriptor-pinned atomic authority: $dest"
     return 0
   fi
+  if ! require_transfer_capacity "$TMP" "$dest" \
+      "$MAX_APP_ARCHIVE_BYTES" "$MAX_APP_EXPANDED_BYTES" \
+      "FrankenTerm.app"; then
+    warn "Insufficient bounded capacity for FrankenTerm.app; skipping GUI app install"
+    return 0
+  fi
 
   info "Downloading FrankenTerm.app from $app_url"
   tmp_app_tar="$TMP/$APP_ASSET"
   if ! run_with_spinner "Downloading $APP_ASSET" \
-      curl -fsSL --max-time 300 --retry 3 --retry-delay 2 --retry-connrefused \
-      ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$app_url" -o "$tmp_app_tar"; then
+      download_https_bounded "$app_url" "$tmp_app_tar" \
+        "$MAX_APP_ARCHIVE_BYTES" 300 1; then
     warn "FrankenTerm.app asset not found at $app_url; skipping GUI app install"
     return 0
   fi
@@ -2300,14 +2546,15 @@ PY
   # externally fetched release archive checksum. Optional Sigstore verification
   # may be disabled, but SHA-256 authentication is never bypassed.
   local app_sum=""
-  if curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
-      "${app_url}.sha256" -o "$TMP/app.sha256" 2>/dev/null; then
-    app_sum=$(awk '{print $1}' "$TMP/app.sha256")
+  if download_https_bounded "${app_url}.sha256" "$TMP/app.sha256" 4096 30 \
+      2>/dev/null; then
+    app_sum=$(read_sha256_sidecar "$TMP/app.sha256" "$APP_ASSET" 2>/dev/null || true)
   fi
   if [ -z "$app_sum" ] || ! verify_checksum "$tmp_app_tar" "$app_sum"; then
     warn "FrankenTerm.app checksum is absent or invalid; skipping GUI app install"
     return 0
   fi
+  app_archive_identity="$VERIFIED_ARCHIVE_IDENTITY"
 
   # Validate the complete archive namespace before extracting into a new
   # private directory. No member may traverse out of the two expected roots or
@@ -2317,7 +2564,7 @@ PY
   extraction_root="$TMP/app-package"
   mkdir -m 0700 "$extraction_root" || return 0
   if ! extract_authenticated_archive "$tmp_app_tar" "$extraction_root" app \
-      FrankenTerm.app.component-manifest.json
+      FrankenTerm.app.component-manifest.json "$app_archive_identity"
   then
     warn "FrankenTerm.app archive namespace failed validation; skipping GUI app install"
     return 0
@@ -2337,8 +2584,10 @@ PY
     }
   app_metadata=$(process_family_manifest_metadata "$app_manifest" app) || return 0
   standalone_metadata=$(process_family_manifest_metadata "$ACTIVE_PROCESS_FAMILY_MANIFEST" triplet) || return 0
-  IFS=$'\t' read -r app_manifest_id app_build app_source app_version app_target app_profile app_features <<<"$app_metadata"
-  IFS=$'\t' read -r _family_manifest_id family_build family_source family_version family_target family_profile family_features <<<"$standalone_metadata"
+  IFS=$'\t' read -r app_manifest_id app_build app_source app_version app_target app_profile app_features app_inventory_bytes <<<"$app_metadata"
+  IFS=$'\t' read -r _family_manifest_id family_build family_source family_version family_target family_profile family_features family_inventory_bytes <<<"$standalone_metadata"
+  [[ "$app_inventory_bytes" =~ ^[0-9]+$ ]] && \
+    [[ "$family_inventory_bytes" =~ ^[0-9]+$ ]] || return 0
   [ "$app_build" = "$family_build" ] && [ "$app_source" = "$family_source" ] && \
     [ "$app_version" = "$family_version" ] && [ "$app_target" = "$family_target" ] && \
     [ "$app_profile" = "$family_profile" ] && [ "$app_features" = "$family_features" ] && \
@@ -2387,6 +2636,12 @@ PY
     warn "Retained app stage is not one resumable directory"
     return 0
   fi
+  require_filesystem_capacity "$dest" \
+    "$((app_inventory_bytes + INSTALLER_FREE_SPACE_HEADROOM_BYTES))" \
+    "atomic app generation" || {
+    warn "Insufficient destination capacity for FrankenTerm.app"
+    return 0
+  }
   if ! ensure_exact_staged_tree "$extracted_app" "$staged_app"; then
     warn "Retained app stage is not an exact resumable prefix of the requested app generation"
     return 0
@@ -2840,12 +3095,25 @@ fi
 
 TMP=$(mktemp -d)
 
+# Refuse before the first archive byte is transferred unless both the private
+# temporary workspace (compressed bytes plus bounded extraction) and the final
+# destination (bounded installed generation) have enough capacity. Exact
+# authenticated inventory sizes are checked again before publication.
+if [ "$FROM_SOURCE" -eq 0 ]; then
+  require_transfer_capacity "$TMP" "$DEST" \
+    "$MAX_PROCESS_ARCHIVE_BYTES" "$MAX_PROCESS_EXPANDED_BYTES" \
+    "standalone process-family" || exit 1
+fi
+
 # ───────────────────────────────────────────────────────────────────────────
 # Download / source build / offline-tarball selection
 # ───────────────────────────────────────────────────────────────────────────
 if [ -n "$OFFLINE_TARBALL" ]; then
   info "Using offline tarball: $OFFLINE_TARBALL"
-  cp "$OFFLINE_TARBALL" "$TMP/$TAR"
+  ensure_exact_staged_file "$OFFLINE_TARBALL" "$TMP/$TAR" 0400 || {
+    err "Offline archive is not one stable bounded no-follow regular file"
+    exit 1
+  }
 elif [ "$FROM_SOURCE" -eq 0 ]; then
   if [ -z "$URL" ]; then
     warn "No artifact URL resolved; falling back to source build"
@@ -2857,8 +3125,8 @@ elif [ "$FROM_SOURCE" -eq 0 ]; then
     # common "GitHub CDN just woke up" 5s window. The 300s max-time still
     # caps the whole transfer.
     if ! run_with_spinner "Downloading $TAR" \
-        curl -fsSL --max-time 300 --retry 3 --retry-delay 2 --retry-connrefused \
-        ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$URL" -o "$TMP/$TAR"; then
+        download_https_bounded "$URL" "$TMP/$TAR" \
+          "$MAX_PROCESS_ARCHIVE_BYTES" 300 1; then
       warn "Artifact download failed; falling back to build-from-source"
       FROM_SOURCE=1
     fi
@@ -2868,39 +3136,33 @@ fi
 if [ "$FROM_SOURCE" -eq 1 ]; then
   build_from_source
 else
-  # Checksum verification
-  if [ "$NO_CHECKSUM" -eq 1 ]; then
-    warn "Verification skipped (--no-verify)"
-  elif [ -n "$OFFLINE_TARBALL" ] && [ -z "$CHECKSUM" ]; then
-    warn "Offline tarball + no --checksum supplied; skipping checksum verification"
-  else
-    if [ -z "$CHECKSUM" ]; then
-      [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
-      info "Fetching checksum from $CHECKSUM_URL"
-      if ! curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$CHECKSUM_URL" -o "$TMP/checksum.sha256"; then
-        err "Checksum required and could not be fetched"
-        err "Use --no-verify to skip checksum verification (not recommended)"
-        exit 1
-      fi
-      CHECKSUM=$(awk '{print $1}' "$TMP/checksum.sha256")
-      [ -n "$CHECKSUM" ] || { err "Empty checksum file"; exit 1; }
-    fi
-    verify_checksum "$TMP/$TAR" "$CHECKSUM" || { err "Installation aborted"; exit 1; }
-    if [ -n "$URL" ]; then
-      verify_sigstore_bundle "$TMP/$TAR" "$URL" || { err "Signature verification failed"; exit 1; }
-    fi
+  # The archive-provided verifier is executable code, so one externally
+  # supplied SHA-256 authority is mandatory before extraction or execution.
+  # --no-verify disables only the optional Sigstore layer.
+  verify_archive_checksum_authority "$TMP/$TAR" "$TAR" || {
+    err "Installation aborted before archive extraction"
+    exit 1
+  }
+  if [ "$NO_SIGSTORE" -eq 0 ] && [ -n "$URL" ]; then
+    verify_sigstore_bundle "$TMP/$TAR" "$URL" || {
+      err "Signature verification failed"
+      exit 1
+    }
+  elif [ "$NO_SIGSTORE" -eq 1 ]; then
+    warn "Optional Sigstore verification skipped (--no-verify); SHA-256 was still verified"
   fi
 
-  # Extract into an otherwise-empty package root.  The atomic manifest verifies
-  # the complete inventory, so download/checksum sidecars in $TMP must not be
-  # allowed to masquerade as package members (or make every valid archive fail).
+  # Extract into an otherwise-empty private package root with a two-pass
+  # streaming inventory. No archive member can escape or allocate an unbounded
+  # retained metadata list before the exact five-file namespace is accepted.
   PACKAGE_ROOT="$TMP/package"
-  if ! mkdir -p "$PACKAGE_ROOT"; then
+  if ! mkdir -m 0700 "$PACKAGE_ROOT"; then
     err "Failed to create package verification directory"
     exit 1
   fi
   info "Extracting $TAR"
-  if ! tar -xf "$TMP/$TAR" -C "$PACKAGE_ROOT"; then
+  if ! extract_authenticated_archive "$TMP/$TAR" "$PACKAGE_ROOT" process-family \
+      "${ASSET%.tar.xz}.component-manifest.json" "$VERIFIED_ARCHIVE_IDENTITY"; then
     err "Failed to extract $TAR — archive may be corrupt or truncated"
     err "If the download was interrupted, retry; otherwise file an issue at:"
     err "  https://github.com/${OWNER}/${REPO}/issues"
@@ -2909,8 +3171,8 @@ else
 
   # A checksum proves archive bytes, but it cannot prove that the CLI, mux
   # server, and PTY guardian came from one source/build identity. Keep this
-  # atomic process-family verification mandatory even when --no-verify skips
-  # transport authenticity.
+  # atomic process-family verification mandatory after the externally rooted
+  # archive proof.
   COMPONENT_VERIFIER="$PACKAGE_ROOT/verify-components.sh"
   COMPONENT_MANIFEST="$PACKAGE_ROOT/${ASSET%.tar.xz}.component-manifest.json"
   [ -f "$COMPONENT_VERIFIER" ] || {
@@ -2962,7 +3224,9 @@ fi
 # ───────────────────────────────────────────────────────────────────────────
 # Post-install
 # ───────────────────────────────────────────────────────────────────────────
-maybe_add_path
+if [ "$PROCESS_FAMILY_ACTIVE_AUTHORITY" != none ]; then
+  maybe_add_path
+fi
 
 if [ "$WITH_FONT" -eq 1 ]; then
   install_pragmasevka
@@ -2973,65 +3237,100 @@ if should_install_app; then
 fi
 
 if [ "$VERIFY" -eq 1 ]; then
-  info "Running \`ft doctor --json\` (informational; non-zero exit is OK on first install)"
-  set +e
-  if [ "$QUIET" -eq 1 ]; then
-    # In quiet mode we just want a yes/no on "did the binary launch and emit
-    # parseable JSON?" — don't dump the doctor body to stdout.
-    "$DEST/ft" doctor --json >/dev/null 2>&1
+  if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
+    warn "Skipping candidate self-test because the candidate is not activated"
   else
-    "$DEST/ft" doctor --json 2>/dev/null | head -40
+    info "Running \`ft doctor --json\` (informational; non-zero exit is OK on first install)"
+    set +e
+    if [ "$QUIET" -eq 1 ]; then
+      # In quiet mode we just want a yes/no on "did the binary launch and emit
+      # parseable JSON?" — don't dump the doctor body to stdout.
+      "$DEST/ft" doctor --json >/dev/null 2>&1
+    else
+      "$DEST/ft" doctor --json 2>/dev/null | head -40
+    fi
+    set -e
+    ok "Self-test invoked"
   fi
-  set -e
-  ok "Self-test invoked"
 fi
 
-# Resolved version for the summary box
-if [ -x "$DEST/ft" ]; then
-  RESOLVED_VERSION=$("$DEST/ft" --version 2>/dev/null | head -1 || echo "ft (unknown version)")
-else
-  RESOLVED_VERSION="ft $VERSION"
-fi
+# The candidate manifest came from the externally authenticated archive (or
+# the caller-owned source build) and is the only version authority needed for
+# this summary. Never execute an older destination pathname merely to decorate
+# success output.
+[ -n "$PUBLISHED_PROCESS_FAMILY_VERSION" ] || {
+  err "Authenticated process-family version receipt is absent"
+  exit 1
+}
+RESOLVED_VERSION="ft $PUBLISHED_PROCESS_FAMILY_VERSION"
 
 # ───────────────────────────────────────────────────────────────────────────
 # Final summary
 # ───────────────────────────────────────────────────────────────────────────
 if [ "$QUIET" -eq 0 ]; then
   summary_lines=()
-  summary_lines+=("\033[1;32mFrankenTerm installed\033[0m")
+  if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
+    summary_lines+=("\033[1;32mFrankenTerm candidate published\033[0m")
+  else
+    summary_lines+=("\033[1;32mFrankenTerm installed\033[0m")
+  fi
   summary_lines+=("")
-  summary_lines+=("Binary:   $DEST/ft")
-  summary_lines+=("Mux:      $DEST/frankenterm-mux-server")
-  summary_lines+=("Guardian: $DEST/frankenterm-pty-guardian")
-  summary_lines+=("Version:  $RESOLVED_VERSION")
+  if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
+    summary_lines+=("Candidate CLI:      $PUBLISHED_PROCESS_FAMILY_ROOT/ft")
+    summary_lines+=("Candidate mux:      $PUBLISHED_PROCESS_FAMILY_ROOT/frankenterm-mux-server")
+    summary_lines+=("Candidate guardian: $PUBLISHED_PROCESS_FAMILY_ROOT/frankenterm-pty-guardian")
+    summary_lines+=("Candidate version:  $RESOLVED_VERSION")
+    summary_lines+=("Candidate ID:       $PENDING_PROCESS_FAMILY_GENERATION")
+    summary_lines+=("Active authority:   $PROCESS_FAMILY_ACTIVE_AUTHORITY")
+    if [ -n "$PROCESS_FAMILY_ACTIVE_ROOT" ]; then
+      summary_lines+=("Active root:        $PROCESS_FAMILY_ACTIVE_ROOT")
+    else
+      summary_lines+=("Active root:        none")
+    fi
+    summary_lines+=("Pending reason:     $PROCESS_FAMILY_PENDING_REASON")
+    summary_lines+=("Activation: pending; existing selector and live mux unchanged")
+  else
+    summary_lines+=("Binary:   $DEST/ft")
+    summary_lines+=("Mux:      $DEST/frankenterm-mux-server")
+    summary_lines+=("Guardian: $DEST/frankenterm-pty-guardian")
+    summary_lines+=("Version:  $RESOLVED_VERSION")
+  fi
   if [ -n "${TARGET:-}" ]; then
     summary_lines+=("Platform: ${OS}/${ARCH} ($TARGET)")
   else
     summary_lines+=("Platform: ${OS}/${ARCH}")
   fi
-  if [ "$WITH_FONT" -eq 1 ]; then
-    summary_lines+=("Font:     Pragmasevka NF installed")
+  if [ -n "$FONT_INSTALLED_PATH" ]; then
+    summary_lines+=("Font:     Pragmasevka NF installed at $FONT_INSTALLED_PATH")
   fi
   if [ -n "$APP_INSTALLED_PATH" ]; then
     summary_lines+=("GUI app:  $APP_INSTALLED_PATH")
   fi
   summary_lines+=("")
-  summary_lines+=("Quick start:")
-  summary_lines+=("  ft --help               Show all subcommands")
-  summary_lines+=("  ft version --full       Build metadata (commit / rustc / features)")
-  summary_lines+=("  ft doctor --json        Diagnostic snapshot")
-  summary_lines+=("  ft session list         Inspect running sessions")
+  if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
+    summary_lines+=("Candidate publication is complete; activation requires the cross-launcher lease transaction.")
+  else
+    summary_lines+=("Quick start:")
+    summary_lines+=("  ft --help               Show all subcommands")
+    summary_lines+=("  ft version --full       Build metadata (commit / rustc / features)")
+    summary_lines+=("  ft doctor --json        Diagnostic snapshot")
+    summary_lines+=("  ft session list         Inspect running sessions")
+  fi
   summary_lines+=("")
-  summary_lines+=("Uninstall:")
-  summary_lines+=("  rm $DEST/ft")
-  summary_lines+=("  rm $DEST/frankenterm-mux-server")
-  summary_lines+=("  rm $DEST/frankenterm-pty-guardian")
-  if [ "$WITH_FONT" -eq 1 ]; then
+  if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
+    summary_lines+=("Candidate cleanup (active authority is not changed):")
+    summary_lines+=("  rm -r $PUBLISHED_PROCESS_FAMILY_ROOT")
+  else
+    summary_lines+=("Uninstall:")
+    summary_lines+=("  rm $DEST/ft")
+    summary_lines+=("  rm $DEST/frankenterm-mux-server")
+    summary_lines+=("  rm $DEST/frankenterm-pty-guardian")
+  fi
+  if [ -n "$FONT_INSTALLED_PATH" ]; then
     # Select the right font path based on the platform we installed for —
     # don't concatenate Linux + macOS paths together.
     case "$OS" in
-      linux)  summary_lines+=("  rm -rf ${XDG_DATA_HOME:-$HOME/.local/share}/fonts/pragmasevka") ;;
-      darwin) summary_lines+=("  rm -rf $HOME/Library/Fonts/pragmasevka") ;;
+      linux|darwin) summary_lines+=("  rm -r $FONT_INSTALLED_PATH") ;;
     esac
   fi
   if [ -n "$APP_INSTALLED_PATH" ]; then
@@ -3043,3 +3342,8 @@ if [ "$QUIET" -eq 0 ]; then
   draw_box "0;32" ${summary_lines[@]+"${summary_lines[@]}"}
   echo
 fi
+
+# This exact one-line receipt is intentionally emitted even under --quiet.
+# Automation must branch on `activation`; exit zero alone never means that a
+# selector or live mux was changed.
+emit_process_family_receipt || exit 1
