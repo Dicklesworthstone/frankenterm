@@ -109263,10 +109263,9 @@ while test "$#" -gt 0; do
   esac
   shift
 done
-test -n "$output"
 case "$url" in
-  *.sha256) printf '%s  FrankenTerm-darwin-arm64.app.tar.xz\n' "$FAKE_APP_CHECKSUM" > "$output" ;;
-  *) cp "$FAKE_APP_ARCHIVE" "$output" ;;
+  *.sha256) printf '%s  FrankenTerm-darwin-arm64.app.tar.xz\n' "$FAKE_APP_CHECKSUM" ;;
+  *) cat "$FAKE_APP_ARCHIVE" ;;
 esac
 "#,
         )

@@ -3696,6 +3696,7 @@ dependencies = [
  "rangeset",
  "ratelim",
  "rayon",
+ "shlex",
  "termwiz 0.24.0",
  "thiserror 2.0.20",
  "umask",
