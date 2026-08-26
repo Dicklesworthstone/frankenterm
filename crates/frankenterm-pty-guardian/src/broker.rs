@@ -126,6 +126,7 @@ pub(crate) const BROKER_CONTROL_MAX_FRAME_BYTES: usize =
     BROKER_CONTROL_REQUEST_FIXED_BYTES + BROKER_CONTROL_MAX_PAYLOAD_BYTES;
 const BROKER_CONTROL_LISTENER_TOKEN: Token = Token(0);
 const BROKER_CONTROL_MAX_CONNECTIONS: usize = 1_024;
+const BROKER_CONTROL_ACCEPT_QUANTUM: usize = 32;
 const BROKER_CONTROL_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_CONTROL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_GENESIS_BINDING_BYTES: usize = 256;
@@ -1119,6 +1120,7 @@ pub struct BrokerControlServiceV1 {
     hello_receipts: BTreeMap<Uuid, BrokerHelloReceiptV1>,
     hello_receipt_order: VecDeque<Uuid>,
     max_hello_receipts: usize,
+    accept_quantum: usize,
     next_connection_generation: u64,
     poll_interval: Duration,
     rejected_connections: u64,
@@ -1178,6 +1180,9 @@ impl BrokerControlServiceV1 {
         let max_hello_receipts = config.max_connections.checked_mul(2).ok_or(
             BrokerControlServiceError::InvalidConfiguration("Hello receipt capacity overflow"),
         )?;
+        let accept_quantum = config
+            .max_connections
+            .min(BROKER_CONTROL_ACCEPT_QUANTUM);
         let mut hello_receipt_order = VecDeque::new();
         hello_receipt_order
             .try_reserve(max_hello_receipts)
@@ -1201,6 +1206,7 @@ impl BrokerControlServiceV1 {
             hello_receipts: BTreeMap::new(),
             hello_receipt_order,
             max_hello_receipts,
+            accept_quantum,
             next_connection_generation: 1,
             poll_interval: config.poll_interval,
             rejected_connections: 0,
@@ -1285,7 +1291,10 @@ impl BrokerControlServiceV1 {
 
     fn accept_connections(&mut self) -> Result<(), BrokerControlServiceError> {
         self.socket_authority.validate()?;
-        loop {
+        // Listener readiness is level-triggered. A strict per-poll admission
+        // quantum prevents a same-UID peer that continuously refills the
+        // backlog from monopolizing this loop ahead of authenticated I/O.
+        for _ in 0..self.accept_quantum {
             let (mut stream, _) = match self.listener.accept() {
                 Ok(accepted) => accepted,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -1500,19 +1509,16 @@ impl BrokerControlServiceV1 {
         {
             return Err(());
         }
-        while self.hello_receipts.len() >= self.max_hello_receipts {
-            let Some(candidate) = self.hello_receipt_order.pop_front() else {
-                return Err(());
-            };
-            if self
-                .hello_receipts
-                .get(&candidate)
-                .is_some_and(|receipt| receipt.active_connection.is_some())
-            {
-                self.hello_receipt_order.push_back(candidate);
-                return Err(());
-            }
-            self.hello_receipts.remove(&candidate);
+        if self.hello_receipts.len() > self.max_hello_receipts {
+            return Err(());
+        }
+        if self.hello_receipts.len() == self.max_hello_receipts
+            && !evict_one_inactive_hello_receipt(
+                &mut self.hello_receipts,
+                &mut self.hello_receipt_order,
+            )?
+        {
+            return Err(());
         }
         self.hello_receipts.insert(
             header.request_id,
@@ -1566,6 +1572,29 @@ impl BrokerControlServiceV1 {
             self.free_connection_tokens.push(token.0);
         }
     }
+}
+
+fn evict_one_inactive_hello_receipt(
+    receipts: &mut BTreeMap<Uuid, BrokerHelloReceiptV1>,
+    order: &mut VecDeque<Uuid>,
+) -> Result<bool, ()> {
+    let scan_bound = order.len();
+    let mut candidate_index = None;
+    for (index, request_id) in order.iter().take(scan_bound).enumerate() {
+        let receipt = receipts.get(request_id).ok_or(())?;
+        if receipt.active_connection.is_none() {
+            candidate_index = Some(index);
+            break;
+        }
+    }
+    let Some(candidate_index) = candidate_index else {
+        return Ok(false);
+    };
+    let candidate = order.remove(candidate_index).ok_or(())?;
+    if receipts.remove(&candidate).is_none() {
+        return Err(());
+    }
+    Ok(true)
 }
 
 /// Blocking guardian-side client for the production-disabled broker process.

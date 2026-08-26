@@ -98905,6 +98905,10 @@ recorder_backend = "rusqlite"
         );
         assert!(branch.contains("run_cli_settled_blocking_effect("));
         assert!(!branch.contains("run_cli_blocking_with_cx("));
+        assert!(
+            branch.contains("\"publication_recovered_existing\": published.recovered_existing")
+        );
+        assert!(branch.contains("Publication recovered existing: {}"));
 
         let helper_start = source
             .find("fn publish_mux_dump_payload(")
@@ -98966,6 +98970,10 @@ recorder_backend = "rusqlite"
         assert!(command.contains("run_cli_settled_blocking_effect("));
         assert!(!command.contains("run_cli_blocking_with_cx("));
         assert!(command.contains("publish_mux_dump_payload(&publication_path, payload)"));
+        assert!(
+            command.contains("\"publication_recovered_existing\": published.recovered_existing")
+        );
+        assert!(command.contains("Publication recovered existing: {}"));
     }
 
     #[test]
