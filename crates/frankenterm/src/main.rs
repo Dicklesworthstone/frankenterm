@@ -97256,6 +97256,158 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
+    fn compatible_client_dump_subcommand_parses_explicit_authorities_and_bounds() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "session",
+            "compatible-client-dump",
+            "--client",
+            "/Applications/FrankenTerm.app/Contents/MacOS/ft",
+            "--expected-client-sha256",
+            "2e35331a1c6d7a50384338f4d23a8597ff19d7d9d7176c9792677579a32c91fc",
+            "--expected-client-bytes",
+            "20179712",
+            "--mux-socket",
+            "/tmp/frankenterm-gui.sock",
+            "--output",
+            "/tmp/recovery/mux-dump.json",
+            "--max-panes",
+            "101",
+            "--max-total-bytes",
+            "1048576",
+            "--batch-size",
+            "7",
+            "--batch-timeout-secs",
+            "41",
+            "--max-batch-output-bytes",
+            "2097152",
+            "--format",
+            "json",
+        ])
+        .expect("compatible-client dump command parses");
+        let Some(Commands::Session { command }) = cli.command.map(|command| *command) else {
+            panic!("expected session command");
+        };
+        let SessionCommands::CompatibleClientDump {
+            client,
+            expected_client_sha256,
+            expected_client_bytes,
+            mux_socket,
+            output,
+            max_panes,
+            max_total_bytes,
+            batch_size,
+            batch_timeout_secs,
+            max_batch_output_bytes,
+            format,
+        } = command
+        else {
+            panic!("expected compatible-client-dump subcommand");
+        };
+        assert_eq!(
+            client,
+            PathBuf::from("/Applications/FrankenTerm.app/Contents/MacOS/ft")
+        );
+        assert_eq!(
+            expected_client_sha256,
+            "2e35331a1c6d7a50384338f4d23a8597ff19d7d9d7176c9792677579a32c91fc"
+        );
+        assert_eq!(expected_client_bytes, 20_179_712);
+        assert_eq!(mux_socket, PathBuf::from("/tmp/frankenterm-gui.sock"));
+        assert_eq!(output, PathBuf::from("/tmp/recovery/mux-dump.json"));
+        assert_eq!(max_panes, 101);
+        assert_eq!(max_total_bytes, 1_048_576);
+        assert_eq!(batch_size, 7);
+        assert_eq!(batch_timeout_secs, 41);
+        assert_eq!(max_batch_output_bytes, 2_097_152);
+        assert_eq!(format, "json");
+    }
+
+    #[test]
+    fn compatible_client_version_and_robot_receipts_are_exact_and_content_free_on_rejection() {
+        let version = parse_compatible_client_version(b"ft 0.13.0 (3ebd60566)\n")
+            .expect("the pinned release version line is accepted");
+        assert_eq!(version.version, "0.13.0");
+        assert_eq!(version.git_hash, "3ebd60566");
+        for rejected in [
+            b"ft 0.13.0 (3ebd60566)".as_slice(),
+            b"ft 0.13.0 (other)\n".as_slice(),
+            b"warning\nft 0.13.0 (3ebd60566)\n".as_slice(),
+        ] {
+            assert!(parse_compatible_client_version(rejected).is_err());
+        }
+
+        let planted_secret = "AKIAIOSFODNN7EXAMPLE";
+        let valid = serde_json::json!({
+            "ok": true,
+            "data": [{
+                "pane_id": 7,
+                "pane_uuid": "00112233445566778899aabbccddeeff",
+                "tab_id": 8,
+                "window_id": 9,
+                "domain": "ssh:trj",
+                "title": planted_secret,
+                "cwd": "file:///tmp",
+                "observed": true,
+            }],
+            "error": null,
+            "error_code": null,
+            "hint": null,
+            "elapsed_ms": 3,
+            "version": "0.13.0",
+            "now": 1,
+            "schema_version": 1,
+        });
+        let valid_bytes = serde_json::to_vec(&valid).expect("serialize robot fixture");
+        let panes = parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+            &valid_bytes,
+            compatible_client_state_json_limits(2),
+        )
+        .expect("exact v0.13 success envelope is accepted");
+        assert_eq!(panes.len(), 1);
+
+        let mut wrong_version = valid.clone();
+        wrong_version["version"] = serde_json::json!("0.13.1");
+        let error = parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+            &serde_json::to_vec(&wrong_version).unwrap(),
+            compatible_client_state_json_limits(2),
+        )
+        .expect_err("a different client version must fail closed");
+        assert!(!error.to_string().contains(planted_secret));
+
+        let mut reported_error = valid.clone();
+        reported_error["error"] = serde_json::json!(planted_secret);
+        reported_error["ok"] = serde_json::json!(false);
+        let error = parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+            &serde_json::to_vec(&reported_error).unwrap(),
+            compatible_client_state_json_limits(2),
+        )
+        .expect_err("an error envelope is never accepted as pane data");
+        assert!(!error.to_string().contains(planted_secret));
+
+        let mut trailing = valid_bytes.clone();
+        trailing.extend_from_slice(b" null");
+        assert!(
+            parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+                &trailing,
+                compatible_client_state_json_limits(2),
+            )
+            .is_err()
+        );
+
+        let duplicate_ok = String::from_utf8(valid_bytes)
+            .unwrap()
+            .replacen("\"ok\":true", "\"ok\":true,\"ok\":true", 1);
+        assert!(
+            parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+                duplicate_ok.as_bytes(),
+                compatible_client_state_json_limits(2),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn private_artifact_write_is_verified_and_never_overwrites() {
         let dir = tempfile::tempdir().expect("artifact tempdir");
         let path = dir.path().join("private").join("mux-dump.json");
