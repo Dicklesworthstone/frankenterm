@@ -13607,7 +13607,7 @@ mod tests {
             let elapsed = started.elapsed();
             assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
             assert!(
-                CommandTimedOut::from_io_error(&error).is_some(),
+                process::CommandTimedOut::from_io_error(&error).is_some(),
                 "deadline failure must retain its typed content-free receipt"
             );
             assert!(

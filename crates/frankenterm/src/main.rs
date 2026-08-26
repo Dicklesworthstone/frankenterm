@@ -76078,6 +76078,10 @@ async fn handle_session_command(
                 println!("  Errors:   {}", published.error_count);
                 println!("  Payload SHA-256:  {}", published.payload_sha256);
                 println!("  Artifact SHA-256: {}", published.artifact_sha256);
+                println!(
+                    "  Publication recovered existing: {}",
+                    published.recovered_existing
+                );
                 println!("  Content:  redacted");
             }
             if !published.complete && !allow_partial {
@@ -78286,6 +78290,10 @@ async fn run_compatible_client_dump_command(
             receipt.client_version, receipt.client_git_hash
         );
         println!("  Client SHA-256:       {}", receipt.client_sha256);
+        println!(
+            "  Publication recovered existing: {}",
+            published.recovered_existing
+        );
         println!(
             "  Recovery environment: {}",
             receipt.recovery_environment_path.display()
@@ -98315,8 +98323,7 @@ recorder_backend = "rusqlite"
 
         let mut injected = false;
         let error = write_new_private_artifact_with_hook(&path, &payload, |observed| {
-            if observed == PrivateArtifactPublicationPoint::ExistingTargetSynchronized
-                && !injected
+            if observed == PrivateArtifactPublicationPoint::ExistingTargetSynchronized && !injected
             {
                 injected = true;
                 anyhow::bail!("existing-final reply lost after target synchronization");
