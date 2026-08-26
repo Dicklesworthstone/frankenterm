@@ -744,7 +744,7 @@ pub struct BrokerSpawnObservationPermitV1 {
 pub enum BrokerSpawnAttemptExecutionV1<T> {
     EffectSucceeded {
         value: T,
-        observation: BrokerSpawnObservationPermitV1,
+        observation: Box<BrokerSpawnObservationPermitV1>,
     },
     OutcomeIndeterminate {
         retained_value: Option<T>,
@@ -2033,12 +2033,12 @@ impl BrokerSpawnJournalV1 {
         authority: BrokerSpawnWalFilesystemRevalidationV1,
     ) -> Result<(), BrokerSpawnWalError> {
         self.require_healthy_for_recovery()?;
-        if authority.identity != self.identity
-            || authority.observed_wal_bytes != self.committed_wal_bytes
-            || authority.observed_head_bytes != self.committed_head_bytes
-            || self.wal.metadata()?.len() != authority.observed_wal_bytes
-            || self.head.metadata()?.len() != authority.observed_head_bytes
-        {
+        let authority_matches = authority.identity == self.identity
+            && authority.observed_wal_bytes == self.committed_wal_bytes
+            && authority.observed_head_bytes == self.committed_head_bytes;
+        let descriptors_match = self.wal.metadata()?.len() == authority.observed_wal_bytes
+            && self.head.metadata()?.len() == authority.observed_head_bytes;
+        if !authority_matches || !descriptors_match {
             return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
         }
         if self.head_reconciliation_required {
@@ -2128,10 +2128,6 @@ impl BrokerSpawnJournalV1 {
         }
     }
 
-    #[cfg(not(test))]
-    fn fail_if_injected(&mut self, _fault: ()) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 impl BrokerSpawnWalFilesystemRevalidationV1 {
@@ -2422,12 +2418,12 @@ impl BrokerSpawnAttemptPermitV1 {
                 } else {
                     BrokerSpawnAttemptExecutionV1::EffectSucceeded {
                         value,
-                        observation: BrokerSpawnObservationPermitV1 {
+                        observation: Box::new(BrokerSpawnObservationPermitV1 {
                             identity: self.identity,
                             attempt_id: self.attempt_id,
                             attempt_record_mac: self.attempt_record_mac,
                             child_identity,
-                        },
+                        }),
                     }
                 }
             }

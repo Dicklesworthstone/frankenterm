@@ -13,8 +13,8 @@ use mio::{Interest, Registry, Token};
 use mux::guardian_input_journal::{GuardianInputDisposition, catch_guardian_input_worker_panic};
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_PANES, GuardianCheckpointStageKindV1,
-    GuardianEffectOutcome, GuardianEffectTransactionError, GuardianMuxLeaseRetirement,
-    GuardianDurableSpawnFenceInstallV1, GuardianDurableSpawnFenceV1, GuardianOperation,
+    GuardianDurableSpawnFenceInstallV1, GuardianDurableSpawnFenceV1, GuardianEffectOutcome,
+    GuardianEffectTransactionError, GuardianMuxLeaseRetirement, GuardianOperation,
     GuardianPaneState, GuardianProtocolError, GuardianProtocolState, GuardianRejectionCode,
     GuardianReply, GuardianResizePayload, GuardianResponseEnvelope, GuardianSignal,
     GuardianSpawnPayload, InputEffectState,
