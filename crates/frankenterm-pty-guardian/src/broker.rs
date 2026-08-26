@@ -443,7 +443,7 @@ pub struct BrokerSpawnJournalV1 {
 pub(crate) struct BrokerSpawnWalCatalogV1 {
     directory_path: PathBuf,
     directory: File,
-    _lock: File,
+    lock: File,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1101,6 +1101,500 @@ fn scan_broker_spawn_head(
             terminal_head_mac: previous_head_mac,
         },
     ))
+}
+
+fn broker_spawn_catalog_wal_name(journal_id: Uuid) -> OsString {
+    format!("{BROKER_SPAWN_CATALOG_PREFIX}{journal_id}{BROKER_SPAWN_CATALOG_WAL_SUFFIX}").into()
+}
+
+fn broker_spawn_catalog_head_name(journal_id: Uuid) -> OsString {
+    format!("{BROKER_SPAWN_CATALOG_PREFIX}{journal_id}{BROKER_SPAWN_CATALOG_HEAD_SUFFIX}").into()
+}
+
+fn parse_broker_spawn_catalog_name(
+    name: &OsStr,
+) -> Result<(Uuid, bool), BrokerSpawnWalError> {
+    let text = name
+        .to_str()
+        .ok_or(BrokerSpawnWalError::UnexpectedCatalogEntry)?;
+    let (identifier, is_wal) = if let Some(identifier) = text
+        .strip_prefix(BROKER_SPAWN_CATALOG_PREFIX)
+        .and_then(|rest| rest.strip_suffix(BROKER_SPAWN_CATALOG_WAL_SUFFIX))
+    {
+        (identifier, true)
+    } else if let Some(identifier) = text
+        .strip_prefix(BROKER_SPAWN_CATALOG_PREFIX)
+        .and_then(|rest| rest.strip_suffix(BROKER_SPAWN_CATALOG_HEAD_SUFFIX))
+    {
+        (identifier, false)
+    } else {
+        return Err(BrokerSpawnWalError::UnexpectedCatalogEntry);
+    };
+    let journal_id =
+        Uuid::parse_str(identifier).map_err(|_| BrokerSpawnWalError::UnexpectedCatalogEntry)?;
+    if journal_id.is_nil()
+        || (is_wal && broker_spawn_catalog_wal_name(journal_id) != name)
+        || (!is_wal && broker_spawn_catalog_head_name(journal_id) != name)
+    {
+        return Err(BrokerSpawnWalError::UnexpectedCatalogEntry);
+    }
+    Ok((journal_id, is_wal))
+}
+
+fn validate_broker_spawn_catalog_path(path: &Path) -> Result<(), BrokerSpawnWalError> {
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(BrokerSpawnWalError::InvalidCatalogPath);
+    }
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(part) => current.push(part),
+            _ => return Err(BrokerSpawnWalError::InvalidCatalogPath),
+        }
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+        if current != path && metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o777 != 0o700 {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(())
+}
+
+fn broker_spawn_file_identity_from_metadata(
+    metadata: &Metadata,
+) -> BrokerSpawnWalFileIdentityV1 {
+    BrokerSpawnWalFileIdentityV1 {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        owner: metadata.uid(),
+        links: metadata.nlink(),
+        bytes: metadata.len(),
+    }
+}
+
+fn validate_broker_spawn_catalog_directory_metadata(
+    metadata: &Metadata,
+) -> Result<(), BrokerSpawnWalError> {
+    if !metadata.is_dir()
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(())
+}
+
+fn require_same_broker_spawn_catalog_object(
+    left: &Metadata,
+    right: &Metadata,
+) -> Result<(), BrokerSpawnWalError> {
+    if left.dev() != right.dev()
+        || left.ino() != right.ino()
+        || left.mode() != right.mode()
+        || left.uid() != right.uid()
+        || left.nlink() != right.nlink()
+    {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(())
+}
+
+fn validate_broker_spawn_catalog_file_metadata(
+    metadata: &Metadata,
+    minimum_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<BrokerSpawnWalFileIdentityV1, BrokerSpawnWalError> {
+    if !metadata.is_file()
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() < minimum_bytes
+        || metadata.len() > maximum_bytes
+    {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(broker_spawn_file_identity_from_metadata(metadata))
+}
+
+fn broker_spawn_catalog_stat_identity_at(
+    directory: &File,
+    name: &OsStr,
+    minimum_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<BrokerSpawnWalFileIdentityV1, BrokerSpawnWalError> {
+    let metadata = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(std::io::Error::from)?;
+    #[allow(clippy::useless_conversion)]
+    let identity = BrokerSpawnWalFileIdentityV1 {
+        device: u64::try_from(metadata.st_dev)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?,
+        inode: u64::try_from(metadata.st_ino)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?,
+        mode: u32::from(metadata.st_mode),
+        owner: u32::try_from(metadata.st_uid)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?,
+        links: u64::from(metadata.st_nlink),
+        bytes: u64::try_from(metadata.st_size)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?,
+    };
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::RegularFile
+        || identity.owner != geteuid().as_raw()
+        || identity.mode & 0o777 != 0o600
+        || identity.links != 1
+        || identity.bytes < minimum_bytes
+        || identity.bytes > maximum_bytes
+    {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(identity)
+}
+
+fn open_broker_spawn_catalog_file_at(
+    directory: &File,
+    name: &OsStr,
+    create_new: bool,
+) -> std::io::Result<File> {
+    let mut flags =
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
+    if create_new {
+        flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
+    }
+    let file = rustix::fs::openat(
+        directory,
+        name,
+        flags,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .map(File::from)
+    .map_err(std::io::Error::from)?;
+    if create_new {
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(std::io::Error::from)?;
+    }
+    Ok(file)
+}
+
+fn open_revalidated_broker_spawn_catalog_file(
+    directory: &File,
+    name: &OsStr,
+    minimum_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<File, BrokerSpawnWalError> {
+    let before =
+        broker_spawn_catalog_stat_identity_at(directory, name, minimum_bytes, maximum_bytes)?;
+    let file = open_broker_spawn_catalog_file_at(directory, name, false)?;
+    let opened = validate_broker_spawn_catalog_file_metadata(
+        &file.metadata()?,
+        minimum_bytes,
+        maximum_bytes,
+    )?;
+    let after =
+        broker_spawn_catalog_stat_identity_at(directory, name, minimum_bytes, maximum_bytes)?;
+    if before != opened || opened != after {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(file)
+}
+
+fn revalidate_open_broker_spawn_catalog_file(
+    directory: &File,
+    name: &OsStr,
+    file: &File,
+    minimum_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<BrokerSpawnWalFileIdentityV1, BrokerSpawnWalError> {
+    let named =
+        broker_spawn_catalog_stat_identity_at(directory, name, minimum_bytes, maximum_bytes)?;
+    let opened = validate_broker_spawn_catalog_file_metadata(
+        &file.metadata()?,
+        minimum_bytes,
+        maximum_bytes,
+    )?;
+    if named != opened {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(opened)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn lock_broker_spawn_catalog(file: &File) -> Result<(), BrokerSpawnWalError> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(|error| {
+        let error = std::io::Error::from(error);
+        if error.kind() == ErrorKind::WouldBlock {
+            BrokerSpawnWalError::CatalogAlreadyOwned
+        } else {
+            BrokerSpawnWalError::Io(error)
+        }
+    })
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn lock_broker_spawn_catalog(_file: &File) -> Result<(), BrokerSpawnWalError> {
+    Err(BrokerSpawnWalError::CatalogLockUnsupported)
+}
+
+impl BrokerSpawnWalCatalogV1 {
+    /// Open and exclusively pin an existing owner-only catalog directory.
+    pub(crate) fn open(directory_path: PathBuf) -> Result<Self, BrokerSpawnWalError> {
+        validate_broker_spawn_catalog_path(&directory_path)?;
+        let before = std::fs::symlink_metadata(&directory_path)?;
+        validate_broker_spawn_catalog_directory_metadata(&before)?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&directory_path)?;
+        let opened = directory.metadata()?;
+        validate_broker_spawn_catalog_directory_metadata(&opened)?;
+        require_same_broker_spawn_catalog_object(&before, &opened)?;
+        let after = std::fs::symlink_metadata(&directory_path)?;
+        require_same_broker_spawn_catalog_object(&opened, &after)?;
+
+        let lock_name = OsStr::new(BROKER_SPAWN_CATALOG_LOCK_NAME);
+        let (lock, created) = match open_broker_spawn_catalog_file_at(&directory, lock_name, true) {
+            Ok(lock) => (lock, true),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => (
+                open_revalidated_broker_spawn_catalog_file(&directory, lock_name, 0, 0)?,
+                false,
+            ),
+            Err(error) => return Err(error.into()),
+        };
+        if created {
+            revalidate_open_broker_spawn_catalog_file(&directory, lock_name, &lock, 0, 0)?;
+            lock.sync_all()?;
+            directory.sync_all()?;
+        }
+        lock_broker_spawn_catalog(&lock)?;
+        let catalog = Self {
+            directory_path,
+            directory,
+            lock,
+        };
+        catalog.validate_pinned_directory()?;
+        catalog.scan_pairs()?;
+        Ok(catalog)
+    }
+
+    /// Create and durably publish one new authenticated WAL/head pair.
+    pub(crate) fn create_spawn_journal(
+        &self,
+        identity: BrokerSpawnWalIdentityV1,
+        authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<BrokerSpawnJournalV1, BrokerSpawnWalError> {
+        identity.validate()?;
+        self.validate_pinned_directory()?;
+        let pairs = self.scan_pairs()?;
+        if pairs.len() >= GUARDIAN_MAX_PANES || pairs.contains_key(&identity.journal_id) {
+            return Err(BrokerSpawnWalError::CapacityExhausted);
+        }
+        let wal_name = broker_spawn_catalog_wal_name(identity.journal_id);
+        let head_name = broker_spawn_catalog_head_name(identity.journal_id);
+        let wal = open_broker_spawn_catalog_file_at(&self.directory, &wal_name, true)?;
+        revalidate_open_broker_spawn_catalog_file(&self.directory, &wal_name, &wal, 0, 0)?;
+        let head = open_broker_spawn_catalog_file_at(&self.directory, &head_name, true)?;
+        revalidate_open_broker_spawn_catalog_file(&self.directory, &head_name, &head, 0, 0)?;
+        let mut journal = BrokerSpawnJournalV1::create(wal, head, identity, authenticator)?;
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            &wal_name,
+            &journal.wal,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+        )?;
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            &head_name,
+            &journal.head,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+        )?;
+        journal.sync_parent_directory_and_activate(&self.directory)?;
+        self.validate_pinned_directory()?;
+        Ok(journal)
+    }
+
+    /// Authenticate, revalidate, and reconcile every complete catalog pair.
+    ///
+    /// Unknown names, half-pairs, replaced inodes, torn records, key rotation,
+    /// and catalog drift all fail the entire startup before any caller can
+    /// install a partial set of durable Spawn fences.
+    pub(crate) fn recover_all(
+        &self,
+        authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<Vec<BrokerSpawnJournalV1>, BrokerSpawnWalError> {
+        self.validate_pinned_directory()?;
+        let pairs = self.scan_pairs()?;
+        let mut recovered = Vec::new();
+        recovered
+            .try_reserve_exact(pairs.len())
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        for (journal_id, pair) in &pairs {
+            let wal_name = pair
+                .wal_name
+                .as_ref()
+                .ok_or(BrokerSpawnWalError::IncompleteCatalogPair)?;
+            let head_name = pair
+                .head_name
+                .as_ref()
+                .ok_or(BrokerSpawnWalError::IncompleteCatalogPair)?;
+            let mut wal = open_revalidated_broker_spawn_catalog_file(
+                &self.directory,
+                wal_name,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+            )?;
+            let head = open_revalidated_broker_spawn_catalog_file(
+                &self.directory,
+                head_name,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+            )?;
+            let mut header = [0_u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES];
+            wal.read_exact(&mut header)?;
+            wal.rewind()?;
+            let (identity, _) = decode_broker_spawn_file_header(
+                &header,
+                BROKER_SPAWN_WAL_FILE_MAGIC,
+                authenticator,
+            )?;
+            if identity.journal_id != *journal_id {
+                return Err(BrokerSpawnWalError::CatalogIdentityMismatch);
+            }
+            recovered.push((
+                wal_name.clone(),
+                head_name.clone(),
+                BrokerSpawnJournalV1::open(wal, head, identity, authenticator.clone())?,
+            ));
+        }
+        if self.scan_pairs()? != pairs {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+
+        let mut journals = Vec::new();
+        journals
+            .try_reserve_exact(recovered.len())
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        for (wal_name, head_name, mut journal) in recovered {
+            let wal_identity = revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &wal_name,
+                &journal.wal,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+            )?;
+            let head_identity = revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &head_name,
+                &journal.head,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+            )?;
+            let authority = BrokerSpawnWalFilesystemRevalidationV1::from_revalidated_filesystem(
+                journal.identity,
+                wal_identity.bytes,
+                head_identity.bytes,
+            )?;
+            journal.reconcile_recovered_head_and_activate(authority)?;
+            revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &head_name,
+                &journal.head,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+            )?;
+            journals.push(journal);
+        }
+        self.validate_pinned_directory()?;
+        Ok(journals)
+    }
+
+    fn validate_pinned_directory(&self) -> Result<(), BrokerSpawnWalError> {
+        validate_broker_spawn_catalog_path(&self.directory_path)?;
+        let opened = self.directory.metadata()?;
+        validate_broker_spawn_catalog_directory_metadata(&opened)?;
+        let named = std::fs::symlink_metadata(&self.directory_path)?;
+        validate_broker_spawn_catalog_directory_metadata(&named)?;
+        require_same_broker_spawn_catalog_object(&opened, &named)?;
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            OsStr::new(BROKER_SPAWN_CATALOG_LOCK_NAME),
+            &self.lock,
+            0,
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn scan_pairs(
+        &self,
+    ) -> Result<BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1>, BrokerSpawnWalError> {
+        let mut directory = rustix::fs::Dir::read_from(&self.directory)
+            .map_err(std::io::Error::from)?;
+        let mut pairs = BTreeMap::new();
+        let mut observed_entries = 0_usize;
+        while let Some(entry) = directory.read() {
+            let entry = entry.map_err(std::io::Error::from)?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            observed_entries = observed_entries
+                .checked_add(1)
+                .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+            if observed_entries > BROKER_SPAWN_CATALOG_MAX_ENTRIES {
+                return Err(BrokerSpawnWalError::CapacityExhausted);
+            }
+            let name = OsStr::from_bytes(name.to_bytes());
+            if name == OsStr::new(BROKER_SPAWN_CATALOG_LOCK_NAME) {
+                continue;
+            }
+            let (journal_id, is_wal) = parse_broker_spawn_catalog_name(name)?;
+            let pair = pairs.entry(journal_id).or_default();
+            let slot = if is_wal {
+                &mut pair.wal_name
+            } else {
+                &mut pair.head_name
+            };
+            if slot.replace(name.to_os_string()).is_some() {
+                return Err(BrokerSpawnWalError::UnexpectedCatalogEntry);
+            }
+        }
+        if pairs
+            .values()
+            .any(|pair| pair.wal_name.is_none() || pair.head_name.is_none())
+        {
+            return Err(BrokerSpawnWalError::IncompleteCatalogPair);
+        }
+        Ok(pairs)
+    }
 }
 
 impl BrokerSpawnJournalV1 {
