@@ -391,13 +391,29 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   transient/terminal classification is authenticated and checked before the
   correlated client exposes it; arbitrary runtime error strings never become
   guardian control-plane payloads.
+- Routes authenticated CheckpointStage, Checkpoint, Replay, and ReplayAck
+  operations through the guardian's fixed-capacity off-readiness worker, then
+  restores the sole protocol authority before routing each generation-fenced
+  completion. A staged mux-side guardian proxy now claims one durable pane,
+  replays the newest compatible canonical terminal checkpoint plus its exact
+  raw-output suffix into inert handlers, verifies every cursor, record, digest,
+  geometry, and completion boundary, and only then publishes a live pane.
+  Lost Replay and ReplayAck replies retain their exact request identities for
+  bounded retry, and any unpublished staged or activated claim is retired by
+  an exact identity-bound rollback guard. Tail reads remain adaptively polled
+  while server-side `wait_millis` readiness deferral is completed; production
+  guardian activation remains disabled.
 
 ### Known continuity boundary
 
-- Live mux replacement is still intentionally unavailable while `LocalPane`
-  owns PTY masters and child handles. The guardian lease/replay/checkpoint
-  contract is documented, and deployment fails closed rather than describing a
-  disruptive restart or transcript export as lossless process continuity.
+- Live replacement of panes created by the legacy `LocalPane` path is still
+  intentionally unavailable because those mux processes own their PTY masters
+  and child handles. The guardian lease/replay/checkpoint path applies only to
+  panes born under guardian ownership, and its production selector remains
+  disabled until broker restart recovery, lease rotation, replay readiness,
+  durable topology reconciliation, and real `SIGKILL` upgrade proof are
+  complete. Deployment fails closed rather than describing a disruptive
+  restart or transcript export as lossless process continuity.
 
 Representative landed commits:
 [matched release process family](https://github.com/Dicklesworthstone/frankenterm/commit/80effb4302fef9f7cc172f6e3aff45f19870ab77),
