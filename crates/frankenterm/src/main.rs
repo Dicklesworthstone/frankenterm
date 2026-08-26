@@ -77780,9 +77780,8 @@ async fn capture_compatible_client_dump(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).context(
-                "Failed to establish that the compatible-client dump output is absent",
-            );
+            return Err(error)
+                .context("Failed to establish that the compatible-client dump output is absent");
         }
     }
 
@@ -97395,9 +97394,11 @@ recorder_backend = "rusqlite"
             .is_err()
         );
 
-        let duplicate_ok = String::from_utf8(valid_bytes)
-            .unwrap()
-            .replacen("\"ok\":true", "\"ok\":true,\"ok\":true", 1);
+        let duplicate_ok = String::from_utf8(valid_bytes).unwrap().replacen(
+            "\"ok\":true",
+            "\"ok\":true,\"ok\":true",
+            1,
+        );
         assert!(
             parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
                 duplicate_ok.as_bytes(),
@@ -97488,7 +97489,10 @@ recorder_backend = "rusqlite"
         let first_secret = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let second_secret = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let redactor = frankenterm_core::redactor::Redactor::new();
-        assert_eq!(redactor.redact(first_secret), redactor.redact(second_secret));
+        assert_eq!(
+            redactor.redact(first_secret),
+            redactor.redact(second_secret)
+        );
         assert_ne!(
             compatible_client_raw_topology(&[pane(first_secret)]),
             compatible_client_raw_topology(&[pane(second_secret)]),
@@ -97683,7 +97687,12 @@ recorder_backend = "rusqlite"
             .await;
             assert!(cancellation_error.to_string().contains("was cancelled"));
             frankenterm_core::runtime_async::sleep(Duration::from_millis(900)).await;
-            assert!(!cancellation_directory.path().join("delayed-marker").exists());
+            assert!(
+                !cancellation_directory
+                    .path()
+                    .join("delayed-marker")
+                    .exists()
+            );
         });
     }
 
@@ -98263,32 +98272,55 @@ recorder_backend = "rusqlite"
             .map(|offset| start + offset)
             .expect("session verify-dump branch follows dump");
         let branch = &source[start..end];
-        let write = branch
+        assert!(
+            branch.contains("publish_mux_dump_payload(&output_path, dump)"),
+            "live session dump must route through the shared durable publication helper"
+        );
+
+        let helper_start = source
+            .find("fn publish_mux_dump_payload(")
+            .expect("shared mux dump publication helper remains present");
+        let helper_end = source[helper_start..]
+            .find("async fn run_compatible_client_dump_command(")
+            .map(|offset| helper_start + offset)
+            .expect("compatible-client command follows the publication helper");
+        let helper = &source[helper_start..helper_end];
+        let write = helper
             .find("write_new_private_artifact(&output_path, &artifact_bytes)")
             .expect("dump publication remains no-clobber and durable");
-        let release_tree = branch
+        let release_tree = helper
             .find("drop(envelope)")
             .expect("the producer pane-text tree must be released before publication");
-        let release_buffer = branch
+        let release_buffer = helper
             .find("drop(artifact_bytes)")
             .expect("the artifact-sized producer buffer must be released before reread");
-        let verify = branch
+        let verify = helper
             .find("verify_mux_dump_artifact(&output_path)")
             .expect("published dumps must pass the offline verifier in-process");
-        let success_output = branch
-            .find("let result = serde_json::json!")
-            .expect("dump success output remains present");
         assert!(
-            release_tree < write
-                && write < release_buffer
-                && release_buffer < verify
-                && verify < success_output,
-            "dump success must follow producer-tree release, durable publication, buffer release, and offline verification"
+            release_tree < write && write < release_buffer && release_buffer < verify,
+            "publication receipt must follow producer-tree release, durable no-clobber publication, buffer release, and offline verification"
         );
         assert!(
-            branch[verify..success_output].contains("verified publication receipt disagrees"),
+            helper[verify..].contains("verified publication receipt disagrees"),
             "producer and verifier receipts must be compared before success"
         );
+    }
+
+    #[test]
+    fn compatible_client_subprocess_uses_cleanup_settled_deadline_api() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn execute_bounded_compatible_client_command(")
+            .expect("compatible-client subprocess helper remains present");
+        let end = source[start..]
+            .find("async fn run_compatible_client_subprocess(")
+            .map(|offset| start + offset)
+            .expect("authority wrapper follows compatible-client subprocess helper");
+        let helper = &source[start..end];
+        assert!(helper.contains("output_with_cx_timeout(cx, timeout)"));
+        assert!(!helper.contains("timeout_with_cx("));
+        assert!(helper.contains("process cleanup settled"));
     }
 
     #[test]
