@@ -3292,7 +3292,10 @@ impl IdempotencyStore {
         let metadata = lock_file
             .metadata()
             .map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!("inspect plan catalog lock {}: {err}", lock_display.display()),
+                reason: format!(
+                    "inspect plan catalog lock {}: {err}",
+                    lock_display.display()
+                ),
             })?;
         validate_open_regular_file(&metadata, &lock_display)?;
         let lock_file = lock_file.into_std();
@@ -8417,7 +8420,10 @@ mod tests {
         let err = store_2
             .create_ledger("exec-blocked", &plan)
             .expect_err("create must be blocked by plan catalog lock");
-        assert!(matches!(err, IdempotencyError::PlanMutationInProgress { .. }));
+        assert!(matches!(
+            err,
+            IdempotencyError::PlanMutationInProgress { .. }
+        ));
 
         // Store 1 drops the plan catalog lock
         drop(plan_lock);
@@ -8444,9 +8450,7 @@ mod tests {
         // Create multiple executions for the plan
         for i in 1..=3 {
             let id = format!("exec-multi-{i}");
-            store_1
-                .create_ledger(&id, &plan)
-                .expect("create execution");
+            store_1.create_ledger(&id, &plan).expect("create execution");
             store_1
                 .transition_phase(&id, TxPhase::Preparing)
                 .expect("transition phase");

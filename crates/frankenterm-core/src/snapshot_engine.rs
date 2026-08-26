@@ -7531,7 +7531,11 @@ fn load_verified_checkpoint_for_artifact(
     limits: CheckpointScrollbackArtifactLimits,
 ) -> Result<CheckpointScrollbackCheckpoint, CheckpointScrollbackArtifactError> {
     let checkpoint = crate::session_restore::load_checkpoint_by_id_from_conn(conn, checkpoint_id)
-        .map_err(|error| CheckpointScrollbackArtifactError::Checkpoint(error.to_string()))?
+        .map_err(|_| {
+            CheckpointScrollbackArtifactError::Checkpoint(
+                "selected checkpoint could not be decoded".to_string(),
+            )
+        })?
         .ok_or_else(|| {
             CheckpointScrollbackArtifactError::Checkpoint(
                 "selected checkpoint does not exist".to_string(),
@@ -7556,8 +7560,11 @@ fn load_verified_checkpoint_for_artifact(
             "verified snapshot has no topology".to_string(),
         )
     })?;
-    let topology = TopologySnapshot::from_json(&topology_json)
-        .map_err(|error| CheckpointScrollbackArtifactError::Checkpoint(error.to_string()))?;
+    let topology = TopologySnapshot::from_json(&topology_json).map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "verified snapshot topology JSON is invalid".to_string(),
+        )
+    })?;
     let persisted_panes =
         load_checkpoint_persisted_panes_for_artifact(conn, checkpoint_id, checkpoint.pane_count)?;
     let checkpoint_at = i64::try_from(checkpoint.checkpoint_at).map_err(|_| {
@@ -7587,7 +7594,11 @@ fn load_verified_checkpoint_for_artifact(
         Some(&topology_json),
         &persisted_panes,
     )
-    .map_err(|error| CheckpointScrollbackArtifactError::Checkpoint(error.to_string()))?;
+    .map_err(|_| {
+        CheckpointScrollbackArtifactError::Checkpoint(
+            "checkpoint witness could not be recomputed".to_string(),
+        )
+    })?;
     if recomputed != checkpoint.state_hash {
         return Err(CheckpointScrollbackArtifactError::Checkpoint(
             "checkpoint witness changed during artifact projection".to_string(),
@@ -7769,7 +7780,7 @@ fn load_checkpoint_capture_gaps(
         "SELECT seq_before, seq_after, reason, detected_at
          FROM output_gaps
          WHERE pane_id = ?1 AND seq_after <= ?2 AND detected_at <= ?3
-         ORDER BY seq_before ASC, seq_after ASC, id ASC
+         ORDER BY seq_before ASC, seq_after ASC, detected_at ASC, reason ASC, id ASC
          LIMIT ?4",
     )?;
     let mut rows = statement.query(rusqlite::params![
@@ -7807,6 +7818,15 @@ fn load_checkpoint_capture_gaps(
                 )
             })?,
         });
+        if gaps.len() >= 2 {
+            let previous = &gaps[gaps.len() - 2];
+            let current = &gaps[gaps.len() - 1];
+            if checkpoint_capture_gap_order(previous) >= checkpoint_capture_gap_order(current) {
+                return Err(CheckpointScrollbackArtifactError::Checkpoint(
+                    "capture-gap rows contain a duplicate canonical identity".to_string(),
+                ));
+            }
+        }
     }
     if gaps.len() != relevant_count {
         return Err(CheckpointScrollbackArtifactError::Checkpoint(
@@ -7814,6 +7834,17 @@ fn load_checkpoint_capture_gaps(
         ));
     }
     Ok(gaps)
+}
+
+fn checkpoint_capture_gap_order(
+    gap: &CheckpointScrollbackCaptureGap,
+) -> (u64, u64, u64, &str) {
+    (
+        gap.seq_before,
+        gap.seq_after,
+        gap.detected_at,
+        gap.reason.as_str(),
+    )
 }
 
 fn load_checkpoint_scrollback_prefix(
@@ -8587,9 +8618,11 @@ fn validate_checkpoint_scrollback_prefix(
         ));
     }
     let expected_sequence_gaps =
-        compute_checkpoint_sequence_gaps(prefix.checkpoint_seq, &prefix.segments).map_err(
-            |error| CheckpointScrollbackArtifactError::InvalidArtifact(error.to_string()),
-        )?;
+        compute_checkpoint_sequence_gaps(prefix.checkpoint_seq, &prefix.segments).map_err(|_| {
+            CheckpointScrollbackArtifactError::InvalidArtifact(
+                "pane prefix sequence gaps cannot be recomputed".to_string(),
+            )
+        })?;
     if prefix.sequence_gaps != expected_sequence_gaps
         || (expected_sequence_gaps.is_empty()
             && prefix
@@ -8605,14 +8638,15 @@ fn validate_checkpoint_scrollback_prefix(
     }
     let mut prior_capture_gap = None;
     for gap in &prefix.capture_gaps {
-        let order = (gap.seq_before, gap.seq_after, gap.detected_at);
         if gap.seq_after <= gap.seq_before
             || prefix
                 .checkpoint_seq
                 .is_none_or(|checkpoint_seq| gap.seq_after > checkpoint_seq)
             || gap.detected_at > checkpoint_at
             || gap.reason.len() > CHECKPOINT_SCROLLBACK_MAX_GAP_REASON_BYTES
-            || prior_capture_gap.is_some_and(|previous| previous > order)
+            || prior_capture_gap.is_some_and(|previous| {
+                checkpoint_capture_gap_order(previous) >= checkpoint_capture_gap_order(gap)
+            })
         {
             return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
                 "pane prefix capture-gap evidence is invalid or out of order".to_string(),
@@ -8623,7 +8657,7 @@ fn validate_checkpoint_scrollback_prefix(
                 "capture-gap reason is not a current redaction fixed point".to_string(),
             )
         })?;
-        prior_capture_gap = Some(order);
+        prior_capture_gap = Some(gap);
     }
     let starts_at_zero = match prefix.checkpoint_seq {
         None => prefix.segments.is_empty(),
@@ -8662,7 +8696,11 @@ fn validate_checkpoint_scrollback_payload(
     let embedded_limits = payload
         .limits
         .validate()
-        .map_err(|error| CheckpointScrollbackArtifactError::InvalidArtifact(error.to_string()))?;
+        .map_err(|_| {
+            CheckpointScrollbackArtifactError::InvalidArtifact(
+                "embedded producer limits are invalid".to_string(),
+            )
+        })?;
     if !caller_limits.admits(&embedded_limits) {
         return Err(CheckpointScrollbackArtifactError::ResourceLimit(
             "embedded producer limits exceed verifier limits".to_string(),
