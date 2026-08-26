@@ -60,11 +60,11 @@ compile_error!(
 use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
-use crate::guardian_checkpoint::{
-    capture_and_bind_live_parser_checkpoint, LiveParserCaptureAndBindError, LiveParserCheckpointAck,
-};
 #[cfg(test)]
 use crate::guardian_checkpoint::{GuardianCheckpointBoundary, GuardianCheckpointBoundaryError};
+use crate::guardian_checkpoint::{
+    LiveParserCaptureAndBindError, LiveParserCheckpointAck, capture_and_bind_live_parser_checkpoint,
+};
 use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity};
 #[cfg(test)]
 use crate::guardian_output_journal::{
@@ -76,21 +76,22 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{
-    FrozenWindowOrder, PrepareWindowOrderError, PreparedWindowPaneCount, PreparedWindowState,
-    Window, WindowId, WindowOrderRevision, WindowOrderSnapshotError, MAX_TABS_PER_ORDERED_WINDOW,
+    FrozenWindowOrder, MAX_TABS_PER_ORDERED_WINDOW, PrepareWindowOrderError,
+    PreparedWindowPaneCount, PreparedWindowState, Window, WindowId, WindowOrderRevision,
+    WindowOrderSnapshotError,
 };
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition, TermConfig};
+use config::{ExitBehavior, GuiPosition, TermConfig, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{
-    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
+    AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT, poll, pollfd, socketpair,
 };
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 #[cfg(test)]
@@ -117,7 +118,7 @@ use termwiz::escape::{Action, CSI};
 use termwiz::input::KeyEvent;
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -1921,7 +1922,9 @@ const LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum LiveParserCheckpointError {
-    #[error("live parser checkpoint timeout must be nonzero and no greater than {LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT:?}")]
+    #[error(
+        "live parser checkpoint timeout must be nonzero and no greater than {LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT:?}"
+    )]
     InvalidTimeout,
     #[error("pane registration is no longer current")]
     StaleRegistration,
@@ -7061,10 +7064,12 @@ impl PaneAuthorityIndex {
         if let Some(owner) = self.structural_by_pane_id.get_mut(&prepared.pane_id) {
             debug_assert!(owner.matches_pane(&prepared.pane));
             debug_assert_eq!(owner.domain_id, Some(prepared.domain_id));
-            debug_assert!(owner
-                .registration
-                .as_ref()
-                .is_some_and(|current| { current.same_registration(&prepared.registration) }));
+            debug_assert!(
+                owner
+                    .registration
+                    .as_ref()
+                    .is_some_and(|current| { current.same_registration(&prepared.registration) })
+            );
             owner.registration = None;
             owner.domain_id = None;
         }
@@ -7655,8 +7660,7 @@ impl PaneAuthorityIndex {
                             self.domain_directory_matches(
                                 domain_id,
                                 exact_domain.map(|registration| &registration.domain),
-                            )
-                                && !retired_domain_ids.contains(&domain_id),
+                            ) && !retired_domain_ids.contains(&domain_id),
                             "pane {} live relocation directory names a missing, replaced, or retired domain",
                             state.pane_id
                         );
@@ -13664,10 +13668,10 @@ impl Mux {
                         None => true,
                         Some(_) => {
                             return Err(DomainRegistrationError::RegistryInconsistent {
-                                    detail: format!(
-                                        "domain {domain_id} pane directory names another exact allocation"
-                                    ),
-                                });
+                                detail: format!(
+                                    "domain {domain_id} pane directory names another exact allocation"
+                                ),
+                            });
                         }
                     }
                 } else {
@@ -16339,7 +16343,9 @@ impl Mux {
                     let commit_terminal = |first_revision| {
                         for tab in &retired_tabs {
                             let removed = tabs.remove(&tab.tab_id());
-                            debug_assert!(removed.is_some_and(|removed| Arc::ptr_eq(&removed, tab)));
+                            debug_assert!(
+                                removed.is_some_and(|removed| Arc::ptr_eq(&removed, tab))
+                            );
                         }
                         for (tab, pane_candidates) in
                             retired_tabs.iter().zip(&pane_candidate_batches)
@@ -19857,13 +19863,12 @@ impl Mux {
                         let committed = tab_locks.commit(self, prepared, first_revision);
                         if source_tab_retires {
                             let removed = tabs.remove(&source_tab.tab_id());
-                            debug_assert!(removed
-                                .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
+                            debug_assert!(
+                                removed.is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab))
+                            );
                         }
-                        let prior = tabs.insert(
-                            destination_tab.tab_id(),
-                            Arc::clone(&destination_tab),
-                        );
+                        let prior =
+                            tabs.insert(destination_tab.tab_id(), Arc::clone(&destination_tab));
                         debug_assert!(prior.is_none());
                         committed
                     },
@@ -20242,10 +20247,11 @@ mod tests {
     fn pane_snapshot_bounded_window_census_accepts_exact_limit_and_rejects_before_vector_growth() {
         let _lock = global_test_lock();
         let mux = Arc::new(Mux::new(None));
-        assert!(mux
-            .iter_windows_bounded(0)
-            .expect("an empty mux must fit a zero-window limit")
-            .is_empty());
+        assert!(
+            mux.iter_windows_bounded(0)
+                .expect("an empty mux must fit a zero-window limit")
+                .is_empty()
+        );
         let first = mux.new_empty_window(None, None);
         let first_id = *first;
         drop(first);
@@ -20882,7 +20888,7 @@ mod tests {
             .expect("create live checkpoint journal");
         let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32])
             .expect("valid live checkpoint cipher");
-        let mut journal = GuardianOutputJournal::open(
+        let mut journal = GuardianOutputJournal::create_new(
             file,
             segment,
             cipher,
@@ -21178,7 +21184,7 @@ mod tests {
                 .expect("valid recovery segment");
         let cipher =
             GuardianOutputCipher::try_from_key_slice(&[0x6d; 32]).expect("valid recovery cipher");
-        let mut journal = GuardianOutputJournal::open(
+        let mut journal = GuardianOutputJournal::create_new(
             file,
             segment,
             cipher,
@@ -21322,10 +21328,12 @@ mod tests {
             panic!("injected delivery reservation unwind");
         }));
         assert!(panic.is_err());
-        assert!(waiter
-            .join()
-            .expect("delivery waiter does not panic")
-            .is_err());
+        assert!(
+            waiter
+                .join()
+                .expect("delivery waiter does not panic")
+                .is_err()
+        );
         let state = control.state.lock();
         assert!(!state.delivery_call_in_flight);
         assert!(!state.socket_write_in_flight);
@@ -21443,10 +21451,12 @@ mod tests {
             .expect("capture thread does not panic")
             .expect("exact capture succeeds");
         assert_eq!(ack.parser_stream_bytes(), target);
-        assert!(writer_done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("post-target writer finishes after gate reopens")
-            .is_err());
+        assert!(
+            writer_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("post-target writer finishes after gate reopens")
+                .is_err()
+        );
         post_target_writer
             .join()
             .expect("post-target writer does not panic");
@@ -21591,13 +21601,15 @@ mod tests {
             panic_harness.capture(panic_segment, panic_receipts[0], Duration::from_secs(2)),
             Err(LiveParserCheckpointError::Poisoned(_))
         ));
-        assert!(panic_harness
-            .generation
-            .live_parser_checkpoint
-            .state
-            .lock()
-            .pending
-            .is_none());
+        assert!(
+            panic_harness
+                .generation
+                .live_parser_checkpoint
+                .state
+                .lock()
+                .pending
+                .is_none()
+        );
     }
 
     #[test]
@@ -22181,8 +22193,10 @@ mod tests {
             .split_and_insert(0, SplitRequest::default(), Arc::clone(&inserted))
             .expect_err("injected count allocation failure must reject the split");
 
-        assert!(format!("{error:#}")
-            .contains("injected bound split insertion pane-count allocation failure"));
+        assert!(
+            format!("{error:#}")
+                .contains("injected bound split insertion pane-count allocation failure")
+        );
         assert_eq!(tab.iter_all_panes().len(), 1);
         assert!(Arc::ptr_eq(&tab.iter_all_panes()[0], &root));
         assert_eq!(
@@ -22309,11 +22323,12 @@ mod tests {
         mux.prune_dead_windows_ignoring_activity();
         assert!(mux.get_window(stale_window_id).is_none());
         assert_structural_pane_count_authority(&mux);
-        assert!(mux
-            .tabs
-            .write()
-            .insert(stale_tab.tab_id(), Arc::clone(&stale_tab))
-            .is_none());
+        assert!(
+            mux.tabs
+                .write()
+                .insert(stale_tab.tab_id(), Arc::clone(&stale_tab))
+                .is_none()
+        );
         mux.remove_tab(stale_tab.tab_id())
             .expect("retire the detached stale-parent tab");
         assert_structural_pane_count_authority(&mux);
@@ -23545,9 +23560,10 @@ mod tests {
                     0,
                     "old-generation cleanup must not touch a different-Arc successor"
                 );
-                assert!(mux
-                    .get_pane(pane_id)
-                    .is_some_and(|current| Arc::ptr_eq(&current, &different_arc)));
+                assert!(
+                    mux.get_pane(pane_id)
+                        .is_some_and(|current| Arc::ptr_eq(&current, &different_arc))
+                );
             }
         }
     }
@@ -23590,9 +23606,11 @@ mod tests {
         assert!(Arc::ptr_eq(&tab, &origin_tab));
         assert!(guard.belongs_to(&origin));
         assert!(!guard.belongs_to(&replacement_mux));
-        assert!(replacement_mux
-            .get_pane(162)
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement_pane)));
+        assert!(
+            replacement_mux
+                .get_pane(162)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement_pane))
+        );
 
         drop(guard);
         assert_eq!(origin_kills.load(Ordering::SeqCst), 1);
@@ -23739,9 +23757,10 @@ mod tests {
 
         assert_eq!(original_kills.load(Ordering::SeqCst), 0);
         assert_eq!(replacement_kills.load(Ordering::SeqCst), 0);
-        assert!(mux
-            .get_pane(167)
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)));
+        assert!(
+            mux.get_pane(167)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement))
+        );
     }
 
     #[test]
@@ -24153,9 +24172,11 @@ mod tests {
 
         assert_eq!(receipt.tab_id(), destination.tab_id());
         assert!(destination.has_floating_pane(spawned.pane_id()));
-        assert!(originating_mux
-            .get_pane(spawned.pane_id())
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &spawned)));
+        assert!(
+            originating_mux
+                .get_pane(spawned.pane_id())
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &spawned))
+        );
         assert!(replacement_mux.get_pane(spawned.pane_id()).is_none());
         assert!(replacement_mux.tabs.read().is_empty());
         assert!(replacement_mux.windows.read().is_empty());
@@ -24202,9 +24223,10 @@ mod tests {
         assert_eq!(receipt.invalidated_window_ids, vec![window_id]);
         assert_eq!(receipt.registered_pane_ids, vec![203]);
         assert!(receipt.retired_pane_ids.is_empty());
-        assert!(mux
-            .get_pane(203)
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &floating)));
+        assert!(
+            mux.get_pane(203)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &floating))
+        );
         let positioned = tab.iter_floating_panes();
         assert_eq!(positioned.len(), 1);
         assert!(Arc::ptr_eq(&positioned[0].pane, &floating));
@@ -24294,9 +24316,10 @@ mod tests {
             error = error,
         );
         assert!(tab.iter_floating_panes().is_empty());
-        assert!(mux
-            .get_pane(204)
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &tiled)));
+        assert!(
+            mux.get_pane(204)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &tiled))
+        );
         let after = mux
             .window_order_snapshot(window_id)
             .expect("valid test window after rejection")
@@ -24512,14 +24535,18 @@ mod tests {
         assert_eq!(receipt.tab_id(), target_tab.tab_id());
         assert_eq!(receipt.window_id(), target_window_id);
         receipt.with_pane(|pane| assert!(std::ptr::eq(pane, spawned.as_ref())));
-        assert!(target_tab
-            .iter_all_panes()
-            .iter()
-            .any(|pane| Arc::ptr_eq(pane, &target)));
-        assert!(target_tab
-            .iter_all_panes()
-            .iter()
-            .any(|pane| Arc::ptr_eq(pane, &spawned)));
+        assert!(
+            target_tab
+                .iter_all_panes()
+                .iter()
+                .any(|pane| Arc::ptr_eq(pane, &target))
+        );
+        assert!(
+            target_tab
+                .iter_all_panes()
+                .iter()
+                .any(|pane| Arc::ptr_eq(pane, &spawned))
+        );
         assert_eq!(target_kills.load(Ordering::SeqCst), 0);
         assert_eq!(spawned_kills.load(Ordering::SeqCst), 0);
     }
@@ -24615,19 +24642,25 @@ mod tests {
         assert_eq!(receipt.pane_id(), source.pane_id());
         assert_eq!(receipt.tab_id(), target_tab.tab_id());
         assert_eq!(receipt.window_id(), target_window_id);
-        assert!(receipt
-            .registration()
-            .same_registration(&source_registration));
+        assert!(
+            receipt
+                .registration()
+                .same_registration(&source_registration)
+        );
         receipt.with_pane(|pane| assert!(std::ptr::eq(pane, source.as_ref())));
         assert!(mux.get_tab(source_tab.tab_id()).is_none());
-        assert!(target_tab
-            .iter_all_panes()
-            .iter()
-            .any(|pane| Arc::ptr_eq(pane, &target)));
-        assert!(target_tab
-            .iter_all_panes()
-            .iter()
-            .any(|pane| Arc::ptr_eq(pane, &source)));
+        assert!(
+            target_tab
+                .iter_all_panes()
+                .iter()
+                .any(|pane| Arc::ptr_eq(pane, &target))
+        );
+        assert!(
+            target_tab
+                .iter_all_panes()
+                .iter()
+                .any(|pane| Arc::ptr_eq(pane, &source))
+        );
         assert_eq!(target_kills.load(Ordering::SeqCst), 0);
         assert_eq!(source_kills.load(Ordering::SeqCst), 0);
     }
@@ -24695,10 +24728,11 @@ mod tests {
                 .copied(),
             Some(1)
         );
-        assert!(!mux
-            .num_panes_by_workspace
-            .read()
-            .contains_key(DEFAULT_WORKSPACE));
+        assert!(
+            !mux.num_panes_by_workspace
+                .read()
+                .contains_key(DEFAULT_WORKSPACE)
+        );
         assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
         mux.assert_tab_parent_index_matches_windows();
         let authority = mux.pane_authority.lock();
@@ -24707,10 +24741,12 @@ mod tests {
             .get(&pane.pane_id())
             .expect("detached pane retains structural authority in its new tab");
         assert!(owner.matches_pane(&pane));
-        assert!(owner.matches_tab(
-            &mux.get_tab(receipt.tab_id())
-                .expect("receipt tab remains exact-current")
-        ));
+        assert!(
+            owner.matches_tab(
+                &mux.get_tab(receipt.tab_id())
+                    .expect("receipt tab remains exact-current")
+            )
+        );
         assert!(owner.registration.is_none() && owner.domain_id.is_none());
         drop(authority);
         assert_eq!(kills.load(Ordering::SeqCst), 0);
@@ -24749,14 +24785,15 @@ mod tests {
             .get_tab(receipt.tab_id())
             .expect("replacement tab remains exact-current");
         assert!(destination_tab.active_mux_owner_generation().is_some());
-        assert!(mux
-            .pane_authority
-            .lock()
-            .structural_by_pane_id
-            .get(&pane.pane_id())
-            .is_some_and(|owner| {
-                owner.matches_pane(&pane) && owner.matches_tab(&destination_tab)
-            }));
+        assert!(
+            mux.pane_authority
+                .lock()
+                .structural_by_pane_id
+                .get(&pane.pane_id())
+                .is_some_and(|owner| {
+                    owner.matches_pane(&pane) && owner.matches_tab(&destination_tab)
+                })
+        );
         let after = mux
             .window_order_snapshot(window_id)
             .expect("snapshot replacement window")
@@ -24816,14 +24853,18 @@ mod tests {
             .ordered_tab_ids()
             .collect::<Vec<_>>();
         assert_eq!(order, [source_tab.tab_id(), receipt.tab_id()]);
-        assert!(source_tab
-            .iter_all_panes()
-            .iter()
-            .all(|current| !Arc::ptr_eq(current, &pane)));
-        assert!(source_tab
-            .iter_all_panes()
-            .iter()
-            .any(|current| Arc::ptr_eq(current, &companion)));
+        assert!(
+            source_tab
+                .iter_all_panes()
+                .iter()
+                .all(|current| !Arc::ptr_eq(current, &pane))
+        );
+        assert!(
+            source_tab
+                .iter_all_panes()
+                .iter()
+                .any(|current| Arc::ptr_eq(current, &companion))
+        );
         assert!(mux.get_tab(receipt.tab_id()).is_some_and(|tab| {
             tab.iter_all_panes()
                 .iter()
@@ -24883,13 +24924,16 @@ mod tests {
         .expect_err("topology exhaustion must reject before publication");
 
         assert!(format!("{error:#}").contains("topology revision space is exhausted"));
-        assert!(mux
-            .get_tab(source_tab.tab_id())
-            .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
-        assert!(source_tab
-            .iter_all_panes()
-            .iter()
-            .any(|current| Arc::ptr_eq(current, &pane)));
+        assert!(
+            mux.get_tab(source_tab.tab_id())
+                .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab))
+        );
+        assert!(
+            source_tab
+                .iter_all_panes()
+                .iter()
+                .any(|current| Arc::ptr_eq(current, &pane))
+        );
         let window_after = mux
             .window_order_snapshot(window_id)
             .expect("snapshot rejected move")
@@ -25177,9 +25221,10 @@ mod tests {
             .add_pane(&pane)
             .expect_err("same pane object must not acquire a second live mux owner");
 
-        assert!(err
-            .to_string()
-            .contains("already bound to a live or draining mux registration"));
+        assert!(
+            err.to_string()
+                .contains("already bound to a live or draining mux registration")
+        );
         assert!(second_mux.get_pane(151).is_none());
         assert!(
             first_mux
@@ -25217,9 +25262,10 @@ mod tests {
         let err = second_mux
             .add_pane(&pane)
             .expect_err("owner death cannot prove detached subscriber work is quiescent");
-        assert!(err
-            .to_string()
-            .contains("already bound to a live or draining mux registration"));
+        assert!(
+            err.to_string()
+                .contains("already bound to a live or draining mux registration")
+        );
         assert!(second_mux.get_pane(155).is_none());
         assert_eq!(
             kills.load(Ordering::SeqCst),
@@ -25267,9 +25313,10 @@ mod tests {
         let err = second_mux
             .add_pane(&pane)
             .expect_err("a claimed old-generation kill must fence rebinding");
-        assert!(err
-            .to_string()
-            .contains("already bound to a live or draining mux registration"));
+        assert!(
+            err.to_string()
+                .contains("already bound to a live or draining mux registration")
+        );
         assert_eq!(kills.load(Ordering::SeqCst), 0);
 
         executor.run_until(Duration::from_secs(30), || {
@@ -25324,9 +25371,10 @@ mod tests {
         let err = second_mux
             .add_pane(&pane)
             .expect_err("weak-owner death alone must not authorize rebinding");
-        assert!(err
-            .to_string()
-            .contains("already bound to a live or draining mux registration"));
+        assert!(
+            err.to_string()
+                .contains("already bound to a live or draining mux registration")
+        );
         assert_eq!(kills.load(Ordering::SeqCst), 0);
 
         drop_release_tx
@@ -25336,9 +25384,10 @@ mod tests {
         let err = second_mux
             .add_pane(&pane)
             .expect_err("owner field teardown cannot prove detached work is quiescent");
-        assert!(err
-            .to_string()
-            .contains("already bound to a live or draining mux registration"));
+        assert!(
+            err.to_string()
+                .contains("already bound to a live or draining mux registration")
+        );
         assert_eq!(kills.load(Ordering::SeqCst), 0);
         assert!(second_mux.get_pane(157).is_none());
     }
@@ -25358,9 +25407,10 @@ mod tests {
             .expect("unbound test slot accepts reservation")
             .commit()
             .expect("test reservation commits");
-        assert!(slot
-            .load()
-            .is_some_and(|bound| bound.same_registration(&registration)));
+        assert!(
+            slot.load()
+                .is_some_and(|bound| bound.same_registration(&registration))
+        );
         drop(commit);
         assert!(
             slot.load().is_none(),
@@ -25426,9 +25476,10 @@ mod tests {
         let err = mux
             .add_pane(&pane)
             .expect_err("injected preparation failure should reject publication");
-        assert!(err
-            .to_string()
-            .contains("injected pane reader socketpair failure"));
+        assert!(
+            err.to_string()
+                .contains("injected pane reader socketpair failure")
+        );
         assert!(mux.get_pane(152).is_none());
 
         mux.add_pane(&pane)
@@ -25501,9 +25552,11 @@ mod tests {
         assert!(!tab.kill_pane_registration(&delayed));
         assert_eq!(successor_kills.load(Ordering::SeqCst), 0);
         assert!(tab.contains_pane(139));
-        assert!(origin
-            .get_pane(139)
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &origin_successor)),);
+        assert!(
+            origin
+                .get_pane(139)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &origin_successor)),
+        );
 
         Mux::shutdown();
     }
@@ -25555,9 +25608,11 @@ mod tests {
             !origin.remove_tab_if_same(&origin_tab, &witness),
             "the old witness must not remove a later registration of the same Arc<Tab>",
         );
-        assert!(origin
-            .get_tab(origin_tab.tab_id())
-            .is_some_and(|tab| Arc::ptr_eq(&tab, &origin_tab)));
+        assert!(
+            origin
+                .get_tab(origin_tab.tab_id())
+                .is_some_and(|tab| Arc::ptr_eq(&tab, &origin_tab))
+        );
         assert_eq!(successor_kills.load(Ordering::SeqCst), 0);
         assert!(origin.remove_tab_if_same(&origin_tab, &successor_witness));
         assert_eq!(successor_kills.load(Ordering::SeqCst), 1);
@@ -25578,21 +25633,27 @@ mod tests {
         let error = foreign
             .add_tab_no_panes(&tab)
             .expect_err("one tab allocation must not bind to two mux authorities");
-        assert!(error
-            .to_string()
-            .contains("already bound to a different mux authority"));
-        assert!(origin
-            .get_tab(tab.tab_id())
-            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
+        assert!(
+            error
+                .to_string()
+                .contains("already bound to a different mux authority")
+        );
+        assert!(
+            origin
+                .get_tab(tab.tab_id())
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &tab))
+        );
         assert!(foreign.get_tab(tab.tab_id()).is_none());
 
         assert!(origin.remove_tab(tab.tab_id()).is_some());
         let error = foreign
             .add_tab_no_panes(&tab)
             .expect_err("retirement must not transfer a tab allocation to another mux");
-        assert!(error
-            .to_string()
-            .contains("already bound to a different mux authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("already bound to a different mux authority")
+        );
         assert_eq!(tab.mux_owner_generation_for_test(), 1);
         assert!(origin.get_tab(tab.tab_id()).is_none());
         assert!(foreign.get_tab(tab.tab_id()).is_none());
@@ -25605,9 +25666,11 @@ mod tests {
         let error = origin
             .add_tab_no_panes(&forged)
             .expect_err("an unowned raw tab-map entry must not be adopted implicitly");
-        assert!(error
-            .to_string()
-            .contains("registered without active mux-owner authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("registered without active mux-owner authority")
+        );
         origin.tabs.write().remove(&forged.tab_id());
 
         let stale_active = Arc::new(Tab::new(&test_size()));
@@ -25618,9 +25681,11 @@ mod tests {
         let error = origin
             .add_tab_no_panes(&stale_active)
             .expect_err("an active generation without its map entry must fail closed");
-        assert!(error
-            .to_string()
-            .contains("already has an active mux-owner generation"));
+        assert!(
+            error
+                .to_string()
+                .contains("already has an active mux-owner generation")
+        );
         assert_eq!(stale_active.mux_owner_generation_for_test(), 1);
     }
 
@@ -26033,12 +26098,14 @@ mod tests {
             mux.remove_tab(tab.tab_id()).is_none(),
             "ordinary retirement must obey the same fail-closed preflight",
         );
-        assert!(mux
-            .get_tab(tab.tab_id())
-            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
-        assert!(mux
-            .get_pane(206)
-            .is_some_and(|registered| Arc::ptr_eq(&registered, &pane)));
+        assert!(
+            mux.get_tab(tab.tab_id())
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &tab))
+        );
+        assert!(
+            mux.get_pane(206)
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &pane))
+        );
         assert!(mux.get_window(window_id).is_some_and(|window| {
             window.order_revision().get() == u64::MAX - 1
                 && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
@@ -26070,9 +26137,10 @@ mod tests {
             !mux.remove_empty_tab_local_only_if_same(&tab),
             "empty-tab cleanup must reject before removing the tab registry entry",
         );
-        assert!(mux
-            .get_tab(tab.tab_id())
-            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
+        assert!(
+            mux.get_tab(tab.tab_id())
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &tab))
+        );
         assert!(mux.get_window(window_id).is_some_and(|window| {
             window.order_revision().get() == u64::MAX - 1
                 && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
@@ -26125,12 +26193,14 @@ mod tests {
             window.order_revision().get() == u64::MAX - 1
                 && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
         }));
-        assert!(mux
-            .get_tab(tab.tab_id())
-            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
-        assert!(mux
-            .get_pane(207)
-            .is_some_and(|registered| Arc::ptr_eq(&registered, &pane)));
+        assert!(
+            mux.get_tab(tab.tab_id())
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &tab))
+        );
+        assert!(
+            mux.get_pane(207)
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &pane))
+        );
         assert_eq!(kills.load(Ordering::SeqCst), 0);
 
         Mux::shutdown();
@@ -26394,9 +26464,11 @@ mod tests {
             .expect("replacement subscription");
 
         Mux::set_mux(&replacement);
-        assert!(origin
-            .set_window_title(window_id, "origin window")
-            .expect("set origin window title"));
+        assert!(
+            origin
+                .set_window_title(window_id, "origin window")
+                .expect("set origin window title")
+        );
         assert!(origin.set_tab_title(tab_id, "origin tab"));
         assert_eq!(origin_notifications.load(Ordering::SeqCst), 2);
         assert_eq!(replacement_notifications.load(Ordering::SeqCst), 0);
@@ -27159,9 +27231,10 @@ mod tests {
         assert!(replacement_rejected.load(Ordering::SeqCst));
         mux.add_pane(&replacement)
             .expect("same ID may register after the removal callback completes");
-        assert!(mux
-            .get_pane(91)
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)));
+        assert!(
+            mux.get_pane(91)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement))
+        );
     }
 
     #[test]
@@ -27347,9 +27420,11 @@ mod tests {
             .expect("old cleanup lease")
             .complete();
 
-        assert!(new_mux
-            .get_pane(193)
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &new_pane)));
+        assert!(
+            new_mux
+                .get_pane(193)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &new_pane))
+        );
     }
 
     #[test]
@@ -27608,9 +27683,10 @@ mod tests {
         let err = mux
             .add_tab_no_panes(&duplicate)
             .expect_err("a different tab instance must not replace the registered tab");
-        assert!(err
-            .to_string()
-            .contains("already registered to a different tab instance"));
+        assert!(
+            err.to_string()
+                .contains("already registered to a different tab instance")
+        );
         let registered = mux
             .get_tab(colliding_id)
             .expect("first tab should remain registered");
@@ -27628,9 +27704,10 @@ mod tests {
         let err = mux
             .add_tab_and_active_pane(&tab)
             .expect_err("reader acquisition failure must reject the tab and pane");
-        assert!(err
-            .to_string()
-            .contains("intentional test pane reader acquisition failure"));
+        assert!(
+            err.to_string()
+                .contains("intentional test pane reader acquisition failure")
+        );
         assert!(mux.get_pane(79).is_none());
         assert!(mux.get_tab(tab_id).is_none());
     }
@@ -28259,9 +28336,10 @@ mod tests {
         );
         mux.pane_count_recomputes.store(0, Ordering::Relaxed);
 
-        assert!(mux
-            .set_window_workspace(window_id, "workspace-b")
-            .expect("move populated window to workspace B"));
+        assert!(
+            mux.set_window_workspace(window_id, "workspace-b")
+                .expect("move populated window to workspace B")
+        );
 
         assert_eq!(
             mux.get_window(window_id)
@@ -28329,10 +28407,12 @@ mod tests {
             .send(())
             .expect("release recount publication before workspace transfer");
         recount.join().expect("exact recount must finish");
-        assert!(setter_result_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("workspace transfer must return")
-            .expect("workspace transfer after recount must commit"));
+        assert!(
+            setter_result_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("workspace transfer must return")
+                .expect("workspace transfer after recount must commit")
+        );
         setter.join().expect("workspace setter thread must finish");
 
         assert_eq!(
@@ -28371,9 +28451,10 @@ mod tests {
         })
         .expect("subscribe to workspace no-op events");
 
-        assert!(!mux
-            .set_window_workspace(window_id, DEFAULT_WORKSPACE)
-            .expect("same workspace is a successful no-op"));
+        assert!(
+            !mux.set_window_workspace(window_id, DEFAULT_WORKSPACE)
+                .expect("same workspace is a successful no-op")
+        );
 
         assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
         assert_eq!(
@@ -28606,15 +28687,19 @@ mod tests {
                     assert!(mux_for_subscriber.tabs.try_write().is_some());
                     assert!(mux_for_subscriber.try_window_exclusive_access(window_id));
                     assert!(mux_for_subscriber.tab_parents.try_write().is_some());
-                    assert!(mux_for_subscriber
-                        .num_panes_by_workspace
-                        .try_write()
-                        .is_some());
+                    assert!(
+                        mux_for_subscriber
+                            .num_panes_by_workspace
+                            .try_write()
+                            .is_some()
+                    );
                     assert!(mux_for_subscriber.topology.try_lock().is_some());
-                    assert!(mux_for_subscriber
-                        .pending_window_notifications
-                        .try_lock()
-                        .is_some());
+                    assert!(
+                        mux_for_subscriber
+                            .pending_window_notifications
+                            .try_lock()
+                            .is_some()
+                    );
                     assert_eq!(
                         mux_for_subscriber
                             .num_panes_by_workspace
@@ -28624,9 +28709,11 @@ mod tests {
                         Some(1)
                     );
                     events_for_subscriber.lock().push("workspace");
-                    assert!(mux_for_subscriber
-                        .set_window_title(window_id, "reentrant-title")
-                        .expect("reentrant title transaction after workspace locks"));
+                    assert!(
+                        mux_for_subscriber
+                            .set_window_title(window_id, "reentrant-title")
+                            .expect("reentrant title transaction after workspace locks")
+                    );
                 }
                 MuxNotification::WindowTitleChanged {
                     window_id: id,
@@ -28640,9 +28727,10 @@ mod tests {
         })
         .expect("subscribe to exact workspace transaction");
 
-        assert!(mux
-            .set_window_workspace(window_id, "workspace-b")
-            .expect("workspace callback transaction"));
+        assert!(
+            mux.set_window_workspace(window_id, "workspace-b")
+                .expect("workspace callback transaction")
+        );
 
         assert_eq!(events.lock().as_slice(), &["workspace", "title"]);
         assert_eq!(
@@ -29042,9 +29130,10 @@ mod tests {
         let err = try_reserve_usize_ids(&counter, 2, "test").unwrap_err();
         assert_eq!(err.namespace(), "test");
         assert_eq!(err.requested(), 2);
-        assert!(err
-            .to_string()
-            .contains("insufficient remaining capacity for a reservation of 2"));
+        assert!(
+            err.to_string()
+                .contains("insufficient remaining capacity for a reservation of 2")
+        );
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX - 1);
         assert_eq!(
             try_reserve_usize_ids(&counter, 1, "test").unwrap(),
@@ -29412,8 +29501,12 @@ mod tests {
             .expect("the exact successor generation must admit new work");
         assert!(!stale_guard.same_registration(&replacement_guard));
 
-        assert!(mux
-            .set_active_workspace_for_client_guarded(&replacement_guard, "replacement-workspace",));
+        assert!(
+            mux.set_active_workspace_for_client_guarded(
+                &replacement_guard,
+                "replacement-workspace",
+            )
+        );
         let replacement_before = mux
             .clients
             .read()
@@ -29654,9 +29747,11 @@ mod tests {
             .expect("current replacement remains registered");
         assert!(replacement_after_current.last_input > replacement_before.last_input);
         assert_eq!(replacement_after_current.focused_pane_id, Some(777),);
-        assert!(replacement_after_current
-            .focused_pane_registration()
-            .is_some(),);
+        assert!(
+            replacement_after_current
+                .focused_pane_registration()
+                .is_some(),
+        );
         assert_eq!(
             replacement_after_current.active_workspace.as_deref(),
             Some("replacement-workspace"),
@@ -30020,11 +30115,13 @@ mod tests {
             &[7],
             "mux replacement must not redirect an already-scheduled output drain",
         );
-        assert!(originating_mux
-            .pending_pane_output
-            .lock()
-            .notifications
-            .is_empty());
+        assert!(
+            originating_mux
+                .pending_pane_output
+                .lock()
+                .notifications
+                .is_empty()
+        );
         assert!(
             !originating_mux
                 .pane_output_drain_scheduled
@@ -30454,11 +30551,12 @@ mod tests {
         assert!(guard.is_same_domain(&domain));
         assert!(guard.same_registration(&peer));
         assert!(Arc::ptr_eq(guard.registration(), &registration));
-        assert!(mux
-            .default_domain_registration
-            .read()
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+        assert!(
+            mux.default_domain_registration
+                .read()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &registration))
+        );
         assert_eq!(registration.generation.active_operations(), 2);
         drop(peer);
         assert_eq!(registration.generation.active_operations(), 1);
@@ -30528,31 +30626,36 @@ mod tests {
         );
         mux.fail_next_domain_registration_operation_acquire
             .store(false, Ordering::Release);
-        assert!(mux
-            .domains
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
-        assert!(mux
-            .domains_by_name
-            .read()
-            .get(&domain_name)
-            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
-        assert!(mux
-            .domain_registrations
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &foreign_registration)));
-        assert!(mux
-            .domain_registrations_by_name
-            .read()
-            .get(&domain_name)
-            .is_some_and(|current| Arc::ptr_eq(current, &foreign_registration)));
-        assert!(mux
-            .default_domain_registration
-            .read()
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &correct_registration)));
+        assert!(
+            mux.domains
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &domain))
+        );
+        assert!(
+            mux.domains_by_name
+                .read()
+                .get(&domain_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &domain))
+        );
+        assert!(
+            mux.domain_registrations
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &foreign_registration))
+        );
+        assert!(
+            mux.domain_registrations_by_name
+                .read()
+                .get(&domain_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &foreign_registration))
+        );
+        assert!(
+            mux.default_domain_registration
+                .read()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &correct_registration))
+        );
     }
 
     #[test]
@@ -30622,31 +30725,36 @@ mod tests {
         );
         mux.fail_next_domain_registration_operation_acquire
             .store(false, Ordering::Release);
-        assert!(mux
-            .domains
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
-        assert!(mux
-            .domains_by_name
-            .read()
-            .get(&domain_name)
-            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
-        assert!(mux
-            .domain_registrations
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &fresh_registration)));
-        assert!(mux
-            .domain_registrations_by_name
-            .read()
-            .get(&domain_name)
-            .is_some_and(|current| Arc::ptr_eq(current, &fresh_registration)));
-        assert!(mux
-            .default_domain_registration
-            .read()
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &stale_default_registration)));
+        assert!(
+            mux.domains
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &domain))
+        );
+        assert!(
+            mux.domains_by_name
+                .read()
+                .get(&domain_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &domain))
+        );
+        assert!(
+            mux.domain_registrations
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &fresh_registration))
+        );
+        assert!(
+            mux.domain_registrations_by_name
+                .read()
+                .get(&domain_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &fresh_registration))
+        );
+        assert!(
+            mux.default_domain_registration
+                .read()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &stale_default_registration))
+        );
         drop(fresh_registration);
         drop(stale_default_registration);
         drop(domain);
@@ -30704,26 +30812,30 @@ mod tests {
         );
         mux.fail_next_domain_registration_operation_acquire
             .store(false, Ordering::Release);
-        assert!(mux
-            .domains
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
-        assert!(mux
-            .domains_by_name
-            .read()
-            .get(&domain_name)
-            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
-        assert!(mux
-            .domain_registrations
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &registration)));
-        assert!(mux
-            .domain_registrations_by_name
-            .read()
-            .get(&domain_name)
-            .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+        assert!(
+            mux.domains
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &domain))
+        );
+        assert!(
+            mux.domains_by_name
+                .read()
+                .get(&domain_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &domain))
+        );
+        assert!(
+            mux.domain_registrations
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &registration))
+        );
+        assert!(
+            mux.domain_registrations_by_name
+                .read()
+                .get(&domain_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &registration))
+        );
         assert!(mux.default_domain_registration.read().is_none());
         drop(registration);
         drop(domain);
@@ -30797,33 +30909,38 @@ mod tests {
         );
         mux.fail_next_domain_registration_operation_acquire
             .store(false, Ordering::Release);
-        assert!(mux
-            .domains
-            .read()
-            .get(&2)
-            .is_some_and(|current| Arc::ptr_eq(current, &live)));
-        assert!(mux
-            .domains_by_name
-            .read()
-            .get(&live_name)
-            .is_some_and(|current| Arc::ptr_eq(current, &live)));
-        assert!(mux
-            .domain_registrations
-            .read()
-            .get(&2)
-            .is_some_and(|current| Arc::ptr_eq(current, &live_registration)));
-        assert!(mux
-            .domain_registrations_by_name
-            .read()
-            .get(&live_name)
-            .is_some_and(|current| Arc::ptr_eq(current, &live_registration)));
+        assert!(
+            mux.domains
+                .read()
+                .get(&2)
+                .is_some_and(|current| Arc::ptr_eq(current, &live))
+        );
+        assert!(
+            mux.domains_by_name
+                .read()
+                .get(&live_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &live))
+        );
+        assert!(
+            mux.domain_registrations
+                .read()
+                .get(&2)
+                .is_some_and(|current| Arc::ptr_eq(current, &live_registration))
+        );
+        assert!(
+            mux.domain_registrations_by_name
+                .read()
+                .get(&live_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &live_registration))
+        );
         assert!(!mux.domains.read().contains_key(&1));
         assert!(!mux.domains_by_name.read().contains_key(&requested_name));
         assert!(!mux.domain_registrations.read().contains_key(&1));
-        assert!(!mux
-            .domain_registrations_by_name
-            .read()
-            .contains_key(&requested_name));
+        assert!(
+            !mux.domain_registrations_by_name
+                .read()
+                .contains_key(&requested_name)
+        );
         assert!(mux.default_domain_registration.read().is_none());
         drop(requested);
         assert_eq!(requested_drop_count.load(Ordering::SeqCst), 1);
@@ -30892,9 +31009,11 @@ mod tests {
             .expect("atomic add must return its pre-retirement authority");
         assert!(guard.is_same_domain(&domain));
         assert!(Arc::ptr_eq(guard.registration(), &registration));
-        assert!(retirement
-            .join()
-            .expect("racing retirement thread must not panic"));
+        assert!(
+            retirement
+                .join()
+                .expect("racing retirement thread must not panic")
+        );
         assert!(matches!(
             successor_add
                 .join()
@@ -30932,11 +31051,12 @@ mod tests {
         assert!(mux.default_domain_registration.read().is_none());
         assert!(mux.retired_domain_ids.lock().is_empty());
         assert_eq!(mux.domain_retirements.len(), 0);
-        assert!(mux
-            .pending_domain_retirements
-            .lock()
-            .registrations
-            .is_empty());
+        assert!(
+            mux.pending_domain_retirements
+                .lock()
+                .registrations
+                .is_empty()
+        );
         assert!(mux.pane_authority.lock().registrations_by_domain.is_empty());
 
         let guard = mux
@@ -31051,16 +31171,18 @@ mod tests {
                     "logical retirement must close every selector immediately"
                 );
             }
-            assert!(mux
-                .domains
-                .read()
-                .get(&1)
-                .is_some_and(|current| { Arc::ptr_eq(current, &domain) }));
-            assert!(mux
-                .domain_registrations
-                .read()
-                .get(&1)
-                .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+            assert!(
+                mux.domains
+                    .read()
+                    .get(&1)
+                    .is_some_and(|current| { Arc::ptr_eq(current, &domain) })
+            );
+            assert!(
+                mux.domain_registrations
+                    .read()
+                    .get(&1)
+                    .is_some_and(|current| Arc::ptr_eq(current, &registration))
+            );
             if let Some(kills) = source_kills.as_ref() {
                 assert_eq!(
                     kills.load(Ordering::SeqCst),
@@ -31083,9 +31205,10 @@ mod tests {
             assert!(!mux.domain_registrations.read().contains_key(&1));
             mux.add_domain(&successor)
                 .expect("same ID may be reused after exact cleanup quiesces");
-            assert!(mux
-                .get_domain(1)
-                .is_some_and(|current| current.is_same_domain(&successor)));
+            assert!(
+                mux.get_domain(1)
+                    .is_some_and(|current| current.is_same_domain(&successor))
+            );
         }
     }
 
@@ -31111,19 +31234,21 @@ mod tests {
         assert!(pending.registrations.is_empty());
         assert!(!pending.worker_running);
         drop(pending);
-        assert!(mux
-            .get_domain(1)
-            .is_some_and(|current| current.is_same_domain(&domain)));
+        assert!(
+            mux.get_domain(1)
+                .is_some_and(|current| current.is_same_domain(&domain))
+        );
         assert!(
             mux.default_domain()
                 .is_ok_and(|current| current.is_same_domain(&domain)),
             "worker-start failure must leave the default admission projection unchanged"
         );
-        assert!(mux
-            .domain_registrations
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+        assert!(
+            mux.domain_registrations
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &registration))
+        );
     }
 
     #[test]
@@ -31416,22 +31541,25 @@ mod tests {
         wait_for_domain_retirement_quarantine(&mux, 1);
 
         assert_eq!(kills.load(Ordering::SeqCst), 0);
-        assert!(mux
-            .get_pane(268)
-            .is_some_and(|current| Arc::ptr_eq(&current, &pane)));
+        assert!(
+            mux.get_pane(268)
+                .is_some_and(|current| Arc::ptr_eq(&current, &pane))
+        );
         assert!(mux.domain_retirements.contains(1));
         assert!(mux.retired_domain_ids.lock().contains(&1));
         assert!(mux.get_domain(1).is_none());
-        assert!(mux
-            .domains
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
-        assert!(mux
-            .domain_registrations
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &exact_registration)));
+        assert!(
+            mux.domains
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &domain))
+        );
+        assert!(
+            mux.domain_registrations
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &exact_registration))
+        );
         let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
@@ -31483,25 +31611,29 @@ mod tests {
 
         assert_eq!(first_kills.load(Ordering::SeqCst), 0);
         assert_eq!(second_kills.load(Ordering::SeqCst), 0);
-        assert!(mux
-            .get_pane(269)
-            .is_some_and(|current| Arc::ptr_eq(&current, &first)));
-        assert!(mux
-            .get_pane(270)
-            .is_some_and(|current| Arc::ptr_eq(&current, &second)));
+        assert!(
+            mux.get_pane(269)
+                .is_some_and(|current| Arc::ptr_eq(&current, &first))
+        );
+        assert!(
+            mux.get_pane(270)
+                .is_some_and(|current| Arc::ptr_eq(&current, &second))
+        );
         assert!(mux.domain_retirements.contains(1));
         assert!(mux.retired_domain_ids.lock().contains(&1));
         assert!(mux.get_domain(1).is_none());
-        assert!(mux
-            .domains
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
-        assert!(mux
-            .domain_registrations
-            .read()
-            .get(&1)
-            .is_some_and(|current| Arc::ptr_eq(current, &exact_registration)));
+        assert!(
+            mux.domains
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &domain))
+        );
+        assert!(
+            mux.domain_registrations
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &exact_registration))
+        );
         let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
@@ -31679,9 +31811,10 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(spawned_kills.load(Ordering::SeqCst), 0);
         assert_eq!(target_kills.load(Ordering::SeqCst), 0);
-        assert!(mux
-            .get_tab(tab.tab_id())
-            .is_some_and(|current| Arc::ptr_eq(&current, &tab)));
+        assert!(
+            mux.get_tab(tab.tab_id())
+                .is_some_and(|current| Arc::ptr_eq(&current, &tab))
+        );
         assert_eq!(tab.iter_all_panes().len(), 1);
 
         drop(retirement_barrier);
@@ -31867,9 +32000,10 @@ mod tests {
                 .get_workspace(),
             DEFAULT_WORKSPACE
         );
-        assert!(mux
-            .set_window_workspace(window_id, "workspace-without-global-mux")
-            .expect("set exact mux window workspace"));
+        assert!(
+            mux.set_window_workspace(window_id, "workspace-without-global-mux")
+                .expect("set exact mux window workspace")
+        );
         assert_eq!(
             mux.get_window(window_id)
                 .expect("workspace-mutated window remains registered")
@@ -32394,9 +32528,11 @@ mod tests {
                     Arc::as_ptr(&first),
                 ],
             );
-            assert!(window
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+            assert!(
+                window
+                    .get_active()
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+            );
         }
 
         mux.move_tab_between_windows(active_id, window_id, Some(2))
@@ -32416,9 +32552,11 @@ mod tests {
                 ],
             );
             assert_eq!(window.get_active_idx(), 0);
-            assert!(window
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+            assert!(
+                window
+                    .get_active()
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+            );
             for tab in [&first, &active, &third] {
                 assert_eq!(
                     window.tab_stack_for_tab(tab.tab_id()),
@@ -32649,9 +32787,11 @@ mod tests {
                 Arc::as_ptr(&active),
             ]
         );
-        assert!(live_applied
-            .active_tab()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            live_applied
+                .active_tab()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
         assert_eq!(
             mux.get_window(window_id)
                 .expect("reordered window")
@@ -33085,9 +33225,11 @@ mod tests {
         }
         assert_eq!(ledger.receipts.len(), MAX_WINDOW_ORDER_RECEIPTS);
         assert_eq!(ledger.insertion_order.len(), MAX_WINDOW_ORDER_RECEIPTS);
-        assert!(!ledger
-            .receipts
-            .contains_key(&WindowOrderMutationId::new([0x81; 16], 1)));
+        assert!(
+            !ledger
+                .receipts
+                .contains_key(&WindowOrderMutationId::new([0x81; 16], 1))
+        );
         assert!(ledger.receipts.contains_key(&WindowOrderMutationId::new(
             [0x81; 16],
             MAX_WINDOW_ORDER_RECEIPTS as u64 + 1,
@@ -33157,12 +33299,16 @@ mod tests {
         {
             let source = mux.get_window(source_id).expect("source window");
             let destination = mux.get_window(destination_id).expect("destination window");
-            assert!(source
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &source_active)));
-            assert!(destination
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &destination_active)));
+            assert!(
+                source
+                    .get_active()
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &source_active))
+            );
+            assert!(
+                destination
+                    .get_active()
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &destination_active))
+            );
             assert_eq!(
                 destination.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
                 vec![
@@ -33178,12 +33324,16 @@ mod tests {
         {
             let source = mux.get_window(source_id).expect("source window");
             let empty = mux.get_window(empty_id).expect("empty destination");
-            assert!(source
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &source_right)));
-            assert!(empty
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &source_active)));
+            assert!(
+                source
+                    .get_active()
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &source_right))
+            );
+            assert!(
+                empty
+                    .get_active()
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &source_active))
+            );
         }
 
         mux.move_tab_between_windows(source_last_active.tab_id(), destination_id, None)
@@ -33193,12 +33343,16 @@ mod tests {
                 .get_window(left_fallback_id)
                 .expect("left-fallback source window");
             let destination = mux.get_window(destination_id).expect("destination window");
-            assert!(source
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &source_left)));
-            assert!(destination
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &destination_active)));
+            assert!(
+                source
+                    .get_active()
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &source_left))
+            );
+            assert!(
+                destination
+                    .get_active()
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &destination_active))
+            );
         }
 
         drop(left_fallback_builder);
@@ -33261,12 +33415,16 @@ mod tests {
             destination.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
             destination_before,
         );
-        assert!(source
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab)));
-        assert!(destination
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab)));
+        assert!(
+            source
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab))
+        );
+        assert!(
+            destination
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab))
+        );
 
         drop(destination);
         drop(source);
@@ -33335,13 +33493,17 @@ mod tests {
             .get_window(destination_id)
             .expect("destination window survives");
         assert_eq!(source.len(), 1);
-        assert!(source
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab)));
+        assert!(
+            source
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab))
+        );
         assert_eq!(destination.len(), 1);
-        assert!(destination
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab)));
+        assert!(
+            destination
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab))
+        );
         assert_eq!(destination.order_revision().get(), u64::MAX - 1);
         assert_eq!(source.order_revision(), source_revision_before);
         assert_eq!(
@@ -33411,12 +33573,16 @@ mod tests {
         assert_eq!(destination.order_revision(), destination_revision_before);
         assert_eq!(source.len(), 1);
         assert_eq!(destination.len(), 1);
-        assert!(source
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab)));
-        assert!(destination
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab)));
+        assert!(
+            source
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab))
+        );
+        assert!(
+            destination
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab))
+        );
         assert_eq!(
             events.load(Ordering::SeqCst),
             0,
@@ -33772,9 +33938,10 @@ mod tests {
                 before.ordered_tab_ids().collect::<Vec<_>>(),
             );
         }
-        assert!(mux
-            .get_tab(source_tab.tab_id())
-            .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
+        assert!(
+            mux.get_tab(source_tab.tab_id())
+                .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab))
+        );
         assert!(mux.window_containing_tab(unattached_tab.tab_id()).is_none());
         mux.assert_tab_parent_index_matches_windows();
         assert_eq!(mux.topology.lock().revision, TopologyRevision(u64::MAX - 1));
@@ -33905,11 +34072,12 @@ mod tests {
                 before.ordered_tab_ids().collect::<Vec<_>>(),
             );
         }
-        assert!(mux
-            .tab_parents
-            .write()
-            .insert(tab.tab_id(), TabParentRegistration::new(&tab, source_id),)
-            .is_none());
+        assert!(
+            mux.tab_parents
+                .write()
+                .insert(tab.tab_id(), TabParentRegistration::new(&tab, source_id),)
+                .is_none()
+        );
         mux.assert_tab_parent_index_matches_windows();
 
         drop(destination);
@@ -33946,9 +34114,11 @@ mod tests {
                     window.push(&tab).expect("seed exact window membership");
                     assert!(tabs.insert(tab_id, Arc::clone(&tab)).is_none());
                     assert!(windows.insert(window_id, window).is_none());
-                    assert!(parents
-                        .insert(tab_id, TabParentRegistration::new(&tab, window_id))
-                        .is_none());
+                    assert!(
+                        parents
+                            .insert(tab_id, TabParentRegistration::new(&tab, window_id))
+                            .is_none()
+                    );
                     expected.push((tab_id, window_id));
                 }
             }
@@ -34008,9 +34178,11 @@ mod tests {
                 window.push(&tab).expect("seed unrelated exact membership");
                 assert!(tabs.insert(tab_id, Arc::clone(&tab)).is_none());
                 assert!(windows.insert(window_id, window).is_none());
-                assert!(parents
-                    .insert(tab_id, TabParentRegistration::new(&tab, window_id))
-                    .is_none());
+                assert!(
+                    parents
+                        .insert(tab_id, TabParentRegistration::new(&tab, window_id))
+                        .is_none()
+                );
             }
         }
         mux.assert_tab_parent_index_matches_windows();
@@ -34142,15 +34314,19 @@ mod tests {
                     .expect("reserve scale parent index");
                 for window in &seeded_windows {
                     for tab in window.iter() {
-                        assert!(registered_tabs
-                            .insert(tab.tab_id(), Arc::clone(tab))
-                            .is_none());
-                        assert!(parents
-                            .insert(
-                                tab.tab_id(),
-                                TabParentRegistration::new(tab, window.window_id()),
-                            )
-                            .is_none());
+                        assert!(
+                            registered_tabs
+                                .insert(tab.tab_id(), Arc::clone(tab))
+                                .is_none()
+                        );
+                        assert!(
+                            parents
+                                .insert(
+                                    tab.tab_id(),
+                                    TabParentRegistration::new(tab, window.window_id()),
+                                )
+                                .is_none()
+                        );
                     }
                 }
                 for window in seeded_windows {
@@ -34164,9 +34340,10 @@ mod tests {
                 .and_then(|window| window.get_by_idx(0).map(|tab| tab.tab_id()))
                 .expect("target window retains its first tab");
             let writes_before = mux.tab_parent_write_cuts.load(Ordering::Relaxed);
-            assert!(mux
-                .activate_tab_at_index(target_window_id, target_tab_count - 1, false)
-                .expect("large membership-preserving activation must commit"));
+            assert!(
+                mux.activate_tab_at_index(target_window_id, target_tab_count - 1, false)
+                    .expect("large membership-preserving activation must commit")
+            );
             mux.move_tab_between_windows(
                 reorder_tab_id,
                 target_window_id,

@@ -860,10 +860,8 @@ impl TxExecutionLedger {
                         actual_failed.push(step_id);
                     }
                 }
-                StepOutcome::Compensated { .. } => {
-                    if !actual_compensated.contains(&step_id) {
-                        actual_compensated.push(step_id);
-                    }
+                StepOutcome::Compensated { .. } if !actual_compensated.contains(&step_id) => {
+                    actual_compensated.push(step_id);
                 }
                 _ => {}
             }
@@ -963,10 +961,8 @@ impl TxExecutionLedger {
                         actual_failed.push(step_id);
                     }
                 }
-                StepOutcome::Compensated { .. } => {
-                    if !actual_compensated.contains(&step_id) {
-                        actual_compensated.push(step_id);
-                    }
+                StepOutcome::Compensated { .. } if !actual_compensated.contains(&step_id) => {
+                    actual_compensated.push(step_id);
                 }
                 _ => {}
             }

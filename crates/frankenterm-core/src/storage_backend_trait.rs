@@ -2056,15 +2056,15 @@ impl StorageBackend for RusqliteBackend {
                 return Err(error);
             }
         };
-        let mut tx_handle = RusqliteTransactionHandle {
-            conn: &mut guard,
-            boundary_lost: false,
+        let (callback_result, handle_boundary_lost) = {
+            let mut tx_handle = RusqliteTransactionHandle {
+                conn: &mut guard,
+                boundary_lost: false,
+            };
+            let callback_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx_handle)));
+            (callback_result, tx_handle.boundary_lost())
         };
-        let callback_result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx_handle)));
-
-        let handle_boundary_lost = tx_handle.boundary_lost();
-        drop(tx_handle);
         drop(callback_phase);
         // Keep the inverse transition honest too: future code may add cached
         // callback statements whose prepare-time denial should not survive

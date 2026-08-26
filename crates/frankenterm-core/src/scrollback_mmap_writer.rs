@@ -1338,7 +1338,7 @@ fn v2_slot_candidates(header_bytes: &[u8; HEADER_SIZE]) -> (Vec<(V2RingState, us
             V2SlotObservation::Invalid => saw_invalid = true,
         }
     }
-    candidates.sort_by(|left, right| right.0.slot_epoch.cmp(&left.0.slot_epoch));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0.slot_epoch));
     (candidates, saw_invalid)
 }
 

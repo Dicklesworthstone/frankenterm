@@ -4053,7 +4053,7 @@ mod tests {
             .expect("construct checkpoint fixture segment identity");
         let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32])
             .expect("construct checkpoint fixture cipher");
-        let mut journal = GuardianOutputJournal::open(
+        let mut journal = GuardianOutputJournal::create_new(
             file,
             segment,
             cipher,

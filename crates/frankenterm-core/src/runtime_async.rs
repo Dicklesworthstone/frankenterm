@@ -4689,7 +4689,7 @@ pub mod process {
         }
 
         async fn output_with_cx_deadline(
-            &mut self,
+            &self,
             cx: &crate::cx::Cx,
             deadline: Option<OutputCommandDeadline>,
         ) -> std::io::Result<Output> {
