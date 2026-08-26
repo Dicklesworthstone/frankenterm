@@ -12763,6 +12763,17 @@ mod tests {
                 inventory_checkpoint_scrollback_artifacts(directory.path(), limits).unwrap();
             assert_eq!(inventory.len(), 1);
             assert_eq!(inventory[0].artifact_sha256, first.artifact_sha256);
+
+            let alias_directory = tempfile::TempDir::new().unwrap();
+            let alias_path = alias_directory.path().join(format!(
+                "alias{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}"
+            ));
+            write_private_checkpoint_artifact_test_file(&alias_path, &first_bytes);
+            assert!(matches!(
+                inventory_checkpoint_scrollback_artifacts(alias_directory.path(), limits),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(ref message))
+                    if message.contains("canonical checkpoint leaf")
+            ));
         });
     }
 
@@ -13230,7 +13241,69 @@ mod tests {
                 publish_checkpoint_artifact_bytes(&path, &bytes),
                 Err(CheckpointScrollbackArtifactError::AlreadyExists)
             ));
+
+            let streaming_directory = tempfile::TempDir::new().unwrap();
+            let streaming_leaf = format!("streaming{CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX}");
+            let streaming_path = streaming_directory.path().join(&streaming_leaf);
+            publish_checkpoint_artifact_bytes(&streaming_path, &bytes).unwrap();
+            let streaming_parent =
+                open_checkpoint_artifact_directory_nofollow(streaming_directory.path()).unwrap();
+            let streaming_modified = std::fs::metadata(&streaming_path)
+                .unwrap()
+                .modified()
+                .unwrap();
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let mut streaming_file = streaming_parent
+                .open_with(Path::new(&streaming_leaf), &options)
+                .unwrap();
+            let comparison_error = checkpoint_artifact_open_file_matches_expected_with_hook(
+                &streaming_parent,
+                Path::new(&streaming_leaf),
+                &mut streaming_file,
+                &bytes,
+                false,
+                || {
+                    std::thread::sleep(Duration::from_millis(5));
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&streaming_path)
+                        .unwrap();
+                    file.seek(SeekFrom::Start(0)).unwrap();
+                    file.write_all(&changed_bytes).unwrap();
+                    file.sync_all().unwrap();
+                    file.set_times(
+                        std::fs::FileTimes::new().set_modified(streaming_modified),
+                    )
+                    .unwrap();
+                },
+            )
+            .expect_err("streamed comparisons must bind ctime as well as size and mtime");
+            assert!(matches!(
+                comparison_error,
+                CheckpointScrollbackArtifactError::InvalidArtifact(ref message)
+                    if message.contains("changed while it was compared")
+            ));
         });
+    }
+
+    #[test]
+    fn checkpoint_scrollback_unsupported_noreplace_is_side_effect_free() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let staging = directory.path().join("staging");
+        let target = directory.path().join("target");
+        write_private_checkpoint_artifact_test_file(&staging, b"staging-bytes");
+        write_private_checkpoint_artifact_test_file(&target, b"target-bytes");
+
+        let error = checkpoint_artifact_noreplace_unsupported()
+            .expect_err("an unproven no-replace primitive must fail closed");
+        assert!(matches!(
+            error,
+            CheckpointScrollbackArtifactError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::Unsupported
+        ));
+        assert_eq!(std::fs::read(staging).unwrap(), b"staging-bytes");
+        assert_eq!(std::fs::read(target).unwrap(), b"target-bytes");
     }
 
     #[test]
@@ -13285,6 +13358,22 @@ mod tests {
             assert!(matches!(
                 validate_checkpoint_scrollback_payload(&gap_mutation.payload, limits),
                 Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            ));
+
+            let mut duplicate_capture_gap = artifact.clone();
+            let duplicate = CheckpointScrollbackCaptureGap {
+                seq_before: 0,
+                seq_after: 1,
+                reason: "same canonical capture gap".to_string(),
+                detected_at: 1,
+            };
+            duplicate_capture_gap.payload.scrollback[0]
+                .capture_gaps
+                .extend([duplicate.clone(), duplicate]);
+            assert!(matches!(
+                validate_checkpoint_scrollback_payload(&duplicate_capture_gap.payload, limits),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(ref message))
+                    if message.contains("out of order")
             ));
 
             let mut completeness_mutation = artifact.clone();
@@ -13401,38 +13490,42 @@ mod tests {
         ));
 
         let limits = CheckpointScrollbackArtifactLimits::default();
+        let make_entry = |created_at_epoch_ms: u64,
+                          checkpoint_id: i64,
+                          witness_digit: char,
+                          artifact_digit: char,
+                          artifact_bytes: u64| {
+            let checkpoint_state_hash =
+                format!("{SNAPSHOT_WITNESS_PREFIX}{}", witness_digit.to_string().repeat(64));
+            let file_name = checkpoint_scrollback_artifact_file_name(
+                created_at_epoch_ms,
+                checkpoint_id,
+                &checkpoint_state_hash,
+            )
+            .unwrap();
+            CheckpointScrollbackInventoryEntry {
+                file_name: PathBuf::from(file_name),
+                created_at_epoch_ms,
+                checkpoint_id,
+                checkpoint_state_hash,
+                artifact_bytes,
+                artifact_sha256: artifact_digit.to_string().repeat(64),
+            }
+        };
         let entries = vec![
-            CheckpointScrollbackInventoryEntry {
-                file_name: PathBuf::from("newest"),
-                created_at_epoch_ms: 30,
-                checkpoint_id: 3,
-                artifact_bytes: 10,
-                artifact_sha256: "c".repeat(64),
-            },
-            CheckpointScrollbackInventoryEntry {
-                file_name: PathBuf::from("middle"),
-                created_at_epoch_ms: 20,
-                checkpoint_id: 2,
-                artifact_bytes: 10,
-                artifact_sha256: "b".repeat(64),
-            },
-            CheckpointScrollbackInventoryEntry {
-                file_name: PathBuf::from("oldest"),
-                created_at_epoch_ms: 10,
-                checkpoint_id: 1,
-                artifact_bytes: 1,
-                artifact_sha256: "a".repeat(64),
-            },
+            make_entry(30, 3, 'c', 'c', 10),
+            make_entry(20, 2, 'b', 'b', 10),
+            make_entry(10, 1, 'a', 'a', 1),
         ];
+        let newest = entries[0].file_name.clone();
+        let middle = entries[1].file_name.clone();
+        let oldest = entries[2].file_name.clone();
         let plan = plan_checkpoint_scrollback_artifact_retention(&entries, 3, 15, limits).unwrap();
-        assert_eq!(plan.retain, vec![PathBuf::from("newest")]);
-        assert_eq!(
-            plan.retire,
-            vec![PathBuf::from("middle"), PathBuf::from("oldest")]
-        );
+        assert_eq!(plan.retain, vec![newest]);
+        assert_eq!(plan.retire, vec![middle, oldest]);
         assert_eq!(plan.retained_bytes, 10);
 
-        let mut duplicates = entries;
+        let mut duplicates = entries.clone();
         duplicates[2].file_name = duplicates[0].file_name.clone();
         assert!(matches!(
             plan_checkpoint_scrollback_artifact_retention(&duplicates, 3, 100, limits),
@@ -13441,6 +13534,40 @@ mod tests {
         assert!(matches!(
             plan_checkpoint_scrollback_artifact_retention(&duplicates, 3, 100, one_entry_limits),
             Err(CheckpointScrollbackArtifactError::ResourceLimit(_))
+        ));
+
+        let mut alias = entries.clone();
+        alias[1].file_name = PathBuf::from(format!(
+            "alias{}",
+            CHECKPOINT_SCROLLBACK_ARTIFACT_SUFFIX
+        ));
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(&alias, 3, 100, limits),
+            Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+        ));
+
+        let mut duplicate_artifact = entries.clone();
+        duplicate_artifact[2].artifact_sha256 = duplicate_artifact[0].artifact_sha256.clone();
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(
+                &duplicate_artifact,
+                3,
+                100,
+                limits,
+            ),
+            Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+        ));
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(&entries, 0, 100, limits),
+            Err(CheckpointScrollbackArtifactError::InvalidLimits(_))
+        ));
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(&entries, 3, 0, limits),
+            Err(CheckpointScrollbackArtifactError::InvalidLimits(_))
+        ));
+        assert!(matches!(
+            plan_checkpoint_scrollback_artifact_retention(&entries, 3, 9, limits),
+            Err(CheckpointScrollbackArtifactError::InvalidLimits(_))
         ));
     }
 
