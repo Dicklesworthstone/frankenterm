@@ -7,7 +7,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage, VecStorageIter};
-use crate::{Change, SequenceNo, SEQ_ZERO};
+use crate::{Change, SEQ_ZERO, SequenceNo};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};
@@ -31,7 +31,13 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-const MAX_MATERIALIZED_LINE_LEN: usize = u32::MAX as usize;
+// A physical terminal row cannot exceed the u16 column contract used by
+// portable_pty::PtySize and the guardian/mux wire protocols.  Keeping the
+// materialization fence at u32::MAX made an otherwise valid range starting at
+// zero capable of allocating or iterating billions of cells before it was
+// rejected.  Bound every direct Line mutation to the same representable
+// physical-row width used at the PTY boundary.
+const MAX_MATERIALIZED_LINE_LEN: usize = u16::MAX as usize;
 
 fn normalize_cell_width(width: usize) -> usize {
     width.clamp(1, 2)
@@ -1335,12 +1341,20 @@ impl Line {
         if idx > 0 {
             let prior = idx - 1;
             let cells = self.coerce_vec_storage();
+            if prior >= cells.len() {
+                // Callers may materialize the target range only after this
+                // look-back.  A write beyond the current logical end has no
+                // preceding stored grapheme to invalidate.
+                return;
+            }
             let width = cells[prior].width();
             if width > 1 {
                 let attrs = cells[prior].attrs().clone();
-                for nerf in prior..prior + width {
-                    cells[nerf] = Cell::blank_with_attrs(attrs.clone());
-                }
+                // A resize can truncate the placeholder column(s) owned by a
+                // wide grapheme while retaining its head.  Invalidate only
+                // the materialized portion rather than indexing past storage.
+                let end = prior.saturating_add(width).min(cells.len());
+                cells[prior..end].fill(Cell::blank_with_attrs(attrs));
             }
         }
     }
@@ -1492,6 +1506,22 @@ impl Line {
         let is_default_blank = *cell == Cell::blank();
         let current_len = self.len();
         if is_default_blank && (current_len == 0 || cols.start >= current_len) {
+            // `resize` can truncate the placeholder column owned by a wide
+            // grapheme while retaining its head as the final stored cell.
+            // Filling that implicit placeholder with a default blank is not a
+            // no-op: it erases the wide grapheme that overlaps the target.
+            if cols.start == current_len
+                && current_len > 0
+                && self
+                    .get_cell(current_len - 1)
+                    .is_some_and(|cell| normalize_cell_width(cell.width()) > 1)
+            {
+                self.invalidate_implicit_hyperlinks(seqno);
+                self.invalidate_grapheme_at_or_before(cols.start);
+                self.update_last_change_seqno(seqno);
+                self.invalidate_zones();
+                self.prune_trailing_blanks(seqno);
+            }
             // We would be filling it with blanks only to prune
             // them all away again before we return; NOP
             return;
@@ -3887,16 +3917,22 @@ mod tests {
     #[test]
     fn line_fill_range_wide_cell_returns_promptly_at_or_beyond_materialized_cap() {
         let wide = Cell::new_grapheme_with_width("\u{4e2d}", 2, CellAttributes::default());
+        let narrow = Cell::new('X', CellAttributes::default());
         let mut line = Line::with_width(4, SEQ_ZERO);
         let before = line.clone();
 
+        // A range that begins at zero but exceeds the physical-row contract
+        // must fail before allocating or iterating its pointer-width tail.
+        line.fill_range(0..usize::MAX, &narrow, 1);
+        assert_eq!(line, before);
+
         // The last possible single-column start cannot fit a two-column cell;
         // it must be rejected before iteration or trailing-blank pruning.
-        line.fill_range(MAX_MATERIALIZED_LINE_LEN - 1..usize::MAX, &wide, 1);
+        line.fill_range(MAX_MATERIALIZED_LINE_LEN - 1..usize::MAX, &wide, 2);
         assert_eq!(line, before);
 
         // Starts at the exclusive line-length cap must not iterate at all.
-        line.fill_range(MAX_MATERIALIZED_LINE_LEN..usize::MAX, &wide, 2);
+        line.fill_range(MAX_MATERIALIZED_LINE_LEN..usize::MAX, &wide, 3);
         assert_eq!(line, before);
     }
 

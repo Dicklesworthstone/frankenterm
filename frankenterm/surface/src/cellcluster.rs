@@ -459,7 +459,7 @@ mod tests {
         // After adding multi-byte, idx map should be extrapolated
         assert_eq!(c.byte_to_cell_idx.len(), "aé".len());
         assert_eq!(c.byte_to_cell_idx[0], 0); // "a" -> cell 0
-                                              // "é" bytes -> cell 1
+        // "é" bytes -> cell 1
         for i in 1..c.byte_to_cell_idx.len() {
             assert_eq!(c.byte_to_cell_idx[i], 1);
         }

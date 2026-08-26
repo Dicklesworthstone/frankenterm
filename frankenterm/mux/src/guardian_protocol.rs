@@ -9102,6 +9102,52 @@ impl GuardianProtocolState {
         }
     }
 
+    /// Validate one authenticated Replay request against the exact retained
+    /// pane generation before a worker is allowed to open or continue a
+    /// plaintext-bearing durable snapshot.
+    ///
+    /// This method is deliberately read-only.  It returns decoded request
+    /// metadata, never a replay page or storage authority; the guardian's
+    /// bounded replay worker must consume the corresponding durable snapshot
+    /// capability before constructing a success response.
+    pub fn preflight_replay(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReplayRequestV1, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+        }
+        if request.header.operation != GuardianOperation::Replay {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            });
+        }
+        self.require_replay_generation(request)?;
+        GuardianReplayRequestV1::decode(request.payload())
+    }
+
+    /// Validate one authenticated ReplayAck against the same generation fence
+    /// used by Replay.  Ack is observation/control-plane state only: it never
+    /// consumes a pane mutation sequence and cannot itself authorize retention
+    /// or compaction.
+    pub fn preflight_replay_ack(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReplayAckV1, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+        }
+        if request.header.operation != GuardianOperation::ReplayAck {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            });
+        }
+        self.require_replay_generation(request)?;
+        GuardianReplayAckV1::decode(request.payload())
+    }
+
     /// Validate one authenticated checkpoint Stage request against the live
     /// pane lease before a guardian worker is allowed to inspect persistent
     /// staging state.
@@ -10265,6 +10311,24 @@ impl GuardianProtocolState {
                 .ok_or(GuardianProtocolError::InvalidOperationScope {
                     operation: request.header.operation,
                 })?;
+        let generation = self.require_replay_generation(request)?;
+        Ok(GuardianReply::ReplayReady {
+            pane_id,
+            generation,
+        })
+    }
+
+    fn require_replay_generation(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<u64, GuardianProtocolError> {
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
         let generation = match self.panes.get(&pane_id) {
             Some(GuardianPaneState::LiveClaimed {
                 generation,
@@ -10288,10 +10352,7 @@ impl GuardianProtocolState {
             Some(_) => return Err(GuardianProtocolError::StaleLease),
             None => return Err(GuardianProtocolError::PaneNotFound(pane_id)),
         };
-        Ok(GuardianReply::ReplayReady {
-            pane_id,
-            generation,
-        })
+        Ok(generation)
     }
 
     fn query_input_effect(
@@ -16096,6 +16157,91 @@ mod tests {
                 exit_status: Some(0),
             })
         ));
+    }
+
+    #[test]
+    fn replay_and_ack_preflight_share_the_exact_generation_authority_fence() {
+        let guardian = id(1);
+        let mux = id(2);
+        let successor_mux = id(4);
+        let pane = id(3);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
+
+        let replay_payload = replay_open_payload();
+        let replay = request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(8),
+            Some(pane),
+            1,
+            0,
+            None,
+            &replay_payload,
+        );
+        let authenticated_replay = authenticate(&replay);
+        assert_eq!(
+            state.preflight_replay(&authenticated_replay),
+            GuardianReplayRequestV1::decode(&replay_payload)
+        );
+
+        let ack =
+            GuardianReplayAckV1::new(id(9), [0x31; 32], 0, [0x42; 32], None, 0, [0; 32], true)
+                .unwrap();
+        let ack_payload = ack.encode().unwrap();
+        let ack_request = request(
+            GuardianOperation::ReplayAck,
+            guardian,
+            mux,
+            id(10),
+            Some(pane),
+            1,
+            0,
+            None,
+            &ack_payload,
+        );
+        assert_eq!(
+            state.preflight_replay_ack(&authenticate(&ack_request)),
+            Ok(ack)
+        );
+
+        let mut wrong_live_mux = copy_request(&replay);
+        wrong_live_mux.header.mux_incarnation = successor_mux;
+        assert_eq!(
+            state.preflight_replay(&authenticate(&wrong_live_mux)),
+            Err(GuardianProtocolError::StaleLease)
+        );
+        let mut wrong_generation = copy_request(&ack_request);
+        wrong_generation.header.lease_generation = 2;
+        assert_eq!(
+            state.preflight_replay_ack(&authenticate(&wrong_generation)),
+            Err(GuardianProtocolError::StaleLease)
+        );
+
+        state.mark_exited(pane, 0).unwrap();
+        let mut terminal_successor_replay = copy_request(&replay);
+        terminal_successor_replay.header.mux_incarnation = successor_mux;
+        terminal_successor_replay.header.request_id = id(11);
+        assert_eq!(
+            state.preflight_replay(&authenticate(&terminal_successor_replay)),
+            GuardianReplayRequestV1::decode(&replay_payload),
+            "terminal transcript recovery is generation-fenced, not tied to a dead mux incarnation"
+        );
+
+        assert_eq!(
+            state.preflight_replay(&authenticate(&ack_request)),
+            Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::ReplayAck,
+            })
+        );
+        assert_eq!(
+            state.preflight_replay_ack(&authenticated_replay),
+            Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Replay,
+            })
+        );
     }
 
     #[test]

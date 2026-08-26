@@ -1,10 +1,10 @@
 #![cfg(test)]
 
 use super::*;
+use crate::SEQ_ZERO;
 use crate::hyperlink::{Hyperlink, Rule};
 use crate::line::clusterline::ClusteredLine;
 use crate::line::storage::CellStorage;
-use crate::SEQ_ZERO;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -176,10 +176,11 @@ fn implicit_hyperlink_scan_splits_at_zero_width_cells() {
     line.scan_and_create_hyperlinks(&rules);
 
     assert!(!line.has_hyperlink());
-    assert!(line
-        .coerce_vec_storage()
-        .iter()
-        .all(|cell| cell.attrs().hyperlink().is_none()));
+    assert!(
+        line.coerce_vec_storage()
+            .iter()
+            .all(|cell| cell.attrs().hyperlink().is_none())
+    );
 }
 
 #[test]
@@ -236,33 +237,10 @@ fn cluster_representation_basic() {
         r#"
 C(
     ClusteredLine {
-        text: "hello",
-        is_double_wide: None,
-        clusters: [
-            Cluster {
-                cell_width: 5,
-                attrs: CellAttributes {
-                    attributes: 0,
-                    intensity: Normal,
-                    underline: None,
-                    blink: None,
-                    italic: false,
-                    reverse: false,
-                    strikethrough: false,
-                    invisible: false,
-                    wrapped: false,
-                    overline: false,
-                    semantic_type: Output,
-                    foreground: Default,
-                    background: Default,
-                    fat: None,
-                },
-            },
-        ],
-        len: 5,
-        last_cell_width: Some(
-            1,
-        ),
+        text_bytes: 5,
+        cell_len: 5,
+        cluster_count: 1,
+        text: "[REDACTED]",
     },
 )
 "#
@@ -315,11 +293,10 @@ fn cluster_representation_empty() {
         r#"
 C(
     ClusteredLine {
-        text: "",
-        is_double_wide: None,
-        clusters: [],
-        len: 0,
-        last_cell_width: None,
+        text_bytes: 0,
+        cell_len: 0,
+        cluster_count: 0,
+        text: "[REDACTED]",
     },
 )
 "#
@@ -334,57 +311,15 @@ fn cluster_wrap_last() {
     line.compress_for_scrollback();
     line.set_last_cell_was_wrapped(true, 1);
     k9::snapshot!(
-        line,
+        &line,
         r#"
 Line {
     cells: C(
         ClusteredLine {
-            text: "hello",
-            is_double_wide: None,
-            clusters: [
-                Cluster {
-                    cell_width: 4,
-                    attrs: CellAttributes {
-                        attributes: 0,
-                        intensity: Normal,
-                        underline: None,
-                        blink: None,
-                        italic: false,
-                        reverse: false,
-                        strikethrough: false,
-                        invisible: false,
-                        wrapped: false,
-                        overline: false,
-                        semantic_type: Output,
-                        foreground: Default,
-                        background: Default,
-                        fat: None,
-                    },
-                },
-                Cluster {
-                    cell_width: 1,
-                    attrs: CellAttributes {
-                        attributes: 2048,
-                        intensity: Normal,
-                        underline: None,
-                        blink: None,
-                        italic: false,
-                        reverse: false,
-                        strikethrough: false,
-                        invisible: false,
-                        wrapped: true,
-                        overline: false,
-                        semantic_type: Output,
-                        foreground: Default,
-                        background: Default,
-                        fat: None,
-                    },
-                },
-            ],
-            len: 5,
-            last_cell_width: Some(
-                1,
-            ),
+            text_bytes: 5,
+            cell_len: 5,
+            cluster_count: 2,
+            text: "[REDACTED]",
         },
     ),
     zones: [],
@@ -395,6 +330,13 @@ Line {
 }
 "#
     );
+    let cells = line
+        .visible_cells()
+        .map(|cell| cell.as_cell())
+        .collect::<Vec<_>>();
+    assert_eq!(cells.len(), 5);
+    assert!(cells[..4].iter().all(|cell| !cell.attrs().wrapped()));
+    assert!(cells[4].attrs().wrapped());
 }
 
 fn bold() -> CellAttributes {
@@ -423,90 +365,10 @@ fn cluster_representation_attributes() {
         r#"
 C(
     ClusteredLine {
-        text: "abcd",
-        is_double_wide: None,
-        clusters: [
-            Cluster {
-                cell_width: 1,
-                attrs: CellAttributes {
-                    attributes: 0,
-                    intensity: Normal,
-                    underline: None,
-                    blink: None,
-                    italic: false,
-                    reverse: false,
-                    strikethrough: false,
-                    invisible: false,
-                    wrapped: false,
-                    overline: false,
-                    semantic_type: Output,
-                    foreground: Default,
-                    background: Default,
-                    fat: None,
-                },
-            },
-            Cluster {
-                cell_width: 1,
-                attrs: CellAttributes {
-                    attributes: 1,
-                    intensity: Bold,
-                    underline: None,
-                    blink: None,
-                    italic: false,
-                    reverse: false,
-                    strikethrough: false,
-                    invisible: false,
-                    wrapped: false,
-                    overline: false,
-                    semantic_type: Output,
-                    foreground: Default,
-                    background: Default,
-                    fat: None,
-                },
-            },
-            Cluster {
-                cell_width: 1,
-                attrs: CellAttributes {
-                    attributes: 0,
-                    intensity: Normal,
-                    underline: None,
-                    blink: None,
-                    italic: false,
-                    reverse: false,
-                    strikethrough: false,
-                    invisible: false,
-                    wrapped: false,
-                    overline: false,
-                    semantic_type: Output,
-                    foreground: Default,
-                    background: Default,
-                    fat: None,
-                },
-            },
-            Cluster {
-                cell_width: 1,
-                attrs: CellAttributes {
-                    attributes: 1,
-                    intensity: Bold,
-                    underline: None,
-                    blink: None,
-                    italic: false,
-                    reverse: false,
-                    strikethrough: false,
-                    invisible: false,
-                    wrapped: false,
-                    overline: false,
-                    semantic_type: Output,
-                    foreground: Default,
-                    background: Default,
-                    fat: None,
-                },
-            },
-        ],
-        len: 4,
-        last_cell_width: Some(
-            1,
-        ),
+        text_bytes: 4,
+        cell_len: 4,
+        cluster_count: 4,
+        text: "[REDACTED]",
     },
 )
 "#
@@ -524,76 +386,26 @@ fn cluster_append() {
     cl.append(Cell::new_grapheme("l", CellAttributes::default(), None));
     cl.append(Cell::new_grapheme("o", CellAttributes::default(), None));
     k9::snapshot!(
-        cl,
+        &cl,
         r#"
 ClusteredLine {
-    text: "hello",
-    is_double_wide: None,
-    clusters: [
-        Cluster {
-            cell_width: 2,
-            attrs: CellAttributes {
-                attributes: 0,
-                intensity: Normal,
-                underline: None,
-                blink: None,
-                italic: false,
-                reverse: false,
-                strikethrough: false,
-                invisible: false,
-                wrapped: false,
-                overline: false,
-                semantic_type: Output,
-                foreground: Default,
-                background: Default,
-                fat: None,
-            },
-        },
-        Cluster {
-            cell_width: 1,
-            attrs: CellAttributes {
-                attributes: 1,
-                intensity: Bold,
-                underline: None,
-                blink: None,
-                italic: false,
-                reverse: false,
-                strikethrough: false,
-                invisible: false,
-                wrapped: false,
-                overline: false,
-                semantic_type: Output,
-                foreground: Default,
-                background: Default,
-                fat: None,
-            },
-        },
-        Cluster {
-            cell_width: 2,
-            attrs: CellAttributes {
-                attributes: 0,
-                intensity: Normal,
-                underline: None,
-                blink: None,
-                italic: false,
-                reverse: false,
-                strikethrough: false,
-                invisible: false,
-                wrapped: false,
-                overline: false,
-                semantic_type: Output,
-                foreground: Default,
-                background: Default,
-                fat: None,
-            },
-        },
-    ],
-    len: 5,
-    last_cell_width: Some(
-        1,
-    ),
+    text_bytes: 5,
+    cell_len: 5,
+    cluster_count: 3,
+    text: "[REDACTED]",
 }
 "#
+    );
+    assert_eq!(
+        cl.to_cell_vec(),
+        vec![
+            Cell::new_grapheme("h", CellAttributes::default(), None),
+            Cell::new_grapheme("e", CellAttributes::default(), None),
+            Cell::new_grapheme("l", bold(), None),
+            Cell::new_grapheme("l", CellAttributes::default(), None),
+            Cell::new_grapheme("o", CellAttributes::default(), None),
+        ],
+        "redacted Debug output must not replace cluster behavior coverage"
     );
 }
 
@@ -622,76 +434,15 @@ fn cluster_line_new() {
         5,
     );
     k9::snapshot!(
-        line,
+        &line,
         r#"
 Line {
     cells: C(
         ClusteredLine {
-            text: "hello",
-            is_double_wide: None,
-            clusters: [
-                Cluster {
-                    cell_width: 2,
-                    attrs: CellAttributes {
-                        attributes: 0,
-                        intensity: Normal,
-                        underline: None,
-                        blink: None,
-                        italic: false,
-                        reverse: false,
-                        strikethrough: false,
-                        invisible: false,
-                        wrapped: false,
-                        overline: false,
-                        semantic_type: Output,
-                        foreground: Default,
-                        background: Default,
-                        fat: None,
-                    },
-                },
-                Cluster {
-                    cell_width: 1,
-                    attrs: CellAttributes {
-                        attributes: 1,
-                        intensity: Bold,
-                        underline: None,
-                        blink: None,
-                        italic: false,
-                        reverse: false,
-                        strikethrough: false,
-                        invisible: false,
-                        wrapped: false,
-                        overline: false,
-                        semantic_type: Output,
-                        foreground: Default,
-                        background: Default,
-                        fat: None,
-                    },
-                },
-                Cluster {
-                    cell_width: 2,
-                    attrs: CellAttributes {
-                        attributes: 0,
-                        intensity: Normal,
-                        underline: None,
-                        blink: None,
-                        italic: false,
-                        reverse: false,
-                        strikethrough: false,
-                        invisible: false,
-                        wrapped: false,
-                        overline: false,
-                        semantic_type: Output,
-                        foreground: Default,
-                        background: Default,
-                        fat: None,
-                    },
-                },
-            ],
-            len: 5,
-            last_cell_width: Some(
-                1,
-            ),
+            text_bytes: 5,
+            cell_len: 5,
+            cluster_count: 3,
+            text: "[REDACTED]",
         },
     ),
     zones: [],
@@ -702,4 +453,63 @@ Line {
 }
 "#
     );
+    assert_eq!(
+        line.visible_cells()
+            .map(|cell| cell.as_cell())
+            .collect::<Vec<_>>(),
+        vec![
+            Cell::new_grapheme("h", CellAttributes::default(), None),
+            Cell::new_grapheme("e", CellAttributes::default(), None),
+            Cell::new_grapheme("l", bold(), None),
+            Cell::new_grapheme("l", CellAttributes::default(), None),
+            Cell::new_grapheme("o", CellAttributes::default(), None),
+        ],
+        "redacted Debug output must not replace line cell coverage"
+    );
+}
+
+#[test]
+fn fill_range_past_end_of_empty_line_does_not_panic() {
+    // Regression for the mux-server abort in #85 (index-out-of-bounds with
+    // "len 0 / index 0"): filling a range that starts beyond the
+    // materialized width performed the wide-grapheme look-back on storage
+    // that had not been grown yet.
+    let mut line = Line::from_text("", &CellAttributes::default(), SEQ_ZERO, None);
+    line.fill_range(
+        1..2,
+        &Cell::new_grapheme("x", CellAttributes::default(), None),
+        SEQ_ZERO,
+    );
+    assert_eq!(line.as_str(), " x");
+}
+
+#[test]
+fn fill_range_after_wide_grapheme_truncated_to_head_does_not_panic() {
+    // resize() truncates storage at an arbitrary column, so a double-width
+    // grapheme's head can be the final stored cell.  The look-back then
+    // blanked one cell past the end of storage.
+    let mut line = Line::from_text("a\u{4f60}", &CellAttributes::default(), SEQ_ZERO, None);
+    assert_eq!(line.len(), 3);
+    line.resize(2, SEQ_ZERO);
+    line.fill_range(
+        2..3,
+        &Cell::new_grapheme("x", CellAttributes::default(), None),
+        SEQ_ZERO,
+    );
+    // The truncated wide head is invalidated to a blank rather than left
+    // half-rendered.
+    assert_eq!(line.as_str(), "a x");
+}
+
+#[test]
+fn fill_range_blank_erases_wide_grapheme_truncated_to_head() {
+    let mut line = Line::from_text("a\u{4f60}", &CellAttributes::default(), SEQ_ZERO, None);
+    assert_eq!(line.len(), 3);
+    line.resize(2, SEQ_ZERO);
+
+    line.fill_range(2..3, &Cell::blank(), SEQ_ZERO);
+
+    // Column 2 is the implicit placeholder owned by the wide grapheme at
+    // column 1.  Erasing that placeholder must not leave an orphaned head.
+    assert_eq!(line.as_str(), "a");
 }

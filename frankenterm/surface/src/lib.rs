@@ -29,6 +29,8 @@ use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use serde::{Deserialize, Serialize};
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 use crate::alloc::borrow::ToOwned;
 use crate::alloc::string::ToString;
 use alloc::string::String;
@@ -1312,12 +1314,17 @@ fn compute_position_change(current: usize, pos: &Position, limit: usize) -> usiz
 mod test {
     use super::*;
     use alloc::format;
+    // This crate is no_std by default; std is linked for tests via the
+    // crate-root `#[cfg(test)] extern crate std;`, but expression paths
+    // starting with `std::` do not resolve in submodules, so import what
+    // the unwind-based tests need explicitly.
     #[cfg(feature = "use_image")]
     use alloc::sync::Arc;
     use frankenterm_cell::color::AnsiColor;
     #[cfg(feature = "use_image")]
     use frankenterm_cell::image::ImageData;
     use frankenterm_cell::{AttributeChange, Intensity};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     // The \x20's look a little awkward, but we can't use a plain
     // space in the first chararcter of a multi-line continuation;
@@ -2816,7 +2823,7 @@ mod test {
         let before_cursor = s.cursor_position();
         let before_change_count = s.changes.len();
 
-        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let exhausted = catch_unwind(AssertUnwindSafe(|| {
             s.add_change("b");
         }));
         assert!(exhausted.is_err());
@@ -2831,7 +2838,7 @@ mod test {
         let mut s = Surface::new(2, 1);
         s.seqno = SequenceNo::MAX - 1;
 
-        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let exhausted = catch_unwind(AssertUnwindSafe(|| {
             s.add_changes(vec![
                 Change::Text("a".to_string()),
                 Change::CursorPosition {
@@ -3069,9 +3076,11 @@ mod test {
         let mut s = Surface::new(3, 1);
         s.add_change(Change::Title("myterm".to_string()));
         let (_seq, changes) = s.get_changes(0);
-        assert!(changes
-            .iter()
-            .any(|c| matches!(c, Change::Title(t) if t == "myterm")));
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::Title(t) if t == "myterm"))
+        );
     }
 
     // === repaint includes cursor shape ===
@@ -3081,9 +3090,11 @@ mod test {
         let mut s = Surface::new(3, 1);
         s.add_change(Change::CursorShape(CursorShape::SteadyUnderline));
         let (_seq, changes) = s.get_changes(0);
-        assert!(changes
-            .iter()
-            .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline))));
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline)))
+        );
     }
 
     // === hidden cursor not shown in repaint ===
@@ -3195,7 +3206,7 @@ mod test {
         s.changes
             .push(Change::CursorVisibility(CursorVisibility::Hidden));
 
-        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let exhausted = catch_unwind(AssertUnwindSafe(|| {
             s.resize(1, 2);
         }));
         assert!(exhausted.is_err());
