@@ -109419,7 +109419,7 @@ with tarfile.open(path, "w") as archive:
             .find("install_process_family() {")
             .expect("atomic process-family installer");
         let active_end = installer[active_start..]
-            .find("\n}\n\ncheck_write_permissions()")
+            .find("\n}\n\nemit_process_family_receipt()")
             .map(|offset| active_start + offset)
             .expect("atomic process-family installer end");
         let active = &installer[active_start..active_end];
@@ -109658,6 +109658,143 @@ with tarfile.open(path, "w") as archive:
         assert!(cargo_build < manifest_generation);
         assert!(manifest_generation < manifest_verification);
         assert!(manifest_verification < family_install);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_verify_to_extract_path_replacement_cannot_swap_authenticated_bytes() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create archive replacement fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let archive = fixture.path().join("authenticated.tar");
+        let replacement = fixture.path().join("replacement.tar");
+        let retained = fixture.path().join("authenticated-original.tar");
+        let extraction_root = fixture.path().join("extract");
+        std::fs::write(&archive, b"checksum-authenticated archive inode")
+            .expect("write authenticated archive fixture");
+        std::fs::write(&replacement, b"different replacement pathname bytes")
+            .expect("write archive replacement fixture");
+        std::fs::create_dir(&extraction_root).expect("create private extraction root");
+        std::fs::set_permissions(
+            &extraction_root,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make extraction root private");
+        let checksum = hex::encode(sha2::Sha256::digest(
+            std::fs::read(&archive).expect("read authenticated archive fixture"),
+        ));
+        let script = format!(
+            r#"set -euo pipefail
+export FT_INSTALL_TEST_LIBRARY_ONLY=1
+source {}
+QUIET=1
+HAS_GUM=0
+verify_checksum {} {}
+python3 - {} {} {} <<'PY'
+import os
+import shutil
+import sys
+
+archive, replacement, retained = sys.argv[1:]
+os.rename(archive, retained)
+shutil.copyfile(replacement, archive)
+PY
+if extract_authenticated_archive {} {} app FrankenTerm.app.component-manifest.json "$VERIFIED_ARCHIVE_IDENTITY"; then
+  exit 91
+fi
+"#,
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&checksum),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&replacement.to_string_lossy()),
+            shell_single_quote(&retained.to_string_lossy()),
+            shell_single_quote(&archive.to_string_lossy()),
+            shell_single_quote(&extraction_root.to_string_lossy()),
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute verify-to-extract replacement proof");
+        assert!(
+            output.status.success(),
+            "authenticated pathname replacement was not rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("archive pathname no longer names the checksum-authenticated inode")
+        );
+        assert_eq!(
+            std::fs::read_dir(&extraction_root)
+                .expect("inspect rejected extraction root")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_authenticated_extractor_rejects_adversarial_archive_names_and_links() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create adversarial extractor fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        for (index, (case_name, expected_error)) in [
+            ("traversal", "archive contains an unsafe member name"),
+            (
+                "appledouble",
+                "archive contains a forbidden AppleDouble member",
+            ),
+            (
+                "symlink-ancestor",
+                "archive member descends through a non-directory member",
+            ),
+            (
+                "hardlink",
+                "archive contains a hard link, sparse file, or special file",
+            ),
+            ("duplicate", "archive contains a duplicate member name"),
+            ("absolute-symlink", "archive contains an absolute symlink"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let archive = fixture.path().join(format!("{index}-{case_name}.tar"));
+            let extraction_root = fixture.path().join(format!("extract-{index}"));
+            create_adversarial_installer_archive(&archive, case_name);
+            std::fs::create_dir(&extraction_root).expect("create adversarial extraction root");
+            std::fs::set_permissions(
+                &extraction_root,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .expect("make adversarial extraction root private");
+            let output =
+                run_authenticated_installer_extractor(&installer, &archive, &extraction_root);
+            assert!(
+                !output.status.success(),
+                "{case_name} archive unexpectedly passed the production extractor"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected_error),
+                "{case_name} rejection did not report {expected_error:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_dir(&extraction_root)
+                    .expect("inspect adversarial extraction root")
+                    .count(),
+                0,
+                "{case_name} archive wrote bytes before rejection"
+            );
+            assert!(
+                !fixture.path().join("escaped").exists(),
+                "traversal archive escaped its extraction root"
+            );
+        }
     }
 
     #[cfg(unix)]

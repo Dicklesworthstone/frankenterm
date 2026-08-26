@@ -411,6 +411,10 @@ jobs:
               os.path.abspath(destination), ".frankenterm-process-family", "generations", generation,
           )
           if (receipt.get("activation") != "pending" or
+                  receipt.get("active_authority") != "none" or
+                  receipt.get("active_root") is not None or
+                  receipt.get("pending_reason") !=
+                      "inactive-census-without-shared-launcher-lease" or
                   re.fullmatch(r"[0-9a-f]{64}", generation) is None or
                   receipt.get("candidate_root") != expected_root):
               raise SystemExit("release probe received an unsafe or activated candidate receipt")

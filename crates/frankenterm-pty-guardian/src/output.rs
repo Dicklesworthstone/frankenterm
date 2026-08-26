@@ -8400,7 +8400,7 @@ fn checkpoint_catalog_publish_sealed_stage(
         &seed,
     )?;
     let encoded_base = checkpoint_catalog_encode_candidate_base(&mut candidate)?;
-    let (mut candidate, encoded_candidate) = match &candidate_plan {
+    let (candidate, encoded_candidate) = match &candidate_plan {
         CheckpointCatalogGenesisCandidatePlan::Create => {
             candidate.adoption_evidence = Some(checkpoint_catalog_seal_adoption_evidence(
                 inner, &candidate, seed,
@@ -8738,7 +8738,9 @@ mod tests {
             Some(Uuid::from_u128(0xca02)),
             spawn_payload,
         )?;
-        state.apply_effect_transactionally(&spawn, |_| GuardianEffectOutcome::<()>::Applied)?;
+        state.apply_effect_transactionally(&spawn, |_| {
+            GuardianEffectOutcome::<std::convert::Infallible>::Applied
+        })?;
         let claim = checkpoint_catalog_authenticate_request(
             GuardianOperation::Claim,
             guardian_incarnation,
@@ -8750,7 +8752,9 @@ mod tests {
             Some(Uuid::from_u128(0xca04)),
             Zeroizing::new(Vec::new()),
         )?;
-        state.apply_effect_transactionally(&claim, |_| GuardianEffectOutcome::<()>::Applied)?;
+        state.apply_effect_transactionally(&claim, |_| {
+            GuardianEffectOutcome::<std::convert::Infallible>::Applied
+        })?;
         Ok(state)
     }
 
@@ -8993,7 +8997,6 @@ mod tests {
             None,
         )?;
         let checkpoint_id = begin.checkpoint_id().into_bytes();
-        let boundary_id = begin.boundary_id().into_bytes();
         let replay_semantics_id = begin.descriptor().replay_semantics_id();
         store.apply_begin(&begin)?;
         for (index, bytes) in terminal
