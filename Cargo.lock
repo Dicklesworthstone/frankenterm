@@ -7517,6 +7517,7 @@ dependencies = [
  "promise",
  "proptest",
  "rangeset",
+ "rustix",
  "serde",
  "serde_json",
  "serial2",

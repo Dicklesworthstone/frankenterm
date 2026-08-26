@@ -57,6 +57,7 @@ portable-pty = { workspace=true, features = ["serde_support"]}
 procinfo = { path = "../procinfo", default-features = false }
 promise.workspace = true
 rangeset.workspace = true
+rustix.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
 sha2 = { workspace = true, features = ["zeroize"] }

@@ -7517,45 +7517,48 @@ fn open_scanned_pane_segment_manager(
     Ok(authority)
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
 struct AuthenticatedOutputSegmentSnapshot {
     descriptor_identity: FileIdentity,
-    segment_identity: GuardianOutputSegmentIdentity,
-    committed_bytes: u64,
-    record_count: u64,
-    cumulative_plaintext_bytes: u64,
-    next_sequence: Option<u64>,
-    terminal_receipt: Option<GuardianOutputAppendReceipt>,
-    tail: GuardianOutputJournalTail,
+    pinned_descriptor: File,
+    reader: GuardianOutputJournalReader,
 }
 
 impl AuthenticatedOutputSegmentSnapshot {
     fn from_reader(
         descriptor_identity: FileIdentity,
-        reader: &GuardianOutputJournalReader,
+        pinned_descriptor: File,
+        reader: GuardianOutputJournalReader,
     ) -> Self {
         Self {
             descriptor_identity,
-            segment_identity: reader.identity(),
-            committed_bytes: reader.committed_bytes(),
-            record_count: reader.record_count(),
-            cumulative_plaintext_bytes: reader.cumulative_plaintext_bytes(),
-            next_sequence: reader.next_sequence(),
-            terminal_receipt: reader.terminal_receipt(),
-            tail: reader.tail(),
+            pinned_descriptor,
+            reader,
         }
     }
 
-    fn matches_append_authority(self, journal: &GuardianOutputJournal) -> bool {
-        self.segment_identity == journal.identity()
-            && self.committed_bytes == journal.committed_bytes()
-            && self.record_count == journal.record_count()
-            && self.cumulative_plaintext_bytes == journal.cumulative_plaintext_bytes()
-            && self.next_sequence == journal.next_sequence()
-            && self.terminal_receipt == journal.terminal_receipt()
-            && self.tail == journal.tail()
+    fn matches_append_authority(&self, journal: &GuardianOutputJournal) -> bool {
+        self.reader.identity() == journal.identity()
+            && self.reader.committed_bytes() == journal.committed_bytes()
+            && self.reader.record_count() == journal.record_count()
+            && self.reader.cumulative_plaintext_bytes() == journal.cumulative_plaintext_bytes()
+            && self.reader.next_sequence() == journal.next_sequence()
+            && self.reader.terminal_receipt() == journal.terminal_receipt()
+            && self.reader.authenticated_prefix_digest() == journal.authenticated_prefix_digest()
+            && self.reader.tail() == journal.tail()
             && !journal.directory_entry_sync_required()
             && !journal.is_poisoned()
+    }
+
+    fn validate_pinned_descriptor(&self) -> Result<(), GuardianOutputError> {
+        let metadata = self.pinned_descriptor.metadata().map_err(|error| {
+            GuardianOutputError::io("output-pinned-read-only-segment-metadata", error)
+        })?;
+        if !self.descriptor_identity.matches(&metadata) {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian output pinned read-only segment changed during append promotion",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -7639,7 +7642,8 @@ fn authenticate_segment_chain_read_only(
         if index + 1 == segments.len() {
             current = Some(AuthenticatedOutputSegmentSnapshot::from_reader(
                 descriptor_after,
-                &journal,
+                verification_file,
+                journal,
             ));
         } else {
             previous_terminal = journal
@@ -7707,6 +7711,7 @@ fn open_and_validate_segment_chain(
         &current_segment.path,
         snapshot.descriptor_identity,
     )?;
+    snapshot.validate_pinned_descriptor()?;
     Ok((journal, total_committed_log_bytes, total_records))
 }
 

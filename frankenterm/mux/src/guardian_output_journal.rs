@@ -48,6 +48,8 @@ const AEAD_TAG_BYTES: u32 = 16;
 const AEAD_TAG_BYTES_USIZE: usize = 16;
 const FILE_HEADER_AEAD_DOMAIN: &[u8] = b"frankenterm.guardian-output-file-header.v3\0";
 const RECORD_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-record.v3\0";
+const AUTHENTICATED_PREFIX_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-output-authenticated-prefix.v1\0";
 const PLAINTEXT_DELIVERY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-output-plaintext-delivery.v3\0";
 const RECORD_AAD_DOMAIN: &[u8] = b"frankenterm.guardian-output-aead.v3\0";
@@ -1794,12 +1796,14 @@ pub struct GuardianOutputRecoveryCursor {
     expected_cumulative_plaintext_bytes: u64,
     expected_next_sequence: Option<u64>,
     expected_terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    expected_authenticated_prefix_digest: [u8; 32],
     tail: GuardianOutputJournalTail,
     offset: u64,
     record_count: u64,
     cumulative_plaintext_bytes: u64,
     next_sequence: Option<u64>,
     terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    authenticated_prefix_digest: [u8; 32],
     exhausted: bool,
     failed: bool,
     #[cfg(test)]
@@ -1878,6 +1882,7 @@ impl GuardianOutputRecoveryCursor {
                     || self.cumulative_plaintext_bytes != self.expected_cumulative_plaintext_bytes
                     || self.next_sequence != self.expected_next_sequence
                     || self.terminal_receipt != self.expected_terminal_receipt
+                    || self.authenticated_prefix_digest != self.expected_authenticated_prefix_digest
                 {
                     return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
                 }
@@ -2037,6 +2042,11 @@ impl GuardianOutputRecoveryCursor {
             self.cumulative_plaintext_bytes = cumulative_plaintext_bytes;
             self.next_sequence = sequence.checked_add(1);
             self.terminal_receipt = Some(receipt);
+            self.authenticated_prefix_digest = extend_authenticated_prefix_digest(
+                self.authenticated_prefix_digest,
+                &record_header,
+                &ciphertext,
+            );
             #[cfg(test)]
             {
                 self.verified_record_count = self
@@ -2122,6 +2132,12 @@ pub enum GuardianOutputJournalError {
     RecoveryDescriptorNotReadOnly,
     #[error("guardian output append descriptor is not opened read-write")]
     AppendDescriptorNotReadWrite,
+    #[error("guardian output append authority is unavailable because another writer holds it")]
+    AppendWriterLeaseUnavailable(#[source] std::io::Error),
+    #[error("guardian output append writer leases are unsupported on this target")]
+    AppendWriterLeaseUnsupported,
+    #[error("guardian output append authority does not hold its exclusive writer lease")]
+    AppendWriterLeaseMissing,
     #[error("new guardian output journal descriptor is not empty: found {actual} bytes")]
     NewSegmentNotEmpty { actual: u64 },
     #[error("guardian output journal parent descriptor is not a directory")]
@@ -2199,6 +2215,7 @@ struct JournalScan {
     cumulative_plaintext_bytes: u64,
     next_sequence: Option<u64>,
     terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    authenticated_prefix_digest: [u8; 32],
     tail: GuardianOutputJournalTail,
 }
 
@@ -2280,9 +2297,11 @@ pub struct GuardianOutputJournal {
     cumulative_plaintext_bytes: u64,
     next_sequence: Option<u64>,
     terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    authenticated_prefix_digest: [u8; 32],
     tail: GuardianOutputJournalTail,
     directory_entry_sync_required: bool,
     poisoned: bool,
+    writer_lease_held: bool,
 }
 
 /// Existing-file-only authenticated recovery authority for one raw-output segment.
@@ -2325,6 +2344,47 @@ fn require_guardian_output_read_write_descriptor(
     Ok(())
 }
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn acquire_guardian_output_writer_lease(file: &File) -> Result<(), GuardianOutputJournalError> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(|error| {
+        let error = std::io::Error::from(error);
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            GuardianOutputJournalError::AppendWriterLeaseUnavailable(error)
+        } else {
+            GuardianOutputJournalError::Io(error)
+        }
+    })
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn acquire_guardian_output_writer_lease(_file: &File) -> Result<(), GuardianOutputJournalError> {
+    Err(GuardianOutputJournalError::AppendWriterLeaseUnsupported)
+}
+
 impl GuardianOutputJournal {
     /// Initialize one new journal segment from an empty, securely created descriptor.
     ///
@@ -2339,6 +2399,7 @@ impl GuardianOutputJournal {
     ) -> Result<Self, GuardianOutputJournalError> {
         #[cfg(unix)]
         require_guardian_output_read_write_descriptor(&file)?;
+        acquire_guardian_output_writer_lease(&file)?;
         let limits = limits.validate()?;
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file() {
@@ -2353,7 +2414,7 @@ impl GuardianOutputJournal {
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header)?;
         file.sync_all()?;
-        let mut journal = Self::authenticate_existing(file, identity, cipher, limits)?;
+        let mut journal = Self::authenticate_existing(file, identity, cipher, limits, true)?;
         journal.directory_entry_sync_required = true;
         Ok(journal)
     }
@@ -2372,7 +2433,8 @@ impl GuardianOutputJournal {
     ) -> Result<Self, GuardianOutputJournalError> {
         #[cfg(unix)]
         require_guardian_output_read_write_descriptor(&file)?;
-        Self::authenticate_existing(file, identity, cipher, limits)
+        acquire_guardian_output_writer_lease(&file)?;
+        Self::authenticate_existing(file, identity, cipher, limits, true)
     }
 
     /// Authenticate one existing descriptor without ever modifying it.
@@ -2381,6 +2443,7 @@ impl GuardianOutputJournal {
         identity: GuardianOutputSegmentIdentity,
         cipher: GuardianOutputCipher,
         limits: GuardianOutputJournalLimits,
+        writer_lease_held: bool,
     ) -> Result<Self, GuardianOutputJournalError> {
         let limits = limits.validate()?;
         let metadata = file.metadata()?;
@@ -2428,9 +2491,11 @@ impl GuardianOutputJournal {
             cumulative_plaintext_bytes: scan.cumulative_plaintext_bytes,
             next_sequence: scan.next_sequence,
             terminal_receipt: scan.terminal_receipt,
+            authenticated_prefix_digest: scan.authenticated_prefix_digest,
             tail: scan.tail,
             directory_entry_sync_required: false,
             poisoned: false,
+            writer_lease_held,
         })
     }
 
@@ -2464,6 +2529,13 @@ impl GuardianOutputJournal {
     #[must_use]
     pub const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
         self.terminal_receipt
+    }
+
+    /// Digest of the complete authenticated committed prefix, including the
+    /// exact file header and every ordered record frame.
+    #[must_use]
+    pub const fn authenticated_prefix_digest(&self) -> [u8; 32] {
+        self.authenticated_prefix_digest
     }
 
     /// Verified terminal chain authority after reopen. An empty current
@@ -2573,6 +2645,7 @@ impl GuardianOutputJournal {
         let mut file_header = [0_u8; FILE_HEADER_BYTES];
         read_exact_file_at(&file, &mut file_header, 0)?;
         validate_file_header(&file_header, self.identity, &self.cipher)?;
+        let initial_authenticated_prefix_digest = initial_authenticated_prefix_digest(&file_header);
 
         Ok(GuardianOutputRecoveryCursor {
             file,
@@ -2586,6 +2659,7 @@ impl GuardianOutputJournal {
             expected_cumulative_plaintext_bytes: self.cumulative_plaintext_bytes,
             expected_next_sequence: self.next_sequence,
             expected_terminal_receipt: self.terminal_receipt,
+            expected_authenticated_prefix_digest: self.authenticated_prefix_digest,
             tail: self.tail,
             offset: FILE_HEADER_BYTES_U64,
             record_count: 0,
@@ -2595,6 +2669,7 @@ impl GuardianOutputJournal {
                 .map_or(0, |predecessor| predecessor.cumulative_plaintext_bytes),
             next_sequence: Some(self.identity.first_sequence),
             terminal_receipt: None,
+            authenticated_prefix_digest: initial_authenticated_prefix_digest,
             exhausted: false,
             failed: false,
             #[cfg(test)]
@@ -2671,6 +2746,7 @@ impl GuardianOutputJournal {
             || scan.cumulative_plaintext_bytes != self.cumulative_plaintext_bytes
             || scan.next_sequence != self.next_sequence
             || scan.terminal_receipt != self.terminal_receipt
+            || scan.authenticated_prefix_digest != self.authenticated_prefix_digest
             || scan.tail != self.tail
         {
             return Err(GuardianOutputJournalError::ExternalLengthChange {
@@ -2701,6 +2777,9 @@ impl GuardianOutputJournal {
         &mut self,
         payload: &[u8],
     ) -> Result<GuardianOutputAppendReceipt, GuardianOutputJournalError> {
+        if !self.writer_lease_held {
+            return Err(GuardianOutputJournalError::AppendWriterLeaseMissing);
+        }
         if self.poisoned {
             return Err(GuardianOutputJournalError::Poisoned);
         }
@@ -2806,6 +2885,11 @@ impl GuardianOutputJournal {
             .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
         self.cumulative_plaintext_bytes = cumulative_plaintext_bytes;
         self.next_sequence = sequence.checked_add(1);
+        self.authenticated_prefix_digest = extend_authenticated_prefix_digest(
+            self.authenticated_prefix_digest,
+            &header,
+            &ciphertext,
+        );
         let receipt = GuardianOutputAppendReceipt {
             segment_id: self.identity.segment_id,
             sequence,
@@ -2836,7 +2920,7 @@ impl GuardianOutputJournalReader {
         require_guardian_output_read_only_descriptor(&file)?;
         Ok(Self {
             authenticated: GuardianOutputJournal::authenticate_existing(
-                file, identity, cipher, limits,
+                file, identity, cipher, limits, false,
             )?,
         })
     }
@@ -2869,6 +2953,11 @@ impl GuardianOutputJournalReader {
     #[must_use]
     pub const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
         self.authenticated.terminal_receipt()
+    }
+
+    #[must_use]
+    pub const fn authenticated_prefix_digest(&self) -> [u8; 32] {
+        self.authenticated.authenticated_prefix_digest()
     }
 
     #[must_use]
@@ -3052,6 +3141,28 @@ fn record_digest(
     hasher.finalize().into()
 }
 
+fn initial_authenticated_prefix_digest(file_header: &[u8; FILE_HEADER_BYTES]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(AUTHENTICATED_PREFIX_DIGEST_DOMAIN);
+    hasher.update(FORMAT_VERSION.to_le_bytes());
+    hasher.update(file_header);
+    hasher.finalize().into()
+}
+
+fn extend_authenticated_prefix_digest(
+    previous: [u8; 32],
+    record_header: &[u8; RECORD_HEADER_BYTES],
+    ciphertext: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(AUTHENTICATED_PREFIX_DIGEST_DOMAIN);
+    hasher.update(FORMAT_VERSION.to_le_bytes());
+    hasher.update(previous);
+    hasher.update(record_header);
+    hasher.update(ciphertext);
+    hasher.finalize().into()
+}
+
 fn plaintext_delivery_digest(segment_id: Uuid, sequence: u64, payload: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PLAINTEXT_DELIVERY_DIGEST_DOMAIN);
@@ -3104,6 +3215,7 @@ fn scan_journal_with_recovery<R: Read + Seek>(
     let mut file_header = [0_u8; FILE_HEADER_BYTES];
     reader.read_exact(&mut file_header)?;
     validate_file_header(&file_header, identity, cipher)?;
+    let mut authenticated_prefix_digest = initial_authenticated_prefix_digest(&file_header);
 
     let mut committed_bytes = FILE_HEADER_BYTES_U64;
     let mut record_count = 0_u64;
@@ -3123,6 +3235,7 @@ fn scan_journal_with_recovery<R: Read + Seek>(
                 cumulative_plaintext_bytes,
                 next_sequence,
                 terminal_receipt,
+                authenticated_prefix_digest,
                 tail: GuardianOutputJournalTail::Incomplete {
                     committed_bytes,
                     trailing_bytes: remaining,
@@ -3195,6 +3308,7 @@ fn scan_journal_with_recovery<R: Read + Seek>(
                 cumulative_plaintext_bytes,
                 next_sequence,
                 terminal_receipt,
+                authenticated_prefix_digest,
                 tail: GuardianOutputJournalTail::Incomplete {
                     committed_bytes,
                     trailing_bytes: remaining,
@@ -3262,6 +3376,11 @@ fn scan_journal_with_recovery<R: Read + Seek>(
         if let Some(collector) = recovery.as_deref_mut() {
             collector.observe(receipt, plaintext)?;
         }
+        authenticated_prefix_digest = extend_authenticated_prefix_digest(
+            authenticated_prefix_digest,
+            &record_header,
+            &ciphertext,
+        );
         committed_bytes = projected_committed_bytes;
         record_count = projected_record_count;
         cumulative_plaintext_bytes = projected_cumulative_plaintext_bytes;
@@ -3274,6 +3393,7 @@ fn scan_journal_with_recovery<R: Read + Seek>(
         cumulative_plaintext_bytes,
         next_sequence,
         terminal_receipt,
+        authenticated_prefix_digest,
         tail: GuardianOutputJournalTail::Clean,
     })
 }
@@ -4208,6 +4328,140 @@ mod tests {
                 .expect("read descriptor-mode evidence")
                 .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_authority_is_exclusive_for_the_full_journal_lifetime() {
+        let directory = tempfile::tempdir().expect("create writer-lease directory");
+        let path = directory.path().join("writer-lease.ftgout");
+        let parent = File::open(directory.path()).expect("open writer-lease parent");
+        let mut first = GuardianOutputJournal::create_new(
+            create_journal_file(&path),
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create first exclusive append authority");
+        first
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate first exclusive append authority");
+        let first_receipt = first
+            .append_and_sync(b"first exclusive record")
+            .expect("append through first exclusive authority");
+
+        let second_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open competing append descriptor");
+        let second_error = GuardianOutputJournal::open_existing_for_append(
+            second_file,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .err()
+        .expect("a second append authority must fail closed");
+        assert!(matches!(
+            second_error,
+            GuardianOutputJournalError::AppendWriterLeaseUnavailable(_)
+        ));
+
+        drop(first);
+        let mut successor = GuardianOutputJournal::open_existing_for_append(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("reopen after first append authority drops"),
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("acquire append authority only after predecessor drops");
+        let successor_receipt = successor
+            .append_and_sync(b"successor exclusive record")
+            .expect("append through successor authority");
+        assert_eq!(successor_receipt.sequence(), first_receipt.sequence() + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_prefix_digest_binds_a_nonterminal_valid_fork() {
+        let directory = tempfile::tempdir().expect("create prefix-digest directory");
+        let original_path = directory.path().join("prefix-original.ftgout");
+        let alternate_path = directory.path().join("prefix-alternate.ftgout");
+        let fork_path = directory.path().join("prefix-fork.ftgout");
+        let parent = File::open(directory.path()).expect("open prefix-digest parent");
+        let limits = GuardianOutputJournalLimits::default();
+        let segment_identity = identity();
+        let segment_cipher = cipher();
+
+        let mut original = GuardianOutputJournal::create_new(
+            create_journal_file(&original_path),
+            segment_identity,
+            segment_cipher.clone(),
+            limits,
+        )
+        .expect("create original prefix journal");
+        original
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate original prefix journal");
+        let original_first = original
+            .append_and_sync(b"primary-prefix")
+            .expect("append original nonterminal record");
+        let original_terminal = original
+            .append_and_sync(b"shared-terminal")
+            .expect("append original terminal record");
+        let original_prefix_digest = original.authenticated_prefix_digest();
+        drop(original);
+
+        let mut alternate = GuardianOutputJournal::create_new(
+            create_journal_file(&alternate_path),
+            segment_identity,
+            segment_cipher.clone(),
+            limits,
+        )
+        .expect("create alternate prefix journal");
+        alternate
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate alternate prefix journal");
+        let alternate_first = alternate
+            .append_and_sync(b"adverse-prefix")
+            .expect("append alternate nonterminal record");
+        assert_eq!(
+            alternate_first.committed_log_bytes(),
+            original_first.committed_log_bytes(),
+            "fork fixture records must have identical geometry"
+        );
+        drop(alternate);
+
+        let original_bytes = std::fs::read(&original_path).expect("read original journal bytes");
+        let alternate_bytes = std::fs::read(&alternate_path).expect("read alternate journal bytes");
+        let first_end = usize::try_from(original_first.committed_log_bytes())
+            .expect("first record endpoint fits usize");
+        let mut fork_bytes = Vec::with_capacity(original_bytes.len());
+        fork_bytes.extend_from_slice(&original_bytes[..FILE_HEADER_BYTES]);
+        fork_bytes.extend_from_slice(&alternate_bytes[FILE_HEADER_BYTES..first_end]);
+        fork_bytes.extend_from_slice(&original_bytes[first_end..]);
+        let mut fork_file = create_journal_file(&fork_path);
+        fork_file
+            .write_all(&fork_bytes)
+            .and_then(|()| fork_file.sync_all())
+            .expect("persist valid nonterminal fork fixture");
+        drop(fork_file);
+
+        let fork = GuardianOutputJournalReader::open_existing(
+            open_read_only_journal_file(&fork_path),
+            segment_identity,
+            segment_cipher,
+            limits,
+        )
+        .expect("authenticate the fully valid nonterminal fork");
+        assert_eq!(fork.record_count(), 2);
+        assert_eq!(fork.terminal_receipt(), Some(original_terminal));
+        assert_ne!(fork.authenticated_prefix_digest(), original_prefix_digest);
     }
 
     #[cfg(unix)]
