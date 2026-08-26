@@ -7043,6 +7043,8 @@ pub struct CheckpointScrollbackInventoryEntry {
     pub created_at_epoch_ms: u64,
     /// Verified checkpoint row ID.
     pub checkpoint_id: i64,
+    /// Verified checkpoint state witness used by the canonical leaf name.
+    pub checkpoint_state_hash: String,
     /// Verified artifact bytes.
     pub artifact_bytes: u64,
     /// Verified artifact SHA-256.
@@ -7100,6 +7102,70 @@ impl Write for BoundedCheckpointArtifactWriter {
             std::io::Error::other(format!("bounded artifact allocation failed: {error}"))
         })?;
         self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Allocation-free canonical serializer sink over one already-admitted byte slice.
+///
+/// The verifier necessarily owns both the bounded input bytes and the decoded
+/// artifact tree while checking canonical encoding.  Writing the decoded tree
+/// into this comparator avoids a third artifact-sized `Vec`: each serializer
+/// chunk is compared directly with the corresponding input slice.
+struct ExactCheckpointArtifactWriter<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    limit: usize,
+    exact: bool,
+}
+
+impl<'a> ExactCheckpointArtifactWriter<'a> {
+    fn new(
+        expected: &'a [u8],
+        limit: u64,
+    ) -> Result<Self, CheckpointScrollbackArtifactError> {
+        let limit = usize::try_from(limit).map_err(|_| {
+            CheckpointScrollbackArtifactError::InvalidLimits(
+                "artifact byte limit does not fit this platform".to_string(),
+            )
+        })?;
+        Ok(Self {
+            expected,
+            offset: 0,
+            limit,
+            exact: true,
+        })
+    }
+
+    fn is_exact(&self) -> bool {
+        self.exact && self.offset == self.expected.len()
+    }
+}
+
+impl Write for ExactCheckpointArtifactWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .offset
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("canonical byte count overflow"))?;
+        if next > self.limit {
+            return Err(std::io::Error::other(format!(
+                "canonical encoding exceeds the {} byte limit",
+                self.limit
+            )));
+        }
+        if self
+            .expected
+            .get(self.offset..next)
+            .is_none_or(|expected| expected != buffer)
+        {
+            self.exact = false;
+        }
+        self.offset = next;
         Ok(buffer.len())
     }
 
@@ -7181,6 +7247,31 @@ fn serialize_checkpoint_artifact(
     serde_json::to_writer_pretty(&mut writer, artifact)?;
     writer.write_all(b"\n")?;
     Ok(writer.into_inner())
+}
+
+fn checkpoint_artifact_has_canonical_encoding(
+    artifact: &CheckpointScrollbackArtifact,
+    expected: &[u8],
+    limit: u64,
+) -> Result<bool, CheckpointScrollbackArtifactError> {
+    let mut writer = ExactCheckpointArtifactWriter::new(expected, limit)?;
+    serde_json::to_writer_pretty(&mut writer, artifact)?;
+    writer.write_all(b"\n")?;
+    Ok(writer.is_exact())
+}
+
+fn checkpoint_artifact_untrusted_json_error(
+    site: &'static str,
+    error: &serde_json::Error,
+) -> CheckpointScrollbackArtifactError {
+    // `serde_json` errors may embed an attacker-controlled unknown field name
+    // or invalid string value.  Preserve only the finite call-site label and
+    // numeric source position; never render the original message.
+    CheckpointScrollbackArtifactError::InvalidArtifact(format!(
+        "{site} rejected at line {} column {}",
+        error.line(),
+        error.column()
+    ))
 }
 
 fn require_checkpoint_redaction_fixed_point(
@@ -7351,6 +7442,48 @@ fn load_checkpoint_persisted_panes_for_artifact(
     checkpoint_id: i64,
     expected_panes: usize,
 ) -> Result<Vec<PersistedPaneState>, CheckpointScrollbackArtifactError> {
+    let max_pane_text_bytes = i64::try_from(MAX_PERSISTED_PANE_TEXT_BYTES).unwrap_or(i64::MAX);
+    let (observed_rows, malformed_rows): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN
+                    typeof(pane_id) = 'integer' AND pane_id >= 0
+                    AND typeof(terminal_state_json) = 'text'
+                    AND (cwd IS NULL OR typeof(cwd) = 'text')
+                    AND (command IS NULL OR typeof(command) = 'text')
+                    AND (env_json IS NULL OR typeof(env_json) = 'text')
+                    AND (agent_metadata_json IS NULL OR typeof(agent_metadata_json) = 'text')
+                    AND (scrollback_checkpoint_seq IS NULL OR
+                         (typeof(scrollback_checkpoint_seq) = 'integer'
+                          AND scrollback_checkpoint_seq >= 0))
+                    AND (last_output_at IS NULL OR
+                         (typeof(last_output_at) = 'integer' AND last_output_at >= 0))
+                    AND COALESCE(length(CAST(cwd AS BLOB)), 0)
+                      + COALESCE(length(CAST(command AS BLOB)), 0)
+                      + COALESCE(length(CAST(env_json AS BLOB)), 0)
+                      + length(CAST(terminal_state_json AS BLOB))
+                      + COALESCE(length(CAST(agent_metadata_json AS BLOB)), 0) <= ?2
+                    THEN 0 ELSE 1 END), 0)
+         FROM mux_pane_state
+         WHERE checkpoint_id = ?1",
+        rusqlite::params![checkpoint_id, max_pane_text_bytes],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let expected_rows = i64::try_from(expected_panes).map_err(|_| {
+        CheckpointScrollbackArtifactError::ResourceLimit(
+            "checkpoint pane count does not fit SQLite integer range".to_string(),
+        )
+    })?;
+    if observed_rows != expected_rows {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(format!(
+            "checkpoint declares {expected_panes} panes but contains {observed_rows} pane rows"
+        )));
+    }
+    if malformed_rows != 0 {
+        return Err(CheckpointScrollbackArtifactError::Checkpoint(format!(
+            "checkpoint contains {malformed_rows} malformed pane rows"
+        )));
+    }
+
     let row_limit = expected_panes.checked_add(1).ok_or_else(|| {
         CheckpointScrollbackArtifactError::ResourceLimit(
             "checkpoint pane row limit overflows usize".to_string(),
@@ -7361,27 +7494,11 @@ fn load_checkpoint_persisted_panes_for_artifact(
                 agent_metadata_json, scrollback_checkpoint_seq, last_output_at
          FROM mux_pane_state
          WHERE checkpoint_id = ?1
-           AND typeof(pane_id) = 'integer' AND pane_id >= 0
-           AND typeof(terminal_state_json) = 'text'
-           AND (cwd IS NULL OR typeof(cwd) = 'text')
-           AND (command IS NULL OR typeof(command) = 'text')
-           AND (env_json IS NULL OR typeof(env_json) = 'text')
-           AND (agent_metadata_json IS NULL OR typeof(agent_metadata_json) = 'text')
-           AND (scrollback_checkpoint_seq IS NULL OR
-                (typeof(scrollback_checkpoint_seq) = 'integer' AND scrollback_checkpoint_seq >= 0))
-           AND (last_output_at IS NULL OR
-                (typeof(last_output_at) = 'integer' AND last_output_at >= 0))
-           AND COALESCE(length(CAST(cwd AS BLOB)), 0)
-             + COALESCE(length(CAST(command AS BLOB)), 0)
-             + COALESCE(length(CAST(env_json AS BLOB)), 0)
-             + length(CAST(terminal_state_json AS BLOB))
-             + COALESCE(length(CAST(agent_metadata_json AS BLOB)), 0) <= ?2
          ORDER BY pane_id ASC, id ASC
-         LIMIT ?3",
+         LIMIT ?2",
     )?;
     let mut rows = statement.query(rusqlite::params![
         checkpoint_id,
-        i64::try_from(MAX_PERSISTED_PANE_TEXT_BYTES).unwrap_or(i64::MAX),
         i64::try_from(row_limit).unwrap_or(i64::MAX),
     ])?;
     let mut panes = Vec::with_capacity(expected_panes);

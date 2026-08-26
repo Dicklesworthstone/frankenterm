@@ -1645,6 +1645,25 @@ struct ProofBarrierGuard {
     _lock_file: File,
 }
 
+/// Canonical plan/catalog lock guard.
+///
+/// Ensures serialized ledger creation, retirement, and recovery across processes for a given
+/// `(plan_id, plan_hash)` tuple.
+///
+/// # Canonical Lock Hierarchy & Ordering:
+/// 1. `PlanLock` (`plan_locks/<digest>.catalog.lock`): Acquired FIRST for plan-wide operations
+///    (e.g., creating a ledger or retiring matching ledgers for a plan).
+/// 2. `ExecutionLock` (`execution_locks/<execution_id>.lock`): Acquired SECOND for per-execution operations
+///    (sorted lexicographically when acquiring multiple execution locks).
+/// 3. `ProofBarrier` / `KeyLock` (`key_locks/<key_hash>.lock`): Acquired THIRD for individual step reservations/outcomes.
+#[derive(Debug)]
+pub struct DurablePlanLockGuard {
+    lock_dir: Arc<Dir>,
+    lock_name: PathBuf,
+    spool_display: PathBuf,
+    _lock_file: File,
+}
+
 /// Optional per-key component of a durable lease.
 ///
 /// Single-key writers own one of these beneath a shared plan barrier. Batch
@@ -1880,6 +1899,7 @@ fn select_authoritative_durable_outcome(
 struct DurableSpool {
     parent_dir: Arc<Dir>,
     dir: Arc<Dir>,
+    plan_lock_dir: Arc<Dir>,
     execution_lock_dir: Arc<Dir>,
     key_lock_dir: Arc<Dir>,
     /// Preflighted directory handle used to make ledger namespace mutations
@@ -1912,6 +1932,7 @@ pub struct IdempotencyStore {
 }
 
 const TX_LEDGER_DIR_NAME: &str = "tx_ledgers";
+const PLAN_LOCK_DIR_NAME: &str = "plan_locks";
 const EXECUTION_LOCK_DIR_NAME: &str = "execution_locks";
 const KEY_LOCK_DIR_NAME: &str = "key_locks";
 /// Maximum serialized size accepted for one durable execution ledger. Reads
@@ -2016,6 +2037,12 @@ impl DurableSpool {
             TX_LEDGER_DIR_NAME,
             &self.dir,
             &self.display_path,
+        )?;
+        validate_pinned_dir_entry(
+            &self.dir,
+            PLAN_LOCK_DIR_NAME,
+            &self.plan_lock_dir,
+            &self.display_path.join(PLAN_LOCK_DIR_NAME),
         )?;
         validate_pinned_dir_entry(
             &self.dir,
@@ -3033,6 +3060,11 @@ impl IdempotencyStore {
             &parent_display,
             "persist tx_ledgers namespace entry",
         )?;
+        let plan_lock_dir = open_or_create_dir_nofollow(
+            &spool_dir,
+            PLAN_LOCK_DIR_NAME,
+            &spool_display.join(PLAN_LOCK_DIR_NAME),
+        )?;
         let execution_lock_dir = open_or_create_dir_nofollow(
             &spool_dir,
             EXECUTION_LOCK_DIR_NAME,
@@ -3060,6 +3092,7 @@ impl IdempotencyStore {
             durable_spool: Some(DurableSpool {
                 parent_dir: Arc::new(parent),
                 dir: Arc::new(spool_dir),
+                plan_lock_dir: Arc::new(plan_lock_dir),
                 execution_lock_dir: Arc::new(execution_lock_dir),
                 key_lock_dir: Arc::new(key_lock_dir),
                 sync_file: spool_sync_file,
@@ -3226,6 +3259,126 @@ impl IdempotencyStore {
         }
 
         Ok(store)
+    }
+
+fn plan_lock_name(plan_id: &str, plan_hash: u64) -> PathBuf {
+    let digest = sha256_domain_digest(
+        b"frankenterm.tx.plan-catalog.v1",
+        &[plan_id.as_bytes(), &plan_hash.to_be_bytes()],
+    );
+    PathBuf::from(format!("plan-{digest}.catalog.lock"))
+}
+
+impl IdempotencyStore {
+    fn acquire_plan_catalog_lock(
+        &self,
+        plan_id: &str,
+        plan_hash: u64,
+    ) -> Result<DurablePlanLockGuard, IdempotencyError> {
+        let spool = self.durable_spool()?;
+        let lock_name = plan_lock_name(plan_id, plan_hash);
+        let lock_display = spool.display_path.join(PLAN_LOCK_DIR_NAME).join(&lock_name);
+        let options = lock_open_options();
+        let lock_file = spool
+            .plan_lock_dir
+            .open_with(&lock_name, &options)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "open plan catalog lock {} for plan {plan_id:?} ({plan_hash:016x}) without following symlinks: {err}",
+                    lock_display.display()
+                ),
+            })?;
+        let metadata = lock_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!("inspect plan catalog lock {}: {err}", lock_display.display()),
+            })?;
+        validate_open_regular_file(&metadata, &lock_display)?;
+        let lock_file = lock_file.into_std();
+        match try_lock_with_grace(|| FileExt::try_lock_exclusive(&lock_file)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(IdempotencyError::PlanMutationInProgress {
+                    plan_id: plan_id.to_string(),
+                    plan_hash,
+                });
+            }
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "acquire plan catalog lock {} for plan {plan_id:?} ({plan_hash:016x}): {err}",
+                        lock_display.display()
+                    ),
+                });
+            }
+        }
+        validate_pinned_file_entry(&spool.plan_lock_dir, &lock_name, &lock_file, &lock_display)?;
+        Ok(DurablePlanLockGuard {
+            lock_dir: Arc::clone(&spool.plan_lock_dir),
+            lock_name,
+            spool_display: spool.display_path.clone(),
+            _lock_file: lock_file,
+        })
+    }
+
+    fn rescan_spool_for_matching_ledgers(
+        &mut self,
+        plan_id: &str,
+        plan_hash: u64,
+    ) -> Result<(), IdempotencyError> {
+        let spool = self.durable_spool()?;
+        let entries = spool
+            .dir
+            .entries()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "list pinned tx_ledgers directory {}: {err}",
+                    spool.display_path.display()
+                ),
+            })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "read entry in pinned tx_ledgers directory {}: {err}",
+                    spool.display_path.display()
+                ),
+            })?;
+            let name = PathBuf::from(entry.file_name());
+            if name.extension().and_then(|ext| ext.to_str()) == Some("json")
+                && let Some(stem) = name.file_stem().and_then(|s| s.to_str())
+                && is_valid_execution_id(stem)
+            {
+                let ledger_display = spool.display(&name);
+                let options = nofollow_open_options(true, false);
+                if let Ok(mut file) = spool.dir.open_with(&name, &options) {
+                    if let Ok(metadata) = file.metadata() {
+                        if validate_open_regular_file(&metadata, &ledger_display).is_ok() {
+                            if let Ok(contents) = read_bounded_ledger_with_limit(
+                                &mut file,
+                                &ledger_display,
+                                self.policy.max_ledger_bytes,
+                            ) {
+                                if let Ok(ledger) =
+                                    serde_json::from_slice::<TxExecutionLedger>(&contents)
+                                {
+                                    if ledger.verify_chain().chain_intact
+                                        && ledger.plan_id() == plan_id
+                                        && ledger.plan_hash() == plan_hash
+                                    {
+                                        if !ledger.phase().is_terminal() {
+                                            self.ledgers.insert(stem.to_string(), ledger);
+                                        } else {
+                                            self.ledgers.remove(stem);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn acquire_plan_proof_barrier(
@@ -3868,11 +4021,19 @@ impl IdempotencyStore {
         execution_id: &str,
         plan: &TxPlan,
     ) -> Result<(), IdempotencyError> {
+        let _plan_lock = if self.is_durable() {
+            Some(self.acquire_plan_catalog_lock(&plan.plan_id, plan.plan_hash)?)
+        } else {
+            None
+        };
         let execution_lock = if self.is_durable() {
             Some(self.acquire_execution_lock(execution_id)?)
         } else {
             None
         };
+        if self.is_durable() {
+            self.rescan_spool_for_matching_ledgers(&plan.plan_id, plan.plan_hash)?;
+        }
         if self.ledgers.contains_key(execution_id) {
             return Err(IdempotencyError::DuplicateExecution {
                 key: execution_id.to_string(),
@@ -4367,6 +4528,16 @@ impl IdempotencyStore {
         plan_id: &str,
         plan_hash: u64,
     ) -> Result<Vec<String>, IdempotencyError> {
+        let _plan_lock = if self.is_durable() {
+            Some(self.acquire_plan_catalog_lock(plan_id, plan_hash)?)
+        } else {
+            None
+        };
+
+        if self.is_durable() {
+            self.rescan_spool_for_matching_ledgers(plan_id, plan_hash)?;
+        }
+
         let mut execution_ids: Vec<String> = self
             .ledgers
             .iter()
@@ -4410,9 +4581,7 @@ impl IdempotencyStore {
         }
 
         for execution_id in &execution_ids {
-            self.ledgers
-                .remove(execution_id)
-                .expect("candidate remained active until all snapshots persisted");
+            self.ledgers.remove(execution_id);
         }
 
         Ok(execution_ids)
@@ -4626,6 +4795,9 @@ pub enum IdempotencyError {
 
     #[error("idempotency reservation already in progress for key {key}")]
     ReservationInProgress { key: String },
+
+    #[error("plan mutation already in progress for plan {plan_id} ({plan_hash:016x})")]
+    PlanMutationInProgress { plan_id: String, plan_hash: u64 },
 
     #[error("execution ledger mutation already in progress for execution {execution_id}")]
     ExecutionMutationInProgress { execution_id: String },
@@ -8186,6 +8358,129 @@ mod tests {
         );
 
         store.fail_persist_writes = false;
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stale_catalog_rescan_retires_unseen_durable_ledger() {
+        let ft_dir = durable_test_dir("stale-catalog-rescan");
+        let plan = make_plan(2);
+        let mut store_1 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 1");
+        let mut store_2 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 2");
+
+        // Store 1 creates an execution while Store 2 is idle with an empty memory map
+        store_1
+            .create_ledger("exec-unseen-by-store-2", &plan)
+            .expect("create ledger in store 1");
+        store_1
+            .transition_phase("exec-unseen-by-store-2", TxPhase::Preparing)
+            .expect("transition in store 1");
+        assert_eq!(store_2.active_count(), 0);
+
+        // Store 2 calls abort_and_archive_matching_ledgers: it must rescan the durable spool,
+        // discover exec-unseen-by-store-2, and retire it durably!
+        let retired = store_2
+            .abort_and_archive_matching_ledgers(&plan.plan_id, plan.plan_hash)
+            .expect("retire unseen matching ledgers");
+        assert_eq!(retired, vec!["exec-unseen-by-store-2".to_string()]);
+        assert_eq!(store_2.active_count(), 0);
+
+        // Verify on disk and by opening a fresh store 3 that the execution is indeed Aborted
+        let store_3 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 3");
+        assert_eq!(store_3.active_count(), 0);
+        assert!(store_3.get_ledger("exec-unseen-by-store-2").is_none());
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn concurrent_create_and_retirement_are_serialized_by_plan_lock() {
+        let ft_dir = durable_test_dir("plan-lock-serialization");
+        let plan = make_plan(2);
+        let store_1 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 1");
+        let mut store_2 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 2");
+
+        // Store 1 acquires the plan catalog lock
+        let plan_lock = store_1
+            .acquire_plan_catalog_lock(&plan.plan_id, plan.plan_hash)
+            .expect("acquire plan catalog lock");
+
+        // Store 2 attempts to create a ledger for the same plan while the lock is held
+        let err = store_2
+            .create_ledger("exec-blocked", &plan)
+            .expect_err("create must be blocked by plan catalog lock");
+        assert!(matches!(err, IdempotencyError::PlanMutationInProgress { .. }));
+
+        // Store 1 drops the plan catalog lock
+        drop(plan_lock);
+
+        // Store 2 can now create the ledger
+        store_2
+            .create_ledger("exec-blocked", &plan)
+            .expect("create ledger succeeds after plan lock released");
+        assert!(store_2.get_ledger("exec-blocked").is_some());
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn no_partial_plan_wide_handoff() {
+        let ft_dir = durable_test_dir("no-partial-handoff");
+        let plan = make_plan(2);
+        let mut store_1 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 1");
+        let mut store_2 =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store 2");
+
+        // Create multiple executions for the plan
+        for i in 1..=3 {
+            let id = format!("exec-multi-{i}");
+            store_1
+                .create_ledger(&id, &plan)
+                .expect("create execution");
+            store_1
+                .transition_phase(&id, TxPhase::Preparing)
+                .expect("transition phase");
+        }
+
+        // Store 2 retires all matching ledgers
+        let mut retired = store_2
+            .abort_and_archive_matching_ledgers(&plan.plan_id, plan.plan_hash)
+            .expect("retire all matching ledgers");
+        retired.sort();
+        assert_eq!(
+            retired,
+            vec![
+                "exec-multi-1".to_string(),
+                "exec-multi-2".to_string(),
+                "exec-multi-3".to_string()
+            ]
+        );
+
+        // Verify that every single one was durably aborted
+        for id in &retired {
+            let path = ft_dir.join("tx_ledgers").join(format!("{id}.json"));
+            let ledger: TxExecutionLedger =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(ledger.phase(), TxPhase::Aborted);
+            assert!(ledger.terminal_certificate().is_some());
+        }
+
+        // Now Store 2 creates a superseding execution cleanly
+        store_2
+            .create_ledger("exec-superseding", &plan)
+            .expect("create superseding execution");
+        assert_eq!(store_2.active_count(), 1);
+        assert!(store_2.get_ledger("exec-superseding").is_some());
+
         let _ = std::fs::remove_dir_all(&ft_dir);
     }
 
