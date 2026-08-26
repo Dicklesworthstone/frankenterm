@@ -7130,10 +7130,10 @@ impl CheckpointScrollbackArtifactReceipt {
     }
 }
 
-/// How a canonical checkpoint artifact became durable for this invocation.
+/// How the requested checkpoint artifact became durable for this invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointScrollbackArtifactResolution {
-    /// This invocation published the canonical target.
+    /// This invocation published the requested target.
     Published,
     /// A prior or concurrent invocation had already published the exact target.
     RecoveredExisting,
@@ -7142,7 +7142,7 @@ pub enum CheckpointScrollbackArtifactResolution {
 /// Exact result of publishing or recovering one checkpoint artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointScrollbackArtifactPublication {
-    /// Canonical artifact path derived from the requested checkpoint identity.
+    /// Exact requested artifact path; canonical-catalog calls derive it from the checkpoint identity.
     pub path: PathBuf,
     /// Whether this invocation published or recovered the target.
     pub resolution: CheckpointScrollbackArtifactResolution,
