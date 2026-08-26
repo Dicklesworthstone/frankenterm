@@ -76024,91 +76024,42 @@ async fn handle_session_command(
             let output_format = resolve_session_orphan_output_format(&format);
             let output_path = output.unwrap_or_else(default_live_mux_dump_path);
             let dump = capture_live_mux_dump(config, max_panes, max_total_bytes).await?;
-            let complete = dump
-                .get("complete")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let pane_count = dump
-                .get("panes")
-                .and_then(serde_json::Value::as_array)
-                .map_or(0, Vec::len);
-            let error_count = dump
-                .get("errors")
-                .and_then(serde_json::Value::as_array)
-                .map_or(0, Vec::len);
-            let (_payload_bytes, payload_sha256) = hash_json_bounded(
-                &dump,
-                LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
-                JsonSerializationStyle::Compact,
-            )
-            .context("Failed to hash mux dump payload within the artifact safety limit")?;
-            let envelope = serde_json::json!({
-                "schema": "frankenterm.mux-content-dump.v1",
-                "publication_state": "complete",
-                "payload_sha256": &payload_sha256,
-                "payload": dump,
-            });
-            let mut artifact_bytes = serialize_json_bounded(
-                &envelope,
-                LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES.saturating_sub(1),
-                JsonSerializationStyle::Pretty,
-            )
-            .context("Failed to serialize mux dump envelope within the artifact safety limit")?;
-            // The envelope owns the complete producer-side pane-text tree. Release it
-            // before publication and verifier reread so the verification lane cannot
-            // stack that tree with the persisted artifact bytes and parsed verifier tree.
-            drop(envelope);
-            artifact_bytes.push(b'\n');
-            let artifact_receipt = write_new_private_artifact(&output_path, &artifact_bytes)?;
-            drop(artifact_bytes);
-            let verification = verify_mux_dump_artifact(&output_path).with_context(|| {
-                format!(
-                    "Mux dump was durably retained at {}, but its offline verifier rejected the published artifact",
-                    output_path.display()
-                )
-            })?;
-            if verification.payload_sha256 != payload_sha256
-                || verification.artifact_sha256 != artifact_receipt.sha256
-                || verification.artifact_bytes != artifact_receipt.bytes
-                || verification.capture_complete != complete
-                || verification.pane_count != pane_count
-                || verification.error_count != error_count
-            {
-                anyhow::bail!(
-                    "Mux dump was durably retained at {}, but its verified publication receipt disagrees with the producer receipt",
-                    output_path.display()
-                );
-            }
+            let published = publish_mux_dump_payload(&output_path, dump)?;
 
             let result = serde_json::json!({
-                "ok": complete || allow_partial,
+                "ok": published.complete || allow_partial,
                 "action": "dump",
-                "complete": complete,
+                "complete": published.complete,
                 "path": output_path.display().to_string(),
-                "pane_count": pane_count,
-                "error_count": error_count,
-                "payload_sha256": &payload_sha256,
-                "artifact_sha256": &verification.artifact_sha256,
-                "artifact_bytes": verification.artifact_bytes,
-                "durability": artifact_receipt.durability,
+                "pane_count": published.pane_count,
+                "error_count": published.error_count,
+                "payload_sha256": &published.payload_sha256,
+                "artifact_sha256": &published.artifact_sha256,
+                "artifact_bytes": published.artifact_bytes,
+                "durability": published.durability,
                 "redaction_applied": true,
             });
             if !print_snapshot_session_structured_output(&result, output_format)? {
                 println!("Mux content dump written");
                 println!("  File:     {}", output_path.display());
-                println!("  Complete: {complete}");
-                println!("  Panes:    {pane_count}");
-                println!("  Errors:   {error_count}");
-                println!("  Payload SHA-256:  {payload_sha256}");
-                println!("  Artifact SHA-256: {}", verification.artifact_sha256);
+                println!("  Complete: {}", published.complete);
+                println!("  Panes:    {}", published.pane_count);
+                println!("  Errors:   {}", published.error_count);
+                println!("  Payload SHA-256:  {}", published.payload_sha256);
+                println!("  Artifact SHA-256: {}", published.artifact_sha256);
                 println!("  Content:  redacted");
             }
-            if !complete && !allow_partial {
+            if !published.complete && !allow_partial {
                 anyhow::bail!(
-                    "Mux dump is incomplete ({error_count} capture error(s)); artifact retained at {}. Re-run after resolving the errors or pass --allow-partial only when a partial safety artifact is acceptable.",
+                    "Mux dump is incomplete ({} capture error(s)); artifact retained at {}. Re-run after resolving the errors or pass --allow-partial only when a partial safety artifact is acceptable.",
+                    published.error_count,
                     output_path.display()
                 );
             }
+        }
+
+        SessionCommands::CompatibleClientDump { .. } => {
+            unreachable!("compatible-client dump is dispatched before config initialization")
         }
 
         SessionCommands::VerifyDump { path, format } => {
@@ -76657,6 +76608,7 @@ const LIVE_MUX_DUMP_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES: u64 = 384 * 1024 * 1024;
 const LIVE_MUX_DUMP_MAX_TOPOLOGY_BYTES: u64 = 64 * 1024 * 1024;
 const COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION: &str = "0.13.0";
+const COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH: &str = "3ebd60566";
 const COMPATIBLE_CLIENT_DUMP_MAX_PANES: usize = 1_024;
 const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE: usize = 64;
 const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -76716,6 +76668,8 @@ struct CompatibleClientDumpRequest {
 #[derive(Debug)]
 struct CompatibleClientDumpReceipt {
     path: PathBuf,
+    recovery_environment_path: PathBuf,
+    recovery_environment_path_sha256: String,
     pane_count: usize,
     content_bytes: usize,
     payload_sha256: String,
@@ -76939,6 +76893,8 @@ enum CompatibleClientCommandKind<'a> {
 
 struct CompatibleClientCapture {
     payload: serde_json::Value,
+    recovery_environment_path: PathBuf,
+    recovery_environment_path_sha256: String,
     client_sha256: String,
     client_bytes: u64,
     client_version: String,
@@ -76955,6 +76911,1237 @@ struct CompatibleClientSubprocessAccounting {
     commands: usize,
     stderr_warning_commands: usize,
     stderr_bytes: usize,
+}
+
+#[cfg(unix)]
+fn compatible_client_path_parts(
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    if !path.is_absolute() || path_contains_parent_component(path) {
+        anyhow::bail!("{label} must be an absolute normalized path");
+    }
+    let leaf = path
+        .file_name()
+        .filter(|leaf| !leaf.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("{label} has no file name"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{label} has no parent directory"))?
+        .to_path_buf();
+    Ok((parent, leaf))
+}
+
+#[cfg(unix)]
+fn require_compatible_client_identity(
+    metadata: &cap_std::fs::Metadata,
+    label: &str,
+) -> anyhow::Result<CompatibleClientNamedIdentity> {
+    use cap_fs_ext::OsMetadataExt as _;
+    use cap_std::fs::PermissionsExt as _;
+
+    let identity = CompatibleClientNamedIdentity::from_cap(metadata);
+    let effective_uid = nix::unistd::geteuid().as_raw();
+    anyhow::ensure!(metadata.is_file(), "{label} is not a regular file");
+    anyhow::ensure!(identity.uid == effective_uid, "{label} is not owned by the effective user");
+    anyhow::ensure!(identity.hard_link_count == 1, "{label} has more than one hard link");
+    anyhow::ensure!(
+        identity.mode & 0o100 != 0,
+        "{label} is not executable by its owner"
+    );
+    anyhow::ensure!(
+        identity.mode & 0o022 == 0,
+        "{label} is writable by a group or other user"
+    );
+    anyhow::ensure!(
+        identity.mode & 0o7000 == 0,
+        "{label} has unsupported setuid, setgid, or sticky mode bits"
+    );
+    anyhow::ensure!(
+        identity.byte_len > 0 && identity.byte_len <= COMPATIBLE_CLIENT_DUMP_MAX_CLIENT_BYTES,
+        "{label} byte length is outside the supported bound"
+    );
+    let _ = metadata.dev();
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn pin_compatible_client(
+    path: &Path,
+    expected_sha256: &str,
+    expected_bytes: u64,
+    label: &str,
+) -> anyhow::Result<PinnedCompatibleClient> {
+    anyhow::ensure!(
+        is_canonical_lowercase_sha256(expected_sha256)
+            && expected_sha256.bytes().any(|byte| byte != b'0'),
+        "{label} expected SHA-256 is not a canonical non-zero digest"
+    );
+    anyhow::ensure!(
+        expected_bytes > 0 && expected_bytes <= COMPATIBLE_CLIENT_DUMP_MAX_CLIENT_BYTES,
+        "{label} expected byte length is outside the supported bound"
+    );
+    let (parent_path, leaf) = compatible_client_path_parts(path, label)?;
+    let parent = open_directory_tree_nofollow(&parent_path).with_context(|| {
+        format!("Failed to pin the {label} parent directory without following symlinks")
+    })?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = parent
+        .open_with(&leaf, &options)
+        .with_context(|| format!("Failed to open {label} without following symlinks"))?;
+    let metadata_before = file
+        .metadata()
+        .with_context(|| format!("Failed to inspect {label}"))?;
+    let identity = require_compatible_client_identity(&metadata_before, label)?;
+    anyhow::ensure!(
+        identity.byte_len == expected_bytes,
+        "{label} byte length does not match the pinned expectation"
+    );
+    let named_before = parent
+        .symlink_metadata(&leaf)
+        .with_context(|| format!("Failed to inspect the named {label}"))?;
+    anyhow::ensure!(
+        CompatibleClientNamedIdentity::from_cap(&named_before) == identity,
+        "{label} name and opened handle do not identify the same file"
+    );
+    file.rewind()
+        .with_context(|| format!("Failed to rewind {label}"))?;
+    let (hashed_bytes, sha256) = sha256_reader(&mut file)
+        .with_context(|| format!("Failed to hash {label}"))?;
+    let metadata_after = file
+        .metadata()
+        .with_context(|| format!("Failed to re-inspect {label}"))?;
+    let named_after = parent
+        .symlink_metadata(&leaf)
+        .with_context(|| format!("Failed to re-inspect the named {label}"))?;
+    anyhow::ensure!(
+        CompatibleClientNamedIdentity::from_cap(&metadata_after) == identity
+            && CompatibleClientNamedIdentity::from_cap(&named_after) == identity,
+        "{label} changed identity while it was hashed"
+    );
+    anyhow::ensure!(
+        hashed_bytes == expected_bytes && sha256 == expected_sha256,
+        "{label} bytes do not match the pinned identity"
+    );
+    revalidate_artifact_parent_directory(&parent_path, &parent)?;
+    Ok(PinnedCompatibleClient {
+        path: path.to_path_buf(),
+        parent_path,
+        leaf,
+        parent,
+        file,
+        identity,
+        sha256,
+    })
+}
+
+#[cfg(unix)]
+impl PinnedCompatibleClient {
+    fn revalidate(&mut self, label: &str) -> anyhow::Result<()> {
+        let handle_before = self
+            .file
+            .metadata()
+            .with_context(|| format!("Failed to inspect the pinned {label} handle"))?;
+        anyhow::ensure!(
+            require_compatible_client_identity(&handle_before, label)? == self.identity,
+            "{label} handle identity changed"
+        );
+        let named_before = self
+            .parent
+            .symlink_metadata(&self.leaf)
+            .with_context(|| format!("Failed to inspect the pinned {label} name"))?;
+        anyhow::ensure!(
+            CompatibleClientNamedIdentity::from_cap(&named_before) == self.identity,
+            "{label} name identity changed"
+        );
+        self.file
+            .rewind()
+            .with_context(|| format!("Failed to rewind the pinned {label}"))?;
+        let (bytes, sha256) = sha256_reader(&mut self.file)
+            .with_context(|| format!("Failed to rehash the pinned {label}"))?;
+        let handle_after = self
+            .file
+            .metadata()
+            .with_context(|| format!("Failed to re-inspect the pinned {label} handle"))?;
+        let named_after = self
+            .parent
+            .symlink_metadata(&self.leaf)
+            .with_context(|| format!("Failed to re-inspect the pinned {label} name"))?;
+        anyhow::ensure!(
+            CompatibleClientNamedIdentity::from_cap(&handle_after) == self.identity
+                && CompatibleClientNamedIdentity::from_cap(&named_after) == self.identity
+                && bytes == self.identity.byte_len
+                && sha256 == self.sha256,
+            "{label} bytes or identity changed"
+        );
+        revalidate_artifact_parent_directory(&self.parent_path, &self.parent)
+    }
+}
+
+#[cfg(unix)]
+fn pin_compatible_mux_socket(path: &Path) -> anyhow::Result<PinnedCompatibleMuxSocket> {
+    use cap_fs_ext::{FileTypeExt as _, OsMetadataExt as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let (parent_path, leaf) = compatible_client_path_parts(path, "compatible mux socket")?;
+    let parent = open_directory_tree_nofollow(&parent_path)
+        .context("Failed to pin the compatible mux socket parent without following symlinks")?;
+    let parent_metadata = parent
+        .dir_metadata()
+        .context("Failed to inspect the compatible mux socket parent")?;
+    let effective_uid = nix::unistd::geteuid().as_raw();
+    anyhow::ensure!(
+        parent_metadata.is_dir()
+            && parent_metadata.uid() == effective_uid
+            && CompatibleClientNamedIdentity::from_cap(&parent_metadata).mode & 0o022 == 0,
+        "compatible mux socket parent is not a safe effective-user-owned directory"
+    );
+    let metadata = parent
+        .symlink_metadata(&leaf)
+        .context("Failed to inspect the compatible mux socket without following symlinks")?;
+    let identity = CompatibleClientNamedIdentity::from_cap(&metadata);
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "compatible mux socket is not a Unix socket"
+    );
+    anyhow::ensure!(
+        identity.uid == effective_uid
+            && identity.hard_link_count == 1
+            && identity.mode & 0o022 == 0,
+        "compatible mux socket does not have a safe effective-user-owned identity"
+    );
+    let path_sha256 = sha256_hex(path.as_os_str().as_bytes());
+    revalidate_artifact_parent_directory(&parent_path, &parent)?;
+    Ok(PinnedCompatibleMuxSocket {
+        path: path.to_path_buf(),
+        parent_path,
+        leaf,
+        parent,
+        identity,
+        path_sha256,
+    })
+}
+
+#[cfg(unix)]
+impl PinnedCompatibleMuxSocket {
+    fn revalidate(&self) -> anyhow::Result<()> {
+        use cap_fs_ext::FileTypeExt as _;
+
+        let metadata = self
+            .parent
+            .symlink_metadata(&self.leaf)
+            .context("Failed to re-inspect the compatible mux socket")?;
+        anyhow::ensure!(
+            metadata.file_type().is_socket()
+                && CompatibleClientNamedIdentity::from_cap(&metadata) == self.identity,
+            "compatible mux socket identity changed"
+        );
+        revalidate_artifact_parent_directory(&self.parent_path, &self.parent)
+    }
+}
+
+#[cfg(unix)]
+fn create_compatible_client_environment(output: &Path) -> anyhow::Result<CompatibleClientEnvironment> {
+    use cap_fs_ext::OsMetadataExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let (output_parent, _leaf, output_parent_path) = artifact_parent_and_leaf(output)?;
+    let parent_metadata = output_parent
+        .dir_metadata()
+        .context("Failed to inspect compatible-client recovery parent")?;
+    let effective_uid = nix::unistd::geteuid().as_raw();
+    let parent_mode = CompatibleClientNamedIdentity::from_cap(&parent_metadata).mode;
+    anyhow::ensure!(
+        parent_metadata.is_dir() && parent_metadata.uid() == effective_uid && parent_mode & 0o077 == 0,
+        "compatible-client output parent must be a private effective-user-owned directory"
+    );
+    let temporary = tempfile::Builder::new()
+        .prefix(".frankenterm-compatible-client-")
+        .tempdir_in(&output_parent_path)
+        .context("Failed to create private compatible-client recovery environment")?;
+    let root = temporary.keep();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .context("Failed to seal compatible-client recovery environment permissions")?;
+    let root_metadata = fs::symlink_metadata(&root)
+        .context("Failed to inspect compatible-client recovery environment")?;
+    anyhow::ensure!(
+        root_metadata.is_dir()
+            && root_metadata.uid() == effective_uid
+            && root_metadata.permissions().mode() & 0o077 == 0,
+        "compatible-client recovery environment is not a private effective-user-owned directory"
+    );
+    revalidate_artifact_parent_directory(&output_parent_path, &output_parent)?;
+
+    let empty_path = root.join("empty-path");
+    let home = root.join("home");
+    let config = root.join("config");
+    let data = root.join("data");
+    let workspace = root.join("workspace");
+    let temp = root.join("tmp");
+    for directory in [&empty_path, &home, &config, &data, &workspace, &temp] {
+        fs::create_dir(directory).with_context(|| {
+            format!("Failed to create private recovery directory {}", directory.display())
+        })?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("Failed to seal private recovery directory {}", directory.display())
+        })?;
+        fs::File::open(directory)
+            .and_then(|file| file.sync_all())
+            .with_context(|| format!("Failed to synchronize recovery directory {}", directory.display()))?;
+    }
+    fs::File::open(&root)
+        .and_then(|file| file.sync_all())
+        .context("Failed to synchronize compatible-client recovery environment")?;
+    sync_capability_directory(&output_parent)
+        .context("Failed to synchronize compatible-client recovery parent")?;
+    revalidate_artifact_parent_directory(&output_parent_path, &output_parent)?;
+    let nonexistent_external_cli = root.join("external-wezterm-is-forbidden");
+    anyhow::ensure!(
+        fs::symlink_metadata(&nonexistent_external_cli).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "compatible-client external CLI sentinel unexpectedly exists"
+    );
+    Ok(CompatibleClientEnvironment {
+        root,
+        empty_path,
+        home,
+        config,
+        data,
+        workspace,
+        temp,
+        nonexistent_external_cli,
+    })
+}
+
+#[cfg(unix)]
+fn snapshot_compatible_client(
+    source: &mut PinnedCompatibleClient,
+    environment: &CompatibleClientEnvironment,
+) -> anyhow::Result<PinnedCompatibleClient> {
+    use cap_std::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    source.revalidate("compatible client source")?;
+    let root = open_directory_tree_nofollow(&environment.root)
+        .context("Failed to pin compatible-client recovery environment")?;
+    let leaf = Path::new("pinned-ft-v0.13.0");
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .mode(0o500);
+    let mut destination = root
+        .open_with(leaf, &options)
+        .context("Failed to create the private compatible-client executable snapshot")?;
+    source
+        .file
+        .rewind()
+        .context("Failed to rewind compatible client source for snapshot")?;
+    let mut remaining = source.identity.byte_len;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let allowed = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = source
+            .file
+            .read(&mut buffer[..allowed])
+            .context("Failed to read compatible client source for snapshot")?;
+        anyhow::ensure!(read > 0, "compatible client source ended before its pinned byte length");
+        destination
+            .write_all(&buffer[..read])
+            .context("Failed to write compatible-client executable snapshot")?;
+        remaining = remaining.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    anyhow::ensure!(
+        source.file.read(&mut buffer[..1]).context("Failed to verify compatible client source length")? == 0,
+        "compatible client source grew beyond its pinned byte length"
+    );
+    destination
+        .set_permissions(cap_std::fs::Permissions::from_mode(0o500))
+        .context("Failed to seal compatible-client executable snapshot")?;
+    destination
+        .sync_all()
+        .context("Failed to synchronize compatible-client executable snapshot")?;
+    sync_capability_directory(&root)
+        .context("Failed to synchronize compatible-client executable snapshot directory")?;
+    source.revalidate("compatible client source")?;
+    let snapshot_path = environment.root.join(leaf);
+    pin_compatible_client(
+        &snapshot_path,
+        &source.sha256,
+        source.identity.byte_len,
+        "private compatible client snapshot",
+    )
+}
+
+#[cfg(unix)]
+fn compatible_client_config_bytes(socket: &PinnedCompatibleMuxSocket) -> anyhow::Result<Vec<u8>> {
+    let socket_path = socket
+        .path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("compatible mux socket path is not valid UTF-8"))?;
+    let config = CompatibleClientConfig {
+        vendored: CompatibleClientVendoredConfig {
+            mux_socket_path: socket_path,
+        },
+    };
+    let encoded = toml::to_string(&config)
+        .context("Failed to encode the compatible-client vendored socket configuration")?
+        .into_bytes();
+    anyhow::ensure!(
+        encoded.len() <= 64 * 1024,
+        "compatible-client configuration exceeds its byte bound"
+    );
+    Ok(encoded)
+}
+
+#[cfg(unix)]
+fn compatible_client_command_arguments(
+    environment: &CompatibleClientEnvironment,
+    executable: &PinnedCompatibleClient,
+    kind: CompatibleClientCommandKind<'_>,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+
+    let assignment = |name: &str, value: &Path| {
+        let mut argument = OsString::from(name);
+        argument.push("=");
+        argument.push(value.as_os_str());
+        argument
+    };
+    let mut arguments = vec![
+        OsString::from("-i"),
+        assignment("PATH", &environment.empty_path),
+        assignment("HOME", &environment.home),
+        assignment("XDG_CONFIG_HOME", &environment.config),
+        assignment("XDG_DATA_HOME", &environment.data),
+        assignment("TMPDIR", &environment.temp),
+        OsString::from("LC_ALL=C"),
+        OsString::from("LANG=C"),
+        assignment("FT_WEZTERM_CLI", &environment.nonexistent_external_cli),
+        executable.path.as_os_str().to_owned(),
+        OsString::from("--config"),
+        OsString::from("/dev/stdin"),
+        OsString::from("--workspace"),
+        environment.workspace.as_os_str().to_owned(),
+    ];
+    match kind {
+        CompatibleClientCommandKind::Version => arguments.push(OsString::from("version")),
+        CompatibleClientCommandKind::State => {
+            arguments.extend([
+                OsString::from("robot"),
+                OsString::from("--format"),
+                OsString::from("json"),
+                OsString::from("state"),
+            ]);
+        }
+        CompatibleClientCommandKind::GetText {
+            pane_ids,
+            requested_tail,
+        } => {
+            let pane_ids = pane_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            arguments.extend([
+                OsString::from("robot"),
+                OsString::from("--format"),
+                OsString::from("json"),
+                OsString::from("get-text"),
+                OsString::from("--panes"),
+                OsString::from(pane_ids),
+                OsString::from("--tail"),
+                OsString::from(requested_tail.to_string()),
+            ]);
+        }
+    }
+    arguments
+}
+
+#[cfg(unix)]
+async fn run_compatible_client_subprocess(
+    cx: &frankenterm_core::cx::Cx,
+    source: &mut PinnedCompatibleClient,
+    executable: &mut PinnedCompatibleClient,
+    socket: &PinnedCompatibleMuxSocket,
+    environment: &CompatibleClientEnvironment,
+    kind: CompatibleClientCommandKind<'_>,
+    stdout_limit: usize,
+    timeout: Duration,
+) -> anyhow::Result<CompatibleClientCommandReceipt> {
+    source.revalidate("compatible client source")?;
+    executable.revalidate("private compatible client snapshot")?;
+    socket.revalidate()?;
+    anyhow::ensure!(
+        fs::symlink_metadata(&environment.nonexistent_external_cli)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "compatible-client external CLI sentinel unexpectedly exists"
+    );
+    let arguments = compatible_client_command_arguments(environment, executable, kind);
+    let configuration = compatible_client_config_bytes(socket)?;
+    let workspace = environment.workspace.clone();
+    let run_result = run_cli_blocking_with_cx(cx, "compatible-client subprocess", move || {
+        let mut command = frankenterm_core::runtime_async::process::Command::new("/usr/bin/env");
+        command
+            .args(arguments)
+            .current_dir(workspace)
+            .stdin_limit(64 * 1024)
+            .stdin_bytes(configuration)
+            .stdout_limit(stdout_limit)
+            .stderr_limit(COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES)
+            .kill_on_drop(true);
+        let output = command.output_blocking(timeout).map_err(|error| {
+            anyhow::anyhow!(
+                "compatible-client subprocess failed before a bounded complete receipt ({:?})",
+                error.kind()
+            )
+        })?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "compatible-client subprocess returned a non-success status (code={:?}, stdout_bytes={}, stderr_bytes={})",
+                output.status.code(),
+                output.stdout.len(),
+                output.stderr.len()
+            );
+        }
+        Ok(CompatibleClientCommandReceipt {
+            stdout: output.stdout,
+            stderr_bytes: output.stderr.len(),
+        })
+    })
+    .await;
+
+    let source_revalidation = source.revalidate("compatible client source");
+    let snapshot_revalidation = executable.revalidate("private compatible client snapshot");
+    let socket_revalidation = socket.revalidate();
+    if let Err(error) = source_revalidation
+        .and(snapshot_revalidation)
+        .and(socket_revalidation)
+    {
+        return Err(error.context("compatible-client authority changed across subprocess execution"));
+    }
+    run_result
+}
+
+fn parse_compatible_client_version(bytes: &[u8]) -> anyhow::Result<CompatibleClientVersionIdentity> {
+    let expected = format!(
+        "ft {COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION} ({COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH})\n"
+    );
+    anyhow::ensure!(
+        bytes == expected.as_bytes(),
+        "compatible client version output does not match the pinned v0.13.0 release identity"
+    );
+    Ok(CompatibleClientVersionIdentity {
+        version: COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION.to_string(),
+        git_hash: COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH.to_string(),
+    })
+}
+
+fn parse_compatible_client_robot_envelope<T>(
+    bytes: &[u8],
+    limits: JsonStructureLimits,
+) -> anyhow::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    verify_json_structure_bounded(bytes, limits)
+        .map_err(|_| anyhow::anyhow!("compatible-client robot output exceeded or violated its structural contract"))?;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let envelope = CompatibleClientRobotEnvelope::<T>::deserialize(&mut deserializer)
+        .map_err(|_| anyhow::anyhow!("compatible-client robot output did not match the frozen v0.13.0 JSON schema"))?;
+    deserializer
+        .end()
+        .map_err(|_| anyhow::anyhow!("compatible-client robot output contained trailing data"))?;
+    anyhow::ensure!(
+        envelope.ok
+            && envelope.data.is_some()
+            && envelope.error.is_none()
+            && envelope.error_code.is_none()
+            && envelope.hint.is_none()
+            && envelope.schema_version == 1
+            && envelope.version == COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION
+            && envelope.now > 0,
+        "compatible-client robot output was not an exact successful v0.13.0 receipt"
+    );
+    let _elapsed_ms = envelope.elapsed_ms;
+    envelope
+        .data
+        .ok_or_else(|| anyhow::anyhow!("compatible-client robot success receipt omitted its data"))
+}
+
+fn compatible_client_state_json_limits(max_panes: usize) -> JsonStructureLimits {
+    JsonStructureLimits {
+        max_nodes: max_panes.saturating_mul(16).saturating_add(32),
+        max_map_entries: max_panes.saturating_mul(10).saturating_add(16),
+        max_sequence_entries: max_panes.saturating_add(4),
+        max_string_bytes: COMPATIBLE_CLIENT_DUMP_MAX_STATE_OUTPUT_BYTES as u64,
+        max_depth: 8,
+    }
+}
+
+fn compatible_client_batch_json_limits(
+    batch_size: usize,
+    stdout_limit: usize,
+) -> JsonStructureLimits {
+    JsonStructureLimits {
+        max_nodes: batch_size.saturating_mul(16).saturating_add(32),
+        max_map_entries: batch_size.saturating_mul(8).saturating_add(24),
+        max_sequence_entries: batch_size.saturating_add(8),
+        max_string_bytes: u64::try_from(stdout_limit).unwrap_or(u64::MAX),
+        max_depth: 10,
+    }
+}
+
+fn validate_compatible_client_state(
+    mut panes: Vec<CompatibleClientPaneState>,
+    max_panes: usize,
+) -> anyhow::Result<Vec<CompatibleClientPaneState>> {
+    anyhow::ensure!(
+        !panes.is_empty() && panes.len() <= max_panes,
+        "compatible-client census pane count is outside the requested bound"
+    );
+    panes.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
+    let mut pane_ids = BTreeSet::new();
+    for pane in &panes {
+        anyhow::ensure!(
+            pane_ids.insert(pane.pane_id),
+            "compatible-client census contains a duplicate pane identity"
+        );
+        anyhow::ensure!(
+            !pane.domain.is_empty()
+                && pane.domain.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES,
+            "compatible-client census contains invalid domain metadata"
+        );
+        for value in [pane.pane_uuid.as_deref(), pane.title.as_deref(), pane.cwd.as_deref(), pane.ignore_reason.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            anyhow::ensure!(
+                value.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES,
+                "compatible-client census contains overlong metadata"
+            );
+        }
+        if pane.observed {
+            anyhow::ensure!(
+                pane.ignore_reason.is_none(),
+                "compatible-client census observed flag contradicts its ignore reason"
+            );
+        }
+    }
+    Ok(panes)
+}
+
+fn compatible_client_raw_topology(
+    panes: &[CompatibleClientPaneState],
+) -> Vec<CompatibleClientRawPaneTopology> {
+    panes
+        .iter()
+        .map(|pane| CompatibleClientRawPaneTopology {
+            pane_id: pane.pane_id,
+            pane_uuid: pane.pane_uuid.clone(),
+            tab_id: pane.tab_id,
+            window_id: pane.window_id,
+            domain: pane.domain.clone(),
+        })
+        .collect()
+}
+
+fn account_compatible_client_subprocess(
+    accounting: &mut CompatibleClientSubprocessAccounting,
+    receipt: &CompatibleClientCommandReceipt,
+) -> anyhow::Result<()> {
+    accounting.commands = accounting
+        .commands
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("compatible-client subprocess count overflow"))?;
+    accounting.stderr_bytes = accounting
+        .stderr_bytes
+        .checked_add(receipt.stderr_bytes)
+        .ok_or_else(|| anyhow::anyhow!("compatible-client stderr byte count overflow"))?;
+    if receipt.stderr_bytes > 0 {
+        accounting.stderr_warning_commands = accounting
+            .stderr_warning_commands
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("compatible-client warning count overflow"))?;
+    }
+    Ok(())
+}
+
+fn consume_compatible_client_batch(
+    data: CompatibleClientBatchTextData,
+    expected_pane_ids: &[u64],
+    requested_tail: usize,
+    redactor: &frankenterm_core::redactor::Redactor,
+    admitted: &mut BTreeMap<u64, String>,
+    total_content_bytes: &mut usize,
+    max_total_bytes: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        data.pane_ids == expected_pane_ids
+            && data.tail_lines == requested_tail
+            && !data.escapes_included
+            && data.results.len() == expected_pane_ids.len(),
+        "compatible-client batch receipt does not exactly bind its request"
+    );
+    let expected_set = expected_pane_ids.iter().copied().collect::<BTreeSet<_>>();
+    let result_set = data.results.keys().copied().collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        expected_set == result_set,
+        "compatible-client batch result identities do not exactly match its request"
+    );
+    for (pane_id, result) in data.results {
+        let text = match result {
+            CompatibleClientPaneTextResult::Ok {
+                text,
+                truncated,
+                truncation_info,
+            } => {
+                if let Some(info) = truncation_info.as_ref() {
+                    let _ = (
+                        info.original_bytes,
+                        info.returned_bytes,
+                        info.original_lines,
+                        info.returned_lines,
+                    );
+                }
+                anyhow::ensure!(
+                    !truncated && truncation_info.is_none(),
+                    "compatible-client batch returned truncated pane content"
+                );
+                text
+            }
+            CompatibleClientPaneTextResult::Error {
+                code,
+                message,
+                hint,
+            } => {
+                let _content_free_lengths = (code.len(), message.len(), hint.as_deref().map(str::len));
+                anyhow::bail!("compatible-client batch reported a pane capture failure");
+            }
+        };
+        let redacted = redactor.redact(&text);
+        let next_total = total_content_bytes
+            .checked_add(redacted.len())
+            .ok_or_else(|| anyhow::anyhow!("compatible-client aggregate content byte count overflow"))?;
+        anyhow::ensure!(
+            next_total <= max_total_bytes,
+            "compatible-client pane content exceeds the aggregate byte limit"
+        );
+        anyhow::ensure!(
+            admitted.insert(pane_id, redacted).is_none(),
+            "compatible-client pane content was admitted more than once"
+        );
+        *total_content_bytes = next_total;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn compatible_client_identity_value(
+    identity: &CompatibleClientNamedIdentity,
+    sha256: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(identity)
+        .expect("compatible-client identity serialization cannot fail");
+    if let Some(sha256) = sha256 {
+        value
+            .as_object_mut()
+            .expect("compatible-client identity serializes as an object")
+            .insert("sha256".to_string(), serde_json::json!(sha256));
+    }
+    value
+}
+
+#[cfg(unix)]
+fn compatible_client_remaining_timeout(
+    started_at: Instant,
+    total_timeout: Duration,
+    per_command_timeout: Duration,
+) -> anyhow::Result<Duration> {
+    let remaining = total_timeout.checked_sub(started_at.elapsed()).ok_or_else(|| {
+        anyhow::anyhow!("compatible-client capture exhausted its derived total deadline")
+    })?;
+    anyhow::ensure!(
+        !remaining.is_zero(),
+        "compatible-client capture exhausted its derived total deadline"
+    );
+    Ok(remaining.min(per_command_timeout))
+}
+
+#[cfg(unix)]
+async fn capture_compatible_client_dump(
+    cx: &frankenterm_core::cx::Cx,
+    request: &CompatibleClientDumpRequest,
+) -> anyhow::Result<CompatibleClientCapture> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    anyhow::ensure!(
+        (1..=COMPATIBLE_CLIENT_DUMP_MAX_PANES).contains(&request.max_panes),
+        "--max-panes must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_PANES}"
+    );
+    anyhow::ensure!(
+        (1..=LIVE_MUX_DUMP_MAX_TOTAL_BYTES).contains(&request.max_total_bytes),
+        "--max-total-bytes must be in 1..={LIVE_MUX_DUMP_MAX_TOTAL_BYTES}"
+    );
+    anyhow::ensure!(
+        (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE).contains(&request.batch_size),
+        "--batch-size must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE}"
+    );
+    anyhow::ensure!(
+        !request.batch_timeout.is_zero()
+            && request.batch_timeout <= COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT,
+        "--batch-timeout-secs must be in 1..={} seconds",
+        COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT.as_secs()
+    );
+    anyhow::ensure!(
+        (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES)
+            .contains(&request.max_batch_output_bytes),
+        "--max-batch-output-bytes must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES}"
+    );
+    let requested_tail = request
+        .max_total_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("compatible-client tail bound overflow"))?;
+    if fs::symlink_metadata(&request.output).is_ok() {
+        anyhow::bail!("compatible-client dump output already exists; existing paths are never overwritten");
+    }
+
+    let mut source = pin_compatible_client(
+        &request.client,
+        &request.expected_client_sha256,
+        request.expected_client_bytes,
+        "compatible client source",
+    )?;
+    let socket = pin_compatible_mux_socket(&request.mux_socket)?;
+    let environment = create_compatible_client_environment(&request.output)?;
+    let recovery_environment_path_sha256 =
+        sha256_hex(environment.root.as_os_str().as_bytes());
+    let mut executable = snapshot_compatible_client(&mut source, &environment)?;
+    let mut accounting = CompatibleClientSubprocessAccounting::default();
+
+    let version_receipt = run_compatible_client_subprocess(
+        cx,
+        &mut source,
+        &mut executable,
+        &socket,
+        &environment,
+        CompatibleClientCommandKind::Version,
+        32 * 1024,
+        COMPATIBLE_CLIENT_DUMP_VERSION_TIMEOUT,
+    )
+    .await?;
+    account_compatible_client_subprocess(&mut accounting, &version_receipt)?;
+    let version = parse_compatible_client_version(&version_receipt.stdout)?;
+
+    let capture_started_at = Instant::now();
+    let census_a_receipt = run_compatible_client_subprocess(
+        cx,
+        &mut source,
+        &mut executable,
+        &socket,
+        &environment,
+        CompatibleClientCommandKind::State,
+        COMPATIBLE_CLIENT_DUMP_MAX_STATE_OUTPUT_BYTES,
+        request.batch_timeout,
+    )
+    .await?;
+    account_compatible_client_subprocess(&mut accounting, &census_a_receipt)?;
+    let census_a = parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+        &census_a_receipt.stdout,
+        compatible_client_state_json_limits(request.max_panes),
+    )?;
+    let census_a = validate_compatible_client_state(census_a, request.max_panes)?;
+    let raw_topology_a = compatible_client_raw_topology(&census_a);
+    let batch_count = census_a.len().div_ceil(request.batch_size);
+    let stage_count = batch_count
+        .checked_add(2)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| anyhow::anyhow!("compatible-client deadline stage count overflow"))?;
+    let total_timeout = request
+        .batch_timeout
+        .checked_mul(stage_count)
+        .filter(|timeout| *timeout <= COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pane count, batch size, and per-batch timeout derive a total deadline above {} seconds",
+                COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT.as_secs()
+            )
+        })?;
+
+    let redactor = frankenterm_core::redactor::Redactor::new();
+    let mut pane_text = BTreeMap::new();
+    let mut total_content_bytes = 0usize;
+    let pane_ids = census_a.iter().map(|pane| pane.pane_id).collect::<Vec<_>>();
+    for batch in pane_ids.chunks(request.batch_size) {
+        let timeout = compatible_client_remaining_timeout(
+            capture_started_at,
+            total_timeout,
+            request.batch_timeout,
+        )?;
+        let receipt = run_compatible_client_subprocess(
+            cx,
+            &mut source,
+            &mut executable,
+            &socket,
+            &environment,
+            CompatibleClientCommandKind::GetText {
+                pane_ids: batch,
+                requested_tail,
+            },
+            request.max_batch_output_bytes,
+            timeout,
+        )
+        .await?;
+        account_compatible_client_subprocess(&mut accounting, &receipt)?;
+        let data = parse_compatible_client_robot_envelope::<CompatibleClientBatchTextData>(
+            &receipt.stdout,
+            compatible_client_batch_json_limits(batch.len(), request.max_batch_output_bytes),
+        )?;
+        consume_compatible_client_batch(
+            data,
+            batch,
+            requested_tail,
+            &redactor,
+            &mut pane_text,
+            &mut total_content_bytes,
+            request.max_total_bytes,
+        )?;
+    }
+
+    let final_timeout = compatible_client_remaining_timeout(
+        capture_started_at,
+        total_timeout,
+        request.batch_timeout,
+    )?;
+    let census_b_receipt = run_compatible_client_subprocess(
+        cx,
+        &mut source,
+        &mut executable,
+        &socket,
+        &environment,
+        CompatibleClientCommandKind::State,
+        COMPATIBLE_CLIENT_DUMP_MAX_STATE_OUTPUT_BYTES,
+        final_timeout,
+    )
+    .await?;
+    account_compatible_client_subprocess(&mut accounting, &census_b_receipt)?;
+    let census_b = parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+        &census_b_receipt.stdout,
+        compatible_client_state_json_limits(request.max_panes),
+    )?;
+    let census_b = validate_compatible_client_state(census_b, request.max_panes)?;
+    let raw_topology_b = compatible_client_raw_topology(&census_b);
+    anyhow::ensure!(
+        raw_topology_a == raw_topology_b,
+        "compatible-client raw pane topology changed between censuses"
+    );
+    anyhow::ensure!(
+        pane_text.len() == census_a.len(),
+        "compatible-client per-pane outcomes do not cover the census exactly once"
+    );
+
+    let mut domains = BTreeSet::new();
+    let mut pane_records = Vec::with_capacity(census_a.len());
+    for pane in &census_a {
+        let text = pane_text.remove(&pane.pane_id).ok_or_else(|| {
+            anyhow::anyhow!("compatible-client pane outcome is missing after exact accounting")
+        })?;
+        let domain_name = redactor.redact(&pane.domain);
+        domains.insert(domain_name.clone());
+        let text_sha256 = sha256_hex(text.as_bytes());
+        pane_records.push(serde_json::json!({
+            "pane": {
+                "pane_id": pane.pane_id,
+                "tab_id": pane.tab_id,
+                "window_id": pane.window_id,
+                "domain_id": null,
+                "domain_name": domain_name,
+                "domain_identity_authority": if pane.domain == "local" {
+                    "defaulted_local_without_domain_authority"
+                } else {
+                    "inferred_from_cwd_uri_authority"
+                },
+                "identity_stability": "mux_incarnation_local_ephemeral",
+                "workspace": null,
+                "rows": 0,
+                "cols": 0,
+                "title": pane.title.as_deref().map(|value| redactor.redact(value)),
+                "cwd": pane.cwd.as_deref().map(|value| redactor.redact(value)),
+                "tty_name": null,
+                "cursor_x": null,
+                "cursor_y": null,
+                "cursor_visibility": null,
+                "left_col": null,
+                "top_row": null,
+                "is_active": false,
+                "is_zoomed": false,
+            },
+            "content": {
+                "encoding": "utf-8",
+                "redaction_applied": true,
+                "bytes": text.len(),
+                "lines": text.lines().count(),
+                "sha256": text_sha256,
+                "text": text,
+            },
+        }));
+    }
+    anyhow::ensure!(pane_text.is_empty(), "compatible-client pane outcome inventory is inconsistent");
+    let topology_sha256 = mux_dump_topology_fingerprint_from_records(&pane_records)?;
+    let mut initial_pane_ids = pane_ids;
+    initial_pane_ids.sort_unstable();
+    let source_identity = compatible_client_identity_value(&source.identity, Some(&source.sha256));
+    let socket_identity = compatible_client_identity_value(&socket.identity, None);
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "created_at_epoch_ms": u64::try_from(now_epoch_ms()).unwrap_or(0),
+        "source": {
+            "kind": "live_mux",
+            "ft_version": &version.version,
+            "git_hash": &version.git_hash,
+            "capture_transport": COMPATIBLE_CLIENT_DUMP_CAPTURE_TRANSPORT,
+            "backend_constraint": COMPATIBLE_CLIENT_DUMP_BACKEND_CONSTRAINT,
+            "client": source_identity,
+            "mux_socket": {
+                "path_sha256": &socket.path_sha256,
+                "identity": socket_identity,
+            },
+            "recovery_environment": {
+                "retained": true,
+                "path_sha256": &recovery_environment_path_sha256,
+            },
+        },
+        "complete": true,
+        "completeness_semantics": {
+            "meaning": "every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing",
+            "point_in_time_content_snapshot": false,
+            "pane_content_consistency": "sequential_best_effort_non_atomic",
+            "topology_consistency": "double_list_fingerprint",
+        },
+        "capabilities": {
+            "forensic_text_export": true,
+            "bounded_topology_metadata": true,
+            "executable_restore_image": false,
+            "terminal_parser_render_state": false,
+            "pty_descriptor_state": false,
+            "process_memory_state": false,
+            "running_process_continuity": false,
+            "stable_cross_restart_pane_identity": false,
+        },
+        "redaction_applied": true,
+        "limits": {
+            "max_panes": request.max_panes,
+            "max_total_bytes": request.max_total_bytes,
+        },
+        "summary": {
+            "panes_listed_initial": census_a.len(),
+            "panes_listed_final": census_b.len(),
+            "panes_captured": pane_records.len(),
+            "content_bytes": total_content_bytes,
+            "capture_errors": 0,
+            "domains": domains,
+        },
+        "topology_fence": {
+            "kind": "double_list_fingerprint",
+            "fingerprint_scope": "pane_tab_window_redacted_domain_workspace_geometry_active_zoom",
+            "initial_pane_ids": initial_pane_ids,
+            "initial_sha256": &topology_sha256,
+            "final_sha256": &topology_sha256,
+            "stable": true,
+            "mux_session_incarnation": null,
+            "authoritative_topology_revision": null,
+        },
+        "panes": pane_records,
+        "errors": [],
+    });
+    Ok(CompatibleClientCapture {
+        payload,
+        recovery_environment_path: environment.root,
+        recovery_environment_path_sha256,
+        client_sha256: source.sha256,
+        client_bytes: source.identity.byte_len,
+        client_version: version.version,
+        client_git_hash: version.git_hash,
+        mux_socket_path_sha256: socket.path_sha256,
+        subprocess_count: accounting.commands,
+        stderr_warning_commands: accounting.stderr_warning_commands,
+        stderr_bytes: accounting.stderr_bytes,
+        total_deadline_ms: total_timeout.as_millis(),
+    })
+}
+
+#[cfg(not(unix))]
+async fn capture_compatible_client_dump(
+    _cx: &frankenterm_core::cx::Cx,
+    _request: &CompatibleClientDumpRequest,
+) -> anyhow::Result<CompatibleClientCapture> {
+    anyhow::bail!("compatible-client dump requires Unix descriptor and socket identity support")
+}
+
+fn publish_mux_dump_payload(
+    output_path: &Path,
+    dump: serde_json::Value,
+) -> anyhow::Result<PublishedMuxDumpReceipt> {
+    let complete = dump
+        .get("complete")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let pane_count = dump
+        .get("panes")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let error_count = dump
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let (_payload_bytes, payload_sha256) = hash_json_bounded(
+        &dump,
+        LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+        JsonSerializationStyle::Compact,
+    )
+    .context("Failed to hash mux dump payload within the artifact safety limit")?;
+    let envelope = serde_json::json!({
+        "schema": "frankenterm.mux-content-dump.v1",
+        "publication_state": "complete",
+        "payload_sha256": &payload_sha256,
+        "payload": dump,
+    });
+    let mut artifact_bytes = serialize_json_bounded(
+        &envelope,
+        LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES.saturating_sub(1),
+        JsonSerializationStyle::Pretty,
+    )
+    .context("Failed to serialize mux dump envelope within the artifact safety limit")?;
+    drop(envelope);
+    artifact_bytes.push(b'\n');
+    let artifact_receipt = write_new_private_artifact(output_path, &artifact_bytes)?;
+    drop(artifact_bytes);
+    let verification = verify_mux_dump_artifact(output_path).with_context(|| {
+        format!(
+            "Mux dump was durably retained at {}, but its offline verifier rejected the published artifact",
+            output_path.display()
+        )
+    })?;
+    if verification.payload_sha256 != payload_sha256
+        || verification.artifact_sha256 != artifact_receipt.sha256
+        || verification.artifact_bytes != artifact_receipt.bytes
+        || verification.capture_complete != complete
+        || verification.pane_count != pane_count
+        || verification.error_count != error_count
+    {
+        anyhow::bail!(
+            "Mux dump was durably retained at {}, but its verified publication receipt disagrees with the producer receipt",
+            output_path.display()
+        );
+    }
+    Ok(PublishedMuxDumpReceipt {
+        complete,
+        pane_count,
+        error_count,
+        content_bytes: verification.content_bytes,
+        payload_sha256,
+        artifact_sha256: verification.artifact_sha256,
+        artifact_bytes: verification.artifact_bytes,
+        durability: artifact_receipt.durability,
+    })
+}
+
+async fn run_compatible_client_dump_command(
+    cx: &frankenterm_core::cx::Cx,
+    request: CompatibleClientDumpRequest,
+    format: &str,
+) -> anyhow::Result<()> {
+    let output_format = resolve_session_orphan_output_format(format);
+    let capture = capture_compatible_client_dump(cx, &request).await?;
+    let output_path = request.output;
+    let CompatibleClientCapture {
+        payload,
+        recovery_environment_path,
+        recovery_environment_path_sha256,
+        client_sha256,
+        client_bytes,
+        client_version,
+        client_git_hash,
+        mux_socket_path_sha256,
+        subprocess_count,
+        stderr_warning_commands,
+        stderr_bytes,
+        total_deadline_ms,
+    } = capture;
+    let publication_path = output_path.clone();
+    let published = run_cli_blocking_with_cx(cx, "compatible-client dump publication", move || {
+        publish_mux_dump_payload(&publication_path, payload)
+    })
+    .await?;
+    anyhow::ensure!(
+        published.complete && published.error_count == 0,
+        "compatible-client dump verifier did not certify a complete forensic artifact"
+    );
+    let receipt = CompatibleClientDumpReceipt {
+        path: output_path,
+        recovery_environment_path,
+        recovery_environment_path_sha256,
+        pane_count: published.pane_count,
+        content_bytes: published.content_bytes,
+        payload_sha256: published.payload_sha256,
+        artifact_sha256: published.artifact_sha256,
+        artifact_bytes: published.artifact_bytes,
+        client_sha256,
+        client_bytes,
+        client_version,
+        client_git_hash,
+        mux_socket_path_sha256,
+        subprocess_count,
+        stderr_warning_commands,
+        stderr_bytes,
+        total_deadline_ms,
+    };
+    let result = serde_json::json!({
+        "ok": true,
+        "action": "compatible_client_dump",
+        "path": receipt.path.display().to_string(),
+        "pane_count": receipt.pane_count,
+        "content_bytes": receipt.content_bytes,
+        "payload_sha256": &receipt.payload_sha256,
+        "artifact_sha256": &receipt.artifact_sha256,
+        "artifact_bytes": receipt.artifact_bytes,
+        "client_sha256": &receipt.client_sha256,
+        "client_bytes": receipt.client_bytes,
+        "client_version": &receipt.client_version,
+        "client_git_hash": &receipt.client_git_hash,
+        "mux_socket_path_sha256": &receipt.mux_socket_path_sha256,
+        "subprocess_count": receipt.subprocess_count,
+        "stderr_warning_commands": receipt.stderr_warning_commands,
+        "stderr_bytes": receipt.stderr_bytes,
+        "total_deadline_ms": receipt.total_deadline_ms,
+        "durability": published.durability,
+        "redaction_applied": true,
+        "forensic_text_export": true,
+        "executable_restore_image": false,
+        "retained_recovery_environment": true,
+        "recovery_environment_path": receipt.recovery_environment_path.display().to_string(),
+        "recovery_environment_path_sha256": &receipt.recovery_environment_path_sha256,
+        "production_mux_activation": false,
+    });
+    if !print_snapshot_session_structured_output(&result, output_format)? {
+        println!("Compatible-client mux content dump written and verified");
+        println!("  File:                 {}", receipt.path.display());
+        println!("  Panes:                {}", receipt.pane_count);
+        println!("  Content bytes:        {}", receipt.content_bytes);
+        println!("  Payload SHA-256:      {}", receipt.payload_sha256);
+        println!("  Artifact SHA-256:     {}", receipt.artifact_sha256);
+        println!("  Client:               {} ({})", receipt.client_version, receipt.client_git_hash);
+        println!("  Client SHA-256:       {}", receipt.client_sha256);
+        println!("  Recovery environment: {}", receipt.recovery_environment_path.display());
+        println!("  Content:              redacted forensic text only");
+        println!("  Executable restore:   false");
+        println!("  Mux activation:       disabled");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77906,6 +79093,209 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
     Ok(bytes)
 }
 
+fn require_compatible_client_identity_receipt(
+    value: &serde_json::Value,
+    include_sha256: bool,
+    label: &str,
+) -> anyhow::Result<(u32, u32, u64)> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Mux dump {label} identity is not an object"))?;
+    let mut keys = vec![
+        "device",
+        "inode",
+        "uid",
+        "gid",
+        "mode",
+        "hard_link_count",
+        "byte_len",
+        "modified_seconds",
+        "modified_nanoseconds",
+        "changed_seconds",
+        "changed_nanoseconds",
+    ];
+    if include_sha256 {
+        keys.push("sha256");
+    }
+    require_exact_json_object_keys(object, &keys, label)?;
+    let required_u64 = |field: &str| {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump {label} identity field {field} is invalid"))
+    };
+    let device = required_u64("device")?;
+    let inode = required_u64("inode")?;
+    let uid = u32::try_from(required_u64("uid")?)
+        .map_err(|_| anyhow::anyhow!("Mux dump {label} uid is invalid"))?;
+    let gid = u32::try_from(required_u64("gid")?)
+        .map_err(|_| anyhow::anyhow!("Mux dump {label} gid is invalid"))?;
+    let mode = u32::try_from(required_u64("mode")?)
+        .map_err(|_| anyhow::anyhow!("Mux dump {label} mode is invalid"))?;
+    let hard_link_count = required_u64("hard_link_count")?;
+    let byte_len = required_u64("byte_len")?;
+    anyhow::ensure!(
+        device > 0
+            && inode > 0
+            && mode <= 0o7777
+            && hard_link_count == 1
+            && object
+                .get("modified_seconds")
+                .and_then(serde_json::Value::as_i64)
+                .is_some()
+            && object
+                .get("modified_nanoseconds")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|value| (0..1_000_000_000).contains(&value))
+            && object
+                .get("changed_seconds")
+                .and_then(serde_json::Value::as_i64)
+                .is_some()
+            && object
+                .get("changed_nanoseconds")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|value| (0..1_000_000_000).contains(&value)),
+        "Mux dump {label} identity metadata is invalid"
+    );
+    if include_sha256 {
+        let sha256 = object
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump {label} SHA-256 is missing"))?;
+        anyhow::ensure!(
+            is_canonical_lowercase_sha256(sha256)
+                && sha256.bytes().any(|byte| byte != b'0')
+                && byte_len > 0
+                && byte_len <= COMPATIBLE_CLIENT_DUMP_MAX_CLIENT_BYTES
+                && mode & 0o100 != 0
+                && mode & 0o7022 == 0,
+            "Mux dump {label} executable identity is invalid"
+        );
+    }
+    Ok((uid, gid, byte_len))
+}
+
+fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result<()> {
+    let object = source
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Mux dump source metadata is not an object"))?;
+    if object.len() == 3 {
+        require_exact_json_object_keys(
+            object,
+            &["kind", "ft_version", "git_hash"],
+            "source metadata",
+        )?;
+        anyhow::ensure!(
+            source.get("kind").and_then(serde_json::Value::as_str) == Some("live_mux")
+                && source
+                    .get("ft_version")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                && source
+                    .get("git_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty()),
+            "Mux dump source identity metadata is invalid"
+        );
+        return Ok(());
+    }
+
+    require_exact_json_object_keys(
+        object,
+        &[
+            "kind",
+            "ft_version",
+            "git_hash",
+            "capture_transport",
+            "backend_constraint",
+            "client",
+            "mux_socket",
+            "recovery_environment",
+        ],
+        "compatible-client source metadata",
+    )?;
+    anyhow::ensure!(
+        source.get("kind").and_then(serde_json::Value::as_str) == Some("live_mux")
+            && source
+                .get("ft_version")
+                .and_then(serde_json::Value::as_str)
+                == Some(COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION)
+            && source
+                .get("git_hash")
+                .and_then(serde_json::Value::as_str)
+                == Some(COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH)
+            && source
+                .get("capture_transport")
+                .and_then(serde_json::Value::as_str)
+                == Some(COMPATIBLE_CLIENT_DUMP_CAPTURE_TRANSPORT)
+            && source
+                .get("backend_constraint")
+                .and_then(serde_json::Value::as_str)
+                == Some(COMPATIBLE_CLIENT_DUMP_BACKEND_CONSTRAINT),
+        "Mux dump compatible-client source contract is invalid"
+    );
+    let (client_uid, _client_gid, _client_bytes) = require_compatible_client_identity_receipt(
+        source
+            .get("client")
+            .ok_or_else(|| anyhow::anyhow!("Mux dump compatible-client identity is missing"))?,
+        true,
+        "compatible client",
+    )?;
+    let socket = source
+        .get("mux_socket")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump compatible socket receipt is invalid"))?;
+    require_exact_json_object_keys(
+        socket,
+        &["path_sha256", "identity"],
+        "compatible socket receipt",
+    )?;
+    let path_sha256 = socket
+        .get("path_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump compatible socket path digest is missing"))?;
+    anyhow::ensure!(
+        is_canonical_lowercase_sha256(path_sha256)
+            && path_sha256.bytes().any(|byte| byte != b'0'),
+        "Mux dump compatible socket path digest is invalid"
+    );
+    let (socket_uid, _socket_gid, socket_bytes) = require_compatible_client_identity_receipt(
+        socket
+            .get("identity")
+            .ok_or_else(|| anyhow::anyhow!("Mux dump compatible socket identity is missing"))?,
+        false,
+        "compatible socket",
+    )?;
+    let socket_mode = socket
+        .pointer("/identity/mode")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    anyhow::ensure!(
+        socket_uid == client_uid && socket_bytes == 0 && socket_mode & 0o022 == 0,
+        "Mux dump compatible socket identity is inconsistent with its client"
+    );
+    let recovery = source
+        .get("recovery_environment")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump recovery environment receipt is invalid"))?;
+    require_exact_json_object_keys(
+        recovery,
+        &["retained", "path_sha256"],
+        "recovery environment receipt",
+    )?;
+    let recovery_path_sha256 = recovery
+        .get("path_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump recovery environment path digest is missing"))?;
+    anyhow::ensure!(
+        recovery.get("retained").and_then(serde_json::Value::as_bool) == Some(true)
+            && is_canonical_lowercase_sha256(recovery_path_sha256)
+            && recovery_path_sha256.bytes().any(|byte| byte != b'0'),
+        "Mux dump recovery environment retention receipt is invalid"
+    );
+    Ok(())
+}
+
 fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationReceipt> {
     let persisted = read_private_artifact_bounded(path, LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES)?;
     let artifact_bytes = u64::try_from(persisted.len()).unwrap_or(u64::MAX);
@@ -78001,28 +79391,13 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .get("created_at_epoch_ms")
         .and_then(serde_json::Value::as_u64)
         .is_none()
-        || payload
-            .pointer("/source/kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("live_mux")
-        || !payload
-            .pointer("/source/ft_version")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.is_empty())
-        || !payload
-            .pointer("/source/git_hash")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.is_empty())
     {
         anyhow::bail!("Mux dump source identity metadata is invalid");
     }
-    require_exact_json_object_keys(
+    verify_mux_dump_source_metadata(
         payload
             .get("source")
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| anyhow::anyhow!("Mux dump source metadata is not an object"))?,
-        &["kind", "ft_version", "git_hash"],
-        "source metadata",
+            .ok_or_else(|| anyhow::anyhow!("Mux dump source metadata is missing"))?,
     )?;
     require_exact_json_object_keys(
         payload

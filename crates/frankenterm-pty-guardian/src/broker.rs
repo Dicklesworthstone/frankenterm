@@ -237,36 +237,47 @@ impl BrokerControlRequestHeaderV1 {
                     && !self.operation_id.is_nil()
                     && payload_bytes > 0
             }
-            BrokerControlOperationV1::QueryEffect
-            | BrokerControlOperationV1::AcknowledgeEffect
-            | BrokerControlOperationV1::AttachSuccessor
-            | BrokerControlOperationV1::ClosePane => {
+            BrokerControlOperationV1::QueryEffect | BrokerControlOperationV1::AcknowledgeEffect => {
+                // Generation zero is reserved for querying or acknowledging
+                // the pre-lease Spawn effect. Once a pane lease exists, the
+                // exact nonzero generation fences every other effect receipt.
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == 0
+            }
+            BrokerControlOperationV1::AttachSuccessor | BrokerControlOperationV1::ClosePane => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && self.lease_generation > 0
                     && !self.operation_id.is_nil()
                     && payload_bytes == 0
             }
             BrokerControlOperationV1::Write => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
+                    && self.lease_generation > 0
                     && !self.operation_id.is_nil()
                     && payload_bytes > 0
             }
             BrokerControlOperationV1::Resize => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
+                    && self.lease_generation > 0
                     && !self.operation_id.is_nil()
                     && payload_bytes == 8
             }
             BrokerControlOperationV1::ReadOutput => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
+                    && self.lease_generation > 0
                     && !self.operation_id.is_nil()
                     && payload_bytes == 4
             }
             BrokerControlOperationV1::AcknowledgeOutput => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
+                    && self.lease_generation > 0
                     && !self.operation_id.is_nil()
                     && payload_bytes == 8
             }
@@ -353,15 +364,91 @@ impl BrokerControlResponseHeaderV1 {
                 .map_err(|_| BrokerControlProtocolError::InvalidIdentity)?;
         }
         let pane_scoped = !self.durable_pane_id.is_nil() && !self.operation_id.is_nil();
+        let global_scoped = self.durable_pane_id.is_nil()
+            && self.lease_generation == 0
+            && self.operation_id.is_nil();
+        let empty_effect = self.child_identity.is_none()
+            && self.output_sequence_start == 0
+            && self.output_sequence_end == 0
+            && payload_bytes == 0;
+        let successful = matches!(
+            self.status,
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+        );
+        let unsuccessful = matches!(
+            self.status,
+            BrokerControlResponseStatusV1::Rejected
+                | BrokerControlResponseStatusV1::Retryable
+                | BrokerControlResponseStatusV1::Quarantined
+        );
         let valid = match self.operation {
-            BrokerControlOperationV1::Hello | BrokerControlOperationV1::Census => {
-                self.durable_pane_id.is_nil()
-                    && self.lease_generation == 0
-                    && self.operation_id.is_nil()
-                    && self.child_identity.is_none()
+            BrokerControlOperationV1::Hello => {
+                global_scoped && empty_effect && (successful || unsuccessful)
             }
-            BrokerControlOperationV1::ReadOutput => pane_scoped,
-            _ => pane_scoped && payload_bytes == 0,
+            BrokerControlOperationV1::Census => {
+                global_scoped
+                    && self.child_identity.is_none()
+                    && self.output_sequence_start == 0
+                    && self.output_sequence_end == 0
+                    && (successful || (unsuccessful && payload_bytes == 0))
+            }
+            BrokerControlOperationV1::Spawn => {
+                pane_scoped
+                    && self.output_sequence_start == 0
+                    && self.output_sequence_end == 0
+                    && payload_bytes == 0
+                    && ((successful && self.lease_generation > 0 && self.child_identity.is_some())
+                        || (unsuccessful
+                            && self.lease_generation == 0
+                            && self.child_identity.is_none()))
+            }
+            BrokerControlOperationV1::QueryEffect => {
+                pane_scoped
+                    && self.output_sequence_start == 0
+                    && self.output_sequence_end == 0
+                    && payload_bytes == 0
+                    && ((successful
+                        && ((self.lease_generation == 0 && self.child_identity.is_some())
+                            || (self.lease_generation > 0 && self.child_identity.is_none())))
+                        || (unsuccessful && self.child_identity.is_none()))
+            }
+            BrokerControlOperationV1::AcknowledgeEffect => {
+                pane_scoped && empty_effect && (successful || unsuccessful)
+            }
+            BrokerControlOperationV1::Write
+            | BrokerControlOperationV1::Resize
+            | BrokerControlOperationV1::AcknowledgeOutput
+            | BrokerControlOperationV1::AttachSuccessor => {
+                pane_scoped
+                    && self.lease_generation > 0
+                    && empty_effect
+                    && (successful || unsuccessful)
+            }
+            BrokerControlOperationV1::ClosePane => {
+                pane_scoped
+                    && self.lease_generation > 0
+                    && empty_effect
+                    && (successful
+                        || unsuccessful
+                        || self.status == BrokerControlResponseStatusV1::Terminal)
+            }
+            BrokerControlOperationV1::ReadOutput => {
+                let output_bytes = self
+                    .output_sequence_end
+                    .checked_sub(self.output_sequence_start)
+                    .and_then(|bytes| usize::try_from(bytes).ok());
+                pane_scoped
+                    && self.lease_generation > 0
+                    && self.child_identity.is_none()
+                    && ((successful && output_bytes == Some(payload_bytes))
+                        || (unsuccessful
+                            && self.output_sequence_start == 0
+                            && self.output_sequence_end == 0
+                            && payload_bytes == 0)
+                        || (self.status == BrokerControlResponseStatusV1::Terminal
+                            && output_bytes == Some(0)
+                            && payload_bytes == 0))
+            }
         };
         if valid {
             Ok(())
@@ -3759,7 +3846,7 @@ impl BrokerPreparedPaneV1 {
             spawn_effect_id: self.binding.spawn_effect_id,
             attachment_id: self.initial_attachment_id,
             owner: self.initial_owner,
-            lease_generation: 0,
+            lease_generation: 1,
         };
         let attachment = BrokerPtyAttachmentV1 {
             identity: attachment_identity,
@@ -5144,6 +5231,144 @@ mod tests {
             invalid_write,
             Err(BrokerControlProtocolError::InvalidShape)
         ));
+
+        let leased_operations: [(BrokerControlOperationV1, &[u8]); 6] = [
+            (BrokerControlOperationV1::Write, b"must-be-fenced"),
+            (BrokerControlOperationV1::Resize, &[0; 8]),
+            (BrokerControlOperationV1::ReadOutput, &[0; 4]),
+            (BrokerControlOperationV1::AcknowledgeOutput, &[0; 8]),
+            (BrokerControlOperationV1::AttachSuccessor, &[]),
+            (BrokerControlOperationV1::ClosePane, &[]),
+        ];
+        for (operation, payload) in leased_operations {
+            let zero_generation_request = BrokerControlRequestV1::new(
+                BrokerControlRequestHeaderV1 {
+                    operation,
+                    request_id: id(709),
+                    broker_incarnation: id(705),
+                    guardian_incarnation: id(702),
+                    connection_id: id(703),
+                    mux_incarnation: id(704),
+                    guardian_build_identity_digest: [0x71; 32],
+                    mux_build_identity_digest: [0x72; 32],
+                    durable_pane_id: id(707),
+                    lease_generation: 0,
+                    operation_id: id(710),
+                },
+                payload,
+            );
+            assert!(
+                matches!(
+                    zero_generation_request,
+                    Err(BrokerControlProtocolError::InvalidShape)
+                ),
+                "{operation:?} accepted reserved generation zero"
+            );
+        }
+
+        for operation in [
+            BrokerControlOperationV1::QueryEffect,
+            BrokerControlOperationV1::AcknowledgeEffect,
+        ] {
+            BrokerControlRequestV1::new(
+                BrokerControlRequestHeaderV1 {
+                    operation,
+                    request_id: id(709),
+                    broker_incarnation: id(705),
+                    guardian_incarnation: id(702),
+                    connection_id: id(703),
+                    mux_incarnation: id(704),
+                    guardian_build_identity_digest: [0x71; 32],
+                    mux_build_identity_digest: [0x72; 32],
+                    durable_pane_id: id(707),
+                    lease_generation: 0,
+                    operation_id: id(710),
+                },
+                &[],
+            )
+            .expect("generation zero is reserved for the pre-lease Spawn receipt");
+        }
+
+        let child_identity = BrokerKernelChildIdentityV1 {
+            process_id: 711,
+            broker_child_nonce: id(712),
+            kernel_start_identity_digest: [0x73; 32],
+        };
+        let forged_rejected_write = BrokerControlResponseV1::new(
+            BrokerControlResponseHeaderV1 {
+                operation: BrokerControlOperationV1::Write,
+                status: BrokerControlResponseStatusV1::Rejected,
+                request_id: id(713),
+                broker_incarnation: id(705),
+                guardian_incarnation: id(702),
+                connection_id: id(703),
+                durable_pane_id: id(707),
+                lease_generation: 1,
+                operation_id: id(714),
+                child_identity: Some(child_identity),
+                output_sequence_start: 0,
+                output_sequence_end: 0,
+            },
+            &[],
+        );
+        assert!(matches!(
+            forged_rejected_write,
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+
+        let mismatched_read_range = BrokerControlResponseV1::new(
+            BrokerControlResponseHeaderV1 {
+                operation: BrokerControlOperationV1::ReadOutput,
+                status: BrokerControlResponseStatusV1::Applied,
+                request_id: id(715),
+                broker_incarnation: id(705),
+                guardian_incarnation: id(702),
+                connection_id: id(703),
+                durable_pane_id: id(707),
+                lease_generation: 1,
+                operation_id: id(716),
+                child_identity: None,
+                output_sequence_start: 40,
+                output_sequence_end: 44,
+            },
+            b"five!",
+        );
+        assert!(matches!(
+            mismatched_read_range,
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+
+        let spawn_query = BrokerControlResponseV1::new(
+            BrokerControlResponseHeaderV1 {
+                operation: BrokerControlOperationV1::QueryEffect,
+                status: BrokerControlResponseStatusV1::Recovered,
+                request_id: id(717),
+                broker_incarnation: id(705),
+                guardian_incarnation: id(702),
+                connection_id: id(703),
+                durable_pane_id: id(707),
+                lease_generation: 0,
+                operation_id: id(718),
+                child_identity: Some(child_identity),
+                output_sequence_start: 0,
+                output_sequence_end: 0,
+            },
+            &[],
+        )
+        .expect("generation-zero QueryEffect may recover only Spawn identity");
+        assert_eq!(spawn_query.header.child_identity, Some(child_identity));
+
+        let forged_leased_query = BrokerControlResponseV1::new(
+            BrokerControlResponseHeaderV1 {
+                lease_generation: 1,
+                ..spawn_query.header
+            },
+            &[],
+        );
+        assert!(matches!(
+            forged_leased_query,
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
     }
 
     #[test]
@@ -5692,7 +5917,7 @@ mod tests {
         );
         assert_eq!(
             pane.observe_authenticated_control_eof(eof),
-            Ok(BrokerControlEofOutcomeV1::AwaitingSuccessor { next_generation: 1 })
+            Ok(BrokerControlEofOutcomeV1::AwaitingSuccessor { next_generation: 2 })
         );
         assert_eq!(
             pane.execute_proxy_write(stale_write, b"stale\n"),
@@ -5749,7 +5974,7 @@ mod tests {
                 panic!("first handoff cannot already be applied")
             }
         };
-        assert_eq!(successor_attachment.identity().lease_generation(), 1);
+        assert_eq!(successor_attachment.identity().lease_generation(), 2);
         assert_eq!(pane.child_identity(), child_identity);
         assert_eq!(pane.resource_usage().broker_pty_descriptors, 3);
         assert_eq!(pane.resource_usage().live_guardian_leases, 1);
