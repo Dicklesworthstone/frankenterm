@@ -31,11 +31,9 @@ use frankenterm_term::{Alert, ClipboardSelection, SemanticZone, StableRowIndex, 
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
-#[cfg(test)]
-use mux::tab::PaneEntry;
 use mux::tab::{
-    FloatingPaneRect, PaneArena, PaneArenaNode, PaneArenaTree, PaneArenaWindowTitle, PaneNode,
-    SerdeUrl, SplitRequest, TabId, TabStackId,
+    FloatingPaneRect, PaneArena, PaneArenaNode, PaneArenaTree, PaneArenaWindowTitle, PaneEntry,
+    PaneNode, SerdeUrl, SplitDirectionAndSize, SplitRequest, TabId, TabStackId,
 };
 use mux::window::WindowId;
 use mux::{MuxSessionIncarnation, TopologyRevision};
@@ -1082,6 +1080,14 @@ fn buffered_frame_len_with_limit(
     buffer: &[u8],
     max_frame_bytes: usize,
 ) -> anyhow::Result<Option<usize>> {
+    buffered_frame_len_with_dialect_limit(buffer, max_frame_bytes, None)
+}
+
+fn buffered_frame_len_with_dialect_limit(
+    buffer: &[u8],
+    max_frame_bytes: usize,
+    dialect: Option<MuxWireDialect>,
+) -> anyhow::Result<Option<usize>> {
     let mut slice = buffer;
     let tagged_len = match leb128::read::unsigned(&mut slice) {
         Ok(len) => len,
@@ -1154,7 +1160,16 @@ fn buffered_frame_len_with_limit(
         ident,
         ident_len,
     )?;
-    validate_encoded_body_admission(data_len, serial, ident, is_compressed)?;
+    match dialect {
+        Some(dialect) => validate_encoded_body_admission_for_dialect(
+            data_len,
+            serial,
+            ident,
+            is_compressed,
+            dialect,
+        )?,
+        None => validate_encoded_body_admission(data_len, serial, ident, is_compressed)?,
+    }
 
     if !frame_complete {
         return Ok(None);
@@ -1422,10 +1437,39 @@ fn validate_encoded_body_admission(
     Ok(())
 }
 
+fn validate_encoded_body_admission_for_dialect(
+    data_len: usize,
+    serial: u64,
+    ident: u64,
+    is_compressed: bool,
+    dialect: MuxWireDialect,
+) -> anyhow::Result<()> {
+    let max_payload_bytes = dialect.maximum_encoded_payload_bytes(ident, is_compressed);
+    if data_len > max_payload_bytes {
+        return Err(PduEncodedBodyLimitExceeded {
+            declared_payload_bytes: data_len,
+            max_payload_bytes,
+            serial,
+            ident,
+            is_compressed,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Validate and consume only a frame header, leaving its payload unread.
 async fn decode_raw_header_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
+) -> anyhow::Result<PduFrameHeader> {
+    decode_raw_header_async_with_dialect(r, max_serial, None).await
+}
+
+async fn decode_raw_header_async_with_dialect<R: Unpin + AsyncRead + std::fmt::Debug>(
+    r: &mut R,
+    max_serial: Option<u64>,
+    dialect: Option<MuxWireDialect>,
 ) -> anyhow::Result<PduFrameHeader> {
     let (len, _len_len) = read_u64_async_with_len(r)
         .await
@@ -1455,7 +1499,16 @@ async fn decode_raw_header_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         ident_len,
     )?;
 
-    validate_encoded_body_admission(data_len, serial, ident, is_compressed)?;
+    match dialect {
+        Some(dialect) => validate_encoded_body_admission_for_dialect(
+            data_len,
+            serial,
+            ident,
+            is_compressed,
+            dialect,
+        )?,
+        None => validate_encoded_body_admission(data_len, serial, ident, is_compressed)?,
+    }
 
     if is_compressed {
         metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
@@ -1570,6 +1623,47 @@ fn decode_raw_impl<R: std::io::Read>(mut r: R, record_metrics: bool) -> anyhow::
     let data_len = decoded_payload_len("decode_raw", len, serial, serial_len, ident, ident_len)?;
 
     validate_encoded_body_admission(data_len, serial, ident, is_compressed)?;
+
+    if record_metrics {
+        if is_compressed {
+            metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
+        } else {
+            metrics::histogram!("pdu.decode.size").record(data_len as f64);
+        }
+    }
+
+    let data = read_payload_chunked(&mut r, data_len, len, serial, ident)?;
+    Ok(Decoded {
+        ident,
+        serial,
+        data,
+        is_compressed,
+    })
+}
+
+fn decode_raw_for_dialect<R: std::io::Read>(
+    mut r: R,
+    record_metrics: bool,
+    dialect: MuxWireDialect,
+) -> anyhow::Result<Decoded> {
+    let (len, _len_len) = read_u64_with_len(&mut r).context("reading PDU length")?;
+    let (len, is_compressed) = if (len & COMPRESSED_MASK) != 0 {
+        (len & !COMPRESSED_MASK, true)
+    } else {
+        (len, false)
+    };
+    let (serial, serial_len) = read_u64_with_len(&mut r).context("reading PDU serial")?;
+    let (ident, ident_len) = read_u64_with_len(&mut r).context("reading PDU ident")?;
+    let data_len = decoded_payload_len(
+        "decode_raw_for_dialect",
+        len,
+        serial,
+        serial_len,
+        ident,
+        ident_len,
+    )?;
+
+    validate_encoded_body_admission_for_dialect(data_len, serial, ident, is_compressed, dialect)?;
 
     if record_metrics {
         if is_compressed {
@@ -4199,6 +4293,248 @@ pub const CODEC_VERSION: usize = 64;
 /// silent advances.
 pub const CODEC_VERSION_MIN_SUPPORTED: usize = 61;
 
+/// Exact historical mux dialect supported for reconnecting to v0.13 servers.
+///
+/// This is deliberately not folded into [`CODEC_VERSION_MIN_SUPPORTED`].  The
+/// normal rolling-upgrade window remains 61..=64; codec 46 is an explicitly
+/// selected, schema-by-schema compatibility dialect whose changed wire IDs are
+/// handled below without heuristic fallback.
+pub const LEGACY46_CODEC_VERSION: usize = 46;
+
+/// Closed wire dialect selected by a connection after its peer identity is
+/// established.
+///
+/// The representation is private so a caller cannot forge a current dialect
+/// outside this build's supported window or invent another legacy version.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MuxWireDialect {
+    kind: MuxWireDialectKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MuxWireDialectKind {
+    Current { agreed_codec_version: usize },
+    Legacy46,
+}
+
+/// Invalid construction of a closed mux wire dialect.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error(
+    "current mux wire dialect {agreed_codec_version} is outside the supported window {minimum}..={maximum}"
+)]
+pub struct MuxWireDialectError {
+    agreed_codec_version: usize,
+    minimum: usize,
+    maximum: usize,
+}
+
+impl MuxWireDialectError {
+    #[must_use]
+    pub const fn agreed_codec_version(&self) -> usize {
+        self.agreed_codec_version
+    }
+
+    #[must_use]
+    pub const fn minimum(&self) -> usize {
+        self.minimum
+    }
+
+    #[must_use]
+    pub const fn maximum(&self) -> usize {
+        self.maximum
+    }
+}
+
+impl MuxWireDialect {
+    /// The only supported pre-window compatibility dialect.
+    pub const LEGACY46: Self = Self {
+        kind: MuxWireDialectKind::Legacy46,
+    };
+
+    /// Construct a normal rolling-upgrade dialect after [`check_compat`].
+    pub const fn current(agreed_codec_version: usize) -> Result<Self, MuxWireDialectError> {
+        if agreed_codec_version < CODEC_VERSION_MIN_SUPPORTED
+            || agreed_codec_version > CODEC_VERSION
+        {
+            return Err(MuxWireDialectError {
+                agreed_codec_version,
+                minimum: CODEC_VERSION_MIN_SUPPORTED,
+                maximum: CODEC_VERSION,
+            });
+        }
+        Ok(Self {
+            kind: MuxWireDialectKind::Current {
+                agreed_codec_version,
+            },
+        })
+    }
+
+    /// Exact codec version represented by this dialect.
+    #[must_use]
+    pub const fn codec_version(self) -> usize {
+        match self.kind {
+            MuxWireDialectKind::Current {
+                agreed_codec_version,
+            } => agreed_codec_version,
+            MuxWireDialectKind::Legacy46 => LEGACY46_CODEC_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_legacy46(self) -> bool {
+        matches!(self.kind, MuxWireDialectKind::Legacy46)
+    }
+
+    /// Return whether this exact dialect assigns the supplied wire schema.
+    ///
+    /// Legacy dialect admission is an explicit frozen registry lookup; it is
+    /// never inferred from the current schema's minimum codec version.
+    #[must_use]
+    pub fn admits_wire_spec(self, spec: &PduWireSpec) -> bool {
+        match self.kind {
+            MuxWireDialectKind::Current {
+                agreed_codec_version,
+            } => spec.min_codec_version <= agreed_codec_version,
+            MuxWireDialectKind::Legacy46 => legacy46_knows_ident(spec.ident),
+        }
+    }
+
+    fn maximum_encoded_payload_bytes(self, ident: u64, is_compressed: bool) -> usize {
+        if self.is_legacy46() {
+            if !legacy46_knows_ident(ident) {
+                // A frame outside the frozen v0.13 registry has no payload
+                // schema in this dialect. A zero-body frame can be consumed
+                // as content-free unsupported metadata; any declared body is
+                // rejected before allocation.
+                return 0;
+            }
+            return match ident {
+                ErrorResponse::IDENT => {
+                    if is_compressed {
+                        MAX_LEGACY46_ERROR_RESPONSE_ZSTD_ENCODED_BYTES
+                    } else {
+                        MAX_LEGACY46_ERROR_RESPONSE_DECOMPRESSED_BYTES
+                    }
+                }
+                ListPanesResponse::IDENT => {
+                    if is_compressed {
+                        MAX_LEGACY46_LIST_PANES_RESPONSE_ZSTD_ENCODED_BYTES
+                    } else {
+                        MAX_LEGACY46_LIST_PANES_RESPONSE_DECOMPRESSED_BYTES
+                    }
+                }
+                SendPaste::IDENT => {
+                    if is_compressed {
+                        MAX_LEGACY46_SEND_PASTE_ZSTD_ENCODED_BYTES
+                    } else {
+                        MAX_LEGACY46_SEND_PASTE_DECOMPRESSED_BYTES
+                    }
+                }
+                GetLinesResponse::IDENT | GetPaneRenderChangesResponse::IDENT => {
+                    if is_compressed {
+                        MAX_LEGACY46_TEXT_RENDER_RESPONSE_ZSTD_ENCODED_BYTES
+                    } else {
+                        MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES
+                    }
+                }
+                GetImageCellResponse::IDENT => {
+                    if is_compressed {
+                        MAX_LEGACY46_UNSUPPORTED_IMAGE_RESPONSE_ZSTD_ENCODED_BYTES
+                    } else {
+                        MAX_LEGACY46_UNSUPPORTED_IMAGE_RESPONSE_DECOMPRESSED_BYTES
+                    }
+                }
+                _ => Pdu::wire_spec_for_ident(ident)
+                    .expect("frozen Legacy46 registry entries have current wire specs")
+                    .encoded_body_limit
+                    .maximum_encoded_payload_bytes(is_compressed),
+            };
+        }
+        Pdu::wire_spec_for_ident(ident)
+            .map(|spec| {
+                spec.encoded_body_limit
+                    .maximum_encoded_payload_bytes(is_compressed)
+            })
+            .unwrap_or(MAX_PDU_SIZE)
+    }
+}
+
+fn legacy46_knows_ident(ident: u64) -> bool {
+    // Freeze the exact v0.13 registry rather than using numeric ranges.  A
+    // later build assigning one of the historical gaps must not silently add
+    // that new schema to Legacy46.
+    matches!(
+        ident,
+        0 | 1
+            | 2
+            | 3
+            | 4
+            | 8
+            | 9
+            | 10
+            | 11
+            | 12
+            | 13
+            | 14
+            | 20
+            | 22
+            | 23
+            | 24
+            | 25
+            | 26
+            | 27
+            | 28
+            | 29
+            | 30
+            | 31
+            | 32
+            | 33
+            | 34
+            | 35
+            | 36
+            | 37
+            | 38
+            | 39
+            | 40
+            | 41
+            | 42
+            | 43
+            | 44
+            | 45
+            | 46
+            | 47
+            | 48
+            | 49
+            | 50
+            | 51
+            | 52
+            | 53
+            | 54
+            | 55
+            | 56
+            | 57
+            | 58
+            | 59
+            | 60
+            | 61
+            | 62
+            | 63
+            | 64
+            | 65
+            | 66
+            | 67
+            | 68
+            | 69
+            | 70
+            | 71
+            | 72
+            | 73
+            | 74
+            | 75
+            | 76
+    ) && Pdu::wire_spec_for_ident(ident).is_some()
+}
+
 /// Outcome of [`check_compat`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatDecision {
@@ -4518,6 +4854,956 @@ impl Pdu {
     }
 }
 
+/// One dialect-bound decoded frame.
+///
+/// Fields are private so callers cannot rebind a payload to another serial.
+#[derive(Debug, PartialEq)]
+pub struct DecodedMuxWirePdu {
+    serial: u64,
+    payload: MuxWireDecodedPayload,
+}
+
+impl DecodedMuxWirePdu {
+    #[must_use]
+    pub const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &MuxWireDecodedPayload {
+        &self.payload
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (u64, MuxWireDecodedPayload) {
+        (self.serial, self.payload)
+    }
+}
+
+/// Payload outcome from an explicitly selected mux wire dialect.
+#[derive(Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum MuxWireDecodedPayload {
+    /// A schema whose meaning is identical in the selected dialect.
+    Pdu(Pdu),
+    /// Exact three-field PDU4 topology from codec 46.
+    Legacy46ListPanesResponse(Legacy46ListPanesResponse),
+    /// Exact two-field PDU13 request from codec 46.
+    Legacy46SendPaste(Legacy46SendPaste),
+    /// Content-free classification of legacy PDU0.
+    Legacy46Rejection(Legacy46Rejection),
+    /// The frame was bounded and consumed but cannot safely be represented.
+    Unsupported(MuxWireUnsupportedPdu),
+}
+
+impl MuxWireDecodedPayload {
+    /// Exact frame identity represented by this decoded payload class.
+    #[must_use]
+    pub fn ident(&self) -> u64 {
+        match self {
+            Self::Pdu(pdu) => pdu
+                .wire_spec()
+                .expect("decoded PDUs always have an assigned wire schema")
+                .ident,
+            Self::Legacy46ListPanesResponse(_) => ListPanesResponse::IDENT,
+            Self::Legacy46SendPaste(_) => SendPaste::IDENT,
+            Self::Legacy46Rejection(_) => ErrorResponse::IDENT,
+            Self::Unsupported(unsupported) => unsupported.ident,
+        }
+    }
+
+    /// Stable diagnostic name without projecting a legacy schema into the
+    /// current `Pdu` enum.
+    #[must_use]
+    pub fn pdu_name(&self) -> &'static str {
+        match self {
+            Self::Pdu(pdu) => pdu.pdu_name(),
+            Self::Legacy46ListPanesResponse(_) => "Legacy46ListPanesResponse",
+            Self::Legacy46SendPaste(_) => "Legacy46SendPaste",
+            Self::Legacy46Rejection(_) => "Legacy46Rejection",
+            Self::Unsupported(_) => "UnsupportedMuxWirePdu",
+        }
+    }
+}
+
+/// Why a consumed dialect frame was not exposed as an authoritative PDU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MuxWireUnsupportedReason {
+    PduAbsentFromDialect,
+    Legacy46ImageContentSemanticsUnavailable,
+    Legacy46ChangedOutboundSchemaUnsupported,
+}
+
+/// Content-free unsupported-frame metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MuxWireUnsupportedPdu {
+    ident: u64,
+    reason: MuxWireUnsupportedReason,
+}
+
+impl MuxWireUnsupportedPdu {
+    #[must_use]
+    pub const fn ident(self) -> u64 {
+        self.ident
+    }
+
+    #[must_use]
+    pub const fn reason(self) -> MuxWireUnsupportedReason {
+        self.reason
+    }
+}
+
+/// Availability of floating-pane state in a v46 three-field topology reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Legacy46FloatingPaneState {
+    Unavailable,
+}
+
+/// Exact v46 PDU4 schema.
+///
+/// There is intentionally no `floating_panes: Vec<_>` member.  Consumers must
+/// observe [`Self::floating_pane_state`] and therefore cannot mistake missing
+/// v46 information for an authoritative empty floating-pane snapshot.
+#[derive(PartialEq, Debug)]
+pub struct Legacy46ListPanesResponse {
+    tabs: Vec<PaneNode>,
+    tab_titles: Vec<String>,
+    window_titles: HashMap<WindowId, String>,
+}
+
+impl Legacy46ListPanesResponse {
+    #[must_use]
+    pub fn tabs(&self) -> &[PaneNode] {
+        &self.tabs
+    }
+
+    #[must_use]
+    pub fn tab_titles(&self) -> &[String] {
+        &self.tab_titles
+    }
+
+    #[must_use]
+    pub const fn window_titles(&self) -> &HashMap<WindowId, String> {
+        &self.window_titles
+    }
+
+    #[must_use]
+    pub const fn floating_pane_state(&self) -> Legacy46FloatingPaneState {
+        Legacy46FloatingPaneState::Unavailable
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<PaneNode>, Vec<String>, HashMap<WindowId, String>) {
+        (self.tabs, self.tab_titles, self.window_titles)
+    }
+}
+
+/// Exact v46 PDU13 schema decoded independently from current PDU13.
+#[derive(Deserialize, PartialEq, Debug)]
+pub struct Legacy46SendPaste {
+    pane_id: PaneId,
+    data: String,
+}
+
+impl Legacy46SendPaste {
+    #[must_use]
+    pub const fn pane_id(&self) -> PaneId {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (PaneId, String) {
+        (self.pane_id, self.data)
+    }
+}
+
+#[derive(Serialize)]
+struct Legacy46SendPasteRef<'a> {
+    pane_id: PaneId,
+    data: &'a str,
+}
+
+/// Legacy PDU0 carries no usable effect or retry authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Legacy46RejectionAuthority {
+    Unavailable,
+}
+
+/// Content-free v46 rejection marker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Legacy46Rejection {
+    _private: (),
+}
+
+impl Legacy46Rejection {
+    #[must_use]
+    pub const fn effect_authority(self) -> Legacy46RejectionAuthority {
+        Legacy46RejectionAuthority::Unavailable
+    }
+
+    #[must_use]
+    pub const fn retry_authority(self) -> Legacy46RejectionAuthority {
+        Legacy46RejectionAuthority::Unavailable
+    }
+}
+
+/// Dialect-aware outbound planning failure.  Every variant is definitely-not-
+/// sent: no serial, queue, socket, or delivery ledger has been touched.
+#[derive(Debug, Error)]
+pub enum MuxWireOutboundPlanError {
+    #[error(transparent)]
+    Plan(#[from] PduOutboundPlanError),
+    #[error("PDU {ident} cannot be encoded in mux dialect {dialect_version}: {reason:?}")]
+    Unsupported {
+        dialect_version: usize,
+        ident: u64,
+        reason: MuxWireUnsupportedReason,
+    },
+}
+
+/// Owned exact-PDU capability bound to one validated mux dialect.
+#[must_use = "a dialect-bound prepared PDU must be admitted, encoded, or rejected"]
+pub struct OwnedPreparedMuxWirePdu {
+    pdu: Pdu,
+    dialect: MuxWireDialect,
+    plan: PduOutboundPlan,
+}
+
+impl std::fmt::Debug for OwnedPreparedMuxWirePdu {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedPreparedMuxWirePdu")
+            .field("pdu_name", &self.pdu.pdu_name())
+            .field("dialect", &self.dialect)
+            .field("plan", &self.plan)
+            .finish()
+    }
+}
+
+impl OwnedPreparedMuxWirePdu {
+    #[must_use]
+    pub const fn pdu(&self) -> &Pdu {
+        &self.pdu
+    }
+
+    #[must_use]
+    pub const fn dialect(&self) -> MuxWireDialect {
+        self.dialect
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> &PduOutboundPlan {
+        &self.plan
+    }
+
+    /// Consume the exact payload/dialect/plan tuple and build one bounded
+    /// frame.  This performs no transport or queue side effect.
+    pub fn encode_frame(self, serial: u64) -> Result<Vec<u8>, PduOutboundEncodeError> {
+        let Self { pdu, dialect, plan } = self;
+        if dialect.is_legacy46() {
+            if let Pdu::SendPaste(request) = &pdu {
+                let legacy = Legacy46SendPasteRef {
+                    pane_id: request.pane_id,
+                    data: request.data.as_str(),
+                };
+                return encode_legacy46_payload_from_outbound_plan(&pdu, &legacy, serial, &plan);
+            }
+        }
+        pdu.encode_frame_from_outbound_plan(serial, &plan)
+    }
+}
+
+impl std::ops::Deref for OwnedPreparedMuxWirePdu {
+    type Target = PduOutboundPlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+impl Pdu {
+    /// Validate, measure, and retain one PDU for an explicitly selected mux
+    /// wire dialect.  Legacy46 never falls back to current serialization.
+    pub fn prepare_outbound_for_dialect(
+        self,
+        dialect: MuxWireDialect,
+        producer: PduProducer,
+        role: PduWireRole,
+        correlated_request: Option<&PduWireSpec>,
+        compression_mode: CompressionMode,
+    ) -> Result<OwnedPreparedMuxWirePdu, MuxWireOutboundPlanError> {
+        let Some(spec) = self.wire_spec() else {
+            let Pdu::Invalid { ident } = self else {
+                unreachable!("wire_spec is absent only for Invalid")
+            };
+            return Err(
+                PduOutboundPlanError::from(PduOutboundMetadataError::InvalidPdu { ident }).into(),
+            );
+        };
+
+        if !dialect.admits_wire_spec(spec) {
+            return Err(MuxWireOutboundPlanError::Unsupported {
+                dialect_version: dialect.codec_version(),
+                ident: spec.ident,
+                reason: MuxWireUnsupportedReason::PduAbsentFromDialect,
+            });
+        }
+        if dialect.is_legacy46() && matches!(spec.ident, 0 | 4 | 23 | 25 | 46 | 47) {
+            return Err(MuxWireOutboundPlanError::Unsupported {
+                dialect_version: dialect.codec_version(),
+                ident: spec.ident,
+                reason: if matches!(spec.ident, 23 | 25 | 46 | 47) {
+                    MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable
+                } else {
+                    MuxWireUnsupportedReason::Legacy46ChangedOutboundSchemaUnsupported
+                },
+            });
+        }
+
+        let plan = if dialect.is_legacy46() {
+            if let Pdu::SendPaste(request) = &self {
+                let metadata = spec
+                    .resolve_canonical_outbound_metadata(producer, role, correlated_request)
+                    .map_err(PduOutboundPlanError::from)?;
+                self.validate_before_encode().map_err(|cause| {
+                    PduOutboundPlanError::InvalidPayload {
+                        ident: spec.ident,
+                        cause,
+                    }
+                })?;
+                let _validated_snapshot = ValidatedOrderedSerializationScope::for_pdu(&self)
+                    .map_err(|cause| PduOutboundPlanError::CountingSerialization {
+                        ident: spec.ident,
+                        cause,
+                    })?;
+                let legacy = Legacy46SendPasteRef {
+                    pane_id: request.pane_id,
+                    data: request.data.as_str(),
+                };
+                let legacy_body_limit = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+                    max_decompressed_bytes: MAX_LEGACY46_SEND_PASTE_DECOMPRESSED_BYTES,
+                    max_zstd_encoded_bytes: MAX_LEGACY46_SEND_PASTE_ZSTD_ENCODED_BYTES,
+                };
+                let counted = count_pdu_payload(
+                    &legacy,
+                    legacy_body_limit.maximum_encoded_payload_bytes(false),
+                    spec.ident,
+                )?;
+                let legacy_spec = PduWireSpec {
+                    encoded_body_limit: legacy_body_limit,
+                    ..*spec
+                };
+                PduOutboundPlan::from_counted_payload(
+                    &legacy_spec,
+                    metadata,
+                    compression_mode,
+                    counted,
+                )?
+            } else {
+                self.plan_outbound(producer, role, correlated_request, compression_mode)?
+                    .plan
+            }
+        } else {
+            self.plan_outbound(producer, role, correlated_request, compression_mode)?
+                .plan
+        };
+
+        Ok(OwnedPreparedMuxWirePdu {
+            pdu: self,
+            dialect,
+            plan,
+        })
+    }
+}
+
+fn encode_legacy46_payload_from_outbound_plan<T: Serialize>(
+    pdu: &Pdu,
+    payload: &T,
+    serial: u64,
+    plan: &PduOutboundPlan,
+) -> Result<Vec<u8>, PduOutboundEncodeError> {
+    let ident = pdu.wire_spec().map_or(u64::MAX, |spec| spec.ident);
+    if ident != plan.ident {
+        return Err(PduOutboundEncodeError::IdentityMismatch {
+            planned_ident: plan.ident,
+            actual_ident: ident,
+        });
+    }
+    let serialized = {
+        let _validated_snapshot =
+            ValidatedOrderedSerializationScope::for_pdu(pdu).map_err(|cause| {
+                PduOutboundEncodeError::Codec {
+                    ident,
+                    stage: "validated ordered serialization admission",
+                    cause,
+                }
+            })?;
+        let direct_ordered_section =
+            DirectOrderedSectionScope::enter(ident, plan.ordered_window_section_bytes)?;
+        let serialized = serialize_pdu_payload_from_plan(payload, plan)?;
+        direct_ordered_section.finish(ident)?;
+        serialized
+    };
+    if serialized.uncompressed_len != plan.logical_payload_bytes {
+        return Err(PduOutboundEncodeError::PlanMismatch {
+            ident,
+            field: "logical_payload_bytes",
+            planned: plan.logical_payload_bytes,
+            actual: serialized.uncompressed_len,
+        });
+    }
+    if serialized.data.len() > plan.maximum_encoded_payload_bytes {
+        return Err(PduOutboundEncodeError::PlanMismatch {
+            ident,
+            field: "maximum_encoded_payload_bytes",
+            planned: plan.maximum_encoded_payload_bytes,
+            actual: serialized.data.len(),
+        });
+    }
+    validate_encoded_body_admission_for_dialect(
+        serialized.data.len(),
+        serial,
+        ident,
+        serialized.is_compressed,
+        MuxWireDialect::LEGACY46,
+    )
+    .map_err(|cause| PduOutboundEncodeError::Codec {
+        ident,
+        stage: "encoded body admission",
+        cause,
+    })?;
+    let frame = prepend_frame_header_to_owned_payload(
+        ident,
+        serial,
+        serialized.data,
+        serialized.is_compressed,
+        true,
+    )
+    .map_err(|cause| PduOutboundEncodeError::Codec {
+        ident,
+        stage: "frame construction",
+        cause,
+    })?;
+    if frame.len() > plan.maximum_frame_bytes {
+        return Err(PduOutboundEncodeError::PlanMismatch {
+            ident,
+            field: "maximum_frame_bytes",
+            planned: plan.maximum_frame_bytes,
+            actual: frame.len(),
+        });
+    }
+    log::debug!(
+        "encode_prepared_legacy46 {} size={}",
+        pdu.pdu_name(),
+        frame.len()
+    );
+    metrics::histogram!("pdu.size", "pdu" => pdu.pdu_name()).record(frame.len() as f64);
+    metrics::histogram!("pdu.size.rate", "pdu" => pdu.pdu_name()).record(frame.len() as f64);
+    Ok(frame)
+}
+
+fn legacy46_opaque_rejection(data: &[u8], is_compressed: bool) -> Result<Legacy46Rejection, Error> {
+    let payload = materialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "Legacy46ErrorResponse",
+        MAX_LEGACY46_ERROR_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    let mut opaque = payload.as_ref();
+    let (text_bytes, _) = read_u64_with_len(&mut opaque)
+        .context("reading bounded Legacy46ErrorResponse opaque text length")?;
+    let text_bytes = usize::try_from(text_bytes)
+        .context("Legacy46ErrorResponse opaque text length does not fit in usize")?;
+    if text_bytes > MAX_LEGACY46_ERROR_TEXT_BYTES {
+        bail!(
+            "Legacy46ErrorResponse opaque text length {text_bytes} exceeds maximum {MAX_LEGACY46_ERROR_TEXT_BYTES}"
+        );
+    }
+    if opaque.len() != text_bytes {
+        bail!(
+            "Legacy46ErrorResponse opaque text length {text_bytes} does not match bounded body remainder {}",
+            opaque.len()
+        );
+    }
+    // Do not deserialize, validate as UTF-8, retain, format, or log the peer's
+    // operational text.  Only the length-delimited rejection classification
+    // crosses this function boundary.
+    Ok(Legacy46Rejection { _private: () })
+}
+
+enum Legacy46PendingSplit {
+    AwaitingLeft { depth: usize },
+    AwaitingRight { left: Box<PaneNode> },
+}
+
+fn deserialize_legacy46_metadata_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = ExactRenderTitleV1::deserialize(deserializer)?;
+    String::from_utf8(value.0).map_err(serde::de::Error::custom)
+}
+
+struct Legacy46OptionalMetadataStringVisitor;
+
+impl<'de> serde::de::Visitor<'de> for Legacy46OptionalMetadataStringVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an optional bounded v46 metadata string")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_legacy46_metadata_string(deserializer).map(Some)
+    }
+}
+
+fn deserialize_legacy46_optional_metadata_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_option(Legacy46OptionalMetadataStringVisitor)
+}
+
+/// Non-recursive leaf schema matching the exact v46 `mux::tab::PaneEntry`
+/// field order. All peer-authored strings use the 64 KiB topology metadata
+/// marker, which is zero-wire relative to historical varbincode `String` but
+/// selects a preallocation limit before reading bytes.
+#[derive(Deserialize)]
+struct Legacy46PaneEntryWire {
+    window_id: WindowId,
+    tab_id: TabId,
+    pane_id: PaneId,
+    #[serde(deserialize_with = "deserialize_legacy46_metadata_string")]
+    title: String,
+    size: TerminalSize,
+    #[serde(deserialize_with = "deserialize_legacy46_optional_metadata_string")]
+    working_dir: Option<String>,
+    alt_screen_active: bool,
+    is_active_pane: bool,
+    is_zoomed_pane: bool,
+    #[serde(deserialize_with = "deserialize_legacy46_metadata_string")]
+    workspace: String,
+    cursor_pos: StableCursorPosition,
+    physical_top: StableRowIndex,
+    top_row: usize,
+    left_col: usize,
+    #[serde(deserialize_with = "deserialize_legacy46_optional_metadata_string")]
+    tty_name: Option<String>,
+}
+
+impl Legacy46PaneEntryWire {
+    fn into_pane_entry(self) -> Result<PaneEntry, Error> {
+        Ok(PaneEntry {
+            window_id: self.window_id,
+            tab_id: self.tab_id,
+            pane_id: self.pane_id,
+            title: self.title,
+            size: self.size,
+            working_dir: self
+                .working_dir
+                .map(SerdeUrl::try_from)
+                .transpose()
+                .context("validating bounded v46 pane working directory URL")?,
+            alt_screen_active: self.alt_screen_active,
+            is_active_pane: self.is_active_pane,
+            is_zoomed_pane: self.is_zoomed_pane,
+            workspace: self.workspace,
+            cursor_pos: self.cursor_pos,
+            physical_top: self.physical_top,
+            top_row: self.top_row,
+            left_col: self.left_col,
+            tty_name: self.tty_name,
+        })
+    }
+}
+
+fn deserialize_legacy46_length<R: Read>(
+    decoder: &mut bounded_varbincode::Deserializer<'_, R>,
+    resource: &'static str,
+    maximum: usize,
+) -> Result<usize, Error> {
+    let length = <usize as Deserialize>::deserialize(&mut *decoder)
+        .with_context(|| format!("reading v46 {resource} length"))?;
+    if length > maximum {
+        bail!("v46 {resource} length {length} exceeds maximum {maximum}");
+    }
+    Ok(length)
+}
+
+fn deserialize_legacy46_title<R: Read>(
+    decoder: &mut bounded_varbincode::Deserializer<'_, R>,
+    resource: &'static str,
+) -> Result<String, Error> {
+    let title = ExactRenderTitleV1::deserialize(&mut *decoder)
+        .with_context(|| format!("decoding bounded v46 {resource}"))?;
+    // ExactRenderTitleV1 has already validated both UTF-8 and the 64 KiB
+    // metadata ceiling before allocating its byte buffer.
+    String::from_utf8(title.0).with_context(|| format!("decoding v46 {resource} UTF-8"))
+}
+
+fn deserialize_legacy46_pane_tree<R: Read>(
+    decoder: &mut bounded_varbincode::Deserializer<'_, R>,
+    tree_index: usize,
+    total_nodes: &mut usize,
+    total_leaves: &mut usize,
+) -> Result<PaneNode, Error> {
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(MAX_ORDERED_PANE_TREE_DEPTH)
+        .context("allocating bounded v46 pane-tree parser stack")?;
+    let mut next_depth = Some(1_usize);
+    let mut completed = None;
+    let mut tree_nodes = 0_usize;
+    let mut tree_leaves = 0_usize;
+
+    loop {
+        if let Some(depth) = next_depth.take() {
+            if depth > MAX_ORDERED_PANE_TREE_DEPTH {
+                bail!(
+                    "v46 pane tree {tree_index} levels {depth} exceeds maximum {MAX_ORDERED_PANE_TREE_DEPTH}"
+                );
+            }
+            let next_tree_nodes = tree_nodes
+                .checked_add(1)
+                .context("v46 pane-tree node count overflow")?;
+            if next_tree_nodes > MAX_ORDERED_PANE_NODES_PER_TREE {
+                bail!(
+                    "v46 pane tree {tree_index} nodes {next_tree_nodes} exceeds maximum {MAX_ORDERED_PANE_NODES_PER_TREE}"
+                );
+            }
+            let next_total_nodes = total_nodes
+                .checked_add(1)
+                .context("v46 pane snapshot node count overflow")?;
+            if next_total_nodes > MAX_ORDERED_PANE_NODES_PER_SNAPSHOT {
+                bail!(
+                    "v46 pane snapshot nodes {next_total_nodes} exceeds maximum {MAX_ORDERED_PANE_NODES_PER_SNAPSHOT}"
+                );
+            }
+            tree_nodes = next_tree_nodes;
+            *total_nodes = next_total_nodes;
+
+            let variant = <u32 as Deserialize>::deserialize(&mut *decoder)
+                .with_context(|| format!("decoding v46 pane tree {tree_index} node tag"))?;
+            match variant {
+                0 => completed = Some(PaneNode::Empty),
+                1 => {
+                    // A split at the maximum legal level necessarily has a
+                    // child one level beyond it. Reject before recursively
+                    // shaped wire can cause another decode call or stack use.
+                    if depth == MAX_ORDERED_PANE_TREE_DEPTH {
+                        bail!(
+                            "v46 pane tree {tree_index} levels {} exceeds maximum {MAX_ORDERED_PANE_TREE_DEPTH}",
+                            depth.saturating_add(1)
+                        );
+                    }
+                    pending.push(Legacy46PendingSplit::AwaitingLeft { depth });
+                    next_depth = Some(
+                        depth
+                            .checked_add(1)
+                            .context("v46 pane-tree depth overflow")?,
+                    );
+                    continue;
+                }
+                2 => {
+                    let next_tree_leaves = tree_leaves
+                        .checked_add(1)
+                        .context("v46 pane-tree leaf count overflow")?;
+                    if next_tree_leaves > MAX_ORDERED_PANE_LEAVES_PER_TREE {
+                        bail!(
+                            "v46 pane tree {tree_index} leaves {next_tree_leaves} exceeds maximum {MAX_ORDERED_PANE_LEAVES_PER_TREE}"
+                        );
+                    }
+                    let next_total_leaves = total_leaves
+                        .checked_add(1)
+                        .context("v46 pane snapshot leaf count overflow")?;
+                    if next_total_leaves > MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT {
+                        bail!(
+                            "v46 pane snapshot leaves {next_total_leaves} exceeds maximum {MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT}"
+                        );
+                    }
+                    // Cardinality is admitted before the leaf decoder can
+                    // allocate any of its separately bounded strings.
+                    let entry = Legacy46PaneEntryWire::deserialize(&mut *decoder)
+                        .with_context(|| format!("decoding v46 pane tree {tree_index} leaf"))?
+                        .into_pane_entry()
+                        .with_context(|| {
+                            format!("validating v46 pane tree {tree_index} leaf metadata")
+                        })?;
+                    tree_leaves = next_tree_leaves;
+                    *total_leaves = next_total_leaves;
+                    completed = Some(PaneNode::Leaf(entry));
+                }
+                invalid => bail!("invalid v46 PaneNode variant {invalid}"),
+            }
+        }
+
+        let node = completed
+            .take()
+            .context("v46 pane-tree parser lost its completed node")?;
+        match pending.pop() {
+            None => return Ok(node),
+            Some(Legacy46PendingSplit::AwaitingLeft { depth }) => {
+                pending.push(Legacy46PendingSplit::AwaitingRight {
+                    left: Box::new(node),
+                });
+                next_depth = Some(
+                    depth
+                        .checked_add(1)
+                        .context("v46 pane-tree depth overflow")?,
+                );
+            }
+            Some(Legacy46PendingSplit::AwaitingRight { left }) => {
+                // v46 PaneNode::Split is positional `(left, right, node)`;
+                // split geometry follows both children on the wire.
+                let split = SplitDirectionAndSize::deserialize(&mut *decoder)
+                    .with_context(|| format!("decoding v46 pane tree {tree_index} split"))?;
+                completed = Some(PaneNode::Split {
+                    left,
+                    right: Box::new(node),
+                    node: split,
+                });
+            }
+        }
+    }
+}
+
+fn deserialize_legacy46_list_panes_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<Legacy46ListPanesResponse, Error> {
+    let payload = materialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "Legacy46ListPanesResponse",
+        MAX_LEGACY46_LIST_PANES_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    let mut reader = payload.as_ref();
+    let response = {
+        let mut decoder = bounded_varbincode::Deserializer::new(&mut reader);
+        let tab_count =
+            deserialize_legacy46_length(&mut decoder, "pane trees", MAX_ORDERED_TABS_PER_SNAPSHOT)?;
+        let mut tabs = Vec::new();
+        tabs.try_reserve_exact(tab_count).with_context(|| {
+            format!("allocating admitted v46 pane-tree vector of length {tab_count}")
+        })?;
+        let mut total_nodes = 0_usize;
+        let mut total_leaves = 0_usize;
+        for tree_index in 0..tab_count {
+            tabs.push(deserialize_legacy46_pane_tree(
+                &mut decoder,
+                tree_index,
+                &mut total_nodes,
+                &mut total_leaves,
+            )?);
+        }
+
+        let title_count =
+            deserialize_legacy46_length(&mut decoder, "tab titles", MAX_ORDERED_TABS_PER_SNAPSHOT)?;
+        if title_count != tab_count {
+            bail!(
+                "v46 pane-tree/title cardinality mismatch: {tab_count} trees, {title_count} titles"
+            );
+        }
+        let mut tab_titles = Vec::new();
+        tab_titles.try_reserve_exact(title_count).with_context(|| {
+            format!("allocating admitted v46 tab-title vector of length {title_count}")
+        })?;
+        for _ in 0..title_count {
+            tab_titles.push(deserialize_legacy46_title(&mut decoder, "tab title")?);
+        }
+
+        let window_title_count = deserialize_legacy46_length(
+            &mut decoder,
+            "window titles",
+            MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
+        )?;
+        let mut window_titles = HashMap::new();
+        window_titles
+            .try_reserve(window_title_count)
+            .with_context(|| {
+                format!("allocating admitted v46 window-title map of length {window_title_count}")
+            })?;
+        for _ in 0..window_title_count {
+            let window_id =
+                WindowId::deserialize(&mut decoder).context("decoding v46 window-title id")?;
+            let title = deserialize_legacy46_title(&mut decoder, "window title")?;
+            if window_titles.insert(window_id, title).is_some() {
+                bail!("v46 window titles contain duplicate window id {window_id}");
+            }
+        }
+
+        Legacy46ListPanesResponse {
+            tabs,
+            tab_titles,
+            window_titles,
+        }
+    };
+    if !reader.is_empty() {
+        bail!("Legacy46ListPanesResponse payload has trailing schema bytes");
+    }
+    Ok(response)
+}
+
+fn legacy46_serialized_lines_are_text_only(lines: &SerializedLines) -> bool {
+    lines.images.is_empty()
+        && lines.lines.iter().all(|(_, line)| {
+            line.visible_cells()
+                .all(|cell| cell.attrs().images().is_none_or(|images| images.is_empty()))
+        })
+}
+
+fn unsupported_mux_wire_payload(
+    ident: u64,
+    reason: MuxWireUnsupportedReason,
+) -> MuxWireDecodedPayload {
+    MuxWireDecodedPayload::Unsupported(MuxWireUnsupportedPdu { ident, reason })
+}
+
+fn decode_materialized_for_dialect(
+    decoded: Decoded,
+    dialect: MuxWireDialect,
+) -> Result<DecodedMuxWirePdu, Error> {
+    let serial = decoded.serial;
+    let ident = decoded.ident;
+    let Some(spec) = Pdu::wire_spec_for_ident(ident) else {
+        return Ok(DecodedMuxWirePdu {
+            serial,
+            payload: unsupported_mux_wire_payload(
+                ident,
+                MuxWireUnsupportedReason::PduAbsentFromDialect,
+            ),
+        });
+    };
+    if !dialect.admits_wire_spec(spec) {
+        return Ok(DecodedMuxWirePdu {
+            serial,
+            payload: unsupported_mux_wire_payload(
+                ident,
+                MuxWireUnsupportedReason::PduAbsentFromDialect,
+            ),
+        });
+    }
+
+    let payload = if !dialect.is_legacy46() {
+        MuxWireDecodedPayload::Pdu(Pdu::decode_materialized_async(decoded)?.pdu)
+    } else {
+        match ident {
+            0 => MuxWireDecodedPayload::Legacy46Rejection(legacy46_opaque_rejection(
+                decoded.data.as_slice(),
+                decoded.is_compressed,
+            )?),
+            4 => MuxWireDecodedPayload::Legacy46ListPanesResponse(
+                deserialize_legacy46_list_panes_response(
+                    decoded.data.as_slice(),
+                    decoded.is_compressed,
+                )?,
+            ),
+            13 => MuxWireDecodedPayload::Legacy46SendPaste(deserialize_exact_payload_with_limit(
+                decoded.data.as_slice(),
+                decoded.is_compressed,
+                "Legacy46SendPaste",
+                MAX_LEGACY46_SEND_PASTE_DECOMPRESSED_BYTES,
+            )?),
+            23 => {
+                let response: GetLinesResponse = deserialize_exact_payload_with_limit(
+                    decoded.data.as_slice(),
+                    decoded.is_compressed,
+                    "Legacy46GetLinesResponse",
+                    MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
+                )?;
+                response.lines.validate_structure()?;
+                if legacy46_serialized_lines_are_text_only(&response.lines) {
+                    MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))
+                } else {
+                    unsupported_mux_wire_payload(
+                        ident,
+                        MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable,
+                    )
+                }
+            }
+            25 => {
+                let response: GetPaneRenderChangesResponse = deserialize_exact_payload_with_limit(
+                    decoded.data.as_slice(),
+                    decoded.is_compressed,
+                    "Legacy46GetPaneRenderChangesResponse",
+                    MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
+                )?;
+                response.bonus_lines.validate_structure()?;
+                if legacy46_serialized_lines_are_text_only(&response.bonus_lines) {
+                    MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response))
+                } else {
+                    unsupported_mux_wire_payload(
+                        ident,
+                        MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable,
+                    )
+                }
+            }
+            47 => unsupported_mux_wire_payload(
+                ident,
+                MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable,
+            ),
+            _ => MuxWireDecodedPayload::Pdu(Pdu::decode_materialized_async(decoded)?.pdu),
+        }
+    };
+
+    Ok(DecodedMuxWirePdu { serial, payload })
+}
+
+impl Pdu {
+    /// Decode one complete frame under an exact caller-selected dialect.
+    pub fn decode_for_dialect<R: std::io::Read>(
+        r: R,
+        dialect: MuxWireDialect,
+    ) -> Result<DecodedMuxWirePdu, Error> {
+        let decoded = decode_raw_for_dialect(r, true, dialect).context("decoding a dialect PDU")?;
+        decode_materialized_for_dialect(decoded, dialect)
+    }
+
+    /// Decode one complete async frame under an exact caller-selected dialect.
+    /// The validated dialect body ceiling is applied before payload allocation.
+    pub async fn decode_async_for_dialect<R>(
+        r: &mut R,
+        max_serial: Option<u64>,
+        dialect: MuxWireDialect,
+    ) -> Result<DecodedMuxWirePdu, Error>
+    where
+        R: std::marker::Unpin + AsyncRead + std::fmt::Debug,
+    {
+        let header = decode_raw_header_async_with_dialect(r, max_serial, Some(dialect))
+            .await
+            .context("decoding a dialect PDU")?;
+        let decoded = decode_raw_body_async(r, header)
+            .await
+            .context("decoding a dialect PDU")?;
+        decode_materialized_for_dialect(decoded, dialect)
+    }
+}
+
 /// Minimum consumed prefix reclaimed by a streaming PDU buffer compaction.
 ///
 /// Compaction also requires the consumed prefix to be at least as large as the
@@ -4804,6 +6090,49 @@ impl Pdu {
         )
     }
 
+    /// Decode one complete buffered frame under an exact caller-selected
+    /// dialect.  Partial and malformed frames leave the buffer unchanged;
+    /// success consumes exactly one frame.
+    pub fn stream_decode_for_dialect(
+        buffer: &mut StreamingPduBuffer,
+        dialect: MuxWireDialect,
+    ) -> anyhow::Result<Option<DecodedMuxWirePdu>> {
+        Self::stream_decode_for_dialect_with_frame_limit(buffer, usize::MAX, dialect)
+    }
+
+    /// Dialect-bound streaming decode with a caller frame ceiling in addition
+    /// to the schema/dialect body ceiling.
+    pub fn stream_decode_for_dialect_with_frame_limit(
+        buffer: &mut StreamingPduBuffer,
+        max_frame_bytes: usize,
+        dialect: MuxWireDialect,
+    ) -> anyhow::Result<Option<DecodedMuxWirePdu>> {
+        let Some(frame_len) = buffered_frame_len_with_dialect_limit(
+            buffer.as_slice(),
+            max_frame_bytes,
+            Some(dialect),
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let frame = buffer
+            .as_slice()
+            .get(..frame_len)
+            .context("stream_decode_for_dialect frame length beyond buffer")?;
+        let mut cursor = Cursor::new(frame);
+        let decoded = Self::decode_for_dialect(&mut cursor, dialect)?;
+        let consumed = cursor.position() as usize;
+        if consumed != frame_len {
+            bail!(
+                "stream_decode_for_dialect consumed {consumed} bytes from a {frame_len} byte PDU frame"
+            );
+        }
+
+        buffer.consume_prefix(frame_len)?;
+        Ok(Some(decoded))
+    }
+
     /// Decode one streaming frame and bind logical-retention metadata to it.
     pub fn stream_decode_with_retention_metadata(
         buffer: &mut StreamingPduBuffer,
@@ -4939,6 +6268,48 @@ pub const MUX_ERROR_RESPONSE_SCHEMA_V1: u8 = 1;
 /// from consuming the generic multi-megabyte body allowance.
 pub const MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES: usize = 128;
 pub const MAX_MUX_ERROR_RESPONSE_ZSTD_ENCODED_BYTES: usize = 256;
+
+/// Maximum opaque UTF-8 byte count accepted from the v46 `reason: String`
+/// error schema.  The compatibility decoder never constructs a `String` or
+/// exposes these bytes; this bound exists solely to consume and classify the
+/// legacy rejection without desynchronizing the ordered stream.
+pub const MAX_LEGACY46_ERROR_TEXT_BYTES: usize = 4 * 1024;
+/// Maximum v46 PDU0 body: a ten-byte u64 length prefix plus bounded opaque
+/// text.  Ten bytes covers every legal LEB128 `u64`, including non-canonical
+/// encodings accepted by the historical codec.
+pub const MAX_LEGACY46_ERROR_RESPONSE_DECOMPRESSED_BYTES: usize =
+    MAX_LEGACY46_ERROR_TEXT_BYTES + 10;
+/// Conservative encoded cap for one compressed bounded v46 rejection.
+pub const MAX_LEGACY46_ERROR_RESPONSE_ZSTD_ENCODED_BYTES: usize = 8 * 1024;
+
+/// Exact v46 PDU4 body budgets.  The recursive wire form is admitted only up
+/// to the same whole-snapshot byte envelope as the current flat ordered
+/// topology.  Structural limits are independently enforced while parsing.
+pub const MAX_LEGACY46_LIST_PANES_RESPONSE_DECOMPRESSED_BYTES: usize =
+    MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES;
+pub const MAX_LEGACY46_LIST_PANES_RESPONSE_ZSTD_ENCODED_BYTES: usize =
+    MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES;
+
+/// Exact v46 PDU13 body budgets.  The historical payload is an id plus one
+/// string; using the current sampled-paste envelope keeps both planning and
+/// decode bounded while retaining multi-megabyte paste support.
+pub const MAX_LEGACY46_SEND_PASTE_DECOMPRESSED_BYTES: usize =
+    MAX_SEND_PASTE_TRACED_V1_DECOMPRESSED_BYTES;
+pub const MAX_LEGACY46_SEND_PASTE_ZSTD_ENCODED_BYTES: usize =
+    MAX_SEND_PASTE_TRACED_V1_ZSTD_ENCODED_BYTES;
+
+/// v46 PDU23/PDU25 are exposed only after their decoded line collections are
+/// proven image-free.  A separate body ceiling prevents that compatibility
+/// probe from inheriting the generic 256 MiB allocation envelope.
+pub const MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_LEGACY46_TEXT_RENDER_RESPONSE_ZSTD_ENCODED_BYTES: usize = 32 * 1024 * 1024;
+
+/// A v46 image-cell response can never become an authoritative current image.
+/// The compatibility lane admits only enough body bytes to consume and type a
+/// canonical `data: None` rejection; image-bearing bodies fail at frame-header
+/// admission before codec allocation.
+pub const MAX_LEGACY46_UNSUPPORTED_IMAGE_RESPONSE_DECOMPRESSED_BYTES: usize = 64;
+pub const MAX_LEGACY46_UNSUPPORTED_IMAGE_RESPONSE_ZSTD_ENCODED_BYTES: usize = 256;
 
 /// Stable numeric mux rejection code.
 ///
@@ -21694,7 +23065,8 @@ mod test {
             error
                 .to_string()
                 .contains("reliable pane write data length exceeds maximum 16384"),
-            "unexpected bounded field error: {error}"
+            "unexpected bounded field error: {}",
+            error
         );
 
         for bytes in [
@@ -26598,5 +27970,155 @@ mod test {
             "every interior insertion position must surface as detect-or-error"
         );
         Ok(())
+    }
+
+    #[test]
+    fn legacy46_async_decode_uses_exact_three_field_topology_schema() {
+        let legacy_body = [0_u8, 0_u8, 0_u8];
+        let mut wire = Vec::new();
+        encode_raw(ListPanesResponse::IDENT, 4, &legacy_body, false, &mut wire)
+            .expect("frame legacy PDU4");
+
+        let decoded = runtime::block_on(async {
+            let mut reader = runtime::Cursor::new(wire);
+            Pdu::decode_async_for_dialect(&mut reader, Some(4), MuxWireDialect::LEGACY46).await
+        })
+        .expect("async legacy PDU4 decode");
+        let (_, MuxWireDecodedPayload::Legacy46ListPanesResponse(topology)) = decoded.into_parts()
+        else {
+            panic!("async legacy PDU4 decoded to the wrong payload class");
+        };
+        assert_eq!(
+            topology.floating_pane_state(),
+            Legacy46FloatingPaneState::Unavailable
+        );
+    }
+
+    #[derive(Serialize)]
+    struct FrozenLegacy46TopologyFixture<'a> {
+        tabs: &'a [PaneNode],
+        tab_titles: &'a [String],
+        window_titles: &'a HashMap<WindowId, String>,
+    }
+
+    fn frozen_legacy46_topology_body(tabs: &[PaneNode]) -> Vec<u8> {
+        let tab_titles = (0..tabs.len())
+            .map(|index| format!("legacy-tab-{index}"))
+            .collect::<Vec<_>>();
+        let window_titles = HashMap::new();
+        let fixture = FrozenLegacy46TopologyFixture {
+            tabs,
+            tab_titles: &tab_titles,
+            window_titles: &window_titles,
+        };
+        let mut body = Vec::new();
+        fixture
+            .serialize(&mut varbincode::Serializer::new(&mut body))
+            .expect("serialize exact v46 topology fixture");
+        body
+    }
+
+    #[test]
+    fn legacy46_pdu4_iterative_parser_accepts_exact_depth_and_node_boundaries() {
+        let depth_boundary = [left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH)];
+        let depth_body = frozen_legacy46_topology_body(&depth_boundary);
+        let decoded = deserialize_legacy46_list_panes_response(&depth_body, false)
+            .expect("exact maximum v46 tree depth must decode");
+        assert_eq!(decoded.tabs(), depth_boundary.as_slice());
+
+        let compressed =
+            zstd::stream::encode_all(depth_body.as_slice(), 0).expect("compress v46 PDU4 body");
+        let decoded = deserialize_legacy46_list_panes_response(&compressed, true)
+            .expect("compressed exact-maximum v46 tree depth must decode");
+        assert_eq!(decoded.tabs(), depth_boundary.as_slice());
+
+        let node_boundary = [broad_pane_tree(MAX_ORDERED_PANE_LEAVES_PER_TREE)];
+        let node_body = frozen_legacy46_topology_body(&node_boundary);
+        let decoded = deserialize_legacy46_list_panes_response(&node_body, false)
+            .expect("exact maximum v46 tree node count must decode");
+        assert_eq!(decoded.tabs(), node_boundary.as_slice());
+    }
+
+    #[test]
+    fn legacy46_pdu4_iterative_parser_rejects_depth_and_node_overflow() {
+        let too_deep = [left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH + 1)];
+        let error = deserialize_legacy46_list_panes_response(
+            &frozen_legacy46_topology_body(&too_deep),
+            false,
+        )
+        .expect_err("v46 tree above the depth ceiling must fail closed");
+        assert!(
+            format!("{error:#}").contains("levels 65 exceeds maximum 64"),
+            "unexpected v46 depth error: {:#}",
+            error
+        );
+
+        let too_many_nodes = [PaneNode::Split {
+            left: Box::new(broad_pane_tree(MAX_ORDERED_PANE_LEAVES_PER_TREE)),
+            right: Box::new(PaneNode::Empty),
+            node: sample_split(),
+        }];
+        let error = deserialize_legacy46_list_panes_response(
+            &frozen_legacy46_topology_body(&too_many_nodes),
+            false,
+        )
+        .expect_err("v46 tree above the node ceiling must fail closed");
+        assert!(
+            format!("{error:#}").contains("nodes 8192 exceeds maximum 8191"),
+            "unexpected v46 node error: {:#}",
+            error
+        );
+
+        let mut oversized_leaf = sample_pane_entry(0);
+        oversized_leaf.title = "x".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES + 1);
+        let error = deserialize_legacy46_list_panes_response(
+            &frozen_legacy46_topology_body(&[PaneNode::Leaf(oversized_leaf)]),
+            false,
+        )
+        .expect_err("v46 pane title above the metadata ceiling must fail closed");
+        assert!(
+            format!("{error:#}")
+                .contains("exact render metadata UTF-8 bytes length 65537 exceeds maximum 65536"),
+            "unexpected v46 pane-title error: {:#}",
+            error
+        );
+    }
+
+    #[test]
+    fn legacy46_image_bearing_pdu23_is_consumed_but_not_forged_as_text_complete() {
+        let lines = SerializedLines {
+            lines: vec![(
+                5,
+                Line::from_text("x", &termwiz::cell::CellAttributes::default(), 1, None),
+            )],
+            hyperlinks: Vec::new(),
+            images: vec![SerializedImageCell {
+                line_idx: 5,
+                cell_idx: 0,
+                top_left: TextureCoordinate::new_f32(0.0, 0.0),
+                bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+                data_hash: [7; 32],
+                z_index: 0,
+                padding_left: 0,
+                padding_top: 0,
+                padding_right: 0,
+                padding_bottom: 0,
+                image_id: Some(1),
+                placement_id: Some(2),
+            }],
+        };
+        let wire = Pdu::GetLinesResponse(GetLinesResponse { pane_id: 3, lines })
+            .encode_frame_with_mode(23, CompressionMode::Never)
+            .expect("encode image-bearing PDU23 fixture");
+        let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+            .expect("bounded legacy image PDU23 classification");
+        let (_, MuxWireDecodedPayload::Unsupported(unsupported)) = decoded.into_parts() else {
+            panic!("legacy image PDU23 was exposed as complete text");
+        };
+        assert_eq!(unsupported.ident(), GetLinesResponse::IDENT);
+        assert_eq!(
+            unsupported.reason(),
+            MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable
+        );
     }
 }

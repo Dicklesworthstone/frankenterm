@@ -24,7 +24,7 @@ use mux::guardian_checkpoint::{
     GuardianCheckpointStageRecordContextV1, GuardianCheckpointStageRecordKindV1,
     GuardianCheckpointStageScopeV1, GuardianCheckpointStageSealIntentV1,
     GuardianCheckpointValidatedManifestAuthorityV1, GuardianEncryptedCheckpointStageRecordV1,
-    GuardianGenesisReservationIdentityV1,
+    GuardianGenesisReservationIdentityV1, current_replay_identity_digest,
 };
 use mux::guardian_input_journal::{
     GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
@@ -40,11 +40,16 @@ use mux::guardian_output_journal::{
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
     GuardianCheckpointCatalogAdoptionEvidenceSeedV1, GuardianCheckpointCatalogAdoptionPermitV1,
-    GuardianCheckpointDescriptorV1, GuardianCheckpointPolicyExpiryReceiptV1,
+    GuardianCheckpointChunkDelivery, GuardianCheckpointDescriptorV1,
+    GuardianCheckpointOutputBoundaryV1, GuardianCheckpointPolicyExpiryReceiptV1,
     GuardianCheckpointReceipt, GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1,
     GuardianCheckpointStageKindV1, GuardianCheckpointStageReplyV1,
-    GuardianCheckpointStageRequestV1, GuardianEffectTransactionError, GuardianProtocolError,
-    GuardianProtocolState, GuardianReply,
+    GuardianCheckpointStageRequestV1, GuardianEffectTransactionError, GuardianOperation,
+    GuardianProtocolError, GuardianProtocolState, GuardianReplayAckReceiptV1, GuardianReplayAckV1,
+    GuardianReplayCursorV1, GuardianReplayGapReasonV1, GuardianReplayOutputRecordsDelivery,
+    GuardianReplayPageBodyDelivery, GuardianReplayPageDelivery, GuardianReplayPhaseV1,
+    GuardianReplayPredecessorV1, GuardianReplayRecordDelivery, GuardianReplayRecordMetadataV1,
+    GuardianReplayRequestV1, GuardianReplaySelectorV1, GuardianReply,
 };
 use nix::unistd::{PathconfVar, fpathconf, geteuid};
 use sha2::{Digest as _, Sha256};
@@ -129,6 +134,8 @@ const CHECKPOINT_CATALOG_CANDIDATE_ID_DOMAIN: &[u8] =
 const CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES: u64 =
     GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES as u64
         + CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES;
+const CHECKPOINT_CATALOG_RESTORE_BINDING_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-catalog-restore-binding.v1\0";
 const CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS: usize = 8;
 // One immutable candidate and marker per retained member, plus one bounded
 // crash candidate per generation. No reclamation is performed in this phase.
@@ -144,6 +151,12 @@ const CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES: u64 = GUARDIAN_MAX_CHECKPOINT_BYTE
     + CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES;
 const CHECKPOINT_CATALOG_MAX_RELEVANT_BYTES: u64 =
     CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES * 16 + CHECKPOINT_CATALOG_MARKER_BYTES as u64 * 8;
+const REPLAY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-replay-snapshot.v1\0";
+const REPLAY_REQUEST_BINDING_DOMAIN: &[u8] = b"frankenterm.guardian-replay-request.v1\0";
+const REPLAY_MAX_ACTIVE_SNAPSHOTS: usize = 8;
+const REPLAY_MAX_REQUEST_BINDINGS: usize = 64;
+const REPLAY_MAX_OUTSTANDING_PAGES_PER_SNAPSHOT: usize = 1;
+const _: () = assert!(REPLAY_MAX_OUTSTANDING_PAGES_PER_SNAPSHOT == 1);
 
 #[derive(Clone, Copy, Debug)]
 struct GuardianCheckpointStagePolicy {
@@ -277,6 +290,8 @@ pub enum GuardianCheckpointStageStoreError {
     Conflict,
     #[error("guardian checkpoint staging chunks are not a contiguous prefix")]
     OutOfOrder,
+    #[error("guardian replay snapshot is no longer available")]
+    ReplaySnapshotExpired,
     #[error("guardian checkpoint staging upload is poisoned or incomplete")]
     Poisoned,
     #[error("guardian checkpoint staging resource policy is exhausted")]
@@ -488,6 +503,7 @@ struct GuardianCheckpointStageStoreInner {
     name_max: usize,
     gate: Mutex<()>,
     durable_records: Mutex<Vec<FileIdentity>>,
+    replay: Mutex<GuardianReplayState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -692,10 +708,6 @@ impl CheckpointCatalogFormat {
             Self::ProtectedV3 => CHECKPOINT_CATALOG_MARKER_CHECKSUM_DOMAIN,
         }
     }
-
-    const fn authorizes_scope(self, scope: CheckpointCatalogScope) -> bool {
-        matches!(self, Self::ProtectedV3) || matches!(scope, CheckpointCatalogScope::Genesis { .. })
-    }
 }
 
 struct CheckpointCatalogCandidate {
@@ -735,12 +747,345 @@ struct PublishedCheckpointCatalogMember {
     marker_file_identity: FileIdentity,
 }
 
+/// Opaque proof recovered by authenticating the adoption evidence attached to
+/// one exact protected Pane candidate. Genesis deliberately has no such proof:
+/// its catalog member is reserved for the non-cloneable Spawn admission path.
+struct CheckpointCatalogGenericRestoreEvidence {
+    identity: CheckpointCatalogIdentity,
+    candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    _authenticated: GuardianCheckpointCatalogAdoptionEvidenceV1,
+}
+
 struct CheckpointCatalogScan {
     published: Vec<PublishedCheckpointCatalogMember>,
+    generic_restore_evidence: Vec<CheckpointCatalogGenericRestoreEvidence>,
     unpublished_candidates: Vec<DiscoveredCheckpointCatalogCandidate>,
     staged_files: Vec<DiscoveredCheckpointCatalogStagingFile>,
     relevant_files: usize,
     relevant_bytes: u64,
+}
+
+/// Process-local replay bookkeeping deliberately retains metadata only. Every
+/// plaintext-bearing retry is reconstructed from the pinned encrypted files
+/// and reauthenticated before a new single-use delivery is returned.
+struct GuardianReplayState {
+    snapshots: BTreeMap<Uuid, GuardianReplaySnapshot>,
+    request_bindings: BTreeMap<Uuid, GuardianReplayRequestBinding>,
+    request_order: VecDeque<Uuid>,
+    access_epoch: u64,
+    #[cfg(test)]
+    fail_request_binding_reservation: bool,
+}
+
+impl GuardianReplayState {
+    fn new() -> Self {
+        Self {
+            snapshots: BTreeMap::new(),
+            request_bindings: BTreeMap::new(),
+            request_order: VecDeque::new(),
+            access_epoch: 0,
+            #[cfg(test)]
+            fail_request_binding_reservation: false,
+        }
+    }
+
+    fn plan_next_access_epoch(&self) -> Result<u64, GuardianCheckpointStageStoreError> {
+        self.access_epoch
+            .checked_add(1)
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)
+    }
+}
+
+struct GuardianReplaySnapshot {
+    snapshot_id: Uuid,
+    snapshot_digest: [u8; 32],
+    pane_id: Uuid,
+    generation: u64,
+    guardian_incarnation: Uuid,
+    mux_incarnation: Uuid,
+    descriptor: GuardianCheckpointDescriptorV1,
+    catalog: GuardianReplayCatalogPin,
+    output: Option<GuardianReplayOutputPin>,
+    suffix_first_sequence: u64,
+    suffix_previous_record_digest: [u8; 32],
+    initial_phase: GuardianReplayPhaseV1,
+    initial_next_sequence: u64,
+    initial_previous_record_digest: [u8; 32],
+    max_plaintext_bytes: u32,
+    max_records: u16,
+    issued: Option<GuardianReplayIssuedPage>,
+    access_epoch: u64,
+}
+
+struct GuardianReplayCatalogPin {
+    selected: PublishedCheckpointCatalogMember,
+    settled_head_identity: CheckpointCatalogIdentity,
+    settled_head_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    settled_head_candidate_path: PathBuf,
+    settled_head_candidate_file_identity: FileIdentity,
+    settled_head_marker_path: PathBuf,
+    settled_head_marker_file_identity: FileIdentity,
+}
+
+struct GuardianReplayOutputPin {
+    directory: File,
+    directory_path: PathBuf,
+    cipher: GuardianOutputCipher,
+    policy: OutputSegmentPolicy,
+    manifest: OutputManifestSnapshot,
+    manifest_path: PathBuf,
+    manifest_file_identity: FileIdentity,
+    publication_path: PathBuf,
+    publication_file_identity: FileIdentity,
+    segments: Vec<GuardianReplayOutputSegmentPin>,
+    terminal_sequence: u64,
+    terminal_record_digest: [u8; 32],
+    cumulative_plaintext_bytes: u64,
+}
+
+#[derive(Clone)]
+struct GuardianReplayOutputSegmentPin {
+    authority: SegmentPathAuthority,
+    committed_bytes: u64,
+    terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    was_current: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GuardianReplayIssuedPage {
+    request_id: Uuid,
+    request_fingerprint: [u8; 32],
+    incoming_cursor: Option<GuardianReplayCursorV1>,
+    page_index: u32,
+    page_digest: [u8; 32],
+    next_cursor: Option<GuardianReplayCursorV1>,
+    through_sequence: u64,
+    through_record_digest: [u8; 32],
+    terminal: bool,
+    acknowledged: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GuardianReplayRequestBinding {
+    fingerprint: [u8; 32],
+    outcome: GuardianReplayRequestOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum GuardianReplayRequestOutcome {
+    Page {
+        snapshot_id: Uuid,
+        page_index: u32,
+    },
+    SnapshotExpired {
+        pane_id: Uuid,
+        generation: u64,
+        cursor: GuardianReplayCursorV1,
+        page_digest: [u8; 32],
+    },
+    Ack {
+        receipt: GuardianReplayAckReceiptV1,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct GuardianReplaySnapshotAdmissionPlan {
+    evicted_snapshot_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy)]
+struct GuardianReplayRequestBindingPlan {
+    request_id: Uuid,
+    evicted_order_index: Option<usize>,
+    evicted_request_id: Option<Uuid>,
+}
+
+/// Opaque coordinator fence identity to which restore selection is bound.
+///
+/// This value is only an identity label; this module does not claim that it is
+/// a live lease epoch and has no production issuer. The writer-lease
+/// coordinator must issue the current value and pass that same value at commit
+/// before the dead restore path can be wired into production.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointCatalogRestoreLeaseFenceId(Uuid);
+
+#[allow(dead_code)]
+impl CheckpointCatalogRestoreLeaseFenceId {
+    fn from_coordinator_fence_id(
+        fence_id: Uuid,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        if fence_id.is_nil() {
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        } else {
+            Ok(Self(fence_id))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointCatalogRestoreSelector {
+    LatestCompatible { replay_semantics_id: [u8; 32] },
+    Exact { checkpoint_id: [u8; 32] },
+}
+
+/// Single-use restore selection bound to both one exact catalog member and the
+/// settled catalog head observed under the directory lock.
+///
+/// The authenticated adoption proof makes this type non-`Clone`/non-`Copy`.
+/// The opaque lease-fence identity is intentionally not a claim of live lease
+/// authority; production activation remains disabled until the writer-lease
+/// coordinator supplies and revalidates it.
+#[must_use = "checkpoint catalog restore permits must be committed or discarded"]
+#[allow(dead_code)]
+struct CheckpointCatalogRestorePermit {
+    stage_scope: CheckpointStagePathScope,
+    selected_identity: CheckpointCatalogIdentity,
+    selected_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    settled_head_identity: CheckpointCatalogIdentity,
+    settled_head_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    checkpoint_id: [u8; 32],
+    boundary_id: [u8; 32],
+    replay_semantics_id: [u8; 32],
+    lease_fence_id: CheckpointCatalogRestoreLeaseFenceId,
+    binding_id: [u8; 32],
+    authenticated_adoption: CheckpointCatalogGenericRestoreEvidence,
+}
+
+#[allow(dead_code)]
+impl CheckpointCatalogRestorePermit {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        stage_scope: CheckpointStagePathScope,
+        selected_format: CheckpointCatalogFormat,
+        selected_metadata: CheckpointCatalogMetadata,
+        selected_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+        settled_head_identity: CheckpointCatalogIdentity,
+        settled_head_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+        lease_fence_id: CheckpointCatalogRestoreLeaseFenceId,
+        authenticated_adoption: CheckpointCatalogGenericRestoreEvidence,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let catalog_scope = CheckpointCatalogScope::from_stage_scope(stage_scope);
+        let stage_scope_matches_selected = match stage_scope {
+            CheckpointStagePathScope::Pane {
+                pane_id,
+                generation,
+            } => {
+                selected_metadata.identity.scope == CheckpointCatalogScope::Pane { pane_id }
+                    && selected_metadata.capture_generation == generation
+            }
+            CheckpointStagePathScope::Genesis { .. } => false,
+        };
+        if selected_format != CheckpointCatalogFormat::ProtectedV3
+            || !stage_scope_matches_selected
+            || selected_metadata.identity.scope != catalog_scope
+            || settled_head_identity.scope != catalog_scope
+            || authenticated_adoption.identity != selected_metadata.identity
+            || authenticated_adoption.candidate_checksum != selected_candidate_checksum
+        {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        let binding_id = checkpoint_catalog_restore_binding_id(
+            stage_scope,
+            selected_metadata.identity,
+            selected_candidate_checksum,
+            settled_head_identity,
+            settled_head_candidate_checksum,
+            selected_metadata.checkpoint_id,
+            selected_metadata.boundary_id,
+            selected_metadata.replay_semantics_id,
+            lease_fence_id,
+        );
+        Ok(Self {
+            stage_scope,
+            selected_identity: selected_metadata.identity,
+            selected_candidate_checksum,
+            settled_head_identity,
+            settled_head_candidate_checksum,
+            checkpoint_id: selected_metadata.checkpoint_id,
+            boundary_id: selected_metadata.boundary_id,
+            replay_semantics_id: selected_metadata.replay_semantics_id,
+            lease_fence_id,
+            binding_id,
+            authenticated_adoption,
+        })
+    }
+
+    const fn checkpoint_id(&self) -> [u8; 32] {
+        self.checkpoint_id
+    }
+
+    const fn binding_id(&self) -> [u8; 32] {
+        self.binding_id
+    }
+
+    fn is_exact_revalidation(&self, recovered: &Self) -> bool {
+        self.stage_scope == recovered.stage_scope
+            && self.selected_identity == recovered.selected_identity
+            && self.selected_candidate_checksum == recovered.selected_candidate_checksum
+            && self.settled_head_identity == recovered.settled_head_identity
+            && self.settled_head_candidate_checksum == recovered.settled_head_candidate_checksum
+            && self.checkpoint_id == recovered.checkpoint_id
+            && self.boundary_id == recovered.boundary_id
+            && self.replay_semantics_id == recovered.replay_semantics_id
+            && self.lease_fence_id == recovered.lease_fence_id
+            && self.binding_id == recovered.binding_id
+            && self.authenticated_adoption.identity == recovered.authenticated_adoption.identity
+            && self.authenticated_adoption.candidate_checksum
+                == recovered.authenticated_adoption.candidate_checksum
+    }
+}
+
+fn checkpoint_catalog_restore_hash_scope(hasher: &mut Sha256, scope: CheckpointCatalogScope) {
+    hasher.update([scope.tag()]);
+    hasher.update(scope.identity().as_bytes());
+}
+
+fn checkpoint_catalog_restore_hash_identity(
+    hasher: &mut Sha256,
+    identity: CheckpointCatalogIdentity,
+) {
+    checkpoint_catalog_restore_hash_scope(hasher, identity.scope);
+    hasher.update(identity.generation.to_le_bytes());
+    hasher.update(identity.candidate_id.as_bytes());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_catalog_restore_binding_id(
+    stage_scope: CheckpointStagePathScope,
+    selected_identity: CheckpointCatalogIdentity,
+    selected_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    settled_head_identity: CheckpointCatalogIdentity,
+    settled_head_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    checkpoint_id: [u8; 32],
+    boundary_id: [u8; 32],
+    replay_semantics_id: [u8; 32],
+    lease_fence_id: CheckpointCatalogRestoreLeaseFenceId,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(CHECKPOINT_CATALOG_RESTORE_BINDING_DOMAIN);
+    match stage_scope {
+        CheckpointStagePathScope::Pane {
+            pane_id,
+            generation,
+        } => {
+            hasher.update([1]);
+            hasher.update(pane_id.as_bytes());
+            hasher.update(generation.to_le_bytes());
+        }
+        CheckpointStagePathScope::Genesis { spawn_effect_id } => {
+            hasher.update([2]);
+            hasher.update(spawn_effect_id.as_bytes());
+        }
+    }
+    checkpoint_catalog_restore_hash_identity(&mut hasher, selected_identity);
+    hasher.update(selected_candidate_checksum);
+    checkpoint_catalog_restore_hash_identity(&mut hasher, settled_head_identity);
+    hasher.update(settled_head_candidate_checksum);
+    hasher.update(checkpoint_id);
+    hasher.update(boundary_id);
+    hasher.update(replay_semantics_id);
+    hasher.update(lease_fence_id.0.as_bytes());
+    hasher.finalize().into()
 }
 
 #[derive(Clone)]
@@ -1456,6 +1801,7 @@ impl GuardianCheckpointStageStore {
                 name_max,
                 gate: Mutex::new(()),
                 durable_records: Mutex::new(Vec::new()),
+                replay: Mutex::new(GuardianReplayState::new()),
             }),
         })
     }
@@ -2344,61 +2690,356 @@ impl GuardianCheckpointStageStore {
         })
     }
 
-    /// Select only a checksum-bound published member with current replay
-    /// semantics. Directory entry timestamps are deliberately never read.
+    /// Open or continue one immutable, process-local replay snapshot.
+    /// Plaintext is never retained in the ledger: an exact retry reopens and
+    /// reauthenticates the pinned encrypted artifacts into a fresh delivery.
+    pub(crate) fn apply_replay(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+        replay: GuardianReplayRequestV1,
+        journal: Option<&GuardianPaneOutputJournal>,
+    ) -> Result<GuardianReplayPageDelivery, GuardianCheckpointStageStoreError> {
+        let fingerprint = guardian_replay_request_fingerprint(request, replay)?;
+        let request_id = request.header().request_id;
+        let mut state = self
+            .inner
+            .replay
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        if let Some(binding) = state.request_bindings.get(&request_id).copied() {
+            if binding.fingerprint != fingerprint {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            return guardian_replay_retry_page(&self.inner, &mut state, request, binding);
+        }
+
+        let pane_id = request
+            .header()
+            .pane_id
+            .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+        let generation = request.header().lease_generation;
+        match replay {
+            GuardianReplayRequestV1::Open {
+                selector,
+                max_plaintext_bytes,
+                max_records,
+                ..
+            } => {
+                let snapshot_admission = guardian_replay_plan_snapshot_admission(&state)?;
+                let request_binding = guardian_replay_plan_request_binding(
+                    &state,
+                    request_id,
+                    snapshot_admission.evicted_snapshot_id,
+                )?;
+                let access_epoch = state.plan_next_access_epoch()?;
+                let mut snapshot = self.with_exclusive_directory(|inner| {
+                    guardian_replay_open_snapshot(
+                        inner,
+                        request,
+                        selector,
+                        max_plaintext_bytes,
+                        max_records,
+                        journal,
+                        access_epoch,
+                    )
+                })?;
+                let (page, issued) = guardian_replay_build_page(
+                    &self.inner,
+                    &snapshot,
+                    request_id,
+                    fingerprint,
+                    None,
+                )?;
+                if state.snapshots.contains_key(&snapshot.snapshot_id) {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+                snapshot.issued = Some(issued);
+                let snapshot_id = snapshot.snapshot_id;
+                guardian_replay_commit_snapshot_admission(&mut state, snapshot_admission);
+                state.access_epoch = access_epoch;
+                let replaced = state.snapshots.insert(snapshot_id, snapshot);
+                debug_assert!(replaced.is_none());
+                guardian_replay_publish_request_binding(
+                    &mut state,
+                    request_binding,
+                    GuardianReplayRequestBinding {
+                        fingerprint,
+                        outcome: GuardianReplayRequestOutcome::Page {
+                            snapshot_id,
+                            page_index: issued.page_index,
+                        },
+                    },
+                );
+                Ok(page)
+            }
+            GuardianReplayRequestV1::Continue { cursor } => {
+                let Some(snapshot) = state.snapshots.get(&cursor.snapshot_id()) else {
+                    let page = GuardianReplayPageDelivery::new(
+                        pane_id,
+                        generation,
+                        cursor.snapshot_id(),
+                        cursor.snapshot_digest(),
+                        cursor.digest(),
+                        cursor.page_index(),
+                        None,
+                        GuardianReplayPageBodyDelivery::SnapshotExpired {
+                            snapshot_id: cursor.snapshot_id(),
+                        },
+                    )?;
+                    let page_digest = page.header().declassify_page_digest_for_ack();
+                    let request_binding =
+                        guardian_replay_plan_request_binding(&state, request_id, None)?;
+                    guardian_replay_publish_request_binding(
+                        &mut state,
+                        request_binding,
+                        GuardianReplayRequestBinding {
+                            fingerprint,
+                            outcome: GuardianReplayRequestOutcome::SnapshotExpired {
+                                pane_id,
+                                generation,
+                                cursor,
+                                page_digest,
+                            },
+                        },
+                    );
+                    return Ok(page);
+                };
+                if snapshot.pane_id != pane_id
+                    || snapshot.generation != generation
+                    || snapshot.guardian_incarnation != request.header().guardian_incarnation
+                    || snapshot.mux_incarnation != request.header().mux_incarnation
+                    || snapshot.snapshot_digest != cursor.snapshot_digest()
+                    || snapshot.max_plaintext_bytes != cursor.max_plaintext_bytes()
+                    || snapshot.max_records != cursor.max_records()
+                {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+                let prior = snapshot
+                    .issued
+                    .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+                if !prior.acknowledged || prior.next_cursor != Some(cursor) {
+                    return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+                }
+                let (page, issued) = guardian_replay_build_page(
+                    &self.inner,
+                    state
+                        .snapshots
+                        .get(&cursor.snapshot_id())
+                        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?,
+                    request_id,
+                    fingerprint,
+                    Some(cursor),
+                )?;
+                let request_binding =
+                    guardian_replay_plan_request_binding(&state, request_id, None)?;
+                let access_epoch = state.plan_next_access_epoch()?;
+                {
+                    let snapshot = state
+                        .snapshots
+                        .get_mut(&cursor.snapshot_id())
+                        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                    snapshot.access_epoch = access_epoch;
+                    snapshot.issued = Some(issued);
+                }
+                state.access_epoch = access_epoch;
+                guardian_replay_publish_request_binding(
+                    &mut state,
+                    request_binding,
+                    GuardianReplayRequestBinding {
+                        fingerprint,
+                        outcome: GuardianReplayRequestOutcome::Page {
+                            snapshot_id: cursor.snapshot_id(),
+                            page_index: issued.page_index,
+                        },
+                    },
+                );
+                Ok(page)
+            }
+        }
+    }
+
+    /// Acknowledge only the exact page currently outstanding for a snapshot.
+    /// This ledger transition never authorizes retention or compaction.
+    pub(crate) fn apply_replay_ack(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+        ack: GuardianReplayAckV1,
+    ) -> Result<GuardianReplayAckReceiptV1, GuardianCheckpointStageStoreError> {
+        let fingerprint = guardian_replay_ack_fingerprint(request, ack)?;
+        let request_id = request.header().request_id;
+        let mut state = self
+            .inner
+            .replay
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        if let Some(binding) = state.request_bindings.get(&request_id).copied() {
+            if binding.fingerprint != fingerprint {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            return match binding.outcome {
+                GuardianReplayRequestOutcome::Ack { receipt } => Ok(receipt),
+                GuardianReplayRequestOutcome::Page { .. }
+                | GuardianReplayRequestOutcome::SnapshotExpired { .. } => {
+                    Err(GuardianCheckpointStageStoreError::Conflict)
+                }
+            };
+        }
+        let pane_id = request
+            .header()
+            .pane_id
+            .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+        let snapshot = state
+            .snapshots
+            .get(&ack.snapshot_id())
+            .ok_or(GuardianCheckpointStageStoreError::ReplaySnapshotExpired)?;
+        if snapshot.pane_id != pane_id
+            || snapshot.generation != request.header().lease_generation
+            || snapshot.guardian_incarnation != request.header().guardian_incarnation
+            || snapshot.mux_incarnation != request.header().mux_incarnation
+            || snapshot.snapshot_digest != ack.snapshot_digest()
+        {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let issued = snapshot
+            .issued
+            .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+        let expected_cursor_digest = issued.next_cursor.map(GuardianReplayCursorV1::digest);
+        if issued.acknowledged
+            || ack.page_index() != issued.page_index
+            || ack.page_digest() != issued.page_digest
+            || ack.next_cursor_digest() != expected_cursor_digest
+            || ack.through_sequence() != issued.through_sequence
+            || ack.through_record_digest() != issued.through_record_digest
+            || (ack.release_if_complete() && !issued.terminal)
+        {
+            return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+        }
+        let receipt = GuardianReplayAckReceiptV1::from_ack(ack);
+        let request_binding = guardian_replay_plan_request_binding(
+            &state,
+            request_id,
+            ack.release_if_complete().then_some(ack.snapshot_id()),
+        )?;
+        let access_epoch = if ack.release_if_complete() {
+            None
+        } else {
+            Some(state.plan_next_access_epoch()?)
+        };
+        if ack.release_if_complete() {
+            state
+                .snapshots
+                .remove(&ack.snapshot_id())
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        } else {
+            let access_epoch = access_epoch.ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let snapshot = state
+                .snapshots
+                .get_mut(&ack.snapshot_id())
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let issued = snapshot
+                .issued
+                .as_mut()
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            issued.acknowledged = true;
+            snapshot.access_epoch = access_epoch;
+            state.access_epoch = access_epoch;
+        }
+        guardian_replay_publish_request_binding(
+            &mut state,
+            request_binding,
+            GuardianReplayRequestBinding {
+                fingerprint,
+                outcome: GuardianReplayRequestOutcome::Ack { receipt },
+            },
+        );
+        Ok(receipt)
+    }
+
+    /// Select a protected Pane member with authenticated adoption evidence and
+    /// current replay semantics. The returned linear permit binds the exact
+    /// settled head observed while the directory lock is held.
     #[allow(dead_code)]
-    fn latest_compatible_catalog_member(
+    fn latest_compatible_catalog_restore_permit(
         &self,
         stage_scope: CheckpointStagePathScope,
         replay_semantics_id: [u8; 32],
-    ) -> Result<Option<[u8; 32]>, GuardianCheckpointStageStoreError> {
-        if replay_semantics_id == [0; 32] {
-            return Err(GuardianCheckpointStageStoreError::Conflict);
-        }
+        lease_fence_id: CheckpointCatalogRestoreLeaseFenceId,
+    ) -> Result<Option<CheckpointCatalogRestorePermit>, GuardianCheckpointStageStoreError> {
         self.with_exclusive_directory(|inner| {
             let scan = checkpoint_catalog_scan(
                 inner,
                 CheckpointCatalogScope::from_stage_scope(stage_scope),
             )?;
-            Ok(scan
-                .published
-                .iter()
-                .rev()
-                .find(|member| {
-                    member
-                        .format
-                        .authorizes_scope(member.metadata.identity.scope)
-                        && member.metadata.replay_semantics_id == replay_semantics_id
-                })
-                .map(|member| member.metadata.checkpoint_id))
+            checkpoint_catalog_select_restore_permit(
+                scan,
+                stage_scope,
+                CheckpointCatalogRestoreSelector::LatestCompatible {
+                    replay_semantics_id,
+                },
+                lease_fence_id,
+            )
         })
     }
 
-    /// Resolve one exact artifact identity from the published catalog only.
+    /// Select one exact protected Pane artifact with authenticated adoption
+    /// evidence and bind it to the settled catalog head observed under lock.
     #[allow(dead_code)]
-    fn exact_catalog_member(
+    fn exact_catalog_restore_permit(
         &self,
         stage_scope: CheckpointStagePathScope,
         checkpoint_id: [u8; 32],
-    ) -> Result<Option<[u8; 32]>, GuardianCheckpointStageStoreError> {
-        if checkpoint_id == [0; 32] {
-            return Err(GuardianCheckpointStageStoreError::Conflict);
-        }
+        lease_fence_id: CheckpointCatalogRestoreLeaseFenceId,
+    ) -> Result<Option<CheckpointCatalogRestorePermit>, GuardianCheckpointStageStoreError> {
         self.with_exclusive_directory(|inner| {
             let scan = checkpoint_catalog_scan(
                 inner,
                 CheckpointCatalogScope::from_stage_scope(stage_scope),
             )?;
-            Ok(scan
-                .published
-                .iter()
-                .find(|member| {
-                    member
-                        .format
-                        .authorizes_scope(member.metadata.identity.scope)
-                        && member.metadata.checkpoint_id == checkpoint_id
-                })
-                .map(|member| member.metadata.checkpoint_id))
+            checkpoint_catalog_select_restore_permit(
+                scan,
+                stage_scope,
+                CheckpointCatalogRestoreSelector::Exact { checkpoint_id },
+                lease_fence_id,
+            )
+        })
+    }
+
+    /// Reacquire the directory lock, authenticate a fresh scan, require the
+    /// exact same settled head and selected artifact, then invoke the mutation
+    /// seam while both process-local and filesystem locks remain held.
+    ///
+    /// There is deliberately no production symbol. This method and its
+    /// mutation closure compile only as a proof seam until the writer-lease
+    /// coordinator supplies the current fence identity and a durable receipt
+    /// ledger consumes the stable binding ID.
+    #[cfg(test)]
+    fn commit_catalog_restore_permit<T>(
+        &self,
+        permit: CheckpointCatalogRestorePermit,
+        current_lease_fence_id: CheckpointCatalogRestoreLeaseFenceId,
+        mutation: impl FnOnce([u8; 32]) -> Result<T, GuardianCheckpointStageStoreError>,
+    ) -> Result<T, GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| {
+            let scan = checkpoint_catalog_scan(
+                inner,
+                CheckpointCatalogScope::from_stage_scope(permit.stage_scope),
+            )?;
+            let recovered = checkpoint_catalog_select_restore_permit(
+                scan,
+                permit.stage_scope,
+                CheckpointCatalogRestoreSelector::Exact {
+                    checkpoint_id: permit.checkpoint_id,
+                },
+                current_lease_fence_id,
+            )?
+            .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+            if permit.lease_fence_id != current_lease_fence_id {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            if !permit.is_exact_revalidation(&recovered) {
+                return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+            }
+            mutation(permit.binding_id())
         })
     }
 
@@ -2429,6 +3070,1416 @@ impl GuardianCheckpointStageStore {
             )),
         }
     }
+}
+
+fn guardian_replay_request_fingerprint(
+    request: &AuthenticatedGuardianRequest,
+    replay: GuardianReplayRequestV1,
+) -> Result<[u8; 32], GuardianCheckpointStageStoreError> {
+    let canonical = replay.encode()?;
+    guardian_replay_authenticated_fingerprint(request, GuardianOperation::Replay, &canonical)
+}
+
+fn guardian_replay_ack_fingerprint(
+    request: &AuthenticatedGuardianRequest,
+    ack: GuardianReplayAckV1,
+) -> Result<[u8; 32], GuardianCheckpointStageStoreError> {
+    let canonical = ack.encode()?;
+    guardian_replay_authenticated_fingerprint(request, GuardianOperation::ReplayAck, &canonical)
+}
+
+fn guardian_replay_authenticated_fingerprint(
+    request: &AuthenticatedGuardianRequest,
+    operation: GuardianOperation,
+    canonical_payload: &[u8],
+) -> Result<[u8; 32], GuardianCheckpointStageStoreError> {
+    let header = request.header();
+    let observed_payload_digest: [u8; 32] = Sha256::digest(canonical_payload).into();
+    if header.operation != operation
+        || header.pane_id.is_none()
+        || header.lease_generation == 0
+        || request.payload() != canonical_payload
+        || header.payload_sha256 != observed_payload_digest
+        || usize::try_from(request.authenticated_payload_bytes()).ok()
+            != Some(canonical_payload.len())
+    {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(REPLAY_REQUEST_BINDING_DOMAIN);
+    hasher.update(header.protocol_version.to_le_bytes());
+    hasher.update([header.operation as u8]);
+    hasher.update(header.guardian_incarnation.as_bytes());
+    hasher.update(header.mux_incarnation.as_bytes());
+    hasher.update(header.request_id.as_bytes());
+    hasher.update(header.payload_sha256);
+    hasher.update(header.pane_id.unwrap_or(Uuid::nil()).as_bytes());
+    hasher.update(header.lease_generation.to_le_bytes());
+    hasher.update(header.lease_sequence.to_le_bytes());
+    hasher.update([u8::from(header.effect_id.is_some())]);
+    hasher.update(header.effect_id.unwrap_or(Uuid::nil()).as_bytes());
+    hasher.update(
+        u64::try_from(canonical_payload.len())
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
+            .to_le_bytes(),
+    );
+    hasher.update(canonical_payload);
+    Ok(hasher.finalize().into())
+}
+
+fn guardian_replay_plan_snapshot_admission(
+    state: &GuardianReplayState,
+) -> Result<GuardianReplaySnapshotAdmissionPlan, GuardianCheckpointStageStoreError> {
+    if state.snapshots.len() > REPLAY_MAX_ACTIVE_SNAPSHOTS {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let evicted_snapshot_id = if state.snapshots.len() == REPLAY_MAX_ACTIVE_SNAPSHOTS {
+        Some(
+            state
+                .snapshots
+                .iter()
+                .filter(|(_, snapshot)| snapshot.issued.is_some_and(|issued| issued.acknowledged))
+                .min_by_key(|(_, snapshot)| snapshot.access_epoch)
+                .map(|(snapshot_id, _)| *snapshot_id)
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?,
+        )
+    } else {
+        None
+    };
+    Ok(GuardianReplaySnapshotAdmissionPlan {
+        evicted_snapshot_id,
+    })
+}
+
+fn guardian_replay_commit_snapshot_admission(
+    state: &mut GuardianReplayState,
+    plan: GuardianReplaySnapshotAdmissionPlan,
+) {
+    if let Some(snapshot_id) = plan.evicted_snapshot_id {
+        let removed = state.snapshots.remove(&snapshot_id);
+        debug_assert!(removed.is_some());
+    }
+}
+
+fn guardian_replay_plan_request_binding(
+    state: &GuardianReplayState,
+    request_id: Uuid,
+    future_snapshot_removal: Option<Uuid>,
+) -> Result<GuardianReplayRequestBindingPlan, GuardianCheckpointStageStoreError> {
+    if request_id.is_nil() || state.request_bindings.contains_key(&request_id) {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    #[cfg(test)]
+    if state.fail_request_binding_reservation {
+        return Err(GuardianCheckpointStageStoreError::Capacity);
+    }
+    if state.request_bindings.len() > REPLAY_MAX_REQUEST_BINDINGS
+        || state.request_order.len() != state.request_bindings.len()
+        || state
+            .request_order
+            .iter()
+            .enumerate()
+            .any(|(index, candidate)| {
+                !state.request_bindings.contains_key(candidate)
+                    || state
+                        .request_order
+                        .iter()
+                        .skip(index + 1)
+                        .any(|later| later == candidate)
+            })
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let (evicted_order_index, evicted_request_id) =
+        if state.request_bindings.len() == REPLAY_MAX_REQUEST_BINDINGS {
+            let evicted_order_index = state.request_order.iter().position(|candidate| {
+                state
+                    .request_bindings
+                    .get(candidate)
+                    .is_some_and(|existing| match existing.outcome {
+                        GuardianReplayRequestOutcome::Ack { .. }
+                        | GuardianReplayRequestOutcome::SnapshotExpired { .. } => true,
+                        GuardianReplayRequestOutcome::Page {
+                            snapshot_id,
+                            page_index,
+                        } => {
+                            future_snapshot_removal == Some(snapshot_id)
+                                || state.snapshots.get(&snapshot_id).is_none_or(|snapshot| {
+                                    snapshot.issued.is_none_or(|issued| {
+                                        issued.request_id != *candidate
+                                            || issued.page_index != page_index
+                                    })
+                                })
+                        }
+                    })
+            });
+            let evicted_order_index =
+                evicted_order_index.ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+            (
+                Some(evicted_order_index),
+                Some(state.request_order[evicted_order_index]),
+            )
+        } else {
+            (None, None)
+        };
+    Ok(GuardianReplayRequestBindingPlan {
+        request_id,
+        evicted_order_index,
+        evicted_request_id,
+    })
+}
+
+fn guardian_replay_publish_request_binding(
+    state: &mut GuardianReplayState,
+    plan: GuardianReplayRequestBindingPlan,
+    binding: GuardianReplayRequestBinding,
+) {
+    if let (Some(index), Some(evicted_request_id)) =
+        (plan.evicted_order_index, plan.evicted_request_id)
+    {
+        let removed_order_entry = state.request_order.remove(index);
+        debug_assert_eq!(removed_order_entry, Some(evicted_request_id));
+        let removed_binding = state.request_bindings.remove(&evicted_request_id);
+        debug_assert!(removed_binding.is_some());
+    }
+    let request_id = plan.request_id;
+    debug_assert!(!request_id.is_nil());
+    debug_assert!(state.request_bindings.len() < REPLAY_MAX_REQUEST_BINDINGS);
+    debug_assert!(!state.request_bindings.contains_key(&request_id));
+    state.request_order.push_back(request_id);
+    let replaced = state.request_bindings.insert(request_id, binding);
+    debug_assert!(replaced.is_none());
+}
+
+fn guardian_replay_retry_page(
+    inner: &GuardianCheckpointStageStoreInner,
+    state: &mut GuardianReplayState,
+    request: &AuthenticatedGuardianRequest,
+    binding: GuardianReplayRequestBinding,
+) -> Result<GuardianReplayPageDelivery, GuardianCheckpointStageStoreError> {
+    match binding.outcome {
+        GuardianReplayRequestOutcome::Page {
+            snapshot_id,
+            page_index,
+        } => {
+            let snapshot = state
+                .snapshots
+                .get(&snapshot_id)
+                .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+            let issued = snapshot
+                .issued
+                .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+            if issued.request_id != request.header().request_id
+                || issued.request_fingerprint != binding.fingerprint
+                || issued.page_index != page_index
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let (page, rebuilt) = guardian_replay_build_page(
+                inner,
+                snapshot,
+                issued.request_id,
+                issued.request_fingerprint,
+                issued.incoming_cursor,
+            )?;
+            if rebuilt.page_index != issued.page_index
+                || rebuilt.page_digest != issued.page_digest
+                || rebuilt.next_cursor != issued.next_cursor
+                || rebuilt.through_sequence != issued.through_sequence
+                || rebuilt.through_record_digest != issued.through_record_digest
+                || rebuilt.terminal != issued.terminal
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            Ok(page)
+        }
+        GuardianReplayRequestOutcome::SnapshotExpired {
+            pane_id,
+            generation,
+            cursor,
+            page_digest,
+        } => {
+            if request.header().pane_id != Some(pane_id)
+                || request.header().lease_generation != generation
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let page = GuardianReplayPageDelivery::new(
+                pane_id,
+                generation,
+                cursor.snapshot_id(),
+                cursor.snapshot_digest(),
+                cursor.digest(),
+                cursor.page_index(),
+                None,
+                GuardianReplayPageBodyDelivery::SnapshotExpired {
+                    snapshot_id: cursor.snapshot_id(),
+                },
+            )?;
+            if page.header().declassify_page_digest_for_ack() != page_digest {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            Ok(page)
+        }
+        GuardianReplayRequestOutcome::Ack { .. } => {
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        }
+    }
+}
+
+fn guardian_replay_open_snapshot(
+    inner: &GuardianCheckpointStageStoreInner,
+    request: &AuthenticatedGuardianRequest,
+    selector: GuardianReplaySelectorV1,
+    max_plaintext_bytes: u32,
+    max_records: u16,
+    journal: Option<&GuardianPaneOutputJournal>,
+    access_epoch: u64,
+) -> Result<GuardianReplaySnapshot, GuardianCheckpointStageStoreError> {
+    let pane_id = request
+        .header()
+        .pane_id
+        .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+    let generation = request.header().lease_generation;
+    let scan = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
+    checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
+    checkpoint_catalog_validate_generic_restore_evidence(&scan)?;
+    let has_evidence = |member: &PublishedCheckpointCatalogMember| {
+        member.format == CheckpointCatalogFormat::ProtectedV3
+            && member.metadata.identity.scope == CheckpointCatalogScope::Pane { pane_id }
+            // Capture generation is historical source metadata. A currently
+            // authenticated successor lease may replay an older generation,
+            // but a request must never reach forward into a checkpoint from a
+            // generation newer than its own current lease fence.
+            && member.metadata.capture_generation <= generation
+            && scan.generic_restore_evidence.iter().any(|evidence| {
+                evidence.identity == member.metadata.identity
+                    && evidence.candidate_checksum == member.candidate_checksum
+            })
+    };
+    let selected_index = match selector {
+        GuardianReplaySelectorV1::LatestCompatible => {
+            let semantics = current_replay_identity_digest();
+            scan.published.iter().rposition(|member| {
+                has_evidence(member) && member.metadata.replay_semantics_id == semantics
+            })
+        }
+        GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id }
+        | GuardianReplaySelectorV1::Resume { checkpoint_id, .. } => {
+            scan.published.iter().position(|member| {
+                has_evidence(member) && member.metadata.checkpoint_id == checkpoint_id.into_bytes()
+            })
+        }
+    }
+    .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    let selected = scan.published[selected_index].clone();
+    let head = scan
+        .published
+        .last()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let catalog = GuardianReplayCatalogPin {
+        selected,
+        settled_head_identity: head.metadata.identity,
+        settled_head_candidate_checksum: head.candidate_checksum,
+        settled_head_candidate_path: head.candidate_path.clone(),
+        settled_head_candidate_file_identity: head.candidate_file_identity,
+        settled_head_marker_path: head.marker_path.clone(),
+        settled_head_marker_file_identity: head.marker_file_identity,
+    };
+    let descriptor = guardian_replay_open_catalog_descriptor(inner, &catalog.selected)?;
+    if descriptor.durable_pane_id() != Some(pane_id) || descriptor.capture_generation() > generation
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let (suffix_first_sequence, suffix_previous_record_digest) = descriptor
+        .suffix_start()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let output = journal
+        .map(|journal| {
+            journal.validate_checkpoint_record_origin(&descriptor.canonical_descriptor()?)?;
+            guardian_replay_capture_output(journal, descriptor)
+        })
+        .transpose()?;
+    let (initial_phase, initial_next_sequence, initial_previous_record_digest) = match selector {
+        GuardianReplaySelectorV1::LatestCompatible
+        | GuardianReplaySelectorV1::ExactCheckpoint { .. } => (
+            GuardianReplayPhaseV1::Checkpoint,
+            suffix_first_sequence,
+            suffix_previous_record_digest,
+        ),
+        GuardianReplaySelectorV1::Resume {
+            next_sequence,
+            previous_record_digest,
+            ..
+        } => {
+            let output = output
+                .as_ref()
+                .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+            guardian_replay_validate_resume(
+                output,
+                suffix_first_sequence,
+                suffix_previous_record_digest,
+                next_sequence,
+                previous_record_digest,
+            )?;
+            (
+                GuardianReplayPhaseV1::Output,
+                next_sequence,
+                previous_record_digest,
+            )
+        }
+    };
+    let snapshot_id = Uuid::new_v4();
+    if snapshot_id.is_nil() {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let mut snapshot = GuardianReplaySnapshot {
+        snapshot_id,
+        snapshot_digest: [0; 32],
+        pane_id,
+        generation,
+        guardian_incarnation: request.header().guardian_incarnation,
+        mux_incarnation: request.header().mux_incarnation,
+        descriptor,
+        catalog,
+        output,
+        suffix_first_sequence,
+        suffix_previous_record_digest,
+        initial_phase,
+        initial_next_sequence,
+        initial_previous_record_digest,
+        max_plaintext_bytes,
+        max_records,
+        issued: None,
+        access_epoch,
+    };
+    snapshot.snapshot_digest = guardian_replay_snapshot_digest(&snapshot)?;
+    if snapshot.snapshot_digest == [0; 32] {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(snapshot)
+}
+
+fn guardian_replay_open_catalog_descriptor(
+    inner: &GuardianCheckpointStageStoreInner,
+    member: &PublishedCheckpointCatalogMember,
+) -> Result<GuardianCheckpointDescriptorV1, GuardianCheckpointStageStoreError> {
+    if member.format != CheckpointCatalogFormat::ProtectedV3
+        || !matches!(
+            member.metadata.identity.scope,
+            CheckpointCatalogScope::Pane { .. }
+        )
+    {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let bytes = checkpoint_catalog_read_file(
+        inner,
+        &member.candidate_path,
+        member.candidate_file_identity,
+        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+    )?;
+    let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+    if candidate.format != CheckpointCatalogFormat::ProtectedV3
+        || candidate.metadata != member.metadata
+        || candidate.checksum != member.candidate_checksum
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
+    let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &candidate)?;
+    let begin_record = candidate
+        .records
+        .first()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let begin = inner.cipher.open(
+        &begin_record.context(),
+        begin_record,
+        u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    )?;
+    let request = GuardianCheckpointStageRequestV1::decode(&begin)?;
+    let shape = CheckpointStageRequestShape::from_request(&request)?;
+    if shape.descriptor.checkpoint_id().into_bytes() != member.metadata.checkpoint_id
+        || shape.descriptor.boundary_id().into_bytes() != member.metadata.boundary_id
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(shape.descriptor)
+}
+
+fn guardian_replay_capture_output(
+    journal: &GuardianPaneOutputJournal,
+    descriptor: GuardianCheckpointDescriptorV1,
+) -> Result<GuardianReplayOutputPin, GuardianCheckpointStageStoreError> {
+    let authority = journal
+        .authority
+        .lock()
+        .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+    authority
+        .validate_path_authority()
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    validate_replayable_segment_chain(
+        &authority.directory,
+        &authority.directory_path,
+        &authority.segments,
+        &authority.cipher,
+        authority.policy,
+    )?;
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(authority.segments.len())
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    for (index, segment) in authority.segments.iter().enumerate() {
+        validate_file_identity_at(
+            &authority.directory,
+            &authority.directory_path,
+            &segment.path,
+            segment.file_identity,
+        )?;
+        let file = open_private_file_at(
+            &authority.directory,
+            &authority.directory_path,
+            &segment.path,
+            false,
+        )?;
+        let opened = GuardianOutputJournal::open(
+            file,
+            segment.segment_identity,
+            authority.cipher.clone(),
+            authority.policy.journal_limits,
+        )?;
+        if opened.tail() != GuardianOutputJournalTail::Clean || opened.is_poisoned() {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        segments.push(GuardianReplayOutputSegmentPin {
+            authority: segment.clone(),
+            committed_bytes: opened.committed_bytes(),
+            terminal_receipt: opened.terminal_receipt(),
+            was_current: index + 1 == authority.segments.len(),
+        });
+    }
+    let terminal = segments
+        .iter()
+        .rev()
+        .find_map(|segment| segment.terminal_receipt)
+        .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+    let GuardianCheckpointOutputBoundaryV1::Record {
+        sequence,
+        record_digest,
+        ..
+    } = descriptor.output_boundary()
+    else {
+        return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+    };
+    if terminal.sequence() < sequence
+        || (terminal.sequence() == sequence && terminal.record_digest() != record_digest)
+    {
+        return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+    }
+    Ok(GuardianReplayOutputPin {
+        directory: authority.directory.try_clone().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("replay-output-directory-clone", error)
+        })?,
+        directory_path: authority.directory_path.clone(),
+        cipher: authority.cipher.clone(),
+        policy: authority.policy,
+        manifest: authority.manifest.snapshot.clone(),
+        manifest_path: authority.manifest.path.clone(),
+        manifest_file_identity: authority.manifest.file_identity,
+        publication_path: authority.manifest.publication_path.clone(),
+        publication_file_identity: authority.manifest.publication_file_identity,
+        segments,
+        terminal_sequence: terminal.sequence(),
+        terminal_record_digest: terminal.record_digest(),
+        cumulative_plaintext_bytes: terminal.cumulative_plaintext_bytes(),
+    })
+}
+
+fn guardian_replay_validate_resume(
+    output: &GuardianReplayOutputPin,
+    suffix_first_sequence: u64,
+    suffix_previous_record_digest: [u8; 32],
+    next_sequence: u64,
+    previous_record_digest: [u8; 32],
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    if next_sequence < suffix_first_sequence
+        || next_sequence
+            > output
+                .terminal_sequence
+                .checked_add(1)
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?
+    {
+        return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+    }
+    let expected = if next_sequence == suffix_first_sequence {
+        suffix_previous_record_digest
+    } else {
+        guardian_replay_recover_receipt(output, next_sequence - 1)?.record_digest()
+    };
+    if expected != previous_record_digest {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    Ok(())
+}
+
+fn guardian_replay_validate_output_pin(
+    output: &GuardianReplayOutputPin,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    validate_file_identity_at(
+        &output.directory,
+        &output.directory_path,
+        &output.manifest_path,
+        output.manifest_file_identity,
+    )?;
+    let manifest_file = open_private_file_at(
+        &output.directory,
+        &output.directory_path,
+        &output.manifest_path,
+        false,
+    )?;
+    let manifest_metadata = manifest_file.metadata().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("replay-manifest-metadata", error)
+    })?;
+    if !output.manifest_file_identity.matches(&manifest_metadata) {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let manifest_bytes = read_manifest_file_bounded(manifest_file, &manifest_metadata)?;
+    let manifest = decode_manifest(&manifest_bytes)?;
+    if manifest.durable_pane_id != output.manifest.durable_pane_id
+        || manifest.guardian_incarnation != output.manifest.guardian_incarnation
+        || manifest.manifest_id != output.manifest.manifest_id
+        || manifest.revision != output.manifest.revision
+        || manifest.predecessor != output.manifest.predecessor
+        || manifest.segments != output.manifest.segments
+        || manifest.checksum != output.manifest.checksum
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    validate_file_identity_at(
+        &output.directory,
+        &output.directory_path,
+        &output.publication_path,
+        output.publication_file_identity,
+    )?;
+    if output.segments.len() != output.manifest.segments.len()
+        || output
+            .segments
+            .iter()
+            .zip(&output.manifest.segments)
+            .any(|(segment, identity)| segment.authority.segment_identity != *identity)
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    for segment in &output.segments {
+        validate_file_identity_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            segment.authority.file_identity,
+        )?;
+        let file = open_private_file_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            false,
+        )?;
+        let journal = GuardianOutputJournal::open(
+            file,
+            segment.authority.segment_identity,
+            output.cipher.clone(),
+            output.policy.journal_limits,
+        )?;
+        if journal.tail() != GuardianOutputJournalTail::Clean
+            || journal.is_poisoned()
+            || journal.committed_bytes() < segment.committed_bytes
+            || (!segment.was_current && journal.committed_bytes() != segment.committed_bytes)
+        {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        match segment.terminal_receipt {
+            Some(expected) => {
+                let mut cursor = journal.recovery_cursor(
+                    expected.sequence(),
+                    output.policy.journal_limits.max_record_bytes,
+                )?;
+                let recovered = cursor
+                    .next_record()?
+                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+                if recovered.receipt() != expected {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
+            }
+            None if segment.committed_bytes == OUTPUT_V3_FILE_HEADER_BYTES => {}
+            None => return Err(GuardianCheckpointStageStoreError::Poisoned),
+        }
+    }
+    Ok(())
+}
+
+fn guardian_replay_recover_receipt(
+    output: &GuardianReplayOutputPin,
+    sequence: u64,
+) -> Result<GuardianOutputAppendReceipt, GuardianCheckpointStageStoreError> {
+    guardian_replay_validate_output_pin(output)?;
+    let segment = output
+        .segments
+        .iter()
+        .find(|segment| {
+            let first = segment.authority.segment_identity.first_sequence();
+            let last = segment
+                .terminal_receipt
+                .map(GuardianOutputAppendReceipt::sequence)
+                .unwrap_or_else(|| first.saturating_sub(1));
+            first <= sequence && sequence <= last
+        })
+        .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+    let file = open_private_file_at(
+        &output.directory,
+        &output.directory_path,
+        &segment.authority.path,
+        false,
+    )?;
+    let journal = GuardianOutputJournal::open(
+        file,
+        segment.authority.segment_identity,
+        output.cipher.clone(),
+        output.policy.journal_limits,
+    )?;
+    let mut cursor =
+        journal.recovery_cursor(sequence, output.policy.journal_limits.max_record_bytes)?;
+    let recovered = cursor
+        .next_record()?
+        .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+    if recovered.receipt().sequence() != sequence
+        || segment
+            .terminal_receipt
+            .is_some_and(|terminal| recovered.receipt().sequence() > terminal.sequence())
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(recovered.receipt())
+}
+
+fn guardian_replay_hash_file_identity(hasher: &mut Sha256, identity: FileIdentity) {
+    hasher.update(identity.device.to_le_bytes());
+    hasher.update(identity.inode.to_le_bytes());
+    hasher.update(identity.mode.to_le_bytes());
+    hasher.update(identity.owner.to_le_bytes());
+    hasher.update(identity.links.to_le_bytes());
+    hasher.update([u8::from(identity.expected_len.is_some())]);
+    hasher.update(identity.expected_len.unwrap_or(0).to_le_bytes());
+}
+
+fn guardian_replay_snapshot_digest(
+    snapshot: &GuardianReplaySnapshot,
+) -> Result<[u8; 32], GuardianCheckpointStageStoreError> {
+    let mut hasher = Sha256::new();
+    hasher.update(REPLAY_SNAPSHOT_DIGEST_DOMAIN);
+    hasher.update(snapshot.snapshot_id.as_bytes());
+    hasher.update(snapshot.pane_id.as_bytes());
+    hasher.update(snapshot.generation.to_le_bytes());
+    hasher.update(snapshot.guardian_incarnation.as_bytes());
+    hasher.update(snapshot.mux_incarnation.as_bytes());
+    hasher.update(snapshot.descriptor.checkpoint_id().into_bytes());
+    hasher.update(snapshot.descriptor.boundary_id().into_bytes());
+    hasher.update(snapshot.descriptor.capture_generation().to_le_bytes());
+    hasher.update(snapshot.descriptor.replay_semantics_id());
+    hasher.update(snapshot.descriptor.total_bytes().to_le_bytes());
+    hasher.update(snapshot.descriptor.terminal_payload_digest());
+    hasher.update(snapshot.suffix_first_sequence.to_le_bytes());
+    hasher.update(snapshot.suffix_previous_record_digest);
+    hasher.update([snapshot.initial_phase as u8]);
+    hasher.update(snapshot.initial_next_sequence.to_le_bytes());
+    hasher.update(snapshot.initial_previous_record_digest);
+    hasher.update(snapshot.max_plaintext_bytes.to_le_bytes());
+    hasher.update(snapshot.max_records.to_le_bytes());
+    checkpoint_catalog_restore_hash_identity(
+        &mut hasher,
+        snapshot.catalog.selected.metadata.identity,
+    );
+    hasher.update(snapshot.catalog.selected.candidate_checksum);
+    guardian_replay_hash_file_identity(
+        &mut hasher,
+        snapshot.catalog.selected.candidate_file_identity,
+    );
+    guardian_replay_hash_file_identity(&mut hasher, snapshot.catalog.selected.marker_file_identity);
+    checkpoint_catalog_restore_hash_identity(&mut hasher, snapshot.catalog.settled_head_identity);
+    hasher.update(snapshot.catalog.settled_head_candidate_checksum);
+    guardian_replay_hash_file_identity(
+        &mut hasher,
+        snapshot.catalog.settled_head_candidate_file_identity,
+    );
+    guardian_replay_hash_file_identity(
+        &mut hasher,
+        snapshot.catalog.settled_head_marker_file_identity,
+    );
+    match &snapshot.output {
+        None => hasher.update([0]),
+        Some(output) => {
+            hasher.update([1]);
+            hasher.update(output.manifest.durable_pane_id.as_bytes());
+            hasher.update(output.manifest.guardian_incarnation.as_bytes());
+            hasher.update(output.manifest.manifest_id.as_bytes());
+            hasher.update(output.manifest.revision.to_le_bytes());
+            hasher.update(output.manifest.checksum);
+            guardian_replay_hash_file_identity(&mut hasher, output.manifest_file_identity);
+            guardian_replay_hash_file_identity(&mut hasher, output.publication_file_identity);
+            hasher.update(
+                u64::try_from(output.segments.len())
+                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?
+                    .to_le_bytes(),
+            );
+            for segment in &output.segments {
+                let identity = segment.authority.segment_identity;
+                hasher.update(identity.segment_id().as_bytes());
+                hasher.update(identity.first_sequence().to_le_bytes());
+                hasher.update(segment.committed_bytes.to_le_bytes());
+                guardian_replay_hash_file_identity(&mut hasher, segment.authority.file_identity);
+                if let Some(receipt) = segment.terminal_receipt {
+                    hasher.update([1]);
+                    hasher.update(receipt.sequence().to_le_bytes());
+                    hasher.update(receipt.record_digest());
+                    hasher.update(receipt.committed_log_bytes().to_le_bytes());
+                    hasher.update(receipt.cumulative_plaintext_bytes().to_le_bytes());
+                } else {
+                    hasher.update([0]);
+                }
+            }
+            hasher.update(output.terminal_sequence.to_le_bytes());
+            hasher.update(output.terminal_record_digest);
+            hasher.update(output.cumulative_plaintext_bytes.to_le_bytes());
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn guardian_replay_validate_catalog_pin(
+    inner: &GuardianCheckpointStageStoreInner,
+    pin: &GuardianReplayCatalogPin,
+) -> Result<CheckpointCatalogCandidate, GuardianCheckpointStageStoreError> {
+    let selected_bytes = checkpoint_catalog_read_file(
+        inner,
+        &pin.selected.candidate_path,
+        pin.selected.candidate_file_identity,
+        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+    )?;
+    let selected = checkpoint_catalog_decode_candidate(&selected_bytes)?;
+    let selected_marker_bytes = checkpoint_catalog_read_file(
+        inner,
+        &pin.selected.marker_path,
+        pin.selected.marker_file_identity,
+        u64::try_from(CHECKPOINT_CATALOG_MARKER_BYTES)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    )?;
+    let selected_marker = checkpoint_catalog_decode_marker(&selected_marker_bytes)?;
+    if selected.format != CheckpointCatalogFormat::ProtectedV3
+        || selected.metadata != pin.selected.metadata
+        || selected.checksum != pin.selected.candidate_checksum
+        || !checkpoint_catalog_marker_matches_candidate(&selected_marker, &selected)
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &selected)?;
+
+    let head_bytes = checkpoint_catalog_read_file(
+        inner,
+        &pin.settled_head_candidate_path,
+        pin.settled_head_candidate_file_identity,
+        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+    )?;
+    let head = checkpoint_catalog_decode_candidate(&head_bytes)?;
+    let head_marker_bytes = checkpoint_catalog_read_file(
+        inner,
+        &pin.settled_head_marker_path,
+        pin.settled_head_marker_file_identity,
+        u64::try_from(CHECKPOINT_CATALOG_MARKER_BYTES)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    )?;
+    let head_marker = checkpoint_catalog_decode_marker(&head_marker_bytes)?;
+    if head.metadata.identity != pin.settled_head_identity
+        || head.checksum != pin.settled_head_candidate_checksum
+        || !checkpoint_catalog_marker_matches_candidate(&head_marker, &head)
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok(selected)
+}
+
+fn guardian_replay_checkpoint_chunk(
+    inner: &GuardianCheckpointStageStoreInner,
+    snapshot: &GuardianReplaySnapshot,
+    offset: u64,
+) -> Result<GuardianCheckpointChunkDelivery, GuardianCheckpointStageStoreError> {
+    let total_bytes = snapshot.descriptor.total_bytes();
+    if offset >= total_bytes {
+        return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+    }
+    let requested_bytes = total_bytes
+        .checked_sub(offset)
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?
+        .min(u64::from(snapshot.max_plaintext_bytes));
+    let requested_bytes_usize = usize::try_from(requested_bytes)
+        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
+    let begin_record = candidate
+        .records
+        .first()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let begin_plaintext = inner.cipher.open(
+        &begin_record.context(),
+        begin_record,
+        u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    )?;
+    let begin = GuardianCheckpointStageRequestV1::decode(&begin_plaintext)?;
+    let shape = CheckpointStageRequestShape::from_request(&begin)?;
+    if shape.descriptor != snapshot.descriptor
+        || shape.total_bytes != total_bytes
+        || shape.total_chunks != candidate.metadata.chunk_count
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let chunk_bytes_u64 = u64::from(shape.chunk_bytes);
+    let first_chunk = u32::try_from(offset / chunk_bytes_u64)
+        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let end = offset
+        .checked_add(requested_bytes)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let last_chunk = u32::try_from((end - 1) / chunk_bytes_u64)
+        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    let mut plaintext = Zeroizing::new(Vec::new());
+    plaintext
+        .try_reserve_exact(requested_bytes_usize)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    for index in first_chunk..=last_chunk {
+        let record_index = usize::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        let record = candidate
+            .records
+            .get(record_index)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        let chunk_offset = u64::from(index)
+            .checked_mul(chunk_bytes_u64)
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        let chunk_length = total_bytes
+            .checked_sub(chunk_offset)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?
+            .min(chunk_bytes_u64);
+        let context = record.context();
+        if context.kind() != GuardianCheckpointStageRecordKindV1::Chunk
+            || context.scope() != shape.binding.scope()
+            || context.upload_id() != shape.upload_id
+            || context.publication_id() != candidate.metadata.completion_id
+            || context.chunk_position() != Some((index, chunk_offset))
+            || u64::from(context.plaintext_bytes()) != chunk_length
+            || context.boundary_identity_digest() != candidate.metadata.boundary_id
+            || context.checkpoint_identity_digest() != candidate.metadata.checkpoint_id
+        {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        let chunk = inner.cipher.open(
+            &context,
+            record,
+            u32::try_from(chunk_length).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+        )?;
+        let copy_start = offset.max(chunk_offset) - chunk_offset;
+        let copy_end = end.min(
+            chunk_offset
+                .checked_add(chunk_length)
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?,
+        ) - chunk_offset;
+        let copy_start =
+            usize::try_from(copy_start).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+        let copy_end =
+            usize::try_from(copy_end).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+        plaintext.extend_from_slice(
+            chunk
+                .get(copy_start..copy_end)
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?,
+        );
+    }
+    if plaintext.len() != requested_bytes_usize {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    GuardianCheckpointChunkDelivery::new(snapshot.descriptor, offset, plaintext).map_err(Into::into)
+}
+
+fn guardian_replay_predecessor(
+    predecessor: GuardianOutputPredecessor,
+) -> Result<GuardianReplayPredecessorV1, GuardianCheckpointStageStoreError> {
+    GuardianReplayPredecessorV1::new(
+        predecessor.segment_id(),
+        predecessor.last_sequence(),
+        predecessor.terminal_record_digest(),
+        predecessor.cumulative_plaintext_bytes(),
+        predecessor.committed_log_bytes(),
+    )
+    .map_err(Into::into)
+}
+
+fn guardian_replay_output_page(
+    output: &GuardianReplayOutputPin,
+    first_sequence: u64,
+    previous_record_digest: [u8; 32],
+    max_plaintext_bytes: u32,
+    max_records: u16,
+) -> Result<
+    (
+        GuardianReplayOutputRecordsDelivery,
+        GuardianOutputAppendReceipt,
+    ),
+    GuardianCheckpointStageStoreError,
+> {
+    guardian_replay_validate_output_pin(output)?;
+    if first_sequence == 0 || first_sequence > output.terminal_sequence {
+        return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+    }
+    let mut deliveries = Vec::new();
+    deliveries
+        .try_reserve_exact(usize::from(max_records))
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    let mut plaintext_bytes = 0_u32;
+    let mut next_sequence = first_sequence;
+    let mut terminal_receipt = None;
+    for segment in &output.segments {
+        let segment_first = segment.authority.segment_identity.first_sequence();
+        let Some(segment_terminal) = segment.terminal_receipt else {
+            continue;
+        };
+        if next_sequence > segment_terminal.sequence() || next_sequence < segment_first {
+            continue;
+        }
+        let file = open_private_file_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            false,
+        )?;
+        let journal = GuardianOutputJournal::open(
+            file,
+            segment.authority.segment_identity,
+            output.cipher.clone(),
+            output.policy.journal_limits,
+        )?;
+        let mut cursor = journal
+            .recovery_cursor(next_sequence, output.policy.journal_limits.max_record_bytes)?;
+        while deliveries.len() < usize::from(max_records) {
+            let Some(recovered) = cursor.next_record()? else {
+                break;
+            };
+            let receipt = recovered.receipt();
+            if receipt.sequence() > segment_terminal.sequence() {
+                break;
+            }
+            if receipt.sequence() != next_sequence {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            let projected = plaintext_bytes
+                .checked_add(receipt.payload_bytes())
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+            if projected > max_plaintext_bytes {
+                if deliveries.is_empty() {
+                    return Err(GuardianCheckpointStageStoreError::Capacity);
+                }
+                break;
+            }
+            let predecessor = segment
+                .authority
+                .segment_identity
+                .predecessor()
+                .map(guardian_replay_predecessor)
+                .transpose()?;
+            let metadata = GuardianReplayRecordMetadataV1::new(
+                segment.authority.segment_identity.segment_id(),
+                segment_first,
+                predecessor,
+                receipt.sequence(),
+                receipt.payload_bytes(),
+                receipt.cumulative_plaintext_bytes(),
+                receipt.committed_log_bytes(),
+                receipt.record_digest(),
+            )?;
+            let mut plaintext = Zeroizing::new(Vec::new());
+            plaintext
+                .try_reserve_exact(
+                    usize::try_from(receipt.payload_bytes())
+                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+                )
+                .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+            recovered.into_authenticated_delivery()?.write_all_bounded(
+                &mut *plaintext,
+                output.policy.journal_limits.max_record_bytes,
+            )?;
+            deliveries.push(GuardianReplayRecordDelivery::new(metadata, plaintext)?);
+            plaintext_bytes = projected;
+            terminal_receipt = Some(receipt);
+            next_sequence = receipt
+                .sequence()
+                .checked_add(1)
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+            if receipt.sequence() == output.terminal_sequence {
+                break;
+            }
+        }
+        if deliveries.len() >= usize::from(max_records)
+            || plaintext_bytes >= max_plaintext_bytes
+            || terminal_receipt.is_some_and(|receipt| {
+                receipt.sequence() == output.terminal_sequence
+                    || receipt.sequence() < segment_terminal.sequence()
+            })
+        {
+            break;
+        }
+    }
+    let terminal_receipt = terminal_receipt.ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let records = GuardianReplayOutputRecordsDelivery::new(
+        first_sequence,
+        previous_record_digest,
+        deliveries,
+    )?;
+    Ok((records, terminal_receipt))
+}
+
+fn guardian_replay_build_page(
+    inner: &GuardianCheckpointStageStoreInner,
+    snapshot: &GuardianReplaySnapshot,
+    request_id: Uuid,
+    request_fingerprint: [u8; 32],
+    incoming_cursor: Option<GuardianReplayCursorV1>,
+) -> Result<(GuardianReplayPageDelivery, GuardianReplayIssuedPage), GuardianCheckpointStageStoreError>
+{
+    let _candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
+    let (
+        phase,
+        page_index,
+        checkpoint_offset,
+        next_sequence,
+        previous_record_digest,
+        incoming_cursor_digest,
+    ) = match incoming_cursor {
+        None => (
+            snapshot.initial_phase,
+            0,
+            0,
+            snapshot.initial_next_sequence,
+            snapshot.initial_previous_record_digest,
+            [0; 32],
+        ),
+        Some(cursor) => {
+            if cursor.snapshot_id() != snapshot.snapshot_id
+                || cursor.snapshot_digest() != snapshot.snapshot_digest
+                || cursor.max_plaintext_bytes() != snapshot.max_plaintext_bytes
+                || cursor.max_records() != snapshot.max_records
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            (
+                cursor.phase(),
+                cursor.page_index(),
+                cursor.checkpoint_offset(),
+                cursor.next_sequence(),
+                cursor.previous_record_digest(),
+                cursor.digest(),
+            )
+        }
+    };
+    let next_page_index = page_index
+        .checked_add(1)
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+    let (body, next_cursor, through_sequence, through_record_digest) = match phase {
+        GuardianReplayPhaseV1::Checkpoint => {
+            if next_sequence != snapshot.suffix_first_sequence
+                || previous_record_digest != snapshot.suffix_previous_record_digest
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let chunk = guardian_replay_checkpoint_chunk(inner, snapshot, checkpoint_offset)?;
+            let chunk_bytes = u64::try_from(chunk.byte_len())
+                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+            let next_offset = checkpoint_offset
+                .checked_add(chunk_bytes)
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+            let next_phase = if next_offset < snapshot.descriptor.total_bytes() {
+                GuardianReplayPhaseV1::Checkpoint
+            } else if next_offset == snapshot.descriptor.total_bytes() {
+                GuardianReplayPhaseV1::Output
+            } else {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            };
+            let cursor = GuardianReplayCursorV1::new(
+                snapshot.snapshot_id,
+                snapshot.snapshot_digest,
+                next_phase,
+                next_page_index,
+                if next_phase == GuardianReplayPhaseV1::Checkpoint {
+                    next_offset
+                } else {
+                    0
+                },
+                snapshot.suffix_first_sequence,
+                snapshot.suffix_previous_record_digest,
+                0,
+                snapshot.max_plaintext_bytes,
+                snapshot.max_records,
+            )?;
+            let GuardianCheckpointOutputBoundaryV1::Record {
+                sequence,
+                record_digest,
+                ..
+            } = snapshot.descriptor.output_boundary()
+            else {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            };
+            (
+                GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
+                Some(cursor),
+                sequence,
+                record_digest,
+            )
+        }
+        GuardianReplayPhaseV1::Output => {
+            if checkpoint_offset != 0
+                || next_sequence < snapshot.suffix_first_sequence
+                || (next_sequence == snapshot.suffix_first_sequence
+                    && previous_record_digest != snapshot.suffix_previous_record_digest)
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            match snapshot.output.as_ref() {
+                None => (
+                    GuardianReplayPageBodyDelivery::Gap {
+                        requested_sequence: next_sequence,
+                        oldest_retained_sequence: 0,
+                        verified_through_sequence: 0,
+                        reason: GuardianReplayGapReasonV1::NoRecoveryBase,
+                    },
+                    None,
+                    0,
+                    [0; 32],
+                ),
+                Some(output) => {
+                    guardian_replay_validate_resume(
+                        output,
+                        snapshot.suffix_first_sequence,
+                        snapshot.suffix_previous_record_digest,
+                        next_sequence,
+                        previous_record_digest,
+                    )?;
+                    if next_sequence
+                        == output
+                            .terminal_sequence
+                            .checked_add(1)
+                            .ok_or(GuardianCheckpointStageStoreError::Capacity)?
+                    {
+                        (
+                            GuardianReplayPageBodyDelivery::Complete {
+                                checkpoint_id: snapshot.descriptor.checkpoint_id(),
+                                through_sequence: output.terminal_sequence,
+                                terminal_record_digest: output.terminal_record_digest,
+                                cumulative_plaintext_bytes: output.cumulative_plaintext_bytes,
+                            },
+                            None,
+                            output.terminal_sequence,
+                            output.terminal_record_digest,
+                        )
+                    } else {
+                        let (records, terminal) = guardian_replay_output_page(
+                            output,
+                            next_sequence,
+                            previous_record_digest,
+                            snapshot.max_plaintext_bytes,
+                            snapshot.max_records,
+                        )?;
+                        let cursor = GuardianReplayCursorV1::new(
+                            snapshot.snapshot_id,
+                            snapshot.snapshot_digest,
+                            GuardianReplayPhaseV1::Output,
+                            next_page_index,
+                            0,
+                            terminal
+                                .sequence()
+                                .checked_add(1)
+                                .ok_or(GuardianCheckpointStageStoreError::Capacity)?,
+                            terminal.record_digest(),
+                            0,
+                            snapshot.max_plaintext_bytes,
+                            snapshot.max_records,
+                        )?;
+                        (
+                            GuardianReplayPageBodyDelivery::OutputRecords(records),
+                            Some(cursor),
+                            terminal.sequence(),
+                            terminal.record_digest(),
+                        )
+                    }
+                }
+            }
+        }
+    };
+    let page = GuardianReplayPageDelivery::new(
+        snapshot.pane_id,
+        snapshot.generation,
+        snapshot.snapshot_id,
+        snapshot.snapshot_digest,
+        incoming_cursor_digest,
+        page_index,
+        next_cursor,
+        body,
+    )?;
+    let issued = GuardianReplayIssuedPage {
+        request_id,
+        request_fingerprint,
+        incoming_cursor,
+        page_index,
+        page_digest: page.header().declassify_page_digest_for_ack(),
+        next_cursor: page.header().next_cursor(),
+        through_sequence,
+        through_record_digest,
+        terminal: page.is_terminal(),
+        acknowledged: false,
+    };
+    Ok((page, issued))
+}
+
+fn checkpoint_catalog_require_settled_for_generic_restore(
+    scan: &CheckpointCatalogScan,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    if scan.unpublished_candidates.is_empty() && scan.staged_files.is_empty() {
+        Ok(())
+    } else {
+        // Only the exact publication retry owns enough canonical bytes and
+        // adoption authority to reconcile these crash cuts. A generic restore
+        // must not silently fall back to an older published head while a later
+        // candidate may already have crossed a durable boundary.
+        Err(GuardianCheckpointStageStoreError::OutOfOrder)
+    }
+}
+
+fn checkpoint_catalog_validate_generic_restore_evidence(
+    scan: &CheckpointCatalogScan,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let expected = scan
+        .published
+        .iter()
+        .filter(|member| {
+            member.format == CheckpointCatalogFormat::ProtectedV3
+                && matches!(
+                    member.metadata.identity.scope,
+                    CheckpointCatalogScope::Pane { .. }
+                )
+        })
+        .count();
+    if scan.generic_restore_evidence.len() != expected {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    for evidence in &scan.generic_restore_evidence {
+        let matches = scan
+            .published
+            .iter()
+            .filter(|member| {
+                member.format == CheckpointCatalogFormat::ProtectedV3
+                    && matches!(
+                        member.metadata.identity.scope,
+                        CheckpointCatalogScope::Pane { .. }
+                    )
+                    && member.metadata.identity == evidence.identity
+                    && member.candidate_checksum == evidence.candidate_checksum
+            })
+            .count();
+        if matches != 1 {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_catalog_select_restore_permit(
+    mut scan: CheckpointCatalogScan,
+    stage_scope: CheckpointStagePathScope,
+    selector: CheckpointCatalogRestoreSelector,
+    lease_fence_id: CheckpointCatalogRestoreLeaseFenceId,
+) -> Result<Option<CheckpointCatalogRestorePermit>, GuardianCheckpointStageStoreError> {
+    match selector {
+        CheckpointCatalogRestoreSelector::LatestCompatible {
+            replay_semantics_id,
+        } if replay_semantics_id == [0; 32] => {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        CheckpointCatalogRestoreSelector::Exact { checkpoint_id } if checkpoint_id == [0; 32] => {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        CheckpointCatalogRestoreSelector::LatestCompatible { .. }
+        | CheckpointCatalogRestoreSelector::Exact { .. } => {}
+    }
+    checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
+    checkpoint_catalog_validate_generic_restore_evidence(&scan)?;
+    let expected_scope = CheckpointCatalogScope::from_stage_scope(stage_scope);
+    let has_evidence = |member: &PublishedCheckpointCatalogMember| {
+        let matches_stage_scope = match stage_scope {
+            CheckpointStagePathScope::Pane {
+                pane_id,
+                generation,
+            } => {
+                member.metadata.identity.scope == CheckpointCatalogScope::Pane { pane_id }
+                    && member.metadata.capture_generation == generation
+            }
+            CheckpointStagePathScope::Genesis { .. } => false,
+        };
+        member.format == CheckpointCatalogFormat::ProtectedV3
+            && matches_stage_scope
+            && member.metadata.identity.scope == expected_scope
+            && scan.generic_restore_evidence.iter().any(|evidence| {
+                evidence.identity == member.metadata.identity
+                    && evidence.candidate_checksum == member.candidate_checksum
+            })
+    };
+    let selected_index = match selector {
+        CheckpointCatalogRestoreSelector::LatestCompatible {
+            replay_semantics_id,
+        } => scan.published.iter().rposition(|member| {
+            has_evidence(member) && member.metadata.replay_semantics_id == replay_semantics_id
+        }),
+        CheckpointCatalogRestoreSelector::Exact { checkpoint_id } => {
+            scan.published.iter().position(|member| {
+                has_evidence(member) && member.metadata.checkpoint_id == checkpoint_id
+            })
+        }
+    };
+    let Some(selected_index) = selected_index else {
+        return Ok(None);
+    };
+    let selected = &scan.published[selected_index];
+    let selected_format = selected.format;
+    let selected_metadata = selected.metadata;
+    let selected_candidate_checksum = selected.candidate_checksum;
+    let head = scan
+        .published
+        .last()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let settled_head_identity = head.metadata.identity;
+    let settled_head_candidate_checksum = head.candidate_checksum;
+    let evidence_index = scan
+        .generic_restore_evidence
+        .iter()
+        .position(|evidence| {
+            evidence.identity == selected_metadata.identity
+                && evidence.candidate_checksum == selected_candidate_checksum
+        })
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let authenticated_adoption = scan.generic_restore_evidence.swap_remove(evidence_index);
+    CheckpointCatalogRestorePermit::new(
+        stage_scope,
+        selected_format,
+        selected_metadata,
+        selected_candidate_checksum,
+        settled_head_identity,
+        settled_head_candidate_checksum,
+        lease_fence_id,
+        authenticated_adoption,
+    )
+    .map(Some)
 }
 
 struct CheckpointStageDirectoryLock<'a> {
@@ -7304,6 +9355,7 @@ fn checkpoint_catalog_scan(
     let mut candidates = Vec::new();
     let mut markers = Vec::new();
     let mut staged_files = Vec::new();
+    let mut generic_restore_evidence = Vec::new();
     candidates
         .try_reserve_exact(CHECKPOINT_CATALOG_MAX_RELEVANT_FILES)
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
@@ -7312,6 +9364,9 @@ fn checkpoint_catalog_scan(
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
     staged_files
         .try_reserve_exact(CHECKPOINT_CATALOG_MAX_RELEVANT_FILES)
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    generic_restore_evidence
+        .try_reserve_exact(CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS)
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
     let mut relevant_files = 0_usize;
     let mut relevant_bytes = 0_u64;
@@ -7442,11 +9497,18 @@ fn checkpoint_catalog_scan(
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
         checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
-        match (candidate.format, candidate.metadata.identity.scope) {
+        let authenticated_generic_restore = match (
+            candidate.format,
+            candidate.metadata.identity.scope,
+        ) {
             (CheckpointCatalogFormat::ProtectedV3, CheckpointCatalogScope::Pane { .. }) => {
-                drop(checkpoint_catalog_recover_adoption_evidence(
-                    inner, &candidate,
-                )?);
+                Some(CheckpointCatalogGenericRestoreEvidence {
+                    identity: candidate.metadata.identity,
+                    candidate_checksum: candidate.checksum,
+                    _authenticated: checkpoint_catalog_recover_adoption_evidence(
+                        inner, &candidate,
+                    )?,
+                })
             }
             (
                 CheckpointCatalogFormat::LegacyV2,
@@ -7456,8 +9518,9 @@ fn checkpoint_catalog_scan(
                 if candidate.adoption_evidence.is_some() {
                     return Err(GuardianCheckpointStageStoreError::Poisoned);
                 }
+                None
             }
-        }
+        };
         candidate_entry.published = true;
         published.push(PublishedCheckpointCatalogMember {
             format: candidate.format,
@@ -7468,6 +9531,9 @@ fn checkpoint_catalog_scan(
             marker_path: discovered_marker.path,
             marker_file_identity: discovered_marker.file_identity,
         });
+        if let Some(evidence) = authenticated_generic_restore {
+            generic_restore_evidence.push(evidence);
+        }
     }
     checkpoint_catalog_validate_chain(&mut published)?;
     let unpublished_candidates = candidates
@@ -7480,6 +9546,7 @@ fn checkpoint_catalog_scan(
         .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     Ok(CheckpointCatalogScan {
         published,
+        generic_restore_evidence,
         unpublished_candidates,
         staged_files,
         relevant_files,
@@ -8525,9 +10592,9 @@ mod tests {
     };
     use mio::{Poll, Token};
     use mux::guardian_protocol::{
-        GuardianCheckpointIntent, GuardianEffectOutcome, GuardianOperation,
-        GuardianRequestEnvelope, GuardianRequestHeader, GuardianSecret, GuardianSpawnPayload,
-        decode_guardian_request, encode_guardian_request,
+        GuardianCheckpointIdentityDigest, GuardianCheckpointIntent, GuardianEffectOutcome,
+        GuardianOperation, GuardianRequestEnvelope, GuardianRequestHeader, GuardianSecret,
+        GuardianSpawnPayload, decode_guardian_request, encode_guardian_request,
     };
     use portable_pty::{CommandBuilder, PtySize};
     use std::fs::hard_link;
@@ -9058,6 +11125,951 @@ mod tests {
             store.publish_checkpoint_catalog_adoption(permit)
         })?;
         Ok((checkpoint_id, replay_semantics_id))
+    }
+
+    fn checkpoint_catalog_replay_request(
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        replay: GuardianReplayRequestV1,
+    ) -> Result<AuthenticatedGuardianRequest, GuardianProtocolError> {
+        checkpoint_catalog_authenticate_request(
+            GuardianOperation::Replay,
+            guardian_incarnation,
+            mux_incarnation,
+            request_id,
+            Some(pane_id),
+            generation,
+            0,
+            None,
+            Zeroizing::new(replay.encode()?),
+        )
+    }
+
+    fn checkpoint_catalog_replay_ack_request(
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        ack: GuardianReplayAckV1,
+    ) -> Result<AuthenticatedGuardianRequest, GuardianProtocolError> {
+        checkpoint_catalog_authenticate_request(
+            GuardianOperation::ReplayAck,
+            guardian_incarnation,
+            mux_incarnation,
+            request_id,
+            Some(pane_id),
+            generation,
+            0,
+            None,
+            Zeroizing::new(ack.encode()?.to_vec()),
+        )
+    }
+
+    struct ObservedReplayPage {
+        snapshot_id: Uuid,
+        snapshot_digest: [u8; 32],
+        page_index: u32,
+        page_digest: [u8; 32],
+        next_cursor: Option<GuardianReplayCursorV1>,
+        through_sequence: u64,
+        through_record_digest: [u8; 32],
+        checkpoint_plaintext: Vec<u8>,
+        output_plaintext: Vec<u8>,
+        complete: bool,
+    }
+
+    fn observe_replay_page(
+        page: GuardianReplayPageDelivery,
+        maximum_plaintext_bytes: u32,
+    ) -> Result<ObservedReplayPage, Box<dyn std::error::Error>> {
+        let snapshot_id = page.header().snapshot_id();
+        let snapshot_digest = page.header().snapshot_digest();
+        let page_index = page.header().page_index();
+        let page_digest = page.header().declassify_page_digest_for_ack();
+        let next_cursor = page.header().next_cursor();
+        let mut through_sequence = 0;
+        let mut through_record_digest = [0; 32];
+        let mut checkpoint_plaintext = Vec::new();
+        let mut output_plaintext = Vec::new();
+        let mut complete = false;
+        match page.into_body() {
+            GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
+                let descriptor = chunk.descriptor();
+                let GuardianCheckpointOutputBoundaryV1::Record {
+                    sequence,
+                    record_digest,
+                    ..
+                } = descriptor.output_boundary()
+                else {
+                    return Err("Pane replay returned a Genesis checkpoint".into());
+                };
+                through_sequence = sequence;
+                through_record_digest = record_digest;
+                chunk.write_all_bounded(&mut checkpoint_plaintext, maximum_plaintext_bytes)?;
+            }
+            GuardianReplayPageBodyDelivery::OutputRecords(records) => {
+                for record in records.into_records() {
+                    let metadata = record.metadata();
+                    through_sequence = metadata.sequence();
+                    through_record_digest = metadata.record_digest();
+                    record.write_all_bounded(&mut output_plaintext, maximum_plaintext_bytes)?;
+                }
+            }
+            GuardianReplayPageBodyDelivery::Complete {
+                through_sequence: sequence,
+                terminal_record_digest,
+                ..
+            } => {
+                through_sequence = sequence;
+                through_record_digest = terminal_record_digest;
+                complete = true;
+            }
+            GuardianReplayPageBodyDelivery::Gap { .. }
+            | GuardianReplayPageBodyDelivery::Compacted { .. }
+            | GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => {
+                return Err("unexpected terminal replay outcome".into());
+            }
+        }
+        Ok(ObservedReplayPage {
+            snapshot_id,
+            snapshot_digest,
+            page_index,
+            page_digest,
+            next_cursor,
+            through_sequence,
+            through_record_digest,
+            checkpoint_plaintext,
+            output_plaintext,
+            complete,
+        })
+    }
+
+    fn ack_observed_replay_page(
+        store: &GuardianCheckpointStageStore,
+        state: &GuardianProtocolState,
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        request_id: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        page: &ObservedReplayPage,
+    ) -> Result<GuardianReplayAckReceiptV1, Box<dyn std::error::Error>> {
+        let ack = GuardianReplayAckV1::new(
+            page.snapshot_id,
+            page.snapshot_digest,
+            page.page_index,
+            page.page_digest,
+            page.next_cursor.map(GuardianReplayCursorV1::digest),
+            page.through_sequence,
+            page.through_record_digest,
+            page.complete,
+        )?;
+        let request = checkpoint_catalog_replay_ack_request(
+            guardian_incarnation,
+            mux_incarnation,
+            request_id,
+            pane_id,
+            generation,
+            ack,
+        )?;
+        let preflight = state.preflight_replay_ack(&request)?;
+        store
+            .apply_replay_ack(&request, preflight)
+            .map_err(Into::into)
+    }
+
+    #[test]
+    fn replay_snapshot_pages_checkpoint_then_exact_output_and_acks_idempotently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-happy-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xf100);
+        let mux = Uuid::from_u128(0xf101);
+        let pane = Uuid::from_u128(0xf102);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian,
+            mux,
+            pane,
+            generation,
+            1,
+            0xf110,
+            b"checkpoint-boundary",
+            b"checkpoint-boundary",
+        )?;
+        durable_commit(&pipeline, pane, &journal, b"-durable-suffix")?;
+
+        let maximum_plaintext_bytes = 64 * 1024;
+        let open = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: maximum_plaintext_bytes,
+            max_records: 4,
+            wait_millis: 0,
+        };
+        let open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf120),
+            pane,
+            generation,
+            open,
+        )?;
+        let preflight = state.preflight_replay(&open_request)?;
+        let first = store.apply_replay(&open_request, preflight, Some(&journal))?;
+        assert!(!format!("{first:?}").contains("checkpoint-boundary"));
+        let first = observe_replay_page(first, maximum_plaintext_bytes)?;
+        assert!(!first.checkpoint_plaintext.is_empty());
+
+        let retry = store.apply_replay(&open_request, preflight, Some(&journal))?;
+        let retry = observe_replay_page(retry, maximum_plaintext_bytes)?;
+        assert_eq!(retry.snapshot_id, first.snapshot_id);
+        assert_eq!(retry.snapshot_digest, first.snapshot_digest);
+        assert_eq!(retry.page_index, first.page_index);
+        assert_eq!(retry.page_digest, first.page_digest);
+        assert_eq!(retry.next_cursor, first.next_cursor);
+        assert_eq!(retry.checkpoint_plaintext, first.checkpoint_plaintext);
+
+        let first_ack = ack_observed_replay_page(
+            &store,
+            &state,
+            guardian,
+            mux,
+            Uuid::from_u128(0xf121),
+            pane,
+            generation,
+            &first,
+        )?;
+        let first_ack_retry = ack_observed_replay_page(
+            &store,
+            &state,
+            guardian,
+            mux,
+            Uuid::from_u128(0xf121),
+            pane,
+            generation,
+            &first,
+        )?;
+        assert_eq!(first_ack, first_ack_retry);
+
+        let mut cursor = first.next_cursor.ok_or("checkpoint page cursor")?;
+        let mut suffix = Vec::new();
+        let mut request_identity = 0xf130_u128;
+        loop {
+            let continuation = GuardianReplayRequestV1::Continue { cursor };
+            let request = checkpoint_catalog_replay_request(
+                guardian,
+                mux,
+                Uuid::from_u128(request_identity),
+                pane,
+                generation,
+                continuation,
+            )?;
+            request_identity += 1;
+            let page =
+                store.apply_replay(&request, state.preflight_replay(&request)?, Some(&journal))?;
+            let observed = observe_replay_page(page, maximum_plaintext_bytes)?;
+            suffix.extend_from_slice(&observed.output_plaintext);
+            ack_observed_replay_page(
+                &store,
+                &state,
+                guardian,
+                mux,
+                Uuid::from_u128(request_identity),
+                pane,
+                generation,
+                &observed,
+            )?;
+            request_identity += 1;
+            if observed.complete {
+                break;
+            }
+            cursor = observed.next_cursor.ok_or("nonterminal replay cursor")?;
+        }
+        assert_eq!(suffix, b"-durable-suffix");
+        Ok(())
+    }
+
+    #[test]
+    fn replay_successor_lease_reads_retired_capture_and_stale_lease_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-lease-rotation-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xf200);
+        let old_mux = Uuid::from_u128(0xf201);
+        let successor_mux = Uuid::from_u128(0xf202);
+        let pane = Uuid::from_u128(0xf203);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, old_mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian,
+            old_mux,
+            pane,
+            1,
+            1,
+            0xf210,
+            b"generation-one",
+            b"generation-one",
+        )?;
+        let claim = checkpoint_catalog_authenticate_request(
+            GuardianOperation::Claim,
+            guardian,
+            successor_mux,
+            Uuid::from_u128(0xf220),
+            Some(pane),
+            1,
+            0,
+            Some(Uuid::from_u128(0xf221)),
+            Zeroizing::new(Vec::new()),
+        )?;
+        state.apply_effect_transactionally(&claim, |_| {
+            GuardianEffectOutcome::<std::convert::Infallible>::Applied
+        })?;
+
+        let replay = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: 64 * 1024,
+            max_records: 4,
+            wait_millis: 0,
+        };
+        let stale = checkpoint_catalog_replay_request(
+            guardian,
+            old_mux,
+            Uuid::from_u128(0xf222),
+            pane,
+            1,
+            replay,
+        )?;
+        assert!(matches!(
+            state.preflight_replay(&stale),
+            Err(GuardianProtocolError::StaleLease)
+        ));
+        let successor = checkpoint_catalog_replay_request(
+            guardian,
+            successor_mux,
+            Uuid::from_u128(0xf223),
+            pane,
+            2,
+            replay,
+        )?;
+        let page = store.apply_replay(
+            &successor,
+            state.preflight_replay(&successor)?,
+            Some(&journal),
+        )?;
+        let observed = observe_replay_page(page, 64 * 1024)?;
+        assert!(!observed.checkpoint_plaintext.is_empty());
+        let snapshot = store
+            .inner
+            .replay
+            .lock()
+            .map_err(|_| "replay ledger poisoned")?;
+        let retained = snapshot
+            .snapshots
+            .get(&observed.snapshot_id)
+            .ok_or("successor replay snapshot")?;
+        assert_eq!(retained.generation, 2);
+        assert_eq!(retained.descriptor.capture_generation(), 1);
+        assert_eq!(retained.mux_incarnation, successor_mux);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_ack_restart_expiry_is_typed_while_forged_ack_is_out_of_order_and_exact_reopen_works()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-ack-restart-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xf300);
+        let mux = Uuid::from_u128(0xf301);
+        let pane = Uuid::from_u128(0xf302);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        let (checkpoint_id, _) = checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian,
+            mux,
+            pane,
+            generation,
+            1,
+            0xf310,
+            b"restart-boundary",
+            b"restart-boundary",
+        )?;
+
+        let maximum_plaintext_bytes = 64 * 1024;
+        let open = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)?,
+            },
+            max_plaintext_bytes: maximum_plaintext_bytes,
+            max_records: 4,
+            wait_millis: 0,
+        };
+        let open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf320),
+            pane,
+            generation,
+            open,
+        )?;
+        let page = store.apply_replay(
+            &open_request,
+            state.preflight_replay(&open_request)?,
+            Some(&journal),
+        )?;
+        let page = observe_replay_page(page, maximum_plaintext_bytes)?;
+        let ack = GuardianReplayAckV1::new(
+            page.snapshot_id,
+            page.snapshot_digest,
+            page.page_index,
+            page.page_digest,
+            page.next_cursor.map(GuardianReplayCursorV1::digest),
+            page.through_sequence,
+            page.through_record_digest,
+            page.complete,
+        )?;
+
+        let mut forged_page_digest = page.page_digest;
+        forged_page_digest[0] ^= 0x80;
+        let forged_ack = GuardianReplayAckV1::new(
+            page.snapshot_id,
+            page.snapshot_digest,
+            page.page_index,
+            forged_page_digest,
+            page.next_cursor.map(GuardianReplayCursorV1::digest),
+            page.through_sequence,
+            page.through_record_digest,
+            page.complete,
+        )?;
+        let forged_request = checkpoint_catalog_replay_ack_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf321),
+            pane,
+            generation,
+            forged_ack,
+        )?;
+        assert!(matches!(
+            store.apply_replay_ack(
+                &forged_request,
+                state.preflight_replay_ack(&forged_request)?,
+            ),
+            Err(GuardianCheckpointStageStoreError::OutOfOrder)
+        ));
+
+        let ack_request = checkpoint_catalog_replay_ack_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf322),
+            pane,
+            generation,
+            ack,
+        )?;
+        let preflight_ack = state.preflight_replay_ack(&ack_request)?;
+        let restarted_store = GuardianCheckpointStageStore::open(
+            &pipeline.directory,
+            &pipeline.directory_path,
+            &pipeline.cipher,
+            Arc::clone(&pipeline.persistence),
+            GuardianCheckpointStagePolicy::production(),
+        )?;
+        assert!(matches!(
+            restarted_store.apply_replay_ack(&ack_request, preflight_ack),
+            Err(GuardianCheckpointStageStoreError::ReplaySnapshotExpired)
+        ));
+
+        let reopen_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf323),
+            pane,
+            generation,
+            open,
+        )?;
+        let reopened = restarted_store.apply_replay(
+            &reopen_request,
+            state.preflight_replay(&reopen_request)?,
+            Some(&journal),
+        )?;
+        let reopened = observe_replay_page(reopened, maximum_plaintext_bytes)?;
+        assert_ne!(reopened.snapshot_id, page.snapshot_id);
+        assert!(!reopened.checkpoint_plaintext.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn replay_ack_and_continue_capacity_fail_before_publishing_or_advancing_page_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-atomic-capacity-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xf400);
+        let mux = Uuid::from_u128(0xf401);
+        let pane = Uuid::from_u128(0xf402);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut protocol = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut protocol,
+            guardian,
+            mux,
+            pane,
+            generation,
+            1,
+            0xf410,
+            b"atomic-boundary",
+            b"atomic-boundary",
+        )?;
+
+        let maximum_plaintext_bytes = 64 * 1024;
+        let open = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: maximum_plaintext_bytes,
+            max_records: 4,
+            wait_millis: 0,
+        };
+        let open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf420),
+            pane,
+            generation,
+            open,
+        )?;
+        let page = store.apply_replay(
+            &open_request,
+            protocol.preflight_replay(&open_request)?,
+            Some(&journal),
+        )?;
+        let page = observe_replay_page(page, maximum_plaintext_bytes)?;
+        let cursor = page.next_cursor.ok_or("checkpoint page cursor")?;
+        let ack = GuardianReplayAckV1::new(
+            page.snapshot_id,
+            page.snapshot_digest,
+            page.page_index,
+            page.page_digest,
+            Some(cursor.digest()),
+            page.through_sequence,
+            page.through_record_digest,
+            false,
+        )?;
+        let ack_request_id = Uuid::from_u128(0xf421);
+        let ack_request = checkpoint_catalog_replay_ack_request(
+            guardian,
+            mux,
+            ack_request_id,
+            pane,
+            generation,
+            ack,
+        )?;
+        let ack_preflight = protocol.preflight_replay_ack(&ack_request)?;
+
+        let original_access_epoch = {
+            let mut replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            replay.fail_request_binding_reservation = true;
+            replay.access_epoch
+        };
+        assert!(matches!(
+            store.apply_replay_ack(&ack_request, ack_preflight),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        {
+            let mut replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            assert!(!replay.request_bindings.contains_key(&ack_request_id));
+            assert_eq!(replay.access_epoch, original_access_epoch);
+            assert!(
+                !replay
+                    .snapshots
+                    .get(&page.snapshot_id)
+                    .and_then(|snapshot| snapshot.issued)
+                    .ok_or("outstanding replay page")?
+                    .acknowledged
+            );
+            replay.fail_request_binding_reservation = false;
+            replay.access_epoch = u64::MAX;
+        }
+        assert!(matches!(
+            store.apply_replay_ack(&ack_request, ack_preflight),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        assert!(matches!(
+            store.apply_replay_ack(&ack_request, ack_preflight),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        {
+            let mut replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            assert!(!replay.request_bindings.contains_key(&ack_request_id));
+            assert!(
+                !replay
+                    .snapshots
+                    .get(&page.snapshot_id)
+                    .and_then(|snapshot| snapshot.issued)
+                    .ok_or("outstanding replay page")?
+                    .acknowledged
+            );
+            replay.access_epoch = original_access_epoch;
+        }
+        assert_eq!(
+            store.apply_replay_ack(&ack_request, ack_preflight)?,
+            GuardianReplayAckReceiptV1::from_ack(ack)
+        );
+
+        let continue_request_id = Uuid::from_u128(0xf422);
+        let continuation = GuardianReplayRequestV1::Continue { cursor };
+        let continue_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            continue_request_id,
+            pane,
+            generation,
+            continuation,
+        )?;
+        let continue_preflight = protocol.preflight_replay(&continue_request)?;
+        {
+            let mut replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            replay.fail_request_binding_reservation = true;
+        }
+        assert!(matches!(
+            store.apply_replay(&continue_request, continue_preflight, Some(&journal),),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        {
+            let mut replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            assert!(!replay.request_bindings.contains_key(&continue_request_id));
+            let issued = replay
+                .snapshots
+                .get(&page.snapshot_id)
+                .and_then(|snapshot| snapshot.issued)
+                .ok_or("acknowledged replay page")?;
+            assert_eq!(issued.request_id, open_request.header().request_id);
+            assert_eq!(issued.page_index, page.page_index);
+            assert!(issued.acknowledged);
+            replay.fail_request_binding_reservation = false;
+        }
+        let continued =
+            store.apply_replay(&continue_request, continue_preflight, Some(&journal))?;
+        let continued = observe_replay_page(continued, maximum_plaintext_bytes)?;
+        assert_eq!(continued.snapshot_id, page.snapshot_id);
+        assert_eq!(continued.page_index, page.page_index + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_ack_continue_and_open_late_failures_preserve_unrelated_retry_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-binding-transaction-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xf500);
+        let mux = Uuid::from_u128(0xf501);
+        let pane = Uuid::from_u128(0xf502);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut protocol = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut protocol,
+            guardian,
+            mux,
+            pane,
+            generation,
+            1,
+            0xf510,
+            b"binding-transaction-boundary",
+            b"binding-transaction-boundary",
+        )?;
+
+        let maximum_plaintext_bytes = 64 * 1024;
+        let open = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: maximum_plaintext_bytes,
+            max_records: 4,
+            wait_millis: 0,
+        };
+        let continued_open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf520),
+            pane,
+            generation,
+            open,
+        )?;
+        let continued_page = store.apply_replay(
+            &continued_open_request,
+            protocol.preflight_replay(&continued_open_request)?,
+            Some(&journal),
+        )?;
+        let continued_page = observe_replay_page(continued_page, maximum_plaintext_bytes)?;
+        let continued_cursor = continued_page
+            .next_cursor
+            .ok_or("checkpoint page continuation")?;
+        let known_ack = GuardianReplayAckV1::new(
+            continued_page.snapshot_id,
+            continued_page.snapshot_digest,
+            continued_page.page_index,
+            continued_page.page_digest,
+            Some(continued_cursor.digest()),
+            continued_page.through_sequence,
+            continued_page.through_record_digest,
+            false,
+        )?;
+        let known_request_id = Uuid::from_u128(0xf521);
+        let known_ack_request = checkpoint_catalog_replay_ack_request(
+            guardian,
+            mux,
+            known_request_id,
+            pane,
+            generation,
+            known_ack,
+        )?;
+        let known_ack_preflight = protocol.preflight_replay_ack(&known_ack_request)?;
+        let known_receipt = store.apply_replay_ack(&known_ack_request, known_ack_preflight)?;
+
+        let acked_open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf522),
+            pane,
+            generation,
+            open,
+        )?;
+        let acked_page = store.apply_replay(
+            &acked_open_request,
+            protocol.preflight_replay(&acked_open_request)?,
+            Some(&journal),
+        )?;
+        let acked_page = observe_replay_page(acked_page, maximum_plaintext_bytes)?;
+        let acked_cursor = acked_page
+            .next_cursor
+            .ok_or("second checkpoint page continuation")?;
+        let late_ack = GuardianReplayAckV1::new(
+            acked_page.snapshot_id,
+            acked_page.snapshot_digest,
+            acked_page.page_index,
+            acked_page.page_digest,
+            Some(acked_cursor.digest()),
+            acked_page.through_sequence,
+            acked_page.through_record_digest,
+            false,
+        )?;
+        let late_ack_request_id = Uuid::from_u128(0xf523);
+        let late_ack_request = checkpoint_catalog_replay_ack_request(
+            guardian,
+            mux,
+            late_ack_request_id,
+            pane,
+            generation,
+            late_ack,
+        )?;
+        let late_ack_preflight = protocol.preflight_replay_ack(&late_ack_request)?;
+
+        let late_open_request_id = Uuid::from_u128(0xf524);
+        let late_open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            late_open_request_id,
+            pane,
+            generation,
+            open,
+        )?;
+        let late_open_preflight = protocol.preflight_replay(&late_open_request)?;
+        let late_continue_request_id = Uuid::from_u128(0xf525);
+        let late_continue = GuardianReplayRequestV1::Continue {
+            cursor: continued_cursor,
+        };
+        let late_continue_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            late_continue_request_id,
+            pane,
+            generation,
+            late_continue,
+        )?;
+        let late_continue_preflight = protocol.preflight_replay(&late_continue_request)?;
+
+        {
+            let mut replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            let known_binding = replay
+                .request_bindings
+                .get(&known_request_id)
+                .copied()
+                .ok_or("known Ack binding")?;
+            let known_order_index = replay
+                .request_order
+                .iter()
+                .position(|request_id| *request_id == known_request_id)
+                .ok_or("known Ack order entry")?;
+            assert_eq!(
+                replay.request_order.remove(known_order_index),
+                Some(known_request_id)
+            );
+            replay.request_order.push_front(known_request_id);
+            let mut filler = 0xf600_u128;
+            while replay.request_bindings.len() < REPLAY_MAX_REQUEST_BINDINGS {
+                let filler_request_id = Uuid::from_u128(filler);
+                filler += 1;
+                if replay.request_bindings.contains_key(&filler_request_id) {
+                    continue;
+                }
+                replay.request_order.push_back(filler_request_id);
+                assert!(
+                    replay
+                        .request_bindings
+                        .insert(filler_request_id, known_binding)
+                        .is_none()
+                );
+            }
+            assert_eq!(replay.request_bindings.len(), REPLAY_MAX_REQUEST_BINDINGS);
+            assert_eq!(replay.request_order.front(), Some(&known_request_id));
+            replay.access_epoch = u64::MAX;
+        }
+
+        for (request_id, future_snapshot_removal) in [
+            (late_open_request_id, None),
+            (late_continue_request_id, None),
+            (late_ack_request_id, None),
+        ] {
+            let replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            let plan =
+                guardian_replay_plan_request_binding(&replay, request_id, future_snapshot_removal)?;
+            assert_eq!(plan.evicted_request_id, Some(known_request_id));
+        }
+
+        assert!(matches!(
+            store.apply_replay(&late_open_request, late_open_preflight, Some(&journal)),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        {
+            let replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            assert!(replay.request_bindings.contains_key(&known_request_id));
+            assert!(!replay.request_bindings.contains_key(&late_open_request_id));
+        }
+        assert_eq!(
+            store.apply_replay_ack(&known_ack_request, known_ack_preflight)?,
+            known_receipt
+        );
+
+        assert!(matches!(
+            store.apply_replay(
+                &late_continue_request,
+                late_continue_preflight,
+                Some(&journal),
+            ),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        {
+            let replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            assert!(replay.request_bindings.contains_key(&known_request_id));
+            assert!(
+                !replay
+                    .request_bindings
+                    .contains_key(&late_continue_request_id)
+            );
+        }
+        assert_eq!(
+            store.apply_replay_ack(&known_ack_request, known_ack_preflight)?,
+            known_receipt
+        );
+
+        assert!(matches!(
+            store.apply_replay_ack(&late_ack_request, late_ack_preflight),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        {
+            let replay = store
+                .inner
+                .replay
+                .lock()
+                .map_err(|_| "replay ledger poisoned")?;
+            assert!(replay.request_bindings.contains_key(&known_request_id));
+            assert!(!replay.request_bindings.contains_key(&late_ack_request_id));
+            assert_eq!(replay.access_epoch, u64::MAX);
+            assert!(
+                !replay
+                    .snapshots
+                    .get(&acked_page.snapshot_id)
+                    .and_then(|snapshot| snapshot.issued)
+                    .ok_or("unacknowledged second replay page")?
+                    .acknowledged
+            );
+        }
+        assert_eq!(
+            store.apply_replay_ack(&known_ack_request, known_ack_preflight)?,
+            known_receipt
+        );
+        Ok(())
     }
 
     fn checkpoint_catalog_rewrite_protected_member_as_legacy_fixture(
@@ -10176,9 +13188,9 @@ mod tests {
 
         let legacy = checkpoint_catalog_scan(&store.inner, scope)?;
         assert_eq!(legacy.published.len(), 1);
+        assert!(legacy.generic_restore_evidence.is_empty());
         let legacy_first = &legacy.published[0];
         assert_eq!(legacy_first.format, CheckpointCatalogFormat::LegacyV2);
-        assert!(!legacy_first.format.authorizes_scope(scope));
         assert_eq!(
             std::fs::read(&legacy_first.candidate_path)?,
             legacy_candidate_bytes
@@ -10191,14 +13203,23 @@ mod tests {
             pane_id,
             generation,
         };
-        assert_eq!(
-            store.exact_catalog_member(stage_scope, first_checkpoint_id)?,
-            None,
+        let lease_fence_id = CheckpointCatalogRestoreLeaseFenceId::from_coordinator_fence_id(
+            Uuid::from_u128(0xc904),
+        )?;
+        assert!(
+            store
+                .exact_catalog_restore_permit(stage_scope, first_checkpoint_id, lease_fence_id,)?
+                .is_none(),
             "legacy metadata and SHA fields cannot synthesize Pane recovery authority"
         );
-        assert_eq!(
-            store.latest_compatible_catalog_member(stage_scope, replay_semantics_id)?,
-            None,
+        assert!(
+            store
+                .latest_compatible_catalog_restore_permit(
+                    stage_scope,
+                    replay_semantics_id,
+                    lease_fence_id,
+                )?
+                .is_none(),
             "legacy Pane entries remain readable but are never recovery-selectable"
         );
 
@@ -10227,6 +13248,7 @@ mod tests {
             upgraded.published[1].format,
             CheckpointCatalogFormat::ProtectedV3
         );
+        assert_eq!(upgraded.generic_restore_evidence.len(), 1);
         assert_eq!(
             std::fs::read(&upgraded.published[0].candidate_path)?,
             legacy_candidate_bytes
@@ -10235,17 +13257,28 @@ mod tests {
             std::fs::read(&upgraded.published[0].marker_path)?,
             legacy_marker_bytes
         );
-        assert_eq!(
-            store.exact_catalog_member(stage_scope, first_checkpoint_id)?,
-            None
+        assert!(
+            store
+                .exact_catalog_restore_permit(stage_scope, first_checkpoint_id, lease_fence_id,)?
+                .is_none()
         );
         assert_eq!(
-            store.exact_catalog_member(stage_scope, second_checkpoint_id)?,
-            Some(second_checkpoint_id)
+            store
+                .exact_catalog_restore_permit(stage_scope, second_checkpoint_id, lease_fence_id,)?
+                .expect("protected exact restore permit")
+                .checkpoint_id(),
+            second_checkpoint_id
         );
         assert_eq!(
-            store.latest_compatible_catalog_member(stage_scope, second_replay_semantics_id)?,
-            Some(second_checkpoint_id),
+            store
+                .latest_compatible_catalog_restore_permit(
+                    stage_scope,
+                    second_replay_semantics_id,
+                    lease_fence_id,
+                )?
+                .expect("protected latest-compatible restore permit")
+                .checkpoint_id(),
+            second_checkpoint_id,
             "a protected v3 successor is recovery-selectable across a legacy predecessor"
         );
 
@@ -10287,6 +13320,71 @@ mod tests {
                 "a rejected v3-to-v2 downgrade must not mutate any catalog artifact"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_generic_restore_selector_rejects_protected_v3_genesis()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        let metadata = checkpoint_catalog_test_genesis_metadata(reservation);
+        let file_identity = FileIdentity {
+            device: 1,
+            inode: 1,
+            mode: 0o100600,
+            owner: geteuid().as_raw(),
+            links: 1,
+            expected_len: Some(1),
+        };
+        let member = PublishedCheckpointCatalogMember {
+            format: CheckpointCatalogFormat::ProtectedV3,
+            metadata,
+            candidate_checksum: [0x57; 32],
+            candidate_path: PathBuf::from("protected-genesis-candidate"),
+            candidate_file_identity: file_identity,
+            marker_path: PathBuf::from("protected-genesis-marker"),
+            marker_file_identity: file_identity,
+        };
+        let mut validated_chain = vec![member.clone()];
+        checkpoint_catalog_validate_chain(&mut validated_chain)?;
+        let stage_scope = CheckpointStagePathScope::Genesis {
+            spawn_effect_id: reservation.spawn_effect_id,
+        };
+        let lease_fence_id = CheckpointCatalogRestoreLeaseFenceId::from_coordinator_fence_id(
+            Uuid::from_u128(0xe201),
+        )?;
+        let scan = |member| CheckpointCatalogScan {
+            published: vec![member],
+            generic_restore_evidence: Vec::new(),
+            unpublished_candidates: Vec::new(),
+            staged_files: Vec::new(),
+            relevant_files: 2,
+            relevant_bytes: 2,
+        };
+        assert!(
+            checkpoint_catalog_select_restore_permit(
+                scan(member.clone()),
+                stage_scope,
+                CheckpointCatalogRestoreSelector::Exact {
+                    checkpoint_id: metadata.checkpoint_id,
+                },
+                lease_fence_id,
+            )?
+            .is_none(),
+            "a valid protected v3 Genesis member remains reserved for exact Spawn admission"
+        );
+        assert!(
+            checkpoint_catalog_select_restore_permit(
+                scan(member),
+                stage_scope,
+                CheckpointCatalogRestoreSelector::LatestCompatible {
+                    replay_semantics_id: metadata.replay_semantics_id,
+                },
+                lease_fence_id,
+            )?
+            .is_none(),
+            "format v3 alone cannot synthesize generic Genesis restore authority"
+        );
         Ok(())
     }
 
@@ -10347,6 +13445,358 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_catalog_generic_restore_refuses_unreconciled_publication_cuts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pane_id = Uuid::from_u128(0xe350);
+        let scope = CheckpointCatalogScope::Pane { pane_id };
+        let unpublished_identity = CheckpointCatalogIdentity {
+            scope,
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xe351),
+        };
+        let candidate_path = PathBuf::from("unpublished-candidate");
+        let unpublished = CheckpointCatalogScan {
+            published: Vec::new(),
+            generic_restore_evidence: Vec::new(),
+            unpublished_candidates: vec![checkpoint_catalog_test_unpublished_candidate(
+                unpublished_identity,
+                candidate_path,
+                11,
+            )],
+            staged_files: Vec::new(),
+            relevant_files: 1,
+            relevant_bytes: 100,
+        };
+        assert!(matches!(
+            checkpoint_catalog_require_settled_for_generic_restore(&unpublished),
+            Err(GuardianCheckpointStageStoreError::OutOfOrder)
+        ));
+
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-generic-restore-cut-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian_incarnation = Uuid::from_u128(0xe352);
+        let mux_incarnation = Uuid::from_u128(0xe353);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+        )?;
+        let (checkpoint_id, replay_semantics_id) = checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+            generation,
+            1,
+            0xe360,
+            b"cut",
+            b"cut",
+        )?;
+        let stage_scope = CheckpointStagePathScope::Pane {
+            pane_id,
+            generation,
+        };
+        let lease_fence_id = CheckpointCatalogRestoreLeaseFenceId::from_coordinator_fence_id(
+            Uuid::from_u128(0xe361),
+        )?;
+        let exact_permit = store
+            .exact_catalog_restore_permit(stage_scope, checkpoint_id, lease_fence_id)?
+            .expect("published exact restore permit before staging cut");
+        let latest_permit = store
+            .latest_compatible_catalog_restore_permit(
+                stage_scope,
+                replay_semantics_id,
+                lease_fence_id,
+            )?
+            .expect("published latest-compatible restore permit before staging cut");
+        let head = checkpoint_catalog_scan(&store.inner, scope)?
+            .published
+            .last()
+            .cloned()
+            .ok_or("published catalog head")?;
+        let staged_identity = CheckpointCatalogIdentity {
+            scope,
+            generation: head
+                .metadata
+                .identity
+                .generation
+                .checked_add(1)
+                .ok_or("catalog generation overflow")?,
+            candidate_id: Uuid::from_u128(0xe362),
+        };
+        let canonical = checkpoint_catalog_path(
+            &store.inner,
+            staged_identity,
+            CheckpointCatalogPathRole::Candidate,
+        )?;
+        let staging = checkpoint_catalog_staging_path(&store.inner, &canonical)?;
+        let staged_file = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &staging,
+        )?;
+        staged_file.sync_all()?;
+        store.inner.directory.sync_all()?;
+
+        let mut exact_mutations = 0_u32;
+        assert!(matches!(
+            store.commit_catalog_restore_permit(exact_permit, lease_fence_id, |_| {
+                exact_mutations += 1;
+                Ok(())
+            }),
+            Err(GuardianCheckpointStageStoreError::OutOfOrder)
+        ));
+        let mut latest_mutations = 0_u32;
+        assert!(matches!(
+            store.commit_catalog_restore_permit(latest_permit, lease_fence_id, |_| {
+                latest_mutations += 1;
+                Ok(())
+            }),
+            Err(GuardianCheckpointStageStoreError::OutOfOrder)
+        ));
+        assert_eq!(exact_mutations, 0);
+        assert_eq!(latest_mutations, 0);
+        assert_eq!(
+            std::fs::symlink_metadata(staging)?.len(),
+            0,
+            "generic restore refusal must retain the exact publication prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_generic_restore_successor_invalidates_permit_before_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-restore-successor-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian_incarnation = Uuid::from_u128(0xe370);
+        let mux_incarnation = Uuid::from_u128(0xe371);
+        let pane_id = Uuid::from_u128(0xe372);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+        )?;
+        let (_, replay_semantics_id) = checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+            generation,
+            1,
+            0xe380,
+            b"one",
+            b"one",
+        )?;
+        let stage_scope = CheckpointStagePathScope::Pane {
+            pane_id,
+            generation,
+        };
+        let lease_fence_id = CheckpointCatalogRestoreLeaseFenceId::from_coordinator_fence_id(
+            Uuid::from_u128(0xe373),
+        )?;
+        let stale_permit = store
+            .latest_compatible_catalog_restore_permit(
+                stage_scope,
+                replay_semantics_id,
+                lease_fence_id,
+            )?
+            .expect("initial settled restore permit");
+
+        let (successor_checkpoint_id, successor_replay_semantics_id) =
+            checkpoint_catalog_stage_and_publish(
+                &pipeline,
+                &store,
+                &journal,
+                &mut state,
+                guardian_incarnation,
+                mux_incarnation,
+                pane_id,
+                generation,
+                2,
+                0xe390,
+                b"-two",
+                b"one-two",
+            )?;
+        assert_eq!(successor_replay_semantics_id, replay_semantics_id);
+        let mut stale_mutations = 0_u32;
+        assert!(matches!(
+            store.commit_catalog_restore_permit(stale_permit, lease_fence_id, |_| {
+                stale_mutations += 1;
+                Ok(())
+            }),
+            Err(GuardianCheckpointStageStoreError::OutOfOrder)
+        ));
+        assert_eq!(stale_mutations, 0);
+
+        let fresh_permit = store
+            .latest_compatible_catalog_restore_permit(
+                stage_scope,
+                successor_replay_semantics_id,
+                lease_fence_id,
+            )?
+            .expect("fresh successor-bound restore permit");
+        assert_eq!(fresh_permit.checkpoint_id(), successor_checkpoint_id);
+        let mut fresh_mutations = 0_u32;
+        store.commit_catalog_restore_permit(fresh_permit, lease_fence_id, |_| {
+            fresh_mutations += 1;
+            Ok(())
+        })?;
+        assert_eq!(fresh_mutations, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_generic_restore_binding_supports_idempotent_retry_and_lease_rotation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-restore-idempotency-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian_incarnation = Uuid::from_u128(0xe3a0);
+        let mux_incarnation = Uuid::from_u128(0xe3a1);
+        let pane_id = Uuid::from_u128(0xe3a2);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+        )?;
+        let (checkpoint_id, replay_semantics_id) = checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+            generation,
+            1,
+            0xe3b0,
+            b"stable",
+            b"stable",
+        )?;
+        let stage_scope = CheckpointStagePathScope::Pane {
+            pane_id,
+            generation,
+        };
+        let old_lease_fence = CheckpointCatalogRestoreLeaseFenceId::from_coordinator_fence_id(
+            Uuid::from_u128(0xe3a3),
+        )?;
+        let current_lease_fence = CheckpointCatalogRestoreLeaseFenceId::from_coordinator_fence_id(
+            Uuid::from_u128(0xe3a4),
+        )?;
+        let wrong_generation_scope = CheckpointStagePathScope::Pane {
+            pane_id,
+            generation: generation
+                .checked_add(1)
+                .ok_or("test capture generation overflow")?,
+        };
+        assert!(
+            store
+                .exact_catalog_restore_permit(
+                    wrong_generation_scope,
+                    checkpoint_id,
+                    current_lease_fence,
+                )?
+                .is_none(),
+            "an authenticated checkpoint cannot be relabeled under another pane generation"
+        );
+        assert!(
+            store
+                .latest_compatible_catalog_restore_permit(
+                    wrong_generation_scope,
+                    replay_semantics_id,
+                    current_lease_fence,
+                )?
+                .is_none(),
+            "latest-compatible selection remains capture-generation scoped"
+        );
+        let stale_lease_permit = store
+            .exact_catalog_restore_permit(stage_scope, checkpoint_id, old_lease_fence)?
+            .expect("old-lease restore permit");
+        let mut rotated_lease_mutations = 0_u32;
+        assert!(matches!(
+            store.commit_catalog_restore_permit(stale_lease_permit, current_lease_fence, |_| {
+                rotated_lease_mutations += 1;
+                Ok(())
+            },),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        assert_eq!(rotated_lease_mutations, 0);
+
+        let exact_retry = store
+            .exact_catalog_restore_permit(stage_scope, checkpoint_id, current_lease_fence)?
+            .expect("current-lease exact restore permit");
+        let latest_retry = store
+            .latest_compatible_catalog_restore_permit(
+                stage_scope,
+                replay_semantics_id,
+                current_lease_fence,
+            )?
+            .expect("current-lease latest-compatible restore permit");
+        assert_eq!(exact_retry.binding_id(), latest_retry.binding_id());
+        let expected_binding_id = exact_retry.binding_id();
+        let mut durable_receipt_fixture = BTreeSet::new();
+        let mut mutations = 0_u32;
+        let first_binding_id = store.commit_catalog_restore_permit(
+            exact_retry,
+            current_lease_fence,
+            |binding_id| {
+                if durable_receipt_fixture.insert(binding_id) {
+                    mutations += 1;
+                }
+                Ok(binding_id)
+            },
+        )?;
+        let retry_binding_id = store.commit_catalog_restore_permit(
+            latest_retry,
+            current_lease_fence,
+            |binding_id| {
+                if durable_receipt_fixture.insert(binding_id) {
+                    mutations += 1;
+                }
+                Ok(binding_id)
+            },
+        )?;
+        assert_eq!(first_binding_id, expected_binding_id);
+        assert_eq!(retry_binding_id, expected_binding_id);
+        assert_eq!(durable_receipt_fixture.len(), 1);
+        assert_eq!(mutations, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_generic_restore_permit_is_not_cloneable() {
+        trait AmbiguousIfClone<Marker> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        struct ImplementsClone;
+        impl<T: Clone> AmbiguousIfClone<ImplementsClone> for T {}
+
+        let _ = <CheckpointCatalogRestorePermit as AmbiguousIfClone<_>>::probe;
+    }
+
+    #[test]
     fn checkpoint_catalog_genesis_candidate_retry_reuses_one_identity_and_adds_only_marker() {
         let reservation = checkpoint_catalog_test_genesis_reservation_binding();
         let identity = CheckpointCatalogIdentity {
@@ -10359,6 +13809,7 @@ mod tests {
         let candidate_path = PathBuf::from("deterministic-genesis-candidate");
         let empty = CheckpointCatalogScan {
             published: Vec::new(),
+            generic_restore_evidence: Vec::new(),
             unpublished_candidates: Vec::new(),
             staged_files: Vec::new(),
             relevant_files: 0,
@@ -10378,6 +13829,7 @@ mod tests {
 
         let retry = CheckpointCatalogScan {
             published: Vec::new(),
+            generic_restore_evidence: Vec::new(),
             unpublished_candidates: vec![checkpoint_catalog_test_unpublished_candidate(
                 identity,
                 candidate_path.clone(),
@@ -10412,6 +13864,7 @@ mod tests {
         };
         let fork = CheckpointCatalogScan {
             published: Vec::new(),
+            generic_restore_evidence: Vec::new(),
             unpublished_candidates: vec![checkpoint_catalog_test_unpublished_candidate(
                 wrong_identity,
                 PathBuf::from("fork-candidate"),
@@ -10427,6 +13880,7 @@ mod tests {
         );
         let duplicate = CheckpointCatalogScan {
             published: Vec::new(),
+            generic_restore_evidence: Vec::new(),
             unpublished_candidates: vec![
                 checkpoint_catalog_test_unpublished_candidate(identity, candidate_path.clone(), 9),
                 checkpoint_catalog_test_unpublished_candidate(

@@ -60,6 +60,7 @@ zeroize.workspace = true
 zstd.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+frankenterm-pty-guardian = { path = "../frankenterm-pty-guardian" }
 rustix = { workspace = true, features = ["process"] }
 
 [target."cfg(windows)".dependencies]

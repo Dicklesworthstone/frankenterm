@@ -47,7 +47,8 @@
 use crate::SealedAtomicBuildIdentity;
 use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
 use crate::transport::{
-    GuardianServiceError, SocketPathAuthority, bind_private_unix_listener, load_guardian_secret,
+    GuardianServiceError, GuardianTokenPathAuthority, SocketPathAuthority,
+    bind_private_unix_listener, load_guardian_secret, load_guardian_secret_with_authority,
     validate_existing_socket,
 };
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
@@ -62,7 +63,7 @@ use mux::guardian_protocol::{
     GuardianBrokerControlAuthenticatorV1, GuardianBrokerSpawnWalAuthenticatorV1,
     GuardianDurableSpawnFenceV1, GuardianSpawnPayload,
 };
-use nix::unistd::geteuid;
+use nix::unistd::{PathconfVar, fpathconf, geteuid};
 #[cfg(test)]
 use portable_pty::ExitStatus;
 use portable_pty::{Child, MasterPty, PollablePtyReader, PtyPair, PtySize, native_pty_system};
@@ -77,7 +78,7 @@ use std::os::unix::net::UnixStream as BlockingUnixStream;
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
@@ -116,7 +117,20 @@ const BROKER_SPAWN_CATALOG_LOCK_NAME: &str = ".broker-spawn-catalog.lock.v1";
 const BROKER_SPAWN_CATALOG_PREFIX: &str = "spawn-";
 const BROKER_SPAWN_CATALOG_WAL_SUFFIX: &str = ".wal.v1";
 const BROKER_SPAWN_CATALOG_HEAD_SUFFIX: &str = ".head.v1";
-const BROKER_SPAWN_CATALOG_MAX_ENTRIES: usize = GUARDIAN_MAX_PANES * 2 + 1;
+const BROKER_SPAWN_CREATION_MARKER_PREFIX: &str = "c1-";
+const BROKER_SPAWN_COMPLETED_MARKER_PREFIX: &str = "d1-";
+const BROKER_SPAWN_CREATION_MARKER_MAGIC: [u8; 8] = *b"FTBSC001";
+const BROKER_SPAWN_CREATION_IDENTITY_BYTES: usize = 168;
+const BROKER_SPAWN_CREATION_MARKER_BYTES: usize =
+    BROKER_SPAWN_CREATION_IDENTITY_BYTES + BROKER_SPAWN_WAL_MAC_BYTES;
+const BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES: usize = 250;
+const BROKER_SPAWN_CREATION_MARKER_NAME_BYTES: usize =
+    BROKER_SPAWN_CREATION_MARKER_PREFIX.len() + BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES;
+const BROKER_SPAWN_CREATION_BASE85: &[u8; 85] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()+,-.;:=@[]^_{}~?";
+const BROKER_SPAWN_CATALOG_MAX_ENTRIES: usize = GUARDIAN_MAX_PANES * 3 + 1;
+const BROKER_SPAWN_CATALOG_MAX_PHYSICAL_BYTES: u64 = GUARDIAN_MAX_PANES as u64
+    * (BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES + BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES);
 const BROKER_CONTROL_REQUEST_MAGIC: [u8; 4] = *b"FTBQ";
 const BROKER_CONTROL_RESPONSE_MAGIC: [u8; 4] = *b"FTBP";
 const BROKER_CONTROL_VERSION: u16 = 1;
@@ -132,6 +146,7 @@ const BROKER_CONTROL_LISTENER_TOKEN: Token = Token(0);
 const BROKER_CONTROL_MAX_CONNECTIONS: usize = 1_024;
 const BROKER_CONTROL_ACCEPT_QUANTUM: usize = 32;
 const BROKER_CONTROL_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const BROKER_CONTROL_AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
 const BROKER_CONTROL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_GENESIS_BINDING_BYTES: usize = 256;
 const BROKER_SPAWN_CONTROL_MAGIC: [u8; 4] = *b"BSP1";
@@ -977,6 +992,7 @@ enum BrokerControlReadOutcomeV1 {
 struct BrokerControlConnectionV1 {
     stream: UnixStream,
     generation: u64,
+    accepted_at: Instant,
     read_state: BrokerControlReadStateV1,
     write_frame: Option<BrokerControlWireFrameV1>,
     write_offset: usize,
@@ -988,6 +1004,7 @@ impl BrokerControlConnectionV1 {
         Self {
             stream,
             generation,
+            accepted_at: Instant::now(),
             read_state: BrokerControlReadStateV1::prefix(),
             write_frame: None,
             write_offset: 0,
@@ -1242,6 +1259,21 @@ impl BrokerRecoveredSpawnCatalogV1 {
     }
 }
 
+fn reconcile_broker_catalog_under_token_authority(
+    token_authority: &mut GuardianTokenPathAuthority,
+    spawn_catalog: &BrokerSpawnWalCatalogV1,
+    recovered_catalog: &mut BrokerRecoveredSpawnCatalogV1,
+) -> Result<(), BrokerControlServiceError> {
+    // The scan was authenticated with token-derived authority. Revalidate the
+    // exact still-named token immediately before and after the only startup
+    // transition that may append a recovered head record, so token rotation or
+    // pathname replacement cannot separate recovery from client authority.
+    token_authority.validate()?;
+    spawn_catalog.reconcile_admitted_and_activate(recovered_catalog)?;
+    token_authority.validate()?;
+    Ok(())
+}
+
 /// Separately spawned, single-owner broker control loop.
 ///
 /// This first executable slice authenticates and fences connections and opens
@@ -1254,6 +1286,7 @@ pub struct BrokerControlServiceV1 {
     ready: Vec<BrokerReadyEventV1>,
     listener: UnixListener,
     socket_authority: SocketPathAuthority,
+    token_authority: GuardianTokenPathAuthority,
     control_authenticator: GuardianBrokerControlAuthenticatorV1,
     _spawn_catalog: BrokerSpawnWalCatalogV1,
     _recovered_catalog: BrokerRecoveredSpawnCatalogV1,
@@ -1269,11 +1302,13 @@ pub struct BrokerControlServiceV1 {
     next_connection_generation: u64,
     poll_interval: Duration,
     rejected_connections: u64,
+    expired_unauthenticated_connections: u64,
 }
 
 impl BrokerControlServiceV1 {
     pub fn bind(config: BrokerControlServiceConfigV1) -> Result<Self, BrokerControlServiceError> {
-        let secret = load_guardian_secret(&config.token_path)?;
+        let (secret, mut token_authority) =
+            load_guardian_secret_with_authority(&config.token_path)?;
         let control_authenticator = secret
             .broker_control_authenticator()
             .map_err(|_| BrokerControlServiceError::AuthenticationAuthority)?;
@@ -1281,14 +1316,18 @@ impl BrokerControlServiceV1 {
             .broker_spawn_wal_authenticator()
             .map_err(|_| BrokerControlServiceError::AuthenticationAuthority)?;
         let broker_lineage_id = spawn_authenticator.lineage_id();
-        let spawn_catalog = BrokerSpawnWalCatalogV1::open(config.spawn_catalog_path)?;
+        let mut spawn_catalog = BrokerSpawnWalCatalogV1::open(config.spawn_catalog_path)?;
         let recovered_journals = spawn_catalog.scan_all_for_admission(&spawn_authenticator)?;
         let mut recovered_catalog =
             BrokerRecoveredSpawnCatalogV1::admit(recovered_journals, &spawn_authenticator)?;
         if recovered_catalog.contains_spawn_lifecycle() {
             return Err(BrokerControlServiceError::ExistingSpawnLifecycleUnsupported);
         }
-        spawn_catalog.reconcile_admitted_and_activate(&mut recovered_catalog)?;
+        reconcile_broker_catalog_under_token_authority(
+            &mut token_authority,
+            &spawn_catalog,
+            &mut recovered_catalog,
+        )?;
 
         let poll = Poll::new().map_err(|error| BrokerControlServiceError::io("poll", error))?;
         let event_capacity = config.max_connections.checked_add(1).ok_or(
@@ -1329,7 +1368,9 @@ impl BrokerControlServiceV1 {
         // allocation have succeeded. A post-bind permission or registration
         // failure deliberately retains the exact socket for operator evidence;
         // ordinary allocation failure must not manufacture a stale endpoint.
+        token_authority.validate()?;
         let (mut listener, socket_authority) = bind_private_unix_listener(&config.socket_path)?;
+        token_authority.validate()?;
         poll.registry()
             .register(
                 &mut listener,
@@ -1343,6 +1384,7 @@ impl BrokerControlServiceV1 {
             ready,
             listener,
             socket_authority,
+            token_authority,
             control_authenticator,
             _spawn_catalog: spawn_catalog,
             _recovered_catalog: recovered_catalog,
@@ -1358,6 +1400,7 @@ impl BrokerControlServiceV1 {
             next_connection_generation: 1,
             poll_interval: config.poll_interval,
             rejected_connections: 0,
+            expired_unauthenticated_connections: 0,
         })
     }
 
@@ -1369,6 +1412,11 @@ impl BrokerControlServiceV1 {
     #[must_use]
     pub const fn rejected_connections(&self) -> u64 {
         self.rejected_connections
+    }
+
+    #[must_use]
+    pub const fn expired_unauthenticated_connections(&self) -> u64 {
+        self.expired_unauthenticated_connections
     }
 
     pub fn run_forever(&mut self) -> Result<(), BrokerControlServiceError> {
@@ -1386,12 +1434,14 @@ impl BrokerControlServiceV1 {
     }
 
     pub fn poll_once(&mut self) -> Result<(), BrokerControlServiceError> {
+        self.token_authority.validate()?;
         self.socket_authority.validate()?;
         match self.poll.poll(&mut self.events, Some(self.poll_interval)) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(()),
             Err(error) => return Err(BrokerControlServiceError::io("readiness-poll", error)),
         }
+        self.token_authority.validate()?;
         self.ready.clear();
         for event in &self.events {
             let token = event.token();
@@ -1434,10 +1484,43 @@ impl BrokerControlServiceV1 {
                 self.finish_connection(event.token, generation);
             }
         }
+        self.expire_unauthenticated_connections();
         Ok(())
     }
 
+    fn expire_unauthenticated_connections(&mut self) {
+        let now = Instant::now();
+        self.ready.clear();
+        for (token, connection) in &self.connections {
+            if connection.hello.is_none()
+                && now.saturating_duration_since(connection.accepted_at)
+                    >= BROKER_CONTROL_AUTHENTICATION_DEADLINE
+            {
+                self.ready.push(BrokerReadyEventV1 {
+                    token: *token,
+                    generation: Some(connection.generation),
+                    readable: false,
+                    writable: false,
+                    closed: true,
+                });
+            }
+        }
+        for index in 0..self.ready.len() {
+            let event = self.ready[index];
+            let Some(generation) = event.generation else {
+                continue;
+            };
+            if !self.connection_matches(event.token, generation) {
+                continue;
+            }
+            self.finish_connection(event.token, generation);
+            self.expired_unauthenticated_connections =
+                self.expired_unauthenticated_connections.saturating_add(1);
+        }
+    }
+
     fn accept_connections(&mut self) -> Result<(), BrokerControlServiceError> {
+        self.token_authority.validate()?;
         self.socket_authority.validate()?;
         // Listener readiness is level-triggered. A strict per-poll admission
         // quantum prevents a same-UID peer that continuously refills the
@@ -1452,6 +1535,7 @@ impl BrokerControlServiceV1 {
                     break;
                 }
             };
+            self.token_authority.validate()?;
             self.socket_authority.validate()?;
             let Some(raw_token) = self.free_connection_tokens.pop() else {
                 self.rejected_connections = self.rejected_connections.saturating_add(1);
@@ -2498,6 +2582,7 @@ pub struct BrokerSpawnJournalV1 {
     head_trailing_bytes: u64,
     records: Vec<BrokerSpawnWalRecordState>,
     terminal_head_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+    publication_binding: Option<BrokerSpawnWalPublicationBindingV1>,
     directory_entry_sync_required: bool,
     recovery_append_authority_withheld: bool,
     head_reconciliation_required: bool,
@@ -2517,12 +2602,35 @@ pub(crate) struct BrokerSpawnWalCatalogV1 {
     directory_path: PathBuf,
     directory: File,
     lock: File,
+    #[cfg(test)]
+    creation_fault: Option<BrokerSpawnCreationInjectedFault>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct BrokerSpawnWalCatalogPairV1 {
     wal_name: Option<OsString>,
     head_name: Option<OsString>,
+    creating: Option<BrokerSpawnCreationMarkerV1>,
+    completed: Option<BrokerSpawnCreationMarkerV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BrokerSpawnCreationMarkerV1 {
+    name: OsString,
+    identity: BrokerSpawnWalIdentityV1,
+    authentication_tag: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
+}
+
+struct BrokerSpawnCreationRecoveryPlanV1 {
+    marker: File,
+    creating: BrokerSpawnCreationMarkerV1,
+    completed_name: OsString,
+    wal_name: OsString,
+    head_name: OsString,
+    wal: Option<File>,
+    head: Option<File>,
+    wal_header: [u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
+    head_header: [u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2543,6 +2651,13 @@ pub(crate) struct BrokerSpawnWalFilesystemRevalidationV1 {
     observed_head_bytes: u64,
 }
 
+struct BrokerSpawnWalPublicationBindingV1 {
+    parent_device: u64,
+    parent_inode: u64,
+    wal_name: OsString,
+    head_name: OsString,
+}
+
 /// Fully preflighted, allocation-free plan for one recovered journal.
 ///
 /// Catalog recovery prepares every plan before applying the first one, so a
@@ -2555,6 +2670,7 @@ struct BrokerSpawnWalRecoveryActivationV1 {
 
 struct BrokerSpawnWalHeadReconciliationV1 {
     encoded: [u8; BROKER_SPAWN_HEAD_RECORD_BYTES],
+    durable_prefix_bytes: usize,
     projected_head_bytes: u64,
     head_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
 }
@@ -2630,6 +2746,16 @@ pub enum BrokerSpawnWalError {
     RecoveredCatalogDuplicateOriginRequestId,
     #[error("new broker Spawn WAL or head descriptor is not empty")]
     NewJournalNotEmpty,
+    #[error("broker Spawn WAL creation marker is malformed or noncanonical")]
+    InvalidCreationMarker,
+    #[error("broker Spawn WAL creation marker authentication failed")]
+    CreationMarkerAuthenticationFailed,
+    #[error("broker Spawn WAL creation transaction state is invalid")]
+    InvalidCreationState,
+    #[error("broker Spawn WAL catalog cannot represent the authenticated creation marker name")]
+    CreationMarkerNameTooLong,
+    #[error("broker Spawn WAL creation header is not an exact authenticated prefix")]
+    CreationHeaderMismatch,
     #[error("broker Spawn WAL file header is torn")]
     TornFileHeader,
     #[error("broker Spawn WAL file magic is invalid")]
@@ -2688,6 +2814,23 @@ enum BrokerSpawnWalInjectedFault {
     BeforeWalWrite,
     AfterWalSyncBeforeHead,
     BeforeHeadSync,
+    DuringRecoveredHeadWrite,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerSpawnCreationInjectedFault {
+    AfterMarkerCreateBeforeSync,
+    AfterMarkerSyncBeforeDirectorySync,
+    AfterMarkerDirectorySync,
+    DuringWalHeaderWrite { durable_prefix_bytes: usize },
+    AfterWalHeaderWriteBeforeSync,
+    AfterWalHeaderSync,
+    DuringHeadHeaderWrite { durable_prefix_bytes: usize },
+    AfterHeadHeaderWriteBeforeSync,
+    AfterHeadHeaderSync,
+    AfterPairDirectorySyncBeforeMarkerRename,
+    AfterMarkerRenameBeforeDirectorySync,
 }
 
 fn broker_genesis_binding_digest(binding: BrokerGenesisBinding) -> [u8; 32] {
@@ -2728,6 +2871,266 @@ fn broker_spawn_wal_verify(
     authenticator
         .verify(bytes, tag)
         .map_err(|_| BrokerSpawnWalError::AuthenticationFailed)
+}
+
+fn encode_broker_spawn_creation_identity(
+    identity: BrokerSpawnWalIdentityV1,
+) -> Result<[u8; BROKER_SPAWN_CREATION_IDENTITY_BYTES], BrokerSpawnWalError> {
+    identity.validate()?;
+    let mut encoded = [0_u8; BROKER_SPAWN_CREATION_IDENTITY_BYTES];
+    encoded[0..16].copy_from_slice(identity.journal_id.as_bytes());
+    encoded[16..32].copy_from_slice(identity.broker_lineage_id.as_bytes());
+    encoded[32..48].copy_from_slice(identity.mux_incarnation.as_bytes());
+    encoded[48..64].copy_from_slice(identity.durable_pane_id.as_bytes());
+    encoded[64..80].copy_from_slice(identity.spawn_effect_id.as_bytes());
+    encoded[80..96].copy_from_slice(identity.origin_request_id.as_bytes());
+    encoded[96..104].copy_from_slice(&identity.spawn_payload_bytes.to_le_bytes());
+    encoded[104..136].copy_from_slice(&identity.spawn_payload_digest);
+    encoded[136..168].copy_from_slice(&identity.binding_digest);
+    Ok(encoded)
+}
+
+fn decode_broker_spawn_creation_identity(
+    encoded: &[u8; BROKER_SPAWN_CREATION_IDENTITY_BYTES],
+) -> Result<BrokerSpawnWalIdentityV1, BrokerSpawnWalError> {
+    let identity = BrokerSpawnWalIdentityV1 {
+        journal_id: read_broker_uuid(&encoded[0..16]),
+        broker_lineage_id: read_broker_uuid(&encoded[16..32]),
+        mux_incarnation: read_broker_uuid(&encoded[32..48]),
+        durable_pane_id: read_broker_uuid(&encoded[48..64]),
+        spawn_effect_id: read_broker_uuid(&encoded[64..80]),
+        origin_request_id: read_broker_uuid(&encoded[80..96]),
+        spawn_payload_bytes: read_broker_u64(&encoded[96..104]),
+        spawn_payload_digest: read_broker_array_32(&encoded[104..136]),
+        binding_digest: read_broker_array_32(&encoded[136..168]),
+    };
+    identity.validate()?;
+    Ok(identity)
+}
+
+fn broker_spawn_creation_authenticated_bytes(
+    identity_bytes: &[u8; BROKER_SPAWN_CREATION_IDENTITY_BYTES],
+) -> [u8; 8 + BROKER_SPAWN_CREATION_IDENTITY_BYTES] {
+    let mut authenticated = [0_u8; 8 + BROKER_SPAWN_CREATION_IDENTITY_BYTES];
+    authenticated[..8].copy_from_slice(&BROKER_SPAWN_CREATION_MARKER_MAGIC);
+    authenticated[8..].copy_from_slice(identity_bytes);
+    authenticated
+}
+
+fn encode_broker_spawn_creation_base85(
+    bytes: &[u8; BROKER_SPAWN_CREATION_MARKER_BYTES],
+) -> [u8; BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES] {
+    let mut encoded = [0_u8; BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES];
+    for (chunk_index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let mut value = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let encoded_offset = chunk_index * 5;
+        for digit in (0..5).rev() {
+            let alphabet_index =
+                usize::try_from(value % 85).expect("base85 digit always fits usize");
+            encoded[encoded_offset + digit] = BROKER_SPAWN_CREATION_BASE85[alphabet_index];
+            value /= 85;
+        }
+    }
+    encoded
+}
+
+fn decode_broker_spawn_creation_base85(
+    encoded: &[u8],
+) -> Result<[u8; BROKER_SPAWN_CREATION_MARKER_BYTES], BrokerSpawnWalError> {
+    if encoded.len() != BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    let mut decoded = [0_u8; BROKER_SPAWN_CREATION_MARKER_BYTES];
+    for (chunk_index, chunk) in encoded.chunks_exact(5).enumerate() {
+        let mut value = 0_u64;
+        for byte in chunk {
+            let digit = BROKER_SPAWN_CREATION_BASE85
+                .iter()
+                .position(|candidate| candidate == byte)
+                .ok_or(BrokerSpawnWalError::InvalidCreationMarker)?;
+            value = value
+                .checked_mul(85)
+                .and_then(|value| {
+                    value.checked_add(u64::try_from(digit).expect("base85 index fits u64"))
+                })
+                .ok_or(BrokerSpawnWalError::InvalidCreationMarker)?;
+        }
+        let value = u32::try_from(value).map_err(|_| BrokerSpawnWalError::InvalidCreationMarker)?;
+        let decoded_offset = chunk_index * 4;
+        decoded[decoded_offset..decoded_offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    if encode_broker_spawn_creation_base85(&decoded).as_slice() != encoded {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    Ok(decoded)
+}
+
+fn broker_spawn_creation_marker_name(
+    identity: BrokerSpawnWalIdentityV1,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    completed: bool,
+) -> Result<OsString, BrokerSpawnWalError> {
+    let identity_bytes = encode_broker_spawn_creation_identity(identity)?;
+    let authentication_tag = broker_spawn_wal_authenticate(
+        authenticator,
+        &broker_spawn_creation_authenticated_bytes(&identity_bytes),
+    )?;
+    let mut marker = [0_u8; BROKER_SPAWN_CREATION_MARKER_BYTES];
+    marker[..BROKER_SPAWN_CREATION_IDENTITY_BYTES].copy_from_slice(&identity_bytes);
+    marker[BROKER_SPAWN_CREATION_IDENTITY_BYTES..].copy_from_slice(&authentication_tag);
+    let encoded = encode_broker_spawn_creation_base85(&marker);
+    let encoded =
+        std::str::from_utf8(&encoded).map_err(|_| BrokerSpawnWalError::InvalidCreationMarker)?;
+    let prefix = if completed {
+        BROKER_SPAWN_COMPLETED_MARKER_PREFIX
+    } else {
+        BROKER_SPAWN_CREATION_MARKER_PREFIX
+    };
+    let name = format!("{prefix}{encoded}");
+    if name.len() != BROKER_SPAWN_CREATION_MARKER_NAME_BYTES {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    Ok(name.into())
+}
+
+fn decode_broker_spawn_creation_marker_name(
+    name: &OsStr,
+) -> Result<(BrokerSpawnCreationMarkerV1, bool), BrokerSpawnWalError> {
+    let text = name
+        .to_str()
+        .ok_or(BrokerSpawnWalError::InvalidCreationMarker)?;
+    if text.len() != BROKER_SPAWN_CREATION_MARKER_NAME_BYTES {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    let (encoded, completed) =
+        if let Some(encoded) = text.strip_prefix(BROKER_SPAWN_CREATION_MARKER_PREFIX) {
+            (encoded, false)
+        } else if let Some(encoded) = text.strip_prefix(BROKER_SPAWN_COMPLETED_MARKER_PREFIX) {
+            (encoded, true)
+        } else {
+            return Err(BrokerSpawnWalError::InvalidCreationMarker);
+        };
+    let decoded = decode_broker_spawn_creation_base85(encoded.as_bytes())?;
+    let mut identity_bytes = [0_u8; BROKER_SPAWN_CREATION_IDENTITY_BYTES];
+    identity_bytes.copy_from_slice(&decoded[..BROKER_SPAWN_CREATION_IDENTITY_BYTES]);
+    let identity = decode_broker_spawn_creation_identity(&identity_bytes)?;
+    let mut authentication_tag = [0_u8; BROKER_SPAWN_WAL_MAC_BYTES];
+    authentication_tag.copy_from_slice(&decoded[BROKER_SPAWN_CREATION_IDENTITY_BYTES..]);
+    Ok((
+        BrokerSpawnCreationMarkerV1 {
+            name: name.to_os_string(),
+            identity,
+            authentication_tag,
+        },
+        completed,
+    ))
+}
+
+fn validate_broker_spawn_creation_marker(
+    marker: &BrokerSpawnCreationMarkerV1,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    completed: bool,
+) -> Result<(), BrokerSpawnWalError> {
+    let identity_bytes = encode_broker_spawn_creation_identity(marker.identity)?;
+    broker_spawn_wal_verify(
+        authenticator,
+        &broker_spawn_creation_authenticated_bytes(&identity_bytes),
+        &marker.authentication_tag,
+    )
+    .map_err(|_| BrokerSpawnWalError::CreationMarkerAuthenticationFailed)?;
+    let expected = broker_spawn_creation_marker_name(marker.identity, authenticator, completed)?;
+    if marker.name != expected {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    Ok(())
+}
+
+fn validate_broker_spawn_creation_header_prefix(
+    file: &mut File,
+    expected: &[u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
+) -> Result<usize, BrokerSpawnWalError> {
+    let observed_bytes = usize::try_from(file.metadata()?.len())
+        .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+    if observed_bytes > expected.len() {
+        return Err(BrokerSpawnWalError::InvalidCreationState);
+    }
+    let mut observed = [0_u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut observed[..observed_bytes])?;
+    validate_broker_spawn_creation_header_prefix_bytes(&observed[..observed_bytes], expected)?;
+    file.seek(SeekFrom::Start(
+        u64::try_from(observed_bytes).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?,
+    ))?;
+    Ok(observed_bytes)
+}
+
+fn validate_broker_spawn_creation_header_prefix_bytes(
+    observed: &[u8],
+    expected: &[u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
+) -> Result<(), BrokerSpawnWalError> {
+    if observed.len() > expected.len() || observed != &expected[..observed.len()] {
+        return Err(BrokerSpawnWalError::CreationHeaderMismatch);
+    }
+    Ok(())
+}
+
+fn read_broker_spawn_header_identity(
+    file: &mut File,
+    magic: [u8; 8],
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<BrokerSpawnWalIdentityV1, BrokerSpawnWalError> {
+    let mut header = [0_u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header)?;
+    file.rewind()?;
+    decode_broker_spawn_file_header(&header, magic, authenticator).map(|(identity, _)| identity)
+}
+
+fn validate_broker_spawn_catalog_identities(
+    identities: &[BrokerSpawnWalIdentityV1],
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<(), BrokerSpawnWalError> {
+    if identities.len() > GUARDIAN_MAX_PANES {
+        return Err(BrokerSpawnWalError::CapacityExhausted);
+    }
+    let mut journal_ids = HashMap::new();
+    let mut pane_ids = HashMap::new();
+    let mut effect_ids = HashMap::new();
+    let mut request_ids = HashMap::new();
+    for index in [
+        &mut journal_ids,
+        &mut pane_ids,
+        &mut effect_ids,
+        &mut request_ids,
+    ] {
+        index
+            .try_reserve(identities.len())
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+    }
+    for (index, identity) in identities.iter().copied().enumerate() {
+        if identity.broker_lineage_id() != authenticator.lineage_id() {
+            return Err(BrokerSpawnWalError::RecoveredCatalogLineageMismatch);
+        }
+        if journal_ids.insert(identity.journal_id(), index).is_some() {
+            return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateJournalId);
+        }
+        if pane_ids.insert(identity.durable_pane_id(), index).is_some() {
+            return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateDurablePaneId);
+        }
+        if effect_ids
+            .insert(identity.spawn_effect_id(), index)
+            .is_some()
+        {
+            return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateSpawnEffectId);
+        }
+        if request_ids
+            .insert(identity.origin_request_id(), index)
+            .is_some()
+        {
+            return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateOriginRequestId);
+        }
+    }
+    Ok(())
 }
 
 fn encode_broker_spawn_file_header(
@@ -3185,6 +3588,27 @@ fn scan_broker_spawn_head(
         previous_head_mac = head_mac;
         record_macs.push(head_mac);
     }
+    if trailing_bytes != 0 {
+        let next_index = usize::try_from(complete_records)
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        let wal_record = wal_records
+            .get(next_index)
+            .ok_or(BrokerSpawnWalError::IncompleteTail)?;
+        let expected = encode_broker_spawn_head_record(
+            head_header_mac,
+            authenticator,
+            complete_records,
+            wal_record.receipt.record_mac,
+            previous_head_mac,
+        )?;
+        let prefix_bytes =
+            usize::try_from(trailing_bytes).map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        let mut observed = [0_u8; BROKER_SPAWN_HEAD_RECORD_BYTES];
+        head.read_exact(&mut observed[..prefix_bytes])?;
+        if observed[..prefix_bytes] != expected[..prefix_bytes] {
+            return Err(BrokerSpawnWalError::IncompleteTail);
+        }
+    }
     Ok((
         head_header_mac,
         BrokerSpawnHeadScan {
@@ -3205,10 +3629,31 @@ fn broker_spawn_catalog_head_name(journal_id: Uuid) -> OsString {
     format!("{BROKER_SPAWN_CATALOG_PREFIX}{journal_id}{BROKER_SPAWN_CATALOG_HEAD_SUFFIX}").into()
 }
 
-fn parse_broker_spawn_catalog_name(name: &OsStr) -> Result<(Uuid, bool), BrokerSpawnWalError> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BrokerSpawnCatalogNameV1 {
+    Wal(Uuid),
+    Head(Uuid),
+    Creating(BrokerSpawnCreationMarkerV1),
+    Completed(BrokerSpawnCreationMarkerV1),
+}
+
+fn parse_broker_spawn_catalog_name(
+    name: &OsStr,
+) -> Result<BrokerSpawnCatalogNameV1, BrokerSpawnWalError> {
     let text = name
         .to_str()
         .ok_or(BrokerSpawnWalError::UnexpectedCatalogEntry)?;
+    if text.starts_with(BROKER_SPAWN_CREATION_MARKER_PREFIX)
+        || text.starts_with(BROKER_SPAWN_COMPLETED_MARKER_PREFIX)
+    {
+        let (marker, completed) = decode_broker_spawn_creation_marker_name(name)
+            .map_err(|_| BrokerSpawnWalError::UnexpectedCatalogEntry)?;
+        return Ok(if completed {
+            BrokerSpawnCatalogNameV1::Completed(marker)
+        } else {
+            BrokerSpawnCatalogNameV1::Creating(marker)
+        });
+    }
     let (identifier, is_wal) = if let Some(identifier) = text
         .strip_prefix(BROKER_SPAWN_CATALOG_PREFIX)
         .and_then(|rest| rest.strip_suffix(BROKER_SPAWN_CATALOG_WAL_SUFFIX))
@@ -3230,7 +3675,11 @@ fn parse_broker_spawn_catalog_name(name: &OsStr) -> Result<(Uuid, bool), BrokerS
     {
         return Err(BrokerSpawnWalError::UnexpectedCatalogEntry);
     }
-    Ok((journal_id, is_wal))
+    Ok(if is_wal {
+        BrokerSpawnCatalogNameV1::Wal(journal_id)
+    } else {
+        BrokerSpawnCatalogNameV1::Head(journal_id)
+    })
 }
 
 fn validate_broker_spawn_catalog_path(path: &Path) -> Result<(), BrokerSpawnWalError> {
@@ -3260,6 +3709,35 @@ fn validate_broker_spawn_catalog_path(path: &Path) -> Result<(), BrokerSpawnWalE
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o777 != 0o700 {
         return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(())
+}
+
+fn validate_broker_spawn_catalog_name_capacity(
+    directory: &File,
+) -> Result<(), BrokerSpawnWalError> {
+    if BROKER_SPAWN_CREATION_MARKER_PREFIX.len() != BROKER_SPAWN_COMPLETED_MARKER_PREFIX.len() {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    let observed = fpathconf(directory, PathconfVar::NAME_MAX)
+        .map_err(|error| BrokerSpawnWalError::Io(std::io::Error::from(error)))?
+        .ok_or(BrokerSpawnWalError::CreationMarkerNameTooLong)?;
+    let observed =
+        usize::try_from(observed).map_err(|_| BrokerSpawnWalError::CreationMarkerNameTooLong)?;
+    let maximum_required = BROKER_SPAWN_CREATION_MARKER_NAME_BYTES
+        .max(
+            broker_spawn_catalog_wal_name(Uuid::from_u128(u128::MAX))
+                .as_bytes()
+                .len(),
+        )
+        .max(
+            broker_spawn_catalog_head_name(Uuid::from_u128(u128::MAX))
+                .as_bytes()
+                .len(),
+        )
+        .max(BROKER_SPAWN_CATALOG_LOCK_NAME.len());
+    if maximum_required > observed {
+        return Err(BrokerSpawnWalError::CreationMarkerNameTooLong);
     }
     Ok(())
 }
@@ -3350,6 +3828,163 @@ fn broker_spawn_catalog_stat_identity_at(
         return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
     }
     Ok(identity)
+}
+
+fn broker_spawn_catalog_stat_recoverable_creation_identity_at(
+    directory: &File,
+    name: &OsStr,
+    minimum_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<BrokerSpawnWalFileIdentityV1, BrokerSpawnWalError> {
+    let metadata = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(std::io::Error::from)?;
+    #[allow(clippy::useless_conversion)]
+    let identity = BrokerSpawnWalFileIdentityV1 {
+        device: u64::try_from(metadata.st_dev)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?,
+        inode: u64::try_from(metadata.st_ino)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?,
+        mode: u32::from(metadata.st_mode),
+        owner: u32::try_from(metadata.st_uid)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?,
+        links: u64::from(metadata.st_nlink),
+        bytes: u64::try_from(metadata.st_size)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?,
+    };
+    let permissions = identity.mode & 0o7777;
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::RegularFile
+        || identity.owner != geteuid().as_raw()
+        || permissions & !0o600 != 0
+        || identity.links != 1
+        || identity.bytes < minimum_bytes
+        || identity.bytes > maximum_bytes
+    {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    Ok(identity)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn open_and_seal_broker_spawn_creation_file_mode_at(
+    directory: &File,
+    name: &OsStr,
+    minimum_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<File, BrokerSpawnWalError> {
+    let before = broker_spawn_catalog_stat_recoverable_creation_identity_at(
+        directory,
+        name,
+        minimum_bytes,
+        maximum_bytes,
+    )?;
+    let permissions = before.mode & 0o7777;
+    if permissions != 0o600 {
+        // O_CREAT applies the process umask before returning the new
+        // descriptor. A crash before the creator's fchmod can therefore leave
+        // 000/0200/0400 instead of 0600. Pin that exact regular inode first,
+        // restore only owner read/write permission through its descriptor,
+        // and synchronize the metadata before it can be published complete.
+        if permissions & 0o600 != 0 {
+            let access = if permissions & 0o400 != 0 {
+                rustix::fs::OFlags::RDONLY
+            } else {
+                rustix::fs::OFlags::WRONLY
+            };
+            let mode_file = rustix::fs::openat(
+                directory,
+                name,
+                access | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(std::io::Error::from)?;
+            let opened_metadata = mode_file.metadata()?;
+            let opened = broker_spawn_file_identity_from_metadata(&opened_metadata);
+            if !opened_metadata.is_file()
+                || opened.owner != geteuid().as_raw()
+                || opened.mode & 0o7777 != permissions
+                || opened.links != 1
+                || opened.bytes < minimum_bytes
+                || opened.bytes > maximum_bytes
+                || opened != before
+                || broker_spawn_catalog_stat_recoverable_creation_identity_at(
+                    directory,
+                    name,
+                    minimum_bytes,
+                    maximum_bytes,
+                )? != opened
+            {
+                return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+            }
+            rustix::fs::fchmod(&mode_file, rustix::fs::Mode::from_raw_mode(0o600))
+                .map_err(std::io::Error::from)?;
+        } else {
+            // Mode 000 cannot be opened by its owner after restart. chmodat is
+            // the portable recovery primitive. The parent is the already
+            // pinned owner-only catalog; both pre/post lstat identity checks
+            // make any rename/symlink race fail closed, and this transition
+            // changes no content bytes.
+            rustix::fs::chmodat(
+                directory,
+                name,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                rustix::fs::AtFlags::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+        }
+    }
+    let after =
+        broker_spawn_catalog_stat_identity_at(directory, name, minimum_bytes, maximum_bytes)?;
+    if before.device != after.device
+        || before.inode != after.inode
+        || before.owner != after.owner
+        || before.links != after.links
+        || before.bytes != after.bytes
+    {
+        return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+    }
+    let file =
+        open_revalidated_broker_spawn_catalog_file(directory, name, minimum_bytes, maximum_bytes)?;
+    if permissions != 0o600 {
+        file.sync_all()?;
+        let durable = revalidate_open_broker_spawn_catalog_file(
+            directory,
+            name,
+            &file,
+            minimum_bytes,
+            maximum_bytes,
+        )?;
+        if durable != after {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn open_and_seal_broker_spawn_creation_file_mode_at(
+    _directory: &File,
+    _name: &OsStr,
+    _minimum_bytes: u64,
+    _maximum_bytes: u64,
+) -> Result<File, BrokerSpawnWalError> {
+    Err(BrokerSpawnWalError::CatalogLockUnsupported)
 }
 
 fn open_broker_spawn_catalog_file_at(
@@ -3452,6 +4087,50 @@ fn lock_broker_spawn_catalog(_file: &File) -> Result<(), BrokerSpawnWalError> {
     Err(BrokerSpawnWalError::CatalogLockUnsupported)
 }
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn publish_broker_spawn_completed_marker_noreplace(
+    directory: &File,
+    creating_name: &OsStr,
+    completed_name: &OsStr,
+) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        directory,
+        creating_name,
+        directory,
+        completed_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn publish_broker_spawn_completed_marker_noreplace(
+    _directory: &File,
+    _creating_name: &OsStr,
+    _completed_name: &OsStr,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "atomic no-replace broker Spawn creation publication is unsupported",
+    ))
+}
+
 impl BrokerSpawnWalCatalogV1 {
     /// Open and exclusively pin an existing owner-only catalog directory.
     pub(crate) fn open(directory_path: PathBuf) -> Result<Self, BrokerSpawnWalError> {
@@ -3467,14 +4146,25 @@ impl BrokerSpawnWalCatalogV1 {
         require_same_broker_spawn_catalog_object(&before, &opened)?;
         let after = std::fs::symlink_metadata(&directory_path)?;
         require_same_broker_spawn_catalog_object(&opened, &after)?;
+        // The authenticated creation certificate is deliberately close to
+        // POSIX NAME_MAX. Query the exact pinned directory before creating
+        // even the catalog lock, rather than assuming a platform-wide bound.
+        validate_broker_spawn_catalog_name_capacity(&directory)?;
 
         let lock_name = OsStr::new(BROKER_SPAWN_CATALOG_LOCK_NAME);
         let (lock, created) = match open_broker_spawn_catalog_file_at(&directory, lock_name, true) {
             Ok(lock) => (lock, true),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => (
-                open_revalidated_broker_spawn_catalog_file(&directory, lock_name, 0, 0)?,
-                false,
-            ),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                // The first catalog opener can die after O_CREAT applies a
+                // restrictive umask but before fchmod restores 0600. The
+                // fixed, empty lock inode is safe to resume under the same
+                // recoverable owner-only mode-subset contract as an in-flight
+                // creation marker.
+                (
+                    open_and_seal_broker_spawn_creation_file_mode_at(&directory, lock_name, 0, 0)?,
+                    false,
+                )
+            }
             Err(error) => return Err(error.into()),
         };
         if created {
@@ -3487,9 +4177,11 @@ impl BrokerSpawnWalCatalogV1 {
             directory_path,
             directory,
             lock,
+            #[cfg(test)]
+            creation_fault: None,
         };
         catalog.validate_pinned_directory()?;
-        catalog.scan_pairs()?;
+        catalog.scan_catalog_states()?;
         Ok(catalog)
     }
 
@@ -3519,68 +4211,561 @@ impl BrokerSpawnWalCatalogV1 {
         admitted.require_new_identity_available(identity)?;
         drop(admitted);
         self.validate_pinned_directory()?;
-        self.create_spawn_journal_after_admission(identity, authenticator)
+        self.create_spawn_journal_after_admission(identity, authenticator, true)
     }
 
     fn create_spawn_journal_after_admission(
-        &self,
+        &mut self,
         identity: BrokerSpawnWalIdentityV1,
         authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+        enforce_catalog_uniqueness: bool,
     ) -> Result<BrokerSpawnJournalV1, BrokerSpawnWalError> {
         identity.validate()?;
         self.validate_pinned_directory()?;
-        let pairs = self.scan_pairs()?;
-        if pairs.len() >= GUARDIAN_MAX_PANES || pairs.contains_key(&identity.journal_id) {
+        let states = self.scan_catalog_states()?;
+        if states.len() >= GUARDIAN_MAX_PANES || states.contains_key(&identity.journal_id) {
             return Err(BrokerSpawnWalError::CapacityExhausted);
+        }
+        let creating_name = broker_spawn_creation_marker_name(identity, &authenticator, false)?;
+        let completed_name = broker_spawn_creation_marker_name(identity, &authenticator, true)?;
+        if creating_name.as_bytes().len() > BROKER_SPAWN_CREATION_MARKER_NAME_BYTES
+            || completed_name.as_bytes().len() > BROKER_SPAWN_CREATION_MARKER_NAME_BYTES
+            || creating_name == completed_name
+        {
+            return Err(BrokerSpawnWalError::InvalidCreationMarker);
+        }
+        validate_broker_spawn_catalog_name_capacity(&self.directory)?;
+
+        // The filename itself carries the complete authenticated identity. A
+        // directory entry is atomic, and no canonical member is created until
+        // this empty marker and its exact parent directory are synchronized.
+        // Thus a crash before this barrier leaves either no marker or one
+        // complete recoverable identity, never a canonical member first.
+        let marker = open_broker_spawn_catalog_file_at(&self.directory, &creating_name, true)?;
+        revalidate_open_broker_spawn_catalog_file(&self.directory, &creating_name, &marker, 0, 0)?;
+        #[cfg(test)]
+        if self.take_creation_fault(BrokerSpawnCreationInjectedFault::AfterMarkerCreateBeforeSync) {
+            return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                "injected broker Spawn creation fault after marker create",
+            )));
+        }
+        marker.sync_all()?;
+        #[cfg(test)]
+        if self.take_creation_fault(
+            BrokerSpawnCreationInjectedFault::AfterMarkerSyncBeforeDirectorySync,
+        ) {
+            return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                "injected broker Spawn creation fault after marker sync",
+            )));
+        }
+        self.directory.sync_all()?;
+        #[cfg(test)]
+        if self.take_creation_fault(BrokerSpawnCreationInjectedFault::AfterMarkerDirectorySync) {
+            return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                "injected broker Spawn creation fault after marker directory sync",
+            )));
+        }
+        revalidate_open_broker_spawn_catalog_file(&self.directory, &creating_name, &marker, 0, 0)?;
+        drop(marker);
+
+        self.recover_creation_transactions(&authenticator, enforce_catalog_uniqueness)?;
+        let pairs = self.scan_pairs()?;
+        let pair = pairs
+            .get(&identity.journal_id)
+            .ok_or(BrokerSpawnWalError::InvalidCreationState)?;
+        let completed = pair
+            .completed
+            .as_ref()
+            .ok_or(BrokerSpawnWalError::InvalidCreationState)?;
+        if completed.identity != identity || completed.name != completed_name {
+            return Err(BrokerSpawnWalError::InvalidCreationState);
         }
         let wal_name = broker_spawn_catalog_wal_name(identity.journal_id);
         let head_name = broker_spawn_catalog_head_name(identity.journal_id);
-        let wal = open_broker_spawn_catalog_file_at(&self.directory, &wal_name, true)?;
-        revalidate_open_broker_spawn_catalog_file(&self.directory, &wal_name, &wal, 0, 0)?;
-        let head = open_broker_spawn_catalog_file_at(&self.directory, &head_name, true)?;
-        revalidate_open_broker_spawn_catalog_file(&self.directory, &head_name, &head, 0, 0)?;
-        let mut journal = BrokerSpawnJournalV1::create(wal, head, identity, authenticator)?;
-        revalidate_open_broker_spawn_catalog_file(
+        let wal = open_revalidated_broker_spawn_catalog_file(
             &self.directory,
             &wal_name,
-            &journal.wal,
             BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
             BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
         )?;
-        revalidate_open_broker_spawn_catalog_file(
+        let head = open_revalidated_broker_spawn_catalog_file(
             &self.directory,
             &head_name,
-            &journal.head,
             BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
             BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
         )?;
-        journal.sync_parent_directory_and_activate(&self.directory)?;
+        let mut journal = BrokerSpawnJournalV1::open(wal, head, identity, authenticator)?;
+        let authority = BrokerSpawnWalFilesystemRevalidationV1::from_revalidated_filesystem(
+            identity,
+            journal.wal.metadata()?.len(),
+            journal.head.metadata()?.len(),
+        )?;
+        journal.reconcile_recovered_head_and_activate(authority)?;
         self.validate_pinned_directory()?;
         Ok(journal)
     }
 
     #[cfg(test)]
     fn create_spawn_journal_fixture_unadmitted(
-        &self,
+        &mut self,
         identity: BrokerSpawnWalIdentityV1,
         authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
     ) -> Result<BrokerSpawnJournalV1, BrokerSpawnWalError> {
-        self.create_spawn_journal_after_admission(identity, authenticator)
+        self.create_spawn_journal_after_admission(identity, authenticator, false)
     }
 
-    /// Authenticate and revalidate every complete catalog pair without
-    /// granting append authority or writing either durable file.
+    /// Complete every authenticated header-only creation transaction before
+    /// ordinary lifecycle admission. All markers, header prefixes, lineage,
+    /// identities, and namespace uniqueness are preflighted before the first
+    /// byte is written. The transition has no child effect and is idempotent.
+    fn recover_creation_transactions(
+        &mut self,
+        authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+        enforce_catalog_uniqueness: bool,
+    ) -> Result<(), BrokerSpawnWalError> {
+        if self
+            .scan_catalog_states()?
+            .values()
+            .all(|pair| pair.creating.is_none())
+        {
+            return Ok(());
+        }
+        let plans =
+            self.preflight_creation_transactions(authenticator, enforce_catalog_uniqueness)?;
+        for plan in plans {
+            self.apply_creation_recovery_plan(plan)?;
+        }
+        self.validate_pinned_directory()?;
+        Ok(())
+    }
+
+    fn preflight_creation_transactions(
+        &self,
+        authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+        enforce_catalog_uniqueness: bool,
+    ) -> Result<Vec<BrokerSpawnCreationRecoveryPlanV1>, BrokerSpawnWalError> {
+        self.validate_pinned_directory()?;
+        validate_broker_spawn_catalog_name_capacity(&self.directory)?;
+        let states = self.scan_catalog_states()?;
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(states.len())
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        // Validate every filename certificate, every completed/legacy pair,
+        // lineage, and global identity namespace before changing even a
+        // recoverable mode bit. A creating pair whose mode was masked by
+        // umask cannot always be reopened yet, but its full authenticated
+        // identity is available in the filename.
+        for (journal_id, pair) in &states {
+            if let Some(completed) = pair.completed.as_ref() {
+                validate_broker_spawn_creation_marker(completed, authenticator, true)?;
+            }
+            if let Some(creating) = pair.creating.as_ref() {
+                validate_broker_spawn_creation_marker(creating, authenticator, false)?;
+            }
+
+            if let Some(creating) = pair.creating.as_ref() {
+                if pair.completed.is_some() || creating.identity.journal_id() != *journal_id {
+                    return Err(BrokerSpawnWalError::InvalidCreationState);
+                }
+                identities.push(creating.identity);
+                continue;
+            }
+
+            let wal_name = pair
+                .wal_name
+                .as_ref()
+                .ok_or(BrokerSpawnWalError::IncompleteCatalogPair)?;
+            let head_name = pair
+                .head_name
+                .as_ref()
+                .ok_or(BrokerSpawnWalError::IncompleteCatalogPair)?;
+            let mut wal = open_revalidated_broker_spawn_catalog_file(
+                &self.directory,
+                wal_name,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+            )?;
+            let mut head = open_revalidated_broker_spawn_catalog_file(
+                &self.directory,
+                head_name,
+                BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+            )?;
+            let wal_identity = read_broker_spawn_header_identity(
+                &mut wal,
+                BROKER_SPAWN_WAL_FILE_MAGIC,
+                authenticator,
+            )?;
+            let head_identity = read_broker_spawn_header_identity(
+                &mut head,
+                BROKER_SPAWN_HEAD_FILE_MAGIC,
+                authenticator,
+            )?;
+            if wal_identity != head_identity || wal_identity.journal_id() != *journal_id {
+                return Err(BrokerSpawnWalError::CatalogIdentityMismatch);
+            }
+            if pair
+                .completed
+                .as_ref()
+                .is_some_and(|completed| completed.identity != wal_identity)
+            {
+                return Err(BrokerSpawnWalError::InvalidCreationState);
+            }
+            let journal =
+                BrokerSpawnJournalV1::open(wal, head, wal_identity, authenticator.clone())?;
+            journal.require_healthy_for_recovery()?;
+            identities.push(wal_identity);
+        }
+
+        if enforce_catalog_uniqueness {
+            validate_broker_spawn_catalog_identities(&identities, authenticator)?;
+        } else if identities
+            .iter()
+            .any(|identity| identity.broker_lineage_id() != authenticator.lineage_id())
+        {
+            return Err(BrokerSpawnWalError::RecoveredCatalogLineageMismatch);
+        }
+
+        let mut plans = Vec::new();
+        plans
+            .try_reserve_exact(states.len())
+            .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+        for (journal_id, pair) in &states {
+            let Some(creating) = pair.creating.as_ref() else {
+                continue;
+            };
+            let wal_header = encode_broker_spawn_file_header(
+                BROKER_SPAWN_WAL_FILE_MAGIC,
+                creating.identity,
+                authenticator,
+            )?;
+            let head_header = encode_broker_spawn_file_header(
+                BROKER_SPAWN_HEAD_FILE_MAGIC,
+                creating.identity,
+                authenticator,
+            )?;
+            let marker = open_and_seal_broker_spawn_creation_file_mode_at(
+                &self.directory,
+                &creating.name,
+                0,
+                0,
+            )?;
+            let wal = if let Some(wal_name) = pair.wal_name.as_ref() {
+                let mut wal = open_and_seal_broker_spawn_creation_file_mode_at(
+                    &self.directory,
+                    wal_name,
+                    0,
+                    BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                )?;
+                validate_broker_spawn_creation_header_prefix(&mut wal, &wal_header)?;
+                Some(wal)
+            } else {
+                None
+            };
+            let head = if let Some(head_name) = pair.head_name.as_ref() {
+                let mut head = open_and_seal_broker_spawn_creation_file_mode_at(
+                    &self.directory,
+                    head_name,
+                    0,
+                    BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                )?;
+                validate_broker_spawn_creation_header_prefix(&mut head, &head_header)?;
+                Some(head)
+            } else {
+                None
+            };
+            plans.push(BrokerSpawnCreationRecoveryPlanV1 {
+                marker,
+                creating: creating.clone(),
+                completed_name: broker_spawn_creation_marker_name(
+                    creating.identity,
+                    authenticator,
+                    true,
+                )?,
+                wal_name: broker_spawn_catalog_wal_name(*journal_id),
+                head_name: broker_spawn_catalog_head_name(*journal_id),
+                wal,
+                head,
+                wal_header,
+                head_header,
+            });
+        }
+        if self.scan_catalog_states()? != states {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+        for plan in &mut plans {
+            revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &plan.creating.name,
+                &plan.marker,
+                0,
+                0,
+            )?;
+            if let Some(wal) = plan.wal.as_mut() {
+                revalidate_open_broker_spawn_catalog_file(
+                    &self.directory,
+                    &plan.wal_name,
+                    wal,
+                    0,
+                    BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                )?;
+                validate_broker_spawn_creation_header_prefix(wal, &plan.wal_header)?;
+            }
+            if let Some(head) = plan.head.as_mut() {
+                revalidate_open_broker_spawn_catalog_file(
+                    &self.directory,
+                    &plan.head_name,
+                    head,
+                    0,
+                    BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                )?;
+                validate_broker_spawn_creation_header_prefix(head, &plan.head_header)?;
+            }
+        }
+        Ok(plans)
+    }
+
+    fn apply_creation_recovery_plan(
+        &mut self,
+        mut plan: BrokerSpawnCreationRecoveryPlanV1,
+    ) -> Result<(), BrokerSpawnWalError> {
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            &plan.creating.name,
+            &plan.marker,
+            0,
+            0,
+        )?;
+        // A process may have died before either synchronization in the
+        // original marker barrier. Re-establish both halves on every resume
+        // before creating a missing canonical member.
+        plan.marker.sync_all()?;
+        self.directory.sync_all()?;
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            &plan.creating.name,
+            &plan.marker,
+            0,
+            0,
+        )?;
+        let wal = self.materialize_creation_header(
+            plan.wal.take(),
+            &plan.wal_name,
+            &plan.wal_header,
+            true,
+        )?;
+        #[cfg(test)]
+        if self.take_creation_fault(BrokerSpawnCreationInjectedFault::AfterWalHeaderSync) {
+            return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                "injected broker Spawn creation fault after WAL header sync",
+            )));
+        }
+        let head = self.materialize_creation_header(
+            plan.head.take(),
+            &plan.head_name,
+            &plan.head_header,
+            false,
+        )?;
+        #[cfg(test)]
+        if self.take_creation_fault(BrokerSpawnCreationInjectedFault::AfterHeadHeaderSync) {
+            return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                "injected broker Spawn creation fault after head header sync",
+            )));
+        }
+
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            &plan.wal_name,
+            &wal,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        )?;
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            &plan.head_name,
+            &head,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        )?;
+        self.directory.sync_all()?;
+        #[cfg(test)]
+        if self.take_creation_fault(
+            BrokerSpawnCreationInjectedFault::AfterPairDirectorySyncBeforeMarkerRename,
+        ) {
+            return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                "injected broker Spawn creation fault before marker publication",
+            )));
+        }
+
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            &plan.creating.name,
+            &plan.marker,
+            0,
+            0,
+        )?;
+        publish_broker_spawn_completed_marker_noreplace(
+            &self.directory,
+            &plan.creating.name,
+            &plan.completed_name,
+        )?;
+        #[cfg(test)]
+        if self.take_creation_fault(
+            BrokerSpawnCreationInjectedFault::AfterMarkerRenameBeforeDirectorySync,
+        ) {
+            return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                "injected broker Spawn creation fault after marker publication",
+            )));
+        }
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            &plan.completed_name,
+            &plan.marker,
+            0,
+            0,
+        )?;
+        self.directory.sync_all()?;
+
+        let states = self.scan_catalog_states()?;
+        let completed = states
+            .get(&plan.creating.identity.journal_id())
+            .and_then(|pair| pair.completed.as_ref())
+            .ok_or(BrokerSpawnWalError::InvalidCreationState)?;
+        if states
+            .get(&plan.creating.identity.journal_id())
+            .and_then(|pair| pair.creating.as_ref())
+            .is_some()
+            || completed.name != plan.completed_name
+            || completed.identity != plan.creating.identity
+        {
+            return Err(BrokerSpawnWalError::InvalidCreationState);
+        }
+        Ok(())
+    }
+
+    fn materialize_creation_header(
+        &mut self,
+        existing: Option<File>,
+        name: &OsStr,
+        expected: &[u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
+        _is_wal: bool,
+    ) -> Result<File, BrokerSpawnWalError> {
+        let mut file = if let Some(file) = existing {
+            file
+        } else {
+            let file = open_broker_spawn_catalog_file_at(&self.directory, name, true)?;
+            revalidate_open_broker_spawn_catalog_file(&self.directory, name, &file, 0, 0)?;
+            file
+        };
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            name,
+            &file,
+            0,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        )?;
+        let durable_prefix_bytes =
+            validate_broker_spawn_creation_header_prefix(&mut file, expected)?;
+        file.seek(SeekFrom::Start(
+            u64::try_from(durable_prefix_bytes)
+                .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?,
+        ))?;
+
+        #[cfg(test)]
+        if let Some(injected_prefix_bytes) = self.take_partial_creation_header_fault(_is_wal) {
+            if injected_prefix_bytes < durable_prefix_bytes
+                || injected_prefix_bytes > expected.len()
+            {
+                return Err(BrokerSpawnWalError::InvalidCreationState);
+            }
+            file.write_all(&expected[durable_prefix_bytes..injected_prefix_bytes])?;
+            file.sync_all()?;
+            return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                "injected partial broker Spawn creation-header write",
+            )));
+        }
+
+        file.write_all(&expected[durable_prefix_bytes..])?;
+        #[cfg(test)]
+        {
+            let fault = if _is_wal {
+                BrokerSpawnCreationInjectedFault::AfterWalHeaderWriteBeforeSync
+            } else {
+                BrokerSpawnCreationInjectedFault::AfterHeadHeaderWriteBeforeSync
+            };
+            if self.take_creation_fault(fault) {
+                return Err(BrokerSpawnWalError::Io(std::io::Error::other(
+                    "injected broker Spawn creation fault before header sync",
+                )));
+            }
+        }
+        file.sync_all()?;
+        revalidate_open_broker_spawn_catalog_file(
+            &self.directory,
+            name,
+            &file,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        )?;
+        validate_broker_spawn_creation_header_prefix(&mut file, expected)?;
+        Ok(file)
+    }
+
+    #[cfg(test)]
+    fn inject_creation_fault(&mut self, fault: BrokerSpawnCreationInjectedFault) {
+        self.creation_fault = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn take_creation_fault(&mut self, expected: BrokerSpawnCreationInjectedFault) -> bool {
+        if self.creation_fault == Some(expected) {
+            self.creation_fault = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn take_partial_creation_header_fault(&mut self, is_wal: bool) -> Option<usize> {
+        let observed = self.creation_fault?;
+        let prefix = match (is_wal, observed) {
+            (
+                true,
+                BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+                    durable_prefix_bytes,
+                },
+            )
+            | (
+                false,
+                BrokerSpawnCreationInjectedFault::DuringHeadHeaderWrite {
+                    durable_prefix_bytes,
+                },
+            ) => durable_prefix_bytes,
+            _ => return None,
+        };
+        self.creation_fault = None;
+        Some(prefix)
+    }
+
+    /// Recover authenticated header-creation prefixes, then authenticate and
+    /// revalidate every complete catalog pair without granting lifecycle
+    /// append authority.
     ///
-    /// Unknown names, half-pairs, replaced inodes, torn records, key rotation,
-    /// and catalog drift all fail the entire scan before any caller can admit a
-    /// partial set of durable Spawn fences. Cross-journal uniqueness and
-    /// lifecycle policy must be decided before
+    /// A filename-carried creation identity may finish missing exact header
+    /// suffixes before lifecycle admission; this never performs Spawn or adds
+    /// a lifecycle record. Unknown names, unmarked half-pairs, replaced
+    /// inodes, torn lifecycle records, key rotation, and catalog drift fail the
+    /// entire scan. Cross-journal uniqueness and lifecycle policy are decided
+    /// before
     /// [`Self::reconcile_admitted_and_activate`] is called.
     fn scan_all_for_admission(
-        &self,
+        &mut self,
         authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
     ) -> Result<Vec<BrokerSpawnJournalV1>, BrokerSpawnWalError> {
         self.validate_pinned_directory()?;
+        self.recover_creation_transactions(authenticator, true)?;
         let pairs = self.scan_pairs()?;
         let mut recovered = Vec::new();
         recovered
@@ -3617,6 +4802,12 @@ impl BrokerSpawnWalCatalogV1 {
             )?;
             if identity.journal_id != *journal_id {
                 return Err(BrokerSpawnWalError::CatalogIdentityMismatch);
+            }
+            if let Some(completed) = pair.completed.as_ref() {
+                validate_broker_spawn_creation_marker(completed, authenticator, true)?;
+                if completed.identity != identity {
+                    return Err(BrokerSpawnWalError::InvalidCreationState);
+                }
             }
             let journal = BrokerSpawnJournalV1::open(wal, head, identity, authenticator.clone())?;
             // A torn physical tail is preserved by `open`, but it is never an
@@ -3768,10 +4959,21 @@ impl BrokerSpawnWalCatalogV1 {
     fn scan_pairs(
         &self,
     ) -> Result<BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1>, BrokerSpawnWalError> {
+        let states = self.scan_catalog_states()?;
+        Ok(states
+            .into_iter()
+            .filter(|(_, pair)| pair.creating.is_none())
+            .collect())
+    }
+
+    fn scan_catalog_states(
+        &self,
+    ) -> Result<BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1>, BrokerSpawnWalError> {
         let mut directory =
             rustix::fs::Dir::read_from(&self.directory).map_err(std::io::Error::from)?;
         let mut pairs: BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1> = BTreeMap::new();
         let mut observed_entries = 0_usize;
+        let mut observed_bytes = 0_u64;
         while let Some(entry) = directory.read() {
             let entry = entry.map_err(std::io::Error::from)?;
             let name = entry.file_name();
@@ -3786,24 +4988,121 @@ impl BrokerSpawnWalCatalogV1 {
             }
             let name = OsStr::from_bytes(name.to_bytes());
             if name == OsStr::new(BROKER_SPAWN_CATALOG_LOCK_NAME) {
+                let lock = broker_spawn_catalog_stat_identity_at(&self.directory, name, 0, 0)?;
+                observed_bytes = observed_bytes
+                    .checked_add(lock.bytes)
+                    .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
                 continue;
             }
-            let (journal_id, is_wal) = parse_broker_spawn_catalog_name(name)?;
-            let pair = pairs.entry(journal_id).or_default();
-            let slot = if is_wal {
-                &mut pair.wal_name
-            } else {
-                &mut pair.head_name
-            };
-            if slot.replace(name.to_os_string()).is_some() {
-                return Err(BrokerSpawnWalError::UnexpectedCatalogEntry);
+            match parse_broker_spawn_catalog_name(name)? {
+                BrokerSpawnCatalogNameV1::Wal(journal_id) => {
+                    // Enumeration order is unspecified, so the corresponding
+                    // creating marker may be encountered later. Accept only a
+                    // secure owner-only mode subset here; the completed-state
+                    // pass below still requires exact 0600.
+                    let identity = broker_spawn_catalog_stat_recoverable_creation_identity_at(
+                        &self.directory,
+                        name,
+                        0,
+                        BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+                    )?;
+                    observed_bytes = observed_bytes
+                        .checked_add(identity.bytes)
+                        .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+                    let pair = pairs.entry(journal_id).or_default();
+                    if pair.wal_name.replace(name.to_os_string()).is_some() {
+                        return Err(BrokerSpawnWalError::UnexpectedCatalogEntry);
+                    }
+                }
+                BrokerSpawnCatalogNameV1::Head(journal_id) => {
+                    let identity = broker_spawn_catalog_stat_recoverable_creation_identity_at(
+                        &self.directory,
+                        name,
+                        0,
+                        BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+                    )?;
+                    observed_bytes = observed_bytes
+                        .checked_add(identity.bytes)
+                        .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+                    let pair = pairs.entry(journal_id).or_default();
+                    if pair.head_name.replace(name.to_os_string()).is_some() {
+                        return Err(BrokerSpawnWalError::UnexpectedCatalogEntry);
+                    }
+                }
+                BrokerSpawnCatalogNameV1::Creating(marker) => {
+                    let identity = broker_spawn_catalog_stat_recoverable_creation_identity_at(
+                        &self.directory,
+                        name,
+                        0,
+                        0,
+                    )?;
+                    observed_bytes = observed_bytes
+                        .checked_add(identity.bytes)
+                        .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+                    let pair = pairs.entry(marker.identity.journal_id()).or_default();
+                    if pair.creating.replace(marker).is_some() {
+                        return Err(BrokerSpawnWalError::InvalidCreationState);
+                    }
+                }
+                BrokerSpawnCatalogNameV1::Completed(marker) => {
+                    let identity =
+                        broker_spawn_catalog_stat_identity_at(&self.directory, name, 0, 0)?;
+                    observed_bytes = observed_bytes
+                        .checked_add(identity.bytes)
+                        .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+                    let pair = pairs.entry(marker.identity.journal_id()).or_default();
+                    if pair.completed.replace(marker).is_some() {
+                        return Err(BrokerSpawnWalError::InvalidCreationState);
+                    }
+                }
             }
         }
-        if pairs
-            .values()
-            .any(|pair| pair.wal_name.is_none() || pair.head_name.is_none())
+        if pairs.len() > GUARDIAN_MAX_PANES
+            || observed_bytes > BROKER_SPAWN_CATALOG_MAX_PHYSICAL_BYTES
         {
-            return Err(BrokerSpawnWalError::IncompleteCatalogPair);
+            return Err(BrokerSpawnWalError::CapacityExhausted);
+        }
+        for pair in pairs.values() {
+            if pair.creating.is_some() && pair.completed.is_some() {
+                return Err(BrokerSpawnWalError::InvalidCreationState);
+            }
+            if pair.creating.is_some() {
+                if let Some(wal_name) = pair.wal_name.as_ref() {
+                    broker_spawn_catalog_stat_recoverable_creation_identity_at(
+                        &self.directory,
+                        wal_name,
+                        0,
+                        BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                    )?;
+                }
+                if let Some(head_name) = pair.head_name.as_ref() {
+                    broker_spawn_catalog_stat_recoverable_creation_identity_at(
+                        &self.directory,
+                        head_name,
+                        0,
+                        BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                    )?;
+                }
+            } else if pair.wal_name.is_none() || pair.head_name.is_none() {
+                return Err(if pair.completed.is_some() {
+                    BrokerSpawnWalError::InvalidCreationState
+                } else {
+                    BrokerSpawnWalError::IncompleteCatalogPair
+                });
+            } else {
+                broker_spawn_catalog_stat_identity_at(
+                    &self.directory,
+                    pair.wal_name.as_deref().expect("validated WAL name"),
+                    BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                    BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+                )?;
+                broker_spawn_catalog_stat_identity_at(
+                    &self.directory,
+                    pair.head_name.as_deref().expect("validated head name"),
+                    BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+                    BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+                )?;
+            }
         }
         Ok(pairs)
     }
@@ -3862,6 +5161,7 @@ impl BrokerSpawnJournalV1 {
             head_trailing_bytes: 0,
             records,
             terminal_head_mac: read_broker_array_32(&head_header[192..224]),
+            publication_binding: None,
             directory_entry_sync_required: true,
             recovery_append_authority_withheld: false,
             head_reconciliation_required: false,
@@ -3927,6 +5227,7 @@ impl BrokerSpawnJournalV1 {
             head_trailing_bytes: head_scan.trailing_bytes,
             records,
             terminal_head_mac: head_scan.terminal_head_mac,
+            publication_binding: None,
             directory_entry_sync_required: false,
             recovery_append_authority_withheld: true,
             head_reconciliation_required: head_gap == 1,
@@ -3981,7 +5282,41 @@ impl BrokerSpawnJournalV1 {
         self.poisoned
     }
 
-    /// Synchronize the parent that published both newly created files.
+    fn bind_parent_publication(
+        &mut self,
+        parent_directory: &File,
+        wal_name: &OsStr,
+        head_name: &OsStr,
+    ) -> Result<(), BrokerSpawnWalError> {
+        if !self.directory_entry_sync_required || self.publication_binding.is_some() {
+            return Err(BrokerSpawnWalError::DirectoryEntryNotDurable);
+        }
+        let parent = parent_directory.metadata()?;
+        validate_broker_spawn_catalog_directory_metadata(&parent)?;
+        revalidate_open_broker_spawn_catalog_file(
+            parent_directory,
+            wal_name,
+            &self.wal,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+        )?;
+        revalidate_open_broker_spawn_catalog_file(
+            parent_directory,
+            head_name,
+            &self.head,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+        )?;
+        self.publication_binding = Some(BrokerSpawnWalPublicationBindingV1 {
+            parent_device: parent.dev(),
+            parent_inode: parent.ino(),
+            wal_name: wal_name.to_os_string(),
+            head_name: head_name.to_os_string(),
+        });
+        Ok(())
+    }
+
+    /// Synchronize the exact parent that published both newly created files.
     pub fn sync_parent_directory_and_activate(
         &mut self,
         parent_directory: &File,
@@ -3989,11 +5324,31 @@ impl BrokerSpawnJournalV1 {
         if !self.directory_entry_sync_required {
             return Ok(());
         }
-        if !parent_directory.metadata()?.file_type().is_dir() {
-            return Err(BrokerSpawnWalError::NotDirectory);
+        let Some(binding) = self.publication_binding.as_ref() else {
+            return Err(BrokerSpawnWalError::DirectoryEntryNotDurable);
+        };
+        let parent = parent_directory.metadata()?;
+        validate_broker_spawn_catalog_directory_metadata(&parent)?;
+        if parent.dev() != binding.parent_device || parent.ino() != binding.parent_inode {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
         }
+        revalidate_open_broker_spawn_catalog_file(
+            parent_directory,
+            &binding.wal_name,
+            &self.wal,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+        )?;
+        revalidate_open_broker_spawn_catalog_file(
+            parent_directory,
+            &binding.head_name,
+            &self.head,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+        )?;
         parent_directory.sync_all()?;
         self.directory_entry_sync_required = false;
+        self.publication_binding = None;
         Ok(())
     }
 
@@ -4020,7 +5375,12 @@ impl BrokerSpawnJournalV1 {
             return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
         }
         let authoritative_lengths = (authority.observed_wal_bytes, authority.observed_head_bytes);
-        let recovered_lengths = (self.committed_wal_bytes, self.committed_head_bytes);
+        let recovered_lengths = (
+            self.committed_wal_bytes,
+            self.committed_head_bytes
+                .checked_add(self.head_trailing_bytes)
+                .ok_or(BrokerSpawnWalError::CapacityExhausted)?,
+        );
         if authoritative_lengths != recovered_lengths {
             return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
         }
@@ -4055,9 +5415,15 @@ impl BrokerSpawnJournalV1 {
                 .committed_head_bytes
                 .checked_add(BROKER_SPAWN_HEAD_RECORD_BYTES_U64)
                 .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+            let durable_prefix_bytes = usize::try_from(self.head_trailing_bytes)
+                .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
+            if durable_prefix_bytes >= BROKER_SPAWN_HEAD_RECORD_BYTES {
+                return Err(BrokerSpawnWalError::IncompleteTail);
+            }
             let head_mac = read_broker_array_32(&encoded[88..120]);
             Some(BrokerSpawnWalHeadReconciliationV1 {
                 encoded,
+                durable_prefix_bytes,
                 projected_head_bytes,
                 head_mac,
             })
@@ -4079,7 +5445,12 @@ impl BrokerSpawnJournalV1 {
             activation.authority.observed_wal_bytes,
             activation.authority.observed_head_bytes,
         );
-        let recovered_lengths = (self.committed_wal_bytes, self.committed_head_bytes);
+        let recovered_lengths = (
+            self.committed_wal_bytes,
+            self.committed_head_bytes
+                .checked_add(self.head_trailing_bytes)
+                .ok_or(BrokerSpawnWalError::CapacityExhausted)?,
+        );
         if authoritative_lengths != recovered_lengths {
             return Err(BrokerSpawnWalError::FilesystemRevalidationMismatch);
         }
@@ -4094,8 +5465,26 @@ impl BrokerSpawnJournalV1 {
                     .last_mut()
                     .ok_or(BrokerSpawnWalError::HeadAnchorMismatch)?;
                 let result = (|| -> std::io::Result<()> {
-                    self.head.seek(SeekFrom::Start(self.committed_head_bytes))?;
-                    self.head.write_all(&head.encoded)?;
+                    let write_offset = self
+                        .committed_head_bytes
+                        .checked_add(self.head_trailing_bytes)
+                        .ok_or_else(|| std::io::Error::other("head write offset overflow"))?;
+                    self.head.seek(SeekFrom::Start(write_offset))?;
+                    #[cfg(test)]
+                    if self.injected_fault
+                        == Some(BrokerSpawnWalInjectedFault::DuringRecoveredHeadWrite)
+                    {
+                        self.injected_fault = None;
+                        let remaining = &head.encoded[head.durable_prefix_bytes..];
+                        let injected_prefix_bytes = remaining.len().min(37);
+                        self.head.write_all(&remaining[..injected_prefix_bytes])?;
+                        self.head.sync_all()?;
+                        return Err(std::io::Error::other(
+                            "injected partial recovered-head write",
+                        ));
+                    }
+                    self.head
+                        .write_all(&head.encoded[head.durable_prefix_bytes..])?;
                     self.head.sync_all()
                 })();
                 if let Err(error) = result {
@@ -4103,6 +5492,7 @@ impl BrokerSpawnJournalV1 {
                     return Err(BrokerSpawnWalError::Io(error));
                 }
                 self.committed_head_bytes = head.projected_head_bytes;
+                self.head_trailing_bytes = 0;
                 self.terminal_head_mac = head.head_mac;
                 terminal.receipt.head_mac = head.head_mac;
                 terminal.receipt.committed_head_bytes = self.committed_head_bytes;
@@ -4122,7 +5512,9 @@ impl BrokerSpawnJournalV1 {
         if self.directory_entry_sync_required {
             return Err(BrokerSpawnWalError::DirectoryEntryNotDurable);
         }
-        if self.wal_trailing_bytes != 0 || self.head_trailing_bytes != 0 {
+        if self.wal_trailing_bytes != 0
+            || (self.head_trailing_bytes != 0 && !self.head_reconciliation_required)
+        {
             return Err(BrokerSpawnWalError::IncompleteTail);
         }
         Ok(())
@@ -6718,12 +8110,693 @@ mod tests {
         }
     }
 
+    fn create_empty_private_file(path: &Path) {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .expect("create empty owner-only broker test file");
+        file.sync_all()
+            .expect("synchronize empty owner-only broker test file");
+    }
+
+    fn assert_creation_fault_recovers(fault: BrokerSpawnCreationInjectedFault, seed: u8) {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(seed.wrapping_add(0x20));
+        let identity = recovered_catalog_identity(&authenticator, seed);
+        let creating_name = broker_spawn_creation_marker_name(identity, &authenticator, false)
+            .expect("encode creating marker name");
+        let completed_name = broker_spawn_creation_marker_name(identity, &authenticator, true)
+            .expect("encode completed marker name");
+        let wal_name = broker_spawn_catalog_wal_name(identity.journal_id());
+        let head_name = broker_spawn_catalog_head_name(identity.journal_id());
+        let creating_path = directory.path().join(&creating_name);
+        let completed_path = directory.path().join(&completed_name);
+        let wal_path = directory.path().join(&wal_name);
+        let head_path = directory.path().join(&head_name);
+        let expected_wal =
+            encode_broker_spawn_file_header(BROKER_SPAWN_WAL_FILE_MAGIC, identity, &authenticator)
+                .expect("encode expected creation WAL header");
+        let expected_head =
+            encode_broker_spawn_file_header(BROKER_SPAWN_HEAD_FILE_MAGIC, identity, &authenticator)
+                .expect("encode expected creation head header");
+
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open catalog for injected creation crash cut");
+        catalog.inject_creation_fault(fault);
+        assert!(matches!(
+            catalog.create_spawn_journal_fixture_unadmitted(identity, authenticator.clone()),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(catalog);
+
+        assert!(creating_path.exists() || completed_path.exists());
+        assert_ne!(creating_path.exists(), completed_path.exists());
+        if matches!(
+            fault,
+            BrokerSpawnCreationInjectedFault::AfterMarkerCreateBeforeSync
+                | BrokerSpawnCreationInjectedFault::AfterMarkerSyncBeforeDirectorySync
+                | BrokerSpawnCreationInjectedFault::AfterMarkerDirectorySync
+        ) {
+            assert!(!wal_path.exists(), "canonical WAL preceded marker barrier");
+            assert!(
+                !head_path.exists(),
+                "canonical head preceded marker barrier"
+            );
+        }
+        if wal_path.exists() {
+            let observed = fs::read(&wal_path).expect("read retained WAL creation prefix");
+            assert!(observed.len() <= expected_wal.len());
+            assert_eq!(observed, expected_wal[..observed.len()]);
+        }
+        if head_path.exists() {
+            let observed = fs::read(&head_path).expect("read retained head creation prefix");
+            assert!(observed.len() <= expected_head.len());
+            assert_eq!(observed, expected_head[..observed.len()]);
+        }
+
+        let mut recovered = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("reopen catalog after injected creation crash cut");
+        let journals = recovered
+            .scan_all_for_admission(&authenticator)
+            .expect("resume authenticated creation transaction");
+        assert_eq!(journals.len(), 1);
+        assert_eq!(journals[0].identity(), identity);
+        assert_eq!(
+            fs::read(&wal_path).expect("read recovered WAL header"),
+            expected_wal
+        );
+        assert_eq!(
+            fs::read(&head_path).expect("read recovered head header"),
+            expected_head
+        );
+        assert!(!creating_path.exists());
+        assert!(completed_path.exists());
+        assert_eq!(
+            fs::metadata(&completed_path)
+                .expect("completed marker metadata")
+                .len(),
+            0
+        );
+        let states = recovered
+            .scan_catalog_states()
+            .expect("scan completed creation state");
+        let pair = states
+            .get(&identity.journal_id())
+            .expect("completed pair identity");
+        assert!(pair.creating.is_none());
+        assert_eq!(
+            pair.completed.as_ref().map(|marker| marker.identity),
+            Some(identity)
+        );
+    }
+
+    #[test]
+    fn spawn_creation_recovers_every_durability_and_publication_boundary() {
+        let faults = [
+            BrokerSpawnCreationInjectedFault::AfterMarkerCreateBeforeSync,
+            BrokerSpawnCreationInjectedFault::AfterMarkerSyncBeforeDirectorySync,
+            BrokerSpawnCreationInjectedFault::AfterMarkerDirectorySync,
+            BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+                durable_prefix_bytes: 0,
+            },
+            BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+                durable_prefix_bytes: 1,
+            },
+            BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+                durable_prefix_bytes: 8,
+            },
+            BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+                durable_prefix_bytes: 112,
+            },
+            BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+                durable_prefix_bytes: 192,
+            },
+            BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+                durable_prefix_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES - 1,
+            },
+            BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+                durable_prefix_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES,
+            },
+            BrokerSpawnCreationInjectedFault::AfterWalHeaderWriteBeforeSync,
+            BrokerSpawnCreationInjectedFault::AfterWalHeaderSync,
+            BrokerSpawnCreationInjectedFault::DuringHeadHeaderWrite {
+                durable_prefix_bytes: 0,
+            },
+            BrokerSpawnCreationInjectedFault::DuringHeadHeaderWrite {
+                durable_prefix_bytes: 8,
+            },
+            BrokerSpawnCreationInjectedFault::DuringHeadHeaderWrite {
+                durable_prefix_bytes: 112,
+            },
+            BrokerSpawnCreationInjectedFault::DuringHeadHeaderWrite {
+                durable_prefix_bytes: 192,
+            },
+            BrokerSpawnCreationInjectedFault::DuringHeadHeaderWrite {
+                durable_prefix_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES - 1,
+            },
+            BrokerSpawnCreationInjectedFault::DuringHeadHeaderWrite {
+                durable_prefix_bytes: BROKER_SPAWN_WAL_FILE_HEADER_BYTES,
+            },
+            BrokerSpawnCreationInjectedFault::AfterHeadHeaderWriteBeforeSync,
+            BrokerSpawnCreationInjectedFault::AfterHeadHeaderSync,
+            BrokerSpawnCreationInjectedFault::AfterPairDirectorySyncBeforeMarkerRename,
+            BrokerSpawnCreationInjectedFault::AfterMarkerRenameBeforeDirectorySync,
+        ];
+        for (index, fault) in faults.into_iter().enumerate() {
+            let seed = u8::try_from(index + 1).expect("bounded creation fault seed");
+            assert_creation_fault_recovers(fault, seed);
+        }
+    }
+
+    #[test]
+    fn spawn_creation_prefix_contract_is_exhaustive_for_wal_and_head_headers() {
+        let authenticator = wal_authenticator(0x91);
+        let identity = recovered_catalog_identity(&authenticator, 0x31);
+        let wal =
+            encode_broker_spawn_file_header(BROKER_SPAWN_WAL_FILE_MAGIC, identity, &authenticator)
+                .expect("encode exhaustive WAL header");
+        let head =
+            encode_broker_spawn_file_header(BROKER_SPAWN_HEAD_FILE_MAGIC, identity, &authenticator)
+                .expect("encode exhaustive head header");
+        for expected in [&wal, &head] {
+            for cut in 0..=expected.len() {
+                validate_broker_spawn_creation_header_prefix_bytes(&expected[..cut], expected)
+                    .expect("every exact header prefix is resumable");
+                if cut != 0 {
+                    let mut mismatch = expected[..cut].to_vec();
+                    mismatch[cut - 1] ^= 1;
+                    assert!(matches!(
+                        validate_broker_spawn_creation_header_prefix_bytes(&mismatch, expected),
+                        Err(BrokerSpawnWalError::CreationHeaderMismatch)
+                    ));
+                }
+            }
+            let mut oversized = expected.to_vec();
+            oversized.push(0);
+            assert!(matches!(
+                validate_broker_spawn_creation_header_prefix_bytes(&oversized, expected),
+                Err(BrokerSpawnWalError::CreationHeaderMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn spawn_creation_marker_is_full_mac_canonical_and_fits_observed_name_max() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0x92);
+        let identity = recovered_catalog_identity(&authenticator, 0x32);
+        let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open catalog after NAME_MAX preflight");
+        let creating = broker_spawn_creation_marker_name(identity, &authenticator, false)
+            .expect("encode creating certificate");
+        let completed = broker_spawn_creation_marker_name(identity, &authenticator, true)
+            .expect("encode completed certificate");
+        assert_eq!(
+            creating.as_bytes().len(),
+            BROKER_SPAWN_CREATION_MARKER_NAME_BYTES
+        );
+        assert_eq!(
+            completed.as_bytes().len(),
+            BROKER_SPAWN_CREATION_MARKER_NAME_BYTES
+        );
+        let observed_name_max = fpathconf(&catalog.directory, PathconfVar::NAME_MAX)
+            .expect("query exact catalog NAME_MAX")
+            .expect("finite catalog NAME_MAX");
+        assert!(
+            usize::try_from(observed_name_max).expect("positive NAME_MAX")
+                >= BROKER_SPAWN_CREATION_MARKER_NAME_BYTES
+        );
+        let (decoded, is_completed) =
+            decode_broker_spawn_creation_marker_name(&creating).expect("decode creating marker");
+        assert!(!is_completed);
+        assert_eq!(decoded.identity, identity);
+        validate_broker_spawn_creation_marker(&decoded, &authenticator, false)
+            .expect("verify full marker MAC");
+        let (decoded, is_completed) =
+            decode_broker_spawn_creation_marker_name(&completed).expect("decode completed marker");
+        assert!(is_completed);
+        assert_eq!(decoded.identity, identity);
+        validate_broker_spawn_creation_marker(&decoded, &authenticator, true)
+            .expect("verify full completed-marker MAC");
+        assert_eq!(BROKER_SPAWN_CATALOG_MAX_ENTRIES, GUARDIAN_MAX_PANES * 3 + 1);
+        assert_eq!(
+            BROKER_SPAWN_CATALOG_MAX_PHYSICAL_BYTES,
+            GUARDIAN_MAX_PANES as u64
+                * (BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES + BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES)
+        );
+    }
+
+    #[test]
+    fn forged_or_forked_creation_certificates_fail_closed_without_mutation() {
+        let authenticator = wal_authenticator(0x93);
+        let identity = recovered_catalog_identity(&authenticator, 0x33);
+
+        let forged_directory = private_catalog_directory();
+        let identity_bytes =
+            encode_broker_spawn_creation_identity(identity).expect("encode marker identity");
+        let mut tag = broker_spawn_wal_authenticate(
+            &authenticator,
+            &broker_spawn_creation_authenticated_bytes(&identity_bytes),
+        )
+        .expect("authenticate marker identity");
+        tag[0] ^= 1;
+        let mut forged_payload = [0_u8; BROKER_SPAWN_CREATION_MARKER_BYTES];
+        forged_payload[..BROKER_SPAWN_CREATION_IDENTITY_BYTES].copy_from_slice(&identity_bytes);
+        forged_payload[BROKER_SPAWN_CREATION_IDENTITY_BYTES..].copy_from_slice(&tag);
+        let forged_encoded = encode_broker_spawn_creation_base85(&forged_payload);
+        let forged_name = OsString::from(format!(
+            "{BROKER_SPAWN_CREATION_MARKER_PREFIX}{}",
+            std::str::from_utf8(&forged_encoded).expect("ASCII base85")
+        ));
+        create_empty_private_file(&forged_directory.path().join(&forged_name));
+        let mut forged_catalog =
+            BrokerSpawnWalCatalogV1::open(forged_directory.path().to_path_buf())
+                .expect("structurally open forged marker catalog");
+        assert!(matches!(
+            forged_catalog.scan_all_for_admission(&authenticator),
+            Err(BrokerSpawnWalError::CreationMarkerAuthenticationFailed)
+        ));
+        assert!(forged_directory.path().join(&forged_name).exists());
+
+        let forked_directory = private_catalog_directory();
+        let first = identity;
+        let mut second = recovered_catalog_identity(&authenticator, 0x34);
+        second.journal_id = first.journal_id();
+        let first_name = broker_spawn_creation_marker_name(first, &authenticator, false)
+            .expect("encode first fork marker");
+        let second_name = broker_spawn_creation_marker_name(second, &authenticator, false)
+            .expect("encode second fork marker");
+        assert_ne!(first_name, second_name);
+        create_empty_private_file(&forked_directory.path().join(&first_name));
+        create_empty_private_file(&forked_directory.path().join(&second_name));
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(forked_directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::InvalidCreationState)
+        ));
+        assert!(forked_directory.path().join(&first_name).exists());
+        assert!(forked_directory.path().join(&second_name).exists());
+
+        let split_directory = private_catalog_directory();
+        let creating_name = broker_spawn_creation_marker_name(first, &authenticator, false)
+            .expect("encode split creating marker");
+        let completed_name = broker_spawn_creation_marker_name(first, &authenticator, true)
+            .expect("encode split completed marker");
+        create_empty_private_file(&split_directory.path().join(&creating_name));
+        create_empty_private_file(&split_directory.path().join(&completed_name));
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(split_directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::InvalidCreationState)
+        ));
+        assert!(split_directory.path().join(&creating_name).exists());
+        assert!(split_directory.path().join(&completed_name).exists());
+    }
+
+    #[test]
+    fn completed_creation_certificate_never_repairs_truncation_or_tamper() {
+        let authenticator = wal_authenticator(0x94);
+        let identity = recovered_catalog_identity(&authenticator, 0x35);
+
+        let truncated_directory = private_catalog_directory();
+        let mut catalog = BrokerSpawnWalCatalogV1::open(truncated_directory.path().to_path_buf())
+            .expect("open catalog for completed truncation test");
+        let journal = catalog
+            .create_spawn_journal(identity, authenticator.clone())
+            .expect("create completed journal before truncation");
+        drop(journal);
+        drop(catalog);
+        let wal_path = truncated_directory
+            .path()
+            .join(broker_spawn_catalog_wal_name(identity.journal_id()));
+        let head_path = truncated_directory
+            .path()
+            .join(broker_spawn_catalog_head_name(identity.journal_id()));
+        let head_before = fs::read(&head_path).expect("read untouched completed head");
+        let wal = OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .expect("open completed WAL for truncation simulation");
+        wal.set_len(37)
+            .expect("simulate durable completed-WAL truncation");
+        wal.sync_all()
+            .expect("synchronize completed-WAL truncation");
+        drop(wal);
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(truncated_directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::InsecureCatalogIdentity)
+        ));
+        assert_eq!(
+            fs::metadata(&wal_path)
+                .expect("truncated WAL metadata")
+                .len(),
+            37
+        );
+        assert_eq!(
+            fs::read(&head_path).expect("read head after rejected truncation"),
+            head_before
+        );
+
+        let tampered_directory = private_catalog_directory();
+        let mut catalog = BrokerSpawnWalCatalogV1::open(tampered_directory.path().to_path_buf())
+            .expect("open catalog for completed tamper test");
+        let journal = catalog
+            .create_spawn_journal(identity, authenticator.clone())
+            .expect("create completed journal before tamper");
+        drop(journal);
+        drop(catalog);
+        let wal_path = tampered_directory
+            .path()
+            .join(broker_spawn_catalog_wal_name(identity.journal_id()));
+        let mut tampered = fs::read(&wal_path).expect("read completed WAL before tamper");
+        tampered[120] ^= 1;
+        let mut wal = OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .expect("open completed WAL for same-length tamper");
+        wal.seek(SeekFrom::Start(120))
+            .expect("seek completed WAL tamper offset");
+        wal.write_all(&tampered[120..121])
+            .expect("write completed WAL tamper");
+        wal.sync_all().expect("synchronize completed WAL tamper");
+        drop(wal);
+        let mut reopened = BrokerSpawnWalCatalogV1::open(tampered_directory.path().to_path_buf())
+            .expect("structurally reopen same-length completed tamper");
+        assert!(matches!(
+            reopened.scan_all_for_admission(&authenticator),
+            Err(BrokerSpawnWalError::AuthenticationFailed)
+        ));
+        assert_eq!(
+            fs::read(&wal_path).expect("read retained completed WAL tamper"),
+            tampered
+        );
+    }
+
+    #[test]
+    fn completed_creation_certificate_never_repairs_mode_tamper() {
+        let authenticator = wal_authenticator(0xa2);
+        let identity = recovered_catalog_identity(&authenticator, 0x42);
+
+        let certificate_directory = private_catalog_directory();
+        let mut catalog = BrokerSpawnWalCatalogV1::open(certificate_directory.path().to_path_buf())
+            .expect("open completed-certificate mode-tamper catalog");
+        drop(
+            catalog
+                .create_spawn_journal(identity, authenticator.clone())
+                .expect("create completed journal for certificate mode tamper"),
+        );
+        drop(catalog);
+        let certificate_path = certificate_directory.path().join(
+            broker_spawn_creation_marker_name(identity, &authenticator, true)
+                .expect("encode completed certificate name"),
+        );
+        let wal_path = certificate_directory
+            .path()
+            .join(broker_spawn_catalog_wal_name(identity.journal_id()));
+        let wal_before = fs::read(&wal_path).expect("read WAL before certificate mode tamper");
+        fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o000))
+            .expect("tamper completed certificate mode");
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(certificate_directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::InsecureCatalogIdentity)
+        ));
+        assert_eq!(
+            fs::metadata(&certificate_path)
+                .expect("retained completed certificate mode")
+                .mode()
+                & 0o7777,
+            0
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("read WAL after rejected certificate mode tamper"),
+            wal_before
+        );
+
+        let canonical_directory = private_catalog_directory();
+        let mut catalog = BrokerSpawnWalCatalogV1::open(canonical_directory.path().to_path_buf())
+            .expect("open completed-canonical mode-tamper catalog");
+        drop(
+            catalog
+                .create_spawn_journal(identity, authenticator.clone())
+                .expect("create completed journal for canonical mode tamper"),
+        );
+        drop(catalog);
+        let wal_path = canonical_directory
+            .path()
+            .join(broker_spawn_catalog_wal_name(identity.journal_id()));
+        let wal_before = fs::read(&wal_path).expect("read WAL before canonical mode tamper");
+        fs::set_permissions(&wal_path, fs::Permissions::from_mode(0o400))
+            .expect("tamper completed canonical mode");
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(canonical_directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::InsecureCatalogIdentity)
+        ));
+        assert_eq!(
+            fs::metadata(&wal_path)
+                .expect("retained completed canonical mode")
+                .mode()
+                & 0o7777,
+            0o400
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("read retained canonical mode tamper"),
+            wal_before
+        );
+    }
+
+    #[test]
+    fn mismatching_partial_creation_header_is_retained_and_never_repaired() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0x95);
+        let identity = recovered_catalog_identity(&authenticator, 0x36);
+        let wal_path = directory
+            .path()
+            .join(broker_spawn_catalog_wal_name(identity.journal_id()));
+        let head_path = directory
+            .path()
+            .join(broker_spawn_catalog_head_name(identity.journal_id()));
+        let creating_path = directory.path().join(
+            broker_spawn_creation_marker_name(identity, &authenticator, false)
+                .expect("encode retained creating marker"),
+        );
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open catalog for partial mismatch test");
+        catalog.inject_creation_fault(BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+            durable_prefix_bytes: 37,
+        });
+        assert!(matches!(
+            catalog.create_spawn_journal_fixture_unadmitted(identity, authenticator.clone()),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(catalog);
+
+        let mut retained = fs::read(&wal_path).expect("read exact retained WAL prefix");
+        retained[20] ^= 1;
+        let mut wal = OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .expect("open retained WAL prefix for mismatch");
+        wal.seek(SeekFrom::Start(20))
+            .expect("seek retained WAL prefix mismatch");
+        wal.write_all(&retained[20..21])
+            .expect("write retained WAL prefix mismatch");
+        wal.sync_all()
+            .expect("synchronize retained WAL prefix mismatch");
+        drop(wal);
+
+        let mut reopened = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("structurally reopen partial mismatch catalog");
+        assert!(matches!(
+            reopened.scan_all_for_admission(&authenticator),
+            Err(BrokerSpawnWalError::CreationHeaderMismatch)
+        ));
+        assert_eq!(
+            fs::read(&wal_path).expect("read preserved partial mismatch"),
+            retained
+        );
+        assert!(!head_path.exists());
+        assert!(creating_path.exists());
+    }
+
+    #[test]
+    fn creation_completion_publication_is_atomic_noreplace_and_retains_both_forks() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0x96);
+        let identity = recovered_catalog_identity(&authenticator, 0x37);
+        let creating_name = broker_spawn_creation_marker_name(identity, &authenticator, false)
+            .expect("encode no-replace creating marker");
+        let completed_name = broker_spawn_creation_marker_name(identity, &authenticator, true)
+            .expect("encode no-replace completed marker");
+        create_empty_private_file(&directory.path().join(&creating_name));
+        create_empty_private_file(&directory.path().join(&completed_name));
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(directory.path())
+            .expect("open no-replace parent directory");
+        let creating_before = fs::metadata(directory.path().join(&creating_name))
+            .expect("creating marker metadata before no-replace");
+        let completed_before = fs::metadata(directory.path().join(&completed_name))
+            .expect("completed marker metadata before no-replace");
+        let error = publish_broker_spawn_completed_marker_noreplace(
+            &parent,
+            &creating_name,
+            &completed_name,
+        )
+        .expect_err("no-replace publication must reject an existing certificate");
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        let creating_after = fs::metadata(directory.path().join(&creating_name))
+            .expect("retained creating marker after no-replace");
+        let completed_after = fs::metadata(directory.path().join(&completed_name))
+            .expect("retained completed marker after no-replace");
+        assert_eq!(creating_before.ino(), creating_after.ino());
+        assert_eq!(completed_before.ino(), completed_after.ino());
+        assert_ne!(creating_after.ino(), completed_after.ino());
+    }
+
+    #[test]
+    fn restart_recovers_multiple_independent_creation_transactions_before_admission() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0x97);
+        let first = recovered_catalog_identity(&authenticator, 0x38);
+        let second = recovered_catalog_identity(&authenticator, 0x39);
+        let third = recovered_catalog_identity(&authenticator, 0x3a);
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open multi-creation catalog");
+        let first_journal = catalog
+            .create_spawn_journal(first, authenticator.clone())
+            .expect("create completed first journal");
+        drop(first_journal);
+        drop(catalog);
+
+        let second_marker = broker_spawn_creation_marker_name(second, &authenticator, false)
+            .expect("encode second creating marker");
+        let third_marker = broker_spawn_creation_marker_name(third, &authenticator, false)
+            .expect("encode third creating marker");
+        create_empty_private_file(&directory.path().join(&second_marker));
+        create_empty_private_file(&directory.path().join(&third_marker));
+        let second_wal =
+            encode_broker_spawn_file_header(BROKER_SPAWN_WAL_FILE_MAGIC, second, &authenticator)
+                .expect("encode second partial WAL");
+        create_private_broker_token_with_bytes(
+            &directory
+                .path()
+                .join(broker_spawn_catalog_wal_name(second.journal_id())),
+            &second_wal[..73],
+        );
+        let third_head =
+            encode_broker_spawn_file_header(BROKER_SPAWN_HEAD_FILE_MAGIC, third, &authenticator)
+                .expect("encode third partial head");
+        create_private_broker_token_with_bytes(
+            &directory
+                .path()
+                .join(broker_spawn_catalog_head_name(third.journal_id())),
+            &third_head[..149],
+        );
+
+        let mut recovered = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("reopen multiple independent creation transactions");
+        let journals = recovered
+            .scan_all_for_admission(&authenticator)
+            .expect("recover all independent creation transactions");
+        let admitted = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("admit all recovered unique identities");
+        assert_eq!(admitted.journals.len(), 3);
+        for identity in [first, second, third] {
+            let pair = recovered
+                .scan_catalog_states()
+                .expect("scan multi-creation completion")
+                .remove(&identity.journal_id())
+                .expect("completed multi-creation pair");
+            assert!(pair.creating.is_none());
+            assert_eq!(
+                pair.completed.as_ref().map(|marker| marker.identity),
+                Some(identity)
+            );
+        }
+    }
+
+    #[test]
+    fn later_invalid_lifecycle_member_blocks_all_creation_recovery_mutation() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0x99);
+        let existing = recovered_catalog_identity(&authenticator, 0x3c);
+        let pending = recovered_catalog_identity(&authenticator, 0x3d);
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open catalog for creation preflight ordering");
+        let existing_journal = catalog
+            .create_spawn_journal(existing, authenticator.clone())
+            .expect("create existing completed journal");
+        drop(existing_journal);
+        drop(catalog);
+
+        let existing_wal_path = directory
+            .path()
+            .join(broker_spawn_catalog_wal_name(existing.journal_id()));
+        let mut existing_wal = OpenOptions::new()
+            .append(true)
+            .open(&existing_wal_path)
+            .expect("open existing WAL for retained torn lifecycle tail");
+        existing_wal
+            .write_all(&BROKER_SPAWN_WAL_RECORD_MAGIC[..3])
+            .expect("write retained torn lifecycle tail");
+        existing_wal
+            .sync_all()
+            .expect("synchronize retained torn lifecycle tail");
+        drop(existing_wal);
+
+        let pending_marker = broker_spawn_creation_marker_name(pending, &authenticator, false)
+            .expect("encode pending preflight marker");
+        create_empty_private_file(&directory.path().join(&pending_marker));
+        let pending_wal_path = directory
+            .path()
+            .join(broker_spawn_catalog_wal_name(pending.journal_id()));
+        let pending_head_path = directory
+            .path()
+            .join(broker_spawn_catalog_head_name(pending.journal_id()));
+
+        let mut reopened = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("structurally reopen invalid-lifecycle plus pending creation");
+        assert!(matches!(
+            reopened.scan_all_for_admission(&authenticator),
+            Err(BrokerSpawnWalError::IncompleteTail)
+        ));
+        assert!(!pending_wal_path.exists());
+        assert!(!pending_head_path.exists());
+        assert!(directory.path().join(&pending_marker).exists());
+        assert_eq!(
+            fs::metadata(&existing_wal_path)
+                .expect("retained invalid lifecycle WAL metadata")
+                .len(),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 + 3
+        );
+    }
+
+    #[test]
+    fn creation_certificate_file_must_remain_empty_within_catalog_ceiling() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0x98);
+        let identity = recovered_catalog_identity(&authenticator, 0x3b);
+        let marker = broker_spawn_creation_marker_name(identity, &authenticator, false)
+            .expect("encode nonempty marker name");
+        create_private_broker_token_with_bytes(&directory.path().join(&marker), &[0x5a]);
+        assert!(matches!(
+            BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf()),
+            Err(BrokerSpawnWalError::InsecureCatalogIdentity)
+        ));
+        assert_eq!(
+            fs::read(directory.path().join(&marker)).expect("read retained nonempty marker"),
+            vec![0x5a]
+        );
+    }
+
     fn recover_header_only_catalog_journals(
         directory: &std::path::Path,
         identities: &[BrokerSpawnWalIdentityV1],
         authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
     ) -> (BrokerSpawnWalCatalogV1, Vec<BrokerSpawnJournalV1>) {
-        let catalog = BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
             .expect("open empty catalog for header-only journal creation");
         for identity in identities {
             let journal = catalog
@@ -6733,7 +8806,7 @@ mod tests {
         }
         drop(catalog);
 
-        let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
+        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
             .expect("reopen catalog for admission recovery");
         let journals = recovered_catalog
             .scan_all_for_admission(authenticator)
@@ -7162,6 +9235,85 @@ mod tests {
     }
 
     #[test]
+    fn broker_control_authentication_deadline_reclaims_saturated_partial_connections() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create broker authentication-deadline test root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set broker authentication-deadline root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path).expect("provision broker token");
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path,
+            spawn_catalog_path,
+            sealed(0xa4),
+            2,
+            Duration::from_millis(5),
+        )
+        .expect("valid broker authentication-deadline config");
+        let mut service = BrokerControlServiceV1::bind(config).expect("bind broker service");
+
+        let first = BlockingUnixStream::connect(&socket_path).expect("connect first partial peer");
+        let second =
+            BlockingUnixStream::connect(&socket_path).expect("connect second partial peer");
+        service
+            .accept_connections()
+            .expect("accept saturated partial peers");
+        assert_eq!(service.connections.len(), 2);
+        assert!(service.free_connection_tokens.is_empty());
+
+        let mut tokens = service.connections.keys().copied().collect::<Vec<_>>();
+        tokens.sort_unstable_by_key(|token| token.0);
+        let now = Instant::now();
+        service
+            .connections
+            .get_mut(&tokens[0])
+            .expect("first accepted connection")
+            .accepted_at = now
+            .checked_sub(BROKER_CONTROL_AUTHENTICATION_DEADLINE)
+            .expect("deadline is representable");
+        service
+            .connections
+            .get_mut(&tokens[1])
+            .expect("second accepted connection")
+            .accepted_at = now
+            .checked_sub(BROKER_CONTROL_AUTHENTICATION_DEADLINE - Duration::from_millis(100))
+            .expect("pre-deadline instant is representable");
+
+        service.expire_unauthenticated_connections();
+        assert!(!service.connections.contains_key(&tokens[0]));
+        assert!(service.connections.contains_key(&tokens[1]));
+        assert_eq!(service.expired_unauthenticated_connections(), 1);
+        assert_eq!(service.free_connection_tokens.len(), 1);
+
+        service
+            .connections
+            .get_mut(&tokens[1])
+            .expect("pre-deadline connection remains admitted")
+            .accepted_at = Instant::now()
+            .checked_sub(BROKER_CONTROL_AUTHENTICATION_DEADLINE)
+            .expect("deadline is representable");
+        service.expire_unauthenticated_connections();
+        assert!(service.connections.is_empty());
+        assert_eq!(service.expired_unauthenticated_connections(), 2);
+        assert_eq!(service.free_connection_tokens.len(), 2);
+
+        drop((first, second));
+        let replacement =
+            BlockingUnixStream::connect(&socket_path).expect("connect replacement peer");
+        service
+            .accept_connections()
+            .expect("reuse reclaimed connection capacity");
+        assert_eq!(service.connections.len(), 1);
+        drop(replacement);
+    }
+
+    #[test]
     fn hello_receipt_eviction_skips_active_front_for_inactive_later_entry() {
         let header = |request_id, connection_id| BrokerControlRequestHeaderV1 {
             operation: BrokerControlOperationV1::Hello,
@@ -7403,6 +9555,19 @@ mod tests {
         directory
     }
 
+    fn create_private_broker_token_with_bytes(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .expect("create private broker token replacement");
+        file.write_all(bytes)
+            .expect("write private broker token replacement");
+        file.sync_all()
+            .expect("synchronize private broker token replacement");
+    }
+
     fn open_new_test_file(path: &std::path::Path) -> File {
         OpenOptions::new()
             .read(true)
@@ -7433,9 +9598,50 @@ mod tests {
             .expect("create broker Spawn WAL");
         let parent = File::open(directory).expect("open test parent directory");
         journal
+            .bind_parent_publication(&parent, OsStr::new("spawn.wal"), OsStr::new("spawn.head"))
+            .expect("bind exact broker Spawn WAL parent entries");
+        journal
             .sync_parent_directory_and_activate(&parent)
             .expect("activate broker Spawn WAL directory entries");
         (journal, wal_path, head_path)
+    }
+
+    #[test]
+    fn new_spawn_journal_activation_rejects_an_unrelated_parent_descriptor() {
+        let directory = private_catalog_directory();
+        let unrelated = private_catalog_directory();
+        let wal_path = directory.path().join("spawn.wal");
+        let head_path = directory.path().join("spawn.head");
+        let authenticator = wal_authenticator(0xb1);
+        let identity = recovered_catalog_identity(&authenticator, 0xb2);
+        let mut journal = BrokerSpawnJournalV1::create(
+            open_new_test_file(&wal_path),
+            open_new_test_file(&head_path),
+            identity,
+            authenticator,
+        )
+        .expect("create unpublished broker Spawn journal");
+        let parent = File::open(directory.path()).expect("open exact journal parent");
+        let wrong_parent = File::open(unrelated.path()).expect("open unrelated journal parent");
+        journal
+            .bind_parent_publication(&parent, OsStr::new("spawn.wal"), OsStr::new("spawn.head"))
+            .expect("bind exact journal publication authority");
+
+        assert!(matches!(
+            journal.sync_parent_directory_and_activate(&wrong_parent),
+            Err(BrokerSpawnWalError::InsecureCatalogIdentity)
+        ));
+        assert!(matches!(
+            journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::DirectoryEntryNotDurable)
+        ));
+
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate through the exact bound parent");
+        journal
+            .append_intent_and_sync()
+            .expect("append only after exact parent activation");
     }
 
     fn create_test_output_journal(
@@ -7612,6 +9818,105 @@ mod tests {
                 TerminalReadMode::Zero => Ok(0),
                 TerminalReadMode::Eio => Err(std::io::Error::from_raw_os_error(libc::EIO)),
             }
+        }
+    }
+
+    #[test]
+    fn spawn_creation_recovers_every_secure_umask_cut_without_changing_prefix_bytes() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xa1);
+        let identity = recovered_catalog_identity(&authenticator, 0x41);
+        let creating_name = broker_spawn_creation_marker_name(identity, &authenticator, false)
+            .expect("encode mode-cut creating marker");
+        let completed_name = broker_spawn_creation_marker_name(identity, &authenticator, true)
+            .expect("encode mode-cut completed marker");
+        let wal_name = broker_spawn_catalog_wal_name(identity.journal_id());
+        let head_name = broker_spawn_catalog_head_name(identity.journal_id());
+        let lock_path = directory.path().join(BROKER_SPAWN_CATALOG_LOCK_NAME);
+        let creating_path = directory.path().join(&creating_name);
+        let completed_path = directory.path().join(&completed_name);
+        let wal_path = directory.path().join(&wal_name);
+        let head_path = directory.path().join(&head_name);
+        let wal_header =
+            encode_broker_spawn_file_header(BROKER_SPAWN_WAL_FILE_MAGIC, identity, &authenticator)
+                .expect("encode mode-cut WAL header");
+        let head_header =
+            encode_broker_spawn_file_header(BROKER_SPAWN_HEAD_FILE_MAGIC, identity, &authenticator)
+                .expect("encode mode-cut head header");
+
+        let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("create mode-cut catalog lock");
+        drop(catalog);
+        create_empty_private_file(&creating_path);
+        create_private_broker_token_with_bytes(&wal_path, &wal_header[..73]);
+        create_private_broker_token_with_bytes(&head_path, &head_header[..149]);
+        let mut head_probe = OpenOptions::new()
+            .read(true)
+            .open(&head_path)
+            .expect("pin head prefix before simulated mode cut");
+
+        // O_CREAT(0600) is filtered through umask. These are the only secure
+        // permission subsets a creator can leave if power fails before its
+        // following fchmod(0600), including the otherwise-unopenable 000 cut.
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o000))
+            .expect("set simulated lock create/fchmod cut");
+        fs::set_permissions(&creating_path, fs::Permissions::from_mode(0o000))
+            .expect("set simulated marker create/fchmod cut");
+        fs::set_permissions(&wal_path, fs::Permissions::from_mode(0o400))
+            .expect("set simulated WAL create/fchmod cut");
+        fs::set_permissions(&head_path, fs::Permissions::from_mode(0o200))
+            .expect("set simulated head create/fchmod cut");
+        assert_eq!(
+            fs::metadata(&lock_path).expect("mode-cut lock").mode() & 0o7777,
+            0
+        );
+        assert_eq!(
+            fs::metadata(&creating_path)
+                .expect("mode-cut marker")
+                .mode()
+                & 0o7777,
+            0
+        );
+        assert_eq!(
+            fs::metadata(&wal_path).expect("mode-cut WAL").mode() & 0o7777,
+            0o400
+        );
+        assert_eq!(
+            fs::metadata(&head_path).expect("mode-cut head").mode() & 0o7777,
+            0o200
+        );
+
+        let mut recovered = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("structurally reopen every secure umask cut");
+        assert_eq!(
+            fs::read(&wal_path).expect("read WAL prefix after structural reopen"),
+            wal_header[..73]
+        );
+        let mut observed_head_prefix = Vec::new();
+        head_probe
+            .read_to_end(&mut observed_head_prefix)
+            .expect("read retained head descriptor after structural reopen");
+        assert_eq!(observed_head_prefix, head_header[..149]);
+        let journals = recovered
+            .scan_all_for_admission(&authenticator)
+            .expect("seal modes and resume exact authenticated prefixes");
+        assert_eq!(journals.len(), 1);
+        assert_eq!(journals[0].identity(), identity);
+        assert_eq!(
+            fs::read(&wal_path).expect("read recovered mode-cut WAL"),
+            wal_header
+        );
+        assert_eq!(
+            fs::read(&head_path).expect("read recovered mode-cut head"),
+            head_header
+        );
+        assert!(!creating_path.exists());
+        assert!(completed_path.exists());
+        for path in [&lock_path, &completed_path, &wal_path, &head_path] {
+            assert_eq!(
+                fs::metadata(path).expect("sealed creation object").mode() & 0o7777,
+                0o600
+            );
         }
     }
 
@@ -7844,7 +10149,7 @@ mod tests {
             .path()
             .join(broker_spawn_catalog_head_name(first.journal_id()));
 
-        let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("open catalog for rejected-admission crash cut");
         let mut first_journal = catalog
             .create_spawn_journal_fixture_unadmitted(first, authenticator.clone())
@@ -7867,7 +10172,7 @@ mod tests {
             BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
         );
 
-        let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("reopen conflicting catalog without mutation");
         let journals = recovered_catalog
             .scan_all_for_admission(&authenticator)
@@ -7920,7 +10225,7 @@ mod tests {
             BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
         );
 
-        let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("reopen catalog for two-pass reconciliation test");
         let journals = recovered_catalog
             .scan_all_for_admission(&authenticator)
@@ -8113,6 +10418,137 @@ mod tests {
     }
 
     #[test]
+    fn token_replacement_before_reconciliation_preserves_head_and_never_binds_socket() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create broker token-fence recovery root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set broker token-fence root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create token-fence Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set token-fence Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision token-fence token");
+        let original_token = fs::read(&token_path).expect("read token-fence token");
+        let (secret, mut token_authority) =
+            crate::transport::load_guardian_secret_with_authority(&token_path)
+                .expect("load retained token-fence authority");
+        let authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive token-fence WAL authority");
+        let identity = recovered_catalog_identity(&authenticator, 19);
+        let head_path =
+            spawn_catalog_path.join(broker_spawn_catalog_head_name(identity.journal_id()));
+
+        let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
+            .expect("open token-fence catalog");
+        let mut journal = catalog
+            .create_spawn_journal(identity, authenticator.clone())
+            .expect("create token-fence WAL-ahead journal");
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(journal);
+        drop(catalog);
+
+        let head_before = fs::read(&head_path).expect("read unreconciled token-fence head");
+        let mut recovered_catalog =
+            BrokerSpawnWalCatalogV1::open(spawn_catalog_path).expect("reopen token-fence catalog");
+        let journals = recovered_catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("scan token-fence catalog before token replacement");
+        let mut admitted = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("admit token-fence catalog before token replacement");
+
+        let retained_token = root.path().join(format!(
+            "guardian-retained-token-fence-{}.token",
+            Uuid::new_v4()
+        ));
+        fs::rename(&token_path, &retained_token).expect("retain original token-fence inode");
+        create_private_broker_token_with_bytes(&token_path, &original_token);
+        assert!(matches!(
+            reconcile_broker_catalog_under_token_authority(
+                &mut token_authority,
+                &recovered_catalog,
+                &mut admitted,
+            ),
+            Err(BrokerControlServiceError::Endpoint(
+                GuardianServiceError::FilesystemSecurity(_)
+            ))
+        ));
+        assert_eq!(
+            fs::read(&head_path).expect("read token-fenced unreconciled head"),
+            head_before,
+            "token replacement reconciled durable head bytes before refusal"
+        );
+        assert!(admitted.journals[0].status().head_reconciliation_required);
+        assert!(
+            !socket_path.exists(),
+            "token replacement reached broker socket binding"
+        );
+        assert_eq!(
+            fs::read(&retained_token).expect("read retained original token"),
+            original_token
+        );
+    }
+
+    #[test]
+    fn running_broker_refuses_token_rotation_before_poll_or_accept() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create running broker token-authority root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set running broker token-authority root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create running broker Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set running broker Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision running broker token");
+        let original_token = fs::read(&token_path).expect("read running broker token");
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path.clone(),
+            spawn_catalog_path,
+            sealed(0xab),
+            4,
+            Duration::from_millis(5),
+        )
+        .expect("valid running broker token-authority config");
+        let mut service = BrokerControlServiceV1::bind(config)
+            .expect("bind running broker under retained token authority");
+        assert!(socket_path.exists());
+
+        let retained_token = root.path().join(format!(
+            "guardian-running-retained-{}.token",
+            Uuid::new_v4()
+        ));
+        fs::rename(&token_path, &retained_token).expect("retain running broker token inode");
+        let mut replacement = original_token.clone();
+        replacement[0] ^= 0x20;
+        create_private_broker_token_with_bytes(&token_path, &replacement);
+
+        assert!(matches!(
+            service.poll_once(),
+            Err(BrokerControlServiceError::Endpoint(
+                GuardianServiceError::FilesystemSecurity(_)
+            ))
+        ));
+        assert!(service.connections.is_empty());
+        assert_eq!(service.rejected_connections(), 0);
+        assert!(
+            socket_path.exists(),
+            "running refusal removed socket evidence"
+        );
+        assert_eq!(fs::read(&retained_token).unwrap(), original_token);
+    }
+
+    #[test]
     fn pinned_catalog_reconciles_wal_ahead_of_head_without_second_spawn_authority() {
         let directory = private_catalog_directory();
         let sentinel = directory.path().join("unused-spawn-sentinel");
@@ -8143,7 +10579,7 @@ mod tests {
         drop(journal);
         drop(catalog);
 
-        let recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("reopen exact pinned broker catalog");
         let journals = recovered_catalog
             .scan_all_for_admission(&authenticator)
@@ -8216,8 +10652,13 @@ mod tests {
         let sentinel = linked_directory.path().join("unused-spawn-sentinel");
         let authority = authority(id(886), id(887), id(888), id(889), 0x83, 0x84);
         let payload = command_payload("printf unexpected", &sentinel);
-        let identity = wal_identity(binding_for(&payload, &authority));
         let authenticator = wal_authenticator(0x92);
+        let identity = BrokerSpawnWalIdentityV1::from_binding(
+            id(900),
+            authenticator.lineage_id(),
+            binding_for(&payload, &authority),
+        )
+        .expect("valid catalog-lineage broker WAL identity");
         let mut catalog = BrokerSpawnWalCatalogV1::open(linked_directory.path().to_path_buf())
             .expect("open catalog before link mutation");
         let journal = catalog
@@ -9349,6 +11790,220 @@ mod tests {
             }
         }
         assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn partial_recovered_head_write_resumes_the_exact_authenticated_suffix() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused-partial-recovery");
+        let authority = authority(id(181), id(182), id(183), id(184), 0x63, 0x64);
+        let payload = command_payload("true", &sentinel);
+        let identity = wal_identity(binding_for(&payload, &authority));
+        let authenticator = wal_authenticator(0x85);
+        let (mut journal, wal_path, head_path) =
+            create_test_spawn_journal(temp.path(), identity, authenticator.clone());
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(journal);
+
+        let mut first_recovery =
+            reopen_test_spawn_journal(&wal_path, &head_path, identity, authenticator.clone());
+        first_recovery.inject_fault(BrokerSpawnWalInjectedFault::DuringRecoveredHeadWrite);
+        let revalidation = revalidate_recovered_test_journal(&first_recovery);
+        assert!(matches!(
+            first_recovery.reconcile_recovered_head_and_activate(revalidation),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        assert!(first_recovery.is_poisoned());
+        drop(first_recovery);
+
+        let partial = fs::read(&head_path).expect("read synchronized partial head record");
+        assert_eq!(
+            partial.len(),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES + 37,
+            "injected recovery cut did not retain the intended exact prefix"
+        );
+
+        let mut resumed =
+            reopen_test_spawn_journal(&wal_path, &head_path, identity, authenticator.clone());
+        assert!(matches!(
+            resumed.status().tail,
+            BrokerSpawnWalTailV1::Incomplete {
+                wal_trailing_bytes: 0,
+                head_trailing_bytes: 37,
+            }
+        ));
+        assert!(resumed.status().head_reconciliation_required);
+        let revalidation = revalidate_recovered_test_journal(&resumed);
+        resumed
+            .reconcile_recovered_head_and_activate(revalidation)
+            .expect("resume only the missing authenticated head suffix");
+        assert!(!resumed.status().append_authority_withheld);
+        assert!(matches!(resumed.status().tail, BrokerSpawnWalTailV1::Clean));
+        drop(resumed);
+
+        let completed = fs::read(&head_path).expect("read completed recovered head record");
+        assert_eq!(
+            completed.len(),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES + BROKER_SPAWN_HEAD_RECORD_BYTES
+        );
+        assert_eq!(
+            &completed[..partial.len()],
+            partial.as_slice(),
+            "recovery rewrote or truncated the already durable prefix"
+        );
+        let reopened = reopen_test_spawn_journal(&wal_path, &head_path, identity, authenticator);
+        assert!(!reopened.status().head_reconciliation_required);
+    }
+
+    #[test]
+    fn multi_journal_reconciliation_resumes_after_a_later_partial_head_write() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0x87);
+        let first = recovered_catalog_identity(&authenticator, 40);
+        let second = recovered_catalog_identity(&authenticator, 41);
+        let first_head_path = directory
+            .path()
+            .join(broker_spawn_catalog_head_name(first.journal_id()));
+        let second_head_path = directory
+            .path()
+            .join(broker_spawn_catalog_head_name(second.journal_id()));
+
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open catalog for interrupted multi-journal reconciliation");
+        let mut first_journal = catalog
+            .create_spawn_journal(first, authenticator.clone())
+            .expect("create first journal");
+        first_journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            first_journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(first_journal);
+        let mut second_journal = catalog
+            .create_spawn_journal(second, authenticator.clone())
+            .expect("create second journal");
+        second_journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            second_journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(second_journal);
+        drop(catalog);
+
+        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("reopen catalog before interrupted reconciliation");
+        let journals = recovered_catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("scan both WAL-ahead journals");
+        let mut admitted = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("admit both WAL-ahead journals");
+        admitted
+            .journals
+            .iter_mut()
+            .find(|journal| journal.identity() == second)
+            .expect("second recovered journal")
+            .inject_fault(BrokerSpawnWalInjectedFault::DuringRecoveredHeadWrite);
+        assert!(matches!(
+            recovered_catalog.reconcile_admitted_and_activate(&mut admitted),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(admitted);
+        drop(recovered_catalog);
+
+        assert_eq!(
+            fs::metadata(&first_head_path)
+                .expect("first head metadata after interrupted batch")
+                .len(),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 + BROKER_SPAWN_HEAD_RECORD_BYTES_U64,
+            "the earlier head did not reach its complete durable record"
+        );
+        assert_eq!(
+            fs::metadata(&second_head_path)
+                .expect("second head metadata after interrupted batch")
+                .len(),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 + 37,
+            "the later head did not retain the simulated partial record"
+        );
+
+        let mut resumed_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("reopen catalog after interrupted reconciliation");
+        let journals = resumed_catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("authenticate the complete and exact-prefix head cuts");
+        let mut resumed = BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator)
+            .expect("readmit both journals after interrupted reconciliation");
+        resumed_catalog
+            .reconcile_admitted_and_activate(&mut resumed)
+            .expect("idempotently finish the interrupted multi-journal reconciliation");
+        assert!(
+            resumed
+                .journals
+                .iter()
+                .all(|journal| !journal.status().append_authority_withheld)
+        );
+    }
+
+    #[test]
+    fn mismatching_partial_recovered_head_is_rejected_without_mutation() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused-mismatching-prefix");
+        let authority = authority(id(281), id(282), id(283), id(284), 0x65, 0x66);
+        let payload = command_payload("true", &sentinel);
+        let identity = wal_identity(binding_for(&payload, &authority));
+        let authenticator = wal_authenticator(0x86);
+        let (mut journal, wal_path, head_path) =
+            create_test_spawn_journal(temp.path(), identity, authenticator.clone());
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.append_intent_and_sync(),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(journal);
+
+        let recovered =
+            reopen_test_spawn_journal(&wal_path, &head_path, identity, authenticator.clone());
+        let record = recovered.records.last().copied().expect("one WAL record");
+        let expected = encode_broker_spawn_head_record(
+            recovered.head_header_mac,
+            &recovered.authenticator,
+            record.receipt.sequence,
+            record.receipt.record_mac,
+            recovered.terminal_head_mac,
+        )
+        .expect("encode expected recovered head record");
+        drop(recovered);
+
+        let mut mismatching_prefix = expected[..37].to_vec();
+        mismatching_prefix[11] ^= 0x80;
+        let mut head = OpenOptions::new()
+            .append(true)
+            .open(&head_path)
+            .expect("open head for mismatching partial prefix");
+        head.write_all(&mismatching_prefix)
+            .expect("append mismatching partial prefix");
+        head.sync_all()
+            .expect("synchronize mismatching partial prefix");
+        drop(head);
+        let before = fs::read(&head_path).expect("read mismatching head evidence");
+
+        assert!(matches!(
+            BrokerSpawnJournalV1::open(
+                open_existing_test_file(&wal_path),
+                open_existing_test_file(&head_path),
+                identity,
+                authenticator,
+            ),
+            Err(BrokerSpawnWalError::IncompleteTail)
+        ));
+        assert_eq!(
+            fs::read(&head_path).expect("reread mismatching head evidence"),
+            before,
+            "rejected recovery mutated the mismatching partial record"
+        );
     }
 
     #[test]

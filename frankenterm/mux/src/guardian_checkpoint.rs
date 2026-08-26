@@ -8505,6 +8505,19 @@ mod tests {
 
     #[test]
     fn catalog_adoption_evidence_is_checksum_bound_recoverable_and_replay_closed() {
+        // Frozen from the production v1 adoption-evidence transcript for this
+        // exact fixture. Changing either answer requires an explicit persisted
+        // format migration; never regenerate it merely to make this test pass.
+        const EXPECTED_REPLAY_STABLE_NONCE: [u8; CHECKPOINT_STAGE_NONCE_BYTES] = [
+            0x03, 0x3d, 0x6c, 0xb3, 0x1e, 0xc7, 0xd2, 0x61, 0xe2, 0xe7, 0x07, 0x07, 0xed, 0xfa,
+            0x82, 0xe3, 0x4d, 0x96, 0x54, 0x35, 0xfe, 0x04, 0xaf, 0xdd,
+        ];
+        const EXPECTED_REPLAY_STABLE_CIPHERTEXT_SHA256: [u8; 32] = [
+            0x8f, 0x67, 0x0f, 0xf0, 0xcd, 0x85, 0xc7, 0x4e, 0x47, 0xcc, 0xc5, 0x2d, 0xe2, 0x15,
+            0xa2, 0x05, 0x54, 0x40, 0x0b, 0x75, 0x9e, 0xfa, 0xb0, 0xde, 0x33, 0x94, 0x51, 0xdc,
+            0x92, 0x02, 0x83, 0xf8,
+        ];
+
         let cipher = checkpoint_stage_cipher(0xad);
         let candidate_id = Uuid::from_u128(0xad07);
         let binding = catalog_adoption_binding(candidate_id, [0x35; 32]);
@@ -8512,6 +8525,18 @@ mod tests {
         let record = cipher
             .seal_catalog_adoption_evidence(catalog_adoption_seed(request_id), &binding)
             .expect("seal protected catalog adoption evidence");
+        let fixed_header = record.fixed_header();
+        assert_eq!(
+            &fixed_header[24..48],
+            EXPECTED_REPLAY_STABLE_NONCE.as_slice(),
+            "the replay-stable nonce transcript is a persisted compatibility contract"
+        );
+        assert_eq!(record.ciphertext_bytes(), 544);
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(record.ciphertext())),
+            EXPECTED_REPLAY_STABLE_CIPHERTEXT_SHA256,
+            "the complete replay-stable ciphertext is a persisted compatibility contract"
+        );
         let exact_retry = cipher
             .seal_catalog_adoption_evidence(catalog_adoption_seed(request_id), &binding)
             .expect("retry exact protected catalog adoption evidence");

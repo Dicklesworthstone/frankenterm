@@ -9,14 +9,15 @@ use crate::runtime::{
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_protocol::{
-    AuthenticatedGuardianRequest, GUARDIAN_AUTH_TOKEN_BYTES, GUARDIAN_MAX_CENSUS_BYTES,
-    GUARDIAN_MAX_CENSUS_ENTRIES, GUARDIAN_MAX_FRAME_BYTES, GUARDIAN_MAX_PANES,
-    GuardianCensusPageRequest, GuardianInputEffectQuery, GuardianOperation, GuardianProtocolError,
-    GuardianRejectionCode, GuardianReply, GuardianRequestEnvelope, GuardianRequestHeader,
-    GuardianResizePayload, GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret,
-    GuardianSignal, GuardianSpawnPayload, GuardianWireFrame, InputEffectState,
-    decode_guardian_request, decode_guardian_response, encode_guardian_request,
-    encode_guardian_response,
+    AuthenticatedGuardianRequest, CorrelatedGuardianResponse, GUARDIAN_AUTH_TOKEN_BYTES,
+    GUARDIAN_MAX_CENSUS_BYTES, GUARDIAN_MAX_CENSUS_ENTRIES, GUARDIAN_MAX_FRAME_BYTES,
+    GUARDIAN_MAX_PANES, GuardianCensusEntry, GuardianCensusPageRequest, GuardianInputEffectQuery,
+    GuardianOperation, GuardianProtocolError, GuardianRejectionCode, GuardianReplayAckReceiptV1,
+    GuardianReplayAckV1, GuardianReplayPageDelivery, GuardianReplayRequestV1, GuardianReply,
+    GuardianRequestEnvelope, GuardianRequestHeader, GuardianResizePayload,
+    GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret, GuardianSignal,
+    GuardianSpawnPayload, GuardianWireFrame, InputEffectState, decode_guardian_request,
+    decode_guardian_response, encode_guardian_request, encode_guardian_response,
 };
 use nix::unistd::geteuid;
 use portable_pty::{CommandBuilder, PtySize};
@@ -171,6 +172,8 @@ pub enum GuardianClientError {
     Io(#[from] std::io::Error),
     #[error("guardian client protocol failed")]
     Protocol(#[from] GuardianProtocolError),
+    #[error("guardian census allocation failed")]
+    CensusAllocation,
     #[error("guardian request was rejected with {0:?}")]
     Rejected(GuardianRejectionCode),
     #[error("guardian returned a reply for the wrong operation")]
@@ -1436,7 +1439,10 @@ impl GuardianService {
                 }
                 if matches!(
                     request.header().operation,
-                    GuardianOperation::CheckpointStage | GuardianOperation::Checkpoint
+                    GuardianOperation::CheckpointStage
+                        | GuardianOperation::Checkpoint
+                        | GuardianOperation::Replay
+                        | GuardianOperation::ReplayAck
                 ) {
                     let Some(route) = GuardianCheckpointRoute::new(
                         token,
@@ -1929,6 +1935,65 @@ impl GuardianClient {
         self.exchange(request)
     }
 
+    /// Consume one authenticated checkpoint/output replay page.
+    ///
+    /// If an I/O error makes reply delivery ambiguous, discard this framed
+    /// connection and retry the exact same request ID and replay payload on a
+    /// freshly connected client. The guardian snapshot ledger makes that retry
+    /// byte-identical; a delayed reply on this stream must never be mistaken
+    /// for the retry.
+    pub fn replay(
+        &mut self,
+        pane_id: Uuid,
+        generation: u64,
+        request_id: Uuid,
+        replay: GuardianReplayRequestV1,
+    ) -> Result<GuardianReplayPageDelivery, GuardianClientError> {
+        let request = self.request(
+            GuardianOperation::Replay,
+            request_id,
+            Some(pane_id),
+            generation,
+            0,
+            None,
+            replay.encode()?,
+        );
+        self.exchange_replay(request)
+    }
+
+    /// Cumulatively acknowledge the exact outstanding replay page. Ack only
+    /// releases bounded delivery state; it never advances retention or grants
+    /// compaction authority. Exact retries recover the same receipt while the
+    /// guardian process retains the snapshot ledger. A
+    /// `Rejected(ReplaySnapshotExpired)` error means that process-local state
+    /// is gone; the caller must abandon this Ack and reopen the exact durable
+    /// checkpoint (or a previously verified output Resume boundary).
+    pub fn replay_ack(
+        &mut self,
+        pane_id: Uuid,
+        generation: u64,
+        request_id: Uuid,
+        ack: GuardianReplayAckV1,
+    ) -> Result<GuardianReplayAckReceiptV1, GuardianClientError> {
+        let request = self.request(
+            GuardianOperation::ReplayAck,
+            request_id,
+            Some(pane_id),
+            generation,
+            0,
+            None,
+            ack.encode()?.to_vec(),
+        );
+        match self.exchange(request)? {
+            GuardianReply::ReplayAcked(receipt)
+                if receipt == GuardianReplayAckReceiptV1::from_ack(ack) =>
+            {
+                Ok(receipt)
+            }
+            _ => Err(GuardianClientError::UnexpectedReply),
+        }
+    }
+
     /// Apply one bounded input effect through the guardian's durable
     /// intent/write/disposition transaction. A terminal
     /// `InputKnownNotApplied` rejection proves that zero bytes reached the PTY;
@@ -2086,14 +2151,31 @@ impl GuardianClient {
         self.exchange(request)
     }
 
+    /// Collect one complete, immutable guardian census snapshot. The entire
+    /// bounded multi-page traversal shares one five-second end-to-end I/O
+    /// deadline; every page retains the authenticated request correlation,
+    /// snapshot identity, cursor, total-count, and protocol resource checks.
+    /// A continuation may only shorten the remaining socket timeout; it must
+    /// never restart the five-second budget.
+    pub fn census_snapshot(&mut self) -> Result<Vec<GuardianCensusEntry>, GuardianClientError> {
+        self.with_client_io_deadline(Self::census_snapshot_before)
+    }
+
     /// Traverse one complete, guardian-bounded census snapshot within one
     /// client I/O deadline. A partial, changing, or overlong traversal is not
     /// accepted as readiness.
     pub fn probe(&mut self) -> Result<GuardianProbeReport, GuardianClientError> {
+        self.with_client_io_deadline(Self::probe_before)
+    }
+
+    fn with_client_io_deadline<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self, Instant) -> Result<T, GuardianClientError>,
+    ) -> Result<T, GuardianClientError> {
         let deadline = Instant::now()
             .checked_add(CLIENT_IO_TIMEOUT)
             .ok_or(GuardianClientError::UnexpectedReply)?;
-        let result = self.probe_before(deadline);
+        let result = operation(self, deadline);
         let reset_read = self.stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
         let reset_write = self.stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
         reset_read?;
@@ -2125,18 +2207,34 @@ impl GuardianClient {
         &mut self,
         deadline: Instant,
     ) -> Result<GuardianProbeReport, GuardianClientError> {
+        let entries = self.census_snapshot_before(deadline)?;
+        let pane_count =
+            u64::try_from(entries.len()).map_err(|_| GuardianClientError::UnexpectedReply)?;
+        Ok(GuardianProbeReport {
+            guardian_incarnation: self.guardian_incarnation,
+            pane_count,
+        })
+    }
+
+    fn census_snapshot_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Vec<GuardianCensusEntry>, GuardianClientError> {
         let max_pages = GUARDIAN_MAX_PANES
             .div_ceil(usize::from(GUARDIAN_MAX_CENSUS_ENTRIES))
             .max(1);
+        let max_total =
+            u64::try_from(GUARDIAN_MAX_PANES).map_err(|_| GuardianClientError::UnexpectedReply)?;
         let mut snapshot_id = Uuid::nil();
         let mut cursor = 0_u64;
         let mut expected_total = None;
+        let mut all_entries = Vec::new();
         for _ in 0..max_pages {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "guardian probe deadline elapsed",
+                    "guardian census deadline elapsed",
                 )
                 .into());
             }
@@ -2157,9 +2255,26 @@ impl GuardianClient {
             else {
                 return Err(GuardianClientError::UnexpectedReply);
             };
+            if Instant::now() >= deadline
+                || returned_snapshot.is_nil()
+                || entries.len() > usize::from(GUARDIAN_MAX_CENSUS_ENTRIES)
+                || total_panes > max_total
+            {
+                return Err(if Instant::now() >= deadline {
+                    std::io::Error::new(ErrorKind::TimedOut, "guardian census deadline elapsed")
+                        .into()
+                } else {
+                    GuardianClientError::UnexpectedReply
+                });
+            }
             if expected_total.is_none() {
                 expected_total = Some(total_panes);
                 snapshot_id = returned_snapshot;
+                let total = usize::try_from(total_panes)
+                    .map_err(|_| GuardianClientError::UnexpectedReply)?;
+                all_entries
+                    .try_reserve_exact(total)
+                    .map_err(|_| GuardianClientError::CensusAllocation)?;
             } else if expected_total != Some(total_panes) || snapshot_id != returned_snapshot {
                 return Err(GuardianClientError::UnexpectedReply);
             }
@@ -2168,13 +2283,24 @@ impl GuardianClient {
             let next_observed = cursor
                 .checked_add(entry_count)
                 .ok_or(GuardianClientError::UnexpectedReply)?;
+            let total = expected_total.ok_or(GuardianClientError::UnexpectedReply)?;
+            if next_observed > total {
+                return Err(GuardianClientError::UnexpectedReply);
+            }
+            all_entries.extend(entries);
             match next_cursor {
-                Some(next) if next == next_observed && next > cursor => cursor = next,
+                Some(next) if next == next_observed && next > cursor && next < total => {
+                    cursor = next;
+                }
                 None if next_observed == total_panes => {
-                    return Ok(GuardianProbeReport {
-                        guardian_incarnation: self.guardian_incarnation,
-                        pane_count: total_panes,
-                    });
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "guardian census deadline elapsed",
+                        )
+                        .into());
+                    }
+                    return Ok(all_entries);
                 }
                 _ => return Err(GuardianClientError::UnexpectedReply),
             }
@@ -2236,6 +2362,41 @@ impl GuardianClient {
         &mut self,
         request: GuardianRequestEnvelope,
     ) -> Result<GuardianReply, GuardianClientError> {
+        let (authenticated, correlated) = self.exchange_correlated(request)?;
+        match correlated.header().status {
+            GuardianResponseStatus::Success => correlated
+                .success_reply(&authenticated)
+                .map_err(GuardianClientError::from),
+            GuardianResponseStatus::Rejected | GuardianResponseStatus::Terminal => {
+                Err(GuardianClientError::Rejected(correlated.rejection_code()?))
+            }
+            GuardianResponseStatus::Indeterminate => correlated
+                .typed_reply(&authenticated)
+                .map_err(GuardianClientError::from),
+        }
+    }
+
+    fn exchange_replay(
+        &mut self,
+        request: GuardianRequestEnvelope,
+    ) -> Result<GuardianReplayPageDelivery, GuardianClientError> {
+        let (authenticated, correlated) = self.exchange_correlated(request)?;
+        match correlated.header().status {
+            GuardianResponseStatus::Success => correlated
+                .into_replay_page(&authenticated)
+                .map_err(GuardianClientError::from),
+            GuardianResponseStatus::Rejected | GuardianResponseStatus::Terminal => {
+                Err(GuardianClientError::Rejected(correlated.rejection_code()?))
+            }
+            GuardianResponseStatus::Indeterminate => Err(GuardianClientError::UnexpectedReply),
+        }
+    }
+
+    fn exchange_correlated(
+        &mut self,
+        request: GuardianRequestEnvelope,
+    ) -> Result<(AuthenticatedGuardianRequest, CorrelatedGuardianResponse), GuardianClientError>
+    {
         let mut request = OwnedClientRequest::new(request);
         #[cfg(test)]
         request.set_wipe_probe(self.request_wipe_probe.clone());
@@ -2261,17 +2422,7 @@ impl GuardianClient {
         let response_frame = read_blocking_frame(&mut self.stream)?;
         let response = decode_guardian_response(&self.secret, &response_frame)?;
         let correlated = response.correlate(authenticated.header())?;
-        match correlated.header().status {
-            GuardianResponseStatus::Success => correlated
-                .success_reply(&authenticated)
-                .map_err(GuardianClientError::from),
-            GuardianResponseStatus::Rejected | GuardianResponseStatus::Terminal => {
-                Err(GuardianClientError::Rejected(correlated.rejection_code()?))
-            }
-            GuardianResponseStatus::Indeterminate => correlated
-                .typed_reply(&authenticated)
-                .map_err(GuardianClientError::from),
-        }
+        Ok((authenticated, correlated))
     }
 }
 
@@ -3769,6 +3920,20 @@ mod tests {
         }
     }
 
+    fn census_test_entry(pane_id: u128, generation: u64) -> GuardianCensusEntry {
+        GuardianCensusEntry {
+            pane_id: Uuid::from_u128(pane_id),
+            status: mux::guardian_protocol::GuardianCensusPaneStatus::LiveUnclaimed,
+            generation,
+            mux_incarnation: None,
+            next_sequence: None,
+            pending_input_effect: None,
+            indeterminate_checkpoint_effect: None,
+            exit_status: None,
+            quarantine_reason: None,
+        }
+    }
+
     #[test]
     fn completion_token_precedes_the_monotonic_pty_token_range() {
         let max_connections = 64_usize;
@@ -4235,6 +4400,151 @@ mod tests {
     }
 
     #[test]
+    fn census_snapshot_collects_multiple_pages_with_exact_bounds_and_restores_timeouts() {
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        client_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+
+        let secret_bytes = [0x5a; GUARDIAN_AUTH_TOKEN_BYTES];
+        let guardian_incarnation = Uuid::from_u128(0x5051);
+        let mux_incarnation = Uuid::from_u128(0x5052);
+        let snapshot_id = Uuid::from_u128(0x5053);
+        let expected = vec![census_test_entry(0x5054, 3), census_test_entry(0x5055, 4)];
+        let served = expected.clone();
+        let server = std::thread::spawn(move || {
+            let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
+            for index in 0..2_usize {
+                let frame = read_blocking_frame(&mut server_stream).unwrap();
+                let request = decode_guardian_request(&secret, &frame).unwrap();
+                assert_eq!(request.header().operation, GuardianOperation::Census);
+                assert_eq!(request.header().guardian_incarnation, guardian_incarnation);
+                assert_eq!(request.header().mux_incarnation, mux_incarnation);
+                let page = GuardianCensusPageRequest::decode(request.payload()).unwrap();
+                assert_eq!(page.max_entries, GUARDIAN_MAX_CENSUS_ENTRIES);
+                assert_eq!(page.max_bytes, GUARDIAN_MAX_CENSUS_BYTES);
+                if index == 0 {
+                    assert_eq!(page.snapshot_id, Uuid::nil());
+                    assert_eq!(page.cursor, 0);
+                } else {
+                    assert_eq!(page.snapshot_id, snapshot_id);
+                    assert_eq!(page.cursor, 1);
+                }
+                let response = GuardianResponseEnvelope::reply(
+                    &request,
+                    &GuardianReply::CensusPage {
+                        snapshot_id,
+                        entries: vec![served[index].clone()],
+                        next_cursor: (index == 0).then_some(1),
+                        total_panes: 2,
+                    },
+                )
+                .unwrap();
+                server_stream
+                    .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                    .unwrap();
+            }
+        });
+
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes(secret_bytes).unwrap(),
+            mux_incarnation,
+            guardian_incarnation,
+            request_wipe_probe: None,
+        };
+        assert_eq!(client.census_snapshot().unwrap(), expected);
+        assert_eq!(
+            client.stream.read_timeout().unwrap(),
+            Some(CLIENT_IO_TIMEOUT)
+        );
+        assert_eq!(
+            client.stream.write_timeout().unwrap(),
+            Some(CLIENT_IO_TIMEOUT)
+        );
+        server
+            .join()
+            .expect("bounded census collection server exits cleanly");
+    }
+
+    #[test]
+    fn census_snapshot_uses_one_deadline_across_multiple_pages() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        client_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+
+        let secret_bytes = [0x5b; GUARDIAN_AUTH_TOKEN_BYTES];
+        let guardian_incarnation = Uuid::from_u128(0x5061);
+        let mux_incarnation = Uuid::from_u128(0x5062);
+        let snapshot_id = Uuid::from_u128(0x5063);
+        let served = [census_test_entry(0x5064, 5), census_test_entry(0x5065, 6)];
+        let observed_requests = Arc::new(AtomicUsize::new(0));
+        let server_observed_requests = Arc::clone(&observed_requests);
+        let server = std::thread::spawn(move || {
+            let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
+            for index in 0..2_usize {
+                let frame = read_blocking_frame(&mut server_stream).unwrap();
+                let request = decode_guardian_request(&secret, &frame).unwrap();
+                let page = GuardianCensusPageRequest::decode(request.payload()).unwrap();
+                assert_eq!(page.cursor, u64::try_from(index).unwrap());
+                server_observed_requests.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(600));
+                let response = GuardianResponseEnvelope::reply(
+                    &request,
+                    &GuardianReply::CensusPage {
+                        snapshot_id,
+                        entries: vec![served[index].clone()],
+                        next_cursor: (index == 0).then_some(1),
+                        total_panes: 2,
+                    },
+                )
+                .unwrap();
+                server_stream
+                    .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                    .unwrap();
+            }
+        });
+
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes(secret_bytes).unwrap(),
+            mux_incarnation,
+            guardian_incarnation,
+            request_wipe_probe: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = client.census_snapshot_before(deadline);
+        assert!(matches!(
+            result,
+            Err(GuardianClientError::Io(error))
+                if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+        ));
+        server.join().expect("deadline census server exits cleanly");
+        assert_eq!(observed_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn production_input_exchange_validates_reply_after_both_plaintext_copies_die() {
         let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
         client_stream
@@ -4319,6 +4629,213 @@ mod tests {
         assert!(wipe_probe.encoded_frame_wipe.load(Ordering::SeqCst));
         assert!(wipe_probe.encoded_frame_drop_wipe.load(Ordering::SeqCst));
         server.join().expect("input test server exits cleanly");
+    }
+
+    #[test]
+    fn replay_and_ack_client_consume_the_exact_correlated_page_and_receipt() {
+        use mux::guardian_protocol::{
+            GuardianCheckpointIdentityDigest, GuardianReplayPageBodyDelivery,
+            GuardianReplaySelectorV1,
+        };
+
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        client_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+
+        let secret_bytes = [0x5a; GUARDIAN_AUTH_TOKEN_BYTES];
+        let guardian_incarnation = Uuid::from_u128(0x5101);
+        let mux_incarnation = Uuid::from_u128(0x5102);
+        let pane_id = Uuid::from_u128(0x5103);
+        let replay_request_id = Uuid::from_u128(0x5104);
+        let ack_request_id = Uuid::from_u128(0x5105);
+        let snapshot_id = Uuid::from_u128(0x5106);
+        let snapshot_digest = [0x51; 32];
+        let checkpoint_id = GuardianCheckpointIdentityDigest::from_bytes([0x52; 32]).unwrap();
+        let replay = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: 4_096,
+            max_records: 16,
+            wait_millis: 0,
+        };
+
+        let server = std::thread::spawn(move || {
+            let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
+            let replay_frame = read_blocking_frame(&mut server_stream).unwrap();
+            let replay_request = decode_guardian_request(&secret, &replay_frame).unwrap();
+            assert_eq!(replay_request.header().operation, GuardianOperation::Replay);
+            assert_eq!(replay_request.header().request_id, replay_request_id);
+            assert_eq!(replay_request.header().pane_id, Some(pane_id));
+            assert_eq!(replay_request.header().lease_generation, 7);
+            assert_eq!(
+                GuardianReplayRequestV1::decode(replay_request.payload()),
+                Ok(replay)
+            );
+
+            let page = GuardianReplayPageDelivery::new(
+                pane_id,
+                7,
+                snapshot_id,
+                snapshot_digest,
+                [0; 32],
+                0,
+                None,
+                GuardianReplayPageBodyDelivery::Complete {
+                    checkpoint_id,
+                    through_sequence: 0,
+                    terminal_record_digest: [0; 32],
+                    cumulative_plaintext_bytes: 0,
+                },
+            )
+            .unwrap();
+            let response = GuardianResponseEnvelope::replay_page(&replay_request, page).unwrap();
+            let response_frame = encode_guardian_response(&secret, &response).unwrap();
+            server_stream.write_all(&response_frame).unwrap();
+
+            let ack_frame = read_blocking_frame(&mut server_stream).unwrap();
+            let ack_request = decode_guardian_request(&secret, &ack_frame).unwrap();
+            assert_eq!(ack_request.header().operation, GuardianOperation::ReplayAck);
+            assert_eq!(ack_request.header().request_id, ack_request_id);
+            assert_eq!(ack_request.header().pane_id, Some(pane_id));
+            assert_eq!(ack_request.header().lease_generation, 7);
+            let ack = GuardianReplayAckV1::decode(ack_request.payload()).unwrap();
+            assert_eq!(ack.snapshot_id(), snapshot_id);
+            assert_eq!(ack.snapshot_digest(), snapshot_digest);
+            assert_eq!(ack.page_index(), 0);
+            assert_eq!(ack.next_cursor_digest(), None);
+            assert!(ack.release_if_complete());
+            let receipt = GuardianReplayAckReceiptV1::from_ack(ack);
+            let response =
+                GuardianResponseEnvelope::reply(&ack_request, &GuardianReply::ReplayAcked(receipt))
+                    .unwrap();
+            let response_frame = encode_guardian_response(&secret, &response).unwrap();
+            server_stream.write_all(&response_frame).unwrap();
+        });
+
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes(secret_bytes).unwrap(),
+            mux_incarnation,
+            guardian_incarnation,
+            request_wipe_probe: None,
+        };
+        let page = client
+            .replay(pane_id, 7, replay_request_id, replay)
+            .expect("client consumes the correlated replay page");
+        assert_eq!(page.header().pane_id(), pane_id);
+        assert_eq!(page.header().generation(), 7);
+        assert_eq!(page.header().snapshot_id(), snapshot_id);
+        assert_eq!(page.header().snapshot_digest(), snapshot_digest);
+        assert_eq!(page.header().page_index(), 0);
+        assert_eq!(page.header().next_cursor(), None);
+        let ack = GuardianReplayAckV1::new(
+            page.header().snapshot_id(),
+            page.header().snapshot_digest(),
+            page.header().page_index(),
+            page.header().declassify_page_digest_for_ack(),
+            None,
+            0,
+            [0; 32],
+            true,
+        )
+        .unwrap();
+        match page.into_body() {
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id: observed,
+                through_sequence: 0,
+                terminal_record_digest,
+                cumulative_plaintext_bytes,
+            } => {
+                assert_eq!(observed, checkpoint_id);
+                assert_eq!(terminal_record_digest, [0; 32]);
+                assert_eq!(cumulative_plaintext_bytes, 0);
+            }
+            other => panic!("unexpected replay body: {other:?}"),
+        }
+        assert_eq!(
+            client
+                .replay_ack(pane_id, 7, ack_request_id, ack)
+                .expect("client consumes the exact ReplayAck receipt"),
+            GuardianReplayAckReceiptV1::from_ack(ack)
+        );
+        server.join().expect("Replay/Ack test server exits cleanly");
+    }
+
+    #[test]
+    fn replay_ack_client_surfaces_typed_snapshot_expiration_for_reopen() {
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        client_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+
+        let secret_bytes = [0x5a; GUARDIAN_AUTH_TOKEN_BYTES];
+        let guardian_incarnation = Uuid::from_u128(0x5201);
+        let mux_incarnation = Uuid::from_u128(0x5202);
+        let pane_id = Uuid::from_u128(0x5203);
+        let request_id = Uuid::from_u128(0x5204);
+        let ack = GuardianReplayAckV1::new(
+            Uuid::from_u128(0x5205),
+            [0x52; 32],
+            3,
+            [0x53; 32],
+            None,
+            17,
+            [0x54; 32],
+            true,
+        )
+        .unwrap();
+
+        let server = std::thread::spawn(move || {
+            let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
+            let frame = read_blocking_frame(&mut server_stream).unwrap();
+            let request = decode_guardian_request(&secret, &frame).unwrap();
+            assert_eq!(request.header().operation, GuardianOperation::ReplayAck);
+            assert_eq!(request.header().request_id, request_id);
+            assert_eq!(GuardianReplayAckV1::decode(request.payload()), Ok(ack));
+            let response = GuardianResponseEnvelope::rejection(
+                &request,
+                GuardianRejectionCode::ReplaySnapshotExpired,
+            );
+            assert_eq!(response.header().status, GuardianResponseStatus::Rejected);
+            server_stream
+                .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                .unwrap();
+        });
+
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes(secret_bytes).unwrap(),
+            mux_incarnation,
+            guardian_incarnation,
+            request_wipe_probe: None,
+        };
+        assert!(matches!(
+            client.replay_ack(pane_id, 7, request_id, ack),
+            Err(GuardianClientError::Rejected(
+                GuardianRejectionCode::ReplaySnapshotExpired
+            ))
+        ));
+        server
+            .join()
+            .expect("ReplayAck expiry server exits cleanly");
     }
 
     #[test]

@@ -1,18 +1,18 @@
 use crate::domain::{ClientDomain, ClientDomainConfig, ClientInner};
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
+use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
 #[cfg(any(windows, test))]
 use asupersync::time::{TimerDriverHandle, TimerHandle};
-use asupersync::Cx;
-use async_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
+use async_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
-use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
+use config::{SshDomain, TlsDomainClient, UnixDomain, UnixTarget, configuration};
 use filedescriptor::FileDescriptor;
-use futures::future::{ready, select, Either};
+use futures::future::{Either, ready, select};
 use futures::pin_mut;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
@@ -27,12 +27,12 @@ use openssl::x509::X509;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use portable_pty::Child;
 use promise::spawn::{
-    try_reserve_main_thread, MainThreadReservationOutcome, MainThreadServiceClass,
-    MainThreadSpawnReservation,
+    MainThreadReservationOutcome, MainThreadServiceClass, MainThreadSpawnReservation,
+    try_reserve_main_thread,
 };
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
 use std::convert::TryFrom;
-use std::future::{poll_fn, Future};
+use std::future::{Future, poll_fn};
 use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
@@ -41,7 +41,7 @@ use std::num::NonZeroU64;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
@@ -152,6 +152,18 @@ pub enum RpcDeliveryCertainty {
     OutcomeUnknown,
 }
 
+/// Codec-46 PDU0 contains no trustworthy text, effect, or retry authority.
+/// Keep that absence typed all the way through pending-reply correlation;
+/// callers receive this terminal error instead of a fabricated current
+/// `ErrorResponse`.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("codec-46 mux server rejected {request} without effect or retry authority")]
+struct Legacy46RpcRejection {
+    request: &'static str,
+    effect_authority: Legacy46RejectionAuthority,
+    retry_authority: Legacy46RejectionAuthority,
+}
+
 impl std::fmt::Display for RpcDeliveryCertainty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -214,9 +226,7 @@ impl std::fmt::Display for RpcRetirementStage {
 /// the operation even though no matching reply reached this client.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RpcTransportError {
-    #[error(
-        "mux client RPC transport unavailable for attempt {attempt_id} ({request}) at {stage}"
-    )]
+    #[error("mux client RPC transport unavailable for attempt {attempt_id} ({request}) at {stage}")]
     Unavailable {
         attempt_id: NonZeroU64,
         request: &'static str,
@@ -354,7 +364,7 @@ enum RpcErrorCompletion {
 }
 
 fn complete_with_rpc_transport_error(
-    completion: &Sender<anyhow::Result<Pdu>>,
+    completion: &Sender<anyhow::Result<PendingRpcReply>>,
     error: RpcTransportError,
 ) -> RpcErrorCompletion {
     record_rpc_transport_error(&error);
@@ -509,7 +519,7 @@ impl ClientOutboundBudget {
         self: &Arc<Self>,
         rpc_transport: Weak<RpcTransportState>,
         generation: NonZeroU64,
-        prepared: OwnedPreparedPduOutbound,
+        prepared: OwnedPreparedMuxWirePdu,
     ) -> Result<ClientOutboundLease, ClientOutboundAdmissionError> {
         let metadata = prepared.metadata();
         let request = prepared.pdu().pdu_name();
@@ -614,7 +624,7 @@ struct ClientOutboundLeaseState {
     planned_codec_bytes: usize,
     noninteractive: bool,
     qos: PduQueueQos,
-    prepared: ParkingMutex<Option<Box<OwnedPreparedPduOutbound>>>,
+    prepared: ParkingMutex<Option<Box<OwnedPreparedMuxWirePdu>>>,
 }
 
 impl ClientOutboundLeaseState {
@@ -712,7 +722,7 @@ impl ClientOutboundLeaseState {
         }
     }
 
-    fn claim_for_reader(&self) -> anyhow::Result<Option<Box<OwnedPreparedPduOutbound>>> {
+    fn claim_for_reader(&self) -> anyhow::Result<Option<Box<OwnedPreparedMuxWirePdu>>> {
         if self
             .phase
             .compare_exchange(
@@ -795,7 +805,7 @@ impl ClientOutboundLease {
 
     fn with_prepared<T>(
         &self,
-        operation: impl FnOnce(&OwnedPreparedPduOutbound) -> T,
+        operation: impl FnOnce(&OwnedPreparedMuxWirePdu) -> T,
     ) -> anyhow::Result<T> {
         let prepared = self.state.prepared.lock();
         let prepared = prepared.as_deref().ok_or_else(|| {
@@ -814,7 +824,7 @@ impl ClientOutboundLease {
         }
     }
 
-    fn claim_for_reader(&self) -> anyhow::Result<Option<Box<OwnedPreparedPduOutbound>>> {
+    fn claim_for_reader(&self) -> anyhow::Result<Option<Box<OwnedPreparedMuxWirePdu>>> {
         self.state.claim_for_reader()
     }
 }
@@ -990,6 +1000,7 @@ struct RpcCodecAuthority {
     remote_max: usize,
     remote_min: usize,
     agreed: usize,
+    dialect: MuxWireDialect,
 }
 
 impl RpcCodecAuthority {
@@ -1003,12 +1014,20 @@ impl RpcCodecAuthority {
         } else {
             advertised_remote_min
         };
-        let codec::CompatDecision::Compatible { agreed } = codec::check_compat(
-            CODEC_VERSION,
-            codec::CODEC_VERSION_MIN_SUPPORTED,
-            remote_max,
-            remote_min,
-        )?;
+        let (agreed, dialect) =
+            if remote_max == LEGACY46_CODEC_VERSION && remote_min == LEGACY46_CODEC_VERSION {
+                (LEGACY46_CODEC_VERSION, MuxWireDialect::LEGACY46)
+            } else {
+                let codec::CompatDecision::Compatible { agreed } = codec::check_compat(
+                    CODEC_VERSION,
+                    codec::CODEC_VERSION_MIN_SUPPORTED,
+                    remote_max,
+                    remote_min,
+                )?;
+                let dialect = MuxWireDialect::current(agreed)
+                    .expect("a negotiated current compatibility window yields a closed dialect");
+                (agreed, dialect)
+            };
         Ok(Self {
             generation,
             local_max: CODEC_VERSION,
@@ -1016,6 +1035,7 @@ impl RpcCodecAuthority {
             remote_max,
             remote_min,
             agreed,
+            dialect,
         })
     }
 }
@@ -1251,6 +1271,12 @@ impl RpcProtocolAuthority {
 
     #[cfg(test)]
     fn established_for_test(generation: NonZeroU64, agreed: usize) -> Self {
+        let dialect = if agreed == LEGACY46_CODEC_VERSION {
+            MuxWireDialect::LEGACY46
+        } else {
+            MuxWireDialect::current(agreed)
+                .expect("test protocol authority requires a supported exact dialect")
+        };
         Self {
             generation,
             phase: RpcProtocolPhase::Established,
@@ -1261,6 +1287,7 @@ impl RpcProtocolAuthority {
                 remote_max: agreed,
                 remote_min: agreed,
                 agreed,
+                dialect,
             }),
             established_capabilities: TopologyCapabilities::NONE,
         }
@@ -1301,6 +1328,16 @@ impl RpcProtocolAuthority {
         self.codec.map_or(CODEC_VERSION, |codec| codec.agreed)
     }
 
+    fn wire_dialect(&self) -> MuxWireDialect {
+        self.codec.map_or_else(
+            || {
+                MuxWireDialect::current(CODEC_VERSION)
+                    .expect("the bootstrap request uses this build's current dialect")
+            },
+            |codec| codec.dialect,
+        )
+    }
+
     fn validate_common(
         &self,
         spec: &PduWireSpec,
@@ -1325,7 +1362,7 @@ impl RpcProtocolAuthority {
             });
         }
         let agreed = self.agreed_dialect();
-        if spec.min_codec_version > agreed {
+        if !self.wire_dialect().admits_wire_spec(spec) {
             return Err(OrdinaryMuxProtocolError::DialectViolation {
                 direction,
                 generation: self.generation,
@@ -2278,6 +2315,17 @@ impl RpcTransportState {
             .validate_outbound_pdu(pdu, RpcOutboundAdmissionPoint::Dequeue)
     }
 
+    fn wire_dialect(
+        &self,
+        generation: NonZeroU64,
+    ) -> Result<MuxWireDialect, OrdinaryMuxProtocolError> {
+        Ok(self
+            .lifecycle
+            .lock()
+            .protocol_for(generation)?
+            .wire_dialect())
+    }
+
     fn validate_inbound_header(
         &self,
         generation: NonZeroU64,
@@ -2290,6 +2338,27 @@ impl RpcTransportState {
             },
         )?;
         let role = if header.serial() == 0 {
+            PduWireRole::Unilateral
+        } else {
+            PduWireRole::CorrelatedReply
+        };
+        self.lifecycle
+            .lock()
+            .protocol_for(generation)?
+            .validate_inbound(spec, role)
+    }
+
+    fn validate_inbound_identity(
+        &self,
+        generation: NonZeroU64,
+        serial: u64,
+        ident: u64,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        let spec = Pdu::wire_spec_for_ident(ident).ok_or(OrdinaryMuxProtocolError::UnknownPdu {
+            direction: RpcProtocolDirection::Inbound,
+            ident,
+        })?;
+        let role = if serial == 0 {
             PduWireRole::Unilateral
         } else {
             PduWireRole::CorrelatedReply
@@ -2561,11 +2630,48 @@ enum TopologySnapshotDecisionAck {
     RejectedTerminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyTopologyFenceAuthority {
+    generation: NonZeroU64,
+    serial: NonZeroU64,
+}
+
+#[derive(Debug)]
+enum PendingRpcReply {
+    Pdu(Box<Pdu>),
+    Legacy46ListPanesResponse {
+        response: Legacy46ListPanesResponse,
+        authority: LegacyTopologyFenceAuthority,
+    },
+    Legacy46Rejection(Legacy46Rejection),
+}
+
+/// Topology payload delivered to the domain under the exact snapshot
+/// authority available from its peer.
+pub(crate) enum RpcTopologySnapshot {
+    Current(ListPanesResponse),
+    Legacy46(Legacy46ListPanesResponse),
+}
+
+impl PendingRpcReply {
+    fn pdu(pdu: Pdu) -> Self {
+        Self::Pdu(Box::new(pdu))
+    }
+
+    fn response_name(&self) -> &'static str {
+        match self {
+            Self::Pdu(pdu) => pdu.pdu_name(),
+            Self::Legacy46ListPanesResponse { .. } => "Legacy46ListPanesResponse",
+            Self::Legacy46Rejection(_) => "Legacy46Rejection",
+        }
+    }
+}
+
 enum ReaderMessage {
     SendPdu {
         binding: RpcBinding,
         lease: ClientOutboundLease,
-        promise: Sender<anyhow::Result<Pdu>>,
+        promise: Sender<anyhow::Result<PendingRpcReply>>,
     },
     PublishReady {
         generation: NonZeroU64,
@@ -2589,6 +2695,11 @@ enum ReaderMessage {
         generation: NonZeroU64,
         authority: TopologyFenceAuthority,
         promise: Sender<anyhow::Result<TopologySnapshotDecisionAck>>,
+    },
+    CommitLegacyTopologySnapshot {
+        generation: NonZeroU64,
+        authority: LegacyTopologyFenceAuthority,
+        promise: Sender<anyhow::Result<()>>,
     },
 }
 
@@ -2616,6 +2727,11 @@ impl ReaderMessage {
             | Self::RejectTopologySnapshot { promise, .. } => {
                 let _ = promise.try_send(Err(anyhow!(
                     "mux topology snapshot decision retired before reader admission: {reason}"
+                )));
+            }
+            Self::CommitLegacyTopologySnapshot { promise, .. } => {
+                let _ = promise.try_send(Err(anyhow!(
+                    "legacy mux topology snapshot commit retired before reader admission: {reason}"
                 )));
             }
         }
@@ -3017,11 +3133,11 @@ impl RpcGenerationScope {
         self.send_pdu_expect(pdu, None)
     }
 
-    fn send_pdu_expect(
+    fn send_pdu_expect_reply(
         &self,
         pdu: Pdu,
         expected_response_ident: Option<NonZeroU64>,
-    ) -> impl std::future::Future<Output = anyhow::Result<Pdu>> + Send + 'static {
+    ) -> impl std::future::Future<Output = anyhow::Result<PendingRpcReply>> + Send + 'static {
         let request = pdu.pdu_name();
         let rpc_transport = Arc::clone(&self.rpc_transport);
         let sender = self.sender.clone();
@@ -3031,7 +3147,7 @@ impl RpcGenerationScope {
         // schema counting. The second validation cut below closes a retirement
         // race while the immutable PDU was being measured.
         let attempt = rpc_transport.allocate_attempt(request);
-        let binding: anyhow::Result<RpcBinding> =
+        let binding: anyhow::Result<(RpcBinding, MuxWireDialect)> =
             attempt.map_err(anyhow::Error::new).and_then(|attempt_id| {
                 let Some(generation) = scoped_generation else {
                     return Err(anyhow::Error::new(RpcTransportState::unavailable_error(
@@ -3069,29 +3185,33 @@ impl RpcGenerationScope {
                         RpcRetirementStage::Admission,
                     )));
                 }
-                lifecycle
+                let protocol = lifecycle
                     .protocol_for(generation)
-                    .and_then(|protocol| {
-                        protocol.validate_outbound_pdu(&pdu, RpcOutboundAdmissionPoint::Preflight)
-                    })
+                    .map_err(anyhow::Error::new)?;
+                protocol
+                    .validate_outbound_pdu(&pdu, RpcOutboundAdmissionPoint::Preflight)
                     .map_err(|error| {
                         record_ordinary_mux_protocol_rejection(&error, "outbound", "preflight");
                         anyhow::Error::new(error)
                     })?;
-                Ok(RpcBinding {
-                    generation,
-                    attempt_id,
-                    request,
-                    expected_response_ident,
-                })
+                Ok((
+                    RpcBinding {
+                        generation,
+                        attempt_id,
+                        request,
+                        expected_response_ident,
+                    },
+                    protocol.wire_dialect(),
+                ))
             });
         // Planning and the worst-case logical-byte reservation both happen
         // synchronously, before this future can allocate a wire serial, touch
         // the pending map, enter the queue, serialize, compress, or write.
         let admission: anyhow::Result<(RpcBinding, ClientOutboundLease)> =
-            binding.and_then(|binding| {
+            binding.and_then(|(binding, dialect)| {
                 let prepared = pdu
-                    .prepare_outbound(
+                    .prepare_outbound_for_dialect(
+                        dialect,
                         PduProducer::Client,
                         PduWireRole::Request,
                         None,
@@ -3116,18 +3236,26 @@ impl RpcGenerationScope {
                             "exact-generation RPC retired while its outbound PDU was being planned",
                         )));
                     }
-                    lifecycle
+                    let protocol = lifecycle
                         .protocol_for(binding.generation)
-                        .and_then(|protocol| {
-                            protocol.validate_outbound_pdu(
-                                prepared.pdu(),
-                                RpcOutboundAdmissionPoint::Preflight,
-                            )
-                        })
+                        .map_err(anyhow::Error::new)?;
+                    protocol
+                        .validate_outbound_pdu(
+                            prepared.pdu(),
+                            RpcOutboundAdmissionPoint::Preflight,
+                        )
                         .map_err(|error| {
                             record_ordinary_mux_protocol_rejection(&error, "outbound", "preflight");
                             anyhow::Error::new(error)
                         })?;
+                    if protocol.wire_dialect() != prepared.dialect() {
+                        bail!(
+                            "mux RPC generation {} changed wire dialect from {} to {} while the exact request was being planned",
+                            binding.generation,
+                            prepared.dialect().codec_version(),
+                            protocol.wire_dialect().codec_version(),
+                        );
+                    }
                 }
                 let lease = rpc_transport
                     .outbound_budget
@@ -3221,6 +3349,30 @@ impl RpcGenerationScope {
         }
     }
 
+    fn send_pdu_expect(
+        &self,
+        pdu: Pdu,
+        expected_response_ident: Option<NonZeroU64>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Pdu>> + Send + 'static {
+        let request_name = pdu.pdu_name();
+        let request = self.send_pdu_expect_reply(pdu, expected_response_ident);
+        async move {
+            match request.await? {
+                PendingRpcReply::Pdu(pdu) => Ok(*pdu),
+                PendingRpcReply::Legacy46Rejection(rejection) => {
+                    Err(anyhow::Error::new(Legacy46RpcRejection {
+                        request: request_name,
+                        effect_authority: rejection.effect_authority(),
+                        retry_authority: rejection.retry_authority(),
+                    }))
+                }
+                PendingRpcReply::Legacy46ListPanesResponse { .. } => {
+                    bail!("legacy topology reply escaped its snapshot consumer for {request_name}")
+                }
+            }
+        }
+    }
+
     async fn decide_topology_snapshot(
         &self,
         authority: TopologyFenceAuthority,
@@ -3296,6 +3448,59 @@ impl RpcGenerationScope {
         }
     }
 
+    async fn commit_legacy_topology_snapshot(
+        &self,
+        authority: LegacyTopologyFenceAuthority,
+    ) -> anyhow::Result<()> {
+        let generation = self.generation.ok_or_else(|| {
+            anyhow!("cannot commit a legacy topology snapshot on an unavailable scope")
+        })?;
+        if authority.generation != generation {
+            bail!(
+                "legacy topology authority generation {} does not match scope {}",
+                authority.generation,
+                generation
+            );
+        }
+        let reader_abort = self
+            .reader_abort
+            .as_ref()
+            .filter(|reader| reader.generation == generation)
+            .cloned()
+            .ok_or_else(|| anyhow!("legacy topology commit lacks exact reader authority"))?;
+        let (promise, receiver) = bounded(1);
+        {
+            let lifecycle = self.rpc_transport.lifecycle.lock();
+            if !matches!(
+                lifecycle.phase,
+                RpcTransportPhase::Live(observed) if observed == generation
+            ) || self
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire)
+                != generation.get()
+                || !Arc::ptr_eq(&lifecycle.reader_abort, &reader_abort)
+            {
+                bail!(
+                    "legacy topology commit lost exact generation {} before enqueue",
+                    generation
+                );
+            }
+            self.sender
+                .try_send(ReaderMessage::CommitLegacyTopologySnapshot {
+                    generation,
+                    authority,
+                    promise,
+                })
+                .map_err(|_| anyhow!("legacy topology commit reader queue is unavailable"))?;
+        }
+        receiver
+            .recv()
+            .await
+            .context("legacy topology commit acknowledgement channel closed")??;
+        Ok(())
+    }
+
     /// Fetch, apply, and commit one exact-generation coherent topology snapshot.
     ///
     /// The per-transport gate remains held from request admission through the
@@ -3305,11 +3510,18 @@ impl RpcGenerationScope {
     pub(crate) async fn with_coherent_topology_snapshot<T>(
         &self,
         consumer: RpcConsumerKind,
-        apply: impl FnOnce(ListPanesResponse) -> anyhow::Result<T>,
+        apply: impl FnOnce(RpcTopologySnapshot) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         let generation = self
             .generation
             .ok_or_else(|| anyhow!("cannot snapshot topology on an unavailable mux RPC scope"))?;
+        let dialect = self
+            .rpc_transport
+            .wire_dialect(generation)
+            .map_err(anyhow::Error::new)?;
+        if dialect.is_legacy46() {
+            return self.with_legacy_topology_snapshot(consumer, apply).await;
+        }
         let reader_abort = self
             .reader_abort
             .as_ref()
@@ -3364,7 +3576,9 @@ impl RpcGenerationScope {
             TopologySnapshotDecisionGuard::new(Arc::clone(&self.rpc_transport), reader_abort);
         request_guard.disarm();
         let applied = self
-            .commit_sync(consumer, || apply(snapshot.panes))
+            .commit_sync(consumer, || {
+                apply(RpcTopologySnapshot::Current(snapshot.panes))
+            })
             .map_err(anyhow::Error::new)?;
         match applied {
             Ok(value) => {
@@ -3384,6 +3598,69 @@ impl RpcGenerationScope {
                 }
                 Err(error).context("applying coherent topology snapshot")
             }
+        }
+    }
+
+    async fn with_legacy_topology_snapshot<T>(
+        &self,
+        consumer: RpcConsumerKind,
+        apply: impl FnOnce(RpcTopologySnapshot) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let generation = self.generation.ok_or_else(|| {
+            anyhow!("cannot snapshot legacy topology on an unavailable mux RPC scope")
+        })?;
+        let reader_abort = self
+            .reader_abort
+            .as_ref()
+            .filter(|authority| authority.generation == generation)
+            .cloned()
+            .ok_or_else(|| anyhow!("legacy topology snapshot lacks reader abort authority"))?;
+        let _topology_gate = self.rpc_transport.topology_sync.lock().await;
+        let mut request_guard = TopologySnapshotRequestGuard::new(
+            Arc::clone(&self.rpc_transport),
+            Arc::clone(&reader_abort),
+        );
+        let reply = self
+            .send_pdu_expect_reply(
+                Pdu::ListPanes(ListPanes {}),
+                Some(
+                    NonZeroU64::new(<ListPanesResponse as PduWireIdent>::IDENT)
+                        .expect("ListPanesResponse has a nonzero wire identity"),
+                ),
+            )
+            .await?;
+        let (response, authority) = match reply {
+            PendingRpcReply::Legacy46ListPanesResponse {
+                response,
+                authority,
+            } => (response, authority),
+            PendingRpcReply::Legacy46Rejection(rejection) => {
+                return Err(anyhow::Error::new(Legacy46RpcRejection {
+                    request: "ListPanes",
+                    effect_authority: rejection.effect_authority(),
+                    retry_authority: rejection.retry_authority(),
+                }));
+            }
+            PendingRpcReply::Pdu(other) => {
+                bail!(
+                    "unexpected {} response to codec-46 ListPanes",
+                    other.pdu_name()
+                );
+            }
+        };
+        let mut decision =
+            TopologySnapshotDecisionGuard::new(Arc::clone(&self.rpc_transport), reader_abort);
+        request_guard.disarm();
+        let applied = self
+            .commit_sync(consumer, || apply(RpcTopologySnapshot::Legacy46(response)))
+            .map_err(anyhow::Error::new)?;
+        match applied {
+            Ok(value) => {
+                self.commit_legacy_topology_snapshot(authority).await?;
+                decision.disarm();
+                Ok(value)
+            }
+            Err(error) => Err(error).context("applying codec-46 topology snapshot"),
         }
     }
 }
@@ -4743,6 +5020,12 @@ struct ClientTopologyAwaitingCommit {
 }
 
 #[derive(Debug)]
+struct ClientLegacyTopologyAwaitingCommit {
+    serial: NonZeroU64,
+    buffered: PreReadyUnilateralQueue,
+}
+
+#[derive(Debug)]
 struct EstablishedClientTopologyStream {
     authority: TopologyFenceAuthority,
     next_revision: Option<TopologyRevision>,
@@ -4755,6 +5038,7 @@ enum ClientTopologyPhase {
     Legacy,
     Fencing(ClientTopologyFenceInFlight),
     AwaitingCommit(ClientTopologyAwaitingCommit),
+    LegacyAwaitingCommit(ClientLegacyTopologyAwaitingCommit),
     Established(EstablishedClientTopologyStream),
     Closed,
 }
@@ -4778,6 +5062,30 @@ enum ClientTopologyUnilateralAction {
 }
 
 impl ClientTopologyCoordinator {
+    fn begin_legacy_fence(&mut self, serial: NonZeroU64) -> anyhow::Result<()> {
+        let phase = std::mem::replace(&mut self.phase, ClientTopologyPhase::Closed);
+        self.phase = match phase {
+            ClientTopologyPhase::Legacy => {
+                ClientTopologyPhase::Fencing(ClientTopologyFenceInFlight {
+                    serial,
+                    prior: ClientTopologyPrior::Legacy {
+                        buffered: PreReadyUnilateralQueue::default(),
+                    },
+                })
+            }
+            other => {
+                self.phase = other;
+                bail!("overlapping or cross-dialect legacy topology snapshot request")
+            }
+        };
+        metrics::counter!(
+            "mux.client.topology_fence.total",
+            "outcome" => "legacy_request_admitted"
+        )
+        .increment(1);
+        Ok(())
+    }
+
     fn begin_fence(&mut self, serial: NonZeroU64) -> anyhow::Result<()> {
         let phase = std::mem::replace(&mut self.phase, ClientTopologyPhase::Closed);
         self.phase = match phase {
@@ -4802,6 +5110,10 @@ impl ClientTopologyCoordinator {
             ClientTopologyPhase::AwaitingCommit(awaiting) => {
                 self.phase = ClientTopologyPhase::AwaitingCommit(awaiting);
                 bail!("a coherent topology snapshot request preceded consumer commit")
+            }
+            ClientTopologyPhase::LegacyAwaitingCommit(awaiting) => {
+                self.phase = ClientTopologyPhase::LegacyAwaitingCommit(awaiting);
+                bail!("a legacy topology snapshot request preceded consumer commit")
             }
             ClientTopologyPhase::Closed => {
                 self.phase = ClientTopologyPhase::Closed;
@@ -4845,6 +5157,16 @@ impl ClientTopologyCoordinator {
                     bail!("legacy topology PDU crossed an established stamped-stream fence")
                 }
             },
+            ClientTopologyPhase::LegacyAwaitingCommit(awaiting) => {
+                awaiting.buffered.enqueue_with_limits(
+                    decoded,
+                    0,
+                    0,
+                    MAX_TOPOLOGY_FENCE_EVENTS,
+                    MAX_TOPOLOGY_FENCE_BYTES,
+                )?;
+                Ok(ClientTopologyUnilateralAction::Buffered)
+            }
             ClientTopologyPhase::AwaitingCommit(_) | ClientTopologyPhase::Established(_) => {
                 bail!("legacy topology PDU arrived after fenced-stream negotiation")
             }
@@ -4884,6 +5206,9 @@ impl ClientTopologyCoordinator {
                 }
                 awaiting.events.insert(event)?;
                 Ok(ClientTopologyUnilateralAction::Buffered)
+            }
+            ClientTopologyPhase::LegacyAwaitingCommit(_) => {
+                bail!("stamped topology event arrived in a codec-46 snapshot gate")
             }
             ClientTopologyPhase::Established(established) => {
                 Self::retain_established_event(established, event)?;
@@ -4985,6 +5310,76 @@ impl ClientTopologyCoordinator {
                 other.pdu_name()
             ),
         }
+    }
+
+    fn on_legacy_response(&mut self, serial: NonZeroU64) -> anyhow::Result<()> {
+        let phase = std::mem::replace(&mut self.phase, ClientTopologyPhase::Closed);
+        let ClientTopologyPhase::Fencing(in_flight) = phase else {
+            self.phase = phase;
+            bail!("legacy topology response arrived without an active local fence");
+        };
+        if in_flight.serial != serial {
+            bail!(
+                "legacy topology response serial {} did not match active fence {}",
+                serial,
+                in_flight.serial
+            );
+        }
+        let ClientTopologyPrior::Legacy { buffered } = in_flight.prior else {
+            bail!("legacy topology response crossed an established stamped stream");
+        };
+        self.phase =
+            ClientTopologyPhase::LegacyAwaitingCommit(ClientLegacyTopologyAwaitingCommit {
+                serial,
+                buffered,
+            });
+        metrics::counter!(
+            "mux.client.topology_fence.total",
+            "outcome" => "legacy_snapshot_delivered"
+        )
+        .increment(1);
+        Ok(())
+    }
+
+    fn on_legacy_rejection(&mut self, serial: NonZeroU64) -> anyhow::Result<Vec<DecodedPdu>> {
+        let phase = std::mem::replace(&mut self.phase, ClientTopologyPhase::Closed);
+        let ClientTopologyPhase::Fencing(in_flight) = phase else {
+            self.phase = phase;
+            bail!("legacy topology rejection arrived without an active local fence");
+        };
+        if in_flight.serial != serial {
+            bail!(
+                "legacy topology rejection serial {} did not match active fence {}",
+                serial,
+                in_flight.serial
+            );
+        }
+        self.restore_prior(in_flight.prior)
+    }
+
+    fn commit_legacy(
+        &mut self,
+        authority: LegacyTopologyFenceAuthority,
+    ) -> anyhow::Result<Vec<DecodedPdu>> {
+        let phase = std::mem::replace(&mut self.phase, ClientTopologyPhase::Closed);
+        let ClientTopologyPhase::LegacyAwaitingCommit(mut awaiting) = phase else {
+            self.phase = phase;
+            bail!("legacy topology commit arrived without a delivered snapshot");
+        };
+        if awaiting.serial != authority.serial {
+            bail!("legacy topology commit authority did not match the delivered snapshot");
+        }
+        let mut routed = Vec::new();
+        for queued in awaiting.buffered.take_all() {
+            routed.push(queued.decode()?);
+        }
+        self.phase = ClientTopologyPhase::Legacy;
+        metrics::counter!(
+            "mux.client.topology_fence.total",
+            "outcome" => "legacy_consumer_committed"
+        )
+        .increment(1);
+        Ok(routed)
     }
 
     fn commit(&mut self, authority: TopologyFenceAuthority) -> anyhow::Result<Vec<DecodedPdu>> {
@@ -5633,9 +6028,36 @@ fn validate_ordinary_mux_inbound_header(
     Ok(())
 }
 
+/// Post-materialization counterpart used only by the exact codec-46 decoder.
+/// Current dialects retain the selector/header path above, including bounded
+/// tombstone drainage.
+#[inline]
+fn validate_legacy_mux_inbound_identity(
+    rpc_transport: &RpcTransportState,
+    generation: NonZeroU64,
+    serial: u64,
+    ident: u64,
+    highest_issued: u64,
+) -> anyhow::Result<()> {
+    if let Err(error) = rpc_transport.validate_inbound_identity(generation, serial, ident) {
+        record_ordinary_mux_protocol_rejection(&error, "inbound", "legacy_materialized");
+        return Err(anyhow::Error::new(
+            NotReconnectableError::ProtocolViolation(error),
+        ));
+    }
+    if serial > highest_issued {
+        return Err(anyhow::Error::new(CorruptResponse::SerialAboveCeiling {
+            serial,
+            max_serial: highest_issued,
+        })
+        .context("decoding a legacy dialect PDU"));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PendingRpc {
-    completion: Sender<anyhow::Result<Pdu>>,
+    completion: Sender<anyhow::Result<PendingRpcReply>>,
     binding: RpcBinding,
     stage: RpcRetirementStage,
     effect: PendingRpcEffect,
@@ -5645,6 +6067,7 @@ struct PendingRpc {
 enum PendingRpcEffect {
     Ordinary,
     CoherentTopologyFence,
+    LegacyTopologyFence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5842,7 +6265,7 @@ impl PendingReplies {
     /// retains this same map entry until reply drainage or transport teardown.
     fn admit(
         &mut self,
-        completion: Sender<anyhow::Result<Pdu>>,
+        completion: Sender<anyhow::Result<PendingRpcReply>>,
         binding: RpcBinding,
         effect: PendingRpcEffect,
     ) -> Result<Option<NonZeroU64>, PendingRpcError> {
@@ -6049,6 +6472,63 @@ impl PendingReplies {
         }
     }
 
+    /// Correlate an already materialized legacy frame.
+    ///
+    /// Codec-46 decoding intentionally does not use the current streaming
+    /// selector because changed schemas must be classified by the exact
+    /// dialect decoder. Consequently correlation happens here, after bounded
+    /// decoding, and never enables the current tombstone fast path.
+    fn legacy_materialized_response_effect(
+        &mut self,
+        serial: NonZeroU64,
+        observed_ident: u64,
+    ) -> Result<PendingRpcEffect, PendingRpcError> {
+        let Some(pending) = self.map.get_mut(&serial) else {
+            if serial.get() > self.highest_issued {
+                self.metrics.future_serial.increment(1);
+                return Err(PendingRpcError::FutureSerial {
+                    serial,
+                    highest_issued: self.highest_issued,
+                });
+            }
+            self.metrics.unmatched_serial.increment(1);
+            return Err(PendingRpcError::UnmatchedSerial {
+                serial,
+                highest_issued: self.highest_issued,
+            });
+        };
+        if pending.binding.generation != self.generation {
+            return Err(PendingRpcError::ResponseGenerationMismatch {
+                serial,
+                pending_generation: pending.binding.generation,
+                transport_generation: self.generation,
+            });
+        }
+        pending.stage = RpcRetirementStage::ResponseMatch;
+        self.rpc_transport.validate(
+            pending.binding,
+            RpcRetirementStage::ResponseMatch,
+            RpcDeliveryCertainty::OutcomeUnknown,
+            "transport retired before legacy response correlation",
+        )?;
+
+        let error_response_ident = <ErrorResponse as PduWireIdent>::IDENT;
+        if let Some(expected_response_ident) = pending.binding.expected_response_ident {
+            if observed_ident != expected_response_ident.get()
+                && observed_ident != error_response_ident
+            {
+                self.metrics.unexpected_response_ident.increment(1);
+                return Err(PendingRpcError::UnexpectedResponseIdent {
+                    serial,
+                    request: pending.binding.request,
+                    expected_response_ident: expected_response_ident.get(),
+                    observed_ident,
+                });
+            }
+        }
+        Ok(pending.effect)
+    }
+
     fn complete_discarded_abandoned(
         &mut self,
         serial: NonZeroU64,
@@ -6102,7 +6582,7 @@ impl PendingReplies {
     fn complete(
         &mut self,
         serial: NonZeroU64,
-        pdu: Pdu,
+        reply: PendingRpcReply,
     ) -> Result<ReplyCompletion, PendingRpcError> {
         let Some(pending) = self.map.remove(&serial) else {
             if serial.get() > self.highest_issued {
@@ -6150,8 +6630,8 @@ impl PendingReplies {
             });
         }
 
-        let response_name = pdu.pdu_name();
-        match pending.completion.try_send(Ok(pdu)) {
+        let response_name = reply.response_name();
+        match pending.completion.try_send(Ok(reply)) {
             Ok(()) => {
                 // "delivered" is linearized at successful enqueue into the
                 // one-shot channel; the caller may close before observing it.
@@ -6197,7 +6677,7 @@ impl PendingReplies {
         serial: NonZeroU64,
         pdu: Pdu,
     ) -> Result<ReplyCompletion, PendingRpcError> {
-        match self.complete(serial, pdu) {
+        match self.complete(serial, PendingRpcReply::pdu(pdu)) {
             Ok(disposition) => Ok(disposition),
             Err(error) => {
                 self.fail_all(&error.to_string());
@@ -6274,7 +6754,7 @@ impl PendingReplies {
     }
 
     fn reject_admission(
-        completion: Sender<anyhow::Result<Pdu>>,
+        completion: Sender<anyhow::Result<PendingRpcReply>>,
         error: PendingRpcError,
     ) -> Result<Option<NonZeroU64>, PendingRpcError> {
         let _ = completion.try_send(Err(anyhow!("{error}")));
@@ -6284,7 +6764,7 @@ impl PendingReplies {
     #[cfg(test)]
     fn admit_named(
         &mut self,
-        completion: Sender<anyhow::Result<Pdu>>,
+        completion: Sender<anyhow::Result<PendingRpcReply>>,
         request: &'static str,
     ) -> Result<Option<NonZeroU64>, PendingRpcError> {
         self.admit_named_expect(completion, request, None)
@@ -6293,7 +6773,7 @@ impl PendingReplies {
     #[cfg(test)]
     fn admit_named_expect(
         &mut self,
-        completion: Sender<anyhow::Result<Pdu>>,
+        completion: Sender<anyhow::Result<PendingRpcReply>>,
         request: &'static str,
         expected_response_ident: Option<NonZeroU64>,
     ) -> Result<Option<NonZeroU64>, PendingRpcError> {
@@ -6850,6 +7330,10 @@ async fn client_thread_async(
             decoded: DecodedPdu,
             effect: Option<PendingRpcEffect>,
         },
+        DecodedLegacy {
+            decoded: DecodedMuxWirePdu,
+            effect: Option<PendingRpcEffect>,
+        },
         Discarded {
             serial: NonZeroU64,
             body: DiscardedPduBody,
@@ -6992,6 +7476,51 @@ async fn client_thread_async(
                         "coherent topology snapshot consumer rejected generation {}",
                         generation
                     );
+                }
+                NextEvent::Message(Ok(ReaderMessage::CommitLegacyTopologySnapshot {
+                    generation: committed_generation,
+                    authority,
+                    promise,
+                })) => {
+                    if committed_generation != generation || authority.generation != generation {
+                        let _ = promise.try_send(Err(anyhow!(
+                            "legacy topology commit for generation {} reached reader {}",
+                            committed_generation,
+                            generation
+                        )));
+                        continue;
+                    }
+                    let routed = match topology.commit_legacy(authority) {
+                        Ok(routed) => routed,
+                        Err(error) => {
+                            let message = format!(
+                                "legacy topology commit failed on generation {}: {error:#}",
+                                generation
+                            );
+                            let _ = promise.try_send(Err(anyhow!(message.clone())));
+                            return Err(error).context(message);
+                        }
+                    };
+                    if let Err(error) = route_client_unilateral_batch(
+                        dispatch_authority,
+                        generation,
+                        &readiness,
+                        &mut pre_ready_unilateral,
+                        routed,
+                    ) {
+                        let message = format!(
+                            "legacy topology replay failed on generation {}: {error:#}",
+                            generation
+                        );
+                        let _ = promise.try_send(Err(anyhow!(message.clone())));
+                        return Err(error).context(message);
+                    }
+                    match promise.try_send(Ok(())) {
+                        Ok(()) | Err(TrySendError::Closed(_)) => {}
+                        Err(TrySendError::Full(_)) => {
+                            bail!("legacy topology commit acknowledgement channel was full");
+                        }
+                    }
                 }
                 NextEvent::Message(Ok(ReaderMessage::PublishReady {
                     generation: published_generation,
@@ -7180,6 +7709,10 @@ async fn client_thread_async(
                     }
                     let effect = if matches!(prepared.pdu(), Pdu::ListPanesCoherent(_)) {
                         PendingRpcEffect::CoherentTopologyFence
+                    } else if prepared.dialect().is_legacy46()
+                        && matches!(prepared.pdu(), Pdu::ListPanes(_))
+                    {
+                        PendingRpcEffect::LegacyTopologyFence
                     } else {
                         PendingRpcEffect::Ordinary
                     };
@@ -7197,10 +7730,18 @@ async fn client_thread_async(
                         }
                         Err(error) => return Err(anyhow::Error::new(error)),
                     };
-                    if effect == PendingRpcEffect::CoherentTopologyFence {
-                        topology
-                            .begin_fence(serial)
-                            .context("admitting a coherent client topology fence")?;
+                    match effect {
+                        PendingRpcEffect::CoherentTopologyFence => {
+                            topology
+                                .begin_fence(serial)
+                                .context("admitting a coherent client topology fence")?;
+                        }
+                        PendingRpcEffect::LegacyTopologyFence => {
+                            topology
+                                .begin_legacy_fence(serial)
+                                .context("admitting a local codec-46 topology fence")?;
+                        }
+                        PendingRpcEffect::Ordinary => {}
                     }
 
                     pending.set_stage(serial, RpcRetirementStage::FrameEncoding)?;
@@ -7282,8 +7823,35 @@ async fn client_thread_async(
                     let rpc_transport = Arc::clone(&dispatch_authority.rpc_transport);
                     let inbound = rpc_transport
                         .complete_before_reader_stop(&reader_abort, async {
-                            let mut selected_effect = None;
                             let highest_issued = pending.highest_issued();
+                            let dialect = rpc_transport
+                                .wire_dialect(generation)
+                                .map_err(NotReconnectableError::ProtocolViolation)?;
+                            if dialect.is_legacy46() {
+                                let decoded = Pdu::decode_async_for_dialect(
+                                    &mut reader,
+                                    None,
+                                    dialect,
+                                )
+                                .await?;
+                                let serial = decoded.serial();
+                                let ident = decoded.payload().ident();
+                                validate_legacy_mux_inbound_identity(
+                                    &rpc_transport,
+                                    generation,
+                                    serial,
+                                    ident,
+                                    highest_issued,
+                                )?;
+                                let effect = NonZeroU64::new(serial)
+                                    .map(|serial| {
+                                        pending.legacy_materialized_response_effect(serial, ident)
+                                    })
+                                    .transpose()?;
+                                return Ok(InboundPdu::DecodedLegacy { decoded, effect });
+                            }
+
+                            let mut selected_effect = None;
                             // The codec's optional serial ceiling is checked
                             // before it reads the PDU identity. Pass `None` so
                             // the selector can classify every inactive or
@@ -7338,6 +7906,125 @@ async fn client_thread_async(
                         })
                         .await?;
                     match inbound {
+                        Ok(InboundPdu::DecodedLegacy { decoded, effect }) => {
+                            let (decoded_serial, payload) = decoded.into_parts();
+                            log::debug!(
+                                "decoded codec-46 serial {} {}",
+                                decoded_serial,
+                                payload.pdu_name()
+                            );
+                            if decoded_serial == 0 {
+                                let MuxWireDecodedPayload::Pdu(pdu) = payload else {
+                                    bail!(
+                                        "codec-46 unilateral frame decoded to non-routable {}",
+                                        payload.pdu_name()
+                                    );
+                                };
+                                let decoded = DecodedPdu {
+                                    serial: decoded_serial,
+                                    pdu,
+                                };
+                                match topology.on_unilateral(decoded)? {
+                                    ClientTopologyUnilateralAction::Buffered => {}
+                                    ClientTopologyUnilateralAction::Route(routed) => {
+                                        route_client_unilateral_batch(
+                                            dispatch_authority,
+                                            generation,
+                                            &readiness,
+                                            &mut pre_ready_unilateral,
+                                            routed,
+                                        )?;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            let serial = NonZeroU64::new(decoded_serial)
+                                .expect("the unilateral serial-zero branch was handled above");
+                            let effect = effect.ok_or_else(|| {
+                                anyhow!(
+                                    "decoded codec-46 RPC serial {} without exact response correlation",
+                                    serial
+                                )
+                            })?;
+                            let binding = pending.binding_for_correlated_response(serial);
+                            match payload {
+                                MuxWireDecodedPayload::Pdu(pdu) => {
+                                    if effect != PendingRpcEffect::Ordinary {
+                                        bail!(
+                                            "codec-46 topology fence received unexpected {}",
+                                            pdu.pdu_name()
+                                        );
+                                    }
+                                    rpc_transport
+                                        .complete_protocol_response(
+                                            generation,
+                                            binding.request,
+                                            &pdu,
+                                        )
+                                        .map_err(NotReconnectableError::ProtocolViolation)?;
+                                    pending.complete(serial, PendingRpcReply::pdu(pdu))?;
+                                }
+                                MuxWireDecodedPayload::Legacy46ListPanesResponse(response) => {
+                                    if effect != PendingRpcEffect::LegacyTopologyFence {
+                                        bail!(
+                                            "codec-46 topology response matched an ordinary RPC serial {}",
+                                            serial
+                                        );
+                                    }
+                                    topology.on_legacy_response(serial)?;
+                                    let completion = pending.complete(
+                                        serial,
+                                        PendingRpcReply::Legacy46ListPanesResponse {
+                                            response,
+                                            authority: LegacyTopologyFenceAuthority {
+                                                generation,
+                                                serial,
+                                            },
+                                        },
+                                    )?;
+                                    if completion.disposition == ReplyDisposition::Abandoned {
+                                        bail!(
+                                            "codec-46 topology snapshot consumer abandoned generation {} before local commit",
+                                            generation
+                                        );
+                                    }
+                                }
+                                MuxWireDecodedPayload::Legacy46Rejection(rejection) => {
+                                    if effect == PendingRpcEffect::CoherentTopologyFence {
+                                        bail!(
+                                            "codec-46 rejection crossed a current coherent topology fence"
+                                        );
+                                    }
+                                    if effect == PendingRpcEffect::LegacyTopologyFence {
+                                        let routed = topology.on_legacy_rejection(serial)?;
+                                        route_client_unilateral_batch(
+                                            dispatch_authority,
+                                            generation,
+                                            &readiness,
+                                            &mut pre_ready_unilateral,
+                                            routed,
+                                        )?;
+                                    }
+                                    pending.complete(
+                                        serial,
+                                        PendingRpcReply::Legacy46Rejection(rejection),
+                                    )?;
+                                }
+                                MuxWireDecodedPayload::Legacy46SendPaste(_) => {
+                                    bail!(
+                                        "codec-46 client received a server-side SendPaste request"
+                                    );
+                                }
+                                MuxWireDecodedPayload::Unsupported(unsupported) => {
+                                    bail!(
+                                        "codec-46 frame {} is unsupported: {:?}",
+                                        unsupported.ident(),
+                                        unsupported.reason()
+                                    );
+                                }
+                            }
+                        }
                         Ok(InboundPdu::Decoded { decoded, effect }) => {
                             log::debug!(
                                 "decoded serial {} {}",
@@ -7417,7 +8104,8 @@ async fn client_thread_async(
                                         )
                                         .map_err(NotReconnectableError::ProtocolViolation)?;
                                 }
-                                let completion = pending.complete(serial, decoded.pdu)?;
+                                let completion = pending
+                                    .complete(serial, PendingRpcReply::pdu(decoded.pdu))?;
                                 if awaiting_commit
                                     && completion.disposition == ReplyDisposition::Abandoned
                                 {
@@ -9310,7 +9998,7 @@ impl Client {
                         return Err(err.into());
                     }
                 };
-                if codec.agreed < TOPOLOGY_FENCE_MIN_CODEC_VERSION {
+                if !codec.dialect.is_legacy46() && codec.agreed < TOPOLOGY_FENCE_MIN_CODEC_VERSION {
                     let error = MissingTopologyFenceProtocolError {
                         remote_codec_version: info.codec_vers,
                         minimum_codec_version: TOPOLOGY_FENCE_MIN_CODEC_VERSION,
@@ -9327,6 +10015,19 @@ impl Client {
                         generation
                     )
                 })?;
+                if codec.dialect.is_legacy46() {
+                    metrics::counter!(
+                        "mux.client.legacy46_connection.total",
+                        "outcome" => "degraded_safe"
+                    )
+                    .increment(1);
+                    let warning = format!(
+                        "Connected to legacy codec-46 mux server {} in degraded-safe mode: tiled topology and text terminal I/O are available; floating-pane state is unavailable and will be preserved locally rather than treated as empty.\n",
+                        info.version_string
+                    );
+                    ui.output_str(&warning);
+                    log::warn!("{}", warning.trim_end());
+                }
                 if info.codec_vers != CODEC_VERSION {
                     log::warn!(
                         "Codec compat window: server={}, client={}, agreed={} \
@@ -9787,7 +10488,7 @@ impl TestRpcPeer {
             outcome: ReliableKeyEventOutcomeV1::Applied,
         });
         promise
-            .send(Ok(response))
+            .send(Ok(PendingRpcReply::pdu(response)))
             .await
             .map_err(|_| anyhow!("test reliable RPC caller retired before response"))?;
         drop(prepared);
@@ -9830,7 +10531,7 @@ impl TestRpcPeer {
             outcome,
         });
         promise
-            .send(Ok(response))
+            .send(Ok(PendingRpcReply::pdu(response)))
             .await
             .map_err(|_| anyhow!("test reliable pane-write RPC caller retired before response"))?;
         drop(prepared);
@@ -9858,6 +10559,7 @@ impl TestRpcPeer {
             .claim_for_reader()?
             .ok_or_else(|| anyhow!("test unit-response RPC was cancelled before reader claim"))?;
         let request = match prepared.pdu() {
+            Pdu::WriteToPane(request) => Pdu::WriteToPane(request.clone()),
             Pdu::SendPaste(request) => Pdu::SendPaste(request.clone()),
             Pdu::SendPasteTracedV1(request) => Pdu::SendPasteTracedV1(request.clone()),
             other => bail!(
@@ -9866,7 +10568,7 @@ impl TestRpcPeer {
             ),
         };
         promise
-            .send(Ok(Pdu::UnitResponse(UnitResponse {})))
+            .send(Ok(PendingRpcReply::pdu(Pdu::UnitResponse(UnitResponse {}))))
             .await
             .map_err(|_| anyhow!("test unit-response RPC caller retired before response"))?;
         drop(prepared);
@@ -9891,10 +10593,16 @@ impl Client {
         )
     }
 
-    fn test_reader_message(&self, pdu: Pdu, promise: Sender<anyhow::Result<Pdu>>) -> ReaderMessage {
+    fn test_reader_message(
+        &self,
+        pdu: Pdu,
+        promise: Sender<anyhow::Result<PendingRpcReply>>,
+    ) -> ReaderMessage {
         let request = pdu.pdu_name();
         let prepared = pdu
-            .prepare_outbound(
+            .prepare_outbound_for_dialect(
+                MuxWireDialect::current(CODEC_VERSION)
+                    .expect("tests use the current exact wire dialect"),
                 PduProducer::Client,
                 PduWireRole::Request,
                 None,
@@ -10651,8 +11359,7 @@ mod tests {
         let scheduler_retry = &reconnect_dispatch[scheduler_rejection..];
         assert!(
             scheduler_retry.contains("abort_rpc_transport_generation(")
-                && scheduler_retry
-                    .contains("successor topology scheduler admission failed")
+                && scheduler_retry.contains("successor topology scheduler admission failed")
                 && scheduler_retry.contains("reconnected = true"),
             "transient scheduler rejection must fence the exact successor and enter ordinary generation retirement before retry"
         );
@@ -10729,9 +11436,11 @@ mod tests {
         let records = logger.records.lock().expect("test logger lock");
         assert_eq!(records.len(), MAX_CAPTURED_COMPAT_WARNINGS);
         assert!(records.iter().all(|record| record.starts_with("WARN ")));
-        assert!(records
-            .last()
-            .is_some_and(|record| record.ends_with("server=31")));
+        assert!(
+            records
+                .last()
+                .is_some_and(|record| record.ends_with("server=31"))
+        );
     }
 
     fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -11573,10 +12282,7 @@ mod tests {
             .rpc_transport
             .active_generation()
             .expect("local-gate test transport starts live");
-        let synthetic_agreed = <ListPanesTabStacks as PduWireIdent>::WIRE_SPEC
-            .min_codec_version
-            .checked_sub(1)
-            .expect("tab-stack request has a nonzero dialect floor");
+        let synthetic_agreed = LEGACY46_CODEC_VERSION;
         client.rpc_transport.lifecycle.lock().protocol = Some(
             RpcProtocolAuthority::established_for_test(generation, synthetic_agreed),
         );
@@ -11595,8 +12301,13 @@ mod tests {
             })
         );
         let above_dialect =
-            asupersync_block_on(client.send_pdu(Pdu::ListPanesTabStacks(ListPanesTabStacks {})))
-                .expect_err("a request above the agreed dialect must fail at local preflight");
+            asupersync_block_on(client.send_pdu(Pdu::ListPanesCoherent(ListPanesCoherent {
+                supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            })))
+            .expect_err(
+                "a request absent from the exact legacy dialect must fail at local preflight",
+            );
         assert!(matches!(
             above_dialect.downcast_ref::<OrdinaryMuxProtocolError>(),
             Some(OrdinaryMuxProtocolError::DialectViolation {
@@ -11604,9 +12315,9 @@ mod tests {
                 required,
                 agreed,
                 ..
-            }) if *ident == <ListPanesTabStacks as PduWireIdent>::IDENT
+            }) if *ident == <ListPanesCoherent as PduWireIdent>::IDENT
                 && *required
-                    == <ListPanesTabStacks as PduWireIdent>::WIRE_SPEC.min_codec_version
+                    == <ListPanesCoherent as PduWireIdent>::WIRE_SPEC.min_codec_version
                 && *agreed == synthetic_agreed
         ));
         assert!(matches!(
@@ -11638,7 +12349,7 @@ mod tests {
                     .expect("valid successor request must retain its exact PDU");
                 assert!(matches!(prepared.pdu(), Pdu::Ping(_)));
                 promise
-                    .send(Ok(Pdu::Pong(Pong {})))
+                    .send(Ok(PendingRpcReply::pdu(Pdu::Pong(Pong {}))))
                     .await
                     .expect("valid successor caller must remain live");
             },
@@ -11671,6 +12382,12 @@ mod tests {
             .expect("legacy min zero must conservatively mean remote max only");
         assert_eq!(legacy.remote_min, CODEC_VERSION);
         assert_eq!(legacy.agreed, CODEC_VERSION);
+
+        let legacy46 = RpcCodecAuthority::negotiate(generation, LEGACY46_CODEC_VERSION, 0)
+            .expect("the exact frozen codec-46 dialect must remain reconnectable");
+        assert_eq!(legacy46.remote_min, LEGACY46_CODEC_VERSION);
+        assert_eq!(legacy46.agreed, LEGACY46_CODEC_VERSION);
+        assert_eq!(legacy46.dialect, MuxWireDialect::LEGACY46);
 
         assert!(RpcCodecAuthority::negotiate(generation, disjoint_max, disjoint_max).is_err());
         assert!(RpcCodecAuthority::negotiate(generation, disjoint_max, CODEC_VERSION).is_err());
@@ -11720,6 +12437,27 @@ mod tests {
             );
         }
 
+        let RealHandshakeProbe {
+            result,
+            transcript,
+            codec,
+            phase,
+            ready_generation,
+            connection_generation,
+        } = run_real_socket_pair_handshake(LEGACY46_CODEC_VERSION, LEGACY46_CODEC_VERSION, true);
+        let info = result.expect("exact codec-46 socket handshake must reconnect");
+        assert_eq!(info.codec_vers, LEGACY46_CODEC_VERSION);
+        assert_eq!(info.min_supported, LEGACY46_CODEC_VERSION);
+        assert_eq!(transcript, ["GetCodecVersion", "SetClientId"]);
+        let codec = codec.expect("exact codec-46 handshake must retain codec authority");
+        assert_eq!(codec.remote_max, LEGACY46_CODEC_VERSION);
+        assert_eq!(codec.remote_min, LEGACY46_CODEC_VERSION);
+        assert_eq!(codec.agreed, LEGACY46_CODEC_VERSION);
+        assert_eq!(codec.dialect, MuxWireDialect::LEGACY46);
+        assert_eq!(phase, Some(RpcProtocolPhase::Established));
+        assert_eq!(ready_generation, INITIAL_CONNECTION_GENERATION);
+        assert_eq!(connection_generation, INITIAL_CONNECTION_GENERATION);
+
         for (remote_max, remote_min, label) in [
             (disjoint_max, disjoint_max, "lower-disjoint-window"),
             (disjoint_max, CODEC_VERSION, "impossible-window"),
@@ -11753,6 +12491,211 @@ mod tests {
                 "{label} must not publish a successor generation"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_legacy46_socket_handshake_and_topology_commit_use_one_live_generation() {
+        fn append_leb128(mut value: u64, target: &mut Vec<u8>) {
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                target.push(byte);
+                if value == 0 {
+                    return;
+                }
+            }
+        }
+
+        fn empty_legacy46_topology_frame(serial: u64) -> Vec<u8> {
+            // Exact v46 PDU4 body: three empty positional fields
+            // (tabs, tab_titles, window_titles), with no fourth floating-pane
+            // vector. Build the frame independently from the current PDU4
+            // encoder so this test cannot accidentally serialize that field.
+            let body = [0_u8, 0_u8, 0_u8];
+            let mut serial_field = Vec::new();
+            append_leb128(serial, &mut serial_field);
+            let ident = <ListPanesResponse as PduWireIdent>::IDENT;
+            let mut ident_field = Vec::new();
+            append_leb128(ident, &mut ident_field);
+            let tagged_len = serial_field
+                .len()
+                .checked_add(ident_field.len())
+                .and_then(|bytes| bytes.checked_add(body.len()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .expect("small legacy topology frame length must fit");
+            let mut frame = Vec::new();
+            append_leb128(tagged_len, &mut frame);
+            frame.extend(serial_field);
+            frame.extend(ident_field);
+            frame.extend(body);
+            frame
+        }
+
+        let _watchdog = hang_watchdog(20, "exact codec-46 topology socket", 99);
+        let (client_stream, mut server_stream) =
+            UnixStream::pair().expect("create exact codec-46 socket pair");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound codec-46 server reads");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("bound codec-46 server writes");
+        let (release_server_tx, release_server_rx) = mpsc::channel::<()>();
+        let server = std::thread::Builder::new()
+            .name("ft-exact-codec46-topology-server".to_string())
+            .spawn(move || -> anyhow::Result<Vec<&'static str>> {
+                let mut transcript = Vec::new();
+                let bootstrap =
+                    Pdu::decode_for_dialect(&mut server_stream, MuxWireDialect::LEGACY46)
+                        .context("decode exact codec-46 GetCodecVersion")?;
+                let (bootstrap_serial, MuxWireDecodedPayload::Pdu(bootstrap)) =
+                    bootstrap.into_parts()
+                else {
+                    bail!("codec-46 bootstrap decoded to a changed legacy schema");
+                };
+                anyhow::ensure!(
+                    matches!(bootstrap, Pdu::GetCodecVersion(_)),
+                    "codec-46 bootstrap did not begin with GetCodecVersion"
+                );
+                transcript.push("GetCodecVersion");
+                let version_frame = Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                    codec_vers: LEGACY46_CODEC_VERSION,
+                    version_string: "captured-live-compatible-codec46".to_string(),
+                    executable_path: PathBuf::from("/test/frankenterm-mux-server-v46"),
+                    config_file_path: None,
+                    min_supported: LEGACY46_CODEC_VERSION,
+                })
+                .prepare_outbound_for_dialect(
+                    MuxWireDialect::LEGACY46,
+                    PduProducer::Server,
+                    PduWireRole::CorrelatedReply,
+                    Some(&<GetCodecVersion as PduWireIdent>::WIRE_SPEC),
+                    CompressionMode::Never,
+                )
+                .context("plan exact codec-46 version response")?
+                .encode_frame(bootstrap_serial)
+                .context("encode exact codec-46 version response")?;
+                Write::write_all(&mut server_stream, &version_frame)
+                    .context("write exact codec-46 version response")?;
+                Write::flush(&mut server_stream)
+                    .context("flush exact codec-46 version response")?;
+
+                let registration =
+                    Pdu::decode_for_dialect(&mut server_stream, MuxWireDialect::LEGACY46)
+                        .context("decode exact codec-46 SetClientId")?;
+                let (registration_serial, MuxWireDecodedPayload::Pdu(registration)) =
+                    registration.into_parts()
+                else {
+                    bail!("codec-46 registration decoded to a changed legacy schema");
+                };
+                anyhow::ensure!(
+                    matches!(registration, Pdu::SetClientId(_)),
+                    "codec-46 bootstrap did not continue with SetClientId"
+                );
+                transcript.push("SetClientId");
+                let registration_frame = Pdu::UnitResponse(UnitResponse {})
+                    .prepare_outbound_for_dialect(
+                        MuxWireDialect::LEGACY46,
+                        PduProducer::Server,
+                        PduWireRole::CorrelatedReply,
+                        Some(&<SetClientId as PduWireIdent>::WIRE_SPEC),
+                        CompressionMode::Never,
+                    )
+                    .context("plan exact codec-46 registration response")?
+                    .encode_frame(registration_serial)
+                    .context("encode exact codec-46 registration response")?;
+                Write::write_all(&mut server_stream, &registration_frame)
+                    .context("write exact codec-46 registration response")?;
+                Write::flush(&mut server_stream)
+                    .context("flush exact codec-46 registration response")?;
+
+                let topology =
+                    Pdu::decode_for_dialect(&mut server_stream, MuxWireDialect::LEGACY46)
+                        .context("decode exact codec-46 ListPanes")?;
+                let (topology_serial, MuxWireDecodedPayload::Pdu(topology)) = topology.into_parts()
+                else {
+                    bail!("codec-46 topology request decoded to a changed legacy schema");
+                };
+                anyhow::ensure!(
+                    matches!(topology, Pdu::ListPanes(_)),
+                    "codec-46 topology did not use ListPanes"
+                );
+                transcript.push("ListPanes");
+                let topology_frame = empty_legacy46_topology_frame(topology_serial);
+                Write::write_all(&mut server_stream, &topology_frame)
+                    .context("write exact three-field codec-46 topology response")?;
+                Write::flush(&mut server_stream)
+                    .context("flush exact three-field codec-46 topology response")?;
+
+                release_server_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .context("hold exact codec-46 socket through client assertions")?;
+                Ok(transcript)
+            })
+            .expect("spawn exact codec-46 topology server");
+
+        let client_domain_config = ClientDomainConfig::Unix(UnixDomain {
+            name: "ft-exact-codec46-topology".to_string(),
+            no_serve_automatically: true,
+            read_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
+            ..Default::default()
+        });
+        let reconnectable = Reconnectable::new(client_domain_config, Some(Box::new(client_stream)));
+        let client = Client::new(None, reconnectable, Weak::new());
+        let ui = ConnectionUI::new_headless();
+        let applied = asupersync_block_on(async {
+            let info = client.verify_version_compat(&ui).await?;
+            anyhow::ensure!(info.codec_vers == LEGACY46_CODEC_VERSION);
+            client
+                .rpc_scope()
+                .with_coherent_topology_snapshot(RpcConsumerKind::TopologySnapshot, |snapshot| {
+                    match snapshot {
+                        RpcTopologySnapshot::Legacy46(topology) => {
+                            anyhow::ensure!(topology.tabs().is_empty());
+                            anyhow::ensure!(topology.tab_titles().is_empty());
+                            anyhow::ensure!(topology.window_titles().is_empty());
+                            anyhow::ensure!(
+                                topology.floating_pane_state()
+                                    == Legacy46FloatingPaneState::Unavailable
+                            );
+                            Ok("legacy46-snapshot-committed")
+                        }
+                        RpcTopologySnapshot::Current(_) => {
+                            bail!("exact codec-46 socket selected the current topology schema")
+                        }
+                    }
+                })
+                .await
+        })
+        .expect("exact codec-46 handshake and local topology commit must complete");
+        assert_eq!(applied, "legacy46-snapshot-committed");
+        let generation = NonZeroU64::new(INITIAL_CONNECTION_GENERATION)
+            .expect("initial connection generation is nonzero");
+        let codec = client
+            .rpc_transport
+            .codec_authority(generation)
+            .expect("exact codec-46 authority must remain live after topology commit");
+        assert_eq!(codec.dialect, MuxWireDialect::LEGACY46);
+        assert_eq!(
+            client.connection_generation.load(AtomicOrdering::Acquire),
+            INITIAL_CONNECTION_GENERATION,
+            "successful codec-46 topology must not mint a reconnect generation"
+        );
+
+        release_server_tx
+            .send(())
+            .expect("release exact codec-46 test server");
+        let transcript = server
+            .join()
+            .expect("exact codec-46 server thread panicked")
+            .expect("exact codec-46 server failed");
+        assert_eq!(transcript, ["GetCodecVersion", "SetClientId", "ListPanes"]);
+        drop(client);
     }
 
     #[test]
@@ -12054,7 +12997,7 @@ mod tests {
                     .complete_protocol_response(generation, binding.request, &response)
                     .expect("replacement registration establishes the protocol");
                 promise
-                    .send(Ok(response))
+                    .send(Ok(PendingRpcReply::pdu(response)))
                     .await
                     .expect("replacement registration caller remains live");
             },
@@ -12084,9 +13027,11 @@ mod tests {
             .expect("register pending readiness participant");
         let error = asupersync_block_on(client.publish_rpc_transport_ready(&rpc, &guard))
             .expect_err("readiness must fail before bootstrap establishes protocol authority");
-        assert!(error
-            .to_string()
-            .contains("before codec negotiation and client registration are established"));
+        assert!(
+            error
+                .to_string()
+                .contains("before codec negotiation and client registration are established")
+        );
         assert_eq!(
             client
                 .rpc_transport
@@ -12114,13 +13059,10 @@ mod tests {
             (PduProducer::Server, PduWireRole::Unilateral),
         ];
 
+        let mut closed_dialects = vec![LEGACY46_CODEC_VERSION];
+        closed_dialects.extend(codec::CODEC_VERSION_MIN_SUPPORTED..=CODEC_VERSION);
         for spec in Pdu::all_wire_specs() {
-            for agreed in [
-                spec.min_codec_version.saturating_sub(1),
-                spec.min_codec_version,
-                CODEC_VERSION,
-                CODEC_VERSION + 1,
-            ] {
+            for agreed in closed_dialects.iter().copied() {
                 let mut protocol = RpcProtocolAuthority::established_for_test(generation, agreed);
                 protocol.established_capabilities = established;
                 for (producer, role) in endpoint_tuples {
@@ -12139,7 +13081,7 @@ mod tests {
                     };
                     let expected = spec.authorizes(producer, role)
                         && RpcProtocolAuthority::endpoint_is_activated(spec)
-                        && spec.min_codec_version <= agreed
+                        && protocol.wire_dialect().admits_wire_spec(spec)
                         && capability_ok;
                     assert_eq!(
                         protocol
@@ -12539,8 +13481,10 @@ mod tests {
         let reader_abort = rpc_transport
             .reader_abort_for(generation)
             .expect("test reader has generation abort authority");
-        assert!(rpc_transport
-            .request_generation_abort(&reader_abort, "ready-operation cancellation race",));
+        assert!(
+            rpc_transport
+                .request_generation_abort(&reader_abort, "ready-operation cancellation race",)
+        );
 
         let error =
             asupersync_block_on(rpc_transport.complete_before_reader_stop(
@@ -12588,9 +13532,11 @@ mod tests {
             .reader_abort_for(successor_generation)
             .expect("successor has fresh reader abort authority");
 
-        assert!(!authority
-            .rpc_transport
-            .request_generation_abort(&first_abort, "stale first-generation cancellation",));
+        assert!(
+            !authority
+                .rpc_transport
+                .request_generation_abort(&first_abort, "stale first-generation cancellation",)
+        );
         assert!(first_abort.cause().is_none());
         assert!(successor_abort.cause().is_none());
         assert_eq!(
@@ -12833,8 +13779,10 @@ mod tests {
         let reader_abort = rpc_transport
             .reader_abort_for(generation)
             .expect("test reader has generation abort authority");
-        assert!(rpc_transport
-            .request_generation_abort(&reader_abort, "test exact-generation predicate split",));
+        assert!(
+            rpc_transport
+                .request_generation_abort(&reader_abort, "test exact-generation predicate split",)
+        );
 
         assert!(
             rpc_transport.reader_abort_for(generation).is_err(),
@@ -12851,12 +13799,16 @@ mod tests {
         let generation =
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
-        assert!(authority
-            .register_participant()
-            .expect("register first readiness participant"));
-        assert!(authority
-            .register_participant()
-            .expect("register duplicate readiness participant"));
+        assert!(
+            authority
+                .register_participant()
+                .expect("register first readiness participant")
+        );
+        assert!(
+            authority
+                .register_participant()
+                .expect("register duplicate readiness participant")
+        );
 
         assert!(
             !authority.release_participant(true),
@@ -12879,9 +13831,11 @@ mod tests {
         let generation =
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
-        assert!(authority
-            .register_participant()
-            .expect("register readiness participant"));
+        assert!(
+            authority
+                .register_participant()
+                .expect("register readiness participant")
+        );
         assert!(
             authority.release_participant(true),
             "the last cancelled participant must commit one abort"
@@ -12889,15 +13843,19 @@ mod tests {
         let error = authority
             .mark_ready()
             .expect_err("publication cannot race past a committed last-participant abort");
-        assert!(error
-            .to_string()
-            .contains("lost all readiness participants"));
+        assert!(
+            error
+                .to_string()
+                .contains("lost all readiness participants")
+        );
         let error = authority
             .register_participant()
             .expect_err("a late participant cannot resurrect aborted authority");
-        assert!(error
-            .to_string()
-            .contains("already committed readiness abort"));
+        assert!(
+            error
+                .to_string()
+                .contains("already committed readiness abort")
+        );
     }
 
     #[test]
@@ -12906,9 +13864,11 @@ mod tests {
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
         for _ in 0..MAX_RPC_READINESS_PARTICIPANTS {
-            assert!(authority
-                .register_participant()
-                .expect("participant below the bound must register"));
+            assert!(
+                authority
+                    .register_participant()
+                    .expect("participant below the bound must register")
+            );
         }
         let error = authority
             .register_participant()
@@ -13427,9 +14387,11 @@ mod tests {
             .try_recv()
             .expect("retirement must complete the queued publication")
             .expect_err("a retired readiness publication must fail");
-        assert!(retired
-            .to_string()
-            .contains("retired before reader admission"));
+        assert!(
+            retired
+                .to_string()
+                .contains("retired before reader admission")
+        );
         assert_eq!(stale_authority.state.lock().queued_publications, 0);
         successor
             .activate_rpc_transport()
@@ -13527,9 +14489,12 @@ mod tests {
 
     #[test]
     fn client_outbound_budget_reserves_capacity_for_small_key_input() {
+        let current_dialect = MuxWireDialect::current(CODEC_VERSION)
+            .expect("the build codec version is a closed current dialect");
         let prepare_normal = || {
             Pdu::ListPanes(ListPanes {})
-                .prepare_outbound(
+                .prepare_outbound_for_dialect(
+                    current_dialect,
                     PduProducer::Client,
                     PduWireRole::Request,
                     None,
@@ -13542,7 +14507,8 @@ mod tests {
             pane_id: 1,
             data: vec![b'k'],
         })
-        .prepare_outbound(
+        .prepare_outbound_for_dialect(
+            current_dialect,
             PduProducer::Client,
             PduWireRole::Request,
             None,
@@ -13837,7 +14803,7 @@ mod tests {
             .expect("interactive reader claim must retain the exact PDU");
         assert!(matches!(prepared.pdu(), Pdu::Ping(Ping {})));
         promise
-            .try_send(Ok(Pdu::Pong(Pong {})))
+            .try_send(Ok(PendingRpcReply::pdu(Pdu::Pong(Pong {}))))
             .expect("complete admitted interactive RPC");
         asupersync_block_on(pending).expect("admitted interactive RPC should observe its reply");
     }
@@ -13863,7 +14829,7 @@ mod tests {
         assert!(matches!(prepared.pdu(), Pdu::Ping(Ping {})));
 
         promise
-            .try_send(Ok(Pdu::Pong(Pong {})))
+            .try_send(Ok(PendingRpcReply::pdu(Pdu::Pong(Pong {}))))
             .expect("the validated response should enter the one-shot channel");
         authority
             .begin_rpc_transport_retirement()
@@ -14520,10 +15486,12 @@ mod tests {
             .set_stage(first_serial, RpcRetirementStage::AwaitingResponse)
             .expect("track the first request as emitted");
         first.fail_all("first transport disconnected");
-        assert!(first_rx
-            .try_recv()
-            .expect("first waiter must retire")
-            .is_err());
+        assert!(
+            first_rx
+                .try_recv()
+                .expect("first waiter must retire")
+                .is_err()
+        );
         first_probe.assert_balanced();
 
         let (_sender, receiver) = unbounded();
@@ -14549,7 +15517,7 @@ mod tests {
         assert_eq!(second_serial.get(), 2);
 
         let stale = second
-            .complete(first_serial, Pdu::Pong(Pong {}))
+            .complete(first_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
             .expect_err("an old-generation serial must not match successor state");
         assert!(matches!(
             stale,
@@ -14561,15 +15529,15 @@ mod tests {
         ));
 
         second
-            .complete(second_serial, Pdu::Pong(Pong {}))
+            .complete(second_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
             .expect("the exact successor serial should complete");
-        assert_eq!(
+        assert!(matches!(
             second_rx
                 .try_recv()
                 .expect("successor completion")
                 .expect("successor RPC result"),
-            Pdu::Pong(Pong {})
-        );
+            PendingRpcReply::Pdu(pdu) if matches!(pdu.as_ref(), Pdu::Pong(Pong {}))
+        ));
         second_probe.assert_balanced();
     }
 
@@ -14598,19 +15566,23 @@ mod tests {
         assert_eq!(probe.pending(), 2.0);
 
         first
-            .complete(first_serial, Pdu::Pong(Pong {}))
+            .complete(first_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
             .expect("first connection reply should enqueue");
-        assert!(first_rx
-            .try_recv()
-            .expect("first connection completion")
-            .is_ok());
+        assert!(
+            first_rx
+                .try_recv()
+                .expect("first connection completion")
+                .is_ok()
+        );
         assert_eq!(probe.pending(), 1.0);
 
         drop(second);
-        assert!(second_rx
-            .try_recv()
-            .expect("PendingReplies::drop must wake the live waiter")
-            .is_err());
+        assert!(
+            second_rx
+                .try_recv()
+                .expect("PendingReplies::drop must wake the live waiter")
+                .is_err()
+        );
         assert_eq!(probe.pending(), 0.0);
         assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
         assert_eq!(RpcMetricProbe::counter(&probe.transport_failed_live), 1);
@@ -14645,18 +15617,18 @@ mod tests {
 
         assert_eq!(
             pending
-                .complete(serial, Pdu::Pong(Pong {}))
+                .complete(serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
                 .expect("live response should deliver")
                 .disposition,
             ReplyDisposition::Delivered
         );
-        assert_eq!(
+        assert!(matches!(
             live_rx
                 .try_recv()
                 .expect("live response should be queued")
                 .expect("live response should be successful"),
-            Pdu::Pong(Pong {})
-        );
+            PendingRpcReply::Pdu(pdu) if matches!(pdu.as_ref(), Pdu::Pong(Pong {}))
+        ));
         assert_eq!(probe.pending(), 0.0);
         probe.assert_balanced();
     }
@@ -14724,10 +15696,12 @@ mod tests {
         );
 
         pending.fail_all("wire serial space exhausted");
-        assert!(max_rx
-            .try_recv()
-            .expect("the maximum-serial waiter must retire exactly once")
-            .is_err());
+        assert!(
+            max_rx
+                .try_recv()
+                .expect("the maximum-serial waiter must retire exactly once")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 
@@ -14756,10 +15730,12 @@ mod tests {
                 pending_request: "Ping",
             } if serial == original_serial
         ));
-        assert!(collision_rx
-            .try_recv()
-            .expect("collision should wake the caller")
-            .is_err());
+        assert!(
+            collision_rx
+                .try_recv()
+                .expect("collision should wake the caller")
+                .is_err()
+        );
         assert_eq!(pending.map.len(), 1);
         assert_eq!(
             pending
@@ -14773,7 +15749,7 @@ mod tests {
         assert_eq!(RpcMetricProbe::counter(&probe.serial_collision), 1);
 
         pending
-            .complete(original_serial, Pdu::Pong(Pong {}))
+            .complete(original_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
             .expect("the original request should complete");
         assert!(original_rx.try_recv().expect("original response").is_ok());
         probe.assert_balanced();
@@ -14790,7 +15766,7 @@ mod tests {
             .expect("assign delivered serial");
         assert_eq!(
             pending
-                .complete(delivered_serial, Pdu::Pong(Pong {}))
+                .complete(delivered_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})),)
                 .expect("response before receiver drop should deliver")
                 .disposition,
             ReplyDisposition::Delivered
@@ -14798,7 +15774,7 @@ mod tests {
         drop(delivered_rx);
 
         let duplicate = pending
-            .complete(delivered_serial, Pdu::Pong(Pong {}))
+            .complete(delivered_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
             .expect_err("a duplicate response must be fatal");
         assert!(matches!(
             duplicate,
@@ -14808,7 +15784,7 @@ mod tests {
         let future_serial =
             NonZeroU64::new(delivered_serial.get() + 1).expect("future serial is nonzero");
         let future = pending
-            .complete(future_serial, Pdu::Pong(Pong {}))
+            .complete(future_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
             .expect_err("a never-issued future response must be fatal");
         assert!(matches!(
             future,
@@ -14825,9 +15801,9 @@ mod tests {
             pending
                 .complete(
                     abandoned_serial,
-                    Pdu::SearchScrollbackResponse(SearchScrollbackResponse {
+                    PendingRpcReply::pdu(Pdu::SearchScrollbackResponse(SearchScrollbackResponse {
                         results: Vec::new(),
-                    }),
+                    },)),
                 )
                 .expect("a late response to an abandoned caller must drain")
                 .disposition,
@@ -14841,10 +15817,10 @@ mod tests {
             .expect("admit full-channel request")
             .expect("assign full-channel serial");
         filler
-            .try_send(Ok(Pdu::Pong(Pong {})))
+            .try_send(Ok(PendingRpcReply::pdu(Pdu::Pong(Pong {}))))
             .expect("test should prefill completion channel");
         let full = pending
-            .complete(full_serial, Pdu::Pong(Pong {}))
+            .complete(full_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
             .expect_err("a full one-shot reply channel is an invariant failure");
         assert!(matches!(
             full,
@@ -15115,17 +16091,14 @@ mod tests {
             );
         }
 
-        let synthetic_agreed = <ListPanesTabStacksResponse as PduWireIdent>::WIRE_SPEC
-            .min_codec_version
-            .checked_sub(1)
-            .expect("tab-stack response has a nonzero dialect floor");
+        let synthetic_agreed = LEGACY46_CODEC_VERSION;
         rpc_transport.lifecycle.lock().protocol = Some(RpcProtocolAuthority::established_for_test(
             generation,
             synthetic_agreed,
         ));
         for (ident, unknown) in [
             (5, true),
-            (<ListPanesTabStacksResponse as PduWireIdent>::IDENT, false),
+            (<ListPanesCoherentResponse as PduWireIdent>::IDENT, false),
         ] {
             let (wire, header_len) = test_opaque_frame(ident, 1, true, &payload);
             let mut reader = std::io::Cursor::new(wire);
@@ -15232,10 +16205,12 @@ mod tests {
                 header_len
             );
             pending.fail_after_decode_error(&error);
-            assert!(completion_rx
-                .try_recv()
-                .expect("terminal cleanup wakes the pending caller exactly once")
-                .is_err());
+            assert!(
+                completion_rx
+                    .try_recv()
+                    .expect("terminal cleanup wakes the pending caller exactly once")
+                    .is_err()
+            );
             assert!(matches!(
                 completion_rx.try_recv(),
                 Err(async_channel::TryRecvError::Empty) | Err(async_channel::TryRecvError::Closed)
@@ -15293,10 +16268,12 @@ mod tests {
             header_len
         );
         pending.fail_after_decode_error(&error);
-        assert!(completion_rx
-            .try_recv()
-            .expect("terminal cleanup wakes the pending caller")
-            .is_err());
+        assert!(
+            completion_rx
+                .try_recv()
+                .expect("terminal cleanup wakes the pending caller")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 
@@ -15431,10 +16408,12 @@ mod tests {
             );
 
             pending.fail_after_decode_error(&error);
-            assert!(completion_rx
-                .try_recv()
-                .expect("terminal teardown must retire the pending caller")
-                .is_err());
+            assert!(
+                completion_rx
+                    .try_recv()
+                    .expect("terminal teardown must retire the pending caller")
+                    .is_err()
+            );
             probe.assert_balanced();
         }
     }
@@ -15497,7 +16476,8 @@ mod tests {
         let (sender, receiver) = unbounded();
         let (completion_tx, completion_rx) = bounded(1);
         let prepared = Pdu::Ping(Ping {})
-            .prepare_outbound(
+            .prepare_outbound_for_dialect(
+                RpcProtocolAuthority::established_for_test(generation, agreed).wire_dialect(),
                 PduProducer::Client,
                 PduWireRole::Request,
                 None,
@@ -15664,11 +16644,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn above_dialect_reply_retires_exact_transport_without_body_or_successor() {
-        let ident = <ListPanesTabStacksResponse as PduWireIdent>::IDENT;
-        let agreed = <ListPanesTabStacksResponse as PduWireIdent>::WIRE_SPEC
-            .min_codec_version
-            .checked_sub(1)
-            .expect("tab-stack response has a nonzero dialect floor");
+        let ident = <ListPanesCoherentResponse as PduWireIdent>::IDENT;
+        let agreed = LEGACY46_CODEC_VERSION;
         let (reader_error, caller_error) =
             run_inbound_protocol_transport_rejection(ident, true, true, agreed);
         assert!(matches!(
@@ -15826,17 +16803,17 @@ mod tests {
             assert_eq!(live.pdu, Pdu::Pong(Pong {}));
             assert_eq!(live_effect, Some(PendingRpcEffect::Ordinary));
             pending
-                .complete(live_serial, live.pdu)
+                .complete(live_serial, PendingRpcReply::pdu(live.pdu))
                 .expect("deliver live response");
         });
 
-        assert_eq!(
+        assert!(matches!(
             live_rx
                 .try_recv()
                 .expect("live response must reach caller")
                 .expect("live response must be successful"),
-            Pdu::Pong(Pong {})
-        );
+            PendingRpcReply::Pdu(pdu) if matches!(pdu.as_ref(), Pdu::Pong(Pong {}))
+        ));
         assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
         assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
         probe.assert_balanced();
@@ -15878,7 +16855,7 @@ mod tests {
         assert_eq!(decoded.pdu, Pdu::ErrorResponse(response));
         assert_eq!(
             pending
-                .complete(serial, decoded.pdu)
+                .complete(serial, PendingRpcReply::pdu(decoded.pdu))
                 .expect("retire abandoned decoded ErrorResponse")
                 .disposition,
             ReplyDisposition::Abandoned
@@ -15919,7 +16896,7 @@ mod tests {
                 panic!("compressed tombstone must never use raw body discard");
             };
             pending
-                .complete(serial, decoded.pdu)
+                .complete(serial, PendingRpcReply::pdu(decoded.pdu))
                 .expect("retire decoded compressed tombstone");
             assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
             probe.assert_balanced();
@@ -15954,7 +16931,7 @@ mod tests {
                 panic!("generic request has no exact typed discard authority");
             };
             pending
-                .complete(serial, decoded.pdu)
+                .complete(serial, PendingRpcReply::pdu(decoded.pdu))
                 .expect("retire decoded generic response");
             assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
             probe.assert_balanced();
@@ -15996,7 +16973,7 @@ mod tests {
                 panic!("topology-fence response must never use raw body discard");
             };
             pending
-                .complete(serial, decoded.pdu)
+                .complete(serial, PendingRpcReply::pdu(decoded.pdu))
                 .expect("retire decoded topology-fence response");
             assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
             probe.assert_balanced();
@@ -16107,10 +17084,12 @@ mod tests {
 
             pending.fail_after_decode_error(&error);
             if let Some(completion_rx) = completion_rx {
-                assert!(completion_rx
-                    .try_recv()
-                    .expect("live waiter must be woken by terminal teardown")
-                    .is_err());
+                assert!(
+                    completion_rx
+                        .try_recv()
+                        .expect("live waiter must be woken by terminal teardown")
+                        .is_err()
+                );
             }
             assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 0);
             probe.assert_balanced();
@@ -16189,10 +17168,12 @@ mod tests {
         );
 
         pending.fail_after_decode_error(&error);
-        assert!(completion_rx
-            .try_recv()
-            .expect("retirement must wake the live response waiter")
-            .is_err());
+        assert!(
+            completion_rx
+                .try_recv()
+                .expect("retirement must wake the live response waiter")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 
@@ -16210,7 +17191,7 @@ mod tests {
             .expect("admit duplicate-failure witness")
             .expect("assign witness serial");
         duplicate_pending
-            .complete(completed_serial, Pdu::Pong(Pong {}))
+            .complete(completed_serial, PendingRpcReply::pdu(Pdu::Pong(Pong {})))
             .expect("first reply should enqueue");
         assert!(completed_rx.try_recv().expect("first completion").is_ok());
 
@@ -16221,10 +17202,12 @@ mod tests {
             duplicate_error,
             PendingRpcError::UnmatchedSerial { serial, .. } if serial == completed_serial
         ));
-        assert!(duplicate_witness_rx
-            .try_recv()
-            .expect("duplicate reply must wake every other live waiter")
-            .is_err());
+        assert!(
+            duplicate_witness_rx
+                .try_recv()
+                .expect("duplicate reply must wake every other live waiter")
+                .is_err()
+        );
         duplicate_probe.assert_balanced();
 
         let (mut full_pending, full_probe) = pending_replies_for_test();
@@ -16240,7 +17223,7 @@ mod tests {
             .expect("admit full-channel witness")
             .expect("assign full-channel witness serial");
         filler
-            .try_send(Ok(Pdu::Pong(Pong {})))
+            .try_send(Ok(PendingRpcReply::pdu(Pdu::Pong(Pong {}))))
             .expect("prefill completion channel");
 
         let full_error = full_pending
@@ -16250,14 +17233,18 @@ mod tests {
             full_error,
             PendingRpcError::ReplyChannelFull { serial, .. } if serial == full_serial
         ));
-        assert!(full_rx
-            .try_recv()
-            .expect("prefilled reply must remain intact")
-            .is_ok());
-        assert!(full_witness_rx
-            .try_recv()
-            .expect("full reply channel must wake every other live waiter")
-            .is_err());
+        assert!(
+            full_rx
+                .try_recv()
+                .expect("prefilled reply must remain intact")
+                .is_ok()
+        );
+        assert!(
+            full_witness_rx
+                .try_recv()
+                .expect("full reply channel must wake every other live waiter")
+                .is_err()
+        );
         full_probe.assert_balanced();
     }
 
@@ -16299,10 +17286,12 @@ mod tests {
             0.0,
             "header rejection must retire the transport and clear every waiter"
         );
-        assert!(live_rx
-            .try_recv()
-            .expect("transport teardown must wake the admitted waiter")
-            .is_err());
+        assert!(
+            live_rx
+                .try_recv()
+                .expect("transport teardown must wake the admitted waiter")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 
@@ -16501,13 +17490,15 @@ mod tests {
                 assert_eq!(binding.request, "GetCodecVersion");
                 assert!(matches!(prepared.pdu(), Pdu::GetCodecVersion(_)));
                 promise
-                    .send(Ok(Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                        codec_vers: rejected_codec_version,
-                        version_string: "below-supported-window-peer".to_string(),
-                        executable_path: PathBuf::from("/test/old-ft"),
-                        config_file_path: None,
-                        min_supported: rejected_codec_version,
-                    })))
+                    .send(Ok(PendingRpcReply::pdu(Pdu::GetCodecVersionResponse(
+                        GetCodecVersionResponse {
+                            codec_vers: rejected_codec_version,
+                            version_string: "below-supported-window-peer".to_string(),
+                            executable_path: PathBuf::from("/test/old-ft"),
+                            config_file_path: None,
+                            min_supported: rejected_codec_version,
+                        },
+                    ))))
                     .await
                     .expect("version response consumer must remain live");
 
@@ -16837,12 +17828,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn abandoned_rpc_replies_drain_without_retiring_transport_generation() {
-        fn recv_rpc_with_timeout(receiver: &Receiver<anyhow::Result<Pdu>>, label: &str) -> Pdu {
+        fn recv_rpc_with_timeout(
+            receiver: &Receiver<anyhow::Result<PendingRpcReply>>,
+            label: &str,
+        ) -> Pdu {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 match receiver.try_recv() {
                     Ok(result) => {
-                        return result.unwrap_or_else(|err| panic!("{}: {:#}", label, err));
+                        return match result.unwrap_or_else(|err| panic!("{}: {:#}", label, err)) {
+                            PendingRpcReply::Pdu(pdu) => *pdu,
+                            other => panic!(
+                                "{}: received unexpected typed reply {}",
+                                label,
+                                other.response_name()
+                            ),
+                        };
                     }
                     Err(async_channel::TryRecvError::Closed) => {
                         panic!("{}: completion channel closed without a response", label)
@@ -17281,7 +18282,8 @@ mod tests {
 
         assert!(
             error.to_string().contains("cannot be shell quoted"),
-            "unexpected error: {error}"
+            "unexpected error: {}",
+            error
         );
     }
 
@@ -17526,10 +18528,12 @@ mod tests {
             session_incarnation,
             snapshot_revision: TopologyRevision::new(snapshot_revision),
         };
-        assert!(coordinator
-            .commit(authority)
-            .expect("initial coherent snapshot should commit")
-            .is_empty());
+        assert!(
+            coordinator
+                .commit(authority)
+                .expect("initial coherent snapshot should commit")
+                .is_empty()
+        );
         (coordinator, authority)
     }
 
@@ -17592,6 +18596,63 @@ mod tests {
         assert!(byte_error.to_string().contains("byte limit"));
         assert!(byte_queue.waiting.is_empty());
         assert_eq!(byte_queue.waiting_bytes, 0);
+    }
+
+    #[test]
+    fn legacy_snapshot_fence_replays_unilateral_events_in_arrival_order_after_commit() {
+        let generation = NonZeroU64::new(9).expect("test generation is nonzero");
+        let serial = NonZeroU64::new(17).expect("test serial is nonzero");
+        let mut coordinator = ClientTopologyCoordinator::default();
+        coordinator
+            .begin_legacy_fence(serial)
+            .expect("codec-46 local topology fence should admit");
+
+        for decoded in [
+            unilateral(Pdu::PaneRemoved(PaneRemoved { pane_id: 41 })),
+            unilateral(Pdu::WindowTitleChanged(WindowTitleChanged {
+                window_id: 7,
+                title: "before-response".to_string(),
+            })),
+        ] {
+            assert!(matches!(
+                coordinator
+                    .on_unilateral(decoded)
+                    .expect("pre-response codec-46 event should quarantine"),
+                ClientTopologyUnilateralAction::Buffered
+            ));
+        }
+        coordinator
+            .on_legacy_response(serial)
+            .expect("matching codec-46 response should await consumer commit");
+        assert!(matches!(
+            coordinator
+                .on_unilateral(unilateral(Pdu::TabTitleChanged(TabTitleChanged {
+                    tab_id: 8,
+                    title: "after-response".to_string(),
+                })))
+                .expect("post-response codec-46 event should remain quarantined"),
+            ClientTopologyUnilateralAction::Buffered
+        ));
+
+        let routed = coordinator
+            .commit_legacy(LegacyTopologyFenceAuthority { generation, serial })
+            .expect("exact consumer commit should release all codec-46 events");
+        assert_eq!(routed.len(), 3);
+        assert!(matches!(
+            routed[0].pdu,
+            Pdu::PaneRemoved(PaneRemoved { pane_id: 41 })
+        ));
+        assert!(matches!(
+            &routed[1].pdu,
+            Pdu::WindowTitleChanged(WindowTitleChanged { window_id: 7, title })
+                if title == "before-response"
+        ));
+        assert!(matches!(
+            &routed[2].pdu,
+            Pdu::TabTitleChanged(TabTitleChanged { tab_id: 8, title })
+                if title == "after-response"
+        ));
+        assert!(matches!(coordinator.phase, ClientTopologyPhase::Legacy));
     }
 
     #[test]
@@ -17841,7 +18902,7 @@ mod tests {
         ));
         assert_eq!(
             pending
-                .complete(serial, decoded.pdu)
+                .complete(serial, PendingRpcReply::pdu(decoded.pdu))
                 .expect("decoded coherent response must settle its pending RPC"),
             ReplyCompletion {
                 disposition: ReplyDisposition::Delivered,
@@ -17851,7 +18912,8 @@ mod tests {
             completion_rx
                 .try_recv()
                 .expect("consumer must observe the delivered coherent response"),
-            Ok(Pdu::ListPanesCoherentResponse(_))
+            Ok(PendingRpcReply::Pdu(pdu))
+                if matches!(pdu.as_ref(), Pdu::ListPanesCoherentResponse(_))
         ));
 
         assert!(matches!(
@@ -18127,10 +19189,12 @@ mod tests {
                     .expect("snapshot should await its exact commit"),
                 ClientTopologyResponseAction::AwaitCommit
             ));
-            assert!(coordinator
-                .commit(authority)
-                .expect("snapshot should establish its connection-scoped stream")
-                .is_empty());
+            assert!(
+                coordinator
+                    .commit(authority)
+                    .expect("snapshot should establish its connection-scoped stream")
+                    .is_empty()
+            );
             (coordinator, authority)
         };
         let (mut old_topology, old_authority) = establish(1, &old_snapshot);
@@ -18220,10 +19284,12 @@ mod tests {
             }
             _ => unreachable!("same-ID helper always returns a coherent response"),
         };
-        assert!(old_topology
-            .commit(late_old_authority)
-            .expect("retired coordinator may settle only its own snapshot")
-            .is_empty());
+        assert!(
+            old_topology
+                .commit(late_old_authority)
+                .expect("retired coordinator may settle only its own snapshot")
+                .is_empty()
+        );
         assert_eq!(
             new_state(&new_topology),
             before_stale_delivery,
@@ -18240,9 +19306,11 @@ mod tests {
                 },
             })))
             .expect_err("an old-session event must not target reused successor identifiers");
-        assert!(stale_event_error
-            .to_string()
-            .contains("wrong established stream identity"));
+        assert!(
+            stale_event_error
+                .to_string()
+                .contains("wrong established stream identity")
+        );
         assert_eq!(
             new_state(&new_topology),
             before_stale_delivery,
@@ -18437,9 +19505,12 @@ mod tests {
             .expect("live generation has exact reader abort authority");
         assert!(authority.generation_is_current());
 
-        assert!(authority
-            .rpc_transport
-            .request_generation_abort(&reader_abort, "test cancellation before reader teardown",));
+        assert!(
+            authority.rpc_transport.request_generation_abort(
+                &reader_abort,
+                "test cancellation before reader teardown",
+            )
+        );
         assert!(
             authority.generation_is_current(),
             "identity authority must remain current so final detach can resolve its owner"

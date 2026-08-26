@@ -17,6 +17,8 @@ pub mod delivery_ledger;
 pub mod delivery_scheduler;
 pub mod dispatch;
 pub mod generation_lifetime;
+#[cfg(unix)]
+pub mod guardian_proxy;
 pub mod guardian_output_keys;
 pub mod local;
 pub mod pki;

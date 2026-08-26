@@ -38,8 +38,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use codec::{
     check_compat, CompatDecision, CompressionMode, CycleStack, GetCodecVersionResponse,
-    MoveFloatingPane, Pdu, RemoveFloatingPane, SelectStackPane, SetFloatingPaneZ, SetLayoutCycle,
-    SwapToLayout, ToggleFloatingPane, UpdatePaneConstraints, CODEC_VERSION,
+    InputSerial, MoveFloatingPane, MuxWireDecodedPayload, MuxWireDialect, Pdu, PduProducer,
+    PduWireRole, RemoveFloatingPane, SelectStackPane, SendPaste, SetFloatingPaneZ, SetLayoutCycle,
+    SwapToLayout, ToggleFloatingPane, UpdatePaneConstraints, WriteToPane, CODEC_VERSION,
     CODEC_VERSION_MIN_SUPPORTED,
 };
 use mux::tab::FloatingPaneRect;
@@ -372,5 +373,87 @@ fn rolling_upgrade_out_of_window_peer_returns_compat_error() {
         "incompat",
         "ok",
         "CompatError surfaces triples + runbook link",
+    );
+}
+
+/// Explicit v46 reconnect lane: the global v61 rolling window stays closed,
+/// while a caller-bound Legacy46 dialect can issue byte-safe pane writes and
+/// exact two-field pastes under every compression policy.
+#[test]
+fn rolling_upgrade_explicit_legacy46_client_input_lane() {
+    log_event(
+        "legacy46.setup",
+        "started",
+        "explicit codec46 dialect; no heuristic fallback",
+    );
+    assert!(MuxWireDialect::current(46).is_err());
+    let dialect = MuxWireDialect::LEGACY46;
+
+    for (index, mode) in IntoIterator::into_iter([
+        CompressionMode::Never,
+        CompressionMode::Auto,
+        CompressionMode::Always,
+    ])
+    .enumerate()
+    {
+        let serial = 0x4600 + index as u64;
+        let write_bytes = vec![b'w'; 32 * 1024];
+        let prepared = Pdu::WriteToPane(WriteToPane {
+            pane_id: 7,
+            data: write_bytes.clone(),
+        })
+        .prepare_outbound_for_dialect(
+            dialect,
+            PduProducer::Client,
+            PduWireRole::Request,
+            None,
+            mode,
+        )
+        .expect("legacy-compatible PDU9 must plan");
+        assert!(prepared.plan().codec_peak_bytes() >= prepared.plan().maximum_frame_bytes());
+        let frame = prepared.encode_frame(serial).expect("legacy PDU9 frame");
+        let decoded =
+            Pdu::decode_for_dialect(Cursor::new(&frame), dialect).expect("legacy PDU9 decode");
+        let (_, MuxWireDecodedPayload::Pdu(Pdu::WriteToPane(write))) = decoded.into_parts() else {
+            panic!("legacy PDU9 decoded to the wrong payload class");
+        };
+        assert_eq!(write.pane_id, 7);
+        assert_eq!(write.data, write_bytes);
+
+        let paste_text = "legacy paste ".repeat(4_096);
+        let prepared = Pdu::SendPaste(SendPaste {
+            pane_id: 8,
+            data: paste_text.clone(),
+            input_serial: InputSerial::from_millis_since_epoch(u64::MAX),
+        })
+        .prepare_outbound_for_dialect(
+            dialect,
+            PduProducer::Client,
+            PduWireRole::Request,
+            None,
+            mode,
+        )
+        .expect("legacy PDU13 must plan");
+        let frame = prepared
+            .encode_frame(serial + 0x100)
+            .expect("legacy PDU13 frame");
+        let decoded =
+            Pdu::decode_for_dialect(Cursor::new(&frame), dialect).expect("legacy PDU13 decode");
+        let (_, MuxWireDecodedPayload::Legacy46SendPaste(paste)) = decoded.into_parts() else {
+            panic!("legacy PDU13 decoded to the wrong payload class");
+        };
+        assert_eq!(paste.pane_id(), 8);
+        assert_eq!(paste.data(), paste_text);
+
+        log_event(
+            "legacy46.input",
+            "ok",
+            &format!("mode={mode:?} serial={serial}"),
+        );
+    }
+    log_event(
+        "legacy46.complete",
+        "ok",
+        "PDU9 current-identical and PDU13 exact-old schemas",
     );
 }

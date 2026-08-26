@@ -3290,6 +3290,12 @@ pub struct PreparedPaneTree {
     zoomed: Option<Arc<dyn Pane>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedPaneTreeFloatingPolicy {
+    Replace,
+    PreserveUnmentioned,
+}
+
 impl PreparedPaneTree {
     fn snapshot_panes_callback_free(&self) -> Vec<Arc<dyn Pane>> {
         let mut panes = Vec::new();
@@ -4875,20 +4881,64 @@ impl Tab {
     where
         F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
     {
+        self.sync_with_pane_tree_policy(
+            size,
+            root,
+            PreparedPaneTreeFloatingPolicy::Replace,
+            &mut make_pane,
+        )
+    }
+
+    /// Replace the tiled tree while retaining every existing floating pane
+    /// that is not named by the replacement tree.
+    ///
+    /// This is used when a remote topology dialect has authoritative tiled
+    /// state but carries no floating-pane field. The replacement and retained
+    /// floating ownership commit under the same tab/mux authority; there is no
+    /// clear-then-restore interval where panes can disappear. An existing
+    /// floating pane named by the replacement tree is atomically promoted to
+    /// the tiled lane instead of being retained in both lanes.
+    pub fn sync_with_pane_tree_preserving_unmentioned_floating<F>(
+        &self,
+        size: TerminalSize,
+        root: PaneNode,
+        mut make_pane: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
+    {
+        self.sync_with_pane_tree_policy(
+            size,
+            root,
+            PreparedPaneTreeFloatingPolicy::PreserveUnmentioned,
+            &mut make_pane,
+        )
+    }
+
+    fn sync_with_pane_tree_policy<F>(
+        &self,
+        size: TerminalSize,
+        root: PaneNode,
+        floating_policy: PreparedPaneTreeFloatingPolicy,
+        make_pane: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
+    {
         let mut active = None;
         let mut zoomed = None;
         log::debug!("sync_with_pane_tree with size {:?}", size);
         // `make_pane` is caller-supplied and may re-enter the mux. Build the
         // complete replacement tree before acquiring the tab topology lock.
-        let tree =
-            build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane)?;
-        self.sync_with_prepared_pane_tree(
+        let tree = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, make_pane)?;
+        self.sync_with_prepared_pane_tree_policy(
             size,
             PreparedPaneTree {
                 tree,
                 active,
                 zoomed,
             },
+            floating_policy,
         )?;
         Ok(())
     }
@@ -4902,6 +4952,19 @@ impl Tab {
         &self,
         size: TerminalSize,
         prepared: PreparedPaneTree,
+    ) -> anyhow::Result<()> {
+        self.sync_with_prepared_pane_tree_policy(
+            size,
+            prepared,
+            PreparedPaneTreeFloatingPolicy::Replace,
+        )
+    }
+
+    fn sync_with_prepared_pane_tree_policy(
+        &self,
+        size: TerminalSize,
+        prepared: PreparedPaneTree,
+        floating_policy: PreparedPaneTreeFloatingPolicy,
     ) -> anyhow::Result<()> {
         let desired_panes = prepared.snapshot_panes_callback_free();
         let install = prepared.into_install(size, &desired_panes)?;
@@ -4922,6 +4985,32 @@ impl Tab {
         } else {
             Vec::new()
         };
+        let replacement_tiled_pane_ids =
+            if floating_policy == PreparedPaneTreeFloatingPolicy::PreserveUnmentioned {
+                let mut pane_ids = HashSet::new();
+                pane_ids.try_reserve(desired_panes.len()).map_err(|error| {
+                    anyhow::anyhow!("reserve replacement tiled-pane identities: {error}")
+                })?;
+                let mut insert_pane_id = |pane_id| {
+                    anyhow::ensure!(
+                        pane_ids.insert(pane_id),
+                        "replacement tiled tree repeats pane id {pane_id}"
+                    );
+                    Ok::<(), anyhow::Error>(())
+                };
+                if expected_mux.is_some() {
+                    for (pane_id, _) in &desired_observed {
+                        insert_pane_id(*pane_id)?;
+                    }
+                } else {
+                    for pane in &desired_panes {
+                        insert_pane_id(observe_pane_id_for_mutation(pane)?)?;
+                    }
+                }
+                Some(pane_ids)
+            } else {
+                None
+            };
         let current = expected_mux
             .as_ref()
             .map(|_| self.snapshot_structural_states_for_authority())
@@ -4944,8 +5033,21 @@ impl Tab {
                         )
                     })?;
                 let mut desired = Vec::new();
+                let retained_floating = replacement_tiled_pane_ids.as_ref().map_or(0, |tiled| {
+                    current
+                        .iter()
+                        .filter(|state| {
+                            state.lane == PaneStructuralLane::Floating
+                                && !tiled.contains(&state.pane_id)
+                        })
+                        .count()
+                });
+                let desired_capacity = desired_observed
+                    .len()
+                    .checked_add(retained_floating)
+                    .context("prepared-tree desired pane count overflow")?;
                 desired
-                    .try_reserve_exact(desired_observed.len())
+                    .try_reserve_exact(desired_capacity)
                     .map_err(|error| {
                         anyhow::anyhow!("reserve desired prepared-tree authority: {error}")
                     })?;
@@ -4979,7 +5081,46 @@ impl Tab {
                             domain_id: registered.domain_id,
                         });
                     }
+                    if let Some(tiled) = &replacement_tiled_pane_ids {
+                        for retained in current.iter().filter(|state| {
+                            state.lane == PaneStructuralLane::Floating
+                                && !tiled.contains(&state.pane_id)
+                        }) {
+                            let registered = panes.get(&retained.pane_id).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "retained floating pane {} is not registered in the owning mux",
+                                    retained.pane_id
+                                )
+                            })?;
+                            anyhow::ensure!(
+                                Arc::ptr_eq(&registered.pane, &retained.pane),
+                                "retained floating pane id {} names another exact mux allocation",
+                                retained.pane_id
+                            );
+                            let registration = PaneRegistrationHandle::new(
+                                &registered.pane,
+                                &registered.generation,
+                            );
+                            anyhow::ensure!(
+                                authority.contains_live_registration(
+                                    retained.pane_id,
+                                    registered.domain_id,
+                                    &registration,
+                                ),
+                                "retained floating pane {} lacks exact domain-registration authority",
+                                retained.pane_id
+                            );
+                            desired.push(DesiredPaneStructuralState {
+                                pane_id: retained.pane_id,
+                                pane: Arc::clone(&retained.pane),
+                                lane: PaneStructuralLane::Floating,
+                                registration,
+                                domain_id: registered.domain_id,
+                            });
+                        }
+                    }
                 }
+                debug_assert_eq!(desired.len(), desired_capacity);
                 let next_structural_count = desired.len();
                 let structural = authority.prepare_tab_structural_replacement(
                     Arc::clone(&registered_tab),
@@ -5042,7 +5183,10 @@ impl Tab {
                     notification: MuxNotification::TabResized(self.tab_id),
                     topology: crate::MuxTopologyStamp::Revision(revision),
                 });
-                let mut callbacks = inner.commit_prepared_pane_tree_install(install);
+                let mut callbacks = inner.commit_prepared_pane_tree_install(
+                    install,
+                    replacement_tiled_pane_ids.as_ref(),
+                );
                 authority.commit_tab_structural_replacement(structural);
                 prepared_counts.commit(&mut windows, &mut workspace_counts);
                 callbacks.topology_notifications = topology_notifications;
@@ -5060,7 +5204,13 @@ impl Tab {
                         anyhow::anyhow!("reserve prepared-tree recency state: {error}")
                     })?;
                 }
-                (None, inner.commit_prepared_pane_tree_install(install))
+                (
+                    None,
+                    inner.commit_prepared_pane_tree_install(
+                        install,
+                        replacement_tiled_pane_ids.as_ref(),
+                    ),
+                )
             }
         };
         callbacks.execute(mux.as_deref());
@@ -10673,6 +10823,7 @@ impl TabInner {
     fn commit_prepared_pane_tree_install(
         &mut self,
         prepared: PreparedPaneTreeInstall,
+        replacement_tiled_pane_ids: Option<&HashSet<PaneId>>,
     ) -> DeferredTabCallbacks {
         let PreparedPaneTreeInstall {
             tree,
@@ -10687,8 +10838,19 @@ impl TabInner {
             self.recency.tag(active_index);
         }
         self.pane.replace(tree);
-        self.floating_panes.clear();
-        self.floating_focus = None;
+        if let Some(replacement_tiled_pane_ids) = replacement_tiled_pane_ids {
+            self.floating_panes
+                .retain(|floating| !replacement_tiled_pane_ids.contains(&floating.pane_id));
+            if self
+                .floating_focus
+                .is_some_and(|pane_id| replacement_tiled_pane_ids.contains(&pane_id))
+            {
+                self.floating_focus = None;
+            }
+        } else {
+            self.floating_panes.clear();
+            self.floating_focus = None;
+        }
         self.pane_stacks.clear();
         self.zoomed = zoomed;
         self.size = size;

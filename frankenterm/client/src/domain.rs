@@ -1,11 +1,11 @@
 use crate::client::{
     with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
-    RpcGenerationScope,
+    RpcGenerationScope, RpcTopologySnapshot,
 };
 use crate::pane::{ClientPane, ReliableInputQueue};
 use anyhow::{anyhow, bail, ensure, Context};
 use async_trait::async_trait;
-use codec::{ListPanesResponse, SpawnV2, SplitPane};
+use codec::{FloatingPaneSnapshotEntry, ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::client::ClientId;
@@ -2381,7 +2381,12 @@ impl ClientDomain {
                     bail!("client attachment retired before coherent topology application");
                 }
                 let _remote_application = inner.begin_remote_metadata_application()?;
-                Self::process_pane_list(&mux, Arc::clone(&inner), panes, primary_window_id)?;
+                Self::process_topology_snapshot(
+                    &mux,
+                    Arc::clone(&inner),
+                    panes,
+                    primary_window_id,
+                )?;
                 if !incarnation_is_current() {
                     bail!("client attachment retired during coherent topology application");
                 }
@@ -2935,28 +2940,111 @@ impl ClientDomain {
         Ok(())
     }
 
+    #[cfg(test)]
     fn process_pane_list(
         mux: &Arc<Mux>,
         inner: Arc<ClientInner>,
         panes: ListPanesResponse,
-        mut primary_window_id: Option<WindowId>,
+        primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         panes
             .validate_floating_panes()
             .context("validating bounded floating-pane snapshot")?;
-        if panes.tabs.len() != panes.tab_titles.len() {
+        let ListPanesResponse {
+            tabs,
+            tab_titles,
+            window_titles,
+            floating_panes,
+        } = panes;
+        Self::process_pane_snapshot(
+            mux,
+            inner,
+            tabs,
+            tab_titles,
+            window_titles,
+            Some(floating_panes),
+            primary_window_id,
+        )
+    }
+
+    fn process_topology_snapshot(
+        mux: &Arc<Mux>,
+        inner: Arc<ClientInner>,
+        snapshot: RpcTopologySnapshot,
+        primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        match snapshot {
+            RpcTopologySnapshot::Current(panes) => {
+                panes
+                    .validate_floating_panes()
+                    .context("validating bounded floating-pane snapshot")?;
+                let ListPanesResponse {
+                    tabs,
+                    tab_titles,
+                    window_titles,
+                    floating_panes,
+                } = panes;
+                Self::process_pane_snapshot(
+                    mux,
+                    inner,
+                    tabs,
+                    tab_titles,
+                    window_titles,
+                    Some(floating_panes),
+                    primary_window_id,
+                )
+            }
+            RpcTopologySnapshot::Legacy46(panes) => {
+                let (tabs, tab_titles, window_titles) = panes.into_parts();
+                Self::process_pane_snapshot(
+                    mux,
+                    inner,
+                    tabs,
+                    tab_titles,
+                    window_titles,
+                    None,
+                    primary_window_id,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_pane_snapshot(
+        mux: &Arc<Mux>,
+        inner: Arc<ClientInner>,
+        tabs: Vec<PaneNode>,
+        tab_titles: Vec<String>,
+        window_titles: HashMap<WindowId, String>,
+        floating_panes: Option<Vec<FloatingPaneSnapshotEntry>>,
+        mut primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        let floating_snapshot_authoritative = floating_panes.is_some();
+        let floating_panes = floating_panes.unwrap_or_default();
+        if !floating_snapshot_authoritative {
+            metrics::counter!(
+                "mux.client.legacy46_topology_snapshot.total",
+                "outcome" => "floating_state_unavailable"
+            )
+            .increment(1);
+            log::warn!(
+                "domain {}: codec-46 topology has no floating-pane authority; preserving unseen pane, tab, and window mappings",
+                inner.local_domain_id
+            );
+        }
+        if tabs.len() != tab_titles.len() {
             bail!(
                 "malformed ListPanes response: {} tab tree(s) but {} tab title(s); refusing \
                  identifier reservation or topology mutation",
-                panes.tabs.len(),
-                panes.tab_titles.len()
+                tabs.len(),
+                tab_titles.len()
             );
         }
         log::debug!(
             "domain {}: ListPanes snapshot has {} tab trees and {} tab titles",
             inner.local_domain_id,
-            panes.tabs.len(),
-            panes.tab_titles.len()
+            tabs.len(),
+            tab_titles.len()
         );
 
         // Check out one fallback local identifier for every unique remote pane
@@ -2969,7 +3057,7 @@ impl ClientDomain {
         let mut seen_remote_pane_ids = HashSet::new();
         let mut remote_tab_owners = HashMap::new();
         let mut remote_pane_tabs = HashMap::new();
-        for tabroot in &panes.tabs {
+        for tabroot in &tabs {
             let mut tree_identity = None;
             collect_remote_pane_ids(
                 tabroot,
@@ -2987,7 +3075,7 @@ impl ClientDomain {
                 }
             }
         }
-        for floating in &panes.floating_panes {
+        for floating in &floating_panes {
             let entry = &floating.pane;
             let Some(expected_window_id) = remote_tab_owners.get(&entry.tab_id).copied() else {
                 bail!(
@@ -3085,21 +3173,30 @@ impl ClientDomain {
 
         // "Mark" the current set of known remote ids, so that we can "Sweep"
         // any unreferenced ids at the bottom, garbage collection style
-        let mut remote_windows_to_forget: HashSet<WindowId> =
+        let mut remote_windows_to_forget: HashSet<WindowId> = if floating_snapshot_authoritative {
             lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
                 .keys()
                 .copied()
-                .collect();
-        let mut remote_tabs_to_forget: HashSet<WindowId> =
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut remote_tabs_to_forget: HashSet<WindowId> = if floating_snapshot_authoritative {
             lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
                 .keys()
                 .copied()
-                .collect();
-        let mut remote_panes_to_forget: HashSet<WindowId> =
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut remote_panes_to_forget: HashSet<WindowId> = if floating_snapshot_authoritative {
             lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
                 .keys()
                 .copied()
-                .collect();
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
         let mut local_tabs_by_remote = HashMap::new();
         local_tabs_by_remote
@@ -3114,7 +3211,7 @@ impl ClientDomain {
             .try_reserve_exact(seen_remote_pane_ids.len())
             .context("reserve pending tiled-pane state updates")?;
 
-        for (tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
+        for (tabroot, tab_title) in tabs.into_iter().zip(tab_titles.iter()) {
             let root_size = match tabroot.root_size() {
                 Some(size) => size,
                 None => continue,
@@ -3162,7 +3259,7 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
-                tab.sync_with_pane_tree(root_size, tabroot, |entry| {
+                let make_pane = |entry: PaneEntry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
                     let pane = if let Some(pane_id) =
@@ -3258,7 +3355,14 @@ impl ClientDomain {
                         );
                     }
                     Ok(pane)
-                })?;
+                };
+                if floating_snapshot_authoritative {
+                    tab.sync_with_pane_tree(root_size, tabroot, make_pane)?;
+                } else {
+                    tab.sync_with_pane_tree_preserving_unmentioned_floating(
+                        root_size, tabroot, make_pane,
+                    )?;
+                }
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let needs_attach = mux
@@ -3360,18 +3464,16 @@ impl ClientDomain {
 
         let mut desired_floating = Vec::new();
         desired_floating
-            .try_reserve_exact(panes.floating_panes.len())
+            .try_reserve_exact(floating_panes.len())
             .context("reserve authoritative floating-pane states")?;
-        let mut pending_float_mappings = PendingFloatingPaneMappings::new(
-            &mut reserved_local_pane_ids,
-            panes.floating_panes.len(),
-        )?;
+        let mut pending_float_mappings =
+            PendingFloatingPaneMappings::new(&mut reserved_local_pane_ids, floating_panes.len())?;
         let mut pending_float_sync = Vec::new();
         pending_float_sync
-            .try_reserve_exact(panes.floating_panes.len())
+            .try_reserve_exact(floating_panes.len())
             .context("reserve pending floating-pane state updates")?;
 
-        for floating in panes.floating_panes {
+        for floating in floating_panes {
             let entry = floating.pane;
             remote_panes_to_forget.remove(&entry.pane_id);
             let tab = local_tabs_by_remote
@@ -3474,57 +3576,68 @@ impl ClientDomain {
                 seen_remote_pane_ids.len()
             );
         }
-        let mut authoritative_panes = Vec::new();
-        authoritative_panes
-            .try_reserve_exact(authoritative_panes_by_remote.len())
-            .context("reserve authoritative local pane set")?;
-        authoritative_panes.extend(authoritative_panes_by_remote.into_values());
+        if floating_snapshot_authoritative {
+            let mut authoritative_panes = Vec::new();
+            authoritative_panes
+                .try_reserve_exact(authoritative_panes_by_remote.len())
+                .context("reserve authoritative local pane set")?;
+            authoritative_panes.extend(authoritative_panes_by_remote.into_values());
 
-        let reconcile_receipt = mux
-            .reconcile_domain_floating_panes(
+            let reconcile_receipt = mux
+                .reconcile_domain_floating_panes(
+                    inner.local_domain_id,
+                    authoritative_panes,
+                    desired_floating,
+                )
+                .context("reconcile authoritative floating-pane topology")?;
+            let mut pending_float_mappings = pending_float_mappings.commit();
+            pending_float_mappings.sort_unstable_by_key(|(_, local_pane_id)| *local_pane_id);
+            debug_assert_eq!(
+                pending_float_mappings.len(),
+                reconcile_receipt.registered_pane_ids.len()
+            );
+            debug_assert!(pending_float_mappings
+                .iter()
+                .map(|(_, local_pane_id)| *local_pane_id)
+                .eq(reconcile_receipt.registered_pane_ids.iter().copied()));
+
+            for (pane, alt_screen_active) in pending_tiled_sync {
+                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                    client_pane.sync_remote_listing_state(alt_screen_active);
+                }
+            }
+            for (pane, alt_screen_active) in pending_float_sync {
+                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                    client_pane.sync_remote_listing_state(alt_screen_active);
+                }
+            }
+            {
+                let mut pane_mappings =
+                    lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+                for (remote_pane_id, local_pane_id) in &pending_float_mappings {
+                    pane_mappings.insert(*remote_pane_id, *local_pane_id);
+                }
+            }
+            log::debug!(
+                "domain {} floating reconciliation changed {} tab(s), registered {} pane(s), and \
+                 retired {} pane(s)",
                 inner.local_domain_id,
-                authoritative_panes,
-                desired_floating,
-            )
-            .context("reconcile authoritative floating-pane topology")?;
-        let mut pending_float_mappings = pending_float_mappings.commit();
-        pending_float_mappings.sort_unstable_by_key(|(_, local_pane_id)| *local_pane_id);
-        debug_assert_eq!(
-            pending_float_mappings.len(),
-            reconcile_receipt.registered_pane_ids.len()
-        );
-        debug_assert!(pending_float_mappings
-            .iter()
-            .map(|(_, local_pane_id)| *local_pane_id)
-            .eq(reconcile_receipt.registered_pane_ids.iter().copied()));
+                reconcile_receipt.changed_tab_ids.len(),
+                reconcile_receipt.registered_pane_ids.len(),
+                reconcile_receipt.retired_pane_ids.len(),
+            );
+        } else {
+            debug_assert!(desired_floating.is_empty());
+            debug_assert!(pending_float_sync.is_empty());
+            drop(pending_float_mappings);
+            for (pane, alt_screen_active) in pending_tiled_sync {
+                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                    client_pane.sync_remote_listing_state(alt_screen_active);
+                }
+            }
+        }
 
-        for (pane, alt_screen_active) in pending_tiled_sync {
-            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
-                client_pane.sync_remote_listing_state(alt_screen_active);
-            }
-        }
-        for (pane, alt_screen_active) in pending_float_sync {
-            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
-                client_pane.sync_remote_listing_state(alt_screen_active);
-            }
-        }
-        {
-            let mut pane_mappings =
-                lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
-            for (remote_pane_id, local_pane_id) in &pending_float_mappings {
-                pane_mappings.insert(*remote_pane_id, *local_pane_id);
-            }
-        }
-        log::debug!(
-            "domain {} floating reconciliation changed {} tab(s), registered {} pane(s), and \
-             retired {} pane(s)",
-            inner.local_domain_id,
-            reconcile_receipt.changed_tab_ids.len(),
-            reconcile_receipt.registered_pane_ids.len(),
-            reconcile_receipt.retired_pane_ids.len(),
-        );
-
-        for (remote_window_id, window_title) in panes.window_titles {
+        for (remote_window_id, window_title) in window_titles {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                 match mux.set_window_title(local_window_id, &window_title) {
                     Ok(_) => {}
@@ -3651,7 +3764,7 @@ impl ClientDomain {
             // rejects a second initial attachment without holding a callback-
             // reentrant mutex across mux topology mutation.
             let result = (|| {
-                Self::process_pane_list(mux, Arc::clone(&inner), panes, primary_window_id)?;
+                Self::process_topology_snapshot(mux, Arc::clone(&inner), panes, primary_window_id)?;
 
                 let mut published = lock_or_recover(&domain.inner, "client_domain_inner");
                 if domain.retired.load(Ordering::Acquire)
@@ -4006,9 +4119,7 @@ impl Domain for ClientDomain {
                         let attach_result = async {
                             client.verify_version_compat_with_scope(&ui, &rpc).await?;
 
-                            ui.output_str(
-                                "Version check OK!  Requesting coherent topology snapshot...\n",
-                            );
+                            ui.output_str("Version check OK!  Requesting topology snapshot...\n");
                             ClientDomain::finish_attach(
                                 &mux,
                                 domain_id,
@@ -5550,6 +5661,92 @@ mod tests {
         assert!(mux.get_pane(local_float_id).is_none());
         assert_eq!(inner.remote_to_local_pane_id(&mux, 62), None);
         assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn legacy_topology_snapshot_preserves_unrepresented_floating_state() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_020);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing_with_float(),
+            None,
+        )
+        .expect("authoritative floating snapshot should attach");
+
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote owner tab should map locally");
+        let tab = mux
+            .get_tab(local_tab_id)
+            .expect("remote owner tab should remain registered");
+        let local_tiled_id = inner
+            .remote_to_local_pane_id(&mux, 61)
+            .expect("remote tiled pane should map locally");
+        let local_float_id = inner
+            .remote_to_local_pane_id(&mux, 62)
+            .expect("remote floating pane should map locally");
+        let tiled_pane = mux
+            .get_pane(local_tiled_id)
+            .expect("remote tiled pane should be live");
+        let floating_pane = mux
+            .get_pane(local_float_id)
+            .expect("remote floating pane should be live");
+        let before = tab.iter_floating_panes();
+        assert_eq!(before.len(), 1);
+        assert!(Arc::ptr_eq(&before[0].pane, &floating_pane));
+
+        let ListPanesResponse {
+            tabs,
+            tab_titles,
+            window_titles,
+            floating_panes: _,
+        } = sample_remote_tab_listing();
+        ClientDomain::process_pane_snapshot(
+            &mux,
+            Arc::clone(&inner),
+            tabs,
+            tab_titles,
+            window_titles,
+            None,
+            None,
+        )
+        .expect("codec-46 tiled snapshot must preserve unrepresented floating state");
+
+        assert_eq!(
+            inner.remote_to_local_pane_id(&mux, 62),
+            Some(local_float_id),
+            "a dialect without floating authority must not sweep its mapping"
+        );
+        assert!(mux
+            .get_pane(local_tiled_id)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &tiled_pane)));
+        assert!(mux
+            .get_pane(local_float_id)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &floating_pane)));
+        let after = tab.iter_floating_panes();
+        assert_eq!(after.len(), 1);
+        assert!(Arc::ptr_eq(&after[0].pane, &floating_pane));
+        assert_eq!(
+            (
+                after[0].left,
+                after[0].top,
+                after[0].width,
+                after[0].height,
+                after[0].z_order,
+                after[0].visible,
+                after[0].pinned,
+                after[0].opacity.to_bits(),
+                after[0].is_focused,
+            ),
+            (4, 3, 20, 8, 7, true, true, 0.75_f32.to_bits(), false),
+        );
+        assert_eq!(mux.iter_panes().len(), 2);
     }
 
     /// Spawn a watchdog that aborts the test process if the body does not

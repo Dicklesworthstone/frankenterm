@@ -714,6 +714,9 @@ pub enum GuardianRejectionCode {
     OwnedPanesPresent = 24,
     /// The exact input effect durably proved that zero bytes reached the PTY.
     InputKnownNotApplied = 25,
+    /// The process-local replay snapshot named by a ReplayAck is unavailable.
+    /// The caller must abandon that snapshot and reopen from durable artifacts.
+    ReplaySnapshotExpired = 26,
 }
 
 impl GuardianRejectionCode {
@@ -726,7 +729,8 @@ impl GuardianRejectionCode {
             | Self::RequestAliasCapacityExhausted
             | Self::InputDurabilityPending
             | Self::CheckpointOutcomeIndeterminate
-            | Self::OwnedPanesPresent => GuardianResponseStatus::Rejected,
+            | Self::OwnedPanesPresent
+            | Self::ReplaySnapshotExpired => GuardianResponseStatus::Rejected,
             _ => GuardianResponseStatus::Terminal,
         }
     }
@@ -777,6 +781,7 @@ impl GuardianRejectionCode {
             23 => Self::CheckpointIdentityMismatch,
             24 => Self::OwnedPanesPresent,
             25 => Self::InputKnownNotApplied,
+            26 => Self::ReplaySnapshotExpired,
             _ => return Err(GuardianProtocolError::InvalidRejectionPayload),
         };
         if code.status() != status {
@@ -1727,7 +1732,6 @@ impl GuardianCheckpointCatalogAdoptionPermitV1 {
     /// Consume this publication capability and reveal the canonical request
     /// identity only inside an opaque evidence seed. Later retry aliases do
     /// not yet exist at this boundary and are deliberately not fabricated.
-    #[must_use]
     pub fn into_evidence_seed(self) -> GuardianCheckpointCatalogAdoptionEvidenceSeedV1 {
         GuardianCheckpointCatalogAdoptionEvidenceSeedV1 {
             identity: self.identity,
@@ -14409,6 +14413,7 @@ mod tests {
             GuardianRejectionCode::CheckpointIdentityMismatch,
             GuardianRejectionCode::OwnedPanesPresent,
             GuardianRejectionCode::InputKnownNotApplied,
+            GuardianRejectionCode::ReplaySnapshotExpired,
         ];
         for code in all_codes {
             let response = GuardianResponseEnvelope::rejection(&authenticated_request, code);
@@ -14466,6 +14471,31 @@ mod tests {
             GuardianRejectionCode::CheckpointOutcomeIndeterminate.status(),
             GuardianResponseStatus::Rejected,
             "a mutation blocked behind reconciliation is retryable after the exact fence clears"
+        );
+        assert_eq!(
+            GuardianRejectionCode::ReplaySnapshotExpired.status(),
+            GuardianResponseStatus::Rejected,
+            "snapshot loss is retryable only by reopening durable replay artifacts"
+        );
+        assert_eq!(
+            GuardianRejectionCode::ReplaySnapshotExpired.encode(),
+            [b'G', b'R', b'E', b'1', 0, 26],
+            "the recovery signal is an exact content-free rejection code"
+        );
+        assert_eq!(
+            GuardianRejectionCode::decode(
+                GuardianResponseStatus::Rejected,
+                &[b'G', b'R', b'E', b'1', 0, 26],
+            ),
+            Ok(GuardianRejectionCode::ReplaySnapshotExpired)
+        );
+        assert_eq!(
+            GuardianRejectionCode::decode(
+                GuardianResponseStatus::Terminal,
+                &[b'G', b'R', b'E', b'1', 0, 26],
+            ),
+            Err(GuardianProtocolError::InvalidRejectionPayload),
+            "forging terminal status must not turn recoverable snapshot loss into a terminal claim"
         );
 
         let checkpoint_fence = GuardianResponseEnvelope::rejection(

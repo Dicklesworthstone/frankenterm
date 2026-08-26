@@ -4351,6 +4351,7 @@ dependencies = [
  "frankenterm-core",
  "frankenterm-core-audit-types",
  "frankenterm-flight-recorder",
+ "frankenterm-pty-guardian",
  "frankenterm-sigpipe",
  "frankenterm-term",
  "frankenterm-uds",

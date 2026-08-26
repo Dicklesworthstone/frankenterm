@@ -90,6 +90,13 @@ pub struct GuardianRuntimeCounters {
     pub checkpoint_worker_disconnects: u64,
     pub checkpoint_worker_panics: u64,
     pub checkpoint_token_authority_failures: u64,
+    pub replay_activation_rejections: u64,
+    pub replay_transactions_submitted: u64,
+    pub replay_transactions_completed: u64,
+    pub replay_retryable_capacity_closes: u64,
+    pub replay_worker_disconnects: u64,
+    pub replay_worker_panics: u64,
+    pub replay_token_authority_failures: u64,
     pub pty_bytes_drained: u64,
     pub pty_bytes_durably_committed: u64,
     pub pty_records_durably_committed: u64,
@@ -162,6 +169,13 @@ impl OutputRearmCursor {
 
 const INPUT_WORKER_QUEUE_CAPACITY: usize = 1;
 const CHECKPOINT_WORKER_QUEUE_CAPACITY: usize = 1;
+
+const fn is_replay_operation(operation: GuardianOperation) -> bool {
+    matches!(
+        operation,
+        GuardianOperation::Replay | GuardianOperation::ReplayAck
+    )
+}
 
 /// Exact transport authority retained across one delayed input transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -461,6 +475,7 @@ struct CheckpointJob {
 
 struct CheckpointWorkerCompletion {
     route: GuardianCheckpointRoute,
+    operation: GuardianOperation,
     protocol: GuardianProtocolState,
     response: Option<GuardianResponseEnvelope>,
     worker_panicked: bool,
@@ -552,6 +567,7 @@ fn checkpoint_worker(
     completion_waker: Arc<Waker>,
 ) {
     while let Ok(mut job) = jobs.recv() {
+        let operation = job.request.header().operation;
         let authority_valid_before = job.token_effect_authority.validate();
         let execution = authority_valid_before.then(|| {
             catch_guardian_checkpoint_worker_panic(|| execute_checkpoint_job(&store, &mut job))
@@ -568,6 +584,7 @@ fn checkpoint_worker(
         };
         let completion = CheckpointWorkerCompletion {
             route: job.route,
+            operation,
             protocol: job.protocol,
             response,
             worker_panicked,
@@ -606,11 +623,80 @@ fn execute_checkpoint_job(
             )
             .ok()
         }
+        GuardianOperation::Replay => {
+            let replay = match job.protocol.preflight_replay(&job.request) {
+                Ok(replay) => replay,
+                Err(error) => {
+                    return Some(GuardianResponseEnvelope::rejection(
+                        &job.request,
+                        GuardianRejectionCode::from_protocol_error(&error),
+                    ));
+                }
+            };
+            let page = match store.apply_replay(&job.request, replay, job.journal.as_ref()) {
+                Ok(page) => page,
+                Err(error) => {
+                    return replay_store_error_response(&job.request, &error);
+                }
+            };
+            GuardianResponseEnvelope::replay_page(&job.request, page).ok()
+        }
+        GuardianOperation::ReplayAck => {
+            let ack = match job.protocol.preflight_replay_ack(&job.request) {
+                Ok(ack) => ack,
+                Err(error) => {
+                    return Some(GuardianResponseEnvelope::rejection(
+                        &job.request,
+                        GuardianRejectionCode::from_protocol_error(&error),
+                    ));
+                }
+            };
+            let receipt = match store.apply_replay_ack(&job.request, ack) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return replay_store_error_response(&job.request, &error);
+                }
+            };
+            GuardianResponseEnvelope::reply(&job.request, &GuardianReply::ReplayAcked(receipt)).ok()
+        }
         _ => Some(GuardianResponseEnvelope::rejection(
             &job.request,
             GuardianRejectionCode::InvalidRequest,
         )),
     }
+}
+
+fn replay_store_error_response(
+    request: &AuthenticatedGuardianRequest,
+    error: &crate::output::GuardianCheckpointStageStoreError,
+) -> Option<GuardianResponseEnvelope> {
+    use crate::output::GuardianCheckpointStageStoreError;
+
+    let rejection = match error {
+        GuardianCheckpointStageStoreError::Protocol(error) => {
+            GuardianRejectionCode::from_protocol_error(error)
+        }
+        GuardianCheckpointStageStoreError::Conflict
+        | GuardianCheckpointStageStoreError::OutOfOrder
+        | GuardianCheckpointStageStoreError::CandidateAbsent
+        | GuardianCheckpointStageStoreError::OriginAuthorityMismatch => {
+            GuardianRejectionCode::InvalidRequest
+        }
+        GuardianCheckpointStageStoreError::ReplaySnapshotExpired => {
+            GuardianRejectionCode::ReplaySnapshotExpired
+        }
+        GuardianCheckpointStageStoreError::Capacity
+        | GuardianCheckpointStageStoreError::Allocation
+        | GuardianCheckpointStageStoreError::NameLimit => GuardianRejectionCode::CapacityExhausted,
+        GuardianCheckpointStageStoreError::Cipher(_)
+        | GuardianCheckpointStageStoreError::Boundary(_)
+        | GuardianCheckpointStageStoreError::Output(_)
+        | GuardianCheckpointStageStoreError::Journal(_)
+        | GuardianCheckpointStageStoreError::Io { .. }
+        | GuardianCheckpointStageStoreError::LockPoisoned
+        | GuardianCheckpointStageStoreError::Poisoned => return None,
+    };
+    Some(GuardianResponseEnvelope::rejection(request, rejection))
 }
 
 fn execute_checkpoint_stage_job(
@@ -926,8 +1012,8 @@ impl GuardianRuntime {
     ///
     /// Input and checkpoint staging are submitted through their owned worker
     /// surfaces so each request and connection survive its off-loop durable
-    /// transaction. Final checkpoint publication and output replay remain
-    /// fail-closed until their publishers exist.
+    /// transaction. Replay and ReplayAck use the same bounded durable worker,
+    /// while Genesis activation remains fail-closed until its publisher exists.
     pub fn dispatch(
         &mut self,
         request: &AuthenticatedGuardianRequest,
@@ -976,20 +1062,25 @@ impl GuardianRuntime {
                     self.counters.input_activation_rejections.saturating_add(1);
                 return None;
             }
-            GuardianOperation::CheckpointStage => {
+            GuardianOperation::CheckpointStage | GuardianOperation::Checkpoint => {
                 // A borrowed request cannot cross the storage-worker boundary.
-                // The transport must route owned Stage traffic through
-                // `submit_checkpoint`.
+                // The transport must route owned Stage/adoption traffic
+                // through `submit_checkpoint`.
                 self.counters.checkpoint_activation_rejections = self
                     .counters
                     .checkpoint_activation_rejections
                     .saturating_add(1);
                 return None;
             }
-            GuardianOperation::Checkpoint
-            | GuardianOperation::Replay
-            | GuardianOperation::ReplayAck
-            | GuardianOperation::GuardedStop => Err(GuardianRejectionCode::InvalidRequest),
+            GuardianOperation::Replay | GuardianOperation::ReplayAck => {
+                // Replay page construction and Ack-ledger mutation are bounded
+                // durable-worker operations. A borrowed request must never run
+                // their catalog or AEAD work on the readiness loop.
+                self.counters.replay_activation_rejections =
+                    self.counters.replay_activation_rejections.saturating_add(1);
+                return None;
+            }
+            GuardianOperation::GuardedStop => Err(GuardianRejectionCode::InvalidRequest),
             GuardianOperation::Hello => {
                 if request.payload().is_empty() {
                     self.apply_observation(request)
@@ -1176,10 +1267,12 @@ impl GuardianRuntime {
     }
 
     /// Transfer the one global protocol authority and one owned authenticated
-    /// Stage or adoption request to the fixed checkpoint worker. Record-backed
+    /// checkpoint or replay request to the fixed durable worker. Record-backed
     /// Seal can reach storage only beside the process-local journal authority
     /// for its authenticated pane; Checkpoint adoption consumes its typed
-    /// mutation permit on the same worker. Ack and Genesis remain fail-closed.
+    /// mutation permit on the same worker. Replay page plaintext and ReplayAck
+    /// ledger mutation remain off the readiness loop. Genesis remains
+    /// fail-closed.
     pub(crate) fn submit_checkpoint_with_token_lease(
         &mut self,
         request: AuthenticatedGuardianRequest,
@@ -1212,9 +1305,13 @@ impl GuardianRuntime {
         route: GuardianCheckpointRoute,
         token_effect_authority: WorkerTokenEffectAuthority,
     ) -> GuardianCheckpointSubmission {
+        let operation = request.header().operation;
         if !matches!(
-            request.header().operation,
-            GuardianOperation::CheckpointStage | GuardianOperation::Checkpoint
+            operation,
+            GuardianOperation::CheckpointStage
+                | GuardianOperation::Checkpoint
+                | GuardianOperation::Replay
+                | GuardianOperation::ReplayAck
         ) || request.header().request_id != route.request_id
         {
             let response = GuardianResponseEnvelope::rejection(
@@ -1224,19 +1321,16 @@ impl GuardianRuntime {
             request.zeroize_payload();
             return GuardianCheckpointSubmission::Respond(response);
         }
-        if self.checkpoint_pipeline_failed || self.protocol.is_none() || self.indeterminate_effect {
-            self.counters.checkpoint_retryable_capacity_closes = self
-                .counters
-                .checkpoint_retryable_capacity_closes
-                .saturating_add(1);
+        if self.checkpoint_pipeline_failed
+            || self.protocol.is_none()
+            || (self.indeterminate_effect && !is_replay_operation(operation))
+        {
+            self.record_durable_retryable_close(operation);
             request.zeroize_payload();
             return GuardianCheckpointSubmission::CloseRetryably;
         }
         let Some(protocol) = self.protocol.take() else {
-            self.counters.checkpoint_retryable_capacity_closes = self
-                .counters
-                .checkpoint_retryable_capacity_closes
-                .saturating_add(1);
+            self.record_durable_retryable_close(operation);
             request.zeroize_payload();
             return GuardianCheckpointSubmission::CloseRetryably;
         };
@@ -1254,29 +1348,52 @@ impl GuardianRuntime {
         };
         match self.checkpoint_pipeline.try_submit(job) {
             Ok(()) => {
-                self.counters.checkpoint_transactions_submitted = self
-                    .counters
-                    .checkpoint_transactions_submitted
-                    .saturating_add(1);
+                if is_replay_operation(operation) {
+                    self.counters.replay_transactions_submitted = self
+                        .counters
+                        .replay_transactions_submitted
+                        .saturating_add(1);
+                } else {
+                    self.counters.checkpoint_transactions_submitted = self
+                        .counters
+                        .checkpoint_transactions_submitted
+                        .saturating_add(1);
+                }
                 GuardianCheckpointSubmission::Pending
             }
             Err(CheckpointSubmitError::Saturated(job)) => {
                 self.restore_unsent_checkpoint_job(*job);
-                self.counters.checkpoint_retryable_capacity_closes = self
-                    .counters
-                    .checkpoint_retryable_capacity_closes
-                    .saturating_add(1);
+                self.record_durable_retryable_close(operation);
                 GuardianCheckpointSubmission::CloseRetryably
             }
             Err(CheckpointSubmitError::Unavailable(job)) => {
                 self.restore_unsent_checkpoint_job(*job);
                 self.checkpoint_pipeline_failed = true;
-                self.counters.checkpoint_worker_disconnects = self
-                    .counters
-                    .checkpoint_worker_disconnects
-                    .saturating_add(1);
+                if is_replay_operation(operation) {
+                    self.counters.replay_worker_disconnects =
+                        self.counters.replay_worker_disconnects.saturating_add(1);
+                } else {
+                    self.counters.checkpoint_worker_disconnects = self
+                        .counters
+                        .checkpoint_worker_disconnects
+                        .saturating_add(1);
+                }
                 GuardianCheckpointSubmission::CloseRetryably
             }
+        }
+    }
+
+    fn record_durable_retryable_close(&mut self, operation: GuardianOperation) {
+        if is_replay_operation(operation) {
+            self.counters.replay_retryable_capacity_closes = self
+                .counters
+                .replay_retryable_capacity_closes
+                .saturating_add(1);
+        } else {
+            self.counters.checkpoint_retryable_capacity_closes = self
+                .counters
+                .checkpoint_retryable_capacity_closes
+                .saturating_add(1);
         }
     }
 
@@ -1406,19 +1523,38 @@ impl GuardianRuntime {
                 let completion = *completion;
                 debug_assert!(self.protocol.is_none());
                 self.protocol = Some(completion.protocol);
-                self.counters.checkpoint_transactions_completed = self
-                    .counters
-                    .checkpoint_transactions_completed
-                    .saturating_add(1);
-                if completion.token_authority_failed {
-                    self.counters.checkpoint_token_authority_failures = self
+                if is_replay_operation(completion.operation) {
+                    self.counters.replay_transactions_completed = self
                         .counters
-                        .checkpoint_token_authority_failures
+                        .replay_transactions_completed
+                        .saturating_add(1);
+                } else {
+                    self.counters.checkpoint_transactions_completed = self
+                        .counters
+                        .checkpoint_transactions_completed
                         .saturating_add(1);
                 }
+                if completion.token_authority_failed {
+                    if is_replay_operation(completion.operation) {
+                        self.counters.replay_token_authority_failures = self
+                            .counters
+                            .replay_token_authority_failures
+                            .saturating_add(1);
+                    } else {
+                        self.counters.checkpoint_token_authority_failures = self
+                            .counters
+                            .checkpoint_token_authority_failures
+                            .saturating_add(1);
+                    }
+                }
                 if completion.worker_panicked {
-                    self.counters.checkpoint_worker_panics =
-                        self.counters.checkpoint_worker_panics.saturating_add(1);
+                    if is_replay_operation(completion.operation) {
+                        self.counters.replay_worker_panics =
+                            self.counters.replay_worker_panics.saturating_add(1);
+                    } else {
+                        self.counters.checkpoint_worker_panics =
+                            self.counters.checkpoint_worker_panics.saturating_add(1);
+                    }
                 }
                 self.replay_deferred_child_exits();
                 GuardianRuntimeCheckpointCompletionState::Ready(Box::new(
@@ -2092,6 +2228,8 @@ const fn operation_allowed_during_effect_quarantine(operation: GuardianOperation
             | GuardianOperation::Census
             | GuardianOperation::QueryInputEffect
             | GuardianOperation::Attach
+            | GuardianOperation::Replay
+            | GuardianOperation::ReplayAck
     )
 }
 
@@ -2330,9 +2468,10 @@ mod tests {
     use mux::guardian_output_journal::GuardianOutputAppendReceipt;
     use mux::guardian_protocol::{
         GuardianCheckpointDescriptorV1, GuardianCheckpointDisposition, GuardianCheckpointIntent,
-        GuardianCheckpointScopeV1, GuardianCheckpointStageRequestV1, GuardianRequestEnvelope,
-        GuardianRequestHeader, GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret,
-        decode_guardian_request, encode_guardian_request,
+        GuardianCheckpointScopeV1, GuardianCheckpointStageRequestV1, GuardianReplayAckV1,
+        GuardianRequestEnvelope, GuardianRequestHeader, GuardianResponseEnvelope,
+        GuardianResponseStatus, GuardianSecret, decode_guardian_request, decode_guardian_response,
+        encode_guardian_request, encode_guardian_response,
     };
     use portable_pty::{CommandBuilder, PtySize};
     use sha2::{Digest as _, Sha256};
@@ -2409,6 +2548,79 @@ mod tests {
             Uuid::from_u128(4),
             b"x",
         )
+    }
+
+    fn authenticated_replay_ack_request() -> AuthenticatedGuardianRequest {
+        let ack = GuardianReplayAckV1::new(
+            Uuid::from_u128(0x6201),
+            [0x62; 32],
+            3,
+            [0x63; 32],
+            None,
+            17,
+            [0x64; 32],
+            true,
+        )
+        .expect("canonical ReplayAck fixture");
+        let payload = ack.encode().expect("ReplayAck fixture encodes").to_vec();
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::ReplayAck,
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                Uuid::from_u128(0x6202),
+                Some(Uuid::from_u128(3)),
+                1,
+                0,
+                None,
+                &payload,
+            ),
+            payload,
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
+    #[test]
+    fn replay_ack_missing_snapshot_maps_to_retryable_typed_rejection_only() {
+        use crate::output::GuardianCheckpointStageStoreError;
+
+        let request = authenticated_replay_ack_request();
+        let expired = replay_store_error_response(
+            &request,
+            &GuardianCheckpointStageStoreError::ReplaySnapshotExpired,
+        )
+        .expect("missing ReplayAck snapshot has a typed response");
+        assert_eq!(expired.header().status, GuardianResponseStatus::Rejected);
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        let expired = decode_guardian_response(
+            &secret,
+            &encode_guardian_response(&secret, &expired).expect("expiry response encodes"),
+        )
+        .expect("expiry response authenticates")
+        .correlate(request.header())
+        .expect("expiry response correlates");
+        assert_eq!(
+            expired.rejection_code(),
+            Ok(GuardianRejectionCode::ReplaySnapshotExpired)
+        );
+
+        let forged =
+            replay_store_error_response(&request, &GuardianCheckpointStageStoreError::OutOfOrder)
+                .expect("forged/out-of-order ReplayAck has a terminal response");
+        assert_eq!(forged.header().status, GuardianResponseStatus::Terminal);
+        let forged = decode_guardian_response(
+            &secret,
+            &encode_guardian_response(&secret, &forged).expect("invalid response encodes"),
+        )
+        .expect("invalid response authenticates")
+        .correlate(request.header())
+        .expect("invalid response correlates");
+        assert_eq!(
+            forged.rejection_code(),
+            Ok(GuardianRejectionCode::InvalidRequest)
+        );
     }
 
     #[derive(Debug)]
@@ -4203,6 +4415,8 @@ mod tests {
             GuardianOperation::Census,
             GuardianOperation::QueryInputEffect,
             GuardianOperation::Attach,
+            GuardianOperation::Replay,
+            GuardianOperation::ReplayAck,
         ] {
             assert!(operation_allowed_during_effect_quarantine(observation));
         }
@@ -4215,8 +4429,6 @@ mod tests {
             GuardianOperation::Close,
             GuardianOperation::Checkpoint,
             GuardianOperation::CheckpointStage,
-            GuardianOperation::Replay,
-            GuardianOperation::ReplayAck,
             GuardianOperation::GuardedStop,
             GuardianOperation::RetireLease,
         ] {
