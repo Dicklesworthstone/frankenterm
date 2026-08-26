@@ -1212,6 +1212,34 @@ impl BrokerRecoveredSpawnCatalogV1 {
             .iter()
             .any(|journal| journal.status().phase.is_some())
     }
+
+    fn require_new_identity_available(
+        &self,
+        identity: BrokerSpawnWalIdentityV1,
+    ) -> Result<(), BrokerSpawnWalError> {
+        if self.by_journal_id.contains_key(&identity.journal_id()) {
+            return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateJournalId);
+        }
+        if self
+            .by_durable_pane_id
+            .contains_key(&identity.durable_pane_id())
+        {
+            return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateDurablePaneId);
+        }
+        if self
+            .by_spawn_effect_id
+            .contains_key(&identity.spawn_effect_id())
+        {
+            return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateSpawnEffectId);
+        }
+        if self
+            .by_origin_request_id
+            .contains_key(&identity.origin_request_id())
+        {
+            return Err(BrokerSpawnWalError::RecoveredCatalogDuplicateOriginRequestId);
+        }
+        Ok(())
+    }
 }
 
 /// Separately spawned, single-owner broker control loop.
@@ -2590,6 +2618,8 @@ pub enum BrokerSpawnWalError {
     CatalogIdentityMismatch,
     #[error("recovered broker Spawn WAL lineage does not match the active broker lineage")]
     RecoveredCatalogLineageMismatch,
+    #[error("new broker Spawn WAL lineage does not match the active broker lineage")]
+    NewJournalLineageMismatch,
     #[error("recovered broker Spawn catalog contains a duplicate journal identity")]
     RecoveredCatalogDuplicateJournalId,
     #[error("recovered broker Spawn catalog contains a duplicate durable pane identity")]
@@ -3463,8 +3493,36 @@ impl BrokerSpawnWalCatalogV1 {
         Ok(catalog)
     }
 
-    /// Create and durably publish one new authenticated WAL/head pair.
+    /// Admit one globally unique Spawn identity, then durably publish its new
+    /// authenticated WAL/head pair.
+    ///
+    /// The mutable catalog borrow is the process-local serialization authority
+    /// for this transition. Every existing pair is authenticated and admitted
+    /// into all four lookup namespaces before either new path is created. A
+    /// future live Spawn path must use this method; the raw file creator exists
+    /// only beneath this admission boundary and in explicit invalid-state test
+    /// fixtures.
     pub(crate) fn create_spawn_journal(
+        &mut self,
+        identity: BrokerSpawnWalIdentityV1,
+        authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<BrokerSpawnJournalV1, BrokerSpawnWalError> {
+        identity.validate()?;
+        if identity.broker_lineage_id() != authenticator.lineage_id() {
+            return Err(BrokerSpawnWalError::NewJournalLineageMismatch);
+        }
+        let recovered = self.scan_all_for_admission(&authenticator)?;
+        let admitted = BrokerRecoveredSpawnCatalogV1::admit(recovered, &authenticator)?;
+        if admitted.journals.len() >= GUARDIAN_MAX_PANES {
+            return Err(BrokerSpawnWalError::CapacityExhausted);
+        }
+        admitted.require_new_identity_available(identity)?;
+        drop(admitted);
+        self.validate_pinned_directory()?;
+        self.create_spawn_journal_after_admission(identity, authenticator)
+    }
+
+    fn create_spawn_journal_after_admission(
         &self,
         identity: BrokerSpawnWalIdentityV1,
         authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
@@ -3499,6 +3557,15 @@ impl BrokerSpawnWalCatalogV1 {
         journal.sync_parent_directory_and_activate(&self.directory)?;
         self.validate_pinned_directory()?;
         Ok(journal)
+    }
+
+    #[cfg(test)]
+    fn create_spawn_journal_fixture_unadmitted(
+        &self,
+        identity: BrokerSpawnWalIdentityV1,
+        authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<BrokerSpawnJournalV1, BrokerSpawnWalError> {
+        self.create_spawn_journal_after_admission(identity, authenticator)
     }
 
     /// Authenticate and revalidate every complete catalog pair without
@@ -6660,7 +6727,7 @@ mod tests {
             .expect("open empty catalog for header-only journal creation");
         for identity in identities {
             let journal = catalog
-                .create_spawn_journal(*identity, authenticator.clone())
+                .create_spawn_journal_fixture_unadmitted(*identity, authenticator.clone())
                 .expect("create header-only catalog journal");
             drop(journal);
         }
@@ -7706,6 +7773,67 @@ mod tests {
     }
 
     #[test]
+    fn new_spawn_journal_admission_reserves_every_identity_namespace_before_file_creation() {
+        let directory = private_catalog_directory();
+        let authenticator = wal_authenticator(0xab);
+        let first = recovered_catalog_identity(&authenticator, 19);
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("open catalog for live identity admission");
+        let first_journal = catalog
+            .create_spawn_journal(first, authenticator.clone())
+            .expect("admit first live journal identity");
+        drop(first_journal);
+
+        let mut duplicate_journal = recovered_catalog_identity(&authenticator, 20);
+        duplicate_journal.journal_id = first.journal_id();
+        assert!(matches!(
+            catalog.create_spawn_journal(duplicate_journal, authenticator.clone()),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateJournalId)
+        ));
+
+        let mut duplicate_pane = recovered_catalog_identity(&authenticator, 21);
+        duplicate_pane.durable_pane_id = first.durable_pane_id();
+        assert!(matches!(
+            catalog.create_spawn_journal(duplicate_pane, authenticator.clone()),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateDurablePaneId)
+        ));
+
+        let mut duplicate_effect = recovered_catalog_identity(&authenticator, 22);
+        duplicate_effect.spawn_effect_id = first.spawn_effect_id();
+        assert!(matches!(
+            catalog.create_spawn_journal(duplicate_effect, authenticator.clone()),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateSpawnEffectId)
+        ));
+
+        let mut duplicate_request = recovered_catalog_identity(&authenticator, 23);
+        duplicate_request.origin_request_id = first.origin_request_id();
+        assert!(matches!(
+            catalog.create_spawn_journal(duplicate_request, authenticator.clone()),
+            Err(BrokerSpawnWalError::RecoveredCatalogDuplicateOriginRequestId)
+        ));
+
+        let mut wrong_lineage = recovered_catalog_identity(&authenticator, 24);
+        wrong_lineage.broker_lineage_id = id(6_024);
+        assert!(matches!(
+            catalog.create_spawn_journal(wrong_lineage, authenticator.clone()),
+            Err(BrokerSpawnWalError::NewJournalLineageMismatch)
+        ));
+
+        let pairs = catalog
+            .scan_pairs()
+            .expect("scan one admitted pair after all rejections");
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs.contains_key(&first.journal_id()));
+        let recovered = catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("recover one admitted journal after all rejections");
+        let admitted = BrokerRecoveredSpawnCatalogV1::admit(recovered, &authenticator)
+            .expect("re-admit the unchanged single identity");
+        assert_eq!(admitted.journals.len(), 1);
+        assert_eq!(admitted.journals[0].identity(), first);
+    }
+
+    #[test]
     fn rejected_duplicate_catalog_does_not_reconcile_a_wal_ahead_head() {
         let directory = private_catalog_directory();
         let authenticator = wal_authenticator(0xa7);
@@ -7719,7 +7847,7 @@ mod tests {
         let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("open catalog for rejected-admission crash cut");
         let mut first_journal = catalog
-            .create_spawn_journal(first, authenticator.clone())
+            .create_spawn_journal_fixture_unadmitted(first, authenticator.clone())
             .expect("create first catalog journal");
         first_journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead);
         assert!(matches!(
@@ -7727,7 +7855,7 @@ mod tests {
             Err(BrokerSpawnWalError::Io(_))
         ));
         let second_journal = catalog
-            .create_spawn_journal(second, authenticator.clone())
+            .create_spawn_journal_fixture_unadmitted(second, authenticator.clone())
             .expect("create conflicting second catalog journal");
         drop(first_journal);
         drop(second_journal);
@@ -7768,7 +7896,7 @@ mod tests {
             .path()
             .join(broker_spawn_catalog_head_name(second.journal_id()));
 
-        let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("open catalog for two-pass reconciliation test");
         let mut first_journal = catalog
             .create_spawn_journal(first, authenticator.clone())
@@ -7851,7 +7979,7 @@ mod tests {
         let second_wal_path =
             spawn_catalog_path.join(broker_spawn_catalog_wal_name(second.journal_id()));
 
-        let catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
+        let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
             .expect("open catalog for torn-tail admission test");
         let mut first_journal = catalog
             .create_spawn_journal(first, authenticator.clone())
@@ -7941,7 +8069,7 @@ mod tests {
         let identity = recovered_catalog_identity(&authenticator, 14);
         let head_path =
             spawn_catalog_path.join(broker_spawn_catalog_head_name(identity.journal_id()));
-        let catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
+        let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
             .expect("open lifecycle-refusal catalog");
         let mut journal = catalog
             .create_spawn_journal(identity, authenticator)
@@ -7997,7 +8125,7 @@ mod tests {
             binding_for(&payload, &authority),
         )
         .expect("valid token-lineage broker WAL identity");
-        let catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
             .expect("open empty pinned broker catalog");
         let mut journal = catalog
             .create_spawn_journal(identity, authenticator.clone())
@@ -8090,7 +8218,7 @@ mod tests {
         let payload = command_payload("printf unexpected", &sentinel);
         let identity = wal_identity(binding_for(&payload, &authority));
         let authenticator = wal_authenticator(0x92);
-        let catalog = BrokerSpawnWalCatalogV1::open(linked_directory.path().to_path_buf())
+        let mut catalog = BrokerSpawnWalCatalogV1::open(linked_directory.path().to_path_buf())
             .expect("open catalog before link mutation");
         let journal = catalog
             .create_spawn_journal(identity, authenticator.clone())
