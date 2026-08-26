@@ -1180,9 +1180,7 @@ impl BrokerControlServiceV1 {
         let max_hello_receipts = config.max_connections.checked_mul(2).ok_or(
             BrokerControlServiceError::InvalidConfiguration("Hello receipt capacity overflow"),
         )?;
-        let accept_quantum = config
-            .max_connections
-            .min(BROKER_CONTROL_ACCEPT_QUANTUM);
+        let accept_quantum = config.max_connections.min(BROKER_CONTROL_ACCEPT_QUANTUM);
         let mut hello_receipt_order = VecDeque::new();
         hello_receipt_order
             .try_reserve(max_hello_receipts)
@@ -6399,6 +6397,111 @@ mod tests {
             forged_leased_query,
             Err(BrokerControlProtocolError::InvalidShape)
         ));
+    }
+
+    #[test]
+    fn broker_control_accept_batch_is_bounded_under_planted_listener_flood() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create broker accept-quantum test root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set broker accept-quantum root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path).expect("provision broker token");
+        let max_connections = BROKER_CONTROL_ACCEPT_QUANTUM + 2;
+        let config = BrokerControlServiceConfigV1::new(
+            socket_path.clone(),
+            token_path,
+            spawn_catalog_path,
+            sealed(0xa1),
+            max_connections,
+            Duration::from_millis(5),
+        )
+        .expect("valid broker accept-quantum config");
+        let mut service = BrokerControlServiceV1::bind(config).expect("bind broker service");
+
+        let mut planted_connections = Vec::new();
+        planted_connections
+            .try_reserve_exact(BROKER_CONTROL_ACCEPT_QUANTUM + 1)
+            .expect("reserve planted connection handles");
+        for _ in 0..=BROKER_CONTROL_ACCEPT_QUANTUM {
+            planted_connections.push(
+                BlockingUnixStream::connect(&socket_path)
+                    .expect("plant connection in broker listener backlog"),
+            );
+        }
+
+        service
+            .accept_connections()
+            .expect("accept one bounded listener batch");
+        assert_eq!(service.connections.len(), BROKER_CONTROL_ACCEPT_QUANTUM);
+        assert_eq!(
+            service.free_connection_tokens.len(),
+            max_connections - BROKER_CONTROL_ACCEPT_QUANTUM
+        );
+
+        service
+            .accept_connections()
+            .expect("leave excess listener readiness for the next batch");
+        assert_eq!(service.connections.len(), BROKER_CONTROL_ACCEPT_QUANTUM + 1);
+        drop(planted_connections);
+    }
+
+    #[test]
+    fn hello_receipt_eviction_skips_active_front_for_inactive_later_entry() {
+        let header = |request_id, connection_id| BrokerControlRequestHeaderV1 {
+            operation: BrokerControlOperationV1::Hello,
+            request_id,
+            broker_incarnation: Uuid::nil(),
+            guardian_incarnation: id(801),
+            connection_id,
+            mux_incarnation: id(802),
+            guardian_build_identity_digest: [0xa2; 32],
+            mux_build_identity_digest: [0xa3; 32],
+            durable_pane_id: Uuid::nil(),
+            lease_generation: 0,
+            operation_id: Uuid::nil(),
+        };
+        let active_front = id(803);
+        let inactive_later = id(804);
+        let active_tail = id(805);
+        let mut receipts = BTreeMap::from([
+            (
+                active_front,
+                BrokerHelloReceiptV1 {
+                    header: header(active_front, id(806)),
+                    active_connection: Some((Token(1), 11)),
+                },
+            ),
+            (
+                inactive_later,
+                BrokerHelloReceiptV1 {
+                    header: header(inactive_later, id(807)),
+                    active_connection: None,
+                },
+            ),
+            (
+                active_tail,
+                BrokerHelloReceiptV1 {
+                    header: header(active_tail, id(808)),
+                    active_connection: Some((Token(2), 12)),
+                },
+            ),
+        ]);
+        let mut order = VecDeque::from([active_front, inactive_later, active_tail]);
+
+        assert_eq!(
+            evict_one_inactive_hello_receipt(&mut receipts, &mut order),
+            Ok(true)
+        );
+        assert_eq!(order, VecDeque::from([active_front, active_tail]));
+        assert!(receipts.contains_key(&active_front));
+        assert!(!receipts.contains_key(&inactive_later));
+        assert!(receipts.contains_key(&active_tail));
     }
 
     #[test]

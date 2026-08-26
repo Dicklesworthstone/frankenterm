@@ -4745,10 +4745,9 @@ pub mod process {
             // long-lived cxs.
             let _watcher_done_guard = WatcherDoneGuard::new(Arc::clone(&watcher_done));
 
-            let result =
-                super::spawn_blocking(move || run_output_command(spec, cancel, deadline))
-                    .await
-                    .map_err(std::io::Error::other)?;
+            let result = super::spawn_blocking(move || run_output_command(spec, cancel, deadline))
+                .await
+                .map_err(std::io::Error::other)?;
 
             // Drain the watcher on the normal path so it exits
             // before this function returns. The guard above already
