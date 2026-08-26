@@ -67,6 +67,8 @@ use nix::unistd::{PathconfVar, fpathconf, geteuid};
 #[cfg(test)]
 use portable_pty::ExitStatus;
 use portable_pty::{Child, MasterPty, PollablePtyReader, PtyPair, PtySize, native_pty_system};
+#[cfg(target_os = "macos")]
+use procinfo::{LocalProcessInfo, ProcessStartTimeObservation};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -151,6 +153,11 @@ const BROKER_CONTROL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_GENESIS_BINDING_BYTES: usize = 256;
 const BROKER_SPAWN_CONTROL_MAGIC: [u8; 4] = *b"BSP1";
 const BROKER_SPAWN_CONTROL_FIXED_BYTES: usize = 332;
+const BROKER_EXEC_BOOTSTRAP_MAGIC: [u8; 8] = *b"FTBEB001";
+const BROKER_EXEC_BOOTSTRAP_VERSION: u16 = 1;
+const BROKER_EXEC_BOOTSTRAP_PAYLOAD_OFFSET: usize = 216;
+const BROKER_EXEC_BOOTSTRAP_FIXED_BYTES: usize =
+    BROKER_EXEC_BOOTSTRAP_PAYLOAD_OFFSET + GUARDIAN_MAC_BYTES;
 
 fn is_pty_terminal_eio(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::EIO)
@@ -2164,11 +2171,10 @@ impl BrokerSpawnWalPhaseV1 {
 
 /// Non-recycled child identity supplied by a platform identity verifier.
 ///
-/// A PID alone is insufficient because it may be reused. The digest must bind
-/// the OS process birth identity (for example pidfd/start-time provenance) to
-/// the exact child returned by the one authorized spawn callback. No
-/// production constructor exists in this module until that platform verifier
-/// is wired; tests exercise the WAL independently of that future OS seam.
+/// A PID alone is insufficient because it may be reused. The digest binds the
+/// OS process birth identity (pidfd plus boot/start-time provenance on Linux,
+/// or boot-session plus microsecond start-time provenance on macOS) to the
+/// exact child returned by the one authorized spawn callback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BrokerKernelChildIdentityV1 {
     process_id: u32,
@@ -2243,16 +2249,6 @@ impl BrokerVerifiedKernelChildV1 {
         if broker_child_nonce.is_nil() {
             return Err(BrokerChildIncarnationError::InvalidIdentity);
         }
-        if child
-            .try_wait()
-            .map_err(|source| BrokerChildIncarnationError::Io {
-                site: "pre-pidfd-child-status",
-                source,
-            })?
-            .is_some()
-        {
-            return Err(BrokerChildIncarnationError::ChildNotRunning);
-        }
         let process_id = child
             .process_id()
             .ok_or(BrokerChildIncarnationError::InvalidIdentity)?;
@@ -2260,24 +2256,35 @@ impl BrokerVerifiedKernelChildV1 {
             i32::try_from(process_id).map_err(|_| BrokerChildIncarnationError::InvalidIdentity)?;
         let pid = rustix::process::Pid::from_raw(raw_pid)
             .ok_or(BrokerChildIncarnationError::InvalidIdentity)?;
-        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
-            .map_err(|error| BrokerChildIncarnationError::Io {
-                site: "pidfd-open",
-                source: std::io::Error::from(error),
-            })?;
-        let (boot_id, start_ticks, state) = linux_process_birth_identity(process_id)?;
-        if matches!(state, b'Z' | b'X' | b'x') {
-            return Err(BrokerChildIncarnationError::ChildNotRunning);
-        }
-        if child
-            .try_wait()
-            .map_err(|source| BrokerChildIncarnationError::Io {
-                site: "post-pidfd-child-status",
-                source,
-            })?
-            .is_some()
-        {
-            return Err(BrokerChildIncarnationError::ChildNotRunning);
+        let pidfd = match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+            Ok(pidfd) => pidfd,
+            Err(error) if error == rustix::io::Errno::SRCH => {
+                return Err(BrokerChildIncarnationError::ChildNotRunning);
+            }
+            Err(error) => {
+                return Err(BrokerChildIncarnationError::Io {
+                    site: "pidfd-open",
+                    source: std::io::Error::from(error),
+                });
+            }
+        };
+        let (boot_id, start_ticks, _state) = linux_process_birth_identity(process_id)?;
+        let terminal_status =
+            child
+                .try_wait()
+                .map_err(|source| BrokerChildIncarnationError::Io {
+                    site: "post-pidfd-child-status",
+                    source,
+                })?;
+        if terminal_status.is_none() {
+            let (rechecked_boot_id, rechecked_start_ticks, rechecked_state) =
+                linux_process_birth_identity(process_id)?;
+            if rechecked_boot_id != boot_id
+                || rechecked_start_ticks != start_ticks
+                || matches!(rechecked_state, b'Z' | b'X' | b'x')
+            {
+                return Err(BrokerChildIncarnationError::InvalidIdentity);
+            }
         }
         let mut hasher = Sha256::new();
         hasher.update(b"frankenterm.guardian-broker.linux-child-incarnation.v1\0");
@@ -2298,7 +2305,64 @@ impl BrokerVerifiedKernelChildV1 {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn verify_spawned_child(
+        child: &mut (dyn Child + Send + Sync),
+        broker_child_nonce: Uuid,
+    ) -> Result<Self, BrokerChildIncarnationError> {
+        if broker_child_nonce.is_nil() {
+            return Err(BrokerChildIncarnationError::InvalidIdentity);
+        }
+        let process_id = child
+            .process_id()
+            .ok_or(BrokerChildIncarnationError::InvalidIdentity)?;
+        let start_token = match LocalProcessInfo::observe_process_start_time(process_id) {
+            ProcessStartTimeObservation::Running(token) if token != 0 => token,
+            ProcessStartTimeObservation::Absent => {
+                return Err(BrokerChildIncarnationError::ChildNotRunning);
+            }
+            ProcessStartTimeObservation::Running(_) | ProcessStartTimeObservation::Unknown => {
+                return Err(BrokerChildIncarnationError::InvalidIdentity);
+            }
+        };
+        let boot_session = LocalProcessInfo::host_boot_id()
+            .filter(|identity| !identity.is_empty())
+            .ok_or(BrokerChildIncarnationError::InvalidIdentity)?;
+        let terminal_status =
+            child
+                .try_wait()
+                .map_err(|source| BrokerChildIncarnationError::Io {
+                    site: "post-start-token-child-status",
+                    source,
+                })?;
+        if terminal_status.is_none()
+            && LocalProcessInfo::observe_process_start_time(process_id)
+                != ProcessStartTimeObservation::Running(start_token)
+        {
+            return Err(BrokerChildIncarnationError::InvalidIdentity);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankenterm.guardian-broker.macos-child-incarnation.v1\0");
+        hasher.update(
+            u64::try_from(boot_session.len())
+                .map_err(|_| BrokerChildIncarnationError::InvalidIdentity)?
+                .to_le_bytes(),
+        );
+        hasher.update(boot_session.as_bytes());
+        hasher.update(process_id.to_le_bytes());
+        hasher.update(start_token.to_le_bytes());
+        let identity = BrokerKernelChildIdentityV1 {
+            process_id,
+            broker_child_nonce,
+            kernel_start_identity_digest: hasher.finalize().into(),
+        };
+        identity
+            .validate()
+            .map_err(|_| BrokerChildIncarnationError::InvalidIdentity)?;
+        Ok(Self { identity })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn verify_spawned_child(
         _child: &mut (dyn Child + Send + Sync),
         _broker_child_nonce: Uuid,
@@ -2708,6 +2772,40 @@ pub enum BrokerSpawnAttemptExecutionV1<T> {
     },
 }
 
+/// Result of fusing one prepared PTY with the durable broker Spawn WAL.
+///
+/// Once the Attempt record is synchronized this API never returns an ordinary
+/// error: the callback result and any adopted pane remain owned by an explicit
+/// indeterminate outcome until startup reconciliation can classify the exact
+/// WAL cut. That prevents error propagation from accidentally dropping the
+/// sole child handle or authorizing a second Spawn.
+pub(crate) enum BrokerDurableSpawnCommitV1 {
+    Applied {
+        adoption: Box<BrokerAdoptionV1>,
+        spawn_observed: BrokerSpawnWalReceiptV1,
+    },
+    Reconciled(BrokerSpawnWalStatusV1),
+    OutcomeIndeterminate {
+        reason: BrokerDurableSpawnIndeterminateReasonV1,
+        retained_adoption: Option<Box<BrokerAdoptionV1>>,
+        status: BrokerSpawnWalStatusV1,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokerDurableSpawnIndeterminateReasonV1 {
+    SpawnCallback,
+    SpawnObservationDurability,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum BrokerDurableSpawnCommitErrorV1 {
+    #[error("broker durable Spawn preflight failed")]
+    Broker(#[from] BrokerError),
+    #[error("broker durable Spawn WAL transition failed before effect authority")]
+    SpawnWal(#[from] BrokerSpawnWalError),
+}
+
 #[derive(Debug, Error)]
 pub enum BrokerSpawnWalError {
     #[error("broker Spawn WAL identity is invalid")]
@@ -2813,6 +2911,7 @@ pub enum BrokerSpawnWalError {
 enum BrokerSpawnWalInjectedFault {
     BeforeWalWrite,
     AfterWalSyncBeforeHead,
+    AfterWalSyncBeforeHeadForPhase(BrokerSpawnWalPhaseV1),
     BeforeHeadSync,
     DuringRecoveredHeadWrite,
 }
@@ -2922,7 +3021,7 @@ fn encode_broker_spawn_creation_base85(
 ) -> [u8; BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES] {
     let mut encoded = [0_u8; BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES];
     let (chunks, remainder) = bytes.as_chunks::<4>();
-    debug_assert!(remainder.is_empty());
+    debug_assert_eq!(remainder.len(), 0);
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         let mut value = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let encoded_offset = chunk_index * 5;
@@ -5555,6 +5654,20 @@ impl BrokerSpawnJournalV1 {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    fn fail_if_injected_for_phase(
+        &mut self,
+        generic: BrokerSpawnWalInjectedFault,
+        phase_specific: BrokerSpawnWalInjectedFault,
+    ) -> std::io::Result<()> {
+        if self.injected_fault == Some(generic) || self.injected_fault == Some(phase_specific) {
+            self.injected_fault = None;
+            Err(std::io::Error::other("injected broker Spawn WAL fault"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl BrokerSpawnWalFilesystemRevalidationV1 {
@@ -5786,7 +5899,10 @@ impl BrokerSpawnJournalV1 {
             self.wal.write_all(&wal_record)?;
             self.wal.sync_all()?;
             #[cfg(test)]
-            self.fail_if_injected(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead)?;
+            self.fail_if_injected_for_phase(
+                BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHead,
+                BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHeadForPhase(phase),
+            )?;
             self.head.seek(SeekFrom::Start(self.committed_head_bytes))?;
             self.head.write_all(&head_record)?;
             #[cfg(test)]
@@ -5965,9 +6081,9 @@ pub struct BrokerResourceUsageV1 {
 
 /// Process-local content-free identity of the child admitted for a reservation.
 ///
-/// The nonce prevents accidental in-process aliasing; PID plus nonce is not a
-/// non-recycled cross-process identity. Activated recovery must bind a pidfd or
-/// platform-equivalent kernel start identity in the durable broker Spawn/Ack.
+/// The nonce prevents accidental in-process aliasing, but consumers that need
+/// a durable or cross-process identity must use the pane's verified kernel
+/// identity rather than this PID-plus-nonce projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BrokerChildIdentityV1 {
     pub durable_pane_id: Uuid,
@@ -6496,7 +6612,7 @@ pub struct BrokerPreparedPaneV1 {
     output_buffer: VecDeque<u8>,
     output_journal: Option<BrokerDurableOutputJournalV1>,
     fenced_attachments: VecDeque<BrokerAttachmentIdentityV1>,
-    command: portable_pty::CommandBuilder,
+    payload: GuardianSpawnPayload,
     binding: BrokerGenesisBinding,
     broker_incarnation: Uuid,
     control_id: Uuid,
@@ -6562,7 +6678,7 @@ impl BrokerPreparedPaneV1 {
 
         let control_id = Uuid::new_v4();
         let initial_attachment_id = Uuid::new_v4();
-        let (command, size) = payload.into_parts();
+        let size = payload.size();
         let PtyPair {
             slave,
             master: broker_master,
@@ -6603,7 +6719,7 @@ impl BrokerPreparedPaneV1 {
                 output_buffer,
                 output_journal: None,
                 fenced_attachments,
-                command,
+                payload,
                 binding,
                 broker_incarnation: authority.broker_incarnation,
                 control_id,
@@ -6680,40 +6796,119 @@ impl BrokerPreparedPaneV1 {
         self.commit_with_proof(control, &proof)
     }
 
+    /// Fuse Genesis admission, the broker Spawn WAL, kernel child identity,
+    /// and the retained PTY owner into one no-duplicate transition.
+    ///
+    /// Every fallible preflight completes before `Attempted` is appended. Once
+    /// that record is durable, all exits are explicit reconciled or
+    /// indeterminate outcomes that retain any adopted pane rather than an
+    /// ordinary error path that could drop the sole PTY/child authority.
+    pub(crate) fn commit_after_durable_pre_spawn_intent_with_wal(
+        self,
+        control: BrokerControlLeaseV1,
+        permit: GuardianPublishedGenesisAdmissionPermitV1,
+        journal: &mut BrokerSpawnJournalV1,
+        attempt_id: Uuid,
+    ) -> Result<BrokerDurableSpawnCommitV1, BrokerDurableSpawnCommitErrorV1> {
+        let proof = BrokerDurablePreSpawnIntentProof::from_permit(permit);
+        self.commit_with_wal_proof(control, &proof, journal, attempt_id)
+    }
+
+    fn commit_with_wal_proof(
+        self,
+        control: BrokerControlLeaseV1,
+        proof: &BrokerDurablePreSpawnIntentProof,
+        journal: &mut BrokerSpawnJournalV1,
+        attempt_id: Uuid,
+    ) -> Result<BrokerDurableSpawnCommitV1, BrokerDurableSpawnCommitErrorV1> {
+        self.validate_commit_preflight(&control, proof)?;
+        if self.output_journal.is_none() {
+            return Err(BrokerError::DurableOutputJournalRequired.into());
+        }
+        let journal_identity = journal.identity();
+        let expected_identity = BrokerSpawnWalIdentityV1::from_binding(
+            journal_identity.journal_id(),
+            journal_identity.broker_lineage_id(),
+            proof.binding,
+        )?;
+        if journal_identity != expected_identity {
+            return Err(BrokerSpawnWalError::IdentityMismatch.into());
+        }
+        journal.append_intent_and_sync()?;
+        let attempt = match journal.begin_spawn_attempt_and_sync(attempt_id)? {
+            BrokerSpawnAttemptAdmissionV1::Authorized(attempt) => attempt,
+            BrokerSpawnAttemptAdmissionV1::Reconciled(status) => {
+                return Ok(BrokerDurableSpawnCommitV1::Reconciled(status));
+            }
+        };
+
+        let execution = attempt.invoke_once(|| {
+            let adoption = self.commit_with_proof(control, proof)?;
+            let child_identity = adoption.pane.kernel_child_identity();
+            Ok::<_, BrokerError>((adoption, child_identity))
+        });
+        match execution {
+            BrokerSpawnAttemptExecutionV1::EffectSucceeded {
+                value: adoption,
+                observation,
+            } => match journal.append_spawn_observed_and_sync(*observation) {
+                Ok(spawn_observed) => Ok(BrokerDurableSpawnCommitV1::Applied {
+                    adoption: Box::new(adoption),
+                    spawn_observed,
+                }),
+                Err(_) => Ok(BrokerDurableSpawnCommitV1::OutcomeIndeterminate {
+                    reason: BrokerDurableSpawnIndeterminateReasonV1::SpawnObservationDurability,
+                    retained_adoption: Some(Box::new(adoption)),
+                    status: journal.status(),
+                }),
+            },
+            BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate { retained_value } => {
+                Ok(BrokerDurableSpawnCommitV1::OutcomeIndeterminate {
+                    reason: BrokerDurableSpawnIndeterminateReasonV1::SpawnCallback,
+                    retained_adoption: retained_value.map(Box::new),
+                    status: journal.status(),
+                })
+            }
+        }
+    }
+
     fn commit_with_proof(
         self,
         control: BrokerControlLeaseV1,
         proof: &BrokerDurablePreSpawnIntentProof,
     ) -> Result<BrokerAdoptionV1, BrokerError> {
-        self.validate_control(&control)?;
-        if proof.binding != self.binding {
-            return Err(BrokerError::DurablePreSpawnIntentMismatch);
-        }
-        if proof.catalog_candidate_checksum == [0; BROKER_CATALOG_CHECKSUM_BYTES] {
-            return Err(BrokerError::InvalidCatalogChecksum);
-        }
+        self.validate_commit_preflight(&control, proof)?;
 
         // Generate every broker identity before spawning.  After the spawn
         // succeeds, constructing the returned typestate performs no fallible
         // allocation or descriptor operation.
         let broker_child_nonce = Uuid::new_v4();
+        let (command, _size) = self.payload.into_parts();
         let mut child = self
             .slave
-            .spawn_command(self.command)
+            .spawn_command(command)
             .map_err(|_| BrokerError::ChildSpawnFailed)?;
         drop(self.slave);
-        let Some(process_id) = child.process_id() else {
-            // Native Unix children always expose a PID.  If a backend violates
-            // that contract, synchronously reap the just-created child and
-            // refuse to publish an ambiguous identity.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(BrokerError::ChildIdentityUnavailable);
+        let verified_kernel_child = match BrokerVerifiedKernelChildV1::verify_spawned_child(
+            &mut *child,
+            broker_child_nonce,
+        ) {
+            Ok(verified) => verified,
+            Err(_) => {
+                // A just-created child without non-recycled kernel
+                // identity can never enter the adopted typestate. Reap it
+                // synchronously while the broker still owns every PTY
+                // descriptor, then report a pre-adoption failure.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BrokerError::ChildIdentityUnavailable);
+            }
         };
+        let kernel_child_identity = verified_kernel_child.identity();
         let child_identity = BrokerChildIdentityV1 {
             durable_pane_id: self.binding.durable_pane_id,
             spawn_effect_id: self.binding.spawn_effect_id,
-            process_id,
+            process_id: kernel_child_identity.process_id(),
             broker_child_nonce,
         };
         let attachment_identity = BrokerAttachmentIdentityV1 {
@@ -6738,6 +6933,7 @@ impl BrokerPreparedPaneV1 {
             fenced_attachments: self.fenced_attachments,
             child,
             child_identity,
+            verified_kernel_child,
             limits: self.limits,
             completed_successor_handoffs: 0,
             buffer_start_sequence: 0,
@@ -6750,6 +6946,21 @@ impl BrokerPreparedPaneV1 {
             },
         };
         Ok(BrokerAdoptionV1 { pane, attachment })
+    }
+
+    fn validate_commit_preflight(
+        &self,
+        control: &BrokerControlLeaseV1,
+        proof: &BrokerDurablePreSpawnIntentProof,
+    ) -> Result<(), BrokerError> {
+        self.validate_control(control)?;
+        if proof.binding != self.binding {
+            return Err(BrokerError::DurablePreSpawnIntentMismatch);
+        }
+        if proof.catalog_candidate_checksum == [0; BROKER_CATALOG_CHECKSUM_BYTES] {
+            return Err(BrokerError::InvalidCatalogChecksum);
+        }
+        Ok(())
     }
 
     fn validate_control(&self, control: &BrokerControlLeaseV1) -> Result<(), BrokerError> {
@@ -6983,6 +7194,7 @@ pub struct BrokerAdoptedPaneV1 {
     fenced_attachments: VecDeque<BrokerAttachmentIdentityV1>,
     child: Box<dyn Child + Send + Sync>,
     child_identity: BrokerChildIdentityV1,
+    verified_kernel_child: BrokerVerifiedKernelChildV1,
     limits: BrokerResourceLimitsV1,
     completed_successor_handoffs: u32,
     buffer_start_sequence: u64,
@@ -6996,6 +7208,13 @@ impl BrokerAdoptedPaneV1 {
     #[must_use]
     pub const fn child_identity(&self) -> BrokerChildIdentityV1 {
         self.child_identity
+    }
+
+    /// Exact non-recycled process identity retained alongside the live child
+    /// handle and suitable for binding into the durable Spawn WAL.
+    #[must_use]
+    pub const fn kernel_child_identity(&self) -> BrokerKernelChildIdentityV1 {
+        self.verified_kernel_child.identity()
     }
 
     #[must_use]
@@ -8388,7 +8607,7 @@ mod tests {
         ));
         assert!(forged_directory.path().join(&forged_name).exists());
 
-        let forked_directory = private_catalog_directory();
+        let duplicate_certificate_directory = private_catalog_directory();
         let first = identity;
         let mut second = recovered_catalog_identity(&authenticator, 0x34);
         second.journal_id = first.journal_id();
@@ -8397,14 +8616,24 @@ mod tests {
         let second_name = broker_spawn_creation_marker_name(second, &authenticator, false)
             .expect("encode second fork marker");
         assert_ne!(first_name, second_name);
-        create_empty_private_file(&forked_directory.path().join(&first_name));
-        create_empty_private_file(&forked_directory.path().join(&second_name));
+        create_empty_private_file(&duplicate_certificate_directory.path().join(&first_name));
+        create_empty_private_file(&duplicate_certificate_directory.path().join(&second_name));
         assert!(matches!(
-            BrokerSpawnWalCatalogV1::open(forked_directory.path().to_path_buf()),
+            BrokerSpawnWalCatalogV1::open(duplicate_certificate_directory.path().to_path_buf()),
             Err(BrokerSpawnWalError::InvalidCreationState)
         ));
-        assert!(forked_directory.path().join(&first_name).exists());
-        assert!(forked_directory.path().join(&second_name).exists());
+        assert!(
+            duplicate_certificate_directory
+                .path()
+                .join(&first_name)
+                .exists()
+        );
+        assert!(
+            duplicate_certificate_directory
+                .path()
+                .join(&second_name)
+                .exists()
+        );
 
         let split_directory = private_catalog_directory();
         let creating_name = broker_spawn_creation_marker_name(first, &authenticator, false)
@@ -8813,7 +9042,7 @@ mod tests {
         }
         drop(catalog);
 
-        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
+        let mut recovered_catalog = reopen_test_catalog_after_owner_drop(directory)
             .expect("reopen catalog for admission recovery");
         let journals = recovered_catalog
             .scan_all_for_admission(authenticator)
@@ -9272,7 +9501,7 @@ mod tests {
             .accept_connections()
             .expect("accept saturated partial peers");
         assert_eq!(service.connections.len(), 2);
-        assert!(service.free_connection_tokens.is_empty());
+        assert_eq!(service.free_connection_tokens.len(), 0);
 
         let mut tokens = service.connections.keys().copied().collect::<Vec<_>>();
         tokens.sort_unstable_by_key(|token| token.0);
@@ -9284,12 +9513,15 @@ mod tests {
             .accepted_at = now
             .checked_sub(BROKER_CONTROL_AUTHENTICATION_DEADLINE)
             .expect("deadline is representable");
+        let pre_deadline_age = BROKER_CONTROL_AUTHENTICATION_DEADLINE
+            .checked_sub(Duration::from_millis(100))
+            .expect("authentication deadline exceeds the test margin");
         service
             .connections
             .get_mut(&tokens[1])
             .expect("second accepted connection")
             .accepted_at = now
-            .checked_sub(BROKER_CONTROL_AUTHENTICATION_DEADLINE - Duration::from_millis(100))
+            .checked_sub(pre_deadline_age)
             .expect("pre-deadline instant is representable");
 
         service.expire_unauthenticated_connections();
@@ -9562,6 +9794,27 @@ mod tests {
         directory
     }
 
+    fn reopen_test_catalog_after_owner_drop(
+        directory: &Path,
+    ) -> Result<BrokerSpawnWalCatalogV1, BrokerSpawnWalError> {
+        // Parallel spawn tests can fork while this process owns the catalog
+        // lock. The child inherits that open-file description until the
+        // portable-pty pre-exec close sweep runs, so an immediate same-process
+        // restart can transiently observe CatalogAlreadyOwned even after the
+        // parent descriptor was explicitly dropped. Production admission must
+        // still fail immediately on a real competing owner; only this bounded
+        // test restart helper waits for the CLOEXEC/pre-exec handoff to settle.
+        for attempt in 0..100 {
+            match BrokerSpawnWalCatalogV1::open(directory.to_path_buf()) {
+                Err(BrokerSpawnWalError::CatalogAlreadyOwned) if attempt < 99 => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the bounded catalog reopen loop always returns")
+    }
+
     fn create_private_broker_token_with_bytes(path: &Path, bytes: &[u8]) {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -9580,6 +9833,7 @@ mod tests {
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(path)
             .expect("create exclusive test file")
     }
@@ -9597,6 +9851,8 @@ mod tests {
         identity: BrokerSpawnWalIdentityV1,
         authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
     ) -> (BrokerSpawnJournalV1, std::path::PathBuf, std::path::PathBuf) {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("set broker Spawn WAL fixture parent owner-only");
         let wal_path = directory.join("spawn.wal");
         let head_path = directory.join("spawn.head");
         let wal = open_new_test_file(&wal_path);
@@ -9983,11 +10239,11 @@ mod tests {
         let mut identity = recovered_catalog_identity(&authenticator, 3);
         identity.broker_lineage_id = id(6_003);
         assert_ne!(identity.broker_lineage_id(), authenticator.lineage_id());
-        let (_catalog, journals) =
-            recover_header_only_catalog_journals(directory.path(), &[identity], &authenticator);
+        let (journal, _wal_path, _head_path) =
+            create_test_spawn_journal(directory.path(), identity, authenticator.clone());
 
         assert!(matches!(
-            BrokerRecoveredSpawnCatalogV1::admit(journals, &authenticator),
+            BrokerRecoveredSpawnCatalogV1::admit(vec![journal], &authenticator),
             Err(BrokerSpawnWalError::RecoveredCatalogLineageMismatch)
         ));
     }
@@ -10179,7 +10435,7 @@ mod tests {
             BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
         );
 
-        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered_catalog = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("reopen conflicting catalog without mutation");
         let journals = recovered_catalog
             .scan_all_for_admission(&authenticator)
@@ -10821,6 +11077,19 @@ mod tests {
             attachment,
         } = commit_for_test(prepared, control, binding).expect("durable commit");
         let child_identity = pane.child_identity();
+        let kernel_child_identity = pane.kernel_child_identity();
+        assert_eq!(
+            kernel_child_identity.process_id(),
+            child_identity.process_id
+        );
+        assert_eq!(
+            kernel_child_identity.broker_child_nonce(),
+            child_identity.broker_child_nonce
+        );
+        assert_ne!(
+            kernel_child_identity.kernel_start_identity_digest(),
+            [0; 32]
+        );
         let first_attachment = attachment.identity();
         proxy_write(&mut pane, &attachment, b"alpha\n");
         let first_output = read_until(&mut pane, &attachment, b"first:alpha");
@@ -11216,6 +11485,208 @@ mod tests {
     }
 
     #[test]
+    fn durable_spawn_commit_fuses_wal_kernel_identity_and_single_child_ownership() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("durable-spawn-count");
+        let authority = authority(id(109), id(110), id(111), id(112), 0x95, 0x96);
+        let script = "printf S >>\"$BROKER_SENTINEL\"; IFS= read -r ignored";
+        let payload = command_payload(script, &sentinel);
+        let binding = binding_for(&payload, &authority);
+        let (prepared, control) = prepare_for_test(
+            payload,
+            binding,
+            &authority,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare durable Spawn pane");
+        let output = create_test_output_journal(
+            temp.path(),
+            binding.durable_pane_id,
+            id(113),
+            GuardianOutputJournalLimits::default(),
+        );
+        let prepared = prepared
+            .bind_fresh_output_journal(output)
+            .expect("bind durable Spawn output journal");
+
+        let authenticator = wal_authenticator(0x97);
+        let wal_identity =
+            BrokerSpawnWalIdentityV1::from_binding(id(114), authenticator.lineage_id(), binding)
+                .expect("bind durable Spawn WAL identity");
+        let (mut journal, _wal_path, _head_path) =
+            create_test_spawn_journal(temp.path(), wal_identity, authenticator);
+        let proof = BrokerDurablePreSpawnIntentProof {
+            binding,
+            catalog_candidate_checksum: [0x98; BROKER_CATALOG_CHECKSUM_BYTES],
+        };
+        let attempt_id = id(115);
+        let (mut pane, child_identity) = match prepared
+            .commit_with_wal_proof(control, &proof, &mut journal, attempt_id)
+            .expect("commit one durable Spawn")
+        {
+            BrokerDurableSpawnCommitV1::Applied {
+                adoption,
+                spawn_observed,
+            } => {
+                assert_eq!(spawn_observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
+                assert_eq!(spawn_observed.sequence(), 2);
+                let adoption = *adoption;
+                let identity = adoption.pane.kernel_child_identity();
+                (adoption.pane, identity)
+            }
+            BrokerDurableSpawnCommitV1::Reconciled(_) => {
+                panic!("first durable Spawn reconciled instead of applying")
+            }
+            BrokerDurableSpawnCommitV1::OutcomeIndeterminate { .. } => {
+                panic!("first durable Spawn became indeterminate")
+            }
+        };
+        assert_eq!(
+            journal.status().child_identity,
+            Some(child_identity),
+            "durable WAL did not retain the exact live kernel child identity"
+        );
+
+        let retry_payload = command_payload(script, &sentinel);
+        let (retry_prepared, retry_control) = prepare_for_test(
+            retry_payload,
+            binding,
+            &authority,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare exact lost-reply retry");
+        let retry_output = create_test_output_journal(
+            temp.path(),
+            binding.durable_pane_id,
+            id(116),
+            GuardianOutputJournalLimits::default(),
+        );
+        let retry_prepared = retry_prepared
+            .bind_fresh_output_journal(retry_output)
+            .expect("bind retry output journal");
+        match retry_prepared
+            .commit_with_wal_proof(retry_control, &proof, &mut journal, attempt_id)
+            .expect("query exact lost durable Spawn reply")
+        {
+            BrokerDurableSpawnCommitV1::Reconciled(status) => {
+                assert_eq!(status.phase, Some(BrokerSpawnWalPhaseV1::SpawnObserved));
+                assert_eq!(status.child_identity, Some(child_identity));
+            }
+            BrokerDurableSpawnCommitV1::Applied { .. } => {
+                panic!("lost durable Spawn reply launched a second child")
+            }
+            BrokerDurableSpawnCommitV1::OutcomeIndeterminate { .. } => {
+                panic!("observed durable Spawn regressed to indeterminate")
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !sentinel.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            fs::read(&sentinel).expect("read durable Spawn sentinel"),
+            b"S",
+            "durable Spawn retry created more than one user child"
+        );
+        assert_eq!(pane.kernel_child_identity(), child_identity);
+        pane.terminate_and_wait_for_test();
+    }
+
+    #[test]
+    fn durable_spawn_observation_crash_cut_retains_pane_and_recovers_exact_child() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("durable-spawn-observation-cut");
+        let authority = authority(id(117), id(118), id(119), id(120), 0x99, 0x9a);
+        let payload = command_payload(
+            "printf O >>\"$BROKER_SENTINEL\"; IFS= read -r ignored",
+            &sentinel,
+        );
+        let binding = binding_for(&payload, &authority);
+        let (prepared, control) = prepare_for_test(
+            payload,
+            binding,
+            &authority,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare observation-cut pane");
+        let output = create_test_output_journal(
+            temp.path(),
+            binding.durable_pane_id,
+            id(121),
+            GuardianOutputJournalLimits::default(),
+        );
+        let prepared = prepared
+            .bind_fresh_output_journal(output)
+            .expect("bind observation-cut output journal");
+        let authenticator = wal_authenticator(0x9b);
+        let wal_identity =
+            BrokerSpawnWalIdentityV1::from_binding(id(122), authenticator.lineage_id(), binding)
+                .expect("bind observation-cut WAL identity");
+        let (mut journal, wal_path, head_path) =
+            create_test_spawn_journal(temp.path(), wal_identity, authenticator.clone());
+        journal.inject_fault(BrokerSpawnWalInjectedFault::AfterWalSyncBeforeHeadForPhase(
+            BrokerSpawnWalPhaseV1::SpawnObserved,
+        ));
+        let proof = BrokerDurablePreSpawnIntentProof {
+            binding,
+            catalog_candidate_checksum: [0x9c; BROKER_CATALOG_CHECKSUM_BYTES],
+        };
+        let mut pane = match prepared
+            .commit_with_wal_proof(control, &proof, &mut journal, id(123))
+            .expect("observation durability failure is an owned outcome")
+        {
+            BrokerDurableSpawnCommitV1::OutcomeIndeterminate {
+                reason,
+                retained_adoption: Some(adoption),
+                status,
+            } => {
+                assert_eq!(
+                    reason,
+                    BrokerDurableSpawnIndeterminateReasonV1::SpawnObservationDurability
+                );
+                assert_eq!(status.phase, Some(BrokerSpawnWalPhaseV1::Attempted));
+                assert!(status.spawn_outcome_is_indeterminate());
+                adoption.pane
+            }
+            BrokerDurableSpawnCommitV1::OutcomeIndeterminate {
+                retained_adoption: None,
+                ..
+            } => panic!("observation crash cut dropped the adopted pane"),
+            BrokerDurableSpawnCommitV1::Applied { .. } => {
+                panic!("injected observation crash cut reported applied")
+            }
+            BrokerDurableSpawnCommitV1::Reconciled(_) => {
+                panic!("new observation crash cut reported reconciled")
+            }
+        };
+        let child_identity = pane.kernel_child_identity();
+        drop(journal);
+
+        let recovered =
+            reopen_test_spawn_journal(&wal_path, &head_path, wal_identity, authenticator);
+        let recovered_status = recovered.status();
+        assert_eq!(
+            recovered_status.phase,
+            Some(BrokerSpawnWalPhaseV1::SpawnObserved)
+        );
+        assert_eq!(recovered_status.child_identity, Some(child_identity));
+        assert!(recovered_status.head_reconciliation_required);
+        assert!(recovered_status.append_authority_withheld);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !sentinel.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            fs::read(&sentinel).expect("read observation-cut sentinel"),
+            b"O",
+            "observation crash cut launched or lost the wrong child"
+        );
+        pane.terminate_and_wait_for_test();
+    }
+
+    #[test]
     fn durable_output_is_synchronized_and_recoverable_before_proxy_delivery() {
         let temp = tempfile::tempdir().expect("test directory");
         let sentinel = temp.path().join("unused");
@@ -11260,7 +11731,7 @@ mod tests {
             }
         }
         assert_eq!(pane.status().output_sequence, 9);
-        assert!(!pumps.is_empty());
+        assert_ne!(pumps.len(), 0);
         for (index, pump) in pumps.iter().enumerate() {
             assert_eq!(
                 pump.durable_journal_sequence,
@@ -11936,7 +12407,7 @@ mod tests {
             "the later head did not retain the simulated partial record"
         );
 
-        let mut resumed_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut resumed_catalog = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("reopen catalog after interrupted reconciliation");
         let journals = resumed_catalog
             .scan_all_for_admission(&authenticator)

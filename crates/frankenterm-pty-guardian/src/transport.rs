@@ -4749,10 +4749,10 @@ mod tests {
         let mux_incarnation = Uuid::from_u128(0x5052);
         let snapshot_id = Uuid::from_u128(0x5053);
         let expected = vec![census_test_entry(0x5054, 3), census_test_entry(0x5055, 4)];
-        let served = expected.clone();
-        let server = std::thread::spawn(move || {
+        let response_entries = expected.clone();
+        let server_thread = std::thread::spawn(move || {
             let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
-            for index in 0..2_usize {
+            for (index, entry) in response_entries.into_iter().enumerate() {
                 let frame = read_blocking_frame(&mut server_stream).unwrap();
                 let request = decode_guardian_request(&secret, &frame).unwrap();
                 assert_eq!(request.header().operation, GuardianOperation::Census);
@@ -4772,7 +4772,7 @@ mod tests {
                     &request,
                     &GuardianReply::CensusPage {
                         snapshot_id,
-                        entries: vec![served[index].clone()],
+                        entries: vec![entry],
                         next_cursor: (index == 0).then_some(1),
                         total_panes: 2,
                     },
@@ -4800,7 +4800,7 @@ mod tests {
             client.stream.write_timeout().unwrap(),
             Some(CLIENT_IO_TIMEOUT)
         );
-        server
+        server_thread
             .join()
             .expect("bounded census collection server exits cleanly");
     }
@@ -4827,12 +4827,12 @@ mod tests {
         let guardian_incarnation = Uuid::from_u128(0x5061);
         let mux_incarnation = Uuid::from_u128(0x5062);
         let snapshot_id = Uuid::from_u128(0x5063);
-        let served = [census_test_entry(0x5064, 5), census_test_entry(0x5065, 6)];
+        let response_entries = [census_test_entry(0x5064, 5), census_test_entry(0x5065, 6)];
         let observed_requests = Arc::new(AtomicUsize::new(0));
         let server_observed_requests = Arc::clone(&observed_requests);
-        let server = std::thread::spawn(move || {
+        let server_thread = std::thread::spawn(move || {
             let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
-            for index in 0..2_usize {
+            for (index, entry) in response_entries.into_iter().enumerate() {
                 let frame = read_blocking_frame(&mut server_stream).unwrap();
                 let request = decode_guardian_request(&secret, &frame).unwrap();
                 let page = GuardianCensusPageRequest::decode(request.payload()).unwrap();
@@ -4843,7 +4843,7 @@ mod tests {
                     &request,
                     &GuardianReply::CensusPage {
                         snapshot_id,
-                        entries: vec![served[index].clone()],
+                        entries: vec![entry],
                         next_cursor: (index == 0).then_some(1),
                         total_panes: 2,
                     },
@@ -4869,7 +4869,9 @@ mod tests {
             Err(GuardianClientError::Io(error))
                 if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
         ));
-        server.join().expect("deadline census server exits cleanly");
+        server_thread
+            .join()
+            .expect("deadline census server exits cleanly");
         assert_eq!(observed_requests.load(Ordering::SeqCst), 2);
     }
 
@@ -4991,7 +4993,11 @@ mod tests {
         let snapshot_digest = [0x51; 32];
         let checkpoint_id = GuardianCheckpointIdentityDigest::from_bytes([0x52; 32]).unwrap();
         let replay = GuardianReplayRequestV1::Open {
-            selector: GuardianReplaySelectorV1::LatestCompatible,
+            selector: GuardianReplaySelectorV1::Resume {
+                checkpoint_id,
+                next_sequence: 1,
+                previous_record_digest: [0; 32],
+            },
             max_plaintext_bytes: 4_096,
             max_records: 16,
             wait_millis: 0,

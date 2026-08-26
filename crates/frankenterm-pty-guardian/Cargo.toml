@@ -38,6 +38,7 @@ mio = { workspace = true, features = ["net", "os-ext", "os-poll"] }
 mux.workspace = true
 nix = { workspace = true, features = ["feature", "fs", "process", "signal", "user"] }
 portable-pty = { workspace = true, features = ["serde_support"] }
+procinfo.workspace = true
 rustix = { workspace = true, features = ["process"] }
 sha2.workspace = true
 uuid = { workspace = true, features = ["rng", "v4"] }

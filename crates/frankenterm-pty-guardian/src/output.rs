@@ -11332,7 +11332,7 @@ mod tests {
         let first = store.apply_replay(&open_request, preflight, Some(&journal))?;
         assert!(!format!("{first:?}").contains("checkpoint-boundary"));
         let first = observe_replay_page(first, maximum_plaintext_bytes)?;
-        assert!(!first.checkpoint_plaintext.is_empty());
+        assert_ne!(first.checkpoint_plaintext.len(), 0);
 
         let retry = store.apply_replay(&open_request, preflight, Some(&journal))?;
         let retry = observe_replay_page(retry, maximum_plaintext_bytes)?;
@@ -11379,9 +11379,9 @@ mod tests {
                 continuation,
             )?;
             request_identity += 1;
-            let page =
+            let replay_outcome =
                 store.apply_replay(&request, state.preflight_replay(&request)?, Some(&journal))?;
-            let observed = observe_replay_page(page, maximum_plaintext_bytes)?;
+            let observed = observe_replay_page(replay_outcome, maximum_plaintext_bytes)?;
             suffix.extend_from_slice(&observed.output_plaintext);
             ack_observed_replay_page(
                 &store,
@@ -11452,7 +11452,7 @@ mod tests {
             max_records: 4,
             wait_millis: 0,
         };
-        let stale = checkpoint_catalog_replay_request(
+        let stale_request = checkpoint_catalog_replay_request(
             guardian,
             old_mux,
             Uuid::from_u128(0xf222),
@@ -11461,7 +11461,7 @@ mod tests {
             replay,
         )?;
         assert!(matches!(
-            state.preflight_replay(&stale),
+            state.preflight_replay(&stale_request),
             Err(GuardianProtocolError::StaleLease)
         ));
         let successor = checkpoint_catalog_replay_request(
@@ -11472,13 +11472,13 @@ mod tests {
             2,
             replay,
         )?;
-        let page = store.apply_replay(
+        let successor_replay = store.apply_replay(
             &successor,
             state.preflight_replay(&successor)?,
             Some(&journal),
         )?;
-        let observed = observe_replay_page(page, 64 * 1024)?;
-        assert!(!observed.checkpoint_plaintext.is_empty());
+        let observed = observe_replay_page(successor_replay, 64 * 1024)?;
+        assert_ne!(observed.checkpoint_plaintext.len(), 0);
         let snapshot = store
             .inner
             .replay
@@ -11540,34 +11540,34 @@ mod tests {
             generation,
             open,
         )?;
-        let page = store.apply_replay(
+        let initial_replay = store.apply_replay(
             &open_request,
             state.preflight_replay(&open_request)?,
             Some(&journal),
         )?;
-        let page = observe_replay_page(page, maximum_plaintext_bytes)?;
+        let replay_page = observe_replay_page(initial_replay, maximum_plaintext_bytes)?;
         let ack = GuardianReplayAckV1::new(
-            page.snapshot_id,
-            page.snapshot_digest,
-            page.page_index,
-            page.page_digest,
-            page.next_cursor.map(GuardianReplayCursorV1::digest),
-            page.through_sequence,
-            page.through_record_digest,
-            page.complete,
+            replay_page.snapshot_id,
+            replay_page.snapshot_digest,
+            replay_page.page_index,
+            replay_page.page_digest,
+            replay_page.next_cursor.map(GuardianReplayCursorV1::digest),
+            replay_page.through_sequence,
+            replay_page.through_record_digest,
+            replay_page.complete,
         )?;
 
-        let mut forged_page_digest = page.page_digest;
+        let mut forged_page_digest = replay_page.page_digest;
         forged_page_digest[0] ^= 0x80;
         let forged_ack = GuardianReplayAckV1::new(
-            page.snapshot_id,
-            page.snapshot_digest,
-            page.page_index,
+            replay_page.snapshot_id,
+            replay_page.snapshot_digest,
+            replay_page.page_index,
             forged_page_digest,
-            page.next_cursor.map(GuardianReplayCursorV1::digest),
-            page.through_sequence,
-            page.through_record_digest,
-            page.complete,
+            replay_page.next_cursor.map(GuardianReplayCursorV1::digest),
+            replay_page.through_sequence,
+            replay_page.through_record_digest,
+            replay_page.complete,
         )?;
         let forged_request = checkpoint_catalog_replay_ack_request(
             guardian,
@@ -11620,8 +11620,8 @@ mod tests {
             Some(&journal),
         )?;
         let reopened = observe_replay_page(reopened, maximum_plaintext_bytes)?;
-        assert_ne!(reopened.snapshot_id, page.snapshot_id);
-        assert!(!reopened.checkpoint_plaintext.is_empty());
+        assert_ne!(reopened.snapshot_id, replay_page.snapshot_id);
+        assert_ne!(reopened.checkpoint_plaintext.len(), 0);
         Ok(())
     }
 
@@ -11669,21 +11669,21 @@ mod tests {
             generation,
             open,
         )?;
-        let page = store.apply_replay(
+        let initial_replay = store.apply_replay(
             &open_request,
             protocol.preflight_replay(&open_request)?,
             Some(&journal),
         )?;
-        let page = observe_replay_page(page, maximum_plaintext_bytes)?;
-        let cursor = page.next_cursor.ok_or("checkpoint page cursor")?;
+        let replay_page = observe_replay_page(initial_replay, maximum_plaintext_bytes)?;
+        let cursor = replay_page.next_cursor.ok_or("checkpoint page cursor")?;
         let ack = GuardianReplayAckV1::new(
-            page.snapshot_id,
-            page.snapshot_digest,
-            page.page_index,
-            page.page_digest,
+            replay_page.snapshot_id,
+            replay_page.snapshot_digest,
+            replay_page.page_index,
+            replay_page.page_digest,
             Some(cursor.digest()),
-            page.through_sequence,
-            page.through_record_digest,
+            replay_page.through_sequence,
+            replay_page.through_record_digest,
             false,
         )?;
         let ack_request_id = Uuid::from_u128(0xf421);
@@ -11721,7 +11721,7 @@ mod tests {
             assert!(
                 !replay
                     .snapshots
-                    .get(&page.snapshot_id)
+                    .get(&replay_page.snapshot_id)
                     .and_then(|snapshot| snapshot.issued)
                     .ok_or("outstanding replay page")?
                     .acknowledged
@@ -11747,7 +11747,7 @@ mod tests {
             assert!(
                 !replay
                     .snapshots
-                    .get(&page.snapshot_id)
+                    .get(&replay_page.snapshot_id)
                     .and_then(|snapshot| snapshot.issued)
                     .ok_or("outstanding replay page")?
                     .acknowledged
@@ -11791,19 +11791,19 @@ mod tests {
             assert!(!replay.request_bindings.contains_key(&continue_request_id));
             let issued = replay
                 .snapshots
-                .get(&page.snapshot_id)
+                .get(&replay_page.snapshot_id)
                 .and_then(|snapshot| snapshot.issued)
                 .ok_or("acknowledged replay page")?;
             assert_eq!(issued.request_id, open_request.header().request_id);
-            assert_eq!(issued.page_index, page.page_index);
+            assert_eq!(issued.page_index, replay_page.page_index);
             assert!(issued.acknowledged);
             replay.fail_request_binding_reservation = false;
         }
         let continued =
             store.apply_replay(&continue_request, continue_preflight, Some(&journal))?;
         let continued = observe_replay_page(continued, maximum_plaintext_bytes)?;
-        assert_eq!(continued.snapshot_id, page.snapshot_id);
-        assert_eq!(continued.page_index, page.page_index + 1);
+        assert_eq!(continued.snapshot_id, replay_page.snapshot_id);
+        assert_eq!(continued.page_index, replay_page.page_index + 1);
         Ok(())
     }
 
