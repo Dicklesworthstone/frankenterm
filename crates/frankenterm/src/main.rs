@@ -77322,7 +77322,7 @@ fn compatible_client_config_bytes(socket: &PinnedCompatibleMuxSocket) -> anyhow:
 #[cfg(unix)]
 fn compatible_client_command_arguments(
     environment: &CompatibleClientEnvironment,
-    executable: &PinnedCompatibleClient,
+    executable_path: &Path,
     kind: CompatibleClientCommandKind<'_>,
 ) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
@@ -77343,7 +77343,7 @@ fn compatible_client_command_arguments(
         OsString::from("LC_ALL=C"),
         OsString::from("LANG=C"),
         assignment("FT_WEZTERM_CLI", &environment.nonexistent_external_cli),
-        executable.path.as_os_str().to_owned(),
+        executable_path.as_os_str().to_owned(),
         OsString::from("--config"),
         OsString::from("/dev/stdin"),
         OsString::from("--workspace"),
@@ -77384,6 +77384,51 @@ fn compatible_client_command_arguments(
 }
 
 #[cfg(unix)]
+async fn execute_bounded_compatible_client_command(
+    cx: &frankenterm_core::cx::Cx,
+    arguments: Vec<std::ffi::OsString>,
+    configuration: Vec<u8>,
+    workspace: &Path,
+    stdout_limit: usize,
+    timeout: Duration,
+) -> anyhow::Result<CompatibleClientCommandReceipt> {
+    let mut command = frankenterm_core::runtime_async::process::Command::new("/usr/bin/env");
+    command
+        .args(arguments)
+        .current_dir(workspace)
+        .stdin_limit(64 * 1024)
+        .stdin_bytes(configuration)
+        .stdout_limit(stdout_limit)
+        .stderr_limit(COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES)
+        .kill_on_drop(true);
+    let output = frankenterm_core::runtime_async::timeout_with_cx(
+        cx,
+        timeout,
+        command.output_with_cx(cx),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("compatible-client subprocess exceeded its wall-clock deadline"))?
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "compatible-client subprocess failed before a bounded complete receipt ({:?})",
+            error.kind()
+        )
+    })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "compatible-client subprocess returned a non-success status (code={:?}, stdout_bytes={}, stderr_bytes={})",
+            output.status.code(),
+            output.stdout.len(),
+            output.stderr.len()
+        );
+    }
+    Ok(CompatibleClientCommandReceipt {
+        stdout: output.stdout,
+        stderr_bytes: output.stderr.len(),
+    })
+}
+
+#[cfg(unix)]
 async fn run_compatible_client_subprocess(
     cx: &frankenterm_core::cx::Cx,
     source: &mut PinnedCompatibleClient,
@@ -77402,44 +77447,17 @@ async fn run_compatible_client_subprocess(
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
         "compatible-client external CLI sentinel unexpectedly exists"
     );
-    let arguments = compatible_client_command_arguments(environment, executable, kind);
+    let arguments = compatible_client_command_arguments(environment, &executable.path, kind);
     let configuration = compatible_client_config_bytes(socket)?;
-    let mut command = frankenterm_core::runtime_async::process::Command::new("/usr/bin/env");
-    command
-        .args(arguments)
-        .current_dir(&environment.workspace)
-        .stdin_limit(64 * 1024)
-        .stdin_bytes(configuration)
-        .stdout_limit(stdout_limit)
-        .stderr_limit(COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES)
-        .kill_on_drop(true);
-    let run_result = frankenterm_core::runtime_async::timeout_with_cx(
+    let run_result = execute_bounded_compatible_client_command(
         cx,
+        arguments,
+        configuration,
+        &environment.workspace,
+        stdout_limit,
         timeout,
-        command.output_with_cx(cx),
     )
-    .await
-    .map_err(|_| anyhow::anyhow!("compatible-client subprocess exceeded its wall-clock deadline"))
-    .and_then(|output| {
-        let output = output.map_err(|error| {
-            anyhow::anyhow!(
-                "compatible-client subprocess failed before a bounded complete receipt ({:?})",
-                error.kind()
-            )
-        })?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "compatible-client subprocess returned a non-success status (code={:?}, stdout_bytes={}, stderr_bytes={})",
-                output.status.code(),
-                output.stdout.len(),
-                output.stderr.len()
-            );
-        }
-        Ok(CompatibleClientCommandReceipt {
-            stdout: output.stdout,
-            stderr_bytes: output.stderr.len(),
-        })
-    });
+    .await;
 
     let source_revalidation = source.revalidate("compatible client source");
     let snapshot_revalidation = executable.revalidate("private compatible client snapshot");

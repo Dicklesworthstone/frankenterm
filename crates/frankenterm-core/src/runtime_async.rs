@@ -4667,6 +4667,32 @@ pub mod process {
         /// watcher sets `watcher_done` on normal-path exit so it
         /// never leaks past the body.
         pub async fn output_with_cx(&mut self, cx: &crate::cx::Cx) -> std::io::Result<Output> {
+            self.output_with_cx_deadline(cx, None).await
+        }
+
+        /// Executes the command under both caller-Cx cancellation and a finite
+        /// wall-clock deadline.
+        ///
+        /// Unlike wrapping [`Self::output_with_cx`] in an outer timeout, this
+        /// deadline is owned by the blocking process supervisor itself. A
+        /// timeout therefore does not return merely because the async future
+        /// was dropped: the supervisor terminates the process group, drains
+        /// its bounded pipes, and reaps the leader before this method settles.
+        /// Caller-Cx cancellation retains the same settled-cleanup guarantee.
+        pub async fn output_with_cx_timeout(
+            &mut self,
+            cx: &crate::cx::Cx,
+            timeout: Duration,
+        ) -> std::io::Result<Output> {
+            self.output_with_cx_deadline(cx, Some(OutputCommandDeadline::new(timeout)))
+                .await
+        }
+
+        async fn output_with_cx_deadline(
+            &mut self,
+            cx: &crate::cx::Cx,
+            deadline: Option<OutputCommandDeadline>,
+        ) -> std::io::Result<Output> {
             cx.checkpoint()
                 .map_err(|_| CommandCancelled.into_io_error())?;
 
@@ -4719,9 +4745,10 @@ pub mod process {
             // long-lived cxs.
             let _watcher_done_guard = WatcherDoneGuard::new(Arc::clone(&watcher_done));
 
-            let result = super::spawn_blocking(move || run_output_command(spec, cancel, None))
-                .await
-                .map_err(std::io::Error::other)?;
+            let result =
+                super::spawn_blocking(move || run_output_command(spec, cancel, deadline))
+                    .await
+                    .map_err(std::io::Error::other)?;
 
             // Drain the watcher on the normal path so it exits
             // before this function returns. The guard above already
@@ -13524,6 +13551,60 @@ mod tests {
             assert!(
                 elapsed < Duration::from_secs(5),
                 "cancellation should surface promptly (got {elapsed:?}); the 10s sleep would dominate if cx was ignored"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    #[test]
+    fn process_command_output_with_cx_timeout_settles_process_tree_before_return() {
+        run_async_test_isolated(|| async {
+            let artifact_dir = tempfile::tempdir().expect("timeout settlement tempdir");
+            let pid_path = artifact_dir.path().join("leader.pid");
+            let delayed_marker_path = artifact_dir.path().join("must-not-exist");
+            let cx = crate::cx::for_testing();
+            let mut command = process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(
+                    "printf '%s' \"$$\" > \"$FT_RUNTIME_COMPAT_PID\"; \
+                     (sleep 2; printf leaked > \"$FT_RUNTIME_COMPAT_MARKER\") & wait",
+                )
+                .env("FT_RUNTIME_COMPAT_PID", &pid_path)
+                .env("FT_RUNTIME_COMPAT_MARKER", &delayed_marker_path)
+                .kill_on_drop(true);
+
+            let started = std::time::Instant::now();
+            let error = command
+                .output_with_cx_timeout(&cx, Duration::from_millis(500))
+                .await
+                .expect_err("finite supervisor deadline must stop the process tree");
+            let elapsed = started.elapsed();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(
+                CommandTimedOut::from_io_error(&error).is_some(),
+                "deadline failure must retain its typed content-free receipt"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "settled timeout must not wait for the child's natural exit: {elapsed:?}"
+            );
+
+            let process_id: i64 = std::fs::read_to_string(&pid_path)
+                .expect("child must publish its process id before the deadline")
+                .parse()
+                .expect("published process id must be numeric");
+            let probe = process::send_unix_signal_to_pid(process_id, "0")
+                .expect("process-existence probe must execute");
+            assert!(
+                !probe.success(),
+                "timed-out process leader must already be reaped when the API returns"
+            );
+
+            sleep(Duration::from_millis(1_750)).await;
+            assert!(
+                !delayed_marker_path.exists(),
+                "timed-out process descendants must not survive to perform delayed effects"
             );
         });
     }
