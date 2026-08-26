@@ -23339,6 +23339,31 @@ where
         })?
 }
 
+/// Run a synchronous filesystem effect to an explicit completion receipt.
+///
+/// Caller cancellation is an admissibility check only before dispatch. Once
+/// the blocking closure is admitted, this boundary deliberately does not race
+/// its join receipt against the caller Cx: an atomic rename or directory fsync
+/// may already have happened, so returning early would turn a settled effect
+/// into an ambiguous lost reply.
+async fn run_cli_settled_blocking_effect<T, F>(
+    cx: &frankenterm_core::cx::Cx,
+    operation: &'static str,
+    work: F,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    anyhow::ensure!(
+        cx.checkpoint().is_ok(),
+        "{operation} was cancelled before its first filesystem mutation"
+    );
+    frankenterm_core::runtime_async::spawn_blocking(work)
+        .await
+        .map_err(|_| anyhow::anyhow!("{operation} failed at the settled blocking boundary"))?
+}
+
 async fn check_watcher_running_with_cx(
     cx: &frankenterm_core::cx::Cx,
     lock_path: PathBuf,
@@ -76024,7 +76049,12 @@ async fn handle_session_command(
             let output_format = resolve_session_orphan_output_format(&format);
             let output_path = output.unwrap_or_else(default_live_mux_dump_path);
             let dump = capture_live_mux_dump(config, max_panes, max_total_bytes).await?;
-            let published = publish_mux_dump_payload(&output_path, dump)?;
+            let publication_path = output_path.clone();
+            let published =
+                run_cli_settled_blocking_effect(&cx, "mux dump publication", move || {
+                    publish_mux_dump_payload(&publication_path, dump)
+                })
+                .await?;
 
             let result = serde_json::json!({
                 "ok": published.complete || allow_partial,
@@ -76037,6 +76067,7 @@ async fn handle_session_command(
                 "artifact_sha256": &published.artifact_sha256,
                 "artifact_bytes": published.artifact_bytes,
                 "durability": published.durability,
+                "publication_recovered_existing": published.recovered_existing,
                 "redaction_applied": true,
             });
             if !print_snapshot_session_structured_output(&result, output_format)? {
@@ -78174,16 +78205,17 @@ async fn run_compatible_client_dump_command(
     } = capture;
     let publication_path = output_path.clone();
     let retained_environment_path = recovery_environment_path.clone();
-    let published = run_cli_blocking_with_cx(cx, "compatible-client dump publication", move || {
-        publish_mux_dump_payload(&publication_path, payload)
-    })
-    .await
-    .with_context(|| {
-        format!(
-            "compatible-client dump publication failed; retained recovery environment: {}",
-            retained_environment_path.display()
-        )
-    })?;
+    let published =
+        run_cli_settled_blocking_effect(cx, "compatible-client dump publication", move || {
+            publish_mux_dump_payload(&publication_path, payload)
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "compatible-client dump publication failed; retained recovery environment: {}",
+                retained_environment_path.display()
+            )
+        })?;
     anyhow::ensure!(
         published.complete && published.error_count == 0,
         "compatible-client dump verifier did not certify a complete forensic artifact; retained recovery environment: {}",
@@ -78227,6 +78259,7 @@ async fn run_compatible_client_dump_command(
         "stderr_bytes": receipt.stderr_bytes,
         "total_deadline_ms": receipt.total_deadline_ms,
         "durability": published.durability,
+        "publication_recovered_existing": published.recovered_existing,
         "redaction_applied": true,
         "forensic_text_export": true,
         "executable_restore_image": false,
@@ -78986,8 +79019,7 @@ const PRIVATE_ARTIFACT_STAGE_PREFIX: &str = ".ft-private-artifact-";
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const PRIVATE_ARTIFACT_MAX_RETAINED_STAGES: u64 = 8;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const PRIVATE_ARTIFACT_MAX_RETAINED_STAGE_BYTES: u64 =
-    LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES * 2;
+const PRIVATE_ARTIFACT_MAX_RETAINED_STAGE_BYTES: u64 = LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES * 2;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn private_artifact_stage_name(target: &Path, expected_sha256: &str) -> String {
@@ -79208,7 +79240,7 @@ where
     };
     let expected_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let projected_count = retained_count
-        .checked_add(u64::from(stage_metadata.is_none()))
+        .checked_add(if stage_metadata.is_none() { 1 } else { 0 })
         .context("private artifact projected stage count overflowed")?;
     let existing_stage_bytes = stage_metadata.as_ref().map_or(0, |metadata| metadata.len());
     let projected_bytes = retained_bytes
@@ -98055,7 +98087,13 @@ recorder_backend = "rusqlite"
         assert_eq!(receipt.bytes, 6);
         assert_eq!(receipt.sha256, sha256_hex(b"first\n"));
         assert_eq!(receipt.durability, "file_and_parent_directory_synced");
+        assert!(!receipt.recovered_existing);
         assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+
+        let replay = write_new_private_artifact(&path, b"first\n")
+            .expect("an exact existing artifact reconciles as lost success");
+        assert!(replay.recovered_existing);
+        assert_eq!(replay.sha256, receipt.sha256);
 
         let error = write_new_private_artifact(&path, b"second\n")
             .expect_err("existing artifact must not be overwritten");

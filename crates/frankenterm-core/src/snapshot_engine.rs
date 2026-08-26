@@ -6769,6 +6769,9 @@ pub enum CheckpointScrollbackArtifactError {
     /// No-clobber publication found an existing conflicting target.
     #[error("checkpoint scrollback target already exists")]
     AlreadyExists,
+    /// Deterministic staging evidence belongs to a different payload.
+    #[error("checkpoint scrollback staging artifact conflicts with the requested publication")]
+    StagingConflict,
     /// Another producer retained the directory-wide publication lock too long.
     #[error("checkpoint scrollback publication lock acquisition timed out")]
     PublicationBusy,
@@ -9090,6 +9093,8 @@ struct CheckpointArtifactFileSnapshot {
     #[cfg(unix)]
     mode: u32,
     #[cfg(unix)]
+    owner: u32,
+    #[cfg(unix)]
     link_count: u64,
     #[cfg(unix)]
     modified_seconds: i64,
@@ -9120,6 +9125,8 @@ impl CheckpointArtifactFileSnapshot {
             #[cfg(unix)]
             mode: metadata.permissions().mode(),
             #[cfg(unix)]
+            owner: cap_std::fs::MetadataExt::uid(metadata),
+            #[cfg(unix)]
             link_count: metadata.nlink(),
             #[cfg(unix)]
             modified_seconds: metadata.mtime(),
@@ -9147,6 +9154,8 @@ impl CheckpointArtifactFileSnapshot {
             inode: metadata.ino(),
             #[cfg(unix)]
             mode: metadata.permissions().mode(),
+            #[cfg(unix)]
+            owner: metadata.uid(),
             #[cfg(unix)]
             link_count: metadata.nlink(),
             #[cfg(unix)]
@@ -9189,6 +9198,12 @@ fn validate_checkpoint_artifact_file_metadata(
     if path_snapshot.mode & 0o077 != 0 {
         return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
             "artifact permissions are not private".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    if path_snapshot.owner != rustix::process::geteuid().as_raw() {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact is not owned by the effective user".to_string(),
         ));
     }
     Ok(handle_snapshot)
