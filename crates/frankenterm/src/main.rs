@@ -77401,14 +77401,10 @@ async fn execute_bounded_compatible_client_command(
         .stdout_limit(stdout_limit)
         .stderr_limit(COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES)
         .kill_on_drop(true);
-    let output = frankenterm_core::runtime_async::timeout_with_cx(
-        cx,
-        timeout,
-        command.output_with_cx(cx),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("compatible-client subprocess exceeded its wall-clock deadline"))?
-    .map_err(|error| {
+    let output = command
+        .output_with_cx_timeout(cx, timeout)
+        .await
+        .map_err(|error| {
         anyhow::anyhow!(
             "compatible-client subprocess failed before a bounded complete receipt ({:?})",
             error.kind()
@@ -77771,10 +77767,18 @@ async fn capture_compatible_client_dump(
         .max_total_bytes
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("compatible-client tail bound overflow"))?;
-    if fs::symlink_metadata(&request.output).is_ok() {
-        anyhow::bail!(
-            "compatible-client dump output already exists; existing paths are never overwritten"
-        );
+    match fs::symlink_metadata(&request.output) {
+        Ok(_) => {
+            anyhow::bail!(
+                "compatible-client dump output already exists; existing paths are never overwritten"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context(
+                "Failed to establish that the compatible-client dump output is absent",
+            );
+        }
     }
 
     let mut source = pin_compatible_client(
