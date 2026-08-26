@@ -76914,10 +76914,7 @@ struct CompatibleClientSubprocessAccounting {
 }
 
 #[cfg(unix)]
-fn compatible_client_path_parts(
-    path: &Path,
-    label: &str,
-) -> anyhow::Result<(PathBuf, PathBuf)> {
+fn compatible_client_path_parts(path: &Path, label: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
     if !path.is_absolute() || path_contains_parent_component(path) {
         anyhow::bail!("{label} must be an absolute normalized path");
     }
@@ -76939,14 +76936,17 @@ fn require_compatible_client_identity(
     metadata: &cap_std::fs::Metadata,
     label: &str,
 ) -> anyhow::Result<CompatibleClientNamedIdentity> {
-    use cap_fs_ext::OsMetadataExt as _;
-    use cap_std::fs::PermissionsExt as _;
-
     let identity = CompatibleClientNamedIdentity::from_cap(metadata);
     let effective_uid = nix::unistd::geteuid().as_raw();
     anyhow::ensure!(metadata.is_file(), "{label} is not a regular file");
-    anyhow::ensure!(identity.uid == effective_uid, "{label} is not owned by the effective user");
-    anyhow::ensure!(identity.hard_link_count == 1, "{label} has more than one hard link");
+    anyhow::ensure!(
+        identity.uid == effective_uid,
+        "{label} is not owned by the effective user"
+    );
+    anyhow::ensure!(
+        identity.hard_link_count == 1,
+        "{label} has more than one hard link"
+    );
     anyhow::ensure!(
         identity.mode & 0o100 != 0,
         "{label} is not executable by its owner"
@@ -76963,7 +76963,6 @@ fn require_compatible_client_identity(
         identity.byte_len > 0 && identity.byte_len <= COMPATIBLE_CLIENT_DUMP_MAX_CLIENT_BYTES,
         "{label} byte length is outside the supported bound"
     );
-    let _ = metadata.dev();
     Ok(identity)
 }
 
@@ -77009,8 +77008,8 @@ fn pin_compatible_client(
     );
     file.rewind()
         .with_context(|| format!("Failed to rewind {label}"))?;
-    let (hashed_bytes, sha256) = sha256_reader(&mut file)
-        .with_context(|| format!("Failed to hash {label}"))?;
+    let (hashed_bytes, sha256) =
+        sha256_reader(&mut file).with_context(|| format!("Failed to hash {label}"))?;
     let metadata_after = file
         .metadata()
         .with_context(|| format!("Failed to re-inspect {label}"))?;
@@ -77144,7 +77143,9 @@ impl PinnedCompatibleMuxSocket {
 }
 
 #[cfg(unix)]
-fn create_compatible_client_environment(output: &Path) -> anyhow::Result<CompatibleClientEnvironment> {
+fn create_compatible_client_environment(
+    output: &Path,
+) -> anyhow::Result<CompatibleClientEnvironment> {
     use cap_fs_ext::OsMetadataExt as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -77155,7 +77156,9 @@ fn create_compatible_client_environment(output: &Path) -> anyhow::Result<Compati
     let effective_uid = nix::unistd::geteuid().as_raw();
     let parent_mode = CompatibleClientNamedIdentity::from_cap(&parent_metadata).mode;
     anyhow::ensure!(
-        parent_metadata.is_dir() && parent_metadata.uid() == effective_uid && parent_mode & 0o077 == 0,
+        parent_metadata.is_dir()
+            && parent_metadata.uid() == effective_uid
+            && parent_mode & 0o077 == 0,
         "compatible-client output parent must be a private effective-user-owned directory"
     );
     let temporary = tempfile::Builder::new()
@@ -77183,14 +77186,25 @@ fn create_compatible_client_environment(output: &Path) -> anyhow::Result<Compati
     let temp = root.join("tmp");
     for directory in [&empty_path, &home, &config, &data, &workspace, &temp] {
         fs::create_dir(directory).with_context(|| {
-            format!("Failed to create private recovery directory {}", directory.display())
+            format!(
+                "Failed to create private recovery directory {}",
+                directory.display()
+            )
         })?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!("Failed to seal private recovery directory {}", directory.display())
+            format!(
+                "Failed to seal private recovery directory {}",
+                directory.display()
+            )
         })?;
         fs::File::open(directory)
             .and_then(|file| file.sync_all())
-            .with_context(|| format!("Failed to synchronize recovery directory {}", directory.display()))?;
+            .with_context(|| {
+                format!(
+                    "Failed to synchronize recovery directory {}",
+                    directory.display()
+                )
+            })?;
     }
     fs::File::open(&root)
         .and_then(|file| file.sync_all())
@@ -77200,7 +77214,8 @@ fn create_compatible_client_environment(output: &Path) -> anyhow::Result<Compati
     revalidate_artifact_parent_directory(&output_parent_path, &output_parent)?;
     let nonexistent_external_cli = root.join("external-wezterm-is-forbidden");
     anyhow::ensure!(
-        fs::symlink_metadata(&nonexistent_external_cli).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        fs::symlink_metadata(&nonexistent_external_cli)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
         "compatible-client external CLI sentinel unexpectedly exists"
     );
     Ok(CompatibleClientEnvironment {
@@ -77220,8 +77235,7 @@ fn snapshot_compatible_client(
     source: &mut PinnedCompatibleClient,
     environment: &CompatibleClientEnvironment,
 ) -> anyhow::Result<PinnedCompatibleClient> {
-    use cap_std::fs::OpenOptionsExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
+    use cap_std::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     source.revalidate("compatible client source")?;
     let root = open_directory_tree_nofollow(&environment.root)
@@ -77249,14 +77263,21 @@ fn snapshot_compatible_client(
             .file
             .read(&mut buffer[..allowed])
             .context("Failed to read compatible client source for snapshot")?;
-        anyhow::ensure!(read > 0, "compatible client source ended before its pinned byte length");
+        anyhow::ensure!(
+            read > 0,
+            "compatible client source ended before its pinned byte length"
+        );
         destination
             .write_all(&buffer[..read])
             .context("Failed to write compatible-client executable snapshot")?;
         remaining = remaining.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
     }
     anyhow::ensure!(
-        source.file.read(&mut buffer[..1]).context("Failed to verify compatible client source length")? == 0,
+        source
+            .file
+            .read(&mut buffer[..1])
+            .context("Failed to verify compatible client source length")?
+            == 0,
         "compatible client source grew beyond its pinned byte length"
     );
     destination
@@ -77422,12 +77443,16 @@ async fn run_compatible_client_subprocess(
         .and(snapshot_revalidation)
         .and(socket_revalidation)
     {
-        return Err(error.context("compatible-client authority changed across subprocess execution"));
+        return Err(
+            error.context("compatible-client authority changed across subprocess execution")
+        );
     }
     run_result
 }
 
-fn parse_compatible_client_version(bytes: &[u8]) -> anyhow::Result<CompatibleClientVersionIdentity> {
+fn parse_compatible_client_version(
+    bytes: &[u8],
+) -> anyhow::Result<CompatibleClientVersionIdentity> {
     let expected = format!(
         "ft {COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION} ({COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH})\n"
     );
@@ -77448,11 +77473,18 @@ fn parse_compatible_client_robot_envelope<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    verify_json_structure_bounded(bytes, limits)
-        .map_err(|_| anyhow::anyhow!("compatible-client robot output exceeded or violated its structural contract"))?;
+    verify_json_structure_bounded(bytes, limits).map_err(|_| {
+        anyhow::anyhow!(
+            "compatible-client robot output exceeded or violated its structural contract"
+        )
+    })?;
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let envelope = CompatibleClientRobotEnvelope::<T>::deserialize(&mut deserializer)
-        .map_err(|_| anyhow::anyhow!("compatible-client robot output did not match the frozen v0.13.0 JSON schema"))?;
+    let envelope =
+        CompatibleClientRobotEnvelope::<T>::deserialize(&mut deserializer).map_err(|_| {
+            anyhow::anyhow!(
+                "compatible-client robot output did not match the frozen v0.13.0 JSON schema"
+            )
+        })?;
     deserializer
         .end()
         .map_err(|_| anyhow::anyhow!("compatible-client robot output contained trailing data"))?;
@@ -77516,9 +77548,14 @@ fn validate_compatible_client_state(
                 && pane.domain.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES,
             "compatible-client census contains invalid domain metadata"
         );
-        for value in [pane.pane_uuid.as_deref(), pane.title.as_deref(), pane.cwd.as_deref(), pane.ignore_reason.as_deref()]
-            .into_iter()
-            .flatten()
+        for value in [
+            pane.pane_uuid.as_deref(),
+            pane.title.as_deref(),
+            pane.cwd.as_deref(),
+            pane.ignore_reason.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             anyhow::ensure!(
                 value.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES,
@@ -77619,14 +77656,17 @@ fn consume_compatible_client_batch(
                 message,
                 hint,
             } => {
-                let _content_free_lengths = (code.len(), message.len(), hint.as_deref().map(str::len));
+                let _content_free_lengths =
+                    (code.len(), message.len(), hint.as_deref().map(str::len));
                 anyhow::bail!("compatible-client batch reported a pane capture failure");
             }
         };
         let redacted = redactor.redact(&text);
         let next_total = total_content_bytes
             .checked_add(redacted.len())
-            .ok_or_else(|| anyhow::anyhow!("compatible-client aggregate content byte count overflow"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("compatible-client aggregate content byte count overflow")
+            })?;
         anyhow::ensure!(
             next_total <= max_total_bytes,
             "compatible-client pane content exceeds the aggregate byte limit"
@@ -77662,9 +77702,11 @@ fn compatible_client_remaining_timeout(
     total_timeout: Duration,
     per_command_timeout: Duration,
 ) -> anyhow::Result<Duration> {
-    let remaining = total_timeout.checked_sub(started_at.elapsed()).ok_or_else(|| {
-        anyhow::anyhow!("compatible-client capture exhausted its derived total deadline")
-    })?;
+    let remaining = total_timeout
+        .checked_sub(started_at.elapsed())
+        .ok_or_else(|| {
+            anyhow::anyhow!("compatible-client capture exhausted its derived total deadline")
+        })?;
     anyhow::ensure!(
         !remaining.is_zero(),
         "compatible-client capture exhausted its derived total deadline"
@@ -77707,7 +77749,9 @@ async fn capture_compatible_client_dump(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("compatible-client tail bound overflow"))?;
     if fs::symlink_metadata(&request.output).is_ok() {
-        anyhow::bail!("compatible-client dump output already exists; existing paths are never overwritten");
+        anyhow::bail!(
+            "compatible-client dump output already exists; existing paths are never overwritten"
+        );
     }
 
     let mut source = pin_compatible_client(
@@ -77718,8 +77762,7 @@ async fn capture_compatible_client_dump(
     )?;
     let socket = pin_compatible_mux_socket(&request.mux_socket)?;
     let environment = create_compatible_client_environment(&request.output)?;
-    let recovery_environment_path_sha256 =
-        sha256_hex(environment.root.as_os_str().as_bytes());
+    let recovery_environment_path_sha256 = sha256_hex(environment.root.as_os_str().as_bytes());
     let mut executable = snapshot_compatible_client(&mut source, &environment)?;
     let mut accounting = CompatibleClientSubprocessAccounting::default();
 
@@ -77890,7 +77933,10 @@ async fn capture_compatible_client_dump(
             },
         }));
     }
-    anyhow::ensure!(pane_text.is_empty(), "compatible-client pane outcome inventory is inconsistent");
+    anyhow::ensure!(
+        pane_text.is_empty(),
+        "compatible-client pane outcome inventory is inconsistent"
+    );
     let topology_sha256 = mux_dump_topology_fingerprint_from_records(&pane_records)?;
     let mut initial_pane_ids = pane_ids;
     initial_pane_ids.sort_unstable();
@@ -78134,9 +78180,15 @@ async fn run_compatible_client_dump_command(
         println!("  Content bytes:        {}", receipt.content_bytes);
         println!("  Payload SHA-256:      {}", receipt.payload_sha256);
         println!("  Artifact SHA-256:     {}", receipt.artifact_sha256);
-        println!("  Client:               {} ({})", receipt.client_version, receipt.client_git_hash);
+        println!(
+            "  Client:               {} ({})",
+            receipt.client_version, receipt.client_git_hash
+        );
         println!("  Client SHA-256:       {}", receipt.client_sha256);
-        println!("  Recovery environment: {}", receipt.recovery_environment_path.display());
+        println!(
+            "  Recovery environment: {}",
+            receipt.recovery_environment_path.display()
+        );
         println!("  Content:              redacted forensic text only");
         println!("  Executable restore:   false");
         println!("  Mux activation:       disabled");
@@ -79216,13 +79268,9 @@ fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result
     )?;
     anyhow::ensure!(
         source.get("kind").and_then(serde_json::Value::as_str) == Some("live_mux")
-            && source
-                .get("ft_version")
-                .and_then(serde_json::Value::as_str)
+            && source.get("ft_version").and_then(serde_json::Value::as_str)
                 == Some(COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION)
-            && source
-                .get("git_hash")
-                .and_then(serde_json::Value::as_str)
+            && source.get("git_hash").and_then(serde_json::Value::as_str)
                 == Some(COMPATIBLE_CLIENT_DUMP_REQUIRED_GIT_HASH)
             && source
                 .get("capture_transport")
@@ -79255,8 +79303,7 @@ fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Mux dump compatible socket path digest is missing"))?;
     anyhow::ensure!(
-        is_canonical_lowercase_sha256(path_sha256)
-            && path_sha256.bytes().any(|byte| byte != b'0'),
+        is_canonical_lowercase_sha256(path_sha256) && path_sha256.bytes().any(|byte| byte != b'0'),
         "Mux dump compatible socket path digest is invalid"
     );
     let (socket_uid, _socket_gid, socket_bytes) = require_compatible_client_identity_receipt(
@@ -79267,7 +79314,8 @@ fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result
         "compatible socket",
     )?;
     let socket_mode = socket
-        .pointer("/identity/mode")
+        .get("identity")
+        .and_then(|identity| identity.get("mode"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(u64::MAX);
     anyhow::ensure!(
@@ -79288,7 +79336,10 @@ fn verify_mux_dump_source_metadata(source: &serde_json::Value) -> anyhow::Result
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Mux dump recovery environment path digest is missing"))?;
     anyhow::ensure!(
-        recovery.get("retained").and_then(serde_json::Value::as_bool) == Some(true)
+        recovery
+            .get("retained")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
             && is_canonical_lowercase_sha256(recovery_path_sha256)
             && recovery_path_sha256.bytes().any(|byte| byte != b'0'),
         "Mux dump recovery environment retention receipt is invalid"
