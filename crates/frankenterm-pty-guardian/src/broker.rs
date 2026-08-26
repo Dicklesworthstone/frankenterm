@@ -165,6 +165,7 @@ const BROKER_CONTROL_ACCEPT_QUANTUM: usize = 32;
 const BROKER_CONTROL_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_CONTROL_AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
 const BROKER_CONTROL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const BROKER_CONTROL_CENSUS_COLLECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_GENESIS_BINDING_BYTES: usize = 256;
 const BROKER_SPAWN_CONTROL_MAGIC: [u8; 4] = *b"BSP1";
 const BROKER_SPAWN_CONTROL_FIXED_BYTES: usize = 332;
@@ -2051,6 +2052,8 @@ pub enum BrokerControlClientError {
     CensusAuthorityConflict,
     #[error("broker recovery Census snapshot capacity is temporarily unavailable")]
     CensusCapacityUnavailable,
+    #[error("broker recovery Census collection exceeded its end-to-end deadline")]
+    CensusCollectionDeadlineExceeded,
     #[error("broker client connection is poisoned after an ambiguous exchange")]
     ConnectionPoisoned,
 }
@@ -2460,6 +2463,30 @@ fn index_broker_recovery_census_by_mux(
     Ok(by_mux)
 }
 
+fn open_and_scan_broker_spawn_catalog_under_token_authority(
+    token_authority: &mut GuardianTokenPathAuthority,
+    spawn_catalog_path: PathBuf,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<(BrokerSpawnWalCatalogV1, Vec<BrokerSpawnJournalV1>), BrokerControlServiceError> {
+    // Catalog open may publish its owner lock, and admission may finish an
+    // already-authenticated interrupted file-creation transaction. Hold the
+    // same shared token-publication fence used by live effects across that
+    // complete mutation window so cooperative token rotation cannot cross it.
+    let mut token_effect_lease = token_authority.acquire_effect_lease()?;
+    token_effect_lease.validate()?;
+    token_authority.validate()?;
+    let result = (|| {
+        let mut spawn_catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path)?;
+        let recovered_journals = spawn_catalog.scan_all_for_admission(authenticator)?;
+        Ok((spawn_catalog, recovered_journals))
+    })();
+    let effect_validation = token_effect_lease.validate();
+    let authority_validation = token_authority.validate();
+    effect_validation?;
+    authority_validation?;
+    result
+}
+
 fn reconcile_broker_catalog_under_token_authority(
     token_authority: &mut GuardianTokenPathAuthority,
     spawn_catalog: &BrokerSpawnWalCatalogV1,
@@ -2504,7 +2531,6 @@ pub struct BrokerControlServiceV1 {
     hello_receipt_order: VecDeque<Uuid>,
     census_snapshots: HashMap<Uuid, BrokerCensusSnapshotV1>,
     max_census_snapshots: usize,
-    next_census_snapshot_sequence: u64,
     max_hello_receipts: usize,
     accept_quantum: usize,
     next_connection_generation: u64,
@@ -2524,8 +2550,12 @@ impl BrokerControlServiceV1 {
             .broker_spawn_wal_authenticator()
             .map_err(|_| BrokerControlServiceError::AuthenticationAuthority)?;
         let broker_lineage_id = spawn_authenticator.lineage_id();
-        let mut spawn_catalog = BrokerSpawnWalCatalogV1::open(config.spawn_catalog_path)?;
-        let recovered_journals = spawn_catalog.scan_all_for_admission(&spawn_authenticator)?;
+        let (spawn_catalog, recovered_journals) =
+            open_and_scan_broker_spawn_catalog_under_token_authority(
+                &mut token_authority,
+                config.spawn_catalog_path,
+                &spawn_authenticator,
+            )?;
         let recovered_catalog =
             BrokerRecoveredSpawnCatalogV1::admit(recovered_journals, &spawn_authenticator)?;
         // Classify every recovered journal before binding, but deliberately do
@@ -2617,7 +2647,6 @@ impl BrokerControlServiceV1 {
             hello_receipt_order,
             census_snapshots,
             max_census_snapshots: config.max_connections,
-            next_census_snapshot_sequence: 1,
             max_hello_receipts,
             accept_quantum,
             next_connection_generation: 1,
@@ -2698,10 +2727,10 @@ impl BrokerControlServiceV1 {
                 continue;
             }
             if event.writable {
-                self.drive_connection_write(event.token, generation);
+                self.drive_connection_write(event.token, generation)?;
             }
             if event.readable && self.connection_matches(event.token, generation) {
-                self.drive_connection_read(event.token, generation);
+                self.drive_connection_read(event.token, generation)?;
             }
             if event.closed && self.connection_matches(event.token, generation) {
                 self.finish_connection(event.token, generation);
@@ -2801,16 +2830,20 @@ impl BrokerControlServiceV1 {
             .is_some_and(|connection| connection.generation == generation)
     }
 
-    fn drive_connection_read(&mut self, token: Token, generation: u64) {
+    fn drive_connection_read(
+        &mut self,
+        token: Token,
+        generation: u64,
+    ) -> Result<(), BrokerControlServiceError> {
         let outcome = match self.connections.get_mut(&token) {
             Some(connection) if connection.generation == generation => connection.read_one(),
-            _ => return,
+            _ => return Ok(()),
         };
         let frame = match outcome {
-            Ok(BrokerControlReadOutcomeV1::Pending) => return,
+            Ok(BrokerControlReadOutcomeV1::Pending) => return Ok(()),
             Ok(BrokerControlReadOutcomeV1::Closed) | Err(_) => {
                 self.finish_connection(token, generation);
-                return;
+                return Ok(());
             }
             Ok(BrokerControlReadOutcomeV1::Frame(frame)) => frame,
         };
@@ -2818,29 +2851,31 @@ impl BrokerControlServiceV1 {
             Ok(request) => request,
             Err(_) => {
                 self.finish_connection(token, generation);
-                return;
+                return Ok(());
             }
         };
+        let mut token_effect_lease = self.token_authority.acquire_effect_lease()?;
+        token_effect_lease.validate()?;
         let response = match self.dispatch_request(token, generation, &request) {
             Ok(response) => response,
             Err(()) => {
                 self.finish_connection(token, generation);
-                return;
+                return Ok(());
             }
         };
         let encoded = match encode_broker_control_response(&self.control_authenticator, &response) {
             Ok(encoded) => encoded,
             Err(_) => {
                 self.finish_connection(token, generation);
-                return;
+                return Ok(());
             }
         };
         let Some(connection) = self.connections.get_mut(&token) else {
-            return;
+            return Ok(());
         };
         if connection.generation != generation || connection.write_frame.is_some() {
             self.finish_connection(token, generation);
-            return;
+            return Ok(());
         }
         connection.write_frame = Some(encoded);
         connection.write_offset = 0;
@@ -2852,12 +2887,23 @@ impl BrokerControlServiceV1 {
         {
             self.finish_connection(token, generation);
         }
+        token_effect_lease.validate()?;
+        Ok(())
     }
 
-    fn drive_connection_write(&mut self, token: Token, generation: u64) {
+    fn drive_connection_write(
+        &mut self,
+        token: Token,
+        generation: u64,
+    ) -> Result<(), BrokerControlServiceError> {
+        if !self.connection_matches(token, generation) {
+            return Ok(());
+        }
+        let mut token_effect_lease = self.token_authority.acquire_effect_lease()?;
+        token_effect_lease.validate()?;
         let complete = match self.connections.get_mut(&token) {
             Some(connection) if connection.generation == generation => connection.flush_one(),
-            _ => return,
+            _ => return Ok(()),
         };
         match complete {
             Ok(false) => {}
@@ -2876,6 +2922,8 @@ impl BrokerControlServiceV1 {
             }
             Err(_) => self.finish_connection(token, generation),
         }
+        token_effect_lease.validate()?;
+        Ok(())
     }
 
     fn dispatch_request(
@@ -3079,14 +3127,9 @@ impl BrokerControlServiceV1 {
         .map_err(|_| ())
     }
 
-    fn allocate_census_snapshot_id(&mut self) -> Result<Uuid, ()> {
+    fn allocate_census_snapshot_id(&self) -> Result<Uuid, ()> {
         for _ in 0..BROKER_CONTROL_CENSUS_SNAPSHOT_ID_ATTEMPTS {
-            let sequence = self.next_census_snapshot_sequence;
-            self.next_census_snapshot_sequence = sequence.checked_add(1).ok_or(())?;
-            let mut snapshot_bytes = [0_u8; 16];
-            snapshot_bytes[..8].copy_from_slice(&self.broker_incarnation.as_bytes()[..8]);
-            snapshot_bytes[8..].copy_from_slice(&sequence.to_be_bytes());
-            let snapshot_id = Uuid::from_bytes(snapshot_bytes);
+            let snapshot_id = Uuid::new_v4();
             if !snapshot_id.is_nil() && !self.census_snapshots.contains_key(&snapshot_id) {
                 return Ok(snapshot_id);
             }
@@ -10751,6 +10794,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12141,6 +12185,7 @@ mod tests {
         let [entry] = entries.as_slice() else {
             panic!("expected one header-only Census row")
         };
+        let entry = *entry;
         assert_eq!(
             entry.disposition,
             BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly
@@ -12152,7 +12197,7 @@ mod tests {
         let encoded_entry = entry.encode().expect("encode canonical Census row");
         assert_eq!(
             BrokerCensusEntryV1::decode(&encoded_entry).expect("decode canonical Census row"),
-            *entry
+            entry
         );
         let mut enabled_effects = encoded_entry;
         enabled_effects[87] = 0;
@@ -12191,7 +12236,7 @@ mod tests {
             .expect("bind canonical Census response to its mux");
         assert_eq!(decoded_page, page);
 
-        let mut cross_mux_entry = *entry;
+        let mut cross_mux_entry = entry;
         cross_mux_entry.mux_incarnation = id(764);
         let cross_mux_page = BrokerCensusPageV1 {
             snapshot_id,
@@ -12221,7 +12266,7 @@ mod tests {
         .expect("canonical continuation request");
         let forged_snapshot = BrokerCensusPageV1 {
             snapshot_id: id(763),
-            entries: vec![*entry],
+            entries: vec![entry],
             next_cursor: None,
             total_entries: 2,
         };
@@ -14433,6 +14478,88 @@ mod tests {
             fs::read(&head_path).expect("read recovered lifecycle head after queries"),
             head_before_bind,
             "recovery visibility reconciled the durable head"
+        );
+    }
+
+    #[test]
+    fn token_replacement_before_creation_recovery_preserves_catalog_and_never_binds() {
+        fn snapshot_catalog(path: &Path) -> Vec<(Vec<u8>, Vec<u8>, u32)> {
+            let mut snapshot = fs::read_dir(path)
+                .expect("enumerate creation-recovery catalog")
+                .map(|entry| {
+                    let entry = entry.expect("read creation-recovery catalog entry");
+                    let metadata = entry
+                        .metadata()
+                        .expect("read creation-recovery catalog metadata");
+                    (
+                        entry.file_name().as_os_str().as_bytes().to_vec(),
+                        fs::read(entry.path()).expect("read creation-recovery catalog bytes"),
+                        metadata.mode() & 0o7777,
+                    )
+                })
+                .collect::<Vec<_>>();
+            snapshot.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            snapshot
+        }
+
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create creation-recovery token-fence root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set creation-recovery token-fence root owner-only");
+        let spawn_catalog_path = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create creation-recovery Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set creation-recovery Spawn catalog owner-only");
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision creation-recovery token");
+        let original_token = fs::read(&token_path).expect("read creation-recovery token");
+        let (secret, mut token_authority) =
+            crate::transport::load_guardian_secret_with_authority(&token_path)
+                .expect("load creation-recovery token authority");
+        let authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive creation-recovery WAL authority");
+        let identity = recovered_catalog_identity(&authenticator, 0x66);
+        let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path.clone())
+            .expect("open interrupted creation-recovery catalog");
+        catalog.inject_creation_fault(BrokerSpawnCreationInjectedFault::DuringWalHeaderWrite {
+            durable_prefix_bytes: 73,
+        });
+        assert!(matches!(
+            catalog.create_spawn_journal_fixture_unadmitted(identity, authenticator.clone()),
+            Err(BrokerSpawnWalError::Io(_))
+        ));
+        drop(catalog);
+        let catalog_before = snapshot_catalog(&spawn_catalog_path);
+
+        let retained_token = root.path().join("guardian-retained-creation-recovery.token");
+        fs::rename(&token_path, &retained_token)
+            .expect("retain original creation-recovery token inode");
+        create_private_broker_token_with_bytes(&token_path, &original_token);
+        assert!(matches!(
+            open_and_scan_broker_spawn_catalog_under_token_authority(
+                &mut token_authority,
+                spawn_catalog_path.clone(),
+                &authenticator,
+            ),
+            Err(BrokerControlServiceError::Endpoint(
+                GuardianServiceError::FilesystemSecurity(_)
+            ))
+        ));
+        assert_eq!(
+            snapshot_catalog(&spawn_catalog_path),
+            catalog_before,
+            "stale token authority changed interrupted creation bytes, names, or modes"
+        );
+        assert!(
+            !socket_path.exists(),
+            "stale token authority reached broker socket binding"
+        );
+        assert_eq!(
+            fs::read(&retained_token).expect("read retained creation-recovery token"),
+            original_token
         );
     }
 
