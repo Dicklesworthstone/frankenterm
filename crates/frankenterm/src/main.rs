@@ -77404,12 +77404,17 @@ async fn execute_bounded_compatible_client_command(
     let output = command
         .output_with_cx_timeout(cx, timeout)
         .await
-        .map_err(|error| {
-        anyhow::anyhow!(
-            "compatible-client subprocess failed before a bounded complete receipt ({:?})",
-            error.kind()
-        )
-    })?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::TimedOut => anyhow::anyhow!(
+                "compatible-client subprocess exceeded its wall-clock deadline; process cleanup settled"
+            ),
+            std::io::ErrorKind::Interrupted => anyhow::anyhow!(
+                "compatible-client subprocess was cancelled; process cleanup settled"
+            ),
+            kind => anyhow::anyhow!(
+                "compatible-client subprocess failed before a bounded complete receipt ({kind:?})"
+            ),
+        })?;
     if !output.status.success() {
         anyhow::bail!(
             "compatible-client subprocess returned a non-success status (code={:?}, stdout_bytes={}, stderr_bytes={})",
@@ -77789,9 +77794,11 @@ async fn capture_compatible_client_dump(
     )?;
     let socket = pin_compatible_mux_socket(&request.mux_socket)?;
     let environment = create_compatible_client_environment(&request.output)?;
+    let retained_environment_path = environment.root.clone();
     let recovery_environment_path_sha256 = sha256_hex(environment.root.as_os_str().as_bytes());
-    let mut executable = snapshot_compatible_client(&mut source, &environment)?;
-    let mut accounting = CompatibleClientSubprocessAccounting::default();
+    let capture_result = async {
+        let mut executable = snapshot_compatible_client(&mut source, &environment)?;
+        let mut accounting = CompatibleClientSubprocessAccounting::default();
 
     let version_receipt = run_compatible_client_subprocess(
         cx,
@@ -78031,19 +78038,27 @@ async fn capture_compatible_client_dump(
         "panes": pane_records,
         "errors": [],
     });
-    Ok(CompatibleClientCapture {
-        payload,
-        recovery_environment_path: environment.root,
-        recovery_environment_path_sha256,
-        client_sha256: source.sha256,
-        client_bytes: source.identity.byte_len,
-        client_version: version.version,
-        client_git_hash: version.git_hash,
-        mux_socket_path_sha256: socket.path_sha256,
-        subprocess_count: accounting.commands,
-        stderr_warning_commands: accounting.stderr_warning_commands,
-        stderr_bytes: accounting.stderr_bytes,
-        total_deadline_ms: total_timeout.as_millis(),
+        Ok(CompatibleClientCapture {
+            payload,
+            recovery_environment_path: environment.root,
+            recovery_environment_path_sha256,
+            client_sha256: source.sha256,
+            client_bytes: source.identity.byte_len,
+            client_version: version.version,
+            client_git_hash: version.git_hash,
+            mux_socket_path_sha256: socket.path_sha256,
+            subprocess_count: accounting.commands,
+            stderr_warning_commands: accounting.stderr_warning_commands,
+            stderr_bytes: accounting.stderr_bytes,
+            total_deadline_ms: total_timeout.as_millis(),
+        })
+    }
+    .await;
+    capture_result.with_context(|| {
+        format!(
+            "compatible-client capture failed; retained recovery environment: {}",
+            retained_environment_path.display()
+        )
     })
 }
 
@@ -78146,13 +78161,21 @@ async fn run_compatible_client_dump_command(
         total_deadline_ms,
     } = capture;
     let publication_path = output_path.clone();
+    let retained_environment_path = recovery_environment_path.clone();
     let published = run_cli_blocking_with_cx(cx, "compatible-client dump publication", move || {
         publish_mux_dump_payload(&publication_path, payload)
     })
-    .await?;
+    .await
+    .with_context(|| {
+        format!(
+            "compatible-client dump publication failed; retained recovery environment: {}",
+            retained_environment_path.display()
+        )
+    })?;
     anyhow::ensure!(
         published.complete && published.error_count == 0,
-        "compatible-client dump verifier did not certify a complete forensic artifact"
+        "compatible-client dump verifier did not certify a complete forensic artifact; retained recovery environment: {}",
+        retained_environment_path.display()
     );
     let receipt = CompatibleClientDumpReceipt {
         path: output_path,
@@ -78200,7 +78223,12 @@ async fn run_compatible_client_dump_command(
         "recovery_environment_path_sha256": &receipt.recovery_environment_path_sha256,
         "production_mux_activation": false,
     });
-    if !print_snapshot_session_structured_output(&result, output_format)? {
+    if !print_snapshot_session_structured_output(&result, output_format).with_context(|| {
+        format!(
+            "compatible-client dump was verified, but output rendering failed; retained recovery environment: {}",
+            retained_environment_path.display()
+        )
+    })? {
         println!("Compatible-client mux content dump written and verified");
         println!("  File:                 {}", receipt.path.display());
         println!("  Panes:                {}", receipt.pane_count);
