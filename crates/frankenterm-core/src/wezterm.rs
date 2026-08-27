@@ -2589,6 +2589,9 @@ impl WeztermClient {
     /// Stub `send_text_impl_with_cx` for configurations without
     /// vendored+unix+asupersync. The legacy CLI cannot carry pane input over
     /// bounded stdin, so this path fails closed before subprocess construction.
+    // Keep the receiver identical to the vendored implementation so every
+    // public send path has one cfg-invariant, method-call-shaped dispatch.
+    #[allow(clippy::unused_self)]
     #[cfg(not(all(feature = "vendored", unix)))]
     fn send_text_impl_with_cx(
         &self,

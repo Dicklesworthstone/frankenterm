@@ -20880,24 +20880,21 @@ mod tests {
     ) -> Vec<GuardianOutputAppendReceipt> {
         assert!(!payloads.is_empty());
         let directory = tempdir().expect("create live checkpoint journal directory");
-        let file = File::options()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(directory.path().join("live-output.segment"))
-            .expect("create live checkpoint journal");
+        let directory_file = File::open(directory.path()).expect("open journal parent");
+        rustix::fs::fchmod(&directory_file, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make live checkpoint journal directory private");
         let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32])
             .expect("valid live checkpoint cipher");
-        let mut journal = GuardianOutputJournal::create_new(
-            file,
+        let mut journal = GuardianOutputJournal::create_new_at(
+            &directory_file,
+            std::ffi::OsStr::new("live-output.segment"),
             segment,
             cipher,
             GuardianOutputJournalLimits::default(),
         )
         .expect("open live checkpoint journal");
-        let directory_file = File::open(directory.path()).expect("open journal parent");
         journal
-            .sync_parent_directory_and_activate(&directory_file)
+            .sync_parent_directory_and_activate()
             .expect("activate live checkpoint journal");
         payloads
             .iter()
@@ -21173,27 +21170,24 @@ mod tests {
             b"recovered-suffix-three",
         ];
         let directory = tempdir().expect("create recovery journal directory");
-        let file = File::options()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(directory.path().join("recovery.segment"))
-            .expect("create recovery journal");
+        let directory_file = File::open(directory.path()).expect("open recovery parent");
+        rustix::fs::fchmod(&directory_file, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make recovery journal directory private");
         let segment =
             GuardianOutputSegmentIdentity::new(durable_pane_id, uuid::Uuid::new_v4(), 1, None)
                 .expect("valid recovery segment");
         let cipher =
             GuardianOutputCipher::try_from_key_slice(&[0x6d; 32]).expect("valid recovery cipher");
-        let mut journal = GuardianOutputJournal::create_new(
-            file,
+        let mut journal = GuardianOutputJournal::create_new_at(
+            &directory_file,
+            std::ffi::OsStr::new("recovery.segment"),
             segment,
             cipher,
             GuardianOutputJournalLimits::default(),
         )
         .expect("open recovery journal");
-        let directory_file = File::open(directory.path()).expect("open recovery parent");
         journal
-            .sync_parent_directory_and_activate(&directory_file)
+            .sync_parent_directory_and_activate()
             .expect("activate recovery journal");
         let receipts = payloads
             .iter()

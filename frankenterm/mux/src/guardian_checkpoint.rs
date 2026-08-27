@@ -7639,26 +7639,23 @@ mod tests {
         assert!(!payloads.is_empty(), "fixture requires at least one output");
         let directory = tempdir().expect("create temporary checkpoint directory");
         let path = directory.path().join("output.segment");
-        let file = File::options()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .expect("create output segment");
+        let directory_file = File::open(directory.path()).expect("open parent directory");
+        rustix::fs::fchmod(&directory_file, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make checkpoint output directory private");
         let identity = GuardianOutputSegmentIdentity::new(pane, Uuid::new_v4(), 1, None)
             .expect("valid segment identity");
         let cipher = GuardianOutputCipher::try_from_key_slice(&[7_u8; 32])
             .expect("valid checkpoint test cipher");
-        let mut journal = GuardianOutputJournal::create_new(
-            file,
+        let mut journal = GuardianOutputJournal::create_new_at(
+            &directory_file,
+            path.file_name().expect("output fixture has a child name"),
             identity,
             cipher,
             GuardianOutputJournalLimits::default(),
         )
         .expect("create output journal");
-        let directory_file = File::open(directory.path()).expect("open parent directory");
         journal
-            .sync_parent_directory_and_activate(&directory_file)
+            .sync_parent_directory_and_activate()
             .expect("activate output segment");
         let mut receipts = Vec::with_capacity(payloads.len());
         for payload in payloads {

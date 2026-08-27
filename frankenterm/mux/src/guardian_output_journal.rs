@@ -2,11 +2,11 @@
 //!
 //! The guardian must synchronize each raw output record before it acknowledges
 //! that record to a mux.  This module owns that narrow storage contract.  It
-//! deliberately does not open paths: the service layer must supply an
-//! exclusively owned, securely opened regular file descriptor from its private
-//! state directory.  Keeping path traversal and service policy outside this
-//! primitive also makes it impossible to confuse transcript export with the
-//! live append authority.
+//! opens a new segment only by one child name relative to a pinned private
+//! directory descriptor.  Existing journals are still opened by the service
+//! layer and passed in as exact descriptors.  Keeping arbitrary path traversal
+//! outside this primitive also makes it impossible to confuse transcript
+//! export with the live append authority.
 //! Raw terminal bytes are always sealed with XChaCha20-Poly1305 before they
 //! reach the file.  Redaction would destroy exact terminal reconstruction, so
 //! this module has no plaintext persistence mode.
@@ -27,8 +27,12 @@ use chacha20poly1305::{
 };
 use sha2::{Digest as _, Sha256};
 use std::convert::{TryFrom, TryInto};
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Component, Path};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -870,11 +874,11 @@ impl GuardianOutputCipher {
         }
         let canonical_bytes = u32::try_from(canonical_manifest.len())
             .map_err(|_| GuardianScrollbackManifestError::CanonicalByteLimit)?;
-        if canonical_bytes == 0
-            || canonical_bytes > SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES
-            || canonical_bytes != authentication.canonical_bytes
-        {
+        if canonical_bytes == 0 || canonical_bytes > SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES {
             return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
+        }
+        if canonical_bytes != authentication.canonical_bytes {
+            return Err(GuardianScrollbackManifestError::AuthenticationFailed);
         }
         let aad = scrollback_manifest_aad(self.key_id, canonical_bytes, canonical_manifest);
         let plaintext = self
@@ -942,11 +946,11 @@ impl GuardianOutputCipher {
         }
         let canonical_bytes = u32::try_from(canonical_wal.len())
             .map_err(|_| GuardianScrollbackAppendWalError::CanonicalByteLimit)?;
-        if canonical_bytes == 0
-            || canonical_bytes > SCROLLBACK_APPEND_WAL_MAX_CANONICAL_BYTES
-            || canonical_bytes != authentication.canonical_bytes
-        {
+        if canonical_bytes == 0 || canonical_bytes > SCROLLBACK_APPEND_WAL_MAX_CANONICAL_BYTES {
             return Err(GuardianScrollbackAppendWalError::CanonicalByteLimit);
+        }
+        if canonical_bytes != authentication.canonical_bytes {
+            return Err(GuardianScrollbackAppendWalError::AuthenticationFailed);
         }
         let aad = scrollback_append_wal_aad(self.key_id, canonical_bytes, canonical_wal);
         let plaintext = self
@@ -2138,6 +2142,18 @@ pub enum GuardianOutputJournalError {
     AppendWriterLeaseUnsupported,
     #[error("guardian output append authority does not hold its exclusive writer lease")]
     AppendWriterLeaseMissing,
+    #[error("new guardian output journal child name is not one normalized path component")]
+    InvalidNewSegmentName,
+    #[error("descriptor-relative guardian output journal creation is unsupported on this target")]
+    NewSegmentCreationUnsupported,
+    #[error("new guardian output journal parent directory is not private current-user authority")]
+    InsecureNewSegmentParent,
+    #[error("new guardian output journal file identity, ownership, mode, or link count is invalid")]
+    InsecureNewSegmentIdentity,
+    #[error("new guardian output journal parent or child identity changed before activation")]
+    NewSegmentPublicationIdentityChanged,
+    #[error("new guardian output journal has no pending publication authority")]
+    NewSegmentPublicationAuthorityMissing,
     #[error("new guardian output journal descriptor is not empty: found {actual} bytes")]
     NewSegmentNotEmpty { actual: u64 },
     #[error("guardian output journal parent descriptor is not a directory")]
@@ -2217,6 +2233,31 @@ struct JournalScan {
     terminal_receipt: Option<GuardianOutputAppendReceipt>,
     authenticated_prefix_digest: [u8; 32],
     tail: GuardianOutputJournalTail,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuardianOutputDirectoryIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    owner: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuardianOutputFileIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    owner: u32,
+    links: u64,
+    bytes: u64,
+}
+
+struct GuardianOutputNewSegmentPublication {
+    parent_directory: File,
+    parent_identity: GuardianOutputDirectoryIdentity,
+    child_name: OsString,
+    child_identity: GuardianOutputFileIdentity,
 }
 
 struct RecoveryCollector {
@@ -2299,7 +2340,7 @@ pub struct GuardianOutputJournal {
     terminal_receipt: Option<GuardianOutputAppendReceipt>,
     authenticated_prefix_digest: [u8; 32],
     tail: GuardianOutputJournalTail,
-    directory_entry_sync_required: bool,
+    new_segment_publication: Option<GuardianOutputNewSegmentPublication>,
     poisoned: bool,
     writer_lease_held: bool,
 }
@@ -2385,17 +2426,199 @@ fn acquire_guardian_output_writer_lease(_file: &File) -> Result<(), GuardianOutp
     Err(GuardianOutputJournalError::AppendWriterLeaseUnsupported)
 }
 
+#[cfg(unix)]
+fn validate_new_segment_child_name(name: &OsStr) -> Result<(), GuardianOutputJournalError> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(component)) if component == name)
+        || components.next().is_some()
+    {
+        return Err(GuardianOutputJournalError::InvalidNewSegmentName);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn capture_new_segment_parent_identity(
+    parent_directory: &File,
+) -> Result<GuardianOutputDirectoryIdentity, GuardianOutputJournalError> {
+    let metadata = parent_directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(GuardianOutputJournalError::InsecureNewSegmentParent);
+    }
+    Ok(GuardianOutputDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        owner: metadata.uid(),
+    })
+}
+
+#[cfg(unix)]
+fn capture_new_segment_file_identity(
+    file: &File,
+) -> Result<GuardianOutputFileIdentity, GuardianOutputJournalError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(GuardianOutputJournalError::InsecureNewSegmentIdentity);
+    }
+    Ok(GuardianOutputFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        owner: metadata.uid(),
+        links: metadata.nlink(),
+        bytes: metadata.len(),
+    })
+}
+
+#[cfg(unix)]
+fn capture_new_segment_named_identity(
+    parent_directory: &File,
+    child_name: &OsStr,
+) -> Result<GuardianOutputFileIdentity, GuardianOutputJournalError> {
+    let metadata = rustix::fs::statat(
+        parent_directory,
+        child_name,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|error| GuardianOutputJournalError::Io(std::io::Error::from(error)))?;
+    let mode = u32::from(metadata.st_mode);
+    let owner = u32::try_from(metadata.st_uid)
+        .map_err(|_| GuardianOutputJournalError::InsecureNewSegmentIdentity)?;
+    let links = u64::from(metadata.st_nlink);
+    let bytes = u64::try_from(metadata.st_size)
+        .map_err(|_| GuardianOutputJournalError::InsecureNewSegmentIdentity)?;
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::RegularFile
+        || owner != nix::unistd::geteuid().as_raw()
+        || mode & 0o7777 != 0o600
+        || links != 1
+    {
+        return Err(GuardianOutputJournalError::InsecureNewSegmentIdentity);
+    }
+    Ok(GuardianOutputFileIdentity {
+        device: u64::try_from(metadata.st_dev)
+            .map_err(|_| GuardianOutputJournalError::InsecureNewSegmentIdentity)?,
+        inode: u64::try_from(metadata.st_ino)
+            .map_err(|_| GuardianOutputJournalError::InsecureNewSegmentIdentity)?,
+        mode,
+        owner,
+        links,
+        bytes,
+    })
+}
+
 impl GuardianOutputJournal {
-    /// Initialize one new journal segment from an empty, securely created descriptor.
+    /// Create one new journal segment relative to an exact private directory.
     ///
-    /// On Unix the descriptor must be `O_RDWR`.  The caller must guarantee
-    /// exclusive ownership and must have created the path without following a
-    /// symlink.  A nonempty descriptor is never accepted or rewritten.
-    pub fn create_new(
+    /// The child name must be one normalized path component.  Creation uses
+    /// `O_CREAT | O_EXCL | O_NOFOLLOW`, and the exact parent, name, file inode,
+    /// owner, mode, and link count remain pinned until directory activation.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    pub fn create_new_at(
+        parent_directory: &File,
+        child_name: &OsStr,
+        identity: GuardianOutputSegmentIdentity,
+        cipher: GuardianOutputCipher,
+        limits: GuardianOutputJournalLimits,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        validate_new_segment_child_name(child_name)?;
+        let limits = limits.validate()?;
+        let header = encode_file_header(identity, &cipher)?;
+        let pinned_parent = parent_directory.try_clone()?;
+        let parent_identity = capture_new_segment_parent_identity(&pinned_parent)?;
+        if capture_new_segment_parent_identity(parent_directory)? != parent_identity {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
+        let file = rustix::fs::openat(
+            parent_directory,
+            child_name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map(File::from)
+        .map_err(|error| GuardianOutputJournalError::Io(std::io::Error::from(error)))?;
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| GuardianOutputJournalError::Io(std::io::Error::from(error)))?;
+        if capture_new_segment_parent_identity(&pinned_parent)? != parent_identity {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
+        let initial_child_identity = capture_new_segment_file_identity(&file)?;
+        if initial_child_identity.device != parent_identity.device
+            || initial_child_identity.bytes != 0
+            || capture_new_segment_named_identity(&pinned_parent, child_name)?
+                != initial_child_identity
+        {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
+        let mut journal = Self::initialize_new_file(file, identity, cipher, limits, header)?;
+        let child_identity = capture_new_segment_file_identity(&journal.file)?;
+        if child_identity.bytes != journal.committed_bytes
+            || capture_new_segment_parent_identity(&pinned_parent)? != parent_identity
+            || capture_new_segment_named_identity(&pinned_parent, child_name)? != child_identity
+        {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
+        journal.new_segment_publication = Some(GuardianOutputNewSegmentPublication {
+            parent_directory: pinned_parent,
+            parent_identity,
+            child_name: child_name.to_os_string(),
+            child_identity,
+        });
+        Ok(journal)
+    }
+
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    )))]
+    pub fn create_new_at(
+        _parent_directory: &File,
+        _child_name: &OsStr,
+        _identity: GuardianOutputSegmentIdentity,
+        _cipher: GuardianOutputCipher,
+        _limits: GuardianOutputJournalLimits,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        Err(GuardianOutputJournalError::NewSegmentCreationUnsupported)
+    }
+
+    fn initialize_new_file(
         mut file: File,
         identity: GuardianOutputSegmentIdentity,
         cipher: GuardianOutputCipher,
         limits: GuardianOutputJournalLimits,
+        header: [u8; FILE_HEADER_BYTES],
     ) -> Result<Self, GuardianOutputJournalError> {
         #[cfg(unix)]
         require_guardian_output_read_write_descriptor(&file)?;
@@ -2410,22 +2633,89 @@ impl GuardianOutputJournal {
                 actual: metadata.len(),
             });
         }
-        let header = encode_file_header(identity, &cipher)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header)?;
         file.sync_all()?;
-        let mut journal = Self::authenticate_existing(file, identity, cipher, limits, true)?;
-        journal.directory_entry_sync_required = true;
+        Self::authenticate_existing(file, identity, cipher, limits, true)
+    }
+
+    /// Open one existing journal segment relative to an exact private directory
+    /// and authenticate it as the sole append authority.
+    ///
+    /// Each call performs its own descriptor-relative `openat`, so callers
+    /// cannot bypass writer exclusion with pre-duplicated file descriptors.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    pub fn open_existing_for_append_at(
+        parent_directory: &File,
+        child_name: &OsStr,
+        identity: GuardianOutputSegmentIdentity,
+        cipher: GuardianOutputCipher,
+        limits: GuardianOutputJournalLimits,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        validate_new_segment_child_name(child_name)?;
+        let parent_identity = capture_new_segment_parent_identity(parent_directory)?;
+        let pinned_parent = parent_directory.try_clone()?;
+        let file = rustix::fs::openat(
+            parent_directory,
+            child_name,
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| GuardianOutputJournalError::Io(std::io::Error::from(error)))?;
+        let file_identity = capture_new_segment_file_identity(&file)?;
+        if file_identity.device != parent_identity.device
+            || capture_new_segment_parent_identity(&pinned_parent)? != parent_identity
+            || capture_new_segment_named_identity(&pinned_parent, child_name)? != file_identity
+        {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
+        let journal = Self::open_existing_append_file(file, identity, cipher, limits)?;
+        if capture_new_segment_parent_identity(&pinned_parent)? != parent_identity
+            || capture_new_segment_file_identity(&journal.file)? != file_identity
+            || capture_new_segment_named_identity(&pinned_parent, child_name)? != file_identity
+        {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
         Ok(journal)
     }
 
-    /// Authenticate one existing journal segment as an append authority.
-    ///
-    /// On Unix the descriptor must be `O_RDWR`.  This constructor has no
-    /// initialization branch: a zero-length or torn descriptor is rejected
-    /// byte-for-byte, so a crash-truncated published segment can never be
-    /// mistaken for a fresh segment during append-authority recovery.
-    pub fn open_existing_for_append(
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    )))]
+    pub fn open_existing_for_append_at(
+        _parent_directory: &File,
+        _child_name: &OsStr,
+        _identity: GuardianOutputSegmentIdentity,
+        _cipher: GuardianOutputCipher,
+        _limits: GuardianOutputJournalLimits,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        Err(GuardianOutputJournalError::NewSegmentCreationUnsupported)
+    }
+
+    fn open_existing_append_file(
         file: File,
         identity: GuardianOutputSegmentIdentity,
         cipher: GuardianOutputCipher,
@@ -2493,7 +2783,7 @@ impl GuardianOutputJournal {
             terminal_receipt: scan.terminal_receipt,
             authenticated_prefix_digest: scan.authenticated_prefix_digest,
             tail: scan.tail,
-            directory_entry_sync_required: false,
+            new_segment_publication: None,
             poisoned: false,
             writer_lease_held,
         })
@@ -2560,29 +2850,98 @@ impl GuardianOutputJournal {
 
     #[must_use]
     pub const fn directory_entry_sync_required(&self) -> bool {
-        self.directory_entry_sync_required
+        self.new_segment_publication.is_some()
     }
 
-    /// Synchronize the exact parent directory that published a new segment.
+    fn revalidate_authenticated_prefix(&self) -> Result<(), GuardianOutputJournalError> {
+        let expected_physical_bytes = match self.tail {
+            GuardianOutputJournalTail::Clean => self.committed_bytes,
+            GuardianOutputJournalTail::Incomplete {
+                committed_bytes,
+                trailing_bytes,
+            } => {
+                if committed_bytes != self.committed_bytes {
+                    return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+                }
+                committed_bytes
+                    .checked_add(trailing_bytes)
+                    .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?
+            }
+        };
+        let mut file = self.file.try_clone()?;
+        let physical_bytes_before = file.metadata()?.len();
+        if physical_bytes_before != expected_physical_bytes {
+            return Err(GuardianOutputJournalError::ExternalLengthChange {
+                expected: expected_physical_bytes,
+                observed: physical_bytes_before,
+            });
+        }
+        let scan = scan_journal(
+            &mut file,
+            physical_bytes_before,
+            self.identity,
+            &self.cipher,
+            self.limits,
+        )?;
+        let physical_bytes_after = file.metadata()?.len();
+        if physical_bytes_after != physical_bytes_before
+            || scan.committed_bytes != self.committed_bytes
+            || scan.record_count != self.record_count
+            || scan.cumulative_plaintext_bytes != self.cumulative_plaintext_bytes
+            || scan.next_sequence != self.next_sequence
+            || scan.terminal_receipt != self.terminal_receipt
+            || scan.authenticated_prefix_digest != self.authenticated_prefix_digest
+            || scan.tail != self.tail
+        {
+            return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Synchronize the exact parent directory that published this new segment.
     ///
     /// A newly initialized file cannot accept output until this succeeds.  A
     /// file-level sync alone does not guarantee that the directory entry will
-    /// survive a crash.  The service layer must pass the securely opened parent
-    /// directory descriptor corresponding to this segment.
-    pub fn sync_parent_directory_and_activate(
-        &mut self,
-        parent_directory: &File,
-    ) -> Result<(), GuardianOutputJournalError> {
-        if !self.directory_entry_sync_required {
-            return Ok(());
+    /// survive a crash.  Creation retains the exact descriptor-relative
+    /// publication authority, so activation accepts no caller-supplied parent.
+    #[cfg(unix)]
+    pub fn sync_parent_directory_and_activate(&mut self) -> Result<(), GuardianOutputJournalError> {
+        let publication = self
+            .new_segment_publication
+            .as_ref()
+            .ok_or(GuardianOutputJournalError::NewSegmentPublicationAuthorityMissing)?;
+        self.revalidate_authenticated_prefix()?;
+        if capture_new_segment_parent_identity(&publication.parent_directory)?
+            != publication.parent_identity
+            || publication.child_identity.bytes != self.committed_bytes
+            || capture_new_segment_file_identity(&self.file)? != publication.child_identity
+            || capture_new_segment_named_identity(
+                &publication.parent_directory,
+                &publication.child_name,
+            )? != publication.child_identity
+        {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
         }
-        let metadata = parent_directory.metadata()?;
-        if !metadata.file_type().is_dir() {
-            return Err(GuardianOutputJournalError::NotDirectory);
+        publication.parent_directory.sync_all()?;
+        self.revalidate_authenticated_prefix()?;
+        if capture_new_segment_parent_identity(&publication.parent_directory)?
+            != publication.parent_identity
+            || publication.child_identity.bytes != self.committed_bytes
+            || capture_new_segment_file_identity(&self.file)? != publication.child_identity
+            || capture_new_segment_named_identity(
+                &publication.parent_directory,
+                &publication.child_name,
+            )? != publication.child_identity
+        {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
         }
-        parent_directory.sync_all()?;
-        self.directory_entry_sync_required = false;
+        self.new_segment_publication = None;
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn sync_parent_directory_and_activate(&mut self) -> Result<(), GuardianOutputJournalError> {
+        Err(GuardianOutputJournalError::NewSegmentCreationUnsupported)
     }
 
     /// Create a frozen, stateful, single-pass recovery cursor.
@@ -2600,7 +2959,7 @@ impl GuardianOutputJournal {
         if self.poisoned {
             return Err(GuardianOutputJournalError::Poisoned);
         }
-        if self.directory_entry_sync_required {
+        if self.directory_entry_sync_required() {
             return Err(GuardianOutputJournalError::DirectoryEntryNotDurable);
         }
         if max_record_plaintext_bytes == 0
@@ -2688,7 +3047,7 @@ impl GuardianOutputJournal {
         if self.poisoned {
             return Err(GuardianOutputJournalError::Poisoned);
         }
-        if self.directory_entry_sync_required {
+        if self.directory_entry_sync_required() {
             return Err(GuardianOutputJournalError::DirectoryEntryNotDurable);
         }
         if first_sequence < self.identity.first_sequence {
@@ -2783,7 +3142,7 @@ impl GuardianOutputJournal {
         if self.poisoned {
             return Err(GuardianOutputJournalError::Poisoned);
         }
-        if self.directory_entry_sync_required {
+        if self.directory_entry_sync_required() {
             return Err(GuardianOutputJournalError::DirectoryEntryNotDurable);
         }
         if self.tail != GuardianOutputJournalTail::Clean {
@@ -3499,6 +3858,46 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn create_new_test_journal(
+        parent: &File,
+        path: &std::path::Path,
+        identity: GuardianOutputSegmentIdentity,
+        cipher: GuardianOutputCipher,
+        limits: GuardianOutputJournalLimits,
+    ) -> Result<GuardianOutputJournal, GuardianOutputJournalError> {
+        rustix::fs::fchmod(parent, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make test journal parent private");
+        GuardianOutputJournal::create_new_at(
+            parent,
+            path.file_name()
+                .expect("test journal path has a child name"),
+            identity,
+            cipher,
+            limits,
+        )
+    }
+
+    #[cfg(unix)]
+    fn open_test_journal_for_append(
+        parent: &File,
+        path: &std::path::Path,
+        identity: GuardianOutputSegmentIdentity,
+        cipher: GuardianOutputCipher,
+        limits: GuardianOutputJournalLimits,
+    ) -> Result<GuardianOutputJournal, GuardianOutputJournalError> {
+        rustix::fs::fchmod(parent, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("keep test journal parent private");
+        GuardianOutputJournal::open_existing_for_append_at(
+            parent,
+            path.file_name()
+                .expect("test journal path has a child name"),
+            identity,
+            cipher,
+            limits,
+        )
+    }
+
+    #[cfg(unix)]
     fn open_read_only_journal_file(path: &std::path::Path) -> File {
         std::fs::OpenOptions::new()
             .read(true)
@@ -3694,6 +4093,10 @@ mod tests {
             ),
             Err(GuardianScrollbackManifestError::AuthenticationFailed)
         ));
+        assert!(matches!(
+            cipher.verify_scrollback_manifest(&authentication, b"different-length-manifest"),
+            Err(GuardianScrollbackManifestError::AuthenticationFailed)
+        ));
         let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
             .expect("wrong-key fixture is structurally valid");
         assert!(matches!(
@@ -3766,6 +4169,10 @@ mod tests {
                 &authentication,
                 br#"{"schema":"frankenterm.live-scrollback-append-wal.v1","revision":8}"#,
             ),
+            Err(GuardianScrollbackAppendWalError::AuthenticationFailed)
+        ));
+        assert!(matches!(
+            cipher.verify_scrollback_append_wal(&authentication, b"different-length-append-wal"),
             Err(GuardianScrollbackAppendWalError::AuthenticationFailed)
         ));
         let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x73; 32])
@@ -3858,15 +4265,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("create cursor journal directory");
         let path = directory.path().join(file_name);
         let parent = File::open(directory.path()).expect("open cursor journal parent");
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("initialize cursor journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate cursor journal");
         let mut receipts = Vec::new();
         receipts
@@ -4298,11 +4706,12 @@ mod tests {
             GuardianOutputJournalError::RecoveryDescriptorNotReadOnly
         ));
 
-        let create_error = GuardianOutputJournal::create_new(
+        let create_error = GuardianOutputJournal::initialize_new_file(
             open_read_only_journal_file(&path),
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
+            encode_file_header(identity(), &cipher()).expect("encode rejection-test header"),
         )
         .err()
         .expect("new append authority must reject an O_RDONLY descriptor");
@@ -4311,7 +4720,7 @@ mod tests {
             GuardianOutputJournalError::AppendDescriptorNotReadWrite
         ));
 
-        let append_error = GuardianOutputJournal::open_existing_for_append(
+        let append_error = GuardianOutputJournal::open_existing_append_file(
             open_read_only_journal_file(&path),
             identity(),
             cipher(),
@@ -4336,27 +4745,42 @@ mod tests {
         let directory = tempfile::tempdir().expect("create writer-lease directory");
         let path = directory.path().join("writer-lease.ftgout");
         let parent = File::open(directory.path()).expect("open writer-lease parent");
-        let mut first = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut first = create_new_test_journal(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("create first exclusive append authority");
         first
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate first exclusive append authority");
         let first_receipt = first
             .append_and_sync(b"first exclusive record")
             .expect("append through first exclusive authority");
+        drop(first);
 
-        let second_file = std::fs::OpenOptions::new()
+        let preopened = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
-            .expect("open competing append descriptor");
-        let second_error = GuardianOutputJournal::open_existing_for_append(
-            second_file,
+            .expect("preopen a caller-controlled read-write descriptor");
+        let precloned = preopened
+            .try_clone()
+            .expect("preclone the caller-controlled open file description");
+        let first_reopened = open_test_journal_for_append(
+            &parent,
+            &path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("descriptor-relative reopen acquires independent append authority");
+
+        let second_error = open_test_journal_for_append(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
@@ -4368,13 +4792,12 @@ mod tests {
             GuardianOutputJournalError::AppendWriterLeaseUnavailable(_)
         ));
 
-        drop(first);
-        let mut successor = GuardianOutputJournal::open_existing_for_append(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .expect("reopen after first append authority drops"),
+        drop(precloned);
+        drop(preopened);
+        drop(first_reopened);
+        let mut successor = open_test_journal_for_append(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
@@ -4398,15 +4821,16 @@ mod tests {
         let segment_identity = identity();
         let segment_cipher = cipher();
 
-        let mut original = GuardianOutputJournal::create_new(
-            create_journal_file(&original_path),
+        let mut original = create_new_test_journal(
+            &parent,
+            &original_path,
             segment_identity,
             segment_cipher.clone(),
             limits,
         )
         .expect("create original prefix journal");
         original
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate original prefix journal");
         let original_first = original
             .append_and_sync(b"primary-prefix")
@@ -4417,15 +4841,16 @@ mod tests {
         let original_prefix_digest = original.authenticated_prefix_digest();
         drop(original);
 
-        let mut alternate = GuardianOutputJournal::create_new(
-            create_journal_file(&alternate_path),
+        let mut alternate = create_new_test_journal(
+            &parent,
+            &alternate_path,
             segment_identity,
             segment_cipher.clone(),
             limits,
         )
         .expect("create alternate prefix journal");
         alternate
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate alternate prefix journal");
         let alternate_first = alternate
             .append_and_sync(b"adverse-prefix")
@@ -4466,27 +4891,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn create_new_rejects_nonempty_descriptor_without_rewrite() {
-        let directory = tempfile::tempdir().expect("create nonempty-new directory");
-        let path = directory.path().join("nonempty-new.ftgout");
-        let retained = b"retained preexisting evidence";
-        let mut file = create_journal_file(&path);
-        file.write_all(retained)
-            .and_then(|()| file.sync_all())
-            .expect("persist nonempty new-segment evidence");
-
-        let error = GuardianOutputJournal::create_new(
-            file,
+    fn descriptor_relative_creation_rejects_preexisting_files_without_rewrite() {
+        let directory = tempfile::tempdir().expect("create preexisting-file directory");
+        let parent = File::open(directory.path()).expect("open preexisting-file parent");
+        let empty_path = directory.path().join("preexisting-empty.ftgout");
+        drop(create_journal_file(&empty_path));
+        let empty_error = create_new_test_journal(
+            &parent,
+            &empty_path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .err()
-        .expect("creation must reject a nonempty descriptor");
+        .expect("exclusive creation must reject a preexisting empty file");
+        assert!(matches!(
+            empty_error,
+            GuardianOutputJournalError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(
+            std::fs::read(&empty_path)
+                .expect("read retained empty evidence")
+                .is_empty()
+        );
+
+        let path = directory.path().join("preexisting-nonempty.ftgout");
+        let retained = b"retained preexisting evidence";
+        let mut file = create_journal_file(&path);
+        file.write_all(retained)
+            .and_then(|()| file.sync_all())
+            .expect("persist nonempty new-segment evidence");
+        drop(file);
+
+        let error = create_new_test_journal(
+            &parent,
+            &path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .err()
+        .expect("exclusive creation must reject a preexisting nonempty file");
         assert!(matches!(
             error,
-            GuardianOutputJournalError::NewSegmentNotEmpty { actual }
-                if actual == u64::try_from(retained.len()).expect("fixture length fits u64")
+            GuardianOutputJournalError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::AlreadyExists
         ));
         assert_eq!(
             std::fs::read(&path).expect("read retained nonempty evidence"),
@@ -4496,20 +4946,300 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn descriptor_relative_creation_rejects_invalid_names_and_limits_before_creation() {
+        let directory = tempfile::tempdir().expect("create invalid-creation directory");
+        let parent = File::open(directory.path()).expect("open invalid-creation parent");
+        rustix::fs::fchmod(&parent, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make invalid-creation parent private");
+        for child_name in ["", ".", "..", "../escape", "nested/child", "/absolute"] {
+            let error = GuardianOutputJournal::create_new_at(
+                &parent,
+                OsStr::new(child_name),
+                identity(),
+                cipher(),
+                GuardianOutputJournalLimits::default(),
+            )
+            .err()
+            .expect("invalid child name must fail before creation");
+            assert!(matches!(
+                error,
+                GuardianOutputJournalError::InvalidNewSegmentName
+            ));
+        }
+        let invalid_limits = GuardianOutputJournalLimits {
+            max_record_bytes: 0,
+            ..GuardianOutputJournalLimits::default()
+        };
+        let error = GuardianOutputJournal::create_new_at(
+            &parent,
+            OsStr::new("invalid-limits.ftgout"),
+            identity(),
+            cipher(),
+            invalid_limits,
+        )
+        .err()
+        .expect("invalid limits must fail before creation");
+        assert!(matches!(
+            error,
+            GuardianOutputJournalError::InvalidLimits(_)
+        ));
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("read invalid-creation directory")
+                .count(),
+            0,
+            "a rejected child name or deterministic limit error created an artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_creation_never_follows_or_rewrites_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("create link-creation directory");
+        let parent = File::open(directory.path()).expect("open link-creation parent");
+        let target_path = directory.path().join("retained-target");
+        let symlink_path = directory.path().join("occupied-symlink.ftgout");
+        let hardlink_path = directory.path().join("occupied-hardlink.ftgout");
+        let retained = b"retained link target evidence";
+        let mut target = create_journal_file(&target_path);
+        target
+            .write_all(retained)
+            .and_then(|()| target.sync_all())
+            .expect("persist link target evidence");
+        drop(target);
+        symlink(&target_path, &symlink_path).expect("create occupied symlink child");
+        std::fs::hard_link(&target_path, &hardlink_path).expect("create occupied hardlink child");
+
+        for path in [&symlink_path, &hardlink_path] {
+            let error = create_new_test_journal(
+                &parent,
+                path,
+                identity(),
+                cipher(),
+                GuardianOutputJournalLimits::default(),
+            )
+            .err()
+            .expect("exclusive no-follow creation must reject an occupied link");
+            assert!(matches!(
+                error,
+                GuardianOutputJournalError::Io(ref source)
+                    if source.kind() == std::io::ErrorKind::AlreadyExists
+            ));
+        }
+        assert_eq!(
+            std::fs::read(&target_path).expect("read retained link target"),
+            retained
+        );
+        assert_eq!(
+            std::fs::read_link(&symlink_path).expect("read retained symlink target"),
+            target_path
+        );
+        assert_eq!(
+            std::fs::read(&hardlink_path).expect("read retained hardlink evidence"),
+            retained
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_segment_creation_enforces_private_cloexec_single_link_authority() {
+        let directory = tempfile::tempdir().expect("create creation-invariant directory");
+        let path = directory.path().join("creation-invariants.ftgout");
+        let parent = File::open(directory.path()).expect("open creation-invariant parent");
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create invariant-bound journal");
+        let metadata = journal
+            .file
+            .metadata()
+            .expect("inspect invariant-bound descriptor");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.len(), FILE_HEADER_BYTES_U64);
+        let descriptor_flags = nix::fcntl::fcntl(&journal.file, nix::fcntl::F_GETFD)
+            .expect("inspect invariant-bound descriptor flags");
+        assert!(
+            nix::fcntl::FdFlag::from_bits_truncate(descriptor_flags)
+                .contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
+        journal
+            .sync_parent_directory_and_activate()
+            .expect("activate invariant-bound journal");
+        assert!(!journal.directory_entry_sync_required());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_rejects_child_replacement_hardlink_and_same_inode_mutation() {
+        let replacement_directory =
+            tempfile::tempdir().expect("create replacement-activation directory");
+        let replacement_path = replacement_directory.path().join("replacement.ftgout");
+        let displaced_path = replacement_directory.path().join("displaced.ftgout");
+        let replacement_parent =
+            File::open(replacement_directory.path()).expect("open replacement parent");
+        let mut replaced = create_new_test_journal(
+            &replacement_parent,
+            &replacement_path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create replacement-race journal");
+        std::fs::rename(&replacement_path, &displaced_path)
+            .expect("displace the exact created child");
+        drop(create_journal_file(&replacement_path));
+        assert!(matches!(
+            replaced.sync_parent_directory_and_activate(),
+            Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged)
+        ));
+        assert!(matches!(
+            replaced.append_and_sync(b"must remain fenced after replacement"),
+            Err(GuardianOutputJournalError::DirectoryEntryNotDurable)
+        ));
+
+        let hardlink_directory = tempfile::tempdir().expect("create hardlink-activation directory");
+        let hardlink_path = hardlink_directory.path().join("hardlink.ftgout");
+        let alias_path = hardlink_directory.path().join("hardlink-alias.ftgout");
+        let hardlink_parent = File::open(hardlink_directory.path()).expect("open hardlink parent");
+        let mut hardlinked = create_new_test_journal(
+            &hardlink_parent,
+            &hardlink_path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create hardlink-race journal");
+        std::fs::hard_link(&hardlink_path, &alias_path).expect("plant post-create hardlink alias");
+        assert!(matches!(
+            hardlinked.sync_parent_directory_and_activate(),
+            Err(GuardianOutputJournalError::InsecureNewSegmentIdentity)
+        ));
+        assert!(matches!(
+            hardlinked.append_and_sync(b"must remain fenced after hardlink"),
+            Err(GuardianOutputJournalError::DirectoryEntryNotDurable)
+        ));
+
+        let mutation_directory = tempfile::tempdir().expect("create mutation-activation directory");
+        let mutation_path = mutation_directory.path().join("mutation.ftgout");
+        let mutation_parent = File::open(mutation_directory.path()).expect("open mutation parent");
+        let mut mutated = create_new_test_journal(
+            &mutation_parent,
+            &mutation_path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create mutation-race journal");
+        let mut external = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&mutation_path)
+            .expect("open same inode for external append");
+        external
+            .write_all(&[0x5a])
+            .and_then(|()| external.sync_all())
+            .expect("persist same-inode length mutation");
+        drop(external);
+        assert!(mutated.sync_parent_directory_and_activate().is_err());
+        assert!(matches!(
+            mutated.append_and_sync(b"must remain fenced after mutation"),
+            Err(GuardianOutputJournalError::DirectoryEntryNotDurable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_rejects_parent_permission_drift_and_same_length_content_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent_directory = tempfile::tempdir().expect("create parent-drift directory");
+        let parent_path = parent_directory.path().join("parent-drift.ftgout");
+        let parent = File::open(parent_directory.path()).expect("open parent-drift parent");
+        let mut parent_drifted = create_new_test_journal(
+            &parent,
+            &parent_path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create parent-drift journal");
+        std::fs::set_permissions(
+            parent_directory.path(),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .expect("plant parent permission drift");
+        assert!(matches!(
+            parent_drifted.sync_parent_directory_and_activate(),
+            Err(GuardianOutputJournalError::InsecureNewSegmentParent)
+        ));
+        std::fs::set_permissions(
+            parent_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore private parent permission for retained fixture");
+        assert!(matches!(
+            parent_drifted.append_and_sync(b"must remain fenced after parent drift"),
+            Err(GuardianOutputJournalError::DirectoryEntryNotDurable)
+        ));
+
+        let content_directory = tempfile::tempdir().expect("create content-drift directory");
+        let content_path = content_directory.path().join("content-drift.ftgout");
+        let content_parent =
+            File::open(content_directory.path()).expect("open content-drift parent");
+        let mut content_drifted = create_new_test_journal(
+            &content_parent,
+            &content_path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create content-drift journal");
+        let mut bytes = std::fs::read(&content_path).expect("read created header");
+        bytes[FILE_HEADER_BYTES - 1] ^= 0x80;
+        let mut external = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&content_path)
+            .expect("open created header for same-length mutation");
+        external
+            .write_all(&bytes)
+            .and_then(|()| external.sync_all())
+            .expect("persist same-length header mutation");
+        drop(external);
+        assert!(matches!(
+            content_drifted.sync_parent_directory_and_activate(),
+            Err(GuardianOutputJournalError::FileHeaderAuthenticationFailed)
+        ));
+        assert!(matches!(
+            content_drifted.append_and_sync(b"must remain fenced after content drift"),
+            Err(GuardianOutputJournalError::DirectoryEntryNotDurable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn read_only_reader_replays_committed_prefix_and_preserves_torn_tail() {
         let directory = tempfile::tempdir().expect("create read-only torn-tail directory");
         let path = directory.path().join("read-only-torn-tail.ftgout");
         let parent = File::open(directory.path()).expect("open read-only torn-tail parent");
         let payload = b"authenticated committed prefix";
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("create read-only torn-tail journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate read-only torn-tail journal");
         let receipt = journal
             .append_and_sync(payload)
@@ -4592,15 +5322,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("create reader-append-race directory");
         let path = directory.path().join("reader-append-race.ftgout");
         let parent = File::open(directory.path()).expect("open reader-append-race parent");
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("create reader-append-race journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate reader-append-race journal");
         let receipt = journal
             .append_and_sync(b"committed before append reopen")
@@ -4626,12 +5357,9 @@ mod tests {
             .expect("synchronize the simulated crash truncation");
         drop(truncated);
 
-        let error = GuardianOutputJournal::open_existing_for_append(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .expect("open truncated segment for append recovery"),
+        let error = open_test_journal_for_append(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
@@ -4666,8 +5394,11 @@ mod tests {
             .expect("write complete legacy header fixture");
         file.sync_all().expect("sync legacy header fixture");
 
-        let error = GuardianOutputJournal::open_existing_for_append(
-            file,
+        drop(file);
+        let parent = File::open(directory.path()).expect("open legacy fixture parent");
+        let error = open_test_journal_for_append(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
@@ -4692,8 +5423,9 @@ mod tests {
         let parent = File::open(directory.path()).expect("open parent directory");
         let payload = b"FT-REAL-FILE-PLAINTEXT-MUST-NOT-APPEAR";
 
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
@@ -4705,7 +5437,7 @@ mod tests {
             Err(GuardianOutputJournalError::DirectoryEntryNotDurable)
         ));
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("durably activate journal");
         let first = journal
             .append_and_sync(payload)
@@ -4727,13 +5459,9 @@ mod tests {
         );
         assert!(!bytes.windows(payload.len()).any(|window| window == payload));
 
-        let reopened_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .expect("reopen journal");
-        let mut reopened = GuardianOutputJournal::open_existing_for_append(
-            reopened_file,
+        let mut reopened = open_test_journal_for_append(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
@@ -5066,7 +5794,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn untrusted_header_hint_selects_only_a_candidate_key_and_never_authorizes_open() {
-        let (_directory, path, journal, _receipts) =
+        let (directory, path, journal, _receipts) =
             real_journal_with_records("untrusted-hint.ftgout", &[b"hint payload"]);
         let hint = GuardianOutputUntrustedHeaderHint::read_from(&journal.file)
             .expect("read structurally valid untrusted header hint");
@@ -5097,9 +5825,12 @@ mod tests {
         let forged_hint = GuardianOutputUntrustedHeaderHint::read_from(&forged_file)
             .expect("structural hint deliberately accepts unauthenticated key bytes");
         assert_ne!(forged_hint.untrusted_key_id(), cipher().key_id());
+        drop(forged_file);
+        let parent = File::open(directory.path()).expect("open forged-hint parent");
         assert!(matches!(
-            GuardianOutputJournal::open_existing_for_append(
-                forged_file,
+            open_test_journal_for_append(
+                &parent,
+                &path,
                 identity(),
                 cipher(),
                 GuardianOutputJournalLimits::default(),
@@ -5120,15 +5851,16 @@ mod tests {
             b"FT-RECOVERY-THIRD-SECRET",
         ];
 
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("initialize recovery journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("durably activate recovery journal");
         let first = journal
             .append_and_sync(payloads[0])
@@ -5272,15 +6004,16 @@ mod tests {
         let path = directory.path().join("mutation-recovery.ftgout");
         let parent = File::open(directory.path()).expect("open mutation recovery parent");
         let segment_identity = identity();
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             segment_identity,
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("initialize mutation recovery journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate mutation recovery journal");
         journal
             .append_and_sync(b"same-length authenticated recovery payload")
@@ -5350,15 +6083,16 @@ mod tests {
             Some(predecessor),
         )
         .expect("maximal-sequence segment is valid");
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             maximal_identity,
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("initialize maximal-sequence journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate maximal-sequence journal");
         let terminal = journal
             .append_and_sync(b"terminal")
@@ -5433,15 +6167,16 @@ mod tests {
         let successor_path = directory.path().join("rollover-successor.ftgout");
         let parent = File::open(directory.path()).expect("open rollover parent directory");
 
-        let mut first_segment = GuardianOutputJournal::create_new(
-            create_journal_file(&first_path),
+        let mut first_segment = create_new_test_journal(
+            &parent,
+            &first_path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("initialize first rollover segment");
         first_segment
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate first rollover segment");
         let first_receipt = first_segment
             .append_and_sync(b"pane-lifetime-before-rollover")
@@ -5456,8 +6191,9 @@ mod tests {
             Some(predecessor),
         )
         .expect("construct exact successor identity");
-        let mut successor = GuardianOutputJournal::create_new(
-            create_journal_file(&successor_path),
+        let mut successor = create_new_test_journal(
+            &parent,
+            &successor_path,
             successor_identity,
             cipher(),
             GuardianOutputJournalLimits::default(),
@@ -5470,7 +6206,7 @@ mod tests {
         assert_eq!(successor.terminal_receipt(), None);
         assert_eq!(successor.terminal_predecessor(), Some(predecessor));
         successor
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate successor segment");
         let successor_payload = b"pane-lifetime-after-rollover";
         let successor_receipt = successor
@@ -5592,15 +6328,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("create journal directory");
         let path = directory.path().join("torn.ftgout");
         let parent = File::open(directory.path()).expect("open parent directory");
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("initialize journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate journal");
         let receipt = journal
             .append_and_sync(b"committed")
@@ -5620,13 +6357,9 @@ mod tests {
             .expect("inspect torn journal")
             .len();
 
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .expect("reopen torn journal");
-        let mut reopened = GuardianOutputJournal::open_existing_for_append(
-            file,
+        let mut reopened = open_test_journal_for_append(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
@@ -5701,15 +6434,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("create journal directory");
         let path = directory.path().join("poison.ftgout");
         let parent = File::open(directory.path()).expect("open parent directory");
-        let mut journal = GuardianOutputJournal::create_new(
-            create_journal_file(&path),
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
             identity(),
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
         .expect("initialize journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate journal");
         journal
             .append_and_sync(b"committed")

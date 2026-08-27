@@ -50,7 +50,7 @@ luahelper = { workspace=true, optional = true }
 metrics.workspace = true
 mlua = { workspace=true, optional = true }
 names.workspace = true
-nix = {workspace=true, features=["term"]}
+nix = {workspace=true, features=["term", "user"]}
 parking_lot.workspace = true
 percent-encoding.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
