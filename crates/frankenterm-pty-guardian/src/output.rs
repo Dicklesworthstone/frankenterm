@@ -6428,6 +6428,8 @@ fn create_collision_resistant_segment(
             Ok(created) => return Ok(created),
             Err(GuardianOutputError::Io { source, .. })
                 if source.kind() == ErrorKind::AlreadyExists => {}
+            Err(GuardianOutputError::Journal(GuardianOutputJournalError::Io(source)))
+                if source.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
@@ -6450,15 +6452,18 @@ fn create_segment_at_identity(
         identity.durable_pane_id(),
         identity.segment_id(),
     );
-    let file = create_private_file_new_at(directory, directory_path, &path)?;
+    let child_name = output_child_name(directory_path, &path)?;
+    let mut journal =
+        GuardianOutputJournal::create_new_at(directory, child_name, identity, cipher, limits)?;
+    let file = open_private_file_read_only_at(directory, directory_path, &path)?;
     let file_identity = FileIdentity::capture(
         &file
             .metadata()
             .map_err(|error| GuardianOutputError::io("output-segment-created-metadata", error))?,
         None,
     );
-    let mut journal = GuardianOutputJournal::create_new(file, identity, cipher, limits)?;
-    journal.sync_parent_directory_and_activate(directory)?;
+    drop(file);
+    journal.sync_parent_directory_and_activate()?;
     validate_file_identity_at(directory, directory_path, &path, file_identity)?;
     if journal.tail() != GuardianOutputJournalTail::Clean
         || journal.is_poisoned()
@@ -7685,17 +7690,10 @@ fn open_and_validate_segment_chain(
         &current_segment.path,
         snapshot.descriptor_identity,
     )?;
-    let file = open_private_file_at(directory, directory_path, &current_segment.path, false)?;
-    let promoted_metadata = file.metadata().map_err(|error| {
-        GuardianOutputError::io("output-append-segment-promotion-metadata", error)
-    })?;
-    if !snapshot.descriptor_identity.matches(&promoted_metadata) {
-        return Err(GuardianOutputError::FilesystemAuthority(
-            "guardian output current segment changed before append promotion",
-        ));
-    }
-    let journal = GuardianOutputJournal::open_existing_for_append(
-        file,
+    let child_name = output_child_name(directory_path, &current_segment.path)?;
+    let journal = GuardianOutputJournal::open_existing_for_append_at(
+        directory,
+        child_name,
         current_segment.segment_identity,
         cipher.clone(),
         policy.journal_limits,

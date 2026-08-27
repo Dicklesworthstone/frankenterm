@@ -85,6 +85,14 @@ const LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const LIVE_SCROLLBACK_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const LIVE_SCROLLBACK_MUTATION_LOCK_NAME: &str = ".mutation-lock.v3";
 
+#[cfg(unix)]
+#[allow(clippy::verbose_bit_mask)]
+const fn unix_mode_is_private(mode: u32) -> bool {
+    // Spell the permission contract as a mask: this is security policy over
+    // group/other bits, not a numeric trailing-zero optimization.
+    mode & 0o077 == 0
+}
+
 #[cfg(test)]
 std::thread_local! {
     static LIVE_SCROLLBACK_AUTHORITY_RECORD_READS: std::cell::Cell<u64> = const {
@@ -1750,6 +1758,27 @@ impl LiveScrollbackSpillSink {
         epoch
     }
 
+    fn clear_successor_state(
+        &self,
+        previous: LiveScrollbackSpillState,
+        ledger_pane_id: u64,
+    ) -> LiveScrollbackSpillState {
+        let predecessor = previous.snapshot_generation();
+        LiveScrollbackSpillState {
+            initial_stable_row: None,
+            newest_stable_row_exclusive: None,
+            max_retained_rows: 0,
+            content_epoch: self.clear_content_epoch(predecessor),
+            revision: 0,
+            authenticated_manifest: true,
+            predecessor_generation: Some(predecessor),
+            clear_manifest_published: true,
+            clear_pending_physical_reclamation: true,
+            transaction_quarantined: false,
+            verified_ledger: Some(VerifiedLedgerState::empty(ledger_pane_id)),
+        }
+    }
+
     fn replacement_ledger_pane_id(
         &self,
         generation: wezterm_term::config::ScrollbackSnapshotGeneration,
@@ -2785,7 +2814,7 @@ impl LiveScrollbackSpillSink {
 
                         let parent_metadata = std::fs::symlink_metadata(parent)?;
                         anyhow::ensure!(
-                            expected.permissions().mode() & 0o077 == 0
+                            unix_mode_is_private(expected.permissions().mode())
                                 && expected.nlink() == 1
                                 && expected.uid() == parent_metadata.uid()
                                 && observed.dev() == expected.dev()
@@ -4140,7 +4169,7 @@ impl LiveScrollbackSpillSink {
         {
             use std::os::unix::fs::PermissionsExt as _;
 
-            if path_metadata_before.permissions().mode() & 0o077 != 0 {
+            if !unix_mode_is_private(path_metadata_before.permissions().mode()) {
                 anyhow::bail!("scrollback manifest is not private: {}", path.display());
             }
         }
@@ -4168,7 +4197,7 @@ impl LiveScrollbackSpillSink {
         {
             use std::os::unix::fs::PermissionsExt as _;
 
-            if handle_metadata_before.permissions().mode() & 0o077 != 0 {
+            if !unix_mode_is_private(handle_metadata_before.permissions().mode()) {
                 anyhow::bail!(
                     "opened scrollback manifest is not private: {}",
                     path.display()
@@ -4266,7 +4295,7 @@ impl LiveScrollbackSpillSink {
                 .ok_or_else(|| anyhow::anyhow!("scrollback append WAL path has no parent"))?;
             let parent_metadata = std::fs::symlink_metadata(parent)?;
             anyhow::ensure!(
-                path_metadata_before.permissions().mode() & 0o077 == 0
+                unix_mode_is_private(path_metadata_before.permissions().mode())
                     && path_metadata_before.nlink() == 1
                     && path_metadata_before.uid() == parent_metadata.uid(),
                 "scrollback append WAL is not private: {}",
@@ -4376,7 +4405,7 @@ impl LiveScrollbackSpillSink {
                 .ok_or_else(|| anyhow::anyhow!("append WAL stage has no parent"))?;
             let parent_metadata = std::fs::symlink_metadata(parent)?;
             anyhow::ensure!(
-                path_metadata.permissions().mode() & 0o077 == 0
+                unix_mode_is_private(path_metadata.permissions().mode())
                     && path_metadata.nlink() == 1
                     && path_metadata.uid() == parent_metadata.uid(),
                 "incomplete append WAL stage is not private"
@@ -4429,7 +4458,7 @@ impl LiveScrollbackSpillSink {
                 .ok_or_else(|| anyhow::anyhow!("manifest stage has no parent"))?;
             let parent_metadata = std::fs::symlink_metadata(parent)?;
             anyhow::ensure!(
-                path_metadata.permissions().mode() & 0o077 == 0
+                unix_mode_is_private(path_metadata.permissions().mode())
                     && path_metadata.nlink() == 1
                     && path_metadata.uid() == parent_metadata.uid(),
                 "incomplete manifest stage is not private"
@@ -4496,7 +4525,7 @@ impl LiveScrollbackSpillSink {
             let parent_metadata = std::fs::symlink_metadata(parent)?;
             anyhow::ensure!(
                 expected.file_type().is_file()
-                    && expected.permissions().mode() & 0o077 == 0
+                    && unix_mode_is_private(expected.permissions().mode())
                     && expected.nlink() == 1
                     && expected.uid() == parent_metadata.uid()
                     && observed.dev() == expected.dev()
@@ -6230,14 +6259,15 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                     .line_at(ledger_pane_id, seq)
                     .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
                     .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
-                let remaining_decoded_bytes = limits
-                    .max_decoded_bytes
-                    .checked_sub(decoded_bytes)
-                    .ok_or(ScrollbackSpillError::ResourceLimit {
-                    resource: "decoded_bytes",
-                    observed: u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
-                    maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
-                })?;
+                let remaining_decoded_bytes =
+                    limits
+                        .max_decoded_bytes
+                        .checked_sub(decoded_bytes)
+                        .ok_or_else(|| ScrollbackSpillError::ResourceLimit {
+                            resource: "decoded_bytes",
+                            observed: u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
+                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
+                        })?;
                 if mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
                     &record,
                 ) {
@@ -6677,20 +6707,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         let (previous, clear_generation) = {
             let mut state = self.lock_state("clear_scrollback state reset")?;
             let previous = *state;
-            let predecessor = previous.snapshot_generation();
-            *state = LiveScrollbackSpillState {
-                initial_stable_row: None,
-                newest_stable_row_exclusive: None,
-                max_retained_rows: 0,
-                content_epoch: self.clear_content_epoch(predecessor),
-                revision: 0,
-                authenticated_manifest: true,
-                predecessor_generation: Some(predecessor),
-                clear_manifest_published: true,
-                clear_pending_physical_reclamation: true,
-                transaction_quarantined: false,
-                verified_ledger: Some(VerifiedLedgerState::empty(ledger_pane_id)),
-            };
+            *state = self.clear_successor_state(previous, ledger_pane_id);
             (previous, state.snapshot_generation())
         };
         // Publish the clear intent before truncating the content log. If the
@@ -6849,7 +6866,7 @@ fn validate_live_scrollback_directory(
         use std::os::unix::fs::PermissionsExt as _;
 
         anyhow::ensure!(
-            !require_private || metadata.permissions().mode() & 0o077 == 0,
+            !require_private || unix_mode_is_private(metadata.permissions().mode()),
             "live scrollback pane directory is not private: {}",
             path.display()
         );
@@ -6881,7 +6898,7 @@ fn validate_live_scrollback_content_file(
         use std::os::unix::fs::PermissionsExt as _;
 
         anyhow::ensure!(
-            metadata.permissions().mode() & 0o077 == 0,
+            unix_mode_is_private(metadata.permissions().mode()),
             "{label} is not private: {}",
             path.display()
         );
@@ -7136,30 +7153,25 @@ pub fn list_live_scrollback_panes(
                         snapshot,
                     )
                     .context("verify authenticated logical ledger during discovery")?;
+                } else if manifest_after.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 {
+                    let observed = live_scrollback_logical_ledger_digest_from_records(
+                        &manifest_after,
+                        ledger_pane_id,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        &[],
+                    )?;
+                    anyhow::ensure!(
+                        observed
+                            == expected_live_scrollback_logical_ledger_digest(&manifest_after)?,
+                        "cleared authenticated v3 logical ledger digest mismatch"
+                    );
                 } else {
-                    if manifest_after.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3 {
-                        let observed = live_scrollback_logical_ledger_digest_from_records(
-                            &manifest_after,
-                            ledger_pane_id,
-                            None,
-                            0,
-                            0,
-                            0,
-                            0,
-                            &[],
-                        )?;
-                        anyhow::ensure!(
-                            observed
-                                == expected_live_scrollback_logical_ledger_digest(&manifest_after)?,
-                            "cleared authenticated v3 logical ledger digest mismatch"
-                        );
-                    } else {
-                        let (anchor, tail) = expected_live_scrollback_v4_chain(&manifest_after)?;
-                        anyhow::ensure!(
-                            anchor == tail,
-                            "cleared authenticated v4 chain is nonempty"
-                        );
-                    }
+                    let (anchor, tail) = expected_live_scrollback_v4_chain(&manifest_after)?;
+                    anyhow::ensure!(anchor == tail, "cleared authenticated v4 chain is nonempty");
                 }
             }
             let metadata_after = std::fs::symlink_metadata(&pane_path)?;
@@ -8468,7 +8480,7 @@ mod tests {
             wezterm_term::config::ScrollbackSnapshotFidelity::ExactSemantic
         );
         assert_eq!(snapshot.generation(), empty.generation());
-        assert!(snapshot.rows().is_empty());
+        assert_eq!(snapshot.rows(), []);
 
         let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
             .simple()
@@ -8790,7 +8802,8 @@ mod tests {
 
         let error = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
             .expect_err("stale guardian authentication must reject a recomputed public checksum");
-        assert!(format!("{error:#}").contains("authentication"));
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains("authentication"), "{error_text}");
     }
 
     #[test]
@@ -8804,11 +8817,27 @@ mod tests {
         };
         let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
             .expect("create bounded-stage sink");
+        {
+            let mut state = sink
+                .lock_state("test bounded manifest stage state")
+                .expect("lock bounded-stage state");
+            state
+                .advance_revision()
+                .expect("advance bounded-stage generation");
+            state.initial_stable_row = Some(0);
+            state.newest_stable_row_exclusive = Some(1);
+            state.max_retained_rows = 8;
+        }
         std::fs::create_dir(&sink.manifest_path)
             .expect("block manifest rename with a destination directory");
-        let line = Line::from_text("never-published", &CellAttributes::blank(), 1, None);
-        assert!(!sink.store_scrollback_line(0, &line, 8));
-        assert!(!sink.store_scrollback_line(0, &line, 8));
+        let first_error = sink
+            .persist_manifest("prepared")
+            .expect_err("the first blocked manifest rename must fail before publication");
+        assert!(!first_error.outcome_indeterminate());
+        let retry_error = sink
+            .persist_manifest("prepared")
+            .expect_err("the blocked retry must fail before publication");
+        assert!(!retry_error.outcome_indeterminate());
         let parent = sink
             .manifest_path
             .parent()
@@ -8826,16 +8855,24 @@ mod tests {
         assert_eq!(installing, 1, "retries must reuse one bounded stage slot");
         std::fs::rename(&sink.manifest_path, parent.join("retained-rename-blocker"))
             .expect("move the test blocker without deleting crash evidence");
-        assert!(
-            sink.store_scrollback_line(0, &line, 8),
-            "the synchronized deterministic stage must remain publishable after the blocker clears"
-        );
+        sink.persist_manifest("prepared")
+            .expect("publish the retained deterministic stage after the blocker clears");
+        let published = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read published deterministic stage")
+            .expect("published deterministic stage exists");
         assert_eq!(
-            sink.load_scrollback_line(0)
-                .expect("row committed through reused deterministic stage")
-                .as_str()
-                .as_ref(),
-            "never-published"
+            published.publication_state, "prepared",
+            "the exact prepared transaction must become authoritative"
+        );
+        assert_eq!(published.revision, Some(1));
+        assert_eq!(published.initial_stable_row, Some(0));
+        assert_eq!(published.newest_stable_row_exclusive, Some(1));
+        let keyring = sink
+            .lock_keyring("test published deterministic stage authentication")
+            .expect("lock guardian keyring for published stage");
+        assert!(
+            LiveScrollbackSpillSink::authenticate_manifest(&published, &keyring)
+                .expect("verify published deterministic stage authentication")
         );
     }
 
@@ -8882,6 +8919,19 @@ mod tests {
                 .expect("load complete-stage active key");
             let record = encode_exact_scrollback_line_record(&second, &cipher, row_identity)
                 .expect("seal complete-stage exact row");
+            let (target_authority, evicted_records) = previous_state
+                .verified_ledger
+                .expect("published predecessor has verified ledger authority")
+                .project_append(
+                    1,
+                    &record,
+                    8,
+                    &sink
+                        .lock_store("test complete-stage successor authority")
+                        .expect("test complete-stage store lock"),
+                )
+                .expect("derive complete-stage successor authority");
+            assert_eq!(evicted_records, 0);
             assert_eq!(
                 sink.lock_store("test complete-stage append")
                     .expect("test complete-stage store lock")
@@ -8889,6 +8939,7 @@ mod tests {
                     .expect("append durable complete-stage row"),
                 1
             );
+            proposed_state.verified_ledger = Some(target_authority);
             *sink
                 .lock_state("test complete-stage publish state")
                 .expect("test complete-stage state lock") = proposed_state;
@@ -8905,6 +8956,18 @@ mod tests {
                 .persist_manifest("complete")
                 .expect_err("complete-stage publication must fail before rename");
             assert!(!error.outcome_indeterminate());
+            let source_text = format!("{:#}", error.source);
+            assert!(
+                source_text.contains("publish scrollback manifest"),
+                "the injected failure must reach the final manifest rename: {source_text}"
+            );
+            let retained_stage =
+                LiveScrollbackSpillSink::deterministic_manifest_stage_path(&sink.manifest_path)
+                    .expect("derive retained complete-stage path");
+            assert!(
+                retained_stage.is_file(),
+                "the pre-rename crash cut must retain one complete stage"
+            );
             std::fs::rename(
                 &sink.manifest_path,
                 parent.join("retained-complete-stage-blocker"),
@@ -9255,9 +9318,9 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum LegacyV1AppendWalCrashCut {
-        ActiveBeforeRow,
-        ActiveAfterRowBeforeRetention,
-        ActiveAfterRetentionBeforeManifest,
+        BeforeRow,
+        AfterRowBeforeRetention,
+        AfterRetentionBeforeManifest,
     }
 
     #[test]
@@ -9422,9 +9485,9 @@ mod tests {
     #[test]
     fn legacy_v1_append_wal_recovers_to_v4_across_crash_cuts_and_cold_reopens() {
         let cuts = [
-            LegacyV1AppendWalCrashCut::ActiveBeforeRow,
-            LegacyV1AppendWalCrashCut::ActiveAfterRowBeforeRetention,
-            LegacyV1AppendWalCrashCut::ActiveAfterRetentionBeforeManifest,
+            LegacyV1AppendWalCrashCut::BeforeRow,
+            LegacyV1AppendWalCrashCut::AfterRowBeforeRetention,
+            LegacyV1AppendWalCrashCut::AfterRetentionBeforeManifest,
         ];
         for (index, cut) in cuts.into_iter().enumerate() {
             let identity_byte = u8::try_from(220 + index).expect("fixture identity fits u8");
@@ -9433,8 +9496,8 @@ mod tests {
             sink.persist_authenticated_append_wal(&wal)
                 .expect("publish legacy v1 append WAL");
             match cut {
-                LegacyV1AppendWalCrashCut::ActiveBeforeRow => {}
-                LegacyV1AppendWalCrashCut::ActiveAfterRowBeforeRetention => {
+                LegacyV1AppendWalCrashCut::BeforeRow => {}
+                LegacyV1AppendWalCrashCut::AfterRowBeforeRetention => {
                     assert_eq!(
                         sink.lock_store("v1 WAL row-before-retention cut")
                             .expect("lock v1 WAL row-before-retention store")
@@ -9443,7 +9506,7 @@ mod tests {
                         wal.appended_sequence
                     );
                 }
-                LegacyV1AppendWalCrashCut::ActiveAfterRetentionBeforeManifest => {
+                LegacyV1AppendWalCrashCut::AfterRetentionBeforeManifest => {
                     let mut store = sink
                         .lock_store("v1 WAL post-retention cut")
                         .expect("lock v1 WAL post-retention store");
@@ -10568,9 +10631,18 @@ mod tests {
                     .expect("compact empty retained set")
             );
             drop(store);
-            sink.lock_state("test empty forward authority target")
-                .expect("test state lock")
-                .verified_ledger = Some(VerifiedLedgerState {
+            let mut target_state = sink
+                .lock_state("test empty forward authority target")
+                .expect("test state lock");
+            let predecessor_generation = target_state.snapshot_generation();
+            target_state
+                .advance_revision()
+                .expect("advance empty forward-retention generation");
+            assert_eq!(
+                target_state.predecessor_generation,
+                Some(predecessor_generation)
+            );
+            target_state.verified_ledger = Some(VerifiedLedgerState {
                 ledger_pane_id: prior_authority.ledger_pane_id,
                 oldest_sequence: None,
                 next_sequence: 4,
@@ -10579,6 +10651,7 @@ mod tests {
                 chain_anchor: prior_authority.chain_tail,
                 chain_tail: prior_authority.chain_tail,
             });
+            drop(target_state);
             sink.persist_manifest("complete")
                 .expect("authenticate empty forward-retention state");
         }
@@ -10719,7 +10792,8 @@ mod tests {
         let error =
             export_live_scrollback_transcript(dir.path(), &durable_pane_id, 1, 1024, 1024 * 1024)
                 .expect_err("row limit must fail closed");
-        assert!(error.to_string().contains("records limit 1"));
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains("records limit 1"), "{error_text}");
     }
 
     #[test]
@@ -11082,6 +11156,15 @@ mod tests {
             &Line::from_text("before-staged-clear", &CellAttributes::blank(), 1, None),
             8,
         ));
+        sink.advance_authenticated_append_wal_supersession()
+            .expect("acknowledge the completed predecessor before staging clear");
+        let previous_state = *sink
+            .lock_state("test staged-clear predecessor")
+            .expect("lock staged-clear predecessor state");
+        *sink
+            .lock_state("test staged-clear successor")
+            .expect("lock staged-clear successor state") =
+            sink.clear_successor_state(previous_state, sink.active_ledger_pane_id());
         let parent = sink
             .manifest_path
             .parent()
@@ -11090,10 +11173,18 @@ mod tests {
         std::fs::rename(&sink.manifest_path, &published_backup)
             .expect("retain pre-clear published manifest");
         std::fs::create_dir(&sink.manifest_path).expect("block clear manifest rename");
-        assert!(matches!(
-            sink.clear_scrollback(),
-            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
-        ));
+        let error = sink
+            .persist_manifest("cleared")
+            .expect_err("blocked clear publication must fail before final rename");
+        assert!(!error.outcome_indeterminate());
+        let source_text = format!("{:#}", error.source);
+        assert!(
+            source_text.contains("publish scrollback manifest"),
+            "the clear crash cut must reach the final manifest rename: {source_text}"
+        );
+        *sink
+            .lock_state("test staged-clear rollback")
+            .expect("lock staged-clear rollback state") = previous_state;
         let staged = LiveScrollbackSpillSink::read_manifest(
             &LiveScrollbackSpillSink::deterministic_manifest_stage_path(&sink.manifest_path)
                 .expect("derive clear-stage path"),
@@ -11188,7 +11279,7 @@ mod tests {
         let empty = sink
             .snapshot_scrollback(6, limits)
             .expect("snapshot committed empty generation");
-        assert!(empty.rows().is_empty());
+        assert_eq!(empty.rows(), []);
         assert_eq!(empty.oldest_stable_row(), None);
         assert_eq!(
             empty.fidelity(),
@@ -11301,7 +11392,7 @@ mod tests {
         } else {
             "0"
         };
-        record.replace_range(checksum_index..checksum_index + 1, replacement);
+        record.replace_range(checksum_index..=checksum_index, replacement);
         assert!(decode_scrollback_line_record(&record).is_none());
     }
 
@@ -11808,7 +11899,6 @@ mod tests {
             port: Some("test-new-port".to_string()),
             baud: Some(115_200),
         };
-        let expected_ssh = replacement_ssh.clone();
         let expected_wsl = replacement_wsl.clone();
         let expected_exec = replacement_exec.clone();
         let expected_serial = replacement_serial.clone();
@@ -11817,6 +11907,10 @@ mod tests {
             config.exec_domains = vec![replacement_exec];
             config.serial_ports = vec![replacement_serial];
         });
+        let expected_ssh = configured_ssh_domains(&replacement_handle)
+            .into_iter()
+            .find(|domain| domain.name == "changed-raw-ssh")
+            .expect("normalized replacement raw SSH configuration exists");
 
         assert_eq!(
             reconcile_mux_domains(&replacement_handle)?,
@@ -12239,10 +12333,13 @@ mod tests {
             multiplexing: SshMultiplexing::None,
             ..SshDomain::default()
         };
-        let expected_raw = replacement_raw.clone();
         let replacement_handle = make_test_handle_with(vec![replacement_raw], |config| {
             config.default_domain = Some("client-to-raw".to_string());
         });
+        let expected_raw = configured_ssh_domains(&replacement_handle)
+            .into_iter()
+            .find(|domain| domain.name == "client-to-raw")
+            .expect("normalized replacement raw SSH configuration exists");
         assert_eq!(
             reconcile_mux_domains(&replacement_handle)?,
             MuxDomainUpdateOutcome::PendingRetirements {

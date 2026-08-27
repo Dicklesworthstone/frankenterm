@@ -1151,6 +1151,12 @@ impl GuardianPaneLeaseActor {
         }
     }
 
+    // The mutable receiver is consumed by the test-only allocation-failure
+    // injector; production deliberately keeps the identical method shape.
+    #[cfg_attr(
+        not(test),
+        allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
+    )]
     fn copy_input(&mut self, payload: &[u8]) -> Result<Vec<u8>, GuardianProxyError> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_input_copy) {
@@ -1307,7 +1313,7 @@ impl GuardianPaneLeaseActor {
             Some(PendingMutation::Input(current)) if current.sequence == pending.sequence => {
                 current.submitted = true;
             }
-            Some(PendingMutation::Input(_)) | Some(PendingMutation::Generic(_)) | None => {
+            Some(PendingMutation::Input(_) | PendingMutation::Generic(_)) | None => {
                 self.disposition = GuardianLeaseDisposition::Quarantined;
                 return Err(GuardianProxyError::UnexpectedMutationReply);
             }
@@ -1747,7 +1753,7 @@ struct GuardianReplayAckPlan {
 }
 
 impl GuardianReplayAckPlan {
-    fn ack(self) -> Result<GuardianReplayAckV1, GuardianProxyError> {
+    fn ack(&self) -> Result<GuardianReplayAckV1, GuardianProxyError> {
         GuardianReplayAckV1::new(
             self.snapshot_id,
             self.snapshot_digest,
@@ -1796,7 +1802,7 @@ fn replay_page_with_exact_retry(
 
 fn replay_ack_with_exact_retry(
     transport: &mut dyn GuardianReplayTransport,
-    plan: GuardianReplayAckPlan,
+    plan: &GuardianReplayAckPlan,
 ) -> Result<(), GuardianProxyError> {
     let ack = plan.ack()?;
     for attempt in 0..GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS {
@@ -2119,7 +2125,7 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     base.previous_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, ack)?;
+                replay_ack_with_exact_retry(transport, &ack)?;
 
                 if u64::try_from(checkpoint.len()) == Ok(observed_descriptor.total_bytes()) {
                     let restored = restore_inert_checkpoint(
@@ -2186,7 +2192,7 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     current.previous_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, ack)?;
+                replay_ack_with_exact_retry(transport, &ack)?;
                 boundary = Some(current);
             }
             GuardianReplayPageBodyDelivery::Complete {
@@ -2231,7 +2237,7 @@ fn consume_one_guardian_replay_snapshot(
                     through_sequence,
                     terminal_record_digest,
                 );
-                replay_ack_with_exact_retry(transport, ack)?;
+                replay_ack_with_exact_retry(transport, &ack)?;
                 return Ok(VerifiedGuardianReplayRestore {
                     inert_terminal: inert_terminal.ok_or(GuardianProxyError::ReplayInvariant(
                         "verified terminal disappeared before activation",
@@ -2243,7 +2249,7 @@ fn consume_one_guardian_replay_snapshot(
             GuardianReplayPageBodyDelivery::Gap { .. } => {
                 let _ = replay_ack_with_exact_retry(
                     transport,
-                    replay_page_ack_plan(
+                    &replay_page_ack_plan(
                         snapshot_id,
                         snapshot_digest,
                         page_index,
@@ -2259,7 +2265,7 @@ fn consume_one_guardian_replay_snapshot(
             GuardianReplayPageBodyDelivery::Compacted { .. } => {
                 let _ = replay_ack_with_exact_retry(
                     transport,
-                    replay_page_ack_plan(
+                    &replay_page_ack_plan(
                         snapshot_id,
                         snapshot_digest,
                         page_index,
@@ -2454,7 +2460,7 @@ impl GuardianReplayTailReader {
         // process-local snapshot expired, Resume must begin after bytes that
         // the parser has already received.
         self.boundary = delivered;
-        match replay_ack_with_exact_retry(self.transport.as_mut(), plan) {
+        match replay_ack_with_exact_retry(self.transport.as_mut(), &plan) {
             Ok(()) => {
                 self.cursor = plan.next_cursor;
             }
@@ -3058,9 +3064,7 @@ impl GuardianProxyStaging {
                 return Err(GuardianProxyError::TerminalActivation);
             }
         };
-        if let Err(error) = self.reader_slot.install_after_restore(reader) {
-            return Err(error);
-        }
+        self.reader_slot.install_after_restore(reader)?;
         let actor = Arc::clone(&self.actor);
         Ok(ActivatedGuardianProxy {
             terminal,
@@ -3865,7 +3869,7 @@ mod tests {
             let snapshot = {
                 let mut state = self.state.lock();
                 state.calls = state.calls.saturating_add(1);
-                state.snapshots.pop_front().ok_or_else(|| {
+                state.snapshots.pop_front().ok_or({
                     GuardianMutationTransportError::Client(GuardianClientError::UnexpectedReply)
                 })?
             };
@@ -4043,26 +4047,27 @@ mod tests {
             .expect("capture exact checkpoint fixture registration");
 
         let directory = tempfile::tempdir().expect("create checkpoint fixture journal directory");
-        let file = File::options()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(directory.path().join("guardian-output.segment"))
-            .expect("create checkpoint fixture output segment");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make checkpoint fixture journal directory private");
+        }
+        let directory_file = File::open(directory.path()).expect("open fixture journal parent");
         let segment = GuardianOutputSegmentIdentity::new(identity().pane_id(), id(0x500), 1, None)
             .expect("construct checkpoint fixture segment identity");
         let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32])
             .expect("construct checkpoint fixture cipher");
-        let mut journal = GuardianOutputJournal::create_new(
-            file,
+        let mut journal = GuardianOutputJournal::create_new_at(
+            &directory_file,
+            std::ffi::OsStr::new("guardian-output.segment"),
             segment,
             cipher,
             GuardianOutputJournalLimits::default(),
         )
         .expect("open checkpoint fixture journal");
-        let directory_file = File::open(directory.path()).expect("open fixture journal parent");
         journal
-            .sync_parent_directory_and_activate(&directory_file)
+            .sync_parent_directory_and_activate()
             .expect("activate checkpoint fixture journal");
         let receipt = journal
             .append_and_sync(&payload)
@@ -5791,6 +5796,6 @@ mod tests {
         let (staging, state) = fake_staging([], 71);
         assert!(staging.reader_slot.take_reader().is_err());
         assert!(staging.reader_slot.take_reader().is_err());
-        assert!(state.lock().calls.is_empty());
+        assert_eq!(state.lock().calls.as_slice(), &[]);
     }
 }

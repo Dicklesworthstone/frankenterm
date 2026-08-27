@@ -587,10 +587,10 @@ fn authority_identity(
     #[cfg(unix)]
     {
         let metadata = directory.dir_metadata()?;
-        return Ok(GuardianOutputAuthorityIdentity {
+        Ok(GuardianOutputAuthorityIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
-        });
+        })
     }
     #[cfg(not(unix))]
     {
@@ -2695,11 +2695,12 @@ mod tests {
             },
         )
         .expect("publish legacy activation");
-        assert!(
+        assert_eq!(
             inventory(&capability)
                 .expect("inventory legacy chain")
                 .intents
-                .is_empty()
+                .as_slice(),
+            &[]
         );
         drop(capability);
 
@@ -2830,8 +2831,8 @@ mod tests {
 
         assert!(matches!(
             keyring.active_cipher(),
-            Err(GuardianOutputKeyringError::UnsafeKeyFile)
-                | Err(GuardianOutputKeyringError::AuthorityChanged)
+            Err(GuardianOutputKeyringError::UnsafeKeyFile
+                | GuardianOutputKeyringError::AuthorityChanged)
         ));
     }
 

@@ -10729,7 +10729,7 @@ mod tests {
             })
         ));
         assert_eq!(pane.writer_calls(), 1);
-        assert!(pane.written_bytes().is_empty());
+        assert_eq!(pane.written_bytes(), Vec::<u8>::new());
 
         pane.set_writer_behavior(FakePaneWriteBehavior::ApplyAll);
         handler.process_one(DecodedPdu {
@@ -16884,7 +16884,9 @@ mod tests {
                     captured: None,
                 })
                 .collect();
-            let mut expected_clients: Vec<Option<ClientId>> = vec![None; 4];
+            let mut slot_owner: Vec<Option<(usize, ClientId)>> = vec![None; 4];
+            let mut latest_owner_by_client: HashMap<ClientId, usize> = HashMap::new();
+            let mut next_owner = 1usize;
 
             for (idx, op) in ops.iter().enumerate() {
                 let serial = idx as u64 + 1;
@@ -16900,6 +16902,17 @@ mod tests {
                         }
 
                         let client = client_for_slot(slot, client_variant);
+                        let registration_is_current =
+                            slot_owner[slot]
+                                .as_ref()
+                                .is_some_and(|(prior_owner, prior_client)| {
+                                    *prior_client == client
+                                        && latest_owner_by_client
+                                            .get(prior_client)
+                                            .is_some_and(|current_owner| {
+                                                current_owner == prior_owner
+                                            })
+                                });
                         slots[slot]
                             .handler
                             .as_mut()
@@ -16911,7 +16924,22 @@ mod tests {
                                     is_proxy: false,
                                 }),
                             });
-                        expected_clients[slot] = Some(client);
+                        if !registration_is_current {
+                            if let Some((prior_owner, prior_client)) = slot_owner[slot].take() {
+                                if latest_owner_by_client
+                                    .get(&prior_client)
+                                    .is_some_and(|current_owner| *current_owner == prior_owner)
+                                {
+                                    latest_owner_by_client.remove(&prior_client);
+                                }
+                            }
+                            let owner = next_owner;
+                            next_owner = next_owner
+                                .checked_add(1)
+                                .expect("property owner epoch must not overflow");
+                            latest_owner_by_client.insert(client.clone(), owner);
+                            slot_owner[slot] = Some((owner, client));
+                        }
 
                         let captured = slots[slot]
                             .captured
@@ -16930,7 +16958,13 @@ mod tests {
                     LifecycleOp::Release { slot } => {
                         slots[slot].handler.take();
                         slots[slot].captured.take();
-                        expected_clients[slot] = None;
+                        if let Some((owner, client)) = slot_owner[slot].take()
+                            && latest_owner_by_client
+                                .get(&client)
+                                .is_some_and(|current_owner| *current_owner == owner)
+                        {
+                            latest_owner_by_client.remove(&client);
+                        }
                     }
                     LifecycleOp::Ping { slot } => {
                         if let Some(handler) = slots[slot].handler.as_mut() {
@@ -16955,10 +16989,8 @@ mod tests {
                     }
                 }
 
-                let expected: HashSet<ClientId> = expected_clients
-                    .iter()
-                    .filter_map(Clone::clone)
-                    .collect();
+                let expected: HashSet<ClientId> =
+                    latest_owner_by_client.keys().cloned().collect();
                 prop_assert_eq!(
                     mux_client_set(&mux),
                     expected,

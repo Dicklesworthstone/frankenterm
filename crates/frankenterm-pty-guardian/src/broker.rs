@@ -11896,7 +11896,7 @@ mod tests {
         fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o000))
             .expect("tamper completed certificate mode");
         assert!(matches!(
-            BrokerSpawnWalCatalogV1::open(certificate_directory.path().to_path_buf()),
+            reopen_test_catalog_after_owner_drop(certificate_directory.path()),
             Err(BrokerSpawnWalError::InsecureCatalogIdentity)
         ));
         assert_eq!(
@@ -11927,7 +11927,7 @@ mod tests {
         fs::set_permissions(&wal_path, fs::Permissions::from_mode(0o400))
             .expect("tamper completed canonical mode");
         assert!(matches!(
-            BrokerSpawnWalCatalogV1::open(canonical_directory.path().to_path_buf()),
+            reopen_test_catalog_after_owner_drop(canonical_directory.path()),
             Err(BrokerSpawnWalError::InsecureCatalogIdentity)
         ));
         assert_eq!(
@@ -15136,12 +15136,19 @@ mod tests {
             .expect("valid initial output segment identity");
         let cipher = GuardianOutputCipher::try_from_key_slice(&[0xa5; 32])
             .expect("valid test output cipher");
-        let mut journal =
-            GuardianOutputJournal::create_new(open_new_test_file(&path), identity, cipher, limits)
-                .expect("create encrypted test output journal");
         let parent = File::open(directory).expect("open output journal parent directory");
+        rustix::fs::fchmod(&parent, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make test output journal parent private");
+        let mut journal = GuardianOutputJournal::create_new_at(
+            &parent,
+            path.file_name().expect("output journal has a child name"),
+            identity,
+            cipher,
+            limits,
+        )
+        .expect("create encrypted test output journal");
         journal
-            .sync_parent_directory_and_activate(&parent)
+            .sync_parent_directory_and_activate()
             .expect("activate output journal directory entry");
         journal
     }
@@ -17108,8 +17115,13 @@ mod tests {
                 .expect("valid unactivated output identity");
         let unactivated_cipher = GuardianOutputCipher::try_from_key_slice(&[0xa6; 32])
             .expect("valid unactivated output cipher");
-        let unactivated_journal = GuardianOutputJournal::create_new(
-            open_new_test_file(&temp.path().join("output-unactivated.journal")),
+        let unactivated_parent =
+            File::open(temp.path()).expect("open unactivated output journal parent");
+        rustix::fs::fchmod(&unactivated_parent, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make unactivated output journal parent private");
+        let unactivated_journal = GuardianOutputJournal::create_new_at(
+            &unactivated_parent,
+            std::ffi::OsStr::new("output-unactivated.journal"),
             unactivated_identity,
             unactivated_cipher,
             GuardianOutputJournalLimits::default(),

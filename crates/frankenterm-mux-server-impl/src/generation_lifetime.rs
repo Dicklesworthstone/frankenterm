@@ -525,42 +525,43 @@ fn current_process_executable_identity() -> Result<GenerationObjectIdentity, Gen
 #[cfg(target_os = "linux")]
 fn revalidate_directory_bindings(
     managed: &ManagedExecutablePath,
-    generations: &std::fs::File,
-    generations_before: NodeSnapshot,
-    generation: &std::fs::File,
-    generation_before: NodeSnapshot,
+    root_directory: &std::fs::File,
+    root_snapshot_before: NodeSnapshot,
+    selected_directory: &std::fs::File,
+    selected_snapshot_before: NodeSnapshot,
     expected_owner: u32,
 ) -> Result<(), GenerationLifetimeError> {
     let generations_reopened = open_absolute_directory_tree_nofollow(
         &managed.generations_directory,
         "re-open managed generations directory",
     )?;
-    let generations_after = snapshot_file(
+    let root_snapshot_after = snapshot_file(
         &generations_reopened,
         "re-inspect managed generations directory",
     )?;
-    validate_directory_snapshot(generations_after, expected_owner, 0o700, None)?;
-    if generations_before.identity != generations_after.identity {
+    validate_directory_snapshot(root_snapshot_after, expected_owner, 0o700, None)?;
+    if root_snapshot_before.identity != root_snapshot_after.identity {
         return Err(GenerationLifetimeError::InvalidAuthority {
             reason: "the named generations directory was rebound after it was pinned",
         });
     }
 
     let generation_named = snapshot_named(
-        generations,
+        root_directory,
         Path::new(&managed.generation_id),
         "re-inspect named generation directory",
     )?;
-    let generation_after = snapshot_file(generation, "re-inspect pinned generation directory")?;
+    let selected_snapshot_after =
+        snapshot_file(selected_directory, "re-inspect pinned generation directory")?;
     validate_directory_snapshot(
-        generation_after,
+        selected_snapshot_after,
         expected_owner,
         0o500,
-        Some(generations_before.identity.device),
+        Some(root_snapshot_before.identity.device),
     )?;
-    if generation_before.identity != generation_after.identity
-        || generation_before.identity != generation_named.identity
-        || generation_after != generation_named
+    if selected_snapshot_before.identity != selected_snapshot_after.identity
+        || selected_snapshot_before.identity != generation_named.identity
+        || selected_snapshot_after != generation_named
     {
         return Err(GenerationLifetimeError::InvalidAuthority {
             reason: "the named generation directory was rebound after it was pinned",
@@ -579,28 +580,28 @@ fn acquire_linux_managed_generation_lifetime(
         &managed.generations_directory,
         "open managed generations directory",
     )?;
-    let generations_before = snapshot_file(&generations, "inspect managed generations directory")?;
-    validate_directory_snapshot(generations_before, effective_uid, 0o700, None)?;
+    let root_snapshot = snapshot_file(&generations, "inspect managed generations directory")?;
+    validate_directory_snapshot(root_snapshot, effective_uid, 0o700, None)?;
 
     let generation = open_directory_at_nofollow(
         &generations,
         Path::new(&managed.generation_id),
         "open managed generation directory",
     )?;
-    let generation_before = snapshot_file(&generation, "inspect managed generation directory")?;
+    let selected_snapshot = snapshot_file(&generation, "inspect managed generation directory")?;
     validate_directory_snapshot(
-        generation_before,
+        selected_snapshot,
         effective_uid,
         0o500,
-        Some(generations_before.identity.device),
+        Some(root_snapshot.identity.device),
     )?;
 
     revalidate_directory_bindings(
         &managed,
         &generations,
-        generations_before,
+        root_snapshot,
         &generation,
-        generation_before,
+        selected_snapshot,
         effective_uid,
     )?;
 
@@ -624,7 +625,7 @@ fn acquire_linux_managed_generation_lifetime(
     validate_lease_snapshot(
         lease_before,
         effective_uid,
-        generation_before.identity.device,
+        selected_snapshot.identity.device,
     )?;
     require_same_named_object(
         lease_before,
@@ -641,7 +642,7 @@ fn acquire_linux_managed_generation_lifetime(
     validate_executable_snapshot(
         executable_before,
         effective_uid,
-        generation_before.identity.device,
+        selected_snapshot.identity.device,
         current_executable_identity,
     )?;
     require_same_named_object(
@@ -666,9 +667,9 @@ fn acquire_linux_managed_generation_lifetime(
     revalidate_directory_bindings(
         &managed,
         &generations,
-        generations_before,
+        root_snapshot,
         &generation,
-        generation_before,
+        selected_snapshot,
         effective_uid,
     )?;
 
@@ -681,7 +682,7 @@ fn acquire_linux_managed_generation_lifetime(
     validate_lease_snapshot(
         lease_after,
         effective_uid,
-        generation_before.identity.device,
+        selected_snapshot.identity.device,
     )?;
     require_same_named_object(
         lease_before,
@@ -703,7 +704,7 @@ fn acquire_linux_managed_generation_lifetime(
     validate_executable_snapshot(
         executable_after,
         effective_uid,
-        generation_before.identity.device,
+        selected_snapshot.identity.device,
         current_executable_identity,
     )?;
     require_same_named_object(
@@ -719,8 +720,8 @@ fn acquire_linux_managed_generation_lifetime(
 
     let metadata = ManagedGenerationLifetimeMetadata {
         generation_id: managed.generation_id,
-        generations_directory: generations_before.identity,
-        generation_directory: generation_before.identity,
+        generations_directory: root_snapshot.identity,
+        generation_directory: selected_snapshot.identity,
         lifetime_lease: lease_after.identity,
         executable: executable_after.identity,
     };
