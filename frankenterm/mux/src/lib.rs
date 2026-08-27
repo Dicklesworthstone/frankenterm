@@ -71,6 +71,7 @@ use crate::guardian_output_journal::{
     GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalTail,
     GuardianOutputPredecessor, GuardianOutputRecoveryBatch, GuardianOutputRecoveryLimits,
 };
+use crate::guardian_protocol::GuardianCheckpointReceipt;
 use crate::pane::{CachePolicy, CloseReason, GuardianLiveOutputReader, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, SplitRequest, Tab, TabId};
@@ -1924,6 +1925,37 @@ struct PaneRetirementCompletion {
 }
 
 const LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+const GUARDIAN_LIVE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+const GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug)]
+struct GuardianLiveCheckpointSchedule {
+    next_attempt: Instant,
+}
+
+impl GuardianLiveCheckpointSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_attempt: now
+                .checked_add(GUARDIAN_LIVE_CHECKPOINT_INTERVAL)
+                .unwrap_or(now),
+        }
+    }
+
+    fn is_due(self, now: Instant) -> bool {
+        now >= self.next_attempt
+    }
+
+    fn record_outcome(&mut self, now: Instant, committed: bool) {
+        let delay = if committed {
+            GUARDIAN_LIVE_CHECKPOINT_INTERVAL
+        } else {
+            GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL
+        };
+        self.next_attempt = now.checked_add(delay).unwrap_or(now);
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum LiveParserCheckpointError {
@@ -4391,6 +4423,26 @@ mod pane_registration_handle {
                 }
             }
             result
+        }
+
+        /// Capture and durably publish one guardian checkpoint while this
+        /// exact pane operation lease remains held.
+        ///
+        /// The publisher consumes the non-cloneable parser acknowledgement
+        /// and must reconcile Stage, mutation-sequenced catalog adoption, and
+        /// durable Ack before returning. A transport error never authorizes
+        /// the caller to advance or retire the lease.
+        pub fn capture_and_publish_guardian_checkpoint(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            output: GuardianOutputAppendReceipt,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+        ) -> anyhow::Result<GuardianCheckpointReceipt> {
+            let capture = self
+                .capture_live_parser_checkpoint(segment, output, limits, timeout)
+                .map_err(anyhow::Error::new)?;
+            self.pane.publish_guardian_checkpoint(capture)
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -10141,6 +10193,35 @@ fn schedule_pane_reader_eof(
     }
 }
 
+fn publish_guardian_checkpoint_after_typed_delivery(
+    pane: &Weak<dyn Pane>,
+    generation: &Arc<PaneRegistrationGeneration>,
+    pane_id: PaneId,
+    segment: GuardianOutputSegmentIdentity,
+    output: GuardianOutputAppendReceipt,
+) -> anyhow::Result<GuardianCheckpointReceipt> {
+    let _generation_lease = generation
+        .try_acquire()
+        .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+    let expected_pane = pane
+        .upgrade()
+        .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+    let mux = resolve_pane_reader_mux(&expected_pane, generation)
+        .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+    let operation = mux
+        .capture_pane_operation(pane_id)
+        .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+    if operation.wire_identity() != generation.wire_identity {
+        return Err(LiveParserCheckpointError::StaleRegistration.into());
+    }
+    operation.capture_and_publish_guardian_checkpoint(
+        segment,
+        output,
+        TerminalCheckpointLimits::default(),
+        GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
+    )
+}
+
 /// This function is run in a separate thread; its purpose is to perform
 /// blocking reads from the pty (non-blocking reads are not portable to
 /// all platforms and pty/tty types), parse the escape sequences and
@@ -10158,8 +10239,10 @@ fn read_from_guardian_live_output(
         Some(pane) => (pane.pane_id(), pane.exit_behavior()),
         None => return,
     };
+    let mut checkpoint_schedule = GuardianLiveCheckpointSchedule::new(Instant::now());
 
     while !dead.load(Ordering::Acquire) {
+        let mut delivered_boundary = None;
         let result = reader.deliver_next_record(&mut |segment, output, payload| {
             let _generation_lease = generation.try_acquire().ok_or_else(|| {
                 std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
@@ -10198,15 +10281,62 @@ fn read_from_guardian_live_output(
             }
             generation
                 .live_parser_checkpoint
-                .write_delivered_bytes(payload.as_ref())
+                .write_delivered_bytes(payload.as_ref())?;
+            delivered_boundary = Some((segment, output));
+            Ok(())
         });
-        if let Err(error) = result {
-            log::error!(
-                "guardian record delivery failed before replay acknowledgement: pane {} {:?}",
+        let delivery = match result {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                log::error!(
+                    "guardian record delivery failed before replay acknowledgement: pane {} {:?}",
+                    pane_id,
+                    error
+                );
+                break;
+            }
+        };
+        let now = Instant::now();
+        if checkpoint_schedule.is_due(now) && delivery.has_durable_replay_page_ack() {
+            let Some((segment, output)) = delivered_boundary else {
+                log::error!(
+                    "guardian record reader returned success without one typed delivery: pane {}",
+                    pane_id
+                );
+                break;
+            };
+            let started_at = Instant::now();
+            match publish_guardian_checkpoint_after_typed_delivery(
+                &pane,
+                &generation,
                 pane_id,
-                error
-            );
-            break;
+                segment,
+                output,
+            ) {
+                Ok(_) => {
+                    metrics::counter!(
+                        "mux.guardian_checkpoint.publication_total",
+                        "outcome" => "committed"
+                    )
+                    .increment(1);
+                    metrics::histogram!("mux.guardian_checkpoint.publication_seconds")
+                        .record(started_at.elapsed().as_secs_f64());
+                    checkpoint_schedule.record_outcome(Instant::now(), true);
+                }
+                Err(error) => {
+                    metrics::counter!(
+                        "mux.guardian_checkpoint.publication_total",
+                        "outcome" => "retryable_failure"
+                    )
+                    .increment(1);
+                    log::error!(
+                        "guardian checkpoint publication failed after replay acknowledgement; retained publication state will reconcile before the next capture: pane {} {:?}",
+                        pane_id,
+                        error
+                    );
+                    checkpoint_schedule.record_outcome(Instant::now(), false);
+                }
+            }
         }
     }
 
@@ -20216,6 +20346,24 @@ mod tests {
         crate::MUX_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn guardian_live_checkpoint_schedule_uses_bounded_success_and_failure_cadence() {
+        let start = Instant::now();
+        let mut schedule = GuardianLiveCheckpointSchedule::new(start);
+        assert!(!schedule.is_due(start));
+        let first_attempt = start + GUARDIAN_LIVE_CHECKPOINT_INTERVAL;
+        assert!(schedule.is_due(first_attempt));
+
+        schedule.record_outcome(first_attempt, false);
+        assert!(!schedule.is_due(first_attempt));
+        let retry = first_attempt + GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL;
+        assert!(schedule.is_due(retry));
+
+        schedule.record_outcome(retry, true);
+        assert!(!schedule.is_due(retry));
+        assert!(schedule.is_due(retry + GUARDIAN_LIVE_CHECKPOINT_INTERVAL));
     }
 
     #[derive(Debug, Eq, PartialEq)]

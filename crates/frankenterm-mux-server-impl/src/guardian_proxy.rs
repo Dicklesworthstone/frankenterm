@@ -10,18 +10,23 @@
 
 use frankenterm_pty_guardian::{GuardianClient, GuardianClientError};
 use mux::domain::DomainId;
+use mux::guardian_checkpoint::LiveParserCheckpointAck;
 use mux::guardian_protocol::{
     GUARDIAN_MAX_INPUT_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
     GUARDIAN_MAX_REPLAY_RECORDS, GUARDIAN_MAX_REPLAY_WAIT_MILLIS, GuardianCensusEntry,
-    GuardianCensusPaneStatus, GuardianCheckpointDescriptorV1, GuardianCheckpointIdentityDigest,
-    GuardianCheckpointOutputBoundaryV1, GuardianInputEffectQuery, GuardianProtocolError,
+    GuardianCensusPaneStatus, GuardianCheckpointDescriptorV1, GuardianCheckpointDisposition,
+    GuardianCheckpointIdentityDigest, GuardianCheckpointIntent, GuardianCheckpointOutputBoundaryV1,
+    GuardianCheckpointReceipt, GuardianCheckpointScopeV1, GuardianCheckpointStageReplyV1,
+    GuardianCheckpointStageRequestV1, GuardianInputEffectQuery, GuardianProtocolError,
     GuardianRejectionCode, GuardianReplayAckReceiptV1, GuardianReplayAckV1, GuardianReplayCursorV1,
     GuardianReplayDeliveryError, GuardianReplayGapReasonV1, GuardianReplayPageBodyDelivery,
     GuardianReplayPageDelivery, GuardianReplayRecordDelivery, GuardianReplayRequestV1,
     GuardianReplaySelectorV1, GuardianReply, InputEffectState,
 };
 use mux::localpane::{GuardianPaneLeaseControl, GuardianPaneLeaseIdentity, LocalPane};
-use mux::pane::{GuardianLiveOutputReader, PaneId};
+use mux::pane::{
+    GuardianLiveCheckpointPublisher, GuardianLiveOutputDelivery, GuardianLiveOutputReader, PaneId,
+};
 use parking_lot::Mutex;
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use sha2::{Digest as _, Sha256};
@@ -47,6 +52,8 @@ const GUARDIAN_RESTORE_REOPEN_ATTEMPTS: usize = 2;
 const GUARDIAN_RESTORE_MAX_PAGES: usize = 65_536;
 const GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL: Duration = Duration::from_millis(1_000);
+const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 = 64 * 1_024;
+const GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS: usize = 2;
 
 /// Maximum age of one guardian-scoped census snapshot used by child facets.
 ///
@@ -105,6 +112,14 @@ pub enum GuardianProxyError {
     MutationOutcomeIndeterminate,
     #[error("guardian returned a reply inconsistent with the pending mutation")]
     UnexpectedMutationReply,
+    #[error("guardian checkpoint staging returned an inconsistent durable state")]
+    CheckpointStageInvariant,
+    #[error("guardian checkpoint staging was quarantined")]
+    CheckpointStageQuarantined,
+    #[error("guardian checkpoint staging expired before durable acknowledgement")]
+    CheckpointStageExpired,
+    #[error("guardian checkpoint staging exceeded a bounded resource")]
+    CheckpointStageCapacity,
     #[error("guardian input is accepted but its durable disposition is still pending")]
     InputDurabilityPending,
     #[error("guardian proved that the pending input wrote zero bytes")]
@@ -218,10 +233,19 @@ struct PendingGenericMutation {
     effect_id: Uuid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingCheckpointMutation {
+    sequence: u64,
+    request_id: Uuid,
+    effect_id: Uuid,
+    intent: GuardianCheckpointIntent,
+}
+
 #[derive(Clone, Debug)]
 enum PendingMutation {
     Input(PendingInput),
     Generic(PendingGenericMutation),
+    Checkpoint(PendingCheckpointMutation),
 }
 
 impl PendingMutation {
@@ -232,11 +256,16 @@ impl PendingMutation {
     fn matches_input(&self, payload: &[u8]) -> bool {
         matches!(self, Self::Input(pending) if pending.matches_payload(payload))
     }
+
+    fn matches_checkpoint(&self, intent: GuardianCheckpointIntent) -> bool {
+        matches!(self, Self::Checkpoint(pending) if pending.intent == intent)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveredPendingMutation {
     Generic,
+    Checkpoint(GuardianCheckpointReceipt),
     InputApplied {
         applied_bytes: u32,
         input_bytes: u32,
@@ -287,6 +316,17 @@ trait GuardianMutationTransport: Send {
         effect_id: Uuid,
         query: GuardianInputEffectQuery,
     ) -> Result<InputEffectState, GuardianMutationTransportError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint(
+        &mut self,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        request_id: Uuid,
+        effect_id: Uuid,
+        intent: GuardianCheckpointIntent,
+    ) -> Result<GuardianCheckpointReceipt, GuardianMutationTransportError>;
 
     fn resize(
         &mut self,
@@ -344,6 +384,32 @@ trait GuardianReplayTransport: Send {
         request_id: Uuid,
         ack: GuardianReplayAckV1,
     ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError>;
+}
+
+/// Independent checkpoint-stage channel for one exact guardian lease.
+///
+/// Staging may perform bounded disk I/O and lost-reply queries, so it must not
+/// borrow the mutation actor's framed client while ordinary input is active.
+trait GuardianCheckpointStageTransport: Send {
+    fn checkpoint_stage(
+        &mut self,
+        request_id: Uuid,
+        request: GuardianCheckpointStageRequestV1,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianProxyError>;
+}
+
+#[cfg(test)]
+struct DormantCheckpointStageTransport;
+
+#[cfg(test)]
+impl GuardianCheckpointStageTransport for DormantCheckpointStageTransport {
+    fn checkpoint_stage(
+        &mut self,
+        _request_id: Uuid,
+        _request: GuardianCheckpointStageRequestV1,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianProxyError> {
+        Err(GuardianProxyError::CheckpointStageInvariant)
+    }
 }
 
 /// One authenticated, bounded fleet census source.
@@ -578,6 +644,575 @@ struct GuardianReplayClientTransport {
     token_path: PathBuf,
     identity: GuardianPaneLeaseIdentity,
     client: Option<GuardianClient>,
+}
+
+struct GuardianCheckpointStageClientTransport {
+    socket_path: PathBuf,
+    token_path: PathBuf,
+    identity: GuardianPaneLeaseIdentity,
+    client: Option<GuardianClient>,
+}
+
+impl GuardianCheckpointStageClientTransport {
+    fn connect(
+        socket_path: &Path,
+        token_path: &Path,
+        identity: GuardianPaneLeaseIdentity,
+    ) -> Result<Self, GuardianProxyError> {
+        let mut transport = Self {
+            socket_path: socket_path.to_path_buf(),
+            token_path: token_path.to_path_buf(),
+            identity,
+            client: None,
+        };
+        transport.ensure_client()?;
+        Ok(transport)
+    }
+
+    fn ensure_client(&mut self) -> Result<&mut GuardianClient, GuardianProxyError> {
+        if self.client.is_none() {
+            let client = GuardianClient::connect(
+                &self.socket_path,
+                &self.token_path,
+                self.identity.mux_incarnation(),
+            )
+            .map_err(GuardianProxyError::Client)?;
+            if client.guardian_incarnation() != self.identity.guardian_incarnation() {
+                return Err(GuardianProxyError::GuardianIncarnationChanged);
+            }
+            self.client = Some(client);
+        }
+        self.client
+            .as_mut()
+            .ok_or(GuardianProxyError::GuardianIncarnationChanged)
+    }
+
+    fn call<T>(
+        &mut self,
+        operation: impl FnOnce(&mut GuardianClient) -> Result<T, GuardianClientError>,
+    ) -> Result<T, GuardianProxyError> {
+        let result = operation(self.ensure_client()?);
+        if matches!(&result, Err(GuardianClientError::Io(_))) {
+            self.client = None;
+        }
+        result.map_err(map_replay_client_error)
+    }
+}
+
+impl GuardianCheckpointStageTransport for GuardianCheckpointStageClientTransport {
+    fn checkpoint_stage(
+        &mut self,
+        request_id: Uuid,
+        request: GuardianCheckpointStageRequestV1,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianProxyError> {
+        self.call(|client| client.checkpoint_stage(request_id, request))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianCheckpointStageStatus {
+    Absent,
+    Progress(u32),
+    Sealed(Uuid),
+    Acked(Uuid),
+    Expired,
+    Quarantined,
+}
+
+struct PendingGuardianCheckpointPublication {
+    scope: GuardianCheckpointScopeV1,
+    upload_id: Uuid,
+    descriptor: GuardianCheckpointDescriptorV1,
+    chunk_bytes: u32,
+    total_chunks: u32,
+    terminal_payload: Zeroizing<Vec<u8>>,
+    begin_request_id: Uuid,
+    chunk_request_ids: Vec<Uuid>,
+    query_request_id: Uuid,
+    seal_request_id: Uuid,
+    ack_request_id: Uuid,
+    completion_id: Option<Uuid>,
+    adoption_receipt: Option<GuardianCheckpointReceipt>,
+}
+
+impl fmt::Debug for PendingGuardianCheckpointPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingGuardianCheckpointPublication")
+            .field("scope", &self.scope)
+            .field("upload_id", &self.upload_id)
+            .field("descriptor", &self.descriptor)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("total_chunks", &self.total_chunks)
+            .field("terminal_payload", &"[REDACTED]")
+            .field("completion_id", &self.completion_id)
+            .field("adoption_receipt", &self.adoption_receipt)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingGuardianCheckpointPublication {
+    fn from_live_capture(
+        identity: GuardianPaneLeaseIdentity,
+        capture: LiveParserCheckpointAck,
+    ) -> Result<Self, GuardianProxyError> {
+        if capture.durable_pane_id() != identity.pane_id() {
+            return Err(GuardianProxyError::LeaseIdentityMismatch);
+        }
+        let descriptor =
+            GuardianCheckpointDescriptorV1::from_live_capture(&capture, identity.generation())
+                .map_err(GuardianProxyError::ReplayProtocol)?;
+        let (_boundary, terminal) = capture.into_parts();
+        let terminal_payload = terminal.into_canonical_payload();
+        if u64::try_from(terminal_payload.len()) != Ok(descriptor.total_bytes()) {
+            return Err(GuardianProxyError::CheckpointStageInvariant);
+        }
+        let total_chunks_u64 = descriptor
+            .total_bytes()
+            .div_ceil(u64::from(GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES));
+        let total_chunks = u32::try_from(total_chunks_u64)
+            .map_err(|_| GuardianProxyError::CheckpointStageCapacity)?;
+        if total_chunks == 0 {
+            return Err(GuardianProxyError::CheckpointStageInvariant);
+        }
+        let total_chunks_usize = usize::try_from(total_chunks)
+            .map_err(|_| GuardianProxyError::CheckpointStageCapacity)?;
+        let mut chunk_request_ids = Vec::new();
+        chunk_request_ids
+            .try_reserve_exact(total_chunks_usize)
+            .map_err(|_| GuardianProxyError::CheckpointStageCapacity)?;
+        chunk_request_ids.extend((0..total_chunks).map(|_| Uuid::new_v4()));
+        Ok(Self {
+            scope: GuardianCheckpointScopeV1::Pane {
+                pane_id: identity.pane_id(),
+                generation: identity.generation(),
+            },
+            upload_id: Uuid::new_v4(),
+            descriptor,
+            chunk_bytes: GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
+            total_chunks,
+            terminal_payload,
+            begin_request_id: Uuid::new_v4(),
+            chunk_request_ids,
+            query_request_id: Uuid::new_v4(),
+            seal_request_id: Uuid::new_v4(),
+            ack_request_id: Uuid::new_v4(),
+            completion_id: None,
+            adoption_receipt: None,
+        })
+    }
+
+    fn classify_reply(
+        &self,
+        reply: GuardianCheckpointStageReplyV1,
+    ) -> Result<GuardianCheckpointStageStatus, GuardianProxyError> {
+        if reply.upload_id() != self.upload_id {
+            return Err(GuardianProxyError::CheckpointStageInvariant);
+        }
+        match reply {
+            GuardianCheckpointStageReplyV1::Absent { .. } => {
+                Ok(GuardianCheckpointStageStatus::Absent)
+            }
+            GuardianCheckpointStageReplyV1::Ready {
+                next_index,
+                committed_bytes,
+                ..
+            }
+            | GuardianCheckpointStageReplyV1::Progress {
+                next_index,
+                committed_bytes,
+                ..
+            } => {
+                if next_index > self.total_chunks {
+                    return Err(GuardianProxyError::CheckpointStageInvariant);
+                }
+                let expected_bytes = u64::from(next_index)
+                    .checked_mul(u64::from(self.chunk_bytes))
+                    .ok_or(GuardianProxyError::CheckpointStageCapacity)?
+                    .min(self.descriptor.total_bytes());
+                if committed_bytes != expected_bytes {
+                    return Err(GuardianProxyError::CheckpointStageInvariant);
+                }
+                Ok(GuardianCheckpointStageStatus::Progress(next_index))
+            }
+            GuardianCheckpointStageReplyV1::Sealed {
+                completion_id,
+                checkpoint_id,
+                boundary_id,
+                total_bytes,
+                ..
+            }
+            | GuardianCheckpointStageReplyV1::Acked {
+                completion_id,
+                checkpoint_id,
+                boundary_id,
+                total_bytes,
+                ..
+            } => {
+                if checkpoint_id != self.descriptor.checkpoint_id()
+                    || boundary_id != self.descriptor.boundary_id()
+                    || total_bytes != self.descriptor.total_bytes()
+                {
+                    return Err(GuardianProxyError::CheckpointStageInvariant);
+                }
+                if matches!(reply, GuardianCheckpointStageReplyV1::Sealed { .. }) {
+                    Ok(GuardianCheckpointStageStatus::Sealed(completion_id))
+                } else {
+                    Ok(GuardianCheckpointStageStatus::Acked(completion_id))
+                }
+            }
+            GuardianCheckpointStageReplyV1::Expired {
+                checkpoint_id,
+                boundary_id,
+                total_bytes,
+                ..
+            } => {
+                if checkpoint_id != self.descriptor.checkpoint_id()
+                    || boundary_id != self.descriptor.boundary_id()
+                    || total_bytes != self.descriptor.total_bytes()
+                {
+                    return Err(GuardianProxyError::CheckpointStageInvariant);
+                }
+                Ok(GuardianCheckpointStageStatus::Expired)
+            }
+            GuardianCheckpointStageReplyV1::Quarantined { .. } => {
+                Ok(GuardianCheckpointStageStatus::Quarantined)
+            }
+        }
+    }
+
+    fn query(
+        &self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+    ) -> Result<GuardianCheckpointStageStatus, GuardianProxyError> {
+        let mut last_error = None;
+        for _ in 0..GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS {
+            let request = GuardianCheckpointStageRequestV1::query(
+                self.scope,
+                self.upload_id,
+                self.descriptor,
+                self.chunk_bytes,
+            )
+            .map_err(GuardianProxyError::ReplayProtocol)?;
+            match transport.checkpoint_stage(self.query_request_id, request) {
+                Ok(reply) => return self.classify_reply(reply),
+                Err(error) if replay_error_is_retryable_io(&error) => last_error = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or(GuardianProxyError::CheckpointStageInvariant))
+    }
+
+    fn classify_exchange(
+        &self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+        result: Result<GuardianCheckpointStageReplyV1, GuardianProxyError>,
+    ) -> Result<GuardianCheckpointStageStatus, GuardianProxyError> {
+        match result {
+            Ok(reply) => self.classify_reply(reply),
+            Err(error) if replay_error_is_retryable_io(&error) => self.query(transport),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn send_begin(
+        &self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+    ) -> Result<GuardianCheckpointStageStatus, GuardianProxyError> {
+        let request = GuardianCheckpointStageRequestV1::begin(
+            self.scope,
+            self.upload_id,
+            self.descriptor,
+            self.chunk_bytes,
+        )
+        .map_err(GuardianProxyError::ReplayProtocol)?;
+        let result = transport.checkpoint_stage(self.begin_request_id, request);
+        self.classify_exchange(transport, result)
+    }
+
+    fn send_chunk(
+        &self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+        index: u32,
+    ) -> Result<GuardianCheckpointStageStatus, GuardianProxyError> {
+        let start_u64 = u64::from(index)
+            .checked_mul(u64::from(self.chunk_bytes))
+            .ok_or(GuardianProxyError::CheckpointStageCapacity)?;
+        let end_u64 = start_u64
+            .checked_add(u64::from(self.chunk_bytes))
+            .ok_or(GuardianProxyError::CheckpointStageCapacity)?
+            .min(self.descriptor.total_bytes());
+        let start =
+            usize::try_from(start_u64).map_err(|_| GuardianProxyError::CheckpointStageCapacity)?;
+        let end =
+            usize::try_from(end_u64).map_err(|_| GuardianProxyError::CheckpointStageCapacity)?;
+        let request_id = *self
+            .chunk_request_ids
+            .get(usize::try_from(index).map_err(|_| GuardianProxyError::CheckpointStageCapacity)?)
+            .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes
+            .try_reserve_exact(end.saturating_sub(start))
+            .map_err(|_| GuardianProxyError::CheckpointStageCapacity)?;
+        bytes.extend_from_slice(
+            self.terminal_payload
+                .get(start..end)
+                .ok_or(GuardianProxyError::CheckpointStageInvariant)?,
+        );
+        let request = GuardianCheckpointStageRequestV1::chunk(
+            self.scope,
+            self.upload_id,
+            self.descriptor,
+            self.chunk_bytes,
+            index,
+            bytes,
+        )
+        .map_err(GuardianProxyError::ReplayProtocol)?;
+        let result = transport.checkpoint_stage(request_id, request);
+        self.classify_exchange(transport, result)
+    }
+
+    fn send_seal(
+        &self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+    ) -> Result<GuardianCheckpointStageStatus, GuardianProxyError> {
+        let request = GuardianCheckpointStageRequestV1::seal(
+            self.scope,
+            self.upload_id,
+            self.descriptor,
+            self.chunk_bytes,
+        )
+        .map_err(GuardianProxyError::ReplayProtocol)?;
+        let result = transport.checkpoint_stage(self.seal_request_id, request);
+        self.classify_exchange(transport, result)
+    }
+
+    fn send_ack(
+        &self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+        completion_id: Uuid,
+    ) -> Result<GuardianCheckpointStageStatus, GuardianProxyError> {
+        let request = GuardianCheckpointStageRequestV1::ack(
+            self.scope,
+            self.upload_id,
+            self.descriptor,
+            self.chunk_bytes,
+            completion_id,
+        )
+        .map_err(GuardianProxyError::ReplayProtocol)?;
+        let result = transport.checkpoint_stage(self.ack_request_id, request);
+        self.classify_exchange(transport, result)
+    }
+
+    fn drive_to_sealed(
+        &mut self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+    ) -> Result<Uuid, GuardianProxyError> {
+        let mut status = self.query(transport)?;
+        let max_steps = usize::try_from(self.total_chunks)
+            .map_err(|_| GuardianProxyError::CheckpointStageCapacity)?
+            .checked_mul(2)
+            .and_then(|steps| steps.checked_add(8))
+            .ok_or(GuardianProxyError::CheckpointStageCapacity)?;
+        for _ in 0..max_steps {
+            status = match status {
+                GuardianCheckpointStageStatus::Absent => self.send_begin(transport)?,
+                GuardianCheckpointStageStatus::Progress(next_index)
+                    if next_index < self.total_chunks =>
+                {
+                    self.send_chunk(transport, next_index)?
+                }
+                GuardianCheckpointStageStatus::Progress(next_index)
+                    if next_index == self.total_chunks =>
+                {
+                    self.send_seal(transport)?
+                }
+                GuardianCheckpointStageStatus::Sealed(completion_id) => {
+                    if self
+                        .completion_id
+                        .is_some_and(|prior| prior != completion_id)
+                    {
+                        return Err(GuardianProxyError::CheckpointStageInvariant);
+                    }
+                    self.completion_id = Some(completion_id);
+                    return Ok(completion_id);
+                }
+                GuardianCheckpointStageStatus::Acked(completion_id) => {
+                    if self.adoption_receipt.is_none()
+                        || self
+                            .completion_id
+                            .is_some_and(|prior| prior != completion_id)
+                    {
+                        return Err(GuardianProxyError::CheckpointStageInvariant);
+                    }
+                    self.completion_id = Some(completion_id);
+                    return Ok(completion_id);
+                }
+                GuardianCheckpointStageStatus::Expired => {
+                    return Err(GuardianProxyError::CheckpointStageExpired);
+                }
+                GuardianCheckpointStageStatus::Quarantined => {
+                    return Err(GuardianProxyError::CheckpointStageQuarantined);
+                }
+                GuardianCheckpointStageStatus::Progress(_) => {
+                    return Err(GuardianProxyError::CheckpointStageInvariant);
+                }
+            };
+        }
+        Err(GuardianProxyError::CheckpointStageInvariant)
+    }
+
+    fn drive_ack(
+        &self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+        completion_id: Uuid,
+    ) -> Result<(), GuardianProxyError> {
+        let mut status = self.send_ack(transport, completion_id)?;
+        for _ in 0..GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS {
+            match status {
+                GuardianCheckpointStageStatus::Acked(observed) if observed == completion_id => {
+                    return Ok(());
+                }
+                GuardianCheckpointStageStatus::Sealed(observed) if observed == completion_id => {
+                    status = self.send_ack(transport, completion_id)?;
+                }
+                GuardianCheckpointStageStatus::Expired => {
+                    return Err(GuardianProxyError::CheckpointStageExpired);
+                }
+                GuardianCheckpointStageStatus::Quarantined => {
+                    return Err(GuardianProxyError::CheckpointStageQuarantined);
+                }
+                GuardianCheckpointStageStatus::Absent
+                | GuardianCheckpointStageStatus::Progress(_)
+                | GuardianCheckpointStageStatus::Sealed(_)
+                | GuardianCheckpointStageStatus::Acked(_) => {
+                    return Err(GuardianProxyError::CheckpointStageInvariant);
+                }
+            }
+        }
+        Err(GuardianProxyError::CheckpointStageInvariant)
+    }
+
+    fn intent(&self) -> GuardianCheckpointIntent {
+        GuardianCheckpointIntent::new(
+            self.descriptor.checkpoint_id(),
+            self.descriptor.boundary_id(),
+        )
+    }
+}
+
+struct GuardianCheckpointPublisherState {
+    transport: Box<dyn GuardianCheckpointStageTransport>,
+    pending: Option<PendingGuardianCheckpointPublication>,
+}
+
+/// Serialized mux-side checkpoint publisher for one exact guardian lease.
+///
+/// A pending publication retains every request identity and the zeroizing
+/// canonical terminal payload until Stage, mutation-sequenced adoption, and
+/// durable Ack all reconcile. Dropping a reply can therefore never mint a new
+/// upload or silently advance the actor's mutation sequence.
+pub struct GuardianCheckpointPublisher {
+    identity: GuardianPaneLeaseIdentity,
+    actor: SharedGuardianPaneLeaseActor,
+    state: Mutex<GuardianCheckpointPublisherState>,
+}
+
+impl fmt::Debug for GuardianCheckpointPublisher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointPublisher")
+            .field("identity", &self.identity)
+            .field(
+                "has_pending_publication",
+                &self.state.lock().pending.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianCheckpointPublisher {
+    fn connect(
+        socket_path: &Path,
+        token_path: &Path,
+        identity: GuardianPaneLeaseIdentity,
+        actor: SharedGuardianPaneLeaseActor,
+    ) -> Result<Self, GuardianProxyError> {
+        if actor.lock().identity() != identity {
+            return Err(GuardianProxyError::LeaseIdentityMismatch);
+        }
+        let transport =
+            GuardianCheckpointStageClientTransport::connect(socket_path, token_path, identity)?;
+        Ok(Self::with_transport(identity, actor, Box::new(transport)))
+    }
+
+    fn with_transport(
+        identity: GuardianPaneLeaseIdentity,
+        actor: SharedGuardianPaneLeaseActor,
+        transport: Box<dyn GuardianCheckpointStageTransport>,
+    ) -> Self {
+        Self {
+            identity,
+            actor,
+            state: Mutex::new(GuardianCheckpointPublisherState {
+                transport,
+                pending: None,
+            }),
+        }
+    }
+
+    fn drive_pending(
+        actor: &SharedGuardianPaneLeaseActor,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+        pending: &mut PendingGuardianCheckpointPublication,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProxyError> {
+        let completion_id = pending.drive_to_sealed(transport)?;
+        let adoption_receipt = if let Some(receipt) = pending.adoption_receipt {
+            receipt
+        } else {
+            let receipt = actor.lock().publish_checkpoint(pending.intent())?;
+            pending.adoption_receipt = Some(receipt);
+            receipt
+        };
+        pending.drive_ack(transport, completion_id)?;
+        Ok(adoption_receipt)
+    }
+
+    /// Publish one exact live-parser capture through Stage, catalog adoption,
+    /// and durable Ack. Any earlier ambiguous publication is reconciled first.
+    pub fn publish(
+        &self,
+        capture: LiveParserCheckpointAck,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProxyError> {
+        let mut state = self.state.lock();
+        if state.pending.is_some() {
+            let GuardianCheckpointPublisherState { transport, pending } = &mut *state;
+            let existing = pending
+                .as_mut()
+                .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
+            Self::drive_pending(&self.actor, transport.as_mut(), existing)?;
+            *pending = None;
+        }
+        let pending =
+            PendingGuardianCheckpointPublication::from_live_capture(self.identity, capture)?;
+        state.pending = Some(pending);
+        let GuardianCheckpointPublisherState { transport, pending } = &mut *state;
+        let current = pending
+            .as_mut()
+            .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
+        let receipt = Self::drive_pending(&self.actor, transport.as_mut(), current)?;
+        *pending = None;
+        Ok(receipt)
+    }
+}
+
+impl GuardianLiveCheckpointPublisher for GuardianCheckpointPublisher {
+    fn publish_checkpoint(
+        &self,
+        capture: LiveParserCheckpointAck,
+    ) -> anyhow::Result<GuardianCheckpointReceipt> {
+        self.publish(capture).map_err(anyhow::Error::new)
+    }
 }
 
 impl GuardianReplayClientTransport {
@@ -847,6 +1482,20 @@ impl GuardianMutationTransport for GuardianClientTransport {
     ) -> Result<InputEffectState, GuardianMutationTransportError> {
         self.call(|client| {
             client.query_input_effect(pane_id, generation, request_id, effect_id, query)
+        })
+    }
+
+    fn checkpoint(
+        &mut self,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        request_id: Uuid,
+        effect_id: Uuid,
+        intent: GuardianCheckpointIntent,
+    ) -> Result<GuardianCheckpointReceipt, GuardianMutationTransportError> {
+        self.call(|client| {
+            client.checkpoint(pane_id, generation, sequence, request_id, effect_id, intent)
         })
     }
 
@@ -1204,6 +1853,23 @@ impl GuardianPaneLeaseActor {
         Ok(())
     }
 
+    fn begin_checkpoint(
+        &mut self,
+        intent: GuardianCheckpointIntent,
+    ) -> Result<(), GuardianProxyError> {
+        self.ensure_attached()?;
+        if self.pending.is_some() {
+            return Err(GuardianProxyError::UnexpectedMutationReply);
+        }
+        self.pending = Some(PendingMutation::Checkpoint(PendingCheckpointMutation {
+            sequence: self.next_sequence,
+            request_id: Uuid::new_v4(),
+            effect_id: Uuid::new_v4(),
+            intent,
+        }));
+        Ok(())
+    }
+
     fn retry_pending(
         &mut self,
         input_payload: Option<&[u8]>,
@@ -1211,7 +1877,52 @@ impl GuardianPaneLeaseActor {
         match self.pending.clone() {
             Some(PendingMutation::Input(pending)) => self.retry_input(pending, input_payload),
             Some(PendingMutation::Generic(pending)) => self.retry_generic(pending),
+            Some(PendingMutation::Checkpoint(pending)) => self.retry_checkpoint(pending),
             None => Err(GuardianProxyError::UnexpectedMutationReply),
+        }
+    }
+
+    fn retry_checkpoint(
+        &mut self,
+        pending: PendingCheckpointMutation,
+    ) -> Result<RecoveredPendingMutation, GuardianProxyError> {
+        let result = self.transport.checkpoint(
+            self.identity.pane_id(),
+            self.identity.generation(),
+            pending.sequence,
+            pending.request_id,
+            pending.effect_id,
+            pending.intent,
+        );
+        match result {
+            Ok(receipt)
+                if receipt.pane_id() == self.identity.pane_id()
+                    && receipt.generation() == self.identity.generation()
+                    && receipt.sequence() == pending.sequence
+                    && receipt.effect_id() == pending.effect_id
+                    && receipt.intent() == pending.intent
+                    && receipt.disposition() == GuardianCheckpointDisposition::Committed =>
+            {
+                self.complete_sequence(pending.sequence)?;
+                Ok(RecoveredPendingMutation::Checkpoint(receipt))
+            }
+            Ok(receipt)
+                if receipt.pane_id() == self.identity.pane_id()
+                    && receipt.generation() == self.identity.generation()
+                    && receipt.sequence() == pending.sequence
+                    && receipt.effect_id() == pending.effect_id
+                    && receipt.intent() == pending.intent
+                    && receipt.disposition()
+                        == GuardianCheckpointDisposition::OutcomeIndeterminate =>
+            {
+                self.disposition = GuardianLeaseDisposition::Quarantined;
+                Err(GuardianProxyError::MutationOutcomeIndeterminate)
+            }
+            Ok(_) => {
+                self.disposition = GuardianLeaseDisposition::Quarantined;
+                Err(GuardianProxyError::UnexpectedMutationReply)
+            }
+            Err(error) => Err(self.transport_failure(error)),
         }
     }
 
@@ -1232,7 +1943,7 @@ impl GuardianPaneLeaseActor {
             Some(PendingMutation::Input(current)) => *current
                 .recovery_query_request_id
                 .get_or_insert_with(Uuid::new_v4),
-            Some(PendingMutation::Generic(_)) | None => {
+            Some(PendingMutation::Generic(_) | PendingMutation::Checkpoint(_)) | None => {
                 self.disposition = GuardianLeaseDisposition::Quarantined;
                 return Err(GuardianProxyError::UnexpectedMutationReply);
             }
@@ -1313,7 +2024,12 @@ impl GuardianPaneLeaseActor {
             Some(PendingMutation::Input(current)) if current.sequence == pending.sequence => {
                 current.submitted = true;
             }
-            Some(PendingMutation::Input(_) | PendingMutation::Generic(_)) | None => {
+            Some(
+                PendingMutation::Input(_)
+                | PendingMutation::Generic(_)
+                | PendingMutation::Checkpoint(_),
+            )
+            | None => {
                 self.disposition = GuardianLeaseDisposition::Quarantined;
                 return Err(GuardianProxyError::UnexpectedMutationReply);
             }
@@ -1537,6 +2253,7 @@ impl GuardianPaneLeaseActor {
                 }
                 Some(
                     RecoveredPendingMutation::Generic
+                    | RecoveredPendingMutation::Checkpoint(_)
                     | RecoveredPendingMutation::InputApplied { .. }
                     | RecoveredPendingMutation::InputKnownNotApplied,
                 )
@@ -1552,7 +2269,7 @@ impl GuardianPaneLeaseActor {
             RecoveredPendingMutation::InputKnownNotApplied => {
                 Err(GuardianProxyError::InputKnownNotApplied)
             }
-            RecoveredPendingMutation::Generic => {
+            RecoveredPendingMutation::Generic | RecoveredPendingMutation::Checkpoint(_) => {
                 self.disposition = GuardianLeaseDisposition::Quarantined;
                 Err(GuardianProxyError::UnexpectedMutationReply)
             }
@@ -1565,7 +2282,7 @@ impl GuardianPaneLeaseActor {
             return Ok(());
         };
         match recovered {
-            RecoveredPendingMutation::Generic => Ok(()),
+            RecoveredPendingMutation::Generic | RecoveredPendingMutation::Checkpoint(_) => Ok(()),
             RecoveredPendingMutation::InputApplied {
                 applied_bytes,
                 input_bytes,
@@ -1612,6 +2329,7 @@ impl GuardianPaneLeaseActor {
                 }
                 Some(
                     RecoveredPendingMutation::Generic
+                    | RecoveredPendingMutation::Checkpoint(_)
                     | RecoveredPendingMutation::InputApplied { .. }
                     | RecoveredPendingMutation::InputKnownNotApplied,
                 )
@@ -1621,7 +2339,52 @@ impl GuardianPaneLeaseActor {
         self.begin_generic(kind)?;
         match self.retry_pending(None)? {
             RecoveredPendingMutation::Generic => Ok(()),
-            RecoveredPendingMutation::InputApplied { .. }
+            RecoveredPendingMutation::Checkpoint(_)
+            | RecoveredPendingMutation::InputApplied { .. }
+            | RecoveredPendingMutation::InputKnownNotApplied => {
+                self.disposition = GuardianLeaseDisposition::Quarantined;
+                Err(GuardianProxyError::UnexpectedMutationReply)
+            }
+        }
+    }
+
+    fn publish_checkpoint(
+        &mut self,
+        intent: GuardianCheckpointIntent,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProxyError> {
+        if self.pending.is_some() {
+            let same_checkpoint = self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.matches_checkpoint(intent));
+            let recovered = self.reconcile_before_new_operation(None)?;
+            match recovered {
+                Some(RecoveredPendingMutation::Checkpoint(receipt)) if same_checkpoint => {
+                    return Ok(receipt);
+                }
+                Some(RecoveredPendingMutation::InputApplied {
+                    applied_bytes,
+                    input_bytes,
+                }) if applied_bytes != input_bytes => {
+                    return Err(GuardianProxyError::PreviousInputPartiallyApplied {
+                        applied_bytes,
+                        input_bytes,
+                    });
+                }
+                Some(
+                    RecoveredPendingMutation::Generic
+                    | RecoveredPendingMutation::Checkpoint(_)
+                    | RecoveredPendingMutation::InputApplied { .. }
+                    | RecoveredPendingMutation::InputKnownNotApplied,
+                )
+                | None => {}
+            }
+        }
+        self.begin_checkpoint(intent)?;
+        match self.retry_pending(None)? {
+            RecoveredPendingMutation::Checkpoint(receipt) => Ok(receipt),
+            RecoveredPendingMutation::Generic
+            | RecoveredPendingMutation::InputApplied { .. }
             | RecoveredPendingMutation::InputKnownNotApplied => {
                 self.disposition = GuardianLeaseDisposition::Quarantined;
                 Err(GuardianProxyError::UnexpectedMutationReply)
@@ -2705,7 +3468,7 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
             mux::guardian_output_journal::GuardianOutputAppendReceipt,
             Arc<[u8]>,
         ) -> io::Result<()>,
-    ) -> io::Result<()> {
+    ) -> io::Result<GuardianLiveOutputDelivery> {
         if self.delivery_failed {
             return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
                 "guardian replay reader is terminal after a failed record delivery",
@@ -2750,7 +3513,8 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
                     }
                 };
                 self.boundary = candidate;
-                if self.records.is_empty() {
+                let completed_replay_page = self.records.is_empty();
+                if completed_replay_page {
                     if self.pending_boundary != Some(candidate) {
                         self.delivery_failed = true;
                         return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
@@ -2759,7 +3523,11 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
                     }
                     self.finish_delivered_page().map_err(io::Error::from)?;
                 }
-                return Ok(());
+                return Ok(if completed_replay_page {
+                    GuardianLiveOutputDelivery::replay_page_acknowledged()
+                } else {
+                    GuardianLiveOutputDelivery::buffered_within_replay_page()
+                });
             }
             self.finish_delivered_page().map_err(io::Error::from)?;
             if let Some(error) = self.pending_terminal_error.take() {
@@ -2859,6 +3627,7 @@ pub struct GuardianProxyStaging {
     census: Arc<GuardianCensusCoordinator>,
     reader_slot: Arc<GuardianReplayReaderSlot>,
     replay_transport: Option<Box<dyn GuardianReplayTransport>>,
+    checkpoint_publisher: Option<Arc<GuardianCheckpointPublisher>>,
     lease_rollback: GuardianClaimedLeaseRollback,
 }
 
@@ -2876,6 +3645,10 @@ impl fmt::Debug for GuardianProxyStaging {
             .field("census_mux", &self.census.mux_incarnation())
             .field("reader_state", &self.reader_slot.state.lock())
             .field("has_replay_transport", &self.replay_transport.is_some())
+            .field(
+                "has_checkpoint_publisher",
+                &self.checkpoint_publisher.is_some(),
+            )
             .field("lease_rollback_armed", &self.lease_rollback.armed)
             .finish_non_exhaustive()
     }
@@ -2984,6 +3757,13 @@ impl GuardianProxyStaging {
         let replay_transport =
             GuardianReplayClientTransport::connect(socket_path, token_path, identity)?;
         staging.replay_transport = Some(Box::new(replay_transport));
+        let checkpoint_publisher = GuardianCheckpointPublisher::connect(
+            socket_path,
+            token_path,
+            identity,
+            Arc::clone(&staging.actor),
+        )?;
+        staging.checkpoint_publisher = Some(Arc::new(checkpoint_publisher));
         Ok(staging)
     }
 
@@ -3007,11 +3787,20 @@ impl GuardianProxyStaging {
         census.invalidate();
         let lease_rollback =
             GuardianClaimedLeaseRollback::new(Arc::clone(&actor), Arc::clone(&census), identity);
+        #[cfg(test)]
+        let checkpoint_publisher = Some(Arc::new(GuardianCheckpointPublisher::with_transport(
+            identity,
+            Arc::clone(&actor),
+            Box::new(DormantCheckpointStageTransport),
+        )));
+        #[cfg(not(test))]
+        let checkpoint_publisher = None;
         Ok(Self {
             actor,
             census,
             reader_slot: Arc::new(GuardianReplayReaderSlot::new()),
             replay_transport: None,
+            checkpoint_publisher,
             lease_rollback,
         })
     }
@@ -3046,6 +3835,11 @@ impl GuardianProxyStaging {
     ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
         let identity = self.identity();
         let expected_size = self.actor.lock().size;
+        if self.checkpoint_publisher.is_none() {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "guardian staging has no checkpoint publisher bound to its claimed lease",
+            ));
+        }
         let mut replay_transport =
             self.replay_transport
                 .take()
@@ -3107,6 +3901,7 @@ impl GuardianProxyStaging {
                 census: Arc::clone(&self.census),
             }),
             guardian_live_output_reader: Some(guardian_live_output_reader),
+            guardian_checkpoint_publisher: self.checkpoint_publisher,
             lease_identity: identity,
             lease_rollback: self.lease_rollback,
         })
@@ -3147,6 +3942,7 @@ impl GuardianProxyStaging {
                 census: Arc::clone(&self.census),
             }),
             guardian_live_output_reader: None,
+            guardian_checkpoint_publisher: self.checkpoint_publisher,
             lease_identity: identity,
             lease_rollback: self.lease_rollback,
         }
@@ -3162,6 +3958,7 @@ pub struct ActivatedGuardianProxy {
     writer: Box<dyn Write + Send>,
     lease_control: Arc<dyn GuardianPaneLeaseControl>,
     guardian_live_output_reader: Option<Box<dyn GuardianLiveOutputReader>>,
+    guardian_checkpoint_publisher: Option<Arc<GuardianCheckpointPublisher>>,
     lease_identity: GuardianPaneLeaseIdentity,
     lease_rollback: GuardianClaimedLeaseRollback,
 }
@@ -3197,6 +3994,9 @@ impl ActivatedGuardianProxy {
             self.guardian_live_output_reader
                 .take()
                 .expect("verified guardian activation must retain its record-aware reader"),
+            self.guardian_checkpoint_publisher
+                .take()
+                .expect("verified guardian activation must retain its checkpoint publisher"),
         );
         // Construction completed, so the LocalPane's guardian ownership is
         // now the sole close/retire authority. If construction unwinds before
@@ -3461,8 +4261,9 @@ mod tests {
         GuardianOutputJournalLimits, GuardianOutputSegmentIdentity,
     };
     use mux::guardian_protocol::{
-        GuardianCheckpointChunkDelivery, GuardianReplayOutputRecordsDelivery,
-        GuardianReplayPhaseV1, GuardianReplayRecordDelivery, GuardianReplayRecordMetadataV1,
+        GuardianCheckpointChunkDelivery, GuardianCheckpointStageKindV1,
+        GuardianReplayOutputRecordsDelivery, GuardianReplayPhaseV1,
+        GuardianReplayRecordDelivery, GuardianReplayRecordMetadataV1,
     };
     use mux::pane::{Pane, alloc_pane_id};
     use std::collections::VecDeque;
@@ -3494,6 +4295,12 @@ mod tests {
         QueryInput {
             request_id: Uuid,
             effect_id: Uuid,
+        },
+        Checkpoint {
+            sequence: u64,
+            request_id: Uuid,
+            effect_id: Uuid,
+            intent: GuardianCheckpointIntent,
         },
         Resize {
             sequence: u64,
@@ -3566,6 +4373,220 @@ mod tests {
         state: Arc<Mutex<FakeReplayState>>,
     }
 
+    struct FakeCheckpointStageState {
+        calls: Vec<(Uuid, GuardianCheckpointStageKindV1)>,
+        lose_reply_once: VecDeque<GuardianCheckpointStageKindV1>,
+        scope: Option<GuardianCheckpointScopeV1>,
+        upload_id: Option<Uuid>,
+        descriptor: Option<GuardianCheckpointDescriptorV1>,
+        chunk_bytes: Option<u32>,
+        total_chunks: Option<u32>,
+        next_index: u32,
+        payload: Zeroizing<Vec<u8>>,
+        completion_id: Option<Uuid>,
+        acked: bool,
+    }
+
+    impl FakeCheckpointStageState {
+        fn new(lose_reply_once: impl IntoIterator<Item = GuardianCheckpointStageKindV1>) -> Self {
+            Self {
+                calls: Vec::new(),
+                lose_reply_once: lose_reply_once.into_iter().collect(),
+                scope: None,
+                upload_id: None,
+                descriptor: None,
+                chunk_bytes: None,
+                total_chunks: None,
+                next_index: 0,
+                payload: Zeroizing::new(Vec::new()),
+                completion_id: None,
+                acked: false,
+            }
+        }
+
+        fn assert_bound_request(
+            &self,
+            scope: GuardianCheckpointScopeV1,
+            upload_id: Uuid,
+            descriptor: GuardianCheckpointDescriptorV1,
+            chunk_bytes: u32,
+            total_chunks: u32,
+        ) {
+            assert_eq!(self.scope, Some(scope));
+            assert_eq!(self.upload_id, Some(upload_id));
+            assert_eq!(self.descriptor, Some(descriptor));
+            assert_eq!(self.chunk_bytes, Some(chunk_bytes));
+            assert_eq!(self.total_chunks, Some(total_chunks));
+        }
+
+        fn current_reply(&self, upload_id: Uuid) -> GuardianCheckpointStageReplyV1 {
+            let Some(descriptor) = self.descriptor else {
+                return GuardianCheckpointStageReplyV1::Absent { upload_id };
+            };
+            if self.acked {
+                return GuardianCheckpointStageReplyV1::Acked {
+                    upload_id,
+                    completion_id: self
+                        .completion_id
+                        .expect("acked fake stage retains completion identity"),
+                    checkpoint_id: descriptor.checkpoint_id(),
+                    boundary_id: descriptor.boundary_id(),
+                    total_bytes: descriptor.total_bytes(),
+                };
+            }
+            if let Some(completion_id) = self.completion_id {
+                return GuardianCheckpointStageReplyV1::Sealed {
+                    upload_id,
+                    completion_id,
+                    checkpoint_id: descriptor.checkpoint_id(),
+                    boundary_id: descriptor.boundary_id(),
+                    total_bytes: descriptor.total_bytes(),
+                };
+            }
+            let committed_bytes =
+                u64::try_from(self.payload.len()).expect("fake Stage payload length fits u64");
+            if self.next_index == 0 {
+                GuardianCheckpointStageReplyV1::Ready {
+                    upload_id,
+                    next_index: 0,
+                    committed_bytes,
+                }
+            } else {
+                GuardianCheckpointStageReplyV1::Progress {
+                    upload_id,
+                    next_index: self.next_index,
+                    committed_bytes,
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeCheckpointStageTransport {
+        state: Arc<Mutex<FakeCheckpointStageState>>,
+    }
+
+    impl GuardianCheckpointStageTransport for FakeCheckpointStageTransport {
+        fn checkpoint_stage(
+            &mut self,
+            request_id: Uuid,
+            request: GuardianCheckpointStageRequestV1,
+        ) -> Result<GuardianCheckpointStageReplyV1, GuardianProxyError> {
+            let kind = request.kind();
+            let scope = request.scope();
+            let upload_id = request.upload_id();
+            let descriptor = request.descriptor();
+            let chunk_bytes = request.chunk_bytes();
+            let total_chunks = request.total_chunks();
+            let completion_id = request.completion_id();
+            let mut state = self.state.lock();
+            state.calls.push((request_id, kind));
+
+            match kind {
+                GuardianCheckpointStageKindV1::Begin => {
+                    if state.scope.is_none() {
+                        state.scope = Some(scope);
+                        state.upload_id = Some(upload_id);
+                        state.descriptor = Some(descriptor);
+                        state.chunk_bytes = Some(chunk_bytes);
+                        state.total_chunks = Some(total_chunks);
+                    } else {
+                        state.assert_bound_request(
+                            scope,
+                            upload_id,
+                            descriptor,
+                            chunk_bytes,
+                            total_chunks,
+                        );
+                    }
+                }
+                GuardianCheckpointStageKindV1::Chunk => {
+                    state.assert_bound_request(
+                        scope,
+                        upload_id,
+                        descriptor,
+                        chunk_bytes,
+                        total_chunks,
+                    );
+                    let ((index, offset), bytes) = request
+                        .into_chunk()
+                        .and_then(|chunk| chunk.into_validated_parts())
+                        .expect("fake Stage accepts a protocol-validated chunk");
+                    assert_eq!(index, state.next_index);
+                    assert_eq!(
+                        offset,
+                        u64::try_from(state.payload.len())
+                            .expect("fake Stage payload offset fits u64")
+                    );
+                    state.payload.extend_from_slice(bytes.as_slice());
+                    state.next_index = state
+                        .next_index
+                        .checked_add(1)
+                        .expect("bounded fake Stage chunk index advances");
+                }
+                GuardianCheckpointStageKindV1::Seal => {
+                    state.assert_bound_request(
+                        scope,
+                        upload_id,
+                        descriptor,
+                        chunk_bytes,
+                        total_chunks,
+                    );
+                    assert_eq!(state.next_index, total_chunks);
+                    assert_eq!(
+                        u64::try_from(state.payload.len())
+                            .expect("fake Stage payload length fits u64"),
+                        descriptor.total_bytes()
+                    );
+                    request
+                        .validate_staged_plaintext(state.payload.as_slice())
+                        .expect("fake Stage validates the production terminal commitment");
+                    state.completion_id = Some(id(0x8f0));
+                }
+                GuardianCheckpointStageKindV1::Query => {
+                    if state.scope.is_some() {
+                        state.assert_bound_request(
+                            scope,
+                            upload_id,
+                            descriptor,
+                            chunk_bytes,
+                            total_chunks,
+                        );
+                    }
+                }
+                GuardianCheckpointStageKindV1::Ack => {
+                    state.assert_bound_request(
+                        scope,
+                        upload_id,
+                        descriptor,
+                        chunk_bytes,
+                        total_chunks,
+                    );
+                    assert_eq!(completion_id, state.completion_id);
+                    state.acked = true;
+                }
+            }
+
+            let reply = state.current_reply(upload_id);
+            let lose_reply = state
+                .lose_reply_once
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .and_then(|position| state.lose_reply_once.remove(position))
+                .is_some();
+            if lose_reply {
+                Err(GuardianProxyError::Client(GuardianClientError::Io(
+                    io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "injected checkpoint Stage lost reply",
+                    ),
+                )))
+            } else {
+                Ok(reply)
+            }
+        }
+    }
+
     impl GuardianReplayTransport for FakeReplayTransport {
         fn replay(
             &mut self,
@@ -3611,6 +4632,7 @@ mod tests {
             GuardianOutputAppendReceipt,
             Arc<[u8]>,
         )>,
+        delivered: SyncSender<()>,
     }
 
     impl GuardianLiveOutputReader for ChannelGuardianReader {
@@ -3621,7 +4643,7 @@ mod tests {
                 GuardianOutputAppendReceipt,
                 Arc<[u8]>,
             ) -> io::Result<()>,
-        ) -> io::Result<()> {
+        ) -> io::Result<GuardianLiveOutputDelivery> {
             let (segment, output, payload) = self
                 .receiver
                 .recv_timeout(Duration::from_secs(5))
@@ -3633,7 +4655,14 @@ mod tests {
                         io::Error::new(io::ErrorKind::TimedOut, "test guardian reader timed out")
                     }
                 })?;
-            deliver(segment, output, payload)
+            deliver(segment, output, payload)?;
+            self.delivered.send(()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test guardian delivery acknowledgement receiver closed",
+                )
+            })?;
+            Ok(GuardianLiveOutputDelivery::replay_page_acknowledged())
         }
     }
 
@@ -3730,6 +4759,26 @@ mod tests {
                     panic!("observe directive routed to input query")
                 }
             }
+        }
+
+        fn checkpoint(
+            &mut self,
+            _pane_id: Uuid,
+            _generation: u64,
+            sequence: u64,
+            request_id: Uuid,
+            effect_id: Uuid,
+            intent: GuardianCheckpointIntent,
+        ) -> Result<GuardianCheckpointReceipt, GuardianMutationTransportError> {
+            let _directive = self.record(FakeCall::Checkpoint {
+                sequence,
+                request_id,
+                effect_id,
+                intent,
+            });
+            Err(GuardianMutationTransportError::Client(
+                GuardianClientError::UnexpectedReply,
+            ))
         }
 
         fn resize(
@@ -4056,11 +5105,15 @@ mod tests {
     fn capture_record_checkpoint_fixture() -> RecordCheckpointFixture {
         let payload = b"guardian-checkpoint-base".to_vec();
         let (sender, receiver) = sync_channel(1);
+        let (delivered_sender, delivered_receiver) = sync_channel(1);
         let (staging, mutation_state) = fake_staging([], 1);
         let activated = staging
             .activate_verified_restore(
                 inert_terminal(),
-                Box::new(ChannelGuardianReader { receiver }),
+                Box::new(ChannelGuardianReader {
+                    receiver,
+                    delivered: delivered_sender,
+                }),
             )
             .expect("activate typed checkpoint fixture reader");
         let pane_id = alloc_pane_id().expect("allocate checkpoint fixture pane id");
@@ -4105,6 +5158,9 @@ mod tests {
         sender
             .send((segment, receipt, Arc::<[u8]>::from(payload)))
             .expect("release checkpoint fixture parser delivery");
+        delivered_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("observe checkpoint fixture delivery authorization");
         let capture = operation
             .capture_live_parser_checkpoint(
                 segment,
@@ -4199,6 +5255,14 @@ mod tests {
         fixture: &RecordCheckpointFixture,
         payload: &[u8],
     ) -> GuardianReplayPageDelivery {
+        tail_output_page_records(fixture, &[payload])
+    }
+
+    fn tail_output_page_records(
+        fixture: &RecordCheckpointFixture,
+        payloads: &[&[u8]],
+    ) -> GuardianReplayPageDelivery {
+        assert!(!payloads.is_empty(), "tail page fixture needs a record");
         let GuardianCheckpointOutputBoundaryV1::Record {
             sequence,
             record_digest,
@@ -4209,33 +5273,47 @@ mod tests {
         else {
             panic!("tail fixture must be record-backed");
         };
-        let output_sequence = sequence.checked_add(1).expect("tail sequence advances");
-        let output_cumulative = cumulative_plaintext_bytes
-            .checked_add(u64::try_from(payload.len()).expect("tail payload length fits u64"))
-            .expect("tail cumulative bytes advance");
-        let output_log_bytes = committed_log_bytes
-            .checked_add(u64::try_from(payload.len()).expect("tail payload length fits u64"))
-            .and_then(|bytes| bytes.checked_add(256))
-            .expect("tail committed bytes advance");
-        let output_digest: [u8; 32] = Sha256::digest(payload).into();
-        let metadata = GuardianReplayRecordMetadataV1::new(
-            fixture.segment.segment_id(),
-            fixture.segment.first_sequence(),
-            None,
-            output_sequence,
-            u32::try_from(payload.len()).expect("tail payload length fits u32"),
-            output_cumulative,
-            output_log_bytes,
-            output_digest,
-        )
-        .expect("construct tail record metadata");
-        let records = GuardianReplayOutputRecordsDelivery::new(
-            output_sequence,
-            record_digest,
-            vec![
+        let first_sequence = sequence.checked_add(1).expect("tail sequence advances");
+        let mut output_sequence = sequence;
+        let mut output_cumulative = cumulative_plaintext_bytes;
+        let mut output_log_bytes = committed_log_bytes;
+        let mut output_digest = record_digest;
+        let mut record_deliveries = Vec::new();
+        record_deliveries
+            .try_reserve_exact(payloads.len())
+            .expect("bounded tail record fixture allocation");
+        for payload in payloads {
+            output_sequence = output_sequence
+                .checked_add(1)
+                .expect("tail sequence advances");
+            output_cumulative = output_cumulative
+                .checked_add(u64::try_from(payload.len()).expect("tail payload length fits u64"))
+                .expect("tail cumulative bytes advance");
+            output_log_bytes = output_log_bytes
+                .checked_add(u64::try_from(payload.len()).expect("tail payload length fits u64"))
+                .and_then(|bytes| bytes.checked_add(256))
+                .expect("tail committed bytes advance");
+            output_digest = Sha256::digest(payload).into();
+            let metadata = GuardianReplayRecordMetadataV1::new(
+                fixture.segment.segment_id(),
+                fixture.segment.first_sequence(),
+                None,
+                output_sequence,
+                u32::try_from(payload.len()).expect("tail payload length fits u32"),
+                output_cumulative,
+                output_log_bytes,
+                output_digest,
+            )
+            .expect("construct tail record metadata");
+            record_deliveries.push(
                 GuardianReplayRecordDelivery::new(metadata, Zeroizing::new(payload.to_vec()))
                     .expect("construct tail record delivery"),
-            ],
+            );
+        }
+        let records = GuardianReplayOutputRecordsDelivery::new(
+            first_sequence,
+            record_digest,
+            record_deliveries,
         )
         .expect("construct tail output page body");
         let snapshot_id = id(0x700);
@@ -4336,6 +5414,12 @@ mod tests {
                 effect_id,
                 ..
             }
+            | FakeCall::Checkpoint {
+                sequence,
+                request_id,
+                effect_id,
+                ..
+            }
             | FakeCall::Terminate {
                 sequence,
                 request_id,
@@ -4353,6 +5437,124 @@ mod tests {
             } => Some((*sequence, *request_id, *effect_id)),
             FakeCall::QueryInput { .. } | FakeCall::Census => None,
         }
+    }
+
+    #[test]
+    fn checkpoint_stage_lost_replies_query_exactly_without_duplicate_committed_chunks() {
+        let fixture = capture_record_checkpoint_fixture();
+        let descriptor = fixture.descriptor;
+        let expected_payload_bytes = fixture.checkpoint.len();
+        let expected_payload_digest = <[u8; 32]>::from(Sha256::digest(
+            fixture.checkpoint.as_slice(),
+        ));
+        let total_chunks = u32::try_from(
+            descriptor
+                .total_bytes()
+                .div_ceil(u64::from(GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES)),
+        )
+        .expect("bounded fixture chunk count fits u32");
+        let chunk_request_ids = (0..total_chunks)
+            .map(|index| id(0x1_000 + u128::from(index)))
+            .collect::<Vec<_>>();
+        let query_request_id = id(0x1_000_000);
+        let mut pending = PendingGuardianCheckpointPublication {
+            scope: GuardianCheckpointScopeV1::Pane {
+                pane_id: identity().pane_id(),
+                generation: identity().generation(),
+            },
+            upload_id: id(0x1_000_001),
+            descriptor,
+            chunk_bytes: GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
+            total_chunks,
+            terminal_payload: fixture.checkpoint,
+            begin_request_id: id(0x1_000_002),
+            chunk_request_ids,
+            query_request_id,
+            seal_request_id: id(0x1_000_003),
+            ack_request_id: id(0x1_000_004),
+            completion_id: None,
+            adoption_receipt: None,
+        };
+        let state = Arc::new(Mutex::new(FakeCheckpointStageState::new([
+            GuardianCheckpointStageKindV1::Query,
+            GuardianCheckpointStageKindV1::Begin,
+            GuardianCheckpointStageKindV1::Chunk,
+            GuardianCheckpointStageKindV1::Seal,
+            GuardianCheckpointStageKindV1::Ack,
+        ])));
+        let mut transport = FakeCheckpointStageTransport {
+            state: Arc::clone(&state),
+        };
+
+        let completion_id = pending
+            .drive_to_sealed(&mut transport)
+            .expect("lost Stage replies reconcile to the exact sealed upload");
+        pending
+            .drive_ack(&mut transport, completion_id)
+            .expect("lost Stage Ack reply reconciles to durable Acked state");
+
+        let state = state.lock();
+        assert!(state.acked);
+        assert_eq!(state.completion_id, Some(completion_id));
+        assert_eq!(state.payload.len(), expected_payload_bytes);
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(state.payload.as_slice())),
+            expected_payload_digest
+        );
+        assert!(state.lose_reply_once.is_empty());
+
+        let query_ids = state
+            .calls
+            .iter()
+            .filter_map(|(request_id, kind)| {
+                (*kind == GuardianCheckpointStageKindV1::Query).then_some(*request_id)
+            })
+            .collect::<Vec<_>>();
+        assert!(query_ids.len() >= 6, "every ambiguous phase is queried");
+        assert!(
+            query_ids
+                .iter()
+                .all(|request_id| *request_id == query_request_id),
+            "all lost-reply recovery reuses one retained Query identity"
+        );
+
+        for (kind, expected_calls) in [
+            (GuardianCheckpointStageKindV1::Begin, 1_usize),
+            (
+                GuardianCheckpointStageKindV1::Chunk,
+                usize::try_from(total_chunks).expect("bounded fixture chunks fit usize"),
+            ),
+            (GuardianCheckpointStageKindV1::Seal, 1),
+            (GuardianCheckpointStageKindV1::Ack, 1),
+        ] {
+            assert_eq!(
+                state
+                    .calls
+                    .iter()
+                    .filter(|(_, observed)| *observed == kind)
+                    .count(),
+                expected_calls,
+                "a committed {kind:?} is discovered by Query, not retransmitted"
+            );
+        }
+
+        let mut mutation_request_ids = state
+            .calls
+            .iter()
+            .filter_map(|(request_id, kind)| {
+                (*kind != GuardianCheckpointStageKindV1::Query).then_some(*request_id)
+            })
+            .collect::<Vec<_>>();
+        mutation_request_ids.sort_unstable();
+        mutation_request_ids.dedup();
+        assert_eq!(
+            mutation_request_ids.len(),
+            usize::try_from(total_chunks)
+                .expect("bounded fixture chunks fit usize")
+                .checked_add(3)
+                .expect("bounded mutation call count"),
+            "every Stage mutation retains a distinct fixed request identity"
+        );
     }
 
     #[test]
@@ -4409,7 +5611,7 @@ mod tests {
             acks_before_delivery, 3,
             "tail record is not acknowledged before typed delivery"
         );
-        reader
+        let delivery = reader
             .deliver_next_record(&mut |segment, output, payload| {
                 assert_eq!(segment.durable_pane_id(), identity().pane_id());
                 assert_eq!(
@@ -4429,6 +5631,10 @@ mod tests {
                 Ok(())
             })
             .expect("deliver exact typed tail record");
+        assert!(
+            delivery.has_durable_replay_page_ack(),
+            "page-terminal delivery reports its durable replay Ack"
+        );
         assert_eq!(
             replay_state.lock().acks.len(),
             acks_before_delivery + 1,
@@ -4524,6 +5730,58 @@ mod tests {
             state.lock().calls.as_slice(),
             [FakeCall::Retire { sequence: 91, .. }]
         ));
+    }
+
+    #[test]
+    fn tail_reader_reports_durable_page_ack_only_after_terminal_record() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive multi-record tail boundary");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([tail_output_page_records(
+                &fixture,
+                &[b"first", b"second"],
+            )]),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct multi-record tail reader");
+
+        let mut first_payload = None;
+        let first = reader
+            .deliver_next_record(&mut |_, _, payload| {
+                first_payload = Some(payload);
+                Ok(())
+            })
+            .expect("deliver first record inside the open replay page");
+        assert_eq!(first_payload.as_deref(), Some(b"first".as_slice()));
+        assert!(!first.has_durable_replay_page_ack());
+        assert!(
+            replay_state.lock().acks.is_empty(),
+            "an interior record cannot report or emit the page Ack"
+        );
+
+        let mut second_payload = None;
+        let second = reader
+            .deliver_next_record(&mut |_, _, payload| {
+                second_payload = Some(payload);
+                Ok(())
+            })
+            .expect("deliver page-terminal record and durable Ack");
+        assert_eq!(second_payload.as_deref(), Some(b"second".as_slice()));
+        assert!(second.has_durable_replay_page_ack());
+        assert_eq!(replay_state.lock().acks.len(), 1);
     }
 
     #[test]

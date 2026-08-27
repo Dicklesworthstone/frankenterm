@@ -12,13 +12,15 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, CorrelatedGuardianResponse, GUARDIAN_AUTH_TOKEN_BYTES,
     GUARDIAN_MAX_CENSUS_BYTES, GUARDIAN_MAX_CENSUS_ENTRIES, GUARDIAN_MAX_FRAME_BYTES,
-    GUARDIAN_MAX_PANES, GuardianCensusEntry, GuardianCensusPageRequest, GuardianInputEffectQuery,
-    GuardianOperation, GuardianProtocolError, GuardianRejectionCode, GuardianReplayAckReceiptV1,
-    GuardianReplayAckV1, GuardianReplayPageDelivery, GuardianReplayRequestV1, GuardianReply,
-    GuardianRequestEnvelope, GuardianRequestHeader, GuardianResizePayload,
-    GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret, GuardianSignal,
-    GuardianSpawnPayload, GuardianWireFrame, InputEffectState, decode_guardian_request,
-    decode_guardian_response, encode_guardian_request, encode_guardian_response,
+    GUARDIAN_MAX_PANES, GuardianCensusEntry, GuardianCensusPageRequest, GuardianCheckpointIntent,
+    GuardianCheckpointReceipt, GuardianCheckpointScopeV1, GuardianCheckpointStageReplyV1,
+    GuardianCheckpointStageRequestV1, GuardianInputEffectQuery, GuardianOperation,
+    GuardianProtocolError, GuardianRejectionCode, GuardianReplayAckReceiptV1, GuardianReplayAckV1,
+    GuardianReplayPageDelivery, GuardianReplayRequestV1, GuardianReply, GuardianRequestEnvelope,
+    GuardianRequestHeader, GuardianResizePayload, GuardianResponseEnvelope, GuardianResponseStatus,
+    GuardianSecret, GuardianSignal, GuardianSpawnPayload, GuardianWireFrame, InputEffectState,
+    decode_guardian_request, decode_guardian_response, encode_guardian_request,
+    encode_guardian_response,
 };
 use nix::unistd::geteuid;
 use portable_pty::{CommandBuilder, PtySize};
@@ -2229,6 +2231,85 @@ impl GuardianClient {
         }
     }
 
+    /// Execute one typed checkpoint staging operation.
+    ///
+    /// The request owns and consumes any Chunk plaintext, while the envelope
+    /// repeats the exact pane lease or genesis effect scope authenticated by
+    /// the descriptor. An I/O error makes reply delivery ambiguous: reconnect
+    /// and issue a metadata-only Query for the same upload identity before
+    /// deciding whether Begin, Chunk, Seal, or Ack needs further work. Never
+    /// mint a new upload ID to resolve an ambiguous result.
+    pub fn checkpoint_stage(
+        &mut self,
+        request_id: Uuid,
+        stage: GuardianCheckpointStageRequestV1,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianClientError> {
+        let upload_id = stage.upload_id();
+        let (pane_id, generation, effect_id) = match stage.scope() {
+            GuardianCheckpointScopeV1::Pane {
+                pane_id,
+                generation,
+            } => (Some(pane_id), generation, None),
+            GuardianCheckpointScopeV1::Genesis { spawn_effect_id } => {
+                (None, 0, Some(spawn_effect_id))
+            }
+        };
+        let payload = stage.into_zeroizing_payload()?;
+        let request = self.request_sensitive(
+            GuardianOperation::CheckpointStage,
+            request_id,
+            pane_id,
+            generation,
+            0,
+            effect_id,
+            payload,
+        );
+        match self.exchange(request)? {
+            GuardianReply::CheckpointStage(reply) if reply.upload_id() == upload_id => Ok(reply),
+            _ => Err(GuardianClientError::UnexpectedReply),
+        }
+    }
+
+    /// Adopt one exact sealed checkpoint through the pane mutation sequence.
+    ///
+    /// A transport error leaves the outcome ambiguous. Reconnect and retry
+    /// this exact sequence, request ID, effect ID, and intent; the guardian's
+    /// durable effect ledger must return the original receipt or its explicit
+    /// indeterminate disposition. Never advance the local mutation sequence
+    /// from an I/O result alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checkpoint(
+        &mut self,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        request_id: Uuid,
+        effect_id: Uuid,
+        intent: GuardianCheckpointIntent,
+    ) -> Result<GuardianCheckpointReceipt, GuardianClientError> {
+        let request = self.request(
+            GuardianOperation::Checkpoint,
+            request_id,
+            Some(pane_id),
+            generation,
+            sequence,
+            Some(effect_id),
+            intent.encode().to_vec(),
+        );
+        match self.exchange(request)? {
+            GuardianReply::CheckpointReceipt(receipt)
+                if receipt.pane_id() == pane_id
+                    && receipt.generation() == generation
+                    && receipt.sequence() == sequence
+                    && receipt.effect_id() == effect_id
+                    && receipt.intent() == intent =>
+            {
+                Ok(receipt)
+            }
+            _ => Err(GuardianClientError::UnexpectedReply),
+        }
+    }
+
     /// Apply one bounded input effect through the guardian's durable
     /// intent/write/disposition transaction. A terminal
     /// `InputKnownNotApplied` rejection proves that zero bytes reached the PTY;
@@ -4144,8 +4225,39 @@ fn require_same_object(left: &Metadata, right: &Metadata) -> Result<(), Guardian
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+    use frankenterm_term::{
+        RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
+    };
     use std::io::SeekFrom;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    #[derive(Debug)]
+    struct TransportCheckpointConfig;
+
+    impl TerminalConfiguration for TransportCheckpointConfig {
+        fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+            frankenterm_term::color::ColorPalette::default()
+        }
+    }
+
+    fn transport_checkpoint() -> RecoveryTerminalCheckpointV2 {
+        Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(TransportCheckpointConfig),
+            "FrankenTerm",
+            "guardian-transport-test",
+            Box::new(Vec::<u8>::new()),
+        )
+        .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+        .expect("capture canonical transport checkpoint fixture")
+    }
 
     fn authority(connection: usize, request: u128, effect: u128) -> GuardedStopAuthority {
         GuardedStopAuthority {
@@ -5171,6 +5283,208 @@ mod tests {
         server
             .join()
             .expect("ReplayAck expiry server exits cleanly");
+    }
+
+    #[test]
+    fn checkpoint_stage_client_preserves_scope_upload_and_typed_recovery_replies() {
+        use mux::guardian_protocol::{
+            GuardianCheckpointDescriptorV1, GuardianCheckpointStageKindV1,
+        };
+
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        client_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+
+        let secret_bytes = [0x5a; GUARDIAN_AUTH_TOKEN_BYTES];
+        let guardian_incarnation = Uuid::from_u128(0x5301);
+        let mux_incarnation = Uuid::from_u128(0x5302);
+        let spawn_effect_id = Uuid::from_u128(0x5303);
+        let upload_id = Uuid::from_u128(0x5304);
+        let completion_id = Uuid::from_u128(0x5305);
+        let request_ids = [
+            Uuid::from_u128(0x5310),
+            Uuid::from_u128(0x5311),
+            Uuid::from_u128(0x5312),
+            Uuid::from_u128(0x5313),
+            Uuid::from_u128(0x5314),
+        ];
+        let terminal = transport_checkpoint();
+        let descriptor =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(spawn_effect_id, &terminal)
+                .unwrap();
+        let scope = GuardianCheckpointScopeV1::Genesis { spawn_effect_id };
+        let chunk_bytes = 1_024;
+        let first_chunk_len = terminal
+            .canonical_payload()
+            .len()
+            .min(usize::try_from(chunk_bytes).unwrap());
+        let first_chunk = Zeroizing::new(terminal.canonical_payload()[..first_chunk_len].to_vec());
+        let committed_bytes = u64::try_from(first_chunk_len).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let secret = GuardianSecret::from_bytes(secret_bytes).unwrap();
+            for (index, expected_kind) in [
+                GuardianCheckpointStageKindV1::Begin,
+                GuardianCheckpointStageKindV1::Chunk,
+                GuardianCheckpointStageKindV1::Query,
+                GuardianCheckpointStageKindV1::Seal,
+                GuardianCheckpointStageKindV1::Ack,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let frame = read_blocking_frame(&mut server_stream).unwrap();
+                let request = decode_guardian_request(&secret, &frame).unwrap();
+                assert_eq!(
+                    request.header().operation,
+                    GuardianOperation::CheckpointStage
+                );
+                assert_eq!(request.header().guardian_incarnation, guardian_incarnation);
+                assert_eq!(request.header().mux_incarnation, mux_incarnation);
+                assert_eq!(request.header().request_id, request_ids[index]);
+                assert_eq!(request.header().pane_id, None);
+                assert_eq!(request.header().lease_generation, 0);
+                assert_eq!(request.header().lease_sequence, 0);
+                assert_eq!(request.header().effect_id, Some(spawn_effect_id));
+                let stage = GuardianCheckpointStageRequestV1::decode(request.payload()).unwrap();
+                assert_eq!(stage.kind(), expected_kind);
+                assert_eq!(stage.scope(), scope);
+                assert_eq!(stage.upload_id(), upload_id);
+                assert_eq!(stage.descriptor(), descriptor);
+                let reply = match expected_kind {
+                    GuardianCheckpointStageKindV1::Begin => GuardianCheckpointStageReplyV1::Ready {
+                        upload_id,
+                        next_index: 0,
+                        committed_bytes: 0,
+                    },
+                    GuardianCheckpointStageKindV1::Chunk | GuardianCheckpointStageKindV1::Query => {
+                        GuardianCheckpointStageReplyV1::Progress {
+                            upload_id,
+                            next_index: 1,
+                            committed_bytes,
+                        }
+                    }
+                    GuardianCheckpointStageKindV1::Seal => GuardianCheckpointStageReplyV1::Sealed {
+                        upload_id,
+                        completion_id,
+                        checkpoint_id: descriptor.checkpoint_id(),
+                        boundary_id: descriptor.boundary_id(),
+                        total_bytes: descriptor.total_bytes(),
+                    },
+                    GuardianCheckpointStageKindV1::Ack => {
+                        assert_eq!(stage.completion_id(), Some(completion_id));
+                        GuardianCheckpointStageReplyV1::Acked {
+                            upload_id,
+                            completion_id,
+                            checkpoint_id: descriptor.checkpoint_id(),
+                            boundary_id: descriptor.boundary_id(),
+                            total_bytes: descriptor.total_bytes(),
+                        }
+                    }
+                };
+                let response = GuardianResponseEnvelope::reply(
+                    &request,
+                    &GuardianReply::CheckpointStage(reply),
+                )
+                .unwrap();
+                server_stream
+                    .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                    .unwrap();
+            }
+        });
+
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes(secret_bytes).unwrap(),
+            mux_incarnation,
+            guardian_incarnation,
+            request_wipe_probe: None,
+        };
+        let ready = client
+            .checkpoint_stage(
+                request_ids[0],
+                GuardianCheckpointStageRequestV1::begin(scope, upload_id, descriptor, chunk_bytes)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            ready,
+            GuardianCheckpointStageReplyV1::Ready {
+                next_index: 0,
+                committed_bytes: 0,
+                ..
+            }
+        ));
+        let progress = client
+            .checkpoint_stage(
+                request_ids[1],
+                GuardianCheckpointStageRequestV1::chunk(
+                    scope,
+                    upload_id,
+                    descriptor,
+                    chunk_bytes,
+                    0,
+                    first_chunk,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            progress,
+            GuardianCheckpointStageReplyV1::Progress { next_index: 1, .. }
+        ));
+        let queried = client
+            .checkpoint_stage(
+                request_ids[2],
+                GuardianCheckpointStageRequestV1::query(scope, upload_id, descriptor, chunk_bytes)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(queried, progress);
+        let sealed = client
+            .checkpoint_stage(
+                request_ids[3],
+                GuardianCheckpointStageRequestV1::seal(scope, upload_id, descriptor, chunk_bytes)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            sealed,
+            GuardianCheckpointStageReplyV1::Sealed {
+                completion_id: observed,
+                ..
+            } if observed == completion_id
+        ));
+        let acked = client
+            .checkpoint_stage(
+                request_ids[4],
+                GuardianCheckpointStageRequestV1::ack(
+                    scope,
+                    upload_id,
+                    descriptor,
+                    chunk_bytes,
+                    completion_id,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            acked,
+            GuardianCheckpointStageReplyV1::Acked { .. }
+        ));
+        server
+            .join()
+            .expect("CheckpointStage client server exits cleanly");
     }
 
     #[test]

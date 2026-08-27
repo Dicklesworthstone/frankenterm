@@ -1,9 +1,14 @@
 use crate::domain::DomainId;
-use crate::guardian_checkpoint::{LiveParserCaptureAuthority, LiveParserPaneCaptureError};
-use crate::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, GuardianLiveOutputReader, LogicalLine, Pane,
-    PaneId, Pattern, SearchResult, WithPaneLines,
+use crate::guardian_checkpoint::{
+    LiveParserCaptureAuthority, LiveParserCheckpointAck, LiveParserPaneCaptureError,
 };
+use crate::guardian_protocol::GuardianCheckpointReceipt;
+use crate::pane::{
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, GuardianLiveCheckpointPublisher,
+    GuardianLiveOutputReader, LogicalLine, Pane, PaneId, Pattern, SearchResult, WithPaneLines,
+};
+#[cfg(test)]
+use crate::pane::GuardianLiveOutputDelivery;
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
 use crate::{Domain, PaneRegistrationHandle, PaneRegistrationSlot};
@@ -1013,6 +1018,7 @@ pub struct LocalPane {
     process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
     guardian_live_output_reader: Mutex<Option<Box<dyn GuardianLiveOutputReader>>>,
+    guardian_checkpoint_publisher: Option<Arc<dyn GuardianLiveCheckpointPublisher>>,
     resize_queue: Arc<Mutex<ResizeQueueState>>,
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
@@ -1446,6 +1452,16 @@ impl Pane for LocalPane {
         &self,
     ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {
         Ok(self.guardian_live_output_reader.lock().take())
+    }
+
+    fn publish_guardian_checkpoint(
+        &self,
+        capture: LiveParserCheckpointAck,
+    ) -> anyhow::Result<GuardianCheckpointReceipt> {
+        self.guardian_checkpoint_publisher
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pane does not own a guardian checkpoint publisher"))?
+            .publish_checkpoint(capture)
     }
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
@@ -2835,6 +2851,7 @@ impl LocalPane {
             durable_pane_id,
             command_description,
             None,
+            None,
             LocalPaneOwnership::LegacyMuxOwned,
         )
     }
@@ -2862,6 +2879,7 @@ impl LocalPane {
         lease_control: Arc<dyn GuardianPaneLeaseControl>,
         command_description: String,
         guardian_live_output_reader: Box<dyn GuardianLiveOutputReader>,
+        guardian_checkpoint_publisher: Arc<dyn GuardianLiveCheckpointPublisher>,
     ) -> Self {
         Self::new_with_ownership(
             pane_id,
@@ -2873,6 +2891,7 @@ impl LocalPane {
             *lease_identity.pane_id().as_bytes(),
             command_description,
             Some(guardian_live_output_reader),
+            Some(guardian_checkpoint_publisher),
             LocalPaneOwnership::guardian(lease_identity, lease_control),
         )
     }
@@ -2888,6 +2907,7 @@ impl LocalPane {
         durable_pane_id: [u8; 16],
         command_description: String,
         guardian_live_output_reader: Option<Box<dyn GuardianLiveOutputReader>>,
+        guardian_checkpoint_publisher: Option<Arc<dyn GuardianLiveCheckpointPublisher>>,
         ownership: LocalPaneOwnership,
     ) -> Self {
         let mux_registration = Arc::new(PaneRegistrationSlot::default());
@@ -2922,6 +2942,7 @@ impl LocalPane {
             process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),
             guardian_live_output_reader: Mutex::new(guardian_live_output_reader),
+            guardian_checkpoint_publisher,
             resize_queue: Arc::new(Mutex::new(ResizeQueueState::default())),
             writer: Mutex::new(writer),
             domain_id,
@@ -3298,11 +3319,22 @@ mod tests {
                 crate::guardian_output_journal::GuardianOutputAppendReceipt,
                 Arc<[u8]>,
             ) -> std::io::Result<()>,
-        ) -> std::io::Result<()> {
+        ) -> std::io::Result<GuardianLiveOutputDelivery> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "guardian lifetime fixture has no output",
             ))
+        }
+    }
+
+    struct GuardianLifetimeTestCheckpointPublisher;
+
+    impl GuardianLiveCheckpointPublisher for GuardianLifetimeTestCheckpointPublisher {
+        fn publish_checkpoint(
+            &self,
+            _capture: LiveParserCheckpointAck,
+        ) -> anyhow::Result<GuardianCheckpointReceipt> {
+            anyhow::bail!("guardian lifetime fixture does not publish checkpoints")
         }
     }
 
@@ -3413,6 +3445,7 @@ mod tests {
             control,
             "guardian-lifetime-test".to_string(),
             Box::new(GuardianLifetimeTestOutputReader),
+            Arc::new(GuardianLifetimeTestCheckpointPublisher),
         )
     }
 

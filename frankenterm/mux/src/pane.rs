@@ -1,6 +1,9 @@
 use crate::domain::DomainId;
-use crate::guardian_checkpoint::{LiveParserCaptureAuthority, LiveParserPaneCaptureError};
+use crate::guardian_checkpoint::{
+    LiveParserCaptureAuthority, LiveParserCheckpointAck, LiveParserPaneCaptureError,
+};
 use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity};
+use crate::guardian_protocol::GuardianCheckpointReceipt;
 use crate::renderable::*;
 use crate::ExitBehavior;
 use async_trait::async_trait;
@@ -364,13 +367,46 @@ fn text_from_semantic_zone_lines(logical_lines: &[LogicalLine], zone: &SemanticZ
     text
 }
 
+/// Result of one successful typed guardian output delivery.
+///
+/// A checkpoint publisher may perform bounded disk and transport I/O. It must
+/// wait for `replay_page_acknowledged` so that work cannot hold an
+/// unacknowledged replay snapshot open between records from the same page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianLiveOutputDelivery {
+    replay_page_acknowledged: bool,
+}
+
+impl GuardianLiveOutputDelivery {
+    #[must_use]
+    pub const fn buffered_within_replay_page() -> Self {
+        Self {
+            replay_page_acknowledged: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn replay_page_acknowledged() -> Self {
+        Self {
+            replay_page_acknowledged: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_durable_replay_page_ack(self) -> bool {
+        self.replay_page_acknowledged
+    }
+}
+
 /// A Pane represents a view on a terminal
 ///
 /// Guardian-backed panes use a record-aware reader so authenticated journal
 /// metadata cannot be flattened away before the live parser registers its
 /// exact receipt. Implementations must invoke `deliver` exactly once for the
 /// next record and must not acknowledge that record or its replay page unless
-/// the callback returns success.
+/// the callback returns success. The returned delivery state must distinguish
+/// a record buffered inside an open replay page from the page-terminal record
+/// whose durable Ack completed before return.
 pub trait GuardianLiveOutputReader: Send {
     fn deliver_next_record(
         &mut self,
@@ -379,7 +415,19 @@ pub trait GuardianLiveOutputReader: Send {
             GuardianOutputAppendReceipt,
             Arc<[u8]>,
         ) -> std::io::Result<()>,
-    ) -> std::io::Result<()>;
+    ) -> std::io::Result<GuardianLiveOutputDelivery>;
+}
+
+/// Durable publisher for one exact live-parser checkpoint capability.
+///
+/// Implementations must retain ambiguous Stage/adoption/Ack identities and
+/// reconcile them before accepting another capture. The non-cloneable capture
+/// is consumed so callers cannot publish the same parser authority twice.
+pub trait GuardianLiveCheckpointPublisher: Send + Sync {
+    fn publish_checkpoint(
+        &self,
+        capture: LiveParserCheckpointAck,
+    ) -> anyhow::Result<GuardianCheckpointReceipt>;
 }
 
 // `async_trait` keeps this trait object-safe by generating boxed `Future`
@@ -527,6 +575,12 @@ pub trait Pane: Downcast + Send + Sync {
         &self,
     ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {
         Ok(None)
+    }
+    fn publish_guardian_checkpoint(
+        &self,
+        _capture: LiveParserCheckpointAck,
+    ) -> anyhow::Result<GuardianCheckpointReceipt> {
+        anyhow::bail!("pane does not own a guardian checkpoint publisher")
     }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
