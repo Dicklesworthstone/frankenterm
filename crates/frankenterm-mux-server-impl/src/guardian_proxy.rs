@@ -2359,6 +2359,7 @@ struct GuardianReplayTailReader {
     pending_ack: Option<GuardianReplayAckPlan>,
     pending_boundary: Option<GuardianReplayBoundary>,
     pending_terminal_error: Option<GuardianReplayDeferredTerminalError>,
+    delivery_failed: bool,
     maximum_record_bytes: u32,
     maximum_page_records: u16,
     idle_poll_interval: Duration,
@@ -2379,6 +2380,7 @@ impl fmt::Debug for GuardianReplayTailReader {
                 "has_pending_terminal_error",
                 &self.pending_terminal_error.is_some(),
             )
+            .field("delivery_failed", &self.delivery_failed)
             .finish_non_exhaustive()
     }
 }
@@ -2414,6 +2416,7 @@ impl GuardianReplayTailReader {
             pending_ack: None,
             pending_boundary: None,
             pending_terminal_error: None,
+            delivery_failed: false,
             maximum_record_bytes,
             maximum_page_records,
             idle_poll_interval: GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL,
@@ -2722,37 +2725,53 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
             Arc<[u8]>,
         ) -> io::Result<()>,
     ) -> io::Result<()> {
+        if self.delivery_failed {
+            return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
+                "guardian replay reader is terminal after a failed record delivery",
+            )));
+        }
         loop {
             if let Some(record) = self.records.pop_front() {
-                let metadata = record.metadata();
-                if metadata.sequence() != self.boundary.next_sequence
-                    || metadata.cumulative_plaintext_bytes()
-                        != self
-                            .boundary
-                            .cumulative_plaintext_bytes
-                            .checked_add(u64::from(metadata.payload_bytes()))
-                            .ok_or_else(|| io::Error::from(GuardianProxyError::ReplayCapacity))?
-                {
-                    return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
-                        "live output record no longer matches the delivered parser boundary",
-                    )));
-                }
-                let candidate = GuardianReplayBoundary {
-                    next_sequence: metadata
-                        .sequence()
-                        .checked_add(1)
-                        .ok_or_else(|| io::Error::from(GuardianProxyError::ReplayCapacity))?,
-                    previous_record_digest: metadata.record_digest(),
-                    cumulative_plaintext_bytes: metadata.cumulative_plaintext_bytes(),
+                let delivery = (|| {
+                    let metadata = record.metadata();
+                    let expected_cumulative = self
+                        .boundary
+                        .cumulative_plaintext_bytes
+                        .checked_add(u64::from(metadata.payload_bytes()))
+                        .ok_or_else(|| io::Error::from(GuardianProxyError::ReplayCapacity))?;
+                    if metadata.sequence() != self.boundary.next_sequence
+                        || metadata.cumulative_plaintext_bytes() != expected_cumulative
+                    {
+                        return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
+                            "live output record no longer matches the delivered parser boundary",
+                        )));
+                    }
+                    let candidate = GuardianReplayBoundary {
+                        next_sequence: metadata
+                            .sequence()
+                            .checked_add(1)
+                            .ok_or_else(|| io::Error::from(GuardianProxyError::ReplayCapacity))?,
+                        previous_record_digest: metadata.record_digest(),
+                        cumulative_plaintext_bytes: metadata.cumulative_plaintext_bytes(),
+                    };
+                    let (segment, output, payload) = record
+                        .into_live_output(self.identity.pane_id())
+                        .map_err(GuardianProxyError::ReplayDelivery)
+                        .map_err(io::Error::from)?;
+                    deliver(segment, output, payload)?;
+                    Ok(candidate)
+                })();
+                let candidate = match delivery {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        self.delivery_failed = true;
+                        return Err(error);
+                    }
                 };
-                let (segment, output, payload) = record
-                    .into_live_output(self.identity.pane_id())
-                    .map_err(GuardianProxyError::ReplayDelivery)
-                    .map_err(io::Error::from)?;
-                deliver(segment, output, payload)?;
                 self.boundary = candidate;
                 if self.records.is_empty() {
                     if self.pending_boundary != Some(candidate) {
+                        self.delivery_failed = true;
                         return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
                             "delivered replay records omitted their terminal page boundary",
                         )));
@@ -2842,9 +2861,9 @@ impl GuardianReplayReaderSlot {
 /// A connected, already-claimed guardian lease that is still off topology.
 ///
 /// No portable-pty object and no reader activation method are exposed from this
-/// type. Production activation stays absent until the consuming replay
-/// coordinator can bind terminal restoration to its authenticated final
-/// sequence/digest and live-subscription witness.
+/// type. The consuming restore transaction must bind terminal restoration to
+/// its authenticated final sequence/digest and retain a record-aware live
+/// reader before any caller can construct a pane.
 pub struct GuardianProxyStaging {
     actor: SharedGuardianPaneLeaseActor,
     census: Arc<GuardianCensusCoordinator>,
@@ -3021,8 +3040,8 @@ impl GuardianProxyStaging {
     }
 
     /// Consume the authenticated checkpoint/output replay while this pane is
-    /// still absent from mux topology, bind a resumable raw-output reader, and
-    /// activate the terminal's live guardian writer.
+    /// still absent from mux topology, bind a resumable authenticated-record
+    /// reader, and activate the terminal's live guardian writer.
     ///
     /// This method never registers the returned pane. Callers must first build
     /// the desired tab/window topology off to the side, convert the result with
@@ -4659,6 +4678,52 @@ mod tests {
                 .all(|request| *request == state.requests[0])
         );
         assert_eq!(state.acks.len(), 1, "successful record delivery is acknowledged");
+    }
+
+    #[test]
+    fn failed_typed_record_delivery_permanently_withholds_replay_ack() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive failed delivery boundary");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([tail_output_page(&fixture, b"tail")]),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct failed-delivery tail reader");
+
+        let delivery_error = reader
+            .deliver_next_record(&mut |_, _, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected parser delivery failure",
+                ))
+            })
+            .expect_err("parser delivery failure must remain visible");
+        assert_eq!(delivery_error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            replay_state.lock().acks.is_empty(),
+            "failed parser delivery cannot acknowledge its replay page"
+        );
+
+        let terminal_error = reader
+            .deliver_next_record(&mut |_, _, _| Ok(()))
+            .expect_err("failed delivery makes this reader terminal");
+        assert_eq!(terminal_error.kind(), io::ErrorKind::InvalidData);
+        let state = replay_state.lock();
+        assert_eq!(state.requests.len(), 1);
+        assert!(state.acks.is_empty());
     }
 
     #[test]

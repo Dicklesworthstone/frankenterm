@@ -2848,8 +2848,8 @@ impl LocalPane {
     /// The explicit ownership value changes only lifetime behavior: `kill`
     /// performs one fenced guardian close, while dropping the mux-side pane
     /// retires only its lease and never invokes the child killer. This
-    /// constructor does not create those transport proxies or claim that
-    /// guardian input/output/checkpoint recovery is already implemented.
+    /// constructor consumes, but does not itself create or authenticate, those
+    /// transport and replay authorities.
     #[allow(clippy::too_many_arguments)]
     pub fn new_guardian_proxy(
         pane_id: PaneId,
