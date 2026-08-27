@@ -8,9 +8,7 @@
 //! an off-topology [`ActivatedGuardianProxy`], and mux registration stays a
 //! separate caller-owned commit boundary.
 
-use frankenterm_pty_guardian::{
-    GuardianClaimedPaneLease, GuardianClient, GuardianClientError,
-};
+use frankenterm_pty_guardian::{GuardianClaimedPaneLease, GuardianClient, GuardianClientError};
 use mux::domain::DomainId;
 use mux::guardian_checkpoint::LiveParserCheckpointAck;
 use mux::guardian_protocol::{
@@ -1326,10 +1324,7 @@ impl GuardianClientTransport {
             claimed_lease.guardian_incarnation(),
             identity.guardian_incarnation()
         );
-        debug_assert_eq!(
-            claimed_lease.mux_incarnation(),
-            identity.mux_incarnation()
-        );
+        debug_assert_eq!(claimed_lease.mux_incarnation(), identity.mux_incarnation());
         debug_assert_eq!(claimed_lease.pane_id(), identity.pane_id());
         debug_assert_eq!(claimed_lease.generation(), identity.generation());
         Self {
@@ -3645,12 +3640,8 @@ impl GuardianProxyLeasePlan {
         census: Arc<GuardianCensusCoordinator>,
     ) -> Result<Self, GuardianProxyError> {
         validate_pty_size(size)?;
-        let client = GuardianClient::connect(
-            socket_path,
-            token_path,
-            census.mux_incarnation(),
-        )
-        .map_err(GuardianProxyError::Client)?;
+        let client = GuardianClient::connect(socket_path, token_path, census.mux_incarnation())
+            .map_err(GuardianProxyError::Client)?;
         if client.guardian_incarnation() != census.guardian_incarnation() {
             return Err(GuardianProxyError::GuardianIncarnationChanged);
         }
@@ -3869,10 +3860,7 @@ impl GuardianProxyStaging {
             claimed_lease.guardian_incarnation(),
             identity.guardian_incarnation()
         );
-        debug_assert_eq!(
-            claimed_lease.mux_incarnation(),
-            identity.mux_incarnation()
-        );
+        debug_assert_eq!(claimed_lease.mux_incarnation(), identity.mux_incarnation());
         debug_assert_eq!(claimed_lease.pane_id(), identity.pane_id());
         debug_assert_eq!(claimed_lease.generation(), identity.generation());
         let next_sequence = claimed_lease.next_sequence();
@@ -3937,12 +3925,14 @@ impl GuardianProxyStaging {
         census: Arc<GuardianCensusCoordinator>,
     ) -> Self {
         debug_assert!(census.ensure_binding(identity).is_ok());
-        let actor = Arc::new(Mutex::new(GuardianPaneLeaseActor::with_validated_transport(
-            identity,
-            next_sequence,
-            size,
-            transport,
-        )));
+        let actor = Arc::new(Mutex::new(
+            GuardianPaneLeaseActor::with_validated_transport(
+                identity,
+                next_sequence,
+                size,
+                transport,
+            ),
+        ));
         // Claim/Attach completed before staging construction and may postdate
         // an otherwise fresh shared snapshot. Never publish a new pane
         // against a cache that could still describe the pre-claim fleet.
@@ -4424,8 +4414,8 @@ mod tests {
     };
     use mux::guardian_protocol::{
         GuardianCheckpointChunkDelivery, GuardianCheckpointStageKindV1,
-        GuardianReplayOutputRecordsDelivery, GuardianReplayPhaseV1,
-        GuardianReplayRecordDelivery, GuardianReplayRecordMetadataV1,
+        GuardianReplayOutputRecordsDelivery, GuardianReplayPhaseV1, GuardianReplayRecordDelivery,
+        GuardianReplayRecordMetadataV1,
     };
     use mux::pane::{Pane, alloc_pane_id};
     use std::collections::VecDeque;
@@ -5606,9 +5596,8 @@ mod tests {
         let fixture = capture_record_checkpoint_fixture();
         let descriptor = fixture.descriptor;
         let expected_payload_bytes = fixture.checkpoint.len();
-        let expected_payload_digest = <[u8; 32]>::from(Sha256::digest(
-            fixture.checkpoint.as_slice(),
-        ));
+        let expected_payload_digest =
+            <[u8; 32]>::from(Sha256::digest(fixture.checkpoint.as_slice()));
         let total_chunks = u32::try_from(
             descriptor
                 .total_bytes()
@@ -5900,10 +5889,7 @@ mod tests {
         let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
             .expect("derive multi-record tail boundary");
         let replay_state = Arc::new(Mutex::new(FakeReplayState {
-            pages: VecDeque::from([tail_output_page_records(
-                &fixture,
-                &[b"first", b"second"],
-            )]),
+            pages: VecDeque::from([tail_output_page_records(&fixture, &[b"first", b"second"])]),
             replay_io_failures: 0,
             ack_io_failures: 0,
             requests: Vec::new(),

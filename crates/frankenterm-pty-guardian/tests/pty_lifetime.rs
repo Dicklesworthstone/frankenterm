@@ -182,12 +182,9 @@ fn replay_resume_wait_wakes_on_durable_output_and_expires_at_its_deadline() -> a
             && claimed_lease.next_sequence() == 1,
         "guardian returned an unexpected replay-wait claim capability"
     );
-    let attached_lease = GuardianClient::connect(
-        &socket_path,
-        &token_path,
-        claimed_lease.mux_incarnation(),
-    )?
-    .attach(pane_id, claimed_lease.generation(), Uuid::new_v4())?;
+    let attached_lease =
+        GuardianClient::connect(&socket_path, &token_path, claimed_lease.mux_incarnation())?
+            .attach(pane_id, claimed_lease.generation(), Uuid::new_v4())?;
     anyhow::ensure!(
         attached_lease.guardian_incarnation() == claimed_lease.guardian_incarnation()
             && attached_lease.mux_incarnation() == claimed_lease.mux_incarnation()

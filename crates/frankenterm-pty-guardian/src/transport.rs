@@ -2294,10 +2294,7 @@ impl GuardianClient {
         else {
             return Err(GuardianClientError::UnexpectedReply);
         };
-        if attached_pane_id != pane_id
-            || attached_generation != generation
-            || next_sequence == 0
-        {
+        if attached_pane_id != pane_id || attached_generation != generation || next_sequence == 0 {
             return Err(GuardianClientError::UnexpectedReply);
         }
         Ok(GuardianClaimedPaneLease {
