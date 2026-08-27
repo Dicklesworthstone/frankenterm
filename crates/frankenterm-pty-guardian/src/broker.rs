@@ -3169,15 +3169,16 @@ fn reconcile_broker_catalog_under_token_authority_with_hook(
 /// withheld, and every namespace collision with recovered state is
 /// quarantined. Exact Spawn acknowledgement is serialized through the same
 /// durability worker and transfers the retained PTY into live-pane authority.
-/// Live Census rows retain exact PTY and lease availability, while proxy
-/// effects, connection-EOF lease fencing, and successor rotation remain
-/// disabled until their durable ownership transitions are integrated and
-/// proven together.
+/// Live Census rows retain exact PTY and lease availability, and authenticated
+/// owner-connection EOF fences the corresponding logical lease. Proxy effects
+/// and successor rotation remain disabled until their durable ownership
+/// transitions are integrated and proven together.
 struct BrokerLiveSpawnV1 {
     fingerprint: BrokerSpawnWorkerFingerprintV1,
     ack_id: Uuid,
     journal: BrokerSpawnJournalV1,
     adoption: Box<BrokerAdoptionV1>,
+    last_lease_mux_incarnation: Uuid,
 }
 
 impl BrokerLiveSpawnV1 {
@@ -3233,6 +3234,7 @@ impl BrokerLiveSpawnV1 {
                 ack_id: acknowledgement_fingerprint.ack_id,
                 journal,
                 adoption,
+                last_lease_mux_incarnation: fingerprint.binding.mux_incarnation,
             }),
             outcome => Err(Box::new(BrokerSpawnAckWorkerCompletionV1 {
                 fingerprint: acknowledgement_fingerprint,
@@ -3250,9 +3252,6 @@ impl BrokerLiveSpawnV1 {
     fn census_entry(&self) -> Result<BrokerCensusEntryV1, BrokerControlProtocolError> {
         let status = self.journal.status();
         let pane_status = self.adoption.pane.status();
-        let Some(owner_mux_incarnation) = pane_status.owner_mux_incarnation else {
-            return Err(BrokerControlProtocolError::InvalidShape);
-        };
         let identity = status.identity;
         let binding = self.fingerprint.binding;
         if !matches!(status.tail, BrokerSpawnWalTailV1::Clean)
@@ -3266,7 +3265,6 @@ impl BrokerLiveSpawnV1 {
             || identity.durable_pane_id() != binding.durable_pane_id
             || identity.spawn_effect_id() != binding.spawn_effect_id
             || identity.origin_request_id() != binding.origin_request_id
-            || pane_status.lifecycle != BrokerPaneLifecycleV1::Active
             || pane_status.child_identity.durable_pane_id != binding.durable_pane_id
             || pane_status.child_identity.spawn_effect_id != binding.spawn_effect_id
             || pane_status.lease_generation == 0
@@ -3274,6 +3272,41 @@ impl BrokerLiveSpawnV1 {
         {
             return Err(BrokerControlProtocolError::InvalidShape);
         }
+        let (disposition, effects_disabled, lease_available, output_replay_available) =
+            match pane_status.lifecycle {
+                BrokerPaneLifecycleV1::Active
+                    if pane_status.owner_mux_incarnation
+                        == Some(self.last_lease_mux_incarnation) =>
+                {
+                    (
+                        BrokerCensusDispositionV1::ReplyAcknowledgedPtyAvailable,
+                        false,
+                        true,
+                        true,
+                    )
+                }
+                BrokerPaneLifecycleV1::AwaitingSuccessor
+                    if pane_status.owner_mux_incarnation.is_none() =>
+                {
+                    (
+                        BrokerCensusDispositionV1::ReplyAcknowledgedAwaitingSuccessor,
+                        true,
+                        false,
+                        false,
+                    )
+                }
+                BrokerPaneLifecycleV1::Quarantined(_)
+                    if pane_status.owner_mux_incarnation.is_none() =>
+                {
+                    (
+                        BrokerCensusDispositionV1::ReplyAcknowledgedQuarantined,
+                        true,
+                        false,
+                        false,
+                    )
+                }
+                _ => return Err(BrokerControlProtocolError::InvalidShape),
+            };
         let entry = BrokerCensusEntryV1 {
             journal_id: identity.journal_id(),
             mux_incarnation: identity.mux_incarnation(),
@@ -3281,7 +3314,7 @@ impl BrokerLiveSpawnV1 {
             spawn_effect_id: identity.spawn_effect_id(),
             origin_request_id: identity.origin_request_id(),
             phase: status.phase,
-            disposition: BrokerCensusDispositionV1::ReplyAcknowledgedPtyAvailable,
+            disposition,
             attempt_id: status.attempt_id,
             child_identity: status.child_identity,
             reply_ack_id: status.reply_ack_id,
@@ -3290,15 +3323,41 @@ impl BrokerLiveSpawnV1 {
             committed_head_bytes: status.committed_head_bytes,
             append_authority_withheld: false,
             head_reconciliation_required: false,
-            effects_disabled: false,
+            effects_disabled,
             pty_available: true,
-            lease_available: true,
-            output_replay_available: true,
-            owner_mux_incarnation: Some(owner_mux_incarnation),
+            lease_available,
+            output_replay_available,
+            owner_mux_incarnation: Some(self.last_lease_mux_incarnation),
             lease_generation: pane_status.lease_generation,
         };
         entry.validate()?;
         Ok(entry)
+    }
+
+    fn observes_owner(
+        &self,
+        owner: BrokerGuardianOwnerIdentity,
+    ) -> Option<BrokerAttachmentIdentityV1> {
+        self.adoption
+            .pane
+            .active_attachment_identity()
+            .filter(|attachment| attachment.owner == owner)
+    }
+
+    fn observe_owner_eof(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+    ) -> Result<Option<BrokerControlEofOutcomeV1>, BrokerError> {
+        let Some(attachment) = self.observes_owner(owner) else {
+            return Ok(None);
+        };
+        self.last_lease_mux_incarnation = owner.mux_incarnation;
+        self.adoption
+            .pane
+            .observe_authenticated_control_eof(
+                BrokerAuthenticatedControlEofV1::from_authenticated_transport_close(attachment),
+            )
+            .map(Some)
     }
 }
 
@@ -3338,6 +3397,8 @@ pub struct BrokerControlServiceV1 {
     poll_interval: Duration,
     rejected_connections: u64,
     expired_unauthenticated_connections: u64,
+    fenced_live_leases: u64,
+    quarantined_live_leases: u64,
 }
 
 impl BrokerControlServiceV1 {
@@ -3548,6 +3609,8 @@ impl BrokerControlServiceV1 {
             poll_interval: config.poll_interval,
             rejected_connections: 0,
             expired_unauthenticated_connections: 0,
+            fenced_live_leases: 0,
+            quarantined_live_leases: 0,
         })
     }
 
@@ -3564,6 +3627,16 @@ impl BrokerControlServiceV1 {
     #[must_use]
     pub const fn expired_unauthenticated_connections(&self) -> u64 {
         self.expired_unauthenticated_connections
+    }
+
+    #[must_use]
+    pub const fn fenced_live_leases(&self) -> u64 {
+        self.fenced_live_leases
+    }
+
+    #[must_use]
+    pub const fn quarantined_live_leases(&self) -> u64 {
+        self.quarantined_live_leases
     }
 
     pub fn run_forever(&mut self) -> Result<(), BrokerControlServiceError> {
@@ -4116,11 +4189,34 @@ impl BrokerControlServiceV1 {
                 )
                 .map_err(|_| ());
             }
-            return self.successful_spawn_response(
-                request.header,
-                BrokerControlResponseStatusV1::Recovered,
-                live.adoption.pane.kernel_child_identity(),
-            );
+            let pane_status = live.adoption.pane.status();
+            return if pane_status.lifecycle == BrokerPaneLifecycleV1::Active
+                && live.observes_owner(owner).is_some()
+            {
+                self.successful_spawn_response(
+                    request.header,
+                    BrokerControlResponseStatusV1::Recovered,
+                    live.adoption.pane.kernel_child_identity(),
+                    pane_status.lease_generation,
+                )
+            } else if pane_status.lifecycle == BrokerPaneLifecycleV1::AwaitingSuccessor
+                && live.last_lease_mux_incarnation == owner.mux_incarnation
+            {
+                BrokerControlResponseV1::new(
+                    self.response_header(request.header, BrokerControlResponseStatusV1::Retryable),
+                    &[],
+                )
+                .map_err(|_| ())
+            } else {
+                BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ())
+            };
         }
         if let Some(retained) = self.retained_spawns.get(&durable_pane_id) {
             if retained.fingerprint != fingerprint {
@@ -4139,6 +4235,7 @@ impl BrokerControlServiceV1 {
                         request.header,
                         BrokerControlResponseStatusV1::Recovered,
                         adoption.pane.kernel_child_identity(),
+                        1,
                     ),
                 _ => BrokerControlResponseV1::new(
                     self.response_header(
@@ -4235,9 +4332,10 @@ impl BrokerControlServiceV1 {
         request: BrokerControlRequestHeaderV1,
         status: BrokerControlResponseStatusV1,
         child_identity: BrokerKernelChildIdentityV1,
+        lease_generation: u64,
     ) -> Result<BrokerControlResponseV1, ()> {
         let mut header = self.response_header(request, status);
-        header.lease_generation = 1;
+        header.lease_generation = lease_generation;
         header.child_identity = Some(child_identity);
         BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
     }
@@ -4602,7 +4700,7 @@ impl BrokerControlServiceV1 {
         request: &BrokerControlRequestV1,
     ) -> Result<BrokerControlResponseV1, ()> {
         if let Some(live) = self.live_spawns.get(&request.header.durable_pane_id)
-            && live.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+            && live.last_lease_mux_incarnation == owner.mux_incarnation
         {
             if live.fingerprint.binding.spawn_effect_id != request.header.operation_id {
                 return BrokerControlResponseV1::new(
@@ -4614,9 +4712,23 @@ impl BrokerControlServiceV1 {
                 )
                 .map_err(|_| ());
             }
-            let mut header =
-                self.response_header(request.header, BrokerControlResponseStatusV1::Recovered);
-            header.lease_generation = live.adoption.pane.status().lease_generation;
+            let pane_status = live.adoption.pane.status();
+            let status = match pane_status.lifecycle {
+                BrokerPaneLifecycleV1::Active if live.observes_owner(owner).is_some() => {
+                    BrokerControlResponseStatusV1::Recovered
+                }
+                BrokerPaneLifecycleV1::AwaitingSuccessor => {
+                    BrokerControlResponseStatusV1::Retryable
+                }
+                BrokerPaneLifecycleV1::Quarantined(_)
+                | BrokerPaneLifecycleV1::FinalTerminalEof
+                | BrokerPaneLifecycleV1::FinalTerminalEofPending
+                | BrokerPaneLifecycleV1::Active => BrokerControlResponseStatusV1::Quarantined,
+            };
+            let mut header = self.response_header(request.header, status);
+            if status == BrokerControlResponseStatusV1::Recovered {
+                header.lease_generation = pane_status.lease_generation;
+            }
             return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
         }
         if let Some(retained) = self.retained_spawns.get(&request.header.durable_pane_id) {
@@ -4766,9 +4878,7 @@ impl BrokerControlServiceV1 {
         let live_count = self
             .live_spawns
             .values()
-            .filter(|live| {
-                live.adoption.pane.status().owner_mux_incarnation == Some(owner.mux_incarnation)
-            })
+            .filter(|live| live.last_lease_mux_incarnation == owner.mux_incarnation)
             .count();
         let total_entries = recovered.len().checked_add(live_count).ok_or(())?;
         if total_entries > GUARDIAN_MAX_PANES {
@@ -4778,7 +4888,7 @@ impl BrokerControlServiceV1 {
         entries.try_reserve_exact(total_entries).map_err(|_| ())?;
         entries.extend_from_slice(recovered);
         for live in self.live_spawns.values() {
-            if live.adoption.pane.status().owner_mux_incarnation == Some(owner.mux_incarnation) {
+            if live.last_lease_mux_incarnation == owner.mux_incarnation {
                 entries.push(live.census_entry().map_err(|_| ())?);
             }
         }
@@ -4914,6 +5024,23 @@ impl BrokerControlServiceV1 {
                 mux_build_identity_digest: hello.mux_build_identity_digest,
                 guardian_build_identity_digest: hello.guardian_build_identity_digest,
             };
+            let mut fenced_live_leases = 0_u64;
+            let mut quarantined_live_leases = 0_u64;
+            for live in self.live_spawns.values_mut() {
+                match live.observe_owner_eof(owner) {
+                    Ok(Some(BrokerControlEofOutcomeV1::AwaitingSuccessor { .. })) => {
+                        fenced_live_leases = fenced_live_leases.saturating_add(1);
+                    }
+                    Ok(Some(BrokerControlEofOutcomeV1::AlreadyObserved) | None) => {}
+                    Err(_) => {
+                        quarantined_live_leases = quarantined_live_leases.saturating_add(1);
+                    }
+                }
+            }
+            self.fenced_live_leases = self.fenced_live_leases.saturating_add(fenced_live_leases);
+            self.quarantined_live_leases = self
+                .quarantined_live_leases
+                .saturating_add(quarantined_live_leases);
             self.census_snapshots
                 .retain(|_, snapshot| snapshot.owner != owner);
             if let Some(receipt) = self.hello_receipts.get_mut(&hello.request_id) {
@@ -6351,6 +6478,8 @@ pub enum BrokerCensusDispositionV1 {
     SpawnObservedPtyUnavailable = 4,
     ReplyAcknowledgedPtyUnavailable = 5,
     ReplyAcknowledgedPtyAvailable = 6,
+    ReplyAcknowledgedAwaitingSuccessor = 7,
+    ReplyAcknowledgedQuarantined = 8,
 }
 
 impl BrokerCensusDispositionV1 {
@@ -6362,6 +6491,8 @@ impl BrokerCensusDispositionV1 {
             4 => Ok(Self::SpawnObservedPtyUnavailable),
             5 => Ok(Self::ReplyAcknowledgedPtyUnavailable),
             6 => Ok(Self::ReplyAcknowledgedPtyAvailable),
+            7 => Ok(Self::ReplyAcknowledgedAwaitingSuccessor),
+            8 => Ok(Self::ReplyAcknowledgedQuarantined),
             _ => Err(BrokerControlProtocolError::InvalidShape),
         }
     }
@@ -6519,6 +6650,24 @@ impl BrokerCensusEntryV1 {
                 && self.pty_available
                 && self.lease_available
                 && self.output_replay_available
+                && self.owner_mux_incarnation.is_some()
+                && self.lease_generation > 0 =>
+            {
+                4
+            }
+            (
+                Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged),
+                BrokerCensusDispositionV1::ReplyAcknowledgedAwaitingSuccessor
+                | BrokerCensusDispositionV1::ReplyAcknowledgedQuarantined,
+            ) if self.attempt_id.is_some()
+                && self.child_identity.is_some()
+                && self.reply_ack_id.is_some()
+                && !self.append_authority_withheld
+                && !self.head_reconciliation_required
+                && self.effects_disabled
+                && self.pty_available
+                && !self.lease_available
+                && !self.output_replay_available
                 && self.owner_mux_incarnation.is_some()
                 && self.lease_generation > 0 =>
             {
@@ -12212,6 +12361,16 @@ impl BrokerAdoptedPaneV1 {
         }
     }
 
+    const fn active_attachment_identity(&self) -> Option<BrokerAttachmentIdentityV1> {
+        match self.lease {
+            BrokerLeaseState::Active { attachment } => Some(attachment),
+            BrokerLeaseState::AwaitingSuccessor { .. }
+            | BrokerLeaseState::Quarantined { .. }
+            | BrokerLeaseState::FinalTerminalEof { .. }
+            | BrokerLeaseState::FinalTerminalEofPending { .. } => None,
+        }
+    }
+
     #[must_use]
     pub fn resource_usage(&self) -> BrokerResourceUsageV1 {
         let live_guardian_leases = match self.lease {
@@ -17595,6 +17754,42 @@ mod tests {
             "control retry created more than one child"
         );
         drop(client);
+        let mut reconnect = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            connection_identity,
+            broker_build,
+        )
+        .expect("reconnect exact mux after acknowledged owner EOF");
+        let eof_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match reconnect
+                .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("query live Spawn while predecessor connection is fenced")
+            {
+                BrokerSpawnEffectQueryV1::Pending => break,
+                BrokerSpawnEffectQueryV1::Quarantined if Instant::now() < eof_deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                outcome => panic!("owner EOF did not fence the live lease: {outcome:?}"),
+            }
+        }
+        let awaiting_census = reconnect
+            .census()
+            .expect("collect awaiting-successor live Spawn Census");
+        let [awaiting_entry] = awaiting_census.entries() else {
+            panic!("awaiting-successor Census did not contain exactly one live pane")
+        };
+        assert_eq!(
+            awaiting_entry.disposition,
+            BrokerCensusDispositionV1::ReplyAcknowledgedAwaitingSuccessor
+        );
+        assert_eq!(awaiting_entry.lease_generation, 2);
+        assert!(awaiting_entry.effects_disabled);
+        assert!(awaiting_entry.pty_available);
+        assert!(!awaiting_entry.lease_available);
+        assert!(!awaiting_entry.output_replay_available);
+        drop(reconnect);
         service.finish();
 
         let secret = crate::transport::load_guardian_secret(&token_path)
