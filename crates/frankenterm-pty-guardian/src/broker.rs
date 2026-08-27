@@ -51,7 +51,9 @@
 #![allow(dead_code)] // Activation is intentionally held for the cross-process tranche.
 
 use crate::SealedAtomicBuildIdentity;
-use crate::output::{GuardianPaneOutputJournal, GuardianPublishedGenesisAdmissionPermitV1};
+use crate::output::{
+    GuardianOutputPipeline, GuardianPaneOutputJournal, GuardianPublishedGenesisAdmissionPermitV1,
+};
 use crate::transport::{
     GuardianServiceError, GuardianTokenPathAuthority, SocketPathAuthority,
     bind_private_unix_listener, load_guardian_secret, load_guardian_secret_with_authority,
@@ -60,7 +62,7 @@ use crate::transport::{
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mio::net::{UnixListener, UnixStream};
 use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
 use mux::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalTail,
@@ -88,6 +90,9 @@ use std::os::unix::prelude::AsRawFd as _;
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
@@ -2275,6 +2280,361 @@ struct BrokerReadyEventV1 {
 #[derive(Clone, Copy)]
 struct BrokerCensusSnapshotV1 {
     owner: BrokerGuardianOwnerIdentity,
+}
+
+/// Complete identity of one admitted Spawn while it is owned by the broker's
+/// capacity-one durability worker.
+///
+/// The canonical payload is committed by `binding`; retaining the complete
+/// authenticated control header additionally prevents a retry from changing
+/// connection, build, mux, request, pane, or effect authority while claiming
+/// to be the same in-flight operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerSpawnWorkerFingerprintV1 {
+    header: BrokerControlRequestHeaderV1,
+    journal_id: Uuid,
+    attempt_id: Uuid,
+    catalog_candidate_checksum: [u8; BROKER_CATALOG_CHECKSUM_BYTES],
+    binding: BrokerGenesisBinding,
+}
+
+/// Non-cloneable ownership transfer from the readiness loop to the sole Spawn
+/// durability worker.
+struct BrokerSpawnWorkerJobV1 {
+    fingerprint: BrokerSpawnWorkerFingerprintV1,
+    owner: BrokerGuardianOwnerIdentity,
+    request: BrokerSpawnControlRequestV1,
+}
+
+impl BrokerSpawnWorkerJobV1 {
+    fn new(
+        broker_incarnation: Uuid,
+        header: BrokerControlRequestHeaderV1,
+        owner: BrokerGuardianOwnerIdentity,
+        request: BrokerSpawnControlRequestV1,
+    ) -> Result<Self, BrokerControlProtocolError> {
+        request.validate()?;
+        request.validate_control_header(header)?;
+        if broker_incarnation.is_nil()
+            || header.broker_incarnation != broker_incarnation
+            || !owner.is_valid()
+            || owner.guardian_incarnation != header.guardian_incarnation
+            || owner.connection_id != header.connection_id
+            || owner.mux_incarnation != header.mux_incarnation
+            || owner.guardian_build_identity_digest != header.guardian_build_identity_digest
+            || owner.mux_build_identity_digest != header.mux_build_identity_digest
+        {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        let fingerprint = BrokerSpawnWorkerFingerprintV1 {
+            header,
+            journal_id: request.journal_id,
+            attempt_id: request.attempt_id,
+            catalog_candidate_checksum: request.catalog_candidate_checksum,
+            binding: request.binding,
+        };
+        Ok(Self {
+            fingerprint,
+            owner,
+            request,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerSpawnWorkerSubmissionV1 {
+    Submitted,
+    RecoveredInFlight,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerSpawnWorkerSubmitErrorV1 {
+    ConflictingInFlight,
+    Saturated,
+    Disconnected,
+    Poisoned,
+}
+
+enum BrokerSpawnWorkerFailureV1 {
+    Identity(BrokerSpawnWalError),
+    Catalog(BrokerSpawnWalError),
+    Output(crate::output::GuardianOutputError),
+    Broker(BrokerError),
+    Commit(BrokerDurableSpawnCommitErrorV1),
+}
+
+enum BrokerSpawnWorkerOutcomeV1 {
+    Applied {
+        journal: BrokerSpawnJournalV1,
+        adoption: Box<BrokerAdoptionV1>,
+        spawn_observed: BrokerSpawnWalReceiptV1,
+    },
+    Reconciled {
+        journal: BrokerSpawnJournalV1,
+        status: BrokerSpawnWalStatusV1,
+    },
+    OutcomeIndeterminate {
+        journal: BrokerSpawnJournalV1,
+        reason: BrokerDurableExecBarrierIndeterminateReasonV1,
+        retained: Option<BrokerExecBarrierRetainedV1>,
+        status: BrokerSpawnWalStatusV1,
+        callback_error: Option<BrokerError>,
+    },
+    FailedBeforeDurableAttempt {
+        journal: Option<BrokerSpawnJournalV1>,
+        error: BrokerSpawnWorkerFailureV1,
+    },
+}
+
+struct BrokerSpawnWorkerCompletionV1 {
+    fingerprint: BrokerSpawnWorkerFingerprintV1,
+    outcome: BrokerSpawnWorkerOutcomeV1,
+}
+
+enum BrokerSpawnWorkerCompletionStateV1 {
+    Ready(Box<BrokerSpawnWorkerCompletionV1>),
+    Empty,
+    Disconnected,
+    Poisoned,
+}
+
+struct BrokerSpawnWorkerStateV1 {
+    spawn_catalog: BrokerSpawnWalCatalogV1,
+    spawn_authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    output_pipeline: GuardianOutputPipeline,
+    exec_launch: BrokerExecBootstrapLaunchV1,
+    broker_incarnation: Uuid,
+    limits: BrokerResourceLimitsV1,
+}
+
+impl BrokerSpawnWorkerStateV1 {
+    fn execute(&mut self, job: BrokerSpawnWorkerJobV1) -> BrokerSpawnWorkerCompletionV1 {
+        let BrokerSpawnWorkerJobV1 {
+            fingerprint,
+            owner,
+            request,
+        } = job;
+        let BrokerSpawnControlRequestV1 {
+            journal_id,
+            attempt_id,
+            catalog_candidate_checksum,
+            binding,
+            payload,
+        } = request;
+        let identity = match BrokerSpawnWalIdentityV1::from_binding(
+            journal_id,
+            self.spawn_authenticator.lineage_id(),
+            binding,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return BrokerSpawnWorkerCompletionV1 {
+                    fingerprint,
+                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                        journal: None,
+                        error: BrokerSpawnWorkerFailureV1::Identity(error),
+                    },
+                };
+            }
+        };
+        let mut journal = match self
+            .spawn_catalog
+            .create_spawn_journal(identity, self.spawn_authenticator.clone())
+        {
+            Ok(journal) => journal,
+            Err(error) => {
+                return BrokerSpawnWorkerCompletionV1 {
+                    fingerprint,
+                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                        journal: None,
+                        error: BrokerSpawnWorkerFailureV1::Catalog(error),
+                    },
+                };
+            }
+        };
+        let published_output = match self
+            .output_pipeline
+            .prepare_pane(owner.guardian_incarnation, binding.durable_pane_id)
+        {
+            Ok(published_output) => published_output,
+            Err(error) => {
+                return BrokerSpawnWorkerCompletionV1 {
+                    fingerprint,
+                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                        journal: Some(journal),
+                        error: BrokerSpawnWorkerFailureV1::Output(error),
+                    },
+                };
+            }
+        };
+        let authority = BrokerAuthenticatedGuardianConnectionV1 {
+            broker_incarnation: self.broker_incarnation,
+            owner,
+        };
+        let (prepared, control) = match BrokerPreparedPaneV1::prepare_binding(
+            binding,
+            payload,
+            &authority,
+            self.limits,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return BrokerSpawnWorkerCompletionV1 {
+                    fingerprint,
+                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                        journal: Some(journal),
+                        error: BrokerSpawnWorkerFailureV1::Broker(error),
+                    },
+                };
+            }
+        };
+        let prepared = match prepared.bind_fresh_published_output_journal(published_output) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return BrokerSpawnWorkerCompletionV1 {
+                    fingerprint,
+                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                        journal: Some(journal),
+                        error: BrokerSpawnWorkerFailureV1::Broker(error),
+                    },
+                };
+            }
+        };
+        let proof = BrokerDurablePreSpawnIntentProof {
+            binding,
+            catalog_candidate_checksum,
+        };
+        let outcome = match prepared.commit_with_exec_barrier_wal_proof(
+            control,
+            &proof,
+            &mut journal,
+            attempt_id,
+            &self.exec_launch,
+        ) {
+            Ok(BrokerDurableExecBarrierCommitV1::Applied {
+                adoption,
+                spawn_observed,
+            }) => BrokerSpawnWorkerOutcomeV1::Applied {
+                journal,
+                adoption,
+                spawn_observed,
+            },
+            Ok(BrokerDurableExecBarrierCommitV1::Reconciled(status)) => {
+                BrokerSpawnWorkerOutcomeV1::Reconciled { journal, status }
+            }
+            Ok(BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate {
+                reason,
+                retained,
+                status,
+                callback_error,
+            }) => BrokerSpawnWorkerOutcomeV1::OutcomeIndeterminate {
+                journal,
+                reason,
+                retained,
+                status,
+                callback_error,
+            },
+            Err(error) => BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                journal: Some(journal),
+                error: BrokerSpawnWorkerFailureV1::Commit(error),
+            },
+        };
+        BrokerSpawnWorkerCompletionV1 {
+            fingerprint,
+            outcome,
+        }
+    }
+}
+
+/// One blocking durability lane for Spawn. The active fingerprint is retained
+/// until the readiness loop consumes the completion, so neither a fast worker
+/// nor a lost wakeup can admit a second PTY while the first result is pending.
+struct BrokerSpawnWorkerV1 {
+    jobs: SyncSender<BrokerSpawnWorkerJobV1>,
+    completions: Receiver<BrokerSpawnWorkerCompletionV1>,
+    active: Arc<Mutex<Option<BrokerSpawnWorkerFingerprintV1>>>,
+    _join: JoinHandle<()>,
+}
+
+impl BrokerSpawnWorkerV1 {
+    fn start(
+        mut state: BrokerSpawnWorkerStateV1,
+        completion_waker: Arc<Waker>,
+    ) -> Result<Self, BrokerControlServiceError> {
+        if state.broker_incarnation.is_nil() {
+            return Err(BrokerControlServiceError::InvalidConfiguration(
+                "Spawn worker broker incarnation is nil",
+            ));
+        }
+        let (job_tx, job_rx) = sync_channel(1);
+        let (completion_tx, completion_rx) = sync_channel(1);
+        let active = Arc::new(Mutex::new(None));
+        let join = std::thread::Builder::new()
+            .name("ft-broker-spawn".to_string())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let completion = state.execute(job);
+                    if completion_tx.send(completion).is_err() {
+                        break;
+                    }
+                    let _ = completion_waker.wake();
+                }
+            })
+            .map_err(|error| BrokerControlServiceError::io("spawn-worker-start", error))?;
+        Ok(Self {
+            jobs: job_tx,
+            completions: completion_rx,
+            active,
+            _join: join,
+        })
+    }
+
+    fn try_submit(
+        &self,
+        job: BrokerSpawnWorkerJobV1,
+    ) -> Result<BrokerSpawnWorkerSubmissionV1, BrokerSpawnWorkerSubmitErrorV1> {
+        let fingerprint = job.fingerprint;
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| BrokerSpawnWorkerSubmitErrorV1::Poisoned)?;
+        if let Some(current) = *active {
+            return if current == fingerprint {
+                Ok(BrokerSpawnWorkerSubmissionV1::RecoveredInFlight)
+            } else {
+                Err(BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight)
+            };
+        }
+        *active = Some(fingerprint);
+        match self.jobs.try_send(job) {
+            Ok(()) => Ok(BrokerSpawnWorkerSubmissionV1::Submitted),
+            Err(TrySendError::Full(_)) => {
+                *active = None;
+                Err(BrokerSpawnWorkerSubmitErrorV1::Saturated)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                *active = None;
+                Err(BrokerSpawnWorkerSubmitErrorV1::Disconnected)
+            }
+        }
+    }
+
+    fn try_completion(&self) -> BrokerSpawnWorkerCompletionStateV1 {
+        match self.completions.try_recv() {
+            Ok(completion) => {
+                let Ok(mut active) = self.active.lock() else {
+                    return BrokerSpawnWorkerCompletionStateV1::Poisoned;
+                };
+                if *active != Some(completion.fingerprint) {
+                    return BrokerSpawnWorkerCompletionStateV1::Poisoned;
+                }
+                *active = None;
+                BrokerSpawnWorkerCompletionStateV1::Ready(Box::new(completion))
+            }
+            Err(TryRecvError::Empty) => BrokerSpawnWorkerCompletionStateV1::Empty,
+            Err(TryRecvError::Disconnected) => BrokerSpawnWorkerCompletionStateV1::Disconnected,
+        }
+    }
 }
 
 /// Fail-closed admission of the complete recovered Spawn catalog.
@@ -11446,6 +11806,29 @@ mod tests {
             .unwrap_or_else(|_| "no child diagnostic was published".to_owned())
     }
 
+    fn spawn_worker_completion(
+        worker: &BrokerSpawnWorkerV1,
+    ) -> BrokerSpawnWorkerCompletionV1 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match worker.try_completion() {
+                BrokerSpawnWorkerCompletionStateV1::Ready(completion) => return *completion,
+                BrokerSpawnWorkerCompletionStateV1::Empty if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                BrokerSpawnWorkerCompletionStateV1::Empty => {
+                    panic!("broker Spawn worker completion timed out")
+                }
+                BrokerSpawnWorkerCompletionStateV1::Disconnected => {
+                    panic!("broker Spawn worker disconnected")
+                }
+                BrokerSpawnWorkerCompletionStateV1::Poisoned => {
+                    panic!("broker Spawn worker authority was poisoned")
+                }
+            }
+        }
+    }
+
     fn exec_bootstrap_identity(
         payload: &GuardianSpawnPayload,
         authority: &BrokerAuthenticatedGuardianConnectionV1,
@@ -14995,6 +15378,138 @@ mod tests {
         mutated[72 + 72] ^= 1;
         assert!(BrokerSpawnControlRequestV1::decode(&mutated).is_err());
         assert!(!sentinel.exists(), "control decode launched a user child");
+    }
+
+    #[test]
+    fn capacity_one_spawn_worker_recovers_exact_inflight_retry_and_spawns_once() {
+        let root = private_catalog_directory().keep();
+        let catalog_path = root.join("spawn-catalog");
+        fs::create_dir(&catalog_path).expect("create Spawn catalog directory");
+        fs::set_permissions(&catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("make Spawn catalog private");
+        let token_path = root.join("broker.token");
+        let (exec_launch, spawn_authenticator) =
+            unit_test_exec_bootstrap_launch(&token_path, 0xd1);
+        let poll = Poll::new().expect("create Spawn worker completion poll");
+        let completion_waker = Arc::new(
+            Waker::new(poll.registry(), Token(1)).expect("create Spawn worker completion waker"),
+        );
+        let output_pipeline = GuardianOutputPipeline::open(
+            &token_path,
+            1,
+            Arc::clone(&completion_waker),
+        )
+        .expect("open Spawn worker output pipeline");
+        let spawn_catalog =
+            BrokerSpawnWalCatalogV1::open(catalog_path).expect("open Spawn worker catalog");
+        let broker_incarnation = id(7_201);
+        let authority = authority(
+            broker_incarnation,
+            id(7_202),
+            id(7_203),
+            id(7_204),
+            0xd2,
+            0xd3,
+        );
+        let sentinel = root.join("spawn-worker-count");
+        let payload = command_payload(
+            "printf W >>\"$BROKER_SENTINEL\"; IFS= read -r ignored",
+            &sentinel,
+        );
+        let binding = binding_for(&payload, &authority);
+        let control_spawn = BrokerSpawnControlRequestV1::from_parts(
+            id(7_205),
+            id(7_206),
+            [0xd4; BROKER_CATALOG_CHECKSUM_BYTES],
+            binding,
+            payload,
+        )
+        .expect("construct worker Spawn request");
+        let encoded_spawn = control_spawn.encode().expect("encode worker Spawn request");
+        let header = BrokerControlRequestHeaderV1 {
+            operation: BrokerControlOperationV1::Spawn,
+            request_id: id(7_207),
+            broker_incarnation,
+            guardian_incarnation: authority.owner.guardian_incarnation,
+            connection_id: authority.owner.connection_id,
+            mux_incarnation: authority.owner.mux_incarnation,
+            guardian_build_identity_digest: authority.owner.guardian_build_identity_digest,
+            mux_build_identity_digest: authority.owner.mux_build_identity_digest,
+            durable_pane_id: binding.durable_pane_id,
+            lease_generation: 0,
+            operation_id: binding.spawn_effect_id,
+        };
+        let make_job = |header| {
+            let request = BrokerSpawnControlRequestV1::decode(&encoded_spawn)
+                .expect("decode independent worker Spawn authority");
+            BrokerSpawnWorkerJobV1::new(
+                broker_incarnation,
+                header,
+                authority.owner,
+                request,
+            )
+            .expect("construct authenticated worker job")
+        };
+        let worker = BrokerSpawnWorkerV1::start(
+            BrokerSpawnWorkerStateV1 {
+                spawn_catalog,
+                spawn_authenticator,
+                output_pipeline,
+                exec_launch,
+                broker_incarnation,
+                limits: BrokerResourceLimitsV1::default(),
+            },
+            completion_waker,
+        )
+        .expect("start capacity-one Spawn worker");
+
+        assert_eq!(
+            worker.try_submit(make_job(header)),
+            Ok(BrokerSpawnWorkerSubmissionV1::Submitted)
+        );
+        assert_eq!(
+            worker.try_submit(make_job(header)),
+            Ok(BrokerSpawnWorkerSubmissionV1::RecoveredInFlight),
+            "exact retry enqueued a second PTY effect"
+        );
+        let mut conflicting_header = header;
+        conflicting_header.request_id = id(7_208);
+        assert_eq!(
+            worker.try_submit(make_job(conflicting_header)),
+            Err(BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight),
+            "mutated retry shared the in-flight authority"
+        );
+
+        let completion = spawn_worker_completion(&worker);
+        assert_eq!(completion.fingerprint.header, header);
+        let BrokerSpawnWorkerOutcomeV1::Applied {
+            journal,
+            adoption,
+            spawn_observed,
+        } = completion.outcome
+        else {
+            panic!("capacity-one worker did not durably apply Spawn")
+        };
+        assert_eq!(spawn_observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
+        assert_eq!(
+            journal.status().phase,
+            Some(BrokerSpawnWalPhaseV1::SpawnObserved)
+        );
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = *adoption;
+        assert_eq!(attachment.identity().lease_generation(), 1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !sentinel.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fs::read(&sentinel).expect("read worker Spawn count"),
+            b"W",
+            "one admitted Spawn created a duplicate child"
+        );
+        pane.terminate_and_wait_for_test();
     }
 
     fn private_catalog_directory() -> tempfile::TempDir {
