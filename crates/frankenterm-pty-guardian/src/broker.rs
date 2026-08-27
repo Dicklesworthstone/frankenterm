@@ -3419,10 +3419,18 @@ fn validate_broker_recovered_lease_bindings(
     }
     for lease in lease_journals {
         let lease_status = lease.status();
-        if !matches!(lease_status.tail, BrokerPaneLeaseWalTailV1::Clean)
-            || !lease_status.append_authority_withheld
-            || lease_status.head_reconciliation_required
-        {
+        let recoverable_tail = match lease_status.tail {
+            BrokerPaneLeaseWalTailV1::Clean => true,
+            BrokerPaneLeaseWalTailV1::Incomplete {
+                wal_trailing_bytes: 0,
+                head_trailing_bytes,
+            } => {
+                lease_status.head_reconciliation_required
+                    && (1..BROKER_LEASE_HEAD_RECORD_BYTES_U64).contains(&head_trailing_bytes)
+            }
+            BrokerPaneLeaseWalTailV1::Incomplete { .. } => false,
+        };
+        if !recoverable_tail || !lease_status.append_authority_withheld {
             return Err(BrokerControlServiceError::InvalidRecoveredLeaseState);
         }
         let Some(spawn) = spawn_catalog
@@ -3453,6 +3461,39 @@ fn validate_broker_recovered_lease_bindings(
         }
     }
     Ok(())
+}
+
+fn reconcile_broker_lease_catalog_under_token_authority(
+    token_authority: &mut GuardianTokenPathAuthority,
+    lease_catalog: &BrokerPaneLeaseWalCatalogV1,
+    recovered_leases: &mut [BrokerPaneLeaseJournalV1],
+) -> Result<(), BrokerControlServiceError> {
+    reconcile_broker_lease_catalog_under_token_authority_with_hook(
+        token_authority,
+        lease_catalog,
+        recovered_leases,
+        || {},
+    )
+}
+
+fn reconcile_broker_lease_catalog_under_token_authority_with_hook(
+    token_authority: &mut GuardianTokenPathAuthority,
+    lease_catalog: &BrokerPaneLeaseWalCatalogV1,
+    recovered_leases: &mut [BrokerPaneLeaseJournalV1],
+    before_reconciliation: impl FnOnce(),
+) -> Result<(), BrokerControlServiceError> {
+    let mut token_effect_lease = token_authority.acquire_effect_lease()?;
+    token_effect_lease.validate()?;
+    token_authority.validate()?;
+    before_reconciliation();
+    let result = lease_catalog
+        .reconcile_recovered_read_only(recovered_leases)
+        .map_err(BrokerControlServiceError::from);
+    let effect_validation = token_effect_lease.validate();
+    let authority_validation = token_authority.validate();
+    effect_validation?;
+    authority_validation?;
+    result
 }
 
 fn reconcile_broker_catalog_under_token_authority(
@@ -3868,7 +3909,7 @@ impl BrokerControlServiceV1 {
                 config.spawn_catalog_path,
                 &spawn_authenticator,
             )?;
-        let (lease_catalog, recovered_lease_journals) =
+        let (lease_catalog, mut recovered_lease_journals) =
             open_and_scan_broker_lease_catalog_under_token_authority(
                 &mut token_authority,
                 config.lease_catalog_path,
@@ -3877,10 +3918,19 @@ impl BrokerControlServiceV1 {
         let recovered_catalog =
             BrokerRecoveredSpawnCatalogV1::admit(recovered_journals, &spawn_authenticator)?;
         validate_broker_recovered_lease_bindings(&recovered_catalog, &recovered_lease_journals)?;
-        // Classify every recovered journal before binding, but deliberately do
-        // not reconcile its head or grant append authority. A restarted broker
-        // no longer owns the old PTY master, even when WAL proves that the old
-        // process observed a child.
+        // Cross-catalog bindings are authenticated before any lease-head
+        // mutation. Complete only the deterministic authenticated head suffix
+        // while holding token authority, then validate the resulting catalog
+        // again. Append authority remains withheld because the restarted
+        // broker no longer owns the old PTY master.
+        reconcile_broker_lease_catalog_under_token_authority(
+            &mut token_authority,
+            &lease_catalog,
+            &mut recovered_lease_journals,
+        )?;
+        validate_broker_recovered_lease_bindings(&recovered_catalog, &recovered_lease_journals)?;
+        // Spawn journals remain classified read-only. Their durable child
+        // observation does not recreate the previous process's PTY descriptor.
         let recovery_census = recovered_catalog
             .recovery_census_entries()
             .map_err(|_| BrokerControlServiceError::InvalidRecoveredSpawnState)?;
@@ -9101,6 +9151,13 @@ struct BrokerPaneLeaseWalFilesystemRevalidationV1 {
 struct BrokerPaneLeaseWalRecoveryActivationV1 {
     authority: BrokerPaneLeaseWalFilesystemRevalidationV1,
     head: Option<BrokerPaneLeaseWalHeadReconciliationV1>,
+    recovered_authority: BrokerPaneLeaseWalRecoveredAuthorityV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerPaneLeaseWalRecoveredAuthorityV1 {
+    ActivateAppend,
+    RetainWithheld,
 }
 
 struct BrokerPaneLeaseWalHeadReconciliationV1 {
@@ -10287,13 +10344,17 @@ impl BrokerPaneLeaseJournalV1 {
         &mut self,
         authority: BrokerPaneLeaseWalFilesystemRevalidationV1,
     ) -> Result<(), BrokerPaneLeaseWalErrorV1> {
-        let activation = self.preflight_recovered_head_activation(authority)?;
+        let activation = self.preflight_recovered_head_activation(
+            authority,
+            BrokerPaneLeaseWalRecoveredAuthorityV1::ActivateAppend,
+        )?;
         self.apply_recovered_head_activation(activation)
     }
 
     fn preflight_recovered_head_activation(
         &self,
         authority: BrokerPaneLeaseWalFilesystemRevalidationV1,
+        recovered_authority: BrokerPaneLeaseWalRecoveredAuthorityV1,
     ) -> Result<BrokerPaneLeaseWalRecoveryActivationV1, BrokerPaneLeaseWalErrorV1> {
         self.require_healthy_for_recovery()?;
         if authority.identity != self.identity {
@@ -10351,7 +10412,11 @@ impl BrokerPaneLeaseJournalV1 {
         } else {
             None
         };
-        Ok(BrokerPaneLeaseWalRecoveryActivationV1 { authority, head })
+        Ok(BrokerPaneLeaseWalRecoveryActivationV1 {
+            authority,
+            head,
+            recovered_authority,
+        })
     }
 
     fn apply_recovered_head_activation(
@@ -10419,7 +10484,10 @@ impl BrokerPaneLeaseJournalV1 {
             (false, None) => {}
             _ => return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch),
         }
-        self.recovery_append_authority_withheld = false;
+        self.recovery_append_authority_withheld = matches!(
+            activation.recovered_authority,
+            BrokerPaneLeaseWalRecoveredAuthorityV1::RetainWithheld
+        );
         Ok(())
     }
 
@@ -11042,6 +11110,135 @@ impl BrokerPaneLeaseWalCatalogV1 {
         }
         self.validate_pinned_directory()?;
         Ok(recovered)
+    }
+
+    /// Reconcile authenticated WAL-ahead crash cuts without restoring the
+    /// append authority that died with the previous broker process.
+    ///
+    /// Every completed marker, retained descriptor, identity, length, and
+    /// deterministic head suffix is preflighted before the first content
+    /// write. A later I/O failure can leave one exact authenticated head prefix
+    /// for the next restart to resume, but it can never make a recovered lease
+    /// writable or recreate its lost PTY effect authority.
+    fn reconcile_recovered_read_only(
+        &self,
+        recovered: &mut [BrokerPaneLeaseJournalV1],
+    ) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        self.validate_pinned_directory()?;
+        let states = self.scan_states()?;
+        if states.len() != recovered.len()
+            || recovered
+                .iter()
+                .any(|journal| !states.contains_key(&journal.identity.spawn.journal_id()))
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+
+        let mut activations = Vec::new();
+        activations
+            .try_reserve_exact(recovered.len())
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        for journal in recovered.iter() {
+            let journal_id = journal.identity.spawn.journal_id();
+            let pair = states
+                .get(&journal_id)
+                .ok_or(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch)?;
+            let completed_name = pair
+                .completed_name
+                .as_ref()
+                .ok_or(BrokerPaneLeaseWalErrorV1::IncompleteCatalogPair)?;
+            let wal_name = pair
+                .wal_name
+                .as_ref()
+                .ok_or(BrokerPaneLeaseWalErrorV1::IncompleteCatalogPair)?;
+            let head_name = pair
+                .head_name
+                .as_ref()
+                .ok_or(BrokerPaneLeaseWalErrorV1::IncompleteCatalogPair)?;
+            if pair.creating_name.is_some()
+                || *completed_name != broker_lease_catalog_completed_name(journal_id)
+                || *wal_name != broker_lease_catalog_wal_name(journal_id)
+                || *head_name != broker_lease_catalog_head_name(journal_id)
+            {
+                return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+            }
+
+            let mut marker = open_revalidated_broker_spawn_catalog_file(
+                &self.directory,
+                completed_name,
+                BROKER_LEASE_CREATION_MARKER_BYTES,
+                BROKER_LEASE_CREATION_MARKER_BYTES,
+            )?;
+            let marker_identity =
+                read_broker_lease_creation_marker(&mut marker, &journal.authenticator)?;
+            if marker_identity != journal.identity {
+                return Err(BrokerPaneLeaseWalErrorV1::IdentityMismatch);
+            }
+            revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                completed_name,
+                &marker,
+                BROKER_LEASE_CREATION_MARKER_BYTES,
+                BROKER_LEASE_CREATION_MARKER_BYTES,
+            )?;
+            let wal_identity = revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                wal_name,
+                &journal.wal,
+                BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_LEASE_WAL_MAX_PHYSICAL_BYTES,
+            )?;
+            let head_identity = revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                head_name,
+                &journal.head,
+                BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_LEASE_HEAD_MAX_PHYSICAL_BYTES,
+            )?;
+            let authority = BrokerPaneLeaseWalFilesystemRevalidationV1::from_revalidated_filesystem(
+                &journal.identity,
+                wal_identity.bytes,
+                head_identity.bytes,
+            )?;
+            activations.push(journal.preflight_recovered_head_activation(
+                authority,
+                BrokerPaneLeaseWalRecoveredAuthorityV1::RetainWithheld,
+            )?);
+        }
+        if self.scan_states()? != states {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+        self.validate_pinned_directory()?;
+
+        for (journal, activation) in recovered.iter_mut().zip(activations) {
+            journal.apply_recovered_head_activation(activation)?;
+        }
+
+        for journal in recovered.iter() {
+            let status = journal.status();
+            if status.head_reconciliation_required || !status.append_authority_withheld {
+                return Err(BrokerPaneLeaseWalErrorV1::RecoveryAuthorityUnavailable);
+            }
+            let journal_id = journal.identity.spawn.journal_id();
+            revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &broker_lease_catalog_wal_name(journal_id),
+                &journal.wal,
+                BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_LEASE_WAL_MAX_PHYSICAL_BYTES,
+            )?;
+            revalidate_open_broker_spawn_catalog_file(
+                &self.directory,
+                &broker_lease_catalog_head_name(journal_id),
+                &journal.head,
+                BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+                BROKER_LEASE_HEAD_MAX_PHYSICAL_BYTES,
+            )?;
+        }
+        if self.scan_states()? != states {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+        self.validate_pinned_directory()
     }
 
     fn create_lease_journal(
@@ -17320,22 +17517,8 @@ mod tests {
         seed: u8,
     ) -> BrokerPaneLeaseWalIdentityV1 {
         let spawn = recovered_catalog_identity(spawn_authenticator, seed);
+        let initial_attachment = lease_catalog_initial_attachment(spawn, seed);
         let base = u32::from(seed) * 1_000;
-        let owner = BrokerGuardianOwnerIdentity {
-            guardian_incarnation: id(u128::from(base + 1)),
-            connection_id: id(u128::from(base + 2)),
-            mux_incarnation: spawn.mux_incarnation(),
-            mux_build_identity_digest: [seed; 32],
-            guardian_build_identity_digest: [seed.wrapping_add(1); 32],
-        };
-        let initial_attachment = BrokerAttachmentIdentityV1 {
-            broker_incarnation: id(u128::from(base + 3)),
-            durable_pane_id: spawn.durable_pane_id(),
-            spawn_effect_id: spawn.spawn_effect_id(),
-            attachment_id: id(u128::from(base + 4)),
-            owner,
-            lease_generation: 1,
-        };
         let secret_bytes = [seed.wrapping_add(2); 32];
         let recovery_secret = BrokerPaneRecoverySecretV1::from_wire(&secret_bytes)
             .expect("construct lease-catalog recovery capability");
@@ -17349,6 +17532,28 @@ mod tests {
             recovery_verifier,
         )
         .expect("construct lease-catalog identity")
+    }
+
+    fn lease_catalog_initial_attachment(
+        spawn: BrokerSpawnWalIdentityV1,
+        seed: u8,
+    ) -> BrokerAttachmentIdentityV1 {
+        let base = u32::from(seed) * 1_000;
+        let owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: id(u128::from(base + 1)),
+            connection_id: id(u128::from(base + 2)),
+            mux_incarnation: spawn.mux_incarnation(),
+            mux_build_identity_digest: [seed; 32],
+            guardian_build_identity_digest: [seed.wrapping_add(1); 32],
+        };
+        BrokerAttachmentIdentityV1 {
+            broker_incarnation: id(u128::from(base + 3)),
+            durable_pane_id: spawn.durable_pane_id(),
+            spawn_effect_id: spawn.spawn_effect_id(),
+            attachment_id: id(u128::from(base + 4)),
+            owner,
+            lease_generation: 1,
+        }
     }
 
     fn control_authenticator(byte: u8) -> GuardianBrokerControlAuthenticatorV1 {
@@ -25946,6 +26151,112 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[test]
+    fn pane_lease_catalog_restart_reconciles_head_but_retains_effect_fence() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xe8);
+        let identity = lease_catalog_identity(&spawn_authenticator, 0x4c);
+        let predecessor = lease_catalog_initial_attachment(identity.spawn, 0x4c);
+        let head_path = temp.path().join(broker_lease_catalog_head_name(
+            identity.spawn.journal_id(),
+        ));
+        let catalog = BrokerPaneLeaseWalCatalogV1::open(temp.path().to_path_buf())
+            .expect("open restart-reconciliation lease catalog");
+        let mut journal = catalog
+            .create_lease_journal(&identity, lease_authenticator.clone())
+            .expect("create restart-reconciliation lease journal");
+        journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.fence_predecessor_and_sync(
+                predecessor,
+                2,
+                identity.initial_recovery_verifier,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::Io(_))
+        ));
+        drop(journal);
+        drop(catalog);
+        let head_before = fs::read(&head_path).expect("read WAL-ahead lease head");
+
+        let catalog = reopen_test_lease_catalog_after_owner_drop(temp.path())
+            .expect("reopen WAL-ahead lease catalog");
+        let mut recovered = catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("scan WAL-ahead lease catalog");
+        let [journal] = recovered.as_slice() else {
+            panic!("expected exactly one WAL-ahead lease journal")
+        };
+        assert!(journal.status().head_reconciliation_required);
+        assert!(journal.status().append_authority_withheld);
+
+        catalog
+            .reconcile_recovered_read_only(&mut recovered)
+            .expect("reconcile lease head without restoring effect authority");
+        let [journal] = recovered.as_mut_slice() else {
+            panic!("expected exactly one reconciled lease journal")
+        };
+        assert!(!journal.status().head_reconciliation_required);
+        assert!(journal.status().append_authority_withheld);
+        assert_eq!(journal.status().tail, BrokerPaneLeaseWalTailV1::Clean);
+        assert_ne!(
+            fs::read(&head_path).expect("read reconciled lease head"),
+            head_before,
+            "restart reconciliation did not append the authenticated head anchor"
+        );
+        let recovered_fence = journal
+            .fence_predecessor_and_sync(
+                predecessor,
+                2,
+                identity.initial_recovery_verifier,
+            )
+            .expect("recover the exact already-durable predecessor fence");
+        assert_eq!(
+            recovered_fence.phase,
+            BrokerPaneLeaseWalPhaseV1::PredecessorFenced
+        );
+        assert_eq!(journal.status().committed_records, 1);
+        let successor_owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: id(76_101),
+            connection_id: id(76_102),
+            mux_incarnation: id(76_103),
+            mux_build_identity_digest: [0x91; 32],
+            guardian_build_identity_digest: [0x92; 32],
+        };
+        let successor = BrokerAttachmentIdentityV1 {
+            broker_incarnation: predecessor.broker_incarnation,
+            durable_pane_id: identity.spawn.durable_pane_id(),
+            spawn_effect_id: identity.spawn.spawn_effect_id(),
+            attachment_id: id(76_104),
+            owner: successor_owner,
+            lease_generation: 2,
+        };
+        let successor_secret = BrokerPaneRecoverySecretV1::from_wire(&[0x93; 32])
+            .expect("construct read-only recovery successor capability");
+        let successor_verifier = successor_secret
+            .verifier(identity.spawn, 2)
+            .expect("derive read-only recovery successor verifier");
+        assert!(matches!(
+            journal.claim_successor_and_sync(
+                id(76_105),
+                predecessor,
+                successor,
+                successor_verifier,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::RecoveryAuthorityUnavailable)
+        ));
+        assert_eq!(journal.status().committed_records, 1);
+        drop(recovered);
+        drop(catalog);
+
+        let catalog = reopen_test_lease_catalog_after_owner_drop(temp.path())
+            .expect("reopen read-only reconciled lease catalog");
+        let recovered = catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("scan read-only reconciled lease catalog");
+        assert!(!recovered[0].status().head_reconciliation_required);
+        assert!(recovered[0].status().append_authority_withheld);
     }
 
     #[test]
