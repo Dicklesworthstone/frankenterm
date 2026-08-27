@@ -100,10 +100,7 @@ impl FocusOptions {
                 return false;
             }
         }
-        if !self.kinds.is_empty() && !self.kinds.contains(&node.kind) {
-            return false;
-        }
-        true
+        !(!self.kinds.is_empty() && !self.kinds.contains(&node.kind))
     }
 }
 

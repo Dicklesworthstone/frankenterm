@@ -634,10 +634,7 @@ impl OscIntegrationHealth {
     #[must_use]
     pub fn is_safe(&self) -> bool {
         let total_interactions = self.osc8_clicks_dispatched_total + self.osc8_select_instead_total;
-        if total_interactions > 0 && self.a11y_announcements_total < total_interactions {
-            return false;
-        }
-        true
+        !(total_interactions > 0 && self.a11y_announcements_total < total_interactions)
     }
 }
 

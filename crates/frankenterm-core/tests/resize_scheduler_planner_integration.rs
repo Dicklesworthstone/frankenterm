@@ -53,7 +53,7 @@ fn planner_hooks_submit_and_schedule_through_single_pane_lifecycle() {
 
     let plan = ViewportReflowPlanner::plan(&input);
     let hooks = plan.scheduling_hooks();
-    assert!(!hooks.is_empty());
+    assert_ne!(hooks, [] as [frankenterm_core::viewport_reflow_planner::ReflowSchedulingHook; 0]);
 
     // Submit only the first hook (viewport core batch) to pane 1.
     let first_hook = &hooks[0];

@@ -310,7 +310,7 @@ fn retention_sweep_generates_auditable_events() {
         );
     }
 
-    assert!(!result.sealed.is_empty());
+    assert_ne!(result.sealed, [] as [std::string::String; 0]);
     let entries = audit_log.entries_by_type(AuditEventType::RetentionSegmentSealed);
     assert_eq!(entries.len(), result.sealed.len());
 
@@ -638,7 +638,7 @@ fn telemetry_snapshot_produces_diagnostic_summary() {
     assert_eq!(snapshot.total_flushes, 2);
 
     let summary = diagnose(&snapshot);
-    assert!(!summary.status.is_empty());
+    assert_ne!(summary.status, "");
     // Green health — no urgent items.
     assert_eq!(snapshot.health_tier, StorageHealthTier::Green);
     assert_eq!(summary.tier, StorageHealthTier::Green);
@@ -800,7 +800,7 @@ fn audit_log_resume_preserves_chain_across_persistence() {
     assert!(verification.chain_intact);
     assert_eq!(verification.total_entries, 10);
     assert_eq!(verification.ordinal_range, Some((0, 9)));
-    assert!(verification.missing_ordinals.is_empty());
+    assert_eq!(verification.missing_ordinals, [] as [u64; 0]);
 }
 
 // =============================================================================
@@ -929,7 +929,7 @@ fn multi_actor_concurrent_operations_audited() {
     let verification = AuditLog::verify_chain(&audit_log.entries(), GENESIS_HASH);
     assert!(verification.chain_intact);
     assert_eq!(verification.total_entries, 19);
-    assert!(verification.missing_ordinals.is_empty());
+    assert_eq!(verification.missing_ordinals, [] as [u64; 0]);
 }
 
 // =============================================================================

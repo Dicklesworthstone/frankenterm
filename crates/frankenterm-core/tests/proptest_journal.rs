@@ -259,7 +259,7 @@ fn compacting_away_latest_checkpoint_repairs_snapshot_checkpoint_state() {
 
     let snapshot = journal.snapshot_state();
     assert_eq!(snapshot.last_checkpoint_seq, None);
-    assert!(snapshot.last_checkpoint_hash.is_empty());
+    assert_eq!(snapshot.last_checkpoint_hash, "");
 
     let replay = journal.replay_from_checkpoint();
     assert_eq!(replay.start_seq, checkpoint_seq + 1);

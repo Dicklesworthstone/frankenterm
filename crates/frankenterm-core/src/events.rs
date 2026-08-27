@@ -2406,11 +2406,7 @@ impl EventFilter {
         }
 
         // 4. Agent type allowlist
-        if !self.agent_types.is_empty() && !self.agent_types.contains(&detection.agent_type) {
-            return false;
-        }
-
-        true
+        !(!self.agent_types.is_empty() && !self.agent_types.contains(&detection.agent_type))
     }
 
     /// Returns `true` when the filter has no restrictions (equivalent to

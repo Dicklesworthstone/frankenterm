@@ -409,8 +409,8 @@ fn manifest_default_has_version_1() {
 #[test]
 fn manifest_entry_default_has_empty_fields() {
     let e = RulesetManifestEntry::default();
-    assert!(e.name.is_empty());
-    assert!(e.path.is_empty());
+    assert_eq!(e.name, "");
+    assert_eq!(e.path, "");
     assert!(e.description.is_none());
     assert!(e.created_at.is_none());
 }

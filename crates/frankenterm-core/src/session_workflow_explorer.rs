@@ -316,10 +316,7 @@ impl TimelineQuery {
                 return false;
             }
         }
-        if self.interventions_only && !event.is_intervention_point {
-            return false;
-        }
-        true
+        !(self.interventions_only && !event.is_intervention_point)
     }
 }
 
