@@ -54,6 +54,8 @@ const GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL: Duration = Duration::from_millis(5
 const GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL: Duration = Duration::from_millis(1_000);
 const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 = 64 * 1_024;
 const GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS: usize = 2;
+const GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL: Duration = Duration::from_millis(50);
+const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum age of one guardian-scoped census snapshot used by child facets.
 ///
@@ -139,6 +141,8 @@ pub enum GuardianProxyError {
     InputAllocation,
     #[error("guardian census cache allocation failed")]
     CensusAllocation,
+    #[error("guardian retained retirement queue reached its pane bound")]
+    RetirementCapacity,
     #[error("guardian mutation sequence cannot advance")]
     SequenceExhausted,
     #[error("guardian client operation failed")]
@@ -431,6 +435,18 @@ struct GuardianCensusCache {
 struct GuardianCensusCoordinatorState {
     transport: Box<dyn GuardianCensusTransport>,
     cache: Option<GuardianCensusCache>,
+    retirement_slots: HashMap<Uuid, GuardianRetirementSlot>,
+    next_retirement_order: u64,
+}
+
+struct GuardianRetirementSlot {
+    identity: GuardianPaneLeaseIdentity,
+    authority: Arc<Mutex<Option<SharedGuardianPaneLeaseActor>>>,
+    retry_attempts: u32,
+    retry_not_before: Instant,
+    retry_in_flight: bool,
+    retry_blocked: bool,
+    order: u64,
 }
 
 /// Explicitly shared, guardian-scoped child census coordinator.
@@ -460,6 +476,7 @@ impl fmt::Debug for GuardianCensusCoordinator {
                 "cached_entries",
                 &state.cache.as_ref().map(|cache| cache.entries.len()),
             )
+            .field("retirement_slots", &state.retirement_slots.len())
             .finish_non_exhaustive()
     }
 }
@@ -514,6 +531,8 @@ impl GuardianCensusCoordinator {
             state: Mutex::new(GuardianCensusCoordinatorState {
                 transport,
                 cache: None,
+                retirement_slots: HashMap::new(),
+                next_retirement_order: 0,
             }),
         })
     }
@@ -553,6 +572,201 @@ impl GuardianCensusCoordinator {
     /// operation. The next observation performs one fresh bounded census.
     pub fn invalidate(&self) {
         self.state.lock().cache = None;
+    }
+
+    fn reserve_retirement(
+        self: &Arc<Self>,
+        identity: GuardianPaneLeaseIdentity,
+    ) -> Result<GuardianRetirementReservation, GuardianProxyError> {
+        self.ensure_binding(identity)?;
+        let mut state = self.state.lock();
+        if state.retirement_slots.contains_key(&identity.pane_id()) {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "guardian pane already has reserved retirement authority",
+            ));
+        }
+        if state.retirement_slots.len() >= GUARDIAN_MAX_PANES {
+            return Err(GuardianProxyError::RetirementCapacity);
+        }
+        state
+            .retirement_slots
+            .try_reserve(1)
+            .map_err(|_| GuardianProxyError::CensusAllocation)?;
+        let order = state.next_retirement_order;
+        state.next_retirement_order = state
+            .next_retirement_order
+            .checked_add(1)
+            .ok_or(GuardianProxyError::SequenceExhausted)?;
+        let authority = Arc::new(Mutex::new(None));
+        state.retirement_slots.insert(
+            identity.pane_id(),
+            GuardianRetirementSlot {
+                identity,
+                authority: Arc::clone(&authority),
+                retry_attempts: 0,
+                retry_not_before: Instant::now(),
+                retry_in_flight: false,
+                retry_blocked: false,
+                order,
+            },
+        );
+        Ok(GuardianRetirementReservation {
+            coordinator: Arc::clone(self),
+            identity,
+            authority,
+            active: true,
+        })
+    }
+
+    fn cancel_retirement_reservation(&self, identity: GuardianPaneLeaseIdentity) {
+        let mut state = self.state.lock();
+        let removable = state.retirement_slots.get(&identity.pane_id()).is_some_and(
+            |slot| {
+                slot.identity == identity
+                    && slot.authority.lock().is_none()
+                    && !slot.retry_in_flight
+            },
+        );
+        if removable {
+            state.retirement_slots.remove(&identity.pane_id());
+        }
+    }
+
+    /// Retry at most one retained unpublished-lease retirement.
+    ///
+    /// The actor preserves the exact pending Retire request, effect, and
+    /// mutation sequence. A failed maintenance call leaves the same authority
+    /// in the bounded coordinator slot for a later attempt.
+    pub fn retry_retained_lease_cleanup(&self) -> Result<bool, GuardianProxyError> {
+        let now = Instant::now();
+        let candidate = {
+            let mut state = self.state.lock();
+            let pane_id = state
+                .retirement_slots
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.authority.lock().is_some()
+                        && !slot.retry_in_flight
+                        && !slot.retry_blocked
+                        && slot.retry_not_before <= now
+                })
+                .min_by_key(|(_, slot)| slot.order)
+                .map(|(pane_id, _)| *pane_id);
+            pane_id.and_then(|pane_id| {
+                let slot = state.retirement_slots.get_mut(&pane_id)?;
+                slot.retry_in_flight = true;
+                Some((
+                    pane_id,
+                    slot.identity,
+                    Arc::clone(slot.authority.lock().as_ref()?),
+                ))
+            })
+        };
+        let Some((pane_id, identity, actor)) = candidate else {
+            return Ok(false);
+        };
+
+        let result = actor.lock().retire(identity);
+        let mut state = self.state.lock();
+        let still_exact = state.retirement_slots.get(&pane_id).is_some_and(|slot| {
+            slot.identity == identity
+                && slot.retry_in_flight
+                && slot
+                    .authority
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|retained| Arc::ptr_eq(retained, &actor))
+        });
+        if !still_exact {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "retained guardian retirement authority changed during retry",
+            ));
+        }
+        match result {
+            Ok(()) => {
+                state.retirement_slots.remove(&pane_id);
+                state.cache = None;
+                metrics::counter!(
+                    "mux.guardian_proxy.retained_retirement_retry_total",
+                    "outcome" => "retired",
+                )
+                .increment(1);
+                Ok(true)
+            }
+            Err(error) if guardian_retirement_is_resolved(&error) => {
+                state.retirement_slots.remove(&pane_id);
+                state.cache = None;
+                log::warn!(
+                    "retained guardian lease retirement no longer has live authority and is resolved without another mutation: {error}"
+                );
+                metrics::counter!(
+                    "mux.guardian_proxy.retained_retirement_retry_total",
+                    "outcome" => "already_absent",
+                )
+                .increment(1);
+                Ok(true)
+            }
+            Err(error) => {
+                let order = state.next_retirement_order;
+                let next_order = state.next_retirement_order.checked_add(1);
+                let retry_safe = guardian_cleanup_retry_is_safe(&error);
+                if retry_safe {
+                    let Some(next_order) = next_order else {
+                        let Some(slot) = state.retirement_slots.get_mut(&pane_id) else {
+                            return Err(GuardianProxyError::InvalidConfiguration(
+                                "retained guardian retirement slot disappeared after retry",
+                            ));
+                        };
+                        slot.retry_in_flight = false;
+                        slot.retry_blocked = true;
+                        return Err(GuardianProxyError::SequenceExhausted);
+                    };
+                    state.next_retirement_order = next_order;
+                }
+                let Some(slot) = state.retirement_slots.get_mut(&pane_id) else {
+                    return Err(GuardianProxyError::InvalidConfiguration(
+                        "retained guardian retirement slot disappeared after retry",
+                    ));
+                };
+                slot.retry_in_flight = false;
+                if !retry_safe {
+                    slot.retry_blocked = true;
+                    metrics::counter!(
+                        "mux.guardian_proxy.retained_retirement_retry_total",
+                        "outcome" => "blocked",
+                    )
+                    .increment(1);
+                    return Err(error);
+                }
+                slot.retry_attempts = slot.retry_attempts.saturating_add(1);
+                slot.retry_not_before = Instant::now()
+                    + guardian_retirement_retry_delay(slot.retry_attempts);
+                slot.order = order;
+                metrics::counter!(
+                    "mux.guardian_proxy.retained_retirement_retry_total",
+                    "outcome" => "retained",
+                )
+                .increment(1);
+                Err(error)
+            }
+        }
+    }
+
+    /// Number of pre-reserved or retained unpublished-lease cleanup slots.
+    #[must_use]
+    pub fn retained_lease_cleanup_count(&self) -> usize {
+        self.state.lock().retirement_slots.len()
+    }
+
+    /// Number of retained cleanup authorities requiring operator intervention.
+    #[must_use]
+    pub fn blocked_retained_lease_cleanup_count(&self) -> usize {
+        self.state
+            .lock()
+            .retirement_slots
+            .values()
+            .filter(|slot| slot.retry_blocked)
+            .count()
     }
 
     fn refresh_locked(
@@ -612,6 +826,11 @@ impl GuardianCensusCoordinator {
         &self,
         identity: GuardianPaneLeaseIdentity,
     ) -> Result<ObservedChildState, GuardianMutationTransportError> {
+        if let Err(error) = self.retry_retained_lease_cleanup() {
+            log::warn!(
+                "retained guardian lease retirement remains pending after bounded census maintenance: {error}"
+            );
+        }
         if self.ensure_binding(identity).is_err() {
             return Err(GuardianMutationTransportError::LeaseMismatch);
         }
@@ -630,6 +849,64 @@ impl GuardianCensusCoordinator {
             .ok_or(GuardianMutationTransportError::PaneNotFound)?;
         classify_child_census_entry(identity, entry)
     }
+}
+
+struct GuardianRetirementReservation {
+    coordinator: Arc<GuardianCensusCoordinator>,
+    identity: GuardianPaneLeaseIdentity,
+    authority: Arc<Mutex<Option<SharedGuardianPaneLeaseActor>>>,
+    active: bool,
+}
+
+impl GuardianRetirementReservation {
+    fn release(&mut self) {
+        if self.active {
+            self.coordinator
+                .cancel_retirement_reservation(self.identity);
+            self.active = false;
+        }
+    }
+
+    fn retain(mut self, actor: SharedGuardianPaneLeaseActor, retry_blocked: bool) {
+        let replaced = self.authority.lock().replace(actor);
+        debug_assert!(replaced.is_none());
+        let slot_updated = {
+            let mut state = self.coordinator.state.lock();
+            state
+                .retirement_slots
+                .get_mut(&self.identity.pane_id())
+                .filter(|slot| {
+                    slot.identity == self.identity && Arc::ptr_eq(&slot.authority, &self.authority)
+                })
+                .map(|slot| slot.retry_blocked = retry_blocked)
+                .is_some()
+        };
+        if !slot_updated {
+            log::error!(
+                "guardian retirement reservation disappeared while retaining exact cleanup authority"
+            );
+            self.active = false;
+            std::mem::forget(self);
+            return;
+        }
+        metrics::counter!("mux.guardian_proxy.retained_retirement_total").increment(1);
+        self.active = false;
+    }
+}
+
+impl Drop for GuardianRetirementReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn guardian_retirement_retry_delay(attempts: u32) -> Duration {
+    let multiplier = 1_u32
+        .checked_shl(attempts.saturating_sub(1).min(7))
+        .unwrap_or(u32::MAX);
+    GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL
+        .saturating_mul(multiplier)
+        .min(GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL)
 }
 
 struct GuardianClientTransport {
@@ -3640,6 +3917,11 @@ impl GuardianProxyLeasePlan {
         census: Arc<GuardianCensusCoordinator>,
     ) -> Result<Self, GuardianProxyError> {
         validate_pty_size(size)?;
+        if let Err(error) = census.retry_retained_lease_cleanup() {
+            log::warn!(
+                "retained guardian lease retirement remains pending before a new lease plan: {error}"
+            );
+        }
         let client = GuardianClient::connect(socket_path, token_path, census.mux_incarnation())
             .map_err(GuardianProxyError::Client)?;
         if client.guardian_incarnation() != census.guardian_incarnation() {
@@ -3679,6 +3961,7 @@ impl GuardianProxyLeasePlan {
                 "guardian Claim plan carried an invalid lease identity",
             )
         })?;
+        let retirement_reservation = self.census.reserve_retirement(identity)?;
         let Self {
             socket_path,
             token_path,
@@ -3694,6 +3977,7 @@ impl GuardianProxyLeasePlan {
             &token_path,
             identity,
             claimed_lease,
+            retirement_reservation,
             size,
             census,
         )
@@ -3718,6 +4002,7 @@ impl GuardianProxyLeasePlan {
                 "guardian Attach plan carried an invalid lease identity",
             )
         })?;
+        let retirement_reservation = self.census.reserve_retirement(identity)?;
         let Self {
             socket_path,
             token_path,
@@ -3733,6 +4018,7 @@ impl GuardianProxyLeasePlan {
             &token_path,
             identity,
             claimed_lease,
+            retirement_reservation,
             size,
             census,
         )
@@ -3785,51 +4071,84 @@ impl fmt::Debug for GuardianProxyStaging {
 /// authority and this guard is explicitly disarmed.
 struct GuardianClaimedLeaseRollback {
     actor: SharedGuardianPaneLeaseActor,
-    census: Arc<GuardianCensusCoordinator>,
-    identity: GuardianPaneLeaseIdentity,
+    retirement_reservation: Option<GuardianRetirementReservation>,
     armed: bool,
 }
 
 impl GuardianClaimedLeaseRollback {
     fn new(
         actor: SharedGuardianPaneLeaseActor,
-        census: Arc<GuardianCensusCoordinator>,
-        identity: GuardianPaneLeaseIdentity,
+        retirement_reservation: GuardianRetirementReservation,
     ) -> Self {
         Self {
             actor,
-            census,
-            identity,
+            retirement_reservation: Some(retirement_reservation),
             armed: true,
         }
     }
 
     fn disarm(&mut self) {
+        if let Some(mut reservation) = self.retirement_reservation.take() {
+            reservation.release();
+        }
         self.armed = false;
+    }
+
+    fn retain_for_later_retry(&mut self, error: &GuardianProxyError) {
+        log::error!(
+            "guardian lease retirement after unpublished restore remains unconfirmed; retaining exact cleanup authority: {error}"
+        );
+        if let Some(reservation) = self.retirement_reservation.take() {
+            reservation.retain(
+                Arc::clone(&self.actor),
+                !guardian_cleanup_retry_is_safe(error),
+            );
+        }
+        self.armed = false;
+    }
+
+    fn resolve_absent_lease(&mut self, error: &GuardianProxyError) {
+        log::warn!(
+            "guardian lease retirement after unpublished restore is already resolved by terminal lease state: {error}"
+        );
+        metrics::counter!(
+            "mux.guardian_proxy.retained_retirement_retry_total",
+            "outcome" => "already_absent",
+        )
+        .increment(1);
+        self.disarm();
     }
 
     fn retire_unpublished_lease(&mut self) {
         if !self.armed {
             return;
         }
-        self.census.invalidate();
-        let first_result = self.actor.lock().retire(self.identity);
+        let Some(reservation) = self.retirement_reservation.as_ref() else {
+            self.armed = false;
+            return;
+        };
+        let identity = reservation.identity;
+        reservation.coordinator.invalidate();
+        let first_result = self.actor.lock().retire(identity);
         match first_result {
-            Ok(()) => self.armed = false,
+            Ok(()) => self.disarm(),
+            Err(error) if guardian_retirement_is_resolved(&error) => {
+                self.resolve_absent_lease(&error);
+            }
             Err(error) if guardian_cleanup_retry_is_safe(&error) => {
                 log::warn!(
                     "guardian lease retirement reply was lost before topology publication; retrying the exact pending mutation: {error}"
                 );
-                match self.actor.lock().retire(self.identity) {
-                    Ok(()) => self.armed = false,
-                    Err(retry_error) => log::error!(
-                        "guardian lease retirement after unpublished restore was not confirmed after an exact retry: {retry_error}"
-                    ),
+                let retry_result = self.actor.lock().retire(identity);
+                match retry_result {
+                    Ok(()) => self.disarm(),
+                    Err(retry_error) if guardian_retirement_is_resolved(&retry_error) => {
+                        self.resolve_absent_lease(&retry_error);
+                    }
+                    Err(retry_error) => self.retain_for_later_retry(&retry_error),
                 }
             }
-            Err(error) => log::error!(
-                "guardian lease retirement after unpublished restore was not confirmed: {error}"
-            ),
+            Err(error) => self.retain_for_later_retry(&error),
         }
     }
 }
@@ -3847,12 +4166,22 @@ fn guardian_cleanup_retry_is_safe(error: &GuardianProxyError) -> bool {
     )
 }
 
+fn guardian_retirement_is_resolved(error: &GuardianProxyError) -> bool {
+    matches!(
+        error,
+        GuardianProxyError::LeaseFenced
+            | GuardianProxyError::PaneNotFound
+            | GuardianProxyError::GuardianIncarnationChanged
+    )
+}
+
 impl GuardianProxyStaging {
     fn from_planned_lease(
         socket_path: &Path,
         token_path: &Path,
         identity: GuardianPaneLeaseIdentity,
         claimed_lease: GuardianClaimedPaneLease,
+        retirement_reservation: GuardianRetirementReservation,
         size: PtySize,
         census: Arc<GuardianCensusCoordinator>,
     ) -> Result<Self, GuardianProxyError> {
@@ -3876,6 +4205,7 @@ impl GuardianProxyStaging {
             size,
             Box::new(mutation_transport),
             census,
+            retirement_reservation,
         );
         // Stage the rollback guard before opening the independent replay
         // channel. A replay-channel setup failure must not leak the Claim that
@@ -3908,12 +4238,14 @@ impl GuardianProxyStaging {
             ));
         }
         validate_pty_size(size)?;
+        let retirement_reservation = census.reserve_retirement(identity)?;
         Ok(Self::with_validated_transports(
             identity,
             next_sequence,
             size,
             transport,
             census,
+            retirement_reservation,
         ))
     }
 
@@ -3923,6 +4255,7 @@ impl GuardianProxyStaging {
         size: PtySize,
         transport: Box<dyn GuardianMutationTransport>,
         census: Arc<GuardianCensusCoordinator>,
+        retirement_reservation: GuardianRetirementReservation,
     ) -> Self {
         debug_assert!(census.ensure_binding(identity).is_ok());
         let actor = Arc::new(Mutex::new(
@@ -3938,7 +4271,7 @@ impl GuardianProxyStaging {
         // against a cache that could still describe the pre-claim fleet.
         census.invalidate();
         let lease_rollback =
-            GuardianClaimedLeaseRollback::new(Arc::clone(&actor), Arc::clone(&census), identity);
+            GuardianClaimedLeaseRollback::new(Arc::clone(&actor), retirement_reservation);
         #[cfg(test)]
         let checkpoint_publisher = Some(Arc::new(GuardianCheckpointPublisher::with_transport(
             identity,
@@ -5865,6 +6198,118 @@ mod tests {
         assert_eq!(retire_calls.len(), 2, "lost retirement reply is retried");
         assert_eq!(retire_calls[0], retire_calls[1]);
         assert_eq!(retire_calls[0].0, 81);
+    }
+
+    #[test]
+    fn unpublished_staging_drop_retains_exact_retirement_after_bounded_retries() {
+        let (staging, state) = fake_staging(
+            [FakeDirective::Io, FakeDirective::Io, FakeDirective::Auto],
+            82,
+        );
+        let census = Arc::clone(&staging.census);
+        assert_eq!(census.retained_lease_cleanup_count(), 1);
+
+        drop(staging);
+
+        assert_eq!(
+            census.retained_lease_cleanup_count(),
+            1,
+            "lost synchronous retries retain the pre-reserved cleanup slot"
+        );
+        assert!(
+            census
+                .retry_retained_lease_cleanup()
+                .expect("later cleanup maintenance confirms Retire"),
+            "one bounded maintenance call retires one retained lease"
+        );
+        assert_eq!(census.retained_lease_cleanup_count(), 0);
+
+        let retire_calls = state
+            .lock()
+            .calls
+            .iter()
+            .filter_map(|call| match call {
+                FakeCall::Retire {
+                    sequence,
+                    request_id,
+                    effect_id,
+                } => Some((*sequence, *request_id, *effect_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retire_calls.len(), 3);
+        assert!(retire_calls.iter().all(|call| *call == retire_calls[0]));
+        assert_eq!(retire_calls[0].0, 82);
+    }
+
+    #[test]
+    fn unpublished_retirement_absence_releases_reserved_cleanup_authority() {
+        let (staging, state) = fake_staging(
+            [FakeDirective::Reject(GuardianRejectionCode::PaneNotFound)],
+            83,
+        );
+        let census = Arc::clone(&staging.census);
+
+        drop(staging);
+
+        assert_eq!(census.retained_lease_cleanup_count(), 0);
+        assert_eq!(census.blocked_retained_lease_cleanup_count(), 0);
+        let retire_calls = state
+            .lock()
+            .calls
+            .iter()
+            .filter(|call| matches!(call, FakeCall::Retire { .. }))
+            .count();
+        assert_eq!(retire_calls, 1, "known pane absence needs no retry");
+    }
+
+    #[test]
+    fn unpublished_retirement_protocol_fault_is_retained_without_busy_retry() {
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Reject(GuardianRejectionCode::InternalInvariant),
+                FakeDirective::Auto,
+            ],
+            84,
+        );
+        let census = Arc::clone(&staging.census);
+
+        drop(staging);
+
+        assert_eq!(census.retained_lease_cleanup_count(), 1);
+        assert_eq!(census.blocked_retained_lease_cleanup_count(), 1);
+        assert!(
+            !census
+                .retry_retained_lease_cleanup()
+                .expect("blocked cleanup remains retained without another mutation")
+        );
+        let retire_calls = state
+            .lock()
+            .calls
+            .iter()
+            .filter(|call| matches!(call, FakeCall::Retire { .. }))
+            .count();
+        assert_eq!(retire_calls, 1, "blocked authority must not busy-retry");
+    }
+
+    #[test]
+    fn retirement_retry_backoff_reaches_its_bounded_ceiling() {
+        assert_eq!(
+            guardian_retirement_retry_delay(1),
+            GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL
+        );
+        assert_eq!(
+            guardian_retirement_retry_delay(2),
+            GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL.saturating_mul(2)
+        );
+        assert_eq!(
+            guardian_retirement_retry_delay(8),
+            GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL
+        );
+        assert_eq!(
+            guardian_retirement_retry_delay(u32::MAX),
+            GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL
+        );
     }
 
     #[test]
