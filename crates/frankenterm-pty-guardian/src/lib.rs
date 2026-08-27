@@ -24,7 +24,9 @@
 //! through an authenticated guarded
 //! transaction only while it owns no panes; a successful stop deliberately
 //! retains the socket path, so restart remains fail-closed until an explicit
-//! non-overwriting retirement design lands.
+//! non-overwriting retirement design lands. Successor Claim/Query/Ack is live
+//! and effect-fenced in process, but its lease transitions are not yet in the
+//! authenticated WAL; production activation therefore remains disabled.
 
 pub use frankenterm_build_identity::{
     AtomicBuildIdentity, AtomicComponentIdentityError, SealedAtomicBuildIdentity,
@@ -87,7 +89,8 @@ pub use broker::{
     BrokerControlServiceError, BrokerControlServiceV1, BrokerExecBootstrapErrorV1,
     BrokerGuardianConnectionIdentityV1, BrokerInitialPaneClaimV1, BrokerPaneRecoverySecretV1,
     BrokerSpawnClaimQueryV1, BrokerSpawnEffectAcknowledgementV1, BrokerSpawnEffectQueryV1,
-    BrokerSpawnSubmissionV1, run_broker_exec_bootstrap,
+    BrokerSpawnSubmissionV1, BrokerSuccessorAcknowledgementV1, BrokerSuccessorClaimQueryV1,
+    BrokerSuccessorPaneClaimV1, run_broker_exec_bootstrap,
 };
 #[cfg(unix)]
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};

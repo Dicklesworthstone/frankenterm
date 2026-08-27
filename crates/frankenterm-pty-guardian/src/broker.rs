@@ -1513,11 +1513,17 @@ impl BrokerControlRequestHeaderV1 {
             BrokerControlOperationV1::AcknowledgeEffect => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
-                    && self.lease_generation == 0
                     && !self.operation_id.is_nil()
                     && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
             }
-            BrokerControlOperationV1::AttachSuccessor | BrokerControlOperationV1::ClosePane => {
+            BrokerControlOperationV1::AttachSuccessor => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && self.lease_generation > 1
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
+            }
+            BrokerControlOperationV1::ClosePane => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
                     && self.lease_generation > 0
@@ -1698,6 +1704,10 @@ impl BrokerControlResponseHeaderV1 {
                             && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
                             && self.lease_generation == 0
                             && self.child_identity.is_some())
+                        || (successful
+                            && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
+                            && self.lease_generation > 1
+                            && self.child_identity.is_none())
                         || (self.status == BrokerControlResponseStatusV1::Quarantined
                             && self.lease_generation == 0
                             && self.child_identity.is_none()
@@ -1709,12 +1719,19 @@ impl BrokerControlResponseHeaderV1 {
             }
             BrokerControlOperationV1::Write
             | BrokerControlOperationV1::Resize
-            | BrokerControlOperationV1::AcknowledgeOutput
-            | BrokerControlOperationV1::AttachSuccessor => {
+            | BrokerControlOperationV1::AcknowledgeOutput => {
                 pane_scoped
                     && self.lease_generation > 0
                     && empty_effect
                     && (successful || unsuccessful)
+            }
+            BrokerControlOperationV1::AttachSuccessor => {
+                pane_scoped
+                    && self.lease_generation > 1
+                    && self.child_identity.is_none()
+                    && ((successful
+                        && matches!(payload_bytes, 0 | BROKER_PANE_RECOVERY_SECRET_BYTES))
+                        || (unsuccessful && payload_bytes == 0))
             }
             BrokerControlOperationV1::ClosePane => {
                 pane_scoped
@@ -3328,16 +3345,36 @@ fn reconcile_broker_catalog_under_token_authority_with_hook(
 /// quarantined. Exact Spawn acknowledgement is serialized through the same
 /// durability worker and transfers the retained PTY into live-pane authority.
 /// Live Census rows retain exact PTY and lease availability, and authenticated
-/// owner-connection EOF fences the corresponding logical lease. Proxy effects
-/// and successor rotation remain disabled until their durable ownership
-/// transitions are integrated and proven together.
+/// owner-connection EOF fences the corresponding logical lease. Successor
+/// Claim/Query/Ack is capability-authenticated and effect-fenced in process;
+/// its lease transitions are not yet recorded in the authenticated WAL. Proxy
+/// effects and production activation remain disabled until those durable
+/// ownership transitions are integrated and proven together.
 struct BrokerLiveSpawnV1 {
     fingerprint: BrokerSpawnWorkerFingerprintV1,
     ack_id: Uuid,
     journal: BrokerSpawnJournalV1,
     adoption: Box<BrokerAdoptionV1>,
     recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    pending_successor: Option<BrokerPendingSuccessorClaimV1>,
+    last_successor_ack: Option<BrokerAppliedSuccessorAcknowledgementV1>,
     last_lease_mux_incarnation: Uuid,
+}
+
+struct BrokerPendingSuccessorClaimV1 {
+    handoff_id: Uuid,
+    owner: BrokerGuardianOwnerIdentity,
+    attachment: BrokerAttachmentIdentityV1,
+    recovery_secret: BrokerPaneRecoverySecretV1,
+    recovery_verifier: BrokerPaneRecoveryVerifierV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerAppliedSuccessorAcknowledgementV1 {
+    handoff_id: Uuid,
+    ack_id: Uuid,
+    owner: BrokerGuardianOwnerIdentity,
+    attachment: BrokerAttachmentIdentityV1,
 }
 
 impl BrokerLiveSpawnV1 {
@@ -3415,6 +3452,8 @@ impl BrokerLiveSpawnV1 {
                     journal,
                     adoption,
                     recovery_verifier,
+                    pending_successor: None,
+                    last_successor_ack: None,
                     last_lease_mux_incarnation: fingerprint.binding.mux_incarnation,
                 })
             }
@@ -3477,6 +3516,19 @@ impl BrokerLiveSpawnV1 {
                         false,
                     )
                 }
+                BrokerPaneLifecycleV1::SuccessorClaimPending
+                    if self.pending_successor.as_ref().is_some_and(|pending| {
+                        pane_status.owner_mux_incarnation == Some(pending.owner.mux_incarnation)
+                            && pane_status.lease_generation == pending.attachment.lease_generation
+                    }) =>
+                {
+                    (
+                        BrokerCensusDispositionV1::ReplyAcknowledgedAwaitingSuccessor,
+                        true,
+                        false,
+                        false,
+                    )
+                }
                 BrokerPaneLifecycleV1::Quarantined(_)
                     if pane_status.owner_mux_incarnation.is_none() =>
                 {
@@ -3509,7 +3561,9 @@ impl BrokerLiveSpawnV1 {
             pty_available: true,
             lease_available,
             output_replay_available,
-            owner_mux_incarnation: Some(self.last_lease_mux_incarnation),
+            owner_mux_incarnation: pane_status
+                .owner_mux_incarnation
+                .or(Some(self.last_lease_mux_incarnation)),
             lease_generation: pane_status.lease_generation,
         };
         entry.validate()?;
@@ -3530,10 +3584,18 @@ impl BrokerLiveSpawnV1 {
         &mut self,
         owner: BrokerGuardianOwnerIdentity,
     ) -> Result<Option<BrokerControlEofOutcomeV1>, BrokerError> {
-        let Some(attachment) = self.observes_owner(owner) else {
+        let attachment = self.observes_owner(owner).or_else(|| {
+            self.pending_successor
+                .as_ref()
+                .filter(|pending| pending.owner == owner)
+                .map(|pending| pending.attachment)
+        });
+        let Some(attachment) = attachment else {
             return Ok(None);
         };
-        self.last_lease_mux_incarnation = owner.mux_incarnation;
+        if self.observes_owner(owner).is_some() {
+            self.last_lease_mux_incarnation = owner.mux_incarnation;
+        }
         self.adoption
             .pane
             .observe_authenticated_control_eof(
@@ -4304,6 +4366,15 @@ impl BrokerControlServiceV1 {
             BrokerControlOperationV1::AcknowledgeEffect if request.header.lease_generation == 0 => {
                 return self.dispatch_spawn_acknowledgement(owner, request);
             }
+            BrokerControlOperationV1::AttachSuccessor => {
+                return self.dispatch_successor_claim(owner, request);
+            }
+            BrokerControlOperationV1::QueryEffect if request.header.lease_generation > 0 => {
+                return self.dispatch_successor_query(owner, request);
+            }
+            BrokerControlOperationV1::AcknowledgeEffect if request.header.lease_generation > 0 => {
+                return self.dispatch_successor_acknowledgement(owner, request);
+            }
             _ => {}
         }
         BrokerControlResponseV1::new(
@@ -4830,6 +4901,280 @@ impl BrokerControlServiceV1 {
             .map_err(|_| ())
     }
 
+    fn dispatch_successor_claim(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let broker_incarnation = self.broker_incarnation;
+        let response_header = |status| BrokerControlResponseHeaderV1 {
+            operation: request.header.operation,
+            status,
+            request_id: request.header.request_id,
+            broker_incarnation,
+            guardian_incarnation: request.header.guardian_incarnation,
+            connection_id: request.header.connection_id,
+            durable_pane_id: request.header.durable_pane_id,
+            lease_generation: request.header.lease_generation,
+            operation_id: request.header.operation_id,
+            child_identity: None,
+            output_sequence_start: 0,
+            output_sequence_end: 0,
+        };
+        let predecessor_secret = match BrokerPaneRecoverySecretV1::from_wire(request.payload()) {
+            Ok(secret) => secret,
+            Err(_) => {
+                return BrokerControlResponseV1::new(
+                    response_header(BrokerControlResponseStatusV1::Rejected),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
+        let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) else {
+            return BrokerControlResponseV1::new(
+                response_header(BrokerControlResponseStatusV1::Rejected),
+                &[],
+            )
+            .map_err(|_| ());
+        };
+        let handoff_id = request.header.operation_id;
+        let successor_generation = request.header.lease_generation;
+        let predecessor_generation = successor_generation.checked_sub(1).ok_or(())?;
+        if let Some(pending) = live.pending_successor.as_ref() {
+            let exact = pending.handoff_id == handoff_id
+                && pending.owner == owner
+                && pending.attachment.lease_generation == successor_generation
+                && live.recovery_verifier.verifies(
+                    &predecessor_secret,
+                    live.journal.identity(),
+                    predecessor_generation,
+                );
+            let status = if exact {
+                BrokerControlResponseStatusV1::Recovered
+            } else {
+                BrokerControlResponseStatusV1::Quarantined
+            };
+            let payload = exact.then_some(pending.recovery_secret.as_wire().as_slice());
+            return BrokerControlResponseV1::new(response_header(status), payload.unwrap_or(&[]))
+                .map_err(|_| ());
+        }
+        let pane_status = live.adoption.pane.status();
+        let predecessor = live.adoption.pane.awaiting_successor_predecessor();
+        let exact_predecessor = pane_status.lifecycle == BrokerPaneLifecycleV1::AwaitingSuccessor
+            && pane_status.lease_generation == successor_generation
+            && predecessor
+                .is_some_and(|attachment| attachment.lease_generation == predecessor_generation)
+            && live.recovery_verifier.verifies(
+                &predecessor_secret,
+                live.journal.identity(),
+                predecessor_generation,
+            );
+        if !exact_predecessor {
+            return BrokerControlResponseV1::new(
+                response_header(BrokerControlResponseStatusV1::Quarantined),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+        let successor_secret = BrokerPaneRecoverySecretV1::generate().map_err(|_| ())?;
+        let successor_verifier = successor_secret
+            .verifier(live.journal.identity(), successor_generation)
+            .map_err(|_| ())?;
+        let authority = BrokerSuccessorHandoffAuthorityV1 {
+            broker_incarnation,
+            durable_pane_id: request.header.durable_pane_id,
+            spawn_effect_id: live.fingerprint.binding.spawn_effect_id,
+            handoff_id,
+            predecessor: predecessor.ok_or(())?,
+            successor: owner,
+        };
+        let attachment = match live.adoption.pane.attach_successor(authority) {
+            Ok(BrokerSuccessorAttachOutcomeV1::Attached(attachment)) => attachment.identity(),
+            Ok(
+                BrokerSuccessorAttachOutcomeV1::RecoveredPendingClaim { .. }
+                | BrokerSuccessorAttachOutcomeV1::RecoveredExistingLease { .. },
+            )
+            | Err(_) => {
+                return BrokerControlResponseV1::new(
+                    response_header(BrokerControlResponseStatusV1::Quarantined),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
+        live.pending_successor = Some(BrokerPendingSuccessorClaimV1 {
+            handoff_id,
+            owner,
+            attachment,
+            recovery_secret: successor_secret,
+            recovery_verifier: successor_verifier,
+        });
+        let pending = live.pending_successor.as_ref().ok_or(())?;
+        BrokerControlResponseV1::new(
+            response_header(BrokerControlResponseStatusV1::Applied),
+            pending.recovery_secret.as_wire(),
+        )
+        .map_err(|_| ())
+    }
+
+    fn dispatch_successor_query(
+        &self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let Some(live) = self.live_spawns.get(&request.header.durable_pane_id) else {
+            return BrokerControlResponseV1::new(
+                self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
+                &[],
+            )
+            .map_err(|_| ());
+        };
+        if let Some(pending) = live.pending_successor.as_ref() {
+            let exact = pending.handoff_id == request.header.operation_id
+                && pending.owner == owner
+                && pending.attachment.lease_generation == request.header.lease_generation;
+            let status = if exact {
+                BrokerControlResponseStatusV1::Recovered
+            } else {
+                BrokerControlResponseStatusV1::Quarantined
+            };
+            return BrokerControlResponseV1::new(
+                self.response_header(request.header, status),
+                if exact {
+                    pending.recovery_secret.as_wire()
+                } else {
+                    &[]
+                },
+            )
+            .map_err(|_| ());
+        }
+        let exact_acknowledgement = live.last_successor_ack.is_some_and(|acknowledgement| {
+            acknowledgement.handoff_id == request.header.operation_id
+                && acknowledgement.owner == owner
+                && acknowledgement.attachment.lease_generation == request.header.lease_generation
+        });
+        BrokerControlResponseV1::new(
+            self.response_header(
+                request.header,
+                if exact_acknowledgement {
+                    BrokerControlResponseStatusV1::Recovered
+                } else {
+                    BrokerControlResponseStatusV1::Quarantined
+                },
+            ),
+            &[],
+        )
+        .map_err(|_| ())
+    }
+
+    fn dispatch_successor_acknowledgement(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let broker_incarnation = self.broker_incarnation;
+        let response_header = |status| BrokerControlResponseHeaderV1 {
+            operation: request.header.operation,
+            status,
+            request_id: request.header.request_id,
+            broker_incarnation,
+            guardian_incarnation: request.header.guardian_incarnation,
+            connection_id: request.header.connection_id,
+            durable_pane_id: request.header.durable_pane_id,
+            lease_generation: request.header.lease_generation,
+            operation_id: request.header.operation_id,
+            child_identity: None,
+            output_sequence_start: 0,
+            output_sequence_end: 0,
+        };
+        let successor_secret = match BrokerPaneRecoverySecretV1::from_wire(request.payload()) {
+            Ok(secret) => secret,
+            Err(_) => {
+                return BrokerControlResponseV1::new(
+                    response_header(BrokerControlResponseStatusV1::Rejected),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
+        let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) else {
+            return BrokerControlResponseV1::new(
+                response_header(BrokerControlResponseStatusV1::Rejected),
+                &[],
+            )
+            .map_err(|_| ());
+        };
+        if let Some(acknowledgement) = live.last_successor_ack {
+            let exact = acknowledgement.handoff_id == request.header.operation_id
+                && acknowledgement.ack_id == request.header.request_id
+                && acknowledgement.owner == owner
+                && acknowledgement.attachment.lease_generation == request.header.lease_generation
+                && live.recovery_verifier.verifies(
+                    &successor_secret,
+                    live.journal.identity(),
+                    request.header.lease_generation,
+                );
+            return BrokerControlResponseV1::new(
+                response_header(if exact {
+                    BrokerControlResponseStatusV1::Recovered
+                } else {
+                    BrokerControlResponseStatusV1::Quarantined
+                }),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+        let pending_is_exact = live.pending_successor.as_ref().is_some_and(|pending| {
+            pending.handoff_id == request.header.operation_id
+                && pending.owner == owner
+                && pending.attachment.lease_generation == request.header.lease_generation
+                && pending.recovery_verifier.verifies(
+                    &successor_secret,
+                    live.journal.identity(),
+                    request.header.lease_generation,
+                )
+        });
+        if !pending_is_exact {
+            return BrokerControlResponseV1::new(
+                response_header(BrokerControlResponseStatusV1::Quarantined),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+        let pending = live.pending_successor.take().ok_or(())?;
+        let authority = BrokerSuccessorAcknowledgementAuthorityV1 {
+            broker_incarnation,
+            durable_pane_id: request.header.durable_pane_id,
+            spawn_effect_id: live.fingerprint.binding.spawn_effect_id,
+            handoff_id: pending.handoff_id,
+            ack_id: request.header.request_id,
+            successor: pending.attachment,
+        };
+        let attachment = match live.adoption.pane.acknowledge_successor(authority) {
+            Ok(BrokerSuccessorAcknowledgementOutcomeV1::Activated(attachment)) => {
+                attachment.identity()
+            }
+            Ok(BrokerSuccessorAcknowledgementOutcomeV1::RecoveredExistingLease { .. }) | Err(_) => {
+                return BrokerControlResponseV1::new(
+                    response_header(BrokerControlResponseStatusV1::Quarantined),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
+        live.recovery_verifier = pending.recovery_verifier;
+        live.last_lease_mux_incarnation = owner.mux_incarnation;
+        live.last_successor_ack = Some(BrokerAppliedSuccessorAcknowledgementV1 {
+            handoff_id: pending.handoff_id,
+            ack_id: request.header.request_id,
+            owner,
+            attachment,
+        });
+        BrokerControlResponseV1::new(response_header(BrokerControlResponseStatusV1::Applied), &[])
+            .map_err(|_| ())
+    }
+
     fn dispatch_census(
         &mut self,
         owner: BrokerGuardianOwnerIdentity,
@@ -4955,6 +5300,9 @@ impl BrokerControlServiceV1 {
                     BrokerControlResponseStatusV1::Recovered
                 }
                 BrokerPaneLifecycleV1::AwaitingSuccessor => {
+                    BrokerControlResponseStatusV1::Retryable
+                }
+                BrokerPaneLifecycleV1::SuccessorClaimPending => {
                     BrokerControlResponseStatusV1::Retryable
                 }
                 BrokerPaneLifecycleV1::Quarantined(_)
@@ -5412,6 +5760,67 @@ pub enum BrokerSpawnClaimQueryV1 {
     RecoveredWithoutPty(BrokerCensusEntryV1),
 }
 
+/// One successor lease claim returned before the broker activates the new
+/// generation. The caller must durably protect the capability and then
+/// acknowledge this exact handoff before any pane effects become available.
+pub struct BrokerSuccessorPaneClaimV1 {
+    durable_pane_id: Uuid,
+    handoff_id: Uuid,
+    lease_generation: u64,
+    recovery_secret: BrokerPaneRecoverySecretV1,
+}
+
+impl BrokerSuccessorPaneClaimV1 {
+    #[must_use]
+    pub const fn durable_pane_id(&self) -> Uuid {
+        self.durable_pane_id
+    }
+
+    #[must_use]
+    pub const fn handoff_id(&self) -> Uuid {
+        self.handoff_id
+    }
+
+    #[must_use]
+    pub const fn lease_generation(&self) -> u64 {
+        self.lease_generation
+    }
+
+    #[must_use]
+    pub const fn recovery_secret(&self) -> &BrokerPaneRecoverySecretV1 {
+        &self.recovery_secret
+    }
+}
+
+impl std::fmt::Debug for BrokerSuccessorPaneClaimV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerSuccessorPaneClaimV1")
+            .field("durable_pane_id", &self.durable_pane_id)
+            .field("handoff_id", &self.handoff_id)
+            .field("lease_generation", &self.lease_generation)
+            .field("recovery_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum BrokerSuccessorClaimQueryV1 {
+    Absent,
+    Pending,
+    Claim(BrokerSuccessorPaneClaimV1),
+    Acknowledged,
+    Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerSuccessorAcknowledgementV1 {
+    Absent,
+    Pending,
+    Acknowledged,
+    Quarantined,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrokerSpawnEffectAcknowledgementV1 {
     Absent,
@@ -5853,6 +6262,183 @@ impl BrokerControlClientV1 {
                     return Err(BrokerControlClientError::UnexpectedResponse);
                 }
                 Ok(BrokerSpawnClaimQueryV1::RecoveredWithoutPty(entry))
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Claim the exact next pane generation with the predecessor generation's
+    /// recovery capability. The returned successor capability must be stored
+    /// durably before acknowledgement; pane effects remain fenced meanwhile.
+    pub fn claim_successor(
+        &mut self,
+        durable_pane_id: Uuid,
+        handoff_id: Uuid,
+        lease_generation: u64,
+        predecessor_secret: &BrokerPaneRecoverySecretV1,
+    ) -> Result<BrokerSuccessorClaimQueryV1, BrokerControlClientError> {
+        if durable_pane_id.is_nil() || handoff_id.is_nil() || lease_generation <= 1 {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::AttachSuccessor,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id,
+                lease_generation,
+                operation_id: handoff_id,
+            },
+            predecessor_secret.as_wire(),
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        self.decode_successor_claim_response(
+            response,
+            durable_pane_id,
+            handoff_id,
+            lease_generation,
+        )
+    }
+
+    /// Recover a successor Claim reply without rotating or issuing another
+    /// pane generation.
+    pub fn query_successor_claim(
+        &mut self,
+        durable_pane_id: Uuid,
+        handoff_id: Uuid,
+        lease_generation: u64,
+    ) -> Result<BrokerSuccessorClaimQueryV1, BrokerControlClientError> {
+        if durable_pane_id.is_nil() || handoff_id.is_nil() || lease_generation <= 1 {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::QueryEffect,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id,
+                lease_generation,
+                operation_id: handoff_id,
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        self.decode_successor_claim_response(
+            response,
+            durable_pane_id,
+            handoff_id,
+            lease_generation,
+        )
+    }
+
+    fn decode_successor_claim_response(
+        &mut self,
+        response: BrokerControlResponseV1,
+        durable_pane_id: Uuid,
+        handoff_id: Uuid,
+        lease_generation: u64,
+    ) -> Result<BrokerSuccessorClaimQueryV1, BrokerControlClientError> {
+        match response.header.status {
+            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
+                Ok(BrokerSuccessorClaimQueryV1::Absent)
+            }
+            BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
+                Ok(BrokerSuccessorClaimQueryV1::Pending)
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().len() == BROKER_PANE_RECOVERY_SECRET_BYTES
+                    && response.header.child_identity.is_none() =>
+            {
+                let recovery_secret = BrokerPaneRecoverySecretV1::from_wire(response.payload())
+                    .map_err(|_| BrokerControlClientError::Protocol)?;
+                Ok(BrokerSuccessorClaimQueryV1::Claim(
+                    BrokerSuccessorPaneClaimV1 {
+                        durable_pane_id,
+                        handoff_id,
+                        lease_generation,
+                        recovery_secret,
+                    },
+                ))
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().is_empty() && response.header.child_identity.is_none() =>
+            {
+                Ok(BrokerSuccessorClaimQueryV1::Acknowledged)
+            }
+            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+                Ok(BrokerSuccessorClaimQueryV1::Quarantined)
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Acknowledge one exact successor capability and atomically enable the
+    /// claimed generation. The caller must reuse `ack_id` after reply loss.
+    pub fn acknowledge_successor_claim(
+        &mut self,
+        durable_pane_id: Uuid,
+        handoff_id: Uuid,
+        ack_id: Uuid,
+        lease_generation: u64,
+        recovery_secret: &BrokerPaneRecoverySecretV1,
+    ) -> Result<BrokerSuccessorAcknowledgementV1, BrokerControlClientError> {
+        if durable_pane_id.is_nil()
+            || handoff_id.is_nil()
+            || ack_id.is_nil()
+            || lease_generation <= 1
+        {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::AcknowledgeEffect,
+                request_id: ack_id,
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id,
+                lease_generation,
+                operation_id: handoff_id,
+            },
+            recovery_secret.as_wire(),
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
+                Ok(BrokerSuccessorAcknowledgementV1::Absent)
+            }
+            BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
+                Ok(BrokerSuccessorAcknowledgementV1::Pending)
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().is_empty() =>
+            {
+                Ok(BrokerSuccessorAcknowledgementV1::Acknowledged)
+            }
+            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+                Ok(BrokerSuccessorAcknowledgementV1::Quarantined)
             }
             _ => {
                 self.poisoned = true;
@@ -12577,6 +13163,7 @@ pub struct BrokerAdoptionV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BrokerAppliedSuccessorHandoffV1 {
     handoff_id: Uuid,
+    ack_id: Option<Uuid>,
     predecessor: BrokerAttachmentIdentityV1,
     successor: BrokerAttachmentIdentityV1,
 }
@@ -12592,6 +13179,17 @@ impl BrokerAppliedSuccessorHandoffV1 {
             && self.successor == active_attachment
             && self.successor.owner == authority.successor
     }
+
+    fn matches_acknowledgement(
+        self,
+        authority: &BrokerSuccessorAcknowledgementAuthorityV1,
+        attachment: BrokerAttachmentIdentityV1,
+    ) -> bool {
+        self.handoff_id == authority.handoff_id
+            && self.ack_id == Some(authority.ack_id)
+            && self.successor == attachment
+            && self.successor == authority.successor
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12602,6 +13200,10 @@ enum BrokerLeaseState {
     AwaitingSuccessor {
         predecessor: BrokerAttachmentIdentityV1,
         next_generation: u64,
+    },
+    ClaimedSuccessor {
+        predecessor: BrokerAttachmentIdentityV1,
+        attachment: BrokerAttachmentIdentityV1,
     },
     Quarantined {
         reason: BrokerQuarantineReasonV1,
@@ -12633,6 +13235,7 @@ pub enum BrokerQuarantineReasonV1 {
 pub enum BrokerPaneLifecycleV1 {
     Active,
     AwaitingSuccessor,
+    SuccessorClaimPending,
     Quarantined(BrokerQuarantineReasonV1),
     FinalTerminalEof,
     FinalTerminalEofPending,
@@ -12831,6 +13434,24 @@ impl BrokerAdoptedPaneV1 {
                     .output_terminal
                     .and_then(|state| state.child_exit_observed),
             },
+            BrokerLeaseState::ClaimedSuccessor { attachment, .. } => BrokerPaneStatusV1 {
+                broker_incarnation: self.broker_incarnation,
+                child_identity: self.child_identity,
+                lifecycle: BrokerPaneLifecycleV1::SuccessorClaimPending,
+                lease_generation: attachment.lease_generation,
+                owner_guardian_incarnation: Some(attachment.owner.guardian_incarnation),
+                owner_mux_incarnation: Some(attachment.owner.mux_incarnation),
+                owner_guardian_build_identity_digest: Some(
+                    attachment.owner.guardian_build_identity_digest,
+                ),
+                owner_mux_build_identity_digest: Some(attachment.owner.mux_build_identity_digest),
+                completed_successor_handoffs: self.completed_successor_handoffs,
+                output_sequence: self.next_output_sequence,
+                output_terminal_reason: self.output_terminal.map(|state| state.reason),
+                output_child_exit_observed: self
+                    .output_terminal
+                    .and_then(|state| state.child_exit_observed),
+            },
             BrokerLeaseState::Quarantined { reason, .. } => BrokerPaneStatusV1 {
                 broker_incarnation: self.broker_incarnation,
                 child_identity: self.child_identity,
@@ -12886,6 +13507,18 @@ impl BrokerAdoptedPaneV1 {
         match self.lease {
             BrokerLeaseState::Active { attachment } => Some(attachment),
             BrokerLeaseState::AwaitingSuccessor { .. }
+            | BrokerLeaseState::ClaimedSuccessor { .. }
+            | BrokerLeaseState::Quarantined { .. }
+            | BrokerLeaseState::FinalTerminalEof { .. }
+            | BrokerLeaseState::FinalTerminalEofPending { .. } => None,
+        }
+    }
+
+    const fn awaiting_successor_predecessor(&self) -> Option<BrokerAttachmentIdentityV1> {
+        match self.lease {
+            BrokerLeaseState::AwaitingSuccessor { predecessor, .. } => Some(predecessor),
+            BrokerLeaseState::Active { .. }
+            | BrokerLeaseState::ClaimedSuccessor { .. }
             | BrokerLeaseState::Quarantined { .. }
             | BrokerLeaseState::FinalTerminalEof { .. }
             | BrokerLeaseState::FinalTerminalEofPending { .. } => None,
@@ -12901,6 +13534,7 @@ impl BrokerAdoptedPaneV1 {
                 ..
             } => 1,
             BrokerLeaseState::AwaitingSuccessor { .. }
+            | BrokerLeaseState::ClaimedSuccessor { .. }
             | BrokerLeaseState::FinalTerminalEof { .. }
             | BrokerLeaseState::FinalTerminalEofPending { .. }
             | BrokerLeaseState::Quarantined {
@@ -13338,6 +13972,11 @@ impl BrokerAdoptedPaneV1 {
             {
                 Ok(BrokerControlEofOutcomeV1::AlreadyObserved)
             }
+            BrokerLeaseState::ClaimedSuccessor { attachment, .. }
+                if attachment == eof.attachment =>
+            {
+                Ok(BrokerControlEofOutcomeV1::AlreadyObserved)
+            }
             BrokerLeaseState::Quarantined { .. } => Err(BrokerError::Quarantined),
             BrokerLeaseState::FinalTerminalEof { .. } => {
                 Err(BrokerError::FinalTerminalEofAlreadySent)
@@ -13345,7 +13984,9 @@ impl BrokerAdoptedPaneV1 {
             BrokerLeaseState::FinalTerminalEofPending { .. } => {
                 Err(BrokerError::FinalTerminalEofInProgress)
             }
-            BrokerLeaseState::Active { .. } | BrokerLeaseState::AwaitingSuccessor { .. } => {
+            BrokerLeaseState::Active { .. }
+            | BrokerLeaseState::AwaitingSuccessor { .. }
+            | BrokerLeaseState::ClaimedSuccessor { .. } => {
                 let attachment_may_be_open = matches!(self.lease, BrokerLeaseState::Active { .. });
                 self.quarantine(
                     BrokerQuarantineReasonV1::ConflictingControlEof,
@@ -13356,7 +13997,9 @@ impl BrokerAdoptedPaneV1 {
         }
     }
 
-    /// Rotate the one active attachment after exact successor handoff proof.
+    /// Stage the one successor attachment after exact handoff proof. The
+    /// claimed attachment remains effect-fenced until
+    /// [`Self::acknowledge_successor`] activates it.
     pub fn attach_successor(
         &mut self,
         authority: BrokerSuccessorHandoffAuthorityV1,
@@ -13401,6 +14044,18 @@ impl BrokerAdoptedPaneV1 {
                     status: self.status(),
                 })
             }
+            BrokerLeaseState::ClaimedSuccessor { attachment, .. }
+                if self
+                    .applied_handoff
+                    .is_some_and(|handoff| handoff.matches_retry(&authority, attachment)) =>
+            {
+                Ok(BrokerSuccessorAttachOutcomeV1::RecoveredPendingClaim {
+                    attachment: BrokerPtyAttachmentV1 {
+                        identity: attachment,
+                    },
+                    status: self.status(),
+                })
+            }
             BrokerLeaseState::AwaitingSuccessor {
                 predecessor,
                 next_generation,
@@ -13425,17 +14080,16 @@ impl BrokerAdoptedPaneV1 {
                     owner: authority.successor,
                     lease_generation: next_generation,
                 };
-                self.completed_successor_handoffs = self
-                    .completed_successor_handoffs
-                    .checked_add(1)
-                    .ok_or(BrokerError::HandoffCapacityExhausted)?;
                 self.applied_handoff = Some(BrokerAppliedSuccessorHandoffV1 {
                     handoff_id: authority.handoff_id,
+                    ack_id: None,
                     predecessor: authority.predecessor,
                     successor: attachment,
                 });
-                self.lease = BrokerLeaseState::Active { attachment };
-                self.current_lease_output_cursor = self.buffer_start_sequence;
+                self.lease = BrokerLeaseState::ClaimedSuccessor {
+                    predecessor,
+                    attachment,
+                };
                 Ok(BrokerSuccessorAttachOutcomeV1::Attached(
                     BrokerPtyAttachmentV1 {
                         identity: attachment,
@@ -13449,8 +14103,88 @@ impl BrokerAdoptedPaneV1 {
             BrokerLeaseState::FinalTerminalEofPending { .. } => {
                 Err(BrokerError::FinalTerminalEofInProgress)
             }
-            BrokerLeaseState::Active { .. } => {
-                self.quarantine(BrokerQuarantineReasonV1::ConflictingSuccessorHandoff, true);
+            BrokerLeaseState::Active { .. } | BrokerLeaseState::ClaimedSuccessor { .. } => {
+                let attachment_may_be_open = matches!(self.lease, BrokerLeaseState::Active { .. });
+                self.quarantine(
+                    BrokerQuarantineReasonV1::ConflictingSuccessorHandoff,
+                    attachment_may_be_open,
+                );
+                Err(BrokerError::ConflictingSuccessorHandoff)
+            }
+        }
+    }
+
+    /// Activate one previously claimed successor only after its exact
+    /// capability-bearing acknowledgement has been validated by the broker
+    /// control service.
+    fn acknowledge_successor(
+        &mut self,
+        authority: BrokerSuccessorAcknowledgementAuthorityV1,
+    ) -> Result<BrokerSuccessorAcknowledgementOutcomeV1, BrokerError> {
+        if authority.broker_incarnation != self.broker_incarnation
+            || authority.durable_pane_id != self.binding.durable_pane_id
+            || authority.spawn_effect_id != self.binding.spawn_effect_id
+            || authority.handoff_id.is_nil()
+            || authority.ack_id.is_nil()
+        {
+            self.quarantine(BrokerQuarantineReasonV1::ConflictingSuccessorHandoff, false);
+            return Err(BrokerError::ConflictingSuccessorHandoff);
+        }
+        match self.lease {
+            BrokerLeaseState::ClaimedSuccessor { attachment, .. }
+                if self.applied_handoff.is_some_and(|handoff| {
+                    handoff.handoff_id == authority.handoff_id
+                        && handoff.ack_id.is_none()
+                        && handoff.successor == attachment
+                        && attachment == authority.successor
+                }) =>
+            {
+                self.completed_successor_handoffs = self
+                    .completed_successor_handoffs
+                    .checked_add(1)
+                    .ok_or(BrokerError::HandoffCapacityExhausted)?;
+                let handoff = self
+                    .applied_handoff
+                    .as_mut()
+                    .ok_or(BrokerError::ConflictingSuccessorHandoff)?;
+                handoff.ack_id = Some(authority.ack_id);
+                self.lease = BrokerLeaseState::Active { attachment };
+                self.current_lease_output_cursor = self.buffer_start_sequence;
+                Ok(BrokerSuccessorAcknowledgementOutcomeV1::Activated(
+                    BrokerPtyAttachmentV1 {
+                        identity: attachment,
+                    },
+                ))
+            }
+            BrokerLeaseState::Active { attachment }
+                if self.applied_handoff.is_some_and(|handoff| {
+                    handoff.matches_acknowledgement(&authority, attachment)
+                }) =>
+            {
+                Ok(
+                    BrokerSuccessorAcknowledgementOutcomeV1::RecoveredExistingLease {
+                        attachment: BrokerPtyAttachmentV1 {
+                            identity: attachment,
+                        },
+                        status: self.status(),
+                    },
+                )
+            }
+            BrokerLeaseState::Quarantined { .. } => Err(BrokerError::Quarantined),
+            BrokerLeaseState::FinalTerminalEof { .. } => {
+                Err(BrokerError::FinalTerminalEofAlreadySent)
+            }
+            BrokerLeaseState::FinalTerminalEofPending { .. } => {
+                Err(BrokerError::FinalTerminalEofInProgress)
+            }
+            BrokerLeaseState::Active { .. }
+            | BrokerLeaseState::AwaitingSuccessor { .. }
+            | BrokerLeaseState::ClaimedSuccessor { .. } => {
+                let attachment_may_be_open = matches!(self.lease, BrokerLeaseState::Active { .. });
+                self.quarantine(
+                    BrokerQuarantineReasonV1::ConflictingSuccessorHandoff,
+                    attachment_may_be_open,
+                );
                 Err(BrokerError::ConflictingSuccessorHandoff)
             }
         }
@@ -13470,6 +14204,9 @@ impl BrokerAdoptedPaneV1 {
                 predecessor,
                 next_generation,
             } => (predecessor, next_generation, true),
+            BrokerLeaseState::ClaimedSuccessor { .. } => {
+                return Err(BrokerError::FinalTerminalEofNotFenced);
+            }
             BrokerLeaseState::FinalTerminalEofPending {
                 predecessor,
                 generation,
@@ -13531,6 +14268,7 @@ impl BrokerAdoptedPaneV1 {
             BrokerLeaseState::AwaitingSuccessor {
                 next_generation, ..
             } => next_generation,
+            BrokerLeaseState::ClaimedSuccessor { attachment, .. } => attachment.lease_generation,
             BrokerLeaseState::Quarantined { generation, .. } => generation,
             BrokerLeaseState::FinalTerminalEof { generation, .. } => generation,
             BrokerLeaseState::FinalTerminalEofPending { generation, .. } => generation,
@@ -13595,11 +14333,10 @@ pub enum BrokerControlEofOutcomeV1 {
     AlreadyObserved,
 }
 
-/// Reserved nonduplicable successor authority.
-///
-/// There is intentionally no production constructor.  A later broker control
-/// protocol must mint this only from a durable, authenticated handoff record;
-/// until then the successor path is impossible to activate in production.
+/// Nonduplicable successor authority minted only inside the authenticated
+/// broker control service after predecessor-capability verification. The
+/// control path is live for process-local proof, but production activation
+/// remains disabled until the same transition is durably recorded.
 pub struct BrokerSuccessorHandoffAuthorityV1 {
     broker_incarnation: Uuid,
     durable_pane_id: Uuid,
@@ -13607,6 +14344,15 @@ pub struct BrokerSuccessorHandoffAuthorityV1 {
     handoff_id: Uuid,
     predecessor: BrokerAttachmentIdentityV1,
     successor: BrokerGuardianOwnerIdentity,
+}
+
+struct BrokerSuccessorAcknowledgementAuthorityV1 {
+    broker_incarnation: Uuid,
+    durable_pane_id: Uuid,
+    spawn_effect_id: Uuid,
+    handoff_id: Uuid,
+    ack_id: Uuid,
+    successor: BrokerAttachmentIdentityV1,
 }
 
 /// Nonduplicable terminal-retirement authority reserved for the future
@@ -13648,6 +14394,18 @@ impl std::fmt::Debug for BrokerSuccessorHandoffAuthorityV1 {
 
 pub enum BrokerSuccessorAttachOutcomeV1 {
     Attached(BrokerPtyAttachmentV1),
+    RecoveredPendingClaim {
+        attachment: BrokerPtyAttachmentV1,
+        status: BrokerPaneStatusV1,
+    },
+    RecoveredExistingLease {
+        attachment: BrokerPtyAttachmentV1,
+        status: BrokerPaneStatusV1,
+    },
+}
+
+enum BrokerSuccessorAcknowledgementOutcomeV1 {
+    Activated(BrokerPtyAttachmentV1),
     RecoveredExistingLease {
         attachment: BrokerPtyAttachmentV1,
         status: BrokerPaneStatusV1,
@@ -14952,7 +15710,10 @@ mod tests {
             (BrokerControlOperationV1::Resize, &[0; 8]),
             (BrokerControlOperationV1::ReadOutput, &[0; 4]),
             (BrokerControlOperationV1::AcknowledgeOutput, &[0; 8]),
-            (BrokerControlOperationV1::AttachSuccessor, &[]),
+            (
+                BrokerControlOperationV1::AttachSuccessor,
+                &[0x75; BROKER_PANE_RECOVERY_SECRET_BYTES],
+            ),
             (BrokerControlOperationV1::ClosePane, &[]),
         ];
         for (operation, payload) in leased_operations {
@@ -18399,7 +19160,126 @@ mod tests {
         assert!(awaiting_entry.pty_available);
         assert!(!awaiting_entry.lease_available);
         assert!(!awaiting_entry.output_replay_available);
+
+        let successor_identity = BrokerGuardianConnectionIdentityV1::new(
+            id(7_316),
+            id(7_317),
+            sealed(0xdb),
+            sealed(0xdc),
+        )
+        .expect("construct successor mux connection identity");
+        let mut successor_client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            successor_identity,
+            broker_build,
+        )
+        .expect("connect successor mux client");
+        let handoff_id = id(7_318);
+        let forged_predecessor_secret =
+            BrokerPaneRecoverySecretV1::from_wire(&[0xb5; BROKER_PANE_RECOVERY_SECRET_BYTES])
+                .expect("construct forged predecessor recovery capability");
+        assert!(matches!(
+            successor_client
+                .claim_successor(
+                    binding.durable_pane_id,
+                    handoff_id,
+                    2,
+                    &forged_predecessor_secret,
+                )
+                .expect("reject forged predecessor capability"),
+            BrokerSuccessorClaimQueryV1::Quarantined
+        ));
+        let successor_claim = match successor_client
+            .claim_successor(
+                binding.durable_pane_id,
+                handoff_id,
+                2,
+                initial_claim.recovery_secret(),
+            )
+            .expect("claim the exact successor generation")
+        {
+            BrokerSuccessorClaimQueryV1::Claim(claim) => claim,
+            outcome => panic!("successor Claim did not return a capability: {outcome:?}"),
+        };
+        assert_eq!(successor_claim.durable_pane_id(), binding.durable_pane_id);
+        assert_eq!(successor_claim.handoff_id(), handoff_id);
+        assert_eq!(successor_claim.lease_generation(), 2);
+        assert!(matches!(
+            reconnect
+                .query_successor_claim(binding.durable_pane_id, handoff_id, 2)
+                .expect("fence predecessor from successor Claim replay"),
+            BrokerSuccessorClaimQueryV1::Quarantined
+        ));
+        assert!(matches!(
+            successor_client
+                .query_successor_claim(binding.durable_pane_id, handoff_id, 2)
+                .expect("replay the exact successor Claim"),
+            BrokerSuccessorClaimQueryV1::Claim(_)
+        ));
+        assert_eq!(
+            successor_client
+                .acknowledge_successor_claim(
+                    binding.durable_pane_id,
+                    handoff_id,
+                    id(7_319),
+                    2,
+                    initial_claim.recovery_secret(),
+                )
+                .expect("reject predecessor capability as successor acknowledgement"),
+            BrokerSuccessorAcknowledgementV1::Quarantined
+        );
+        let successor_ack_id = id(7_320);
+        assert_eq!(
+            successor_client
+                .acknowledge_successor_claim(
+                    binding.durable_pane_id,
+                    handoff_id,
+                    successor_ack_id,
+                    2,
+                    successor_claim.recovery_secret(),
+                )
+                .expect("acknowledge the exact successor Claim"),
+            BrokerSuccessorAcknowledgementV1::Acknowledged
+        );
+        assert_eq!(
+            successor_client
+                .acknowledge_successor_claim(
+                    binding.durable_pane_id,
+                    handoff_id,
+                    successor_ack_id,
+                    2,
+                    successor_claim.recovery_secret(),
+                )
+                .expect("recover the exact successor acknowledgement reply"),
+            BrokerSuccessorAcknowledgementV1::Acknowledged
+        );
+        assert!(matches!(
+            successor_client
+                .query_successor_claim(binding.durable_pane_id, handoff_id, 2)
+                .expect("query the acknowledged successor Claim"),
+            BrokerSuccessorClaimQueryV1::Acknowledged
+        ));
+        let successor_census = successor_client
+            .census()
+            .expect("collect activated successor Census");
+        let [successor_entry] = successor_census.entries() else {
+            panic!("activated successor Census did not contain exactly one live pane")
+        };
+        assert_eq!(
+            successor_entry.disposition,
+            BrokerCensusDispositionV1::ReplyAcknowledgedPtyAvailable
+        );
+        assert_eq!(
+            successor_entry.owner_mux_incarnation,
+            Some(successor_identity.mux_incarnation)
+        );
+        assert_eq!(successor_entry.lease_generation, 2);
+        assert!(!successor_entry.effects_disabled);
+        assert!(successor_entry.lease_available);
+        assert!(successor_entry.output_replay_available);
         drop(reconnect);
+        drop(successor_client);
         service.finish();
 
         let secret = crate::transport::load_guardian_secret(&token_path)
@@ -20227,6 +21107,9 @@ mod tests {
             .expect("attach fenced successor")
         {
             BrokerSuccessorAttachOutcomeV1::Attached(attachment) => attachment,
+            BrokerSuccessorAttachOutcomeV1::RecoveredPendingClaim { .. } => {
+                panic!("first handoff cannot already be pending")
+            }
             BrokerSuccessorAttachOutcomeV1::RecoveredExistingLease { .. } => {
                 panic!("first handoff cannot already be applied")
             }
@@ -20234,7 +21117,12 @@ mod tests {
         assert_eq!(successor_attachment.identity().lease_generation(), 2);
         assert_eq!(pane.child_identity(), child_identity);
         assert_eq!(pane.resource_usage().broker_pty_descriptors, 3);
-        assert_eq!(pane.resource_usage().live_guardian_leases, 1);
+        assert_eq!(pane.resource_usage().live_guardian_leases, 0);
+        assert_eq!(
+            pane.status().lifecycle,
+            BrokerPaneLifecycleV1::SuccessorClaimPending
+        );
+        assert_eq!(pane.status().completed_successor_handoffs, 0);
 
         let successor_identity = successor_attachment.identity();
         let lost_reply_retry = BrokerSuccessorHandoffAuthorityV1 {
@@ -20247,19 +21135,57 @@ mod tests {
         };
         let recovered_attachment = match pane
             .attach_successor(lost_reply_retry)
-            .expect("recover already-applied handoff acknowledgement")
+            .expect("recover pending successor Claim")
         {
-            BrokerSuccessorAttachOutcomeV1::RecoveredExistingLease { attachment, status } => {
-                assert_eq!(status.completed_successor_handoffs, 1);
+            BrokerSuccessorAttachOutcomeV1::RecoveredPendingClaim { attachment, status } => {
+                assert_eq!(status.completed_successor_handoffs, 0);
+                assert_eq!(
+                    status.lifecycle,
+                    BrokerPaneLifecycleV1::SuccessorClaimPending
+                );
                 attachment
             }
             BrokerSuccessorAttachOutcomeV1::Attached(_) => {
                 panic!("lost-reply retry minted a second lease")
             }
+            BrokerSuccessorAttachOutcomeV1::RecoveredExistingLease { .. } => {
+                panic!("an unacknowledged Claim became active")
+            }
         };
         assert_eq!(recovered_attachment.identity(), successor_identity);
+        assert_eq!(pane.resource_usage().live_guardian_leases, 0);
+        let successor_ack = BrokerSuccessorAcknowledgementAuthorityV1 {
+            broker_incarnation: id(21),
+            durable_pane_id: binding.durable_pane_id,
+            spawn_effect_id: binding.spawn_effect_id,
+            handoff_id,
+            ack_id: id(29),
+            successor: recovered_attachment.identity(),
+        };
+        let successor_attachment = match pane
+            .acknowledge_successor(successor_ack)
+            .expect("activate the exact acknowledged successor")
+        {
+            BrokerSuccessorAcknowledgementOutcomeV1::Activated(attachment) => attachment,
+            BrokerSuccessorAcknowledgementOutcomeV1::RecoveredExistingLease { .. } => {
+                panic!("first successor acknowledgement cannot be a retry")
+            }
+        };
+        assert_eq!(pane.status().completed_successor_handoffs, 1);
+        assert_eq!(pane.status().lifecycle, BrokerPaneLifecycleV1::Active);
         assert_eq!(pane.resource_usage().live_guardian_leases, 1);
-        let successor_attachment = recovered_attachment;
+        let recovered_ack = BrokerSuccessorAcknowledgementAuthorityV1 {
+            broker_incarnation: id(21),
+            durable_pane_id: binding.durable_pane_id,
+            spawn_effect_id: binding.spawn_effect_id,
+            handoff_id,
+            ack_id: id(29),
+            successor: successor_attachment.identity(),
+        };
+        assert!(matches!(
+            pane.acknowledge_successor(recovered_ack),
+            Ok(BrokerSuccessorAcknowledgementOutcomeV1::RecoveredExistingLease { .. })
+        ));
 
         let delayed_predecessor_eof =
             BrokerAuthenticatedControlEofV1::from_authenticated_transport_close(first_attachment);
@@ -20318,6 +21244,7 @@ mod tests {
         let handoff_id = id(212);
         let applied = BrokerAppliedSuccessorHandoffV1 {
             handoff_id,
+            ack_id: Some(id(230)),
             predecessor,
             successor,
         };
@@ -20402,7 +21329,7 @@ mod tests {
             pane.attach_successor(forged_retry).err(),
             Some(BrokerError::ConflictingSuccessorHandoff)
         );
-        assert_eq!(pane.status().completed_successor_handoffs, 1);
+        assert_eq!(pane.status().completed_successor_handoffs, 0);
         assert_eq!(
             pane.status().lifecycle,
             BrokerPaneLifecycleV1::Quarantined(
