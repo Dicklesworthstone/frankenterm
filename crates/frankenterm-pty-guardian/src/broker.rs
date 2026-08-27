@@ -9088,6 +9088,7 @@ fn validate_broker_lease_record_fields(
             if !fields.handoff_id.is_nil()
                 && fields.ack_id.is_nil()
                 && !fields.successor_attachment_id.is_nil()
+                && fields.successor_attachment_id != fields.predecessor_attachment_id
                 && fields.predecessor_attachment_digest != [0; 32] =>
         {
             Ok(())
@@ -9096,6 +9097,7 @@ fn validate_broker_lease_record_fields(
             if !fields.handoff_id.is_nil()
                 && !fields.ack_id.is_nil()
                 && !fields.successor_attachment_id.is_nil()
+                && fields.successor_attachment_id != fields.predecessor_attachment_id
                 && fields.predecessor_attachment_digest != [0; 32] =>
         {
             Ok(())
@@ -9137,6 +9139,8 @@ fn validate_broker_lease_record_transition(
             if previous.phase == BrokerPaneLeaseWalPhaseV1::PredecessorFenced
                 && current.lease_generation == previous.lease_generation
                 && current.predecessor_attachment_id == previous.predecessor_attachment_id
+                && current.owner.guardian_incarnation != previous.owner.guardian_incarnation
+                && current.owner.connection_id != previous.owner.connection_id
                 && current.predecessor_attachment_digest == previous.attachment_digest =>
         {
             Ok(())
