@@ -23551,6 +23551,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn token_replacement_before_lease_reconciliation_preserves_head_and_effect_fence() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
+            .expect("create lease token-fence recovery root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("set lease token-fence root owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision lease token-fence token");
+        let original_token = fs::read(&token_path).expect("read lease token-fence token");
+        let (secret, mut token_authority) =
+            crate::transport::load_guardian_secret_with_authority(&token_path)
+                .expect("load retained lease token-fence authority");
+        let spawn_authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive lease token-fence Spawn-WAL authority");
+        let lease_authenticator = secret
+            .broker_lease_wal_authenticator()
+            .expect("derive lease token-fence lease-WAL authority");
+        let identity = lease_catalog_identity(&spawn_authenticator, 0x68);
+        let predecessor = lease_catalog_initial_attachment(identity.spawn, 0x68);
+        let head_path = lease_catalog_path.join(broker_lease_catalog_head_name(
+            identity.spawn.journal_id(),
+        ));
+
+        let catalog = BrokerPaneLeaseWalCatalogV1::open(lease_catalog_path.clone())
+            .expect("open lease token-fence catalog");
+        let mut journal = catalog
+            .create_lease_journal(&identity, lease_authenticator.clone())
+            .expect("create lease token-fence WAL-ahead journal");
+        journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.fence_predecessor_and_sync(
+                predecessor,
+                2,
+                identity.initial_recovery_verifier,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::Io(_))
+        ));
+        drop(journal);
+        drop(catalog);
+
+        let head_before = fs::read(&head_path).expect("read unreconciled lease token-fence head");
+        let catalog = reopen_test_lease_catalog_after_owner_drop(&lease_catalog_path)
+            .expect("reopen lease token-fence catalog");
+        let mut recovered = catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("scan lease token-fence catalog before token replacement");
+        assert!(recovered[0].status().head_reconciliation_required);
+        assert!(recovered[0].status().append_authority_withheld);
+
+        let retained_token = root.path().join(format!(
+            "guardian-retained-lease-token-fence-{}.token",
+            Uuid::new_v4()
+        ));
+        fs::rename(&token_path, &retained_token)
+            .expect("retain original lease token-fence inode");
+        create_private_broker_token_with_bytes(&token_path, &original_token);
+        assert!(matches!(
+            reconcile_broker_lease_catalog_under_token_authority(
+                &mut token_authority,
+                &catalog,
+                &mut recovered,
+            ),
+            Err(BrokerControlServiceError::Endpoint(
+                GuardianServiceError::FilesystemSecurity(_)
+            ))
+        ));
+        assert_eq!(
+            fs::read(&head_path).expect("read stale-authority lease head"),
+            head_before,
+            "stale token authority reconciled a lease head before refusal"
+        );
+        assert!(recovered[0].status().head_reconciliation_required);
+        assert!(recovered[0].status().append_authority_withheld);
+        assert!(
+            !socket_path.exists(),
+            "stale lease token authority reached broker socket binding"
+        );
+        assert_eq!(
+            fs::read(&retained_token).expect("read retained lease token-fence token"),
+            original_token
+        );
+    }
+
     #[cfg(any(
         target_os = "android",
         target_os = "ios",
@@ -26256,6 +26343,153 @@ mod tests {
             .scan_all_for_admission(&lease_authenticator)
             .expect("scan read-only reconciled lease catalog");
         assert!(!recovered[0].status().head_reconciliation_required);
+        assert!(recovered[0].status().append_authority_withheld);
+    }
+
+    #[test]
+    fn pane_lease_catalog_restart_resumes_exact_partial_head_read_only() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xe9);
+        let identity = lease_catalog_identity(&spawn_authenticator, 0x4d);
+        let predecessor = lease_catalog_initial_attachment(identity.spawn, 0x4d);
+        let head_path = temp.path().join(broker_lease_catalog_head_name(
+            identity.spawn.journal_id(),
+        ));
+        let catalog = BrokerPaneLeaseWalCatalogV1::open(temp.path().to_path_buf())
+            .expect("open partial-head restart lease catalog");
+        let mut journal = catalog
+            .create_lease_journal(&identity, lease_authenticator.clone())
+            .expect("create partial-head restart lease journal");
+        journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.fence_predecessor_and_sync(
+                predecessor,
+                2,
+                identity.initial_recovery_verifier,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::Io(_))
+        ));
+        drop(journal);
+        drop(catalog);
+
+        let catalog = reopen_test_lease_catalog_after_owner_drop(temp.path())
+            .expect("reopen partial-head restart lease catalog");
+        let mut first_recovery = catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("scan WAL-ahead lease before partial recovered-head write");
+        first_recovery[0]
+            .inject_fault(BrokerPaneLeaseWalInjectedFaultV1::DuringRecoveredHeadWrite);
+        assert!(matches!(
+            catalog.reconcile_recovered_read_only(&mut first_recovery),
+            Err(BrokerPaneLeaseWalErrorV1::Io(_))
+        ));
+        assert!(first_recovery[0].poisoned);
+        drop(first_recovery);
+        drop(catalog);
+
+        let partial = fs::read(&head_path).expect("read partial catalog-managed lease head");
+        assert_eq!(
+            partial.len(),
+            BROKER_LEASE_WAL_FILE_HEADER_BYTES + 37,
+            "catalog recovery did not retain the exact injected head prefix"
+        );
+        let catalog = reopen_test_lease_catalog_after_owner_drop(temp.path())
+            .expect("reopen exact partial-head lease catalog");
+        let mut resumed = catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("scan exact partial-head lease catalog");
+        assert_eq!(
+            resumed[0].status().tail,
+            BrokerPaneLeaseWalTailV1::Incomplete {
+                wal_trailing_bytes: 0,
+                head_trailing_bytes: 37,
+            }
+        );
+        assert!(resumed[0].status().head_reconciliation_required);
+        assert!(resumed[0].status().append_authority_withheld);
+
+        catalog
+            .reconcile_recovered_read_only(&mut resumed)
+            .expect("resume only the missing lease-head suffix read-only");
+        assert_eq!(resumed[0].status().tail, BrokerPaneLeaseWalTailV1::Clean);
+        assert!(!resumed[0].status().head_reconciliation_required);
+        assert!(resumed[0].status().append_authority_withheld);
+        let completed = fs::read(&head_path).expect("read completed catalog-managed lease head");
+        assert_eq!(
+            &completed[..partial.len()],
+            partial.as_slice(),
+            "catalog recovery rewrote an already durable lease-head prefix"
+        );
+    }
+
+    #[test]
+    fn pane_lease_catalog_reconciliation_preflights_every_journal_before_first_write() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xea);
+        let identities = [
+            lease_catalog_identity(&spawn_authenticator, 0x4e),
+            lease_catalog_identity(&spawn_authenticator, 0x4f),
+        ];
+        let catalog = BrokerPaneLeaseWalCatalogV1::open(temp.path().to_path_buf())
+            .expect("open multi-journal reconciliation catalog");
+        for (identity, seed) in identities.into_iter().zip([0x4e, 0x4f]) {
+            let predecessor = lease_catalog_initial_attachment(identity.spawn, seed);
+            let mut journal = catalog
+                .create_lease_journal(&identity, lease_authenticator.clone())
+                .expect("create multi-journal WAL-ahead lease");
+            journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
+            assert!(matches!(
+                journal.fence_predecessor_and_sync(
+                    predecessor,
+                    2,
+                    identity.initial_recovery_verifier,
+                ),
+                Err(BrokerPaneLeaseWalErrorV1::Io(_))
+            ));
+        }
+        drop(catalog);
+
+        let catalog = reopen_test_lease_catalog_after_owner_drop(temp.path())
+            .expect("reopen multi-journal reconciliation catalog");
+        let mut recovered = catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("scan multi-journal reconciliation catalog");
+        assert_eq!(recovered.len(), 2);
+        assert!(
+            recovered
+                .iter()
+                .all(|journal| journal.status().head_reconciliation_required)
+        );
+        let first_head_path = temp.path().join(broker_lease_catalog_head_name(
+            recovered[0].identity.spawn.journal_id(),
+        ));
+        let later_head_path = temp.path().join(broker_lease_catalog_head_name(
+            recovered[1].identity.spawn.journal_id(),
+        ));
+        let first_head_before = fs::read(&first_head_path)
+            .expect("read first unreconciled head before global preflight");
+        let mut later_head = OpenOptions::new()
+            .append(true)
+            .open(&later_head_path)
+            .expect("open later head for descriptor revalidation fault");
+        later_head
+            .write_all(&[0x5a])
+            .expect("append later head revalidation fault byte");
+        later_head
+            .sync_all()
+            .expect("synchronize later head revalidation fault");
+        drop(later_head);
+
+        assert!(matches!(
+            catalog.reconcile_recovered_read_only(&mut recovered),
+            Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch)
+        ));
+        assert_eq!(
+            fs::read(&first_head_path).expect("reread first head after global preflight refusal"),
+            first_head_before,
+            "an earlier lease head changed before a later journal failed preflight"
+        );
+        assert!(recovered[0].status().head_reconciliation_required);
         assert!(recovered[0].status().append_authority_withheld);
     }
 
