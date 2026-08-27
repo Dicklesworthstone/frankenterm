@@ -17,15 +17,15 @@ use mux::guardian_protocol::{
     GuardianCheckpointOutputBoundaryV1, GuardianInputEffectQuery, GuardianProtocolError,
     GuardianRejectionCode, GuardianReplayAckReceiptV1, GuardianReplayAckV1, GuardianReplayCursorV1,
     GuardianReplayDeliveryError, GuardianReplayGapReasonV1, GuardianReplayPageBodyDelivery,
-    GuardianReplayPageDelivery, GuardianReplayRequestV1, GuardianReplaySelectorV1, GuardianReply,
-    InputEffectState,
+    GuardianReplayPageDelivery, GuardianReplayRecordDelivery, GuardianReplayRequestV1,
+    GuardianReplaySelectorV1, GuardianReply, InputEffectState,
 };
 use mux::localpane::{GuardianPaneLeaseControl, GuardianPaneLeaseIdentity, LocalPane};
-use mux::pane::PaneId;
+use mux::pane::{GuardianLiveOutputReader, PaneId};
 use parking_lot::Mutex;
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use sha2::{Digest as _, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -2355,8 +2355,7 @@ struct GuardianReplayTailReader {
     boundary: GuardianReplayBoundary,
     cursor: Option<GuardianReplayCursorV1>,
     pending_replay: Option<(Uuid, GuardianReplayRequestV1)>,
-    plaintext: BoundedReplayBuffer,
-    plaintext_offset: usize,
+    records: VecDeque<GuardianReplayRecordDelivery>,
     pending_ack: Option<GuardianReplayAckPlan>,
     pending_boundary: Option<GuardianReplayBoundary>,
     pending_terminal_error: Option<GuardianReplayDeferredTerminalError>,
@@ -2374,8 +2373,7 @@ impl fmt::Debug for GuardianReplayTailReader {
             .field("boundary", &self.boundary)
             .field("has_cursor", &self.cursor.is_some())
             .field("has_pending_replay", &self.pending_replay.is_some())
-            .field("buffered_bytes", &self.plaintext.len())
-            .field("plaintext_offset", &self.plaintext_offset)
+            .field("buffered_records", &self.records.len())
             .field("has_pending_ack", &self.pending_ack.is_some())
             .field(
                 "has_pending_terminal_error",
@@ -2412,11 +2410,7 @@ impl GuardianReplayTailReader {
             boundary,
             cursor: None,
             pending_replay: None,
-            plaintext: BoundedReplayBuffer::new(
-                usize::try_from(maximum_record_bytes)
-                    .map_err(|_| GuardianProxyError::ReplayCapacity)?,
-            )?,
-            plaintext_offset: 0,
+            records: VecDeque::new(),
             pending_ack: None,
             pending_boundary: None,
             pending_terminal_error: None,
@@ -2446,9 +2440,9 @@ impl GuardianReplayTailReader {
         let Some(plan) = self.pending_ack else {
             return Ok(());
         };
-        if self.plaintext_offset != self.plaintext.len() {
+        if !self.records.is_empty() {
             return Err(GuardianProxyError::ReplayInvariant(
-                "guardian replay page was acknowledged before plaintext delivery completed",
+                "guardian replay page was acknowledged before record delivery completed",
             ));
         }
         let delivered = self
@@ -2476,15 +2470,13 @@ impl GuardianReplayTailReader {
         }
         self.pending_ack = None;
         self.pending_boundary = None;
-        self.plaintext_offset = 0;
-        self.plaintext.zeroize_and_clear();
         Ok(())
     }
 
     fn load_next_output_page(&mut self) -> Result<(), GuardianProxyError> {
         if self.pending_ack.is_some()
             || self.pending_terminal_error.is_some()
-            || !self.plaintext.is_empty()
+            || !self.records.is_empty()
         {
             return Err(GuardianProxyError::ReplayInvariant(
                 "guardian tail attempted to fetch past unacknowledged plaintext",
@@ -2523,10 +2515,15 @@ impl GuardianReplayTailReader {
                         ));
                     }
                     let mut candidate = self.boundary;
-                    let mut candidate_plaintext = BoundedReplayBuffer::new(self.plaintext.maximum)?;
-                    for record in records.into_records() {
+                    let records = records.into_records();
+                    let mut candidate_records = VecDeque::new();
+                    candidate_records
+                        .try_reserve(records.len())
+                        .map_err(|_| GuardianProxyError::ReplayCapacity)?;
+                    for record in records {
                         let metadata = record.metadata();
                         if metadata.sequence() != candidate.next_sequence
+                            || metadata.payload_bytes() > self.maximum_record_bytes
                             || metadata.cumulative_plaintext_bytes()
                                 != candidate
                                     .cumulative_plaintext_bytes
@@ -2537,26 +2534,19 @@ impl GuardianReplayTailReader {
                                 "live output record breaks the delivered sequence/digest chain",
                             ));
                         }
-                        let observed = record
-                            .write_all_bounded(&mut candidate_plaintext, self.maximum_record_bytes)
-                            .map_err(GuardianProxyError::ReplayDelivery)?;
-                        if observed != metadata {
-                            return Err(GuardianProxyError::ReplayInvariant(
-                                "live replay delivery changed authenticated record metadata",
-                            ));
-                        }
+                        candidate_records.push_back(record);
                         candidate = GuardianReplayBoundary {
-                            next_sequence: observed
+                            next_sequence: metadata
                                 .sequence()
                                 .checked_add(1)
                                 .ok_or(GuardianProxyError::ReplayCapacity)?,
-                            previous_record_digest: observed.record_digest(),
-                            cumulative_plaintext_bytes: observed.cumulative_plaintext_bytes(),
+                            previous_record_digest: metadata.record_digest(),
+                            cumulative_plaintext_bytes: metadata.cumulative_plaintext_bytes(),
                         };
                     }
-                    if candidate_plaintext.is_empty() {
+                    if candidate_records.is_empty() {
                         return Err(GuardianProxyError::ReplayInvariant(
-                            "live output page contained no plaintext",
+                            "live output page contained no records",
                         ));
                     }
                     let pending_ack = replay_page_ack_plan(
@@ -2569,7 +2559,7 @@ impl GuardianReplayTailReader {
                         candidate.through_sequence()?,
                         candidate.previous_record_digest,
                     );
-                    self.plaintext = candidate_plaintext;
+                    self.records = candidate_records;
                     self.pending_ack = Some(pending_ack);
                     self.pending_boundary = Some(candidate);
                     self.pending_replay = None;
@@ -2723,29 +2713,53 @@ fn guardian_replay_remaining_idle_delay(
     idle_delay.saturating_sub(replay_elapsed.min(server_wait_budget))
 }
 
-impl Read for GuardianReplayTailReader {
-    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
-        if target.is_empty() {
-            return Ok(0);
-        }
+impl GuardianLiveOutputReader for GuardianReplayTailReader {
+    fn deliver_next_record(
+        &mut self,
+        deliver: &mut dyn FnMut(
+            mux::guardian_output_journal::GuardianOutputSegmentIdentity,
+            mux::guardian_output_journal::GuardianOutputAppendReceipt,
+            Arc<[u8]>,
+        ) -> io::Result<()>,
+    ) -> io::Result<()> {
         loop {
-            if self.plaintext_offset < self.plaintext.len() {
-                let copied = self
-                    .plaintext
-                    .copy_out(self.plaintext_offset, target)
-                    .map_err(io::Error::from)?;
-                self.plaintext_offset = self
-                    .plaintext_offset
-                    .checked_add(copied)
-                    .ok_or_else(|| io::Error::from(GuardianProxyError::ReplayCapacity))?;
-                if self.plaintext_offset == self.plaintext.len() {
-                    self.boundary = self.pending_boundary.ok_or_else(|| {
-                        io::Error::from(GuardianProxyError::ReplayInvariant(
-                            "delivered replay plaintext omitted its terminal boundary",
-                        ))
-                    })?;
+            if let Some(record) = self.records.pop_front() {
+                let metadata = record.metadata();
+                if metadata.sequence() != self.boundary.next_sequence
+                    || metadata.cumulative_plaintext_bytes()
+                        != self
+                            .boundary
+                            .cumulative_plaintext_bytes
+                            .checked_add(u64::from(metadata.payload_bytes()))
+                            .ok_or_else(|| io::Error::from(GuardianProxyError::ReplayCapacity))?
+                {
+                    return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
+                        "live output record no longer matches the delivered parser boundary",
+                    )));
                 }
-                return Ok(copied);
+                let candidate = GuardianReplayBoundary {
+                    next_sequence: metadata
+                        .sequence()
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::from(GuardianProxyError::ReplayCapacity))?,
+                    previous_record_digest: metadata.record_digest(),
+                    cumulative_plaintext_bytes: metadata.cumulative_plaintext_bytes(),
+                };
+                let (segment, output, payload) = record
+                    .into_live_output(self.identity.pane_id())
+                    .map_err(GuardianProxyError::ReplayDelivery)
+                    .map_err(io::Error::from)?;
+                deliver(segment, output, payload)?;
+                self.boundary = candidate;
+                if self.records.is_empty() {
+                    if self.pending_boundary != Some(candidate) {
+                        return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
+                            "delivered replay records omitted their terminal page boundary",
+                        )));
+                    }
+                    self.finish_delivered_page().map_err(io::Error::from)?;
+                }
+                return Ok(());
             }
             self.finish_delivered_page().map_err(io::Error::from)?;
             if let Some(error) = self.pending_terminal_error.take() {
@@ -2801,6 +2815,7 @@ impl GuardianReplayReaderSlot {
         }
     }
 
+    #[cfg(test)]
     fn install_after_restore(
         &self,
         reader: Box<dyn Read + Send>,
@@ -3048,7 +3063,7 @@ impl GuardianProxyStaging {
     fn activate_verified_restore(
         self,
         inert_terminal: InertTerminal,
-        reader: Box<dyn Read + Send>,
+        guardian_live_output_reader: Box<dyn GuardianLiveOutputReader>,
     ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
         let identity = self.identity();
         let terminal_writer = GuardianProxyWriter {
@@ -3064,7 +3079,6 @@ impl GuardianProxyStaging {
                 return Err(GuardianProxyError::TerminalActivation);
             }
         };
-        self.reader_slot.install_after_restore(reader)?;
         let actor = Arc::clone(&self.actor);
         Ok(ActivatedGuardianProxy {
             terminal,
@@ -3083,6 +3097,7 @@ impl GuardianProxyStaging {
                 actor,
                 census: Arc::clone(&self.census),
             }),
+            guardian_live_output_reader: Some(guardian_live_output_reader),
             lease_identity: identity,
             lease_rollback: self.lease_rollback,
         })
@@ -3122,6 +3137,7 @@ impl GuardianProxyStaging {
                 actor,
                 census: Arc::clone(&self.census),
             }),
+            guardian_live_output_reader: None,
             lease_identity: identity,
             lease_rollback: self.lease_rollback,
         }
@@ -3136,6 +3152,7 @@ pub struct ActivatedGuardianProxy {
     pty: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
     lease_control: Arc<dyn GuardianPaneLeaseControl>,
+    guardian_live_output_reader: Option<Box<dyn GuardianLiveOutputReader>>,
     lease_identity: GuardianPaneLeaseIdentity,
     lease_rollback: GuardianClaimedLeaseRollback,
 }
@@ -3168,6 +3185,9 @@ impl ActivatedGuardianProxy {
             self.lease_identity,
             Arc::clone(&self.lease_control),
             command_description,
+            self.guardian_live_output_reader
+                .take()
+                .expect("verified guardian activation must retain its record-aware reader"),
         );
         // Construction completed, so the LocalPane's guardian ownership is
         // now the sole close/retire authority. If construction unwinds before
@@ -3576,33 +3596,36 @@ mod tests {
         }
     }
 
-    struct ChannelReplayReader {
-        receiver: Receiver<Vec<u8>>,
-        current: io::Cursor<Vec<u8>>,
+    struct ChannelGuardianReader {
+        receiver: Receiver<(
+            GuardianOutputSegmentIdentity,
+            GuardianOutputAppendReceipt,
+            Arc<[u8]>,
+        )>,
     }
 
-    impl Read for ChannelReplayReader {
-        fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
-            if target.is_empty() {
-                return Ok(0);
-            }
-            loop {
-                if usize::try_from(self.current.position()).ok()
-                    != Some(self.current.get_ref().len())
-                {
-                    return self.current.read(target);
-                }
-                match self.receiver.recv_timeout(Duration::from_secs(5)) {
-                    Ok(bytes) => self.current = io::Cursor::new(bytes),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "test replay reader timed out",
-                        ));
+    impl GuardianLiveOutputReader for ChannelGuardianReader {
+        fn deliver_next_record(
+            &mut self,
+            deliver: &mut dyn FnMut(
+                GuardianOutputSegmentIdentity,
+                GuardianOutputAppendReceipt,
+                Arc<[u8]>,
+            ) -> io::Result<()>,
+        ) -> io::Result<()> {
+            let (segment, output, payload) = self
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "test guardian reader closed")
                     }
-                }
-            }
+                    std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "test guardian reader timed out",
+                    ),
+                })?;
+            deliver(segment, output, payload)
         }
     }
 
@@ -4024,15 +4047,14 @@ mod tests {
 
     fn capture_record_checkpoint_fixture() -> RecordCheckpointFixture {
         let payload = b"guardian-checkpoint-base".to_vec();
-        let (sender, receiver) = sync_channel::<Vec<u8>>(1);
+        let (sender, receiver) = sync_channel(1);
         let (staging, mutation_state) = fake_staging([], 1);
-        let activated = staging.activate_after_inert_restore_for_test(
-            inert_terminal(),
-            Box::new(ChannelReplayReader {
-                receiver,
-                current: io::Cursor::new(Vec::new()),
-            }),
-        );
+        let mut activated = staging
+            .activate_verified_restore(
+                inert_terminal(),
+                Box::new(ChannelGuardianReader { receiver }),
+            )
+            .expect("activate typed checkpoint fixture reader");
         let pane_id = alloc_pane_id().expect("allocate checkpoint fixture pane id");
         let pane: Arc<dyn Pane> = Arc::new(activated.into_local_pane(
             pane_id,
@@ -4072,15 +4094,8 @@ mod tests {
         let receipt = journal
             .append_and_sync(&payload)
             .expect("append checkpoint fixture output");
-        operation
-            .authorize_guardian_output_delivery(
-                segment,
-                receipt,
-                Arc::<[u8]>::from(payload.clone()),
-            )
-            .expect("authorize checkpoint fixture parser delivery");
         sender
-            .send(payload)
+            .send((segment, receipt, Arc::<[u8]>::from(payload)))
             .expect("release checkpoint fixture parser delivery");
         let capture = operation
             .capture_live_parser_checkpoint(
@@ -4378,38 +4393,46 @@ mod tests {
         }
 
         let mut reader = activated
-            .pty
-            .try_clone_reader()
-            .expect("take sole verified guardian tail reader");
-        let mut first = [0_u8; 1];
-        assert_eq!(reader.read(&mut first).expect("read first tail byte"), 1);
-        assert_eq!(&first, &tail_payload[..1]);
-        let acks_before_drain = replay_state.lock().acks.len();
+            .guardian_live_output_reader
+            .take()
+            .expect("take sole verified record-aware guardian tail reader");
+        let acks_before_delivery = replay_state.lock().acks.len();
         assert_eq!(
-            acks_before_drain, 3,
-            "partial plaintext is not acknowledged"
+            acks_before_delivery, 3,
+            "tail record is not acknowledged before typed delivery"
         );
-
-        let mut remainder = [0_u8; 3];
-        assert_eq!(
-            reader
-                .read(&mut remainder)
-                .expect("read remaining tail bytes"),
-            remainder.len()
-        );
-        assert_eq!(&remainder, &tail_payload[1..]);
+        reader
+            .deliver_next_record(&mut |segment, output, payload| {
+                assert_eq!(segment.durable_pane_id(), identity().pane_id());
+                assert_eq!(
+                    output.sequence(),
+                    fixture
+                        .receipt
+                        .sequence()
+                        .checked_add(1)
+                        .expect("fixture tail sequence advances")
+                );
+                assert_eq!(payload.as_ref(), tail_payload);
+                assert_eq!(
+                    replay_state.lock().acks.len(),
+                    acks_before_delivery,
+                    "replay page Ack cannot precede successful parser delivery"
+                );
+                Ok(())
+            })
+            .expect("deliver exact typed tail record");
         assert_eq!(
             replay_state.lock().acks.len(),
-            acks_before_drain,
-            "the call returning final bytes cannot hide a failed Ack"
+            acks_before_delivery + 1,
+            "the replay page is acknowledged only after typed delivery succeeds"
         );
 
         let error = reader
-            .read(&mut first)
+            .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("fake source ends after exact tail Ack");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let state = replay_state.lock();
-        assert_eq!(state.acks.len(), acks_before_drain + 1);
+        assert_eq!(state.acks.len(), acks_before_delivery + 1);
         let tail_ack = state.acks.last().expect("tail Ack recorded").1;
         assert_eq!(
             tail_ack.through_sequence(),
@@ -4420,6 +4443,7 @@ mod tests {
                 .expect("fixture tail sequence advances")
         );
         assert!(!tail_ack.release_if_complete());
+        assert!(activated.guardian_live_output_reader.is_none());
         assert!(activated.pty.try_clone_reader().is_err());
     }
 
@@ -4495,7 +4519,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_completion_ack_survives_lost_reply_across_read_calls() {
+    fn tail_completion_ack_survives_lost_reply_across_delivery_calls() {
         let fixture = capture_record_checkpoint_fixture();
         let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
             .expect("derive tail completion boundary");
@@ -4516,10 +4540,8 @@ mod tests {
             TerminalCheckpointLimits::default(),
         )
         .expect("construct exact tail completion reader");
-        let mut byte = [0_u8; 1];
-
         let first_error = reader
-            .read(&mut byte)
+            .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("two lost completion Ack replies remain visible");
         assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
         {
@@ -4530,7 +4552,7 @@ mod tests {
         }
 
         let second_error = reader
-            .read(&mut byte)
+            .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("fake source ends after the retained Ack succeeds");
         assert_eq!(second_error.kind(), io::ErrorKind::InvalidData);
         let state = replay_state.lock();
@@ -4560,10 +4582,8 @@ mod tests {
             TerminalCheckpointLimits::default(),
         )
         .expect("construct no-recovery-base tail reader");
-        let mut byte = [0_u8; 1];
-
         let first_error = reader
-            .read(&mut byte)
+            .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("two lost terminal Ack replies remain visible");
         assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
         {
@@ -4577,7 +4597,7 @@ mod tests {
         }
 
         let gap = reader
-            .read(&mut byte)
+            .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("retained terminal Ack succeeds before Gap is surfaced");
         assert_eq!(gap.kind(), io::ErrorKind::InvalidData);
         assert!(matches!(
@@ -4596,7 +4616,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_replay_request_survives_lost_reply_across_read_calls() {
+    fn tail_replay_request_survives_lost_reply_across_delivery_calls() {
         let fixture = capture_record_checkpoint_fixture();
         let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
             .expect("derive lost Replay boundary");
@@ -4617,17 +4637,18 @@ mod tests {
             TerminalCheckpointLimits::default(),
         )
         .expect("construct lost Replay tail reader");
-        let mut byte = [0_u8; 1];
-
         let first_error = reader
-            .read(&mut byte)
+            .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("two lost Replay replies remain visible");
         assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
-        assert_eq!(
-            reader.read(&mut byte).expect("retry the retained Replay"),
-            1
-        );
-        assert_eq!(byte, [b't']);
+        let mut delivered = None;
+        reader
+            .deliver_next_record(&mut |_, _, payload| {
+                delivered = Some(payload);
+                Ok(())
+            })
+            .expect("retry the retained Replay");
+        assert_eq!(delivered.as_deref(), Some(b"tail".as_slice()));
 
         let state = replay_state.lock();
         assert_eq!(state.requests.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
@@ -4637,10 +4658,7 @@ mod tests {
                 .iter()
                 .all(|request| *request == state.requests[0])
         );
-        assert!(
-            state.acks.is_empty(),
-            "partial plaintext is not acknowledged"
-        );
+        assert_eq!(state.acks.len(), 1, "successful record delivery is acknowledged");
     }
 
     #[test]
