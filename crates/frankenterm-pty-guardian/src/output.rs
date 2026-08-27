@@ -1734,11 +1734,13 @@ impl GuardianPaneOutputJournal {
                 "guardian broker output conversion failed path-authority validation",
             )
         })?;
-        let expected_segment = authority.segments.first().ok_or(
-            GuardianOutputError::FilesystemAuthority(
-                "guardian broker output conversion found no published segment",
-            ),
-        )?;
+        let expected_segment =
+            authority
+                .segments
+                .first()
+                .ok_or(GuardianOutputError::FilesystemAuthority(
+                    "guardian broker output conversion found no published segment",
+                ))?;
         let manifest_segments = &authority.manifest.snapshot.segments;
         let journal_identity = authority.current_journal.identity();
         if authority.failed
@@ -10915,6 +10917,34 @@ mod tests {
         Ok((poll, pipeline))
     }
 
+    fn cold_open_test_pane_after_owner_drop(
+        pipeline: &GuardianOutputPipeline,
+        guardian_incarnation: Uuid,
+        pane_id: Uuid,
+    ) -> Result<GuardianPaneOutputJournal, GuardianOutputError> {
+        // Parallel broker tests fork the test binary while unrelated output
+        // tests own journal descriptors. The child inherits that open-file
+        // description until the portable-pty pre-exec close sweep, so an
+        // immediate test-only cold reopen can transiently observe the old
+        // `flock` even after this process dropped its final handle. Production
+        // writer admission remains nonblocking and fail-closed; only this
+        // bounded restart witness waits for the CLOEXEC/pre-exec handoff.
+        for attempt in 0..100 {
+            match pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id) {
+                Err(GuardianOutputError::Journal(
+                    GuardianOutputJournalError::AppendWriterLeaseUnavailable(_),
+                )) if attempt < 99 => std::thread::sleep(Duration::from_millis(1)),
+                Err(GuardianOutputError::Journal(
+                    GuardianOutputJournalError::AppendWriterLeaseUnavailable(error),
+                )) => panic!(
+                    "test output writer lease remained unavailable after bounded handoff: {error}"
+                ),
+                result => return result,
+            }
+        }
+        unreachable!("the bounded output cold-open retry loop always returns")
+    }
+
     fn durable_commit(
         pipeline: &GuardianOutputPipeline,
         pane_id: Uuid,
@@ -15422,8 +15452,11 @@ mod tests {
         drop(poll);
 
         let (_reopened_poll, reopened_pipeline) = reopen_pipeline(&directory, policy)?;
-        let reopened =
-            reopened_pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id)?;
+        let reopened = cold_open_test_pane_after_owner_drop(
+            &reopened_pipeline,
+            guardian_incarnation,
+            pane_id,
+        )?;
         let final_receipt = durable_commit(&reopened_pipeline, pane_id, &reopened, b"dddd")?;
         assert_eq!(final_receipt.sequence(), 4);
         assert!(reopened.receipt_is_current(final_receipt));
@@ -15492,7 +15525,8 @@ mod tests {
         assert!(torn.exists());
         drop(journal);
 
-        let reopened = pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id)?;
+        let reopened =
+            cold_open_test_pane_after_owner_drop(&pipeline, guardian_incarnation, pane_id)?;
         {
             let authority = reopened
                 .authority
@@ -15508,7 +15542,8 @@ mod tests {
         assert!(torn.exists());
         drop(reopened);
 
-        let validated = pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id)?;
+        let validated =
+            cold_open_test_pane_after_owner_drop(&pipeline, guardian_incarnation, pane_id)?;
         let authority = validated
             .authority
             .lock()
@@ -15643,9 +15678,7 @@ mod tests {
         drop(journal);
 
         assert!(
-            pipeline
-                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-                .is_err()
+            cold_open_test_pane_after_owner_drop(&pipeline, guardian_incarnation, pane_id).is_err()
         );
         assert_eq!(std::fs::metadata(&manifest_path)?.nlink(), 2);
         assert!(manifest_path.exists());
@@ -15689,9 +15722,7 @@ mod tests {
         drop(journal);
 
         assert!(
-            pipeline
-                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-                .is_err()
+            cold_open_test_pane_after_owner_drop(&pipeline, guardian_incarnation, pane_id).is_err()
         );
         assert_eq!(std::fs::metadata(&manifest_path)?.len(), manifest_bytes);
         assert!(manifest_path.exists());
@@ -15725,9 +15756,7 @@ mod tests {
         drop(journal);
 
         assert!(
-            pipeline
-                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-                .is_err()
+            cold_open_test_pane_after_owner_drop(&pipeline, guardian_incarnation, pane_id).is_err()
         );
         assert!(orphan.exists());
         Ok(())
@@ -15889,9 +15918,7 @@ mod tests {
         drop(journal);
 
         assert!(
-            pipeline
-                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-                .is_err()
+            cold_open_test_pane_after_owner_drop(&pipeline, guardian_incarnation, pane_id).is_err()
         );
         assert_eq!(std::fs::metadata(&segment_path)?.len(), torn_bytes);
         assert!(segment_path.exists());
@@ -15929,9 +15956,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&segment_path)?.len(), 0);
 
         assert!(
-            pipeline
-                .cold_open_pane_for_validation(guardian_incarnation, pane_id)
-                .is_err()
+            cold_open_test_pane_after_owner_drop(&pipeline, guardian_incarnation, pane_id).is_err()
         );
         assert_eq!(
             std::fs::metadata(&segment_path)?.len(),

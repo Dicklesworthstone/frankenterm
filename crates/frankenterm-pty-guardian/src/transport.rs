@@ -696,7 +696,7 @@ impl GuardianTokenPathAuthority {
         let lease_parent_metadata = parent.metadata().map_err(|error| {
             GuardianServiceError::io("token-effect-lease-parent-metadata-before-lock", error)
         })?;
-        require_same_object(&retained_parent_metadata, &lease_parent_metadata)?;
+        require_same_directory_identity(&retained_parent_metadata, &lease_parent_metadata)?;
         lock_guardian_token_effect_parent_shared(&parent)
             .map_err(|error| GuardianServiceError::io("token-effect-parent-lock", error))?;
         let mut lease = GuardianTokenEffectLease {
@@ -715,7 +715,7 @@ impl GuardianTokenPathAuthority {
         let lease_parent_metadata = lease.parent.metadata().map_err(|error| {
             GuardianServiceError::io("token-effect-lease-parent-metadata-after-lock", error)
         })?;
-        require_same_object(&retained_parent_metadata, &lease_parent_metadata)?;
+        require_same_directory_identity(&retained_parent_metadata, &lease_parent_metadata)?;
         self.validate()?;
         lease.validate()?;
         Ok(lease)
@@ -3004,7 +3004,7 @@ impl GuardianTokenPublicationLease {
                 error,
             )
         })?;
-        require_same_object(&expected_parent_metadata, &publication_parent_metadata)?;
+        require_same_directory_identity(&expected_parent_metadata, &publication_parent_metadata)?;
         lock_guardian_token_publication_parent_exclusive(&parent)
             .map_err(|error| GuardianServiceError::io("token-publication-parent-lock", error))?;
         let expected_parent_metadata = expected_parent.metadata().map_err(|error| {
@@ -3019,7 +3019,7 @@ impl GuardianTokenPublicationLease {
                 error,
             )
         })?;
-        require_same_object(&expected_parent_metadata, &publication_parent_metadata)?;
+        require_same_directory_identity(&expected_parent_metadata, &publication_parent_metadata)?;
         validate_pinned_private_parent(path, expected_parent)?;
         validate_pinned_private_parent(path, &parent)?;
         Ok(Self {
@@ -3952,10 +3952,10 @@ fn open_private_parent(path: &Path) -> Result<std::fs::File, GuardianServiceErro
     let opened = directory
         .metadata()
         .map_err(|error| GuardianServiceError::io("private-parent-opened-metadata", error))?;
-    require_same_file(&before, &opened)?;
+    require_same_directory_identity(&before, &opened)?;
     let after = std::fs::symlink_metadata(parent)
         .map_err(|error| GuardianServiceError::io("private-parent-metadata-after", error))?;
-    require_same_file(&opened, &after)?;
+    require_same_directory_identity(&opened, &after)?;
     validate_private_parent(path)?;
     Ok(directory)
 }
@@ -3975,7 +3975,7 @@ fn validate_pinned_private_parent(
         .map_err(|error| GuardianServiceError::io("pinned-parent-metadata", error))?;
     let named = std::fs::symlink_metadata(parent)
         .map_err(|error| GuardianServiceError::io("pinned-parent-path-metadata", error))?;
-    require_same_file(&opened, &named)
+    require_same_directory_identity(&opened, &named)
 }
 
 fn sync_pinned_private_parent(
@@ -4004,7 +4004,7 @@ fn sync_private_parent_authority(directory: &File) -> Result<(), GuardianService
     let after = directory
         .metadata()
         .map_err(|error| GuardianServiceError::io("token-parent-authority-after", error))?;
-    require_same_file(&before, &after)
+    require_same_directory_identity(&before, &after)
 }
 
 #[cfg(any(
@@ -4350,6 +4350,30 @@ fn require_same_object(left: &Metadata, right: &Metadata) -> Result<(), Guardian
     {
         return Err(GuardianServiceError::FilesystemSecurity(
             "guardian filesystem object identity changed during mutation",
+        ));
+    }
+    Ok(())
+}
+
+fn require_same_directory_identity(
+    left: &Metadata,
+    right: &Metadata,
+) -> Result<(), GuardianServiceError> {
+    // Directory byte length and link count are namespace bookkeeping, not
+    // object identity. Creating a sibling file can change `len`, and creating
+    // a child directory changes `nlink`, even though the retained descriptor
+    // and pathname still name the exact same directory. Comparing either here
+    // makes ordinary durable publication race endpoint revalidation. Device,
+    // inode, file type/mode, and owner retain the no-replacement authority.
+    if !left.is_dir()
+        || !right.is_dir()
+        || left.dev() != right.dev()
+        || left.ino() != right.ino()
+        || left.mode() != right.mode()
+        || left.uid() != right.uid()
+    {
+        return Err(GuardianServiceError::FilesystemSecurity(
+            "guardian pinned parent directory identity changed",
         ));
     }
     Ok(())
@@ -6103,6 +6127,33 @@ mod tests {
             std::fs::read(retained_parent.join("guardian.token")).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn pinned_parent_directory_identity_ignores_namespace_bookkeeping_only() {
+        let directory = tempfile::Builder::new()
+            .prefix("frankenterm-guardian-directory-identity-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = std::fs::symlink_metadata(directory.path()).unwrap();
+        std::fs::create_dir(directory.path().join("durable-child")).unwrap();
+        let after = std::fs::symlink_metadata(directory.path()).unwrap();
+
+        assert_ne!(before.nlink(), after.nlink());
+        require_same_directory_identity(&before, &after).unwrap();
+
+        let replacement = tempfile::Builder::new()
+            .prefix("frankenterm-guardian-directory-replacement-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap();
+        std::fs::set_permissions(replacement.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let replacement_metadata = std::fs::symlink_metadata(replacement.path()).unwrap();
+        assert!(matches!(
+            require_same_directory_identity(&after, &replacement_metadata),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
     }
 
     #[test]

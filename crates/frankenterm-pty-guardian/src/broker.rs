@@ -15,8 +15,11 @@
 //! guardian, mux, build, connection, broker-incarnation, and token-derived
 //! lineage identities. The same-binary exec bootstrap and its durable
 //! Attempt/SpawnObserved/Release ordering are implemented below. The live
-//! service exposes only a bounded immutable recovery census and exact read-only
-//! Spawn-effect queries; every PTY-changing effect remains rejected. Activation
+//! service now admits new authenticated Spawn requests through one capacity-one
+//! durability worker and exposes exact lost-reply Query recovery. Recovered
+//! catalog members remain read-only and cannot share a pane, effect, journal,
+//! or origin-request namespace with a new Spawn. Effect acknowledgement,
+//! retained-result reclamation, live-pane Census integration, activation
 //! wiring, startup adoption, durable output replay, and successor lease rotation
 //! must land before any production selector may start it. The process-local PTY
 //! typestate below therefore still does **not** prove guardian-`SIGKILL`
@@ -1565,10 +1568,7 @@ impl BrokerControlResponseHeaderV1 {
                             && self.lease_generation == 0
                             && self.child_identity.is_none()
                             && payload_bytes == BROKER_CONTROL_CENSUS_ENTRY_BYTES)
-                        || (unsuccessful
-                            && self.status != BrokerControlResponseStatusV1::Quarantined
-                            && self.child_identity.is_none()
-                            && payload_bytes == 0))
+                        || (unsuccessful && self.child_identity.is_none() && payload_bytes == 0))
             }
             BrokerControlOperationV1::AcknowledgeEffect => {
                 pane_scoped && empty_effect && (successful || unsuccessful)
@@ -2020,6 +2020,10 @@ pub enum BrokerControlServiceError {
     Endpoint(#[from] GuardianServiceError),
     #[error("broker Spawn catalog recovery failed")]
     SpawnCatalog(#[from] BrokerSpawnWalError),
+    #[error("broker output authority initialization failed")]
+    Output(#[from] crate::output::GuardianOutputError),
+    #[error("broker same-binary Spawn bootstrap initialization failed")]
+    SpawnBootstrap(#[from] BrokerError),
     #[error("broker authentication authority initialization failed")]
     AuthenticationAuthority,
     #[error("broker recovered Spawn state cannot be represented safely")]
@@ -2064,6 +2068,10 @@ pub enum BrokerControlClientError {
     CensusCollectionDeadlineExceeded,
     #[error("broker recovery Census collection allocation failed")]
     CensusCollectionCapacityExhausted,
+    #[error("broker rejected the authenticated Spawn admission")]
+    SpawnRejected,
+    #[error("broker quarantined a conflicting or indeterminate Spawn admission")]
+    SpawnQuarantined,
     #[error("broker client connection is poisoned after an ambiguous exchange")]
     ConnectionPoisoned,
 }
@@ -2550,10 +2558,10 @@ impl BrokerSpawnWorkerStateV1 {
 /// until the readiness loop consumes the completion, so neither a fast worker
 /// nor a lost wakeup can admit a second PTY while the first result is pending.
 struct BrokerSpawnWorkerV1 {
-    jobs: SyncSender<BrokerSpawnWorkerJobV1>,
+    jobs: Option<SyncSender<BrokerSpawnWorkerJobV1>>,
     completions: Receiver<BrokerSpawnWorkerCompletionV1>,
     active: Arc<Mutex<Option<BrokerSpawnWorkerFingerprintV1>>>,
-    _join: JoinHandle<()>,
+    join: Option<JoinHandle<()>>,
 }
 
 impl BrokerSpawnWorkerV1 {
@@ -2582,10 +2590,10 @@ impl BrokerSpawnWorkerV1 {
             })
             .map_err(|error| BrokerControlServiceError::io("spawn-worker-start", error))?;
         Ok(Self {
-            jobs: job_tx,
+            jobs: Some(job_tx),
             completions: completion_rx,
             active,
-            _join: join,
+            join: Some(join),
         })
     }
 
@@ -2606,7 +2614,11 @@ impl BrokerSpawnWorkerV1 {
             };
         }
         *active = Some(fingerprint);
-        match self.jobs.try_send(job) {
+        let Some(jobs) = self.jobs.as_ref() else {
+            *active = None;
+            return Err(BrokerSpawnWorkerSubmitErrorV1::Disconnected);
+        };
+        match jobs.try_send(job) {
             Ok(()) => Ok(BrokerSpawnWorkerSubmissionV1::Submitted),
             Err(TrySendError::Full(_)) => {
                 *active = None;
@@ -2633,6 +2645,25 @@ impl BrokerSpawnWorkerV1 {
             }
             Err(TryRecvError::Empty) => BrokerSpawnWorkerCompletionStateV1::Empty,
             Err(TryRecvError::Disconnected) => BrokerSpawnWorkerCompletionStateV1::Disconnected,
+        }
+    }
+
+    fn active_fingerprint(
+        &self,
+    ) -> Result<Option<BrokerSpawnWorkerFingerprintV1>, BrokerSpawnWorkerSubmitErrorV1> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| BrokerSpawnWorkerSubmitErrorV1::Poisoned)?;
+        Ok(*active)
+    }
+}
+
+impl Drop for BrokerSpawnWorkerV1 {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }
@@ -2891,11 +2922,13 @@ fn reconcile_broker_catalog_under_token_authority_with_hook(
 /// Separately spawned, single-owner broker control loop.
 ///
 /// The service authenticates and fences connections, opens the complete Spawn
-/// catalog before listening, and exposes only an immutable paginated recovery
-/// census plus read-only Spawn-effect queries. Every recovered journal keeps
-/// append authority withheld. All PTY effects remain rejected until live pane
-/// ownership, durable output replay, connection-EOF lease fencing, and
-/// successor rotation are integrated and proven together.
+/// catalog before listening, admits new Spawn effects through one serialized
+/// durability worker, and exposes lost-reply Query recovery plus an immutable
+/// paginated recovery census. Every recovered journal keeps append authority
+/// withheld, and every namespace collision with recovered state is
+/// quarantined. Spawn acknowledgement, live Census rows, proxy effects,
+/// connection-EOF lease fencing, and successor rotation remain disabled until
+/// their durable ownership transitions are integrated and proven together.
 pub struct BrokerControlServiceV1 {
     poll: Poll,
     events: Events,
@@ -2904,8 +2937,14 @@ pub struct BrokerControlServiceV1 {
     socket_authority: SocketPathAuthority,
     token_authority: GuardianTokenPathAuthority,
     control_authenticator: GuardianBrokerControlAuthenticatorV1,
-    _spawn_authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
-    _spawn_catalog: BrokerSpawnWalCatalogV1,
+    spawn_worker: BrokerSpawnWorkerV1,
+    spawn_completion_token: Token,
+    retained_spawns: HashMap<Uuid, BrokerSpawnWorkerCompletionV1>,
+    retained_spawn_by_effect: HashMap<Uuid, Uuid>,
+    retained_spawn_by_journal: HashMap<Uuid, Uuid>,
+    retained_spawn_by_origin_request: HashMap<Uuid, Uuid>,
+    blocked_spawn_completion: Option<Box<BrokerSpawnWorkerCompletionV1>>,
+    spawn_worker_unavailable: bool,
     recovered_catalog: BrokerRecoveredSpawnCatalogV1,
     recovery_census_by_mux: HashMap<Uuid, Vec<BrokerCensusEntryV1>>,
     broker_incarnation: Uuid,
@@ -2955,8 +2994,13 @@ impl BrokerControlServiceV1 {
             .map_err(|_| BrokerControlServiceError::InvalidRecoveredSpawnState)?;
         token_authority.validate()?;
 
+        let broker_incarnation = Uuid::new_v4();
         let poll = Poll::new().map_err(|error| BrokerControlServiceError::io("poll", error))?;
-        let event_capacity = config.max_connections.checked_add(1).ok_or(
+        let spawn_completion_raw_token = config.max_connections.checked_add(1).ok_or(
+            BrokerControlServiceError::InvalidConfiguration("Spawn completion token overflow"),
+        )?;
+        let spawn_completion_token = Token(spawn_completion_raw_token);
+        let event_capacity = config.max_connections.checked_add(2).ok_or(
             BrokerControlServiceError::InvalidConfiguration("event capacity overflow"),
         )?;
         let events = Events::with_capacity(event_capacity);
@@ -2995,6 +3039,63 @@ impl BrokerControlServiceV1 {
             .map_err(|_| {
                 BrokerControlServiceError::InvalidConfiguration("Census snapshot allocation failed")
             })?;
+        let mut retained_spawns = HashMap::new();
+        retained_spawns
+            .try_reserve(GUARDIAN_MAX_PANES)
+            .map_err(|_| {
+                BrokerControlServiceError::InvalidConfiguration(
+                    "retained Spawn result allocation failed",
+                )
+            })?;
+        let mut retained_spawn_by_effect = HashMap::new();
+        let mut retained_spawn_by_journal = HashMap::new();
+        let mut retained_spawn_by_origin_request = HashMap::new();
+        for index in [
+            &mut retained_spawn_by_effect,
+            &mut retained_spawn_by_journal,
+            &mut retained_spawn_by_origin_request,
+        ] {
+            index.try_reserve(GUARDIAN_MAX_PANES).map_err(|_| {
+                BrokerControlServiceError::InvalidConfiguration(
+                    "retained Spawn index allocation failed",
+                )
+            })?;
+        }
+        let spawn_completion_waker = Arc::new(
+            Waker::new(poll.registry(), spawn_completion_token)
+                .map_err(|error| BrokerControlServiceError::io("spawn-worker-waker", error))?,
+        );
+        let output_pipeline = GuardianOutputPipeline::open(
+            &config.token_path,
+            GUARDIAN_MAX_PANES,
+            Arc::clone(&spawn_completion_waker),
+        )?;
+        let executable_path = std::env::current_exe()
+            .map_err(|error| BrokerControlServiceError::io("broker-current-exe", error))?;
+        #[cfg(not(test))]
+        let exec_launch = BrokerExecBootstrapLaunchV1::new(
+            executable_path,
+            config.token_path.clone(),
+            control_authenticator.clone(),
+            BROKER_EXEC_BOOTSTRAP_IO_TIMEOUT,
+        )?;
+        #[cfg(test)]
+        let exec_launch = BrokerExecBootstrapLaunchV1::for_unit_test(
+            executable_path,
+            config.token_path.clone(),
+            control_authenticator.clone(),
+        )?;
+        let spawn_worker = BrokerSpawnWorkerV1::start(
+            BrokerSpawnWorkerStateV1 {
+                spawn_catalog,
+                spawn_authenticator,
+                output_pipeline,
+                exec_launch,
+                broker_incarnation,
+                limits: BrokerResourceLimitsV1::default(),
+            },
+            spawn_completion_waker,
+        )?;
 
         // Bind only after catalog policy and every avoidable fallible
         // allocation have succeeded. A post-bind permission or registration
@@ -3018,11 +3119,17 @@ impl BrokerControlServiceV1 {
             socket_authority,
             token_authority,
             control_authenticator,
-            _spawn_authenticator: spawn_authenticator,
-            _spawn_catalog: spawn_catalog,
+            spawn_worker,
+            spawn_completion_token,
+            retained_spawns,
+            retained_spawn_by_effect,
+            retained_spawn_by_journal,
+            retained_spawn_by_origin_request,
+            blocked_spawn_completion: None,
+            spawn_worker_unavailable: false,
             recovered_catalog,
             recovery_census_by_mux,
-            broker_incarnation: Uuid::new_v4(),
+            broker_incarnation,
             broker_lineage_id,
             broker_build_identity: config.broker_build_identity,
             connections,
@@ -3066,12 +3173,19 @@ impl BrokerControlServiceV1 {
         while !stop.load(Ordering::Acquire) {
             self.poll_once()?;
         }
+        #[cfg(test)]
+        for retained in self.retained_spawns.values_mut() {
+            if let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } = &mut retained.outcome {
+                adoption.pane.terminate_and_wait_for_test();
+            }
+        }
         Ok(())
     }
 
     pub fn poll_once(&mut self) -> Result<(), BrokerControlServiceError> {
         self.token_authority.validate()?;
         self.socket_authority.validate()?;
+        self.drain_spawn_completion();
         match self.poll.poll(&mut self.events, Some(self.poll_interval)) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(()),
@@ -3099,9 +3213,18 @@ impl BrokerControlServiceV1 {
         {
             self.accept_connections()?;
         }
+        if self
+            .ready
+            .iter()
+            .any(|event| event.token == self.spawn_completion_token && event.readable)
+        {
+            self.drain_spawn_completion();
+        }
         for index in 0..self.ready.len() {
             let event = self.ready[index];
-            if event.token == BROKER_CONTROL_LISTENER_TOKEN {
+            if event.token == BROKER_CONTROL_LISTENER_TOKEN
+                || event.token == self.spawn_completion_token
+            {
                 continue;
             }
             let Some(generation) = event.generation else {
@@ -3121,7 +3244,44 @@ impl BrokerControlServiceV1 {
             }
         }
         self.expire_unauthenticated_connections();
+        self.drain_spawn_completion();
         Ok(())
+    }
+
+    fn drain_spawn_completion(&mut self) {
+        let completion = match self.spawn_worker.try_completion() {
+            BrokerSpawnWorkerCompletionStateV1::Ready(completion) => completion,
+            BrokerSpawnWorkerCompletionStateV1::Empty => return,
+            BrokerSpawnWorkerCompletionStateV1::Disconnected
+            | BrokerSpawnWorkerCompletionStateV1::Poisoned => {
+                self.spawn_worker_unavailable = true;
+                return;
+            }
+        };
+        let durable_pane_id = completion.fingerprint.binding.durable_pane_id;
+        let spawn_effect_id = completion.fingerprint.binding.spawn_effect_id;
+        let journal_id = completion.fingerprint.journal_id;
+        let origin_request_id = completion.fingerprint.binding.origin_request_id;
+        if self.blocked_spawn_completion.is_some()
+            || self.retained_spawns.len() >= GUARDIAN_MAX_PANES
+            || self.retained_spawns.contains_key(&durable_pane_id)
+            || self.retained_spawn_by_effect.contains_key(&spawn_effect_id)
+            || self.retained_spawn_by_journal.contains_key(&journal_id)
+            || self
+                .retained_spawn_by_origin_request
+                .contains_key(&origin_request_id)
+        {
+            self.blocked_spawn_completion = Some(completion);
+            self.spawn_worker_unavailable = true;
+            return;
+        }
+        self.retained_spawn_by_effect
+            .insert(spawn_effect_id, durable_pane_id);
+        self.retained_spawn_by_journal
+            .insert(journal_id, durable_pane_id);
+        self.retained_spawn_by_origin_request
+            .insert(origin_request_id, durable_pane_id);
+        self.retained_spawns.insert(durable_pane_id, *completion);
     }
 
     fn expire_unauthenticated_connections(&mut self) {
@@ -3381,6 +3541,9 @@ impl BrokerControlServiceV1 {
             return Err(());
         }
         match request.header.operation {
+            BrokerControlOperationV1::Spawn => {
+                return self.dispatch_spawn(owner, request);
+            }
             BrokerControlOperationV1::Census => {
                 return self.dispatch_recovery_census(owner, request);
             }
@@ -3394,6 +3557,137 @@ impl BrokerControlServiceV1 {
             &[],
         )
         .map_err(|_| ())
+    }
+
+    fn dispatch_spawn(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let control_spawn = match BrokerSpawnControlRequestV1::decode(request.payload()) {
+            Ok(control_spawn) => control_spawn,
+            Err(_) => {
+                return BrokerControlResponseV1::new(
+                    self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
+        let job = match BrokerSpawnWorkerJobV1::new(
+            self.broker_incarnation,
+            request.header,
+            owner,
+            control_spawn,
+        ) {
+            Ok(job) => job,
+            Err(_) => {
+                return BrokerControlResponseV1::new(
+                    self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
+        let fingerprint = job.fingerprint;
+        let durable_pane_id = fingerprint.binding.durable_pane_id;
+        if let Some(retained) = self.retained_spawns.get(&durable_pane_id) {
+            if retained.fingerprint != fingerprint {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            return match &retained.outcome {
+                BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } => self
+                    .successful_spawn_response(
+                        request.header,
+                        BrokerControlResponseStatusV1::Recovered,
+                        adoption.pane.kernel_child_identity(),
+                    ),
+                _ => BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ()),
+            };
+        }
+        let retained_identity_conflict = self
+            .retained_spawn_by_effect
+            .contains_key(&fingerprint.binding.spawn_effect_id)
+            || self
+                .retained_spawn_by_journal
+                .contains_key(&fingerprint.journal_id)
+            || self
+                .retained_spawn_by_origin_request
+                .contains_key(&fingerprint.binding.origin_request_id);
+        let recovered_identity_conflict = self
+            .recovered_catalog
+            .by_durable_pane_id
+            .contains_key(&fingerprint.binding.durable_pane_id)
+            || self
+                .recovered_catalog
+                .by_spawn_effect_id
+                .contains_key(&fingerprint.binding.spawn_effect_id)
+            || self
+                .recovered_catalog
+                .by_journal_id
+                .contains_key(&fingerprint.journal_id)
+            || self
+                .recovered_catalog
+                .by_origin_request_id
+                .contains_key(&fingerprint.binding.origin_request_id);
+        if retained_identity_conflict
+            || recovered_identity_conflict
+            || self.blocked_spawn_completion.is_some()
+            || self.spawn_worker_unavailable
+        {
+            return BrokerControlResponseV1::new(
+                self.response_header(request.header, BrokerControlResponseStatusV1::Quarantined),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+        let status = match self.spawn_worker.try_submit(job) {
+            Ok(
+                BrokerSpawnWorkerSubmissionV1::Submitted
+                | BrokerSpawnWorkerSubmissionV1::RecoveredInFlight,
+            )
+            | Err(BrokerSpawnWorkerSubmitErrorV1::Saturated) => {
+                BrokerControlResponseStatusV1::Retryable
+            }
+            Err(BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight) => {
+                BrokerControlResponseStatusV1::Quarantined
+            }
+            Err(
+                BrokerSpawnWorkerSubmitErrorV1::Disconnected
+                | BrokerSpawnWorkerSubmitErrorV1::Poisoned,
+            ) => {
+                self.spawn_worker_unavailable = true;
+                BrokerControlResponseStatusV1::Quarantined
+            }
+        };
+        BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
+            .map_err(|_| ())
+    }
+
+    fn successful_spawn_response(
+        &self,
+        request: BrokerControlRequestHeaderV1,
+        status: BrokerControlResponseStatusV1,
+        child_identity: BrokerKernelChildIdentityV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut header = self.response_header(request, status);
+        header.lease_generation = 1;
+        header.child_identity = Some(child_identity);
+        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
     }
 
     fn dispatch_recovery_census(
@@ -3504,11 +3798,121 @@ impl BrokerControlServiceV1 {
         owner: BrokerGuardianOwnerIdentity,
         request: &BrokerControlRequestV1,
     ) -> Result<BrokerControlResponseV1, ()> {
+        if let Some(retained) = self.retained_spawns.get(&request.header.durable_pane_id) {
+            if retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation {
+                if retained.fingerprint.binding.spawn_effect_id != request.header.operation_id {
+                    return BrokerControlResponseV1::new(
+                        self.response_header(
+                            request.header,
+                            BrokerControlResponseStatusV1::Quarantined,
+                        ),
+                        &[],
+                    )
+                    .map_err(|_| ());
+                }
+                return match &retained.outcome {
+                    BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } => {
+                        let mut header = self.response_header(
+                            request.header,
+                            BrokerControlResponseStatusV1::Recovered,
+                        );
+                        header.child_identity = Some(adoption.pane.kernel_child_identity());
+                        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+                    }
+                    _ => BrokerControlResponseV1::new(
+                        self.response_header(
+                            request.header,
+                            BrokerControlResponseStatusV1::Quarantined,
+                        ),
+                        &[],
+                    )
+                    .map_err(|_| ()),
+                };
+            }
+        }
+        let retained_effect_conflicts_for_owner = self
+            .retained_spawn_by_effect
+            .get(&request.header.operation_id)
+            .and_then(|durable_pane_id| self.retained_spawns.get(durable_pane_id))
+            .is_some_and(|retained| {
+                retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+            });
+        if retained_effect_conflicts_for_owner {
+            return BrokerControlResponseV1::new(
+                self.response_header(request.header, BrokerControlResponseStatusV1::Quarantined),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+        match self.spawn_worker.active_fingerprint() {
+            Ok(Some(active))
+                if active.binding.mux_incarnation == owner.mux_incarnation
+                    && active.binding.durable_pane_id == request.header.durable_pane_id
+                    && active.binding.spawn_effect_id == request.header.operation_id =>
+            {
+                return BrokerControlResponseV1::new(
+                    self.response_header(request.header, BrokerControlResponseStatusV1::Retryable),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            Ok(Some(active))
+                if active.binding.mux_incarnation == owner.mux_incarnation
+                    && (active.binding.durable_pane_id == request.header.durable_pane_id
+                        || active.binding.spawn_effect_id == request.header.operation_id) =>
+            {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            Err(_) => {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            Ok(_) => {}
+        }
         let Some(status) = self.recovered_catalog.recovered_status_for_spawn_effect(
             owner.mux_incarnation,
             request.header.durable_pane_id,
             request.header.operation_id,
         ) else {
+            let recovered_pane_conflicts_for_owner = self
+                .recovered_catalog
+                .by_durable_pane_id
+                .get(&request.header.durable_pane_id)
+                .and_then(|index| self.recovered_catalog.journals.get(*index))
+                .is_some_and(|journal| {
+                    journal.identity().mux_incarnation() == owner.mux_incarnation
+                });
+            let recovered_effect_conflicts_for_owner = self
+                .recovered_catalog
+                .by_spawn_effect_id
+                .get(&request.header.operation_id)
+                .and_then(|index| self.recovered_catalog.journals.get(*index))
+                .is_some_and(|journal| {
+                    journal.identity().mux_incarnation() == owner.mux_incarnation
+                });
+            if recovered_pane_conflicts_for_owner || recovered_effect_conflicts_for_owner {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
             return BrokerControlResponseV1::new(
                 self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
                 &[],
@@ -3695,6 +4099,28 @@ pub struct BrokerControlClientV1 {
     poisoned: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerSpawnSubmissionV1 {
+    Pending {
+        durable_pane_id: Uuid,
+        spawn_effect_id: Uuid,
+    },
+    Applied {
+        durable_pane_id: Uuid,
+        spawn_effect_id: Uuid,
+        child_identity: BrokerKernelChildIdentityV1,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerSpawnEffectQueryV1 {
+    Absent,
+    Pending,
+    Applied(BrokerKernelChildIdentityV1),
+    Quarantined,
+    RecoveredWithoutPty(BrokerCensusEntryV1),
+}
+
 fn broker_control_response_lease_generation_matches(
     request: BrokerControlRequestHeaderV1,
     response: BrokerControlResponseHeaderV1,
@@ -3809,6 +4235,146 @@ impl BrokerControlClientV1 {
     #[must_use]
     pub const fn recovered_hello(&self) -> bool {
         self.recovered_hello
+    }
+
+    /// Consume the guardian's exact post-fsync Genesis authority and submit
+    /// one asynchronous Spawn to the broker durability worker.
+    ///
+    /// `Pending` means the authenticated effect is owned by the broker and
+    /// must be recovered with `query_spawn_effect`; it does not authorize a
+    /// second Spawn. A fast exact retry may instead recover `Applied` directly.
+    pub(crate) fn spawn_from_published_admission(
+        &mut self,
+        permit: GuardianPublishedGenesisAdmissionPermitV1,
+        payload: GuardianSpawnPayload,
+        journal_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<BrokerSpawnSubmissionV1, BrokerControlClientError> {
+        let control_spawn = BrokerSpawnControlRequestV1::from_published_admission(
+            permit, payload, journal_id, attempt_id,
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let binding = control_spawn.binding;
+        let encoded = control_spawn
+            .encode()
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Spawn,
+                request_id: binding.origin_request_id,
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: binding.durable_pane_id,
+                lease_generation: 0,
+                operation_id: binding.spawn_effect_id,
+            },
+            &encoded,
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Retryable
+                if response.header.child_identity.is_none() && response.payload().is_empty() =>
+            {
+                Ok(BrokerSpawnSubmissionV1::Pending {
+                    durable_pane_id: binding.durable_pane_id,
+                    spawn_effect_id: binding.spawn_effect_id,
+                })
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().is_empty() && response.header.child_identity.is_some() =>
+            {
+                Ok(BrokerSpawnSubmissionV1::Applied {
+                    durable_pane_id: binding.durable_pane_id,
+                    spawn_effect_id: binding.spawn_effect_id,
+                    child_identity: response
+                        .header
+                        .child_identity
+                        .ok_or(BrokerControlClientError::UnexpectedResponse)?,
+                })
+            }
+            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
+                Err(BrokerControlClientError::SpawnRejected)
+            }
+            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+                Err(BrokerControlClientError::SpawnQuarantined)
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Recover the exact generation-zero Spawn effect after an asynchronous
+    /// admission, a lost Spawn reply, or a broker restart.
+    pub fn query_spawn_effect(
+        &mut self,
+        durable_pane_id: Uuid,
+        spawn_effect_id: Uuid,
+    ) -> Result<BrokerSpawnEffectQueryV1, BrokerControlClientError> {
+        if durable_pane_id.is_nil() || spawn_effect_id.is_nil() {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::QueryEffect,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id,
+                lease_generation: 0,
+                operation_id: spawn_effect_id,
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
+                Ok(BrokerSpawnEffectQueryV1::Absent)
+            }
+            BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
+                Ok(BrokerSpawnEffectQueryV1::Pending)
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().is_empty() && response.header.child_identity.is_some() =>
+            {
+                Ok(BrokerSpawnEffectQueryV1::Applied(
+                    response
+                        .header
+                        .child_identity
+                        .ok_or(BrokerControlClientError::UnexpectedResponse)?,
+                ))
+            }
+            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+                Ok(BrokerSpawnEffectQueryV1::Quarantined)
+            }
+            BrokerControlResponseStatusV1::Quarantined => {
+                let entry = BrokerCensusEntryV1::decode(response.payload())
+                    .map_err(|_| BrokerControlClientError::Protocol)?;
+                if entry.durable_pane_id != durable_pane_id
+                    || entry.spawn_effect_id != spawn_effect_id
+                    || entry.mux_incarnation != self.identity.mux_incarnation
+                {
+                    self.poisoned = true;
+                    return Err(BrokerControlClientError::UnexpectedResponse);
+                }
+                Ok(BrokerSpawnEffectQueryV1::RecoveredWithoutPty(entry))
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
     }
 
     /// Collect the complete content-free recovery Census from one immutable
@@ -4079,6 +4645,9 @@ impl BrokerControlClientV1 {
         let response = self.exchange(&request)?;
         match response.header.status {
             BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => Ok(None),
+            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+                Err(BrokerControlClientError::SpawnQuarantined)
+            }
             BrokerControlResponseStatusV1::Quarantined => {
                 let entry = match BrokerCensusEntryV1::decode(response.payload()) {
                     Ok(entry) => entry,
@@ -11544,7 +12113,13 @@ mod tests {
         fn start(mut service: BrokerControlServiceV1) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
-            let join = thread::spawn(move || service.run_until(&thread_stop));
+            let join = thread::spawn(move || {
+                let result = service.run_until(&thread_stop);
+                if let Err(error) = &result {
+                    eprintln!("test broker control service failed: {error:?}");
+                }
+                result
+            });
             Self {
                 stop,
                 join: Some(join),
@@ -11806,9 +12381,7 @@ mod tests {
             .unwrap_or_else(|_| "no child diagnostic was published".to_owned())
     }
 
-    fn spawn_worker_completion(
-        worker: &BrokerSpawnWorkerV1,
-    ) -> BrokerSpawnWorkerCompletionV1 {
+    fn spawn_worker_completion(worker: &BrokerSpawnWorkerV1) -> BrokerSpawnWorkerCompletionV1 {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match worker.try_completion() {
@@ -11940,7 +12513,7 @@ mod tests {
             assert_eq!(observed, expected_head[..observed.len()]);
         }
 
-        let mut recovered = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("reopen catalog after injected creation crash cut");
         let journals = recovered
             .scan_all_for_admission(&authenticator)
@@ -12217,7 +12790,7 @@ mod tests {
             .expect("synchronize completed-WAL truncation");
         drop(wal);
         assert!(matches!(
-            BrokerSpawnWalCatalogV1::open(truncated_directory.path().to_path_buf()),
+            reopen_test_catalog_after_owner_drop(truncated_directory.path()),
             Err(BrokerSpawnWalError::InsecureCatalogIdentity)
         ));
         assert_eq!(
@@ -12254,7 +12827,7 @@ mod tests {
             .expect("write completed WAL tamper");
         wal.sync_all().expect("synchronize completed WAL tamper");
         drop(wal);
-        let mut reopened = BrokerSpawnWalCatalogV1::open(tampered_directory.path().to_path_buf())
+        let mut reopened = reopen_test_catalog_after_owner_drop(tampered_directory.path())
             .expect("structurally reopen same-length completed tamper");
         assert!(matches!(
             reopened.scan_all_for_admission(&authenticator),
@@ -12378,7 +12951,7 @@ mod tests {
             .expect("synchronize retained WAL prefix mismatch");
         drop(wal);
 
-        let mut reopened = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut reopened = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("structurally reopen partial mismatch catalog");
         assert!(matches!(
             reopened.scan_all_for_admission(&authenticator),
@@ -12468,7 +13041,7 @@ mod tests {
             &third_head[..149],
         );
 
-        let mut recovered = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("reopen multiple independent creation transactions");
         let journals = recovered
             .scan_all_for_admission(&authenticator)
@@ -12529,7 +13102,7 @@ mod tests {
             .path()
             .join(broker_spawn_catalog_head_name(pending.journal_id()));
 
-        let mut reopened = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut reopened = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("structurally reopen invalid-lifecycle plus pending creation");
         assert!(matches!(
             reopened.scan_all_for_admission(&authenticator),
@@ -14257,7 +14830,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_process_control_loop_exposes_empty_recovery_census_and_rejects_pty_effects() {
+    fn broker_process_control_loop_exposes_empty_recovery_census_and_rejects_invalid_spawn() {
         let root = tempfile::tempdir_in(crate::canonical_test_temp_root())
             .expect("create broker service test root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
@@ -14332,7 +14905,7 @@ mod tests {
             },
             &[0x01],
         )
-        .expect("canonical still-disabled Spawn request");
+        .expect("canonical malformed Spawn request");
         let spawn_response = client
             .exchange(&rejected_spawn)
             .expect("bounded Spawn rejection");
@@ -15388,18 +15961,14 @@ mod tests {
         fs::set_permissions(&catalog_path, fs::Permissions::from_mode(0o700))
             .expect("make Spawn catalog private");
         let token_path = root.join("broker.token");
-        let (exec_launch, spawn_authenticator) =
-            unit_test_exec_bootstrap_launch(&token_path, 0xd1);
+        let (exec_launch, spawn_authenticator) = unit_test_exec_bootstrap_launch(&token_path, 0xd1);
         let poll = Poll::new().expect("create Spawn worker completion poll");
         let completion_waker = Arc::new(
             Waker::new(poll.registry(), Token(1)).expect("create Spawn worker completion waker"),
         );
-        let output_pipeline = GuardianOutputPipeline::open(
-            &token_path,
-            1,
-            Arc::clone(&completion_waker),
-        )
-        .expect("open Spawn worker output pipeline");
+        let output_pipeline =
+            GuardianOutputPipeline::open(&token_path, 1, Arc::clone(&completion_waker))
+                .expect("open Spawn worker output pipeline");
         let spawn_catalog =
             BrokerSpawnWalCatalogV1::open(catalog_path).expect("open Spawn worker catalog");
         let broker_incarnation = id(7_201);
@@ -15442,13 +16011,8 @@ mod tests {
         let make_job = |header| {
             let request = BrokerSpawnControlRequestV1::decode(&encoded_spawn)
                 .expect("decode independent worker Spawn authority");
-            BrokerSpawnWorkerJobV1::new(
-                broker_incarnation,
-                header,
-                authority.owner,
-                request,
-            )
-            .expect("construct authenticated worker job")
+            BrokerSpawnWorkerJobV1::new(broker_incarnation, header, authority.owner, request)
+                .expect("construct authenticated worker job")
         };
         let worker = BrokerSpawnWorkerV1::start(
             BrokerSpawnWorkerStateV1 {
@@ -15510,6 +16074,164 @@ mod tests {
             "one admitted Spawn created a duplicate child"
         );
         pane.terminate_and_wait_for_test();
+    }
+
+    #[test]
+    fn broker_control_spawn_is_async_query_recoverable_and_exactly_once() {
+        for _repetition in 0..20 {
+            broker_control_spawn_is_async_query_recoverable_and_exactly_once_once();
+        }
+    }
+
+    fn broker_control_spawn_is_async_query_recoverable_and_exactly_once_once() {
+        let root = private_catalog_directory().keep();
+        let spawn_catalog_path = root.join("spawn-catalog");
+        fs::create_dir(&spawn_catalog_path).expect("create control Spawn catalog");
+        fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("make control Spawn catalog private");
+        let socket_path = root.join("broker.sock");
+        let token_path = root.join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path)
+            .expect("provision control Spawn token");
+        let broker_build = sealed(0xd5);
+        let service = BrokerControlServiceV1::bind(
+            BrokerControlServiceConfigV1::new(
+                socket_path.clone(),
+                token_path.clone(),
+                spawn_catalog_path,
+                broker_build,
+                2,
+                Duration::from_millis(2),
+            )
+            .expect("construct control Spawn service config"),
+        )
+        .expect("bind control Spawn service");
+        let broker_incarnation = service.incarnation();
+        let service = TestBrokerControlService::start(service);
+        let connection_identity = BrokerGuardianConnectionIdentityV1::new(
+            id(7_301),
+            id(7_302),
+            sealed(0xd6),
+            sealed(0xd7),
+        )
+        .expect("construct control Spawn connection identity");
+        let mut client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            connection_identity,
+            broker_build,
+        )
+        .expect("connect control Spawn client");
+        let authenticated = BrokerAuthenticatedGuardianConnectionV1 {
+            broker_incarnation,
+            owner: BrokerGuardianOwnerIdentity {
+                guardian_incarnation: connection_identity.guardian_incarnation,
+                connection_id: client.connection_id,
+                mux_incarnation: connection_identity.mux_incarnation,
+                mux_build_identity_digest: connection_identity.mux_build_identity.into_bytes(),
+                guardian_build_identity_digest: connection_identity
+                    .guardian_build_identity
+                    .into_bytes(),
+            },
+        };
+        let sentinel = root.join("control-spawn-count");
+        let payload = command_payload(
+            "printf C >>\"$BROKER_SENTINEL\"; IFS= read -r ignored",
+            &sentinel,
+        );
+        let binding = binding_for(&payload, &authenticated);
+        let control_spawn = BrokerSpawnControlRequestV1::from_parts(
+            id(7_303),
+            id(7_304),
+            [0xd8; BROKER_CATALOG_CHECKSUM_BYTES],
+            binding,
+            payload,
+        )
+        .expect("construct control Spawn payload");
+        let encoded_spawn = control_spawn
+            .encode()
+            .expect("encode control Spawn payload");
+        let header = BrokerControlRequestHeaderV1 {
+            operation: BrokerControlOperationV1::Spawn,
+            request_id: binding.origin_request_id,
+            broker_incarnation,
+            guardian_incarnation: authenticated.owner.guardian_incarnation,
+            connection_id: authenticated.owner.connection_id,
+            mux_incarnation: authenticated.owner.mux_incarnation,
+            guardian_build_identity_digest: authenticated.owner.guardian_build_identity_digest,
+            mux_build_identity_digest: authenticated.owner.mux_build_identity_digest,
+            durable_pane_id: binding.durable_pane_id,
+            lease_generation: 0,
+            operation_id: binding.spawn_effect_id,
+        };
+        let spawn_request = |header| {
+            BrokerControlRequestV1::new(header, &encoded_spawn)
+                .expect("construct authenticated control Spawn request")
+        };
+
+        let submitted = client
+            .exchange(&spawn_request(header))
+            .expect("submit asynchronous control Spawn");
+        assert_eq!(
+            submitted.header.status,
+            BrokerControlResponseStatusV1::Retryable
+        );
+        assert!(submitted.header.child_identity.is_none());
+        assert_eq!(
+            client
+                .query_spawn_effect(binding.durable_pane_id, id(7_306))
+                .expect("query live Spawn with a conflicting effect identity"),
+            BrokerSpawnEffectQueryV1::Quarantined
+        );
+        assert_eq!(
+            client
+                .query_spawn_effect(id(7_307), binding.spawn_effect_id)
+                .expect("query live Spawn with a conflicting pane identity"),
+            BrokerSpawnEffectQueryV1::Quarantined
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let child_identity = loop {
+            match client
+                .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("query asynchronous control Spawn")
+            {
+                BrokerSpawnEffectQueryV1::Pending if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                BrokerSpawnEffectQueryV1::Applied(child_identity) => break child_identity,
+                outcome => panic!("control Spawn did not become live: {outcome:?}"),
+            }
+        };
+        let recovered = client
+            .exchange(&spawn_request(header))
+            .expect("recover exact completed control Spawn");
+        assert_eq!(
+            recovered.header.status,
+            BrokerControlResponseStatusV1::Recovered
+        );
+        assert_eq!(recovered.header.child_identity, Some(child_identity));
+
+        let mut mutated_header = header;
+        mutated_header.request_id = id(7_305);
+        let conflict = client
+            .exchange(&spawn_request(mutated_header))
+            .expect("receive mutated Spawn quarantine");
+        assert_eq!(
+            conflict.header.status,
+            BrokerControlResponseStatusV1::Quarantined
+        );
+        let count_deadline = Instant::now() + Duration::from_secs(3);
+        while !sentinel.exists() && Instant::now() < count_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fs::read(&sentinel).expect("read control Spawn count"),
+            b"C",
+            "control retry created more than one child"
+        );
+        drop(client);
+        service.finish();
     }
 
     fn private_catalog_directory() -> tempfile::TempDir {
@@ -15901,7 +16623,7 @@ mod tests {
             0o200
         );
 
-        let mut recovered = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("structurally reopen every secure umask cut");
         assert_eq!(
             fs::read(&wal_path).expect("read WAL prefix after structural reopen"),
@@ -16344,7 +17066,7 @@ mod tests {
         )
         .expect("valid torn-catalog service config");
         assert!(matches!(
-            BrokerControlServiceV1::bind(config),
+            bind_test_service_after_owner_drop(&config),
             Err(BrokerControlServiceError::SpawnCatalog(
                 BrokerSpawnWalError::IncompleteTail
             ))
@@ -16498,10 +17220,18 @@ mod tests {
                 .expect("query exact recovered Spawn identity"),
             Some(*entry)
         );
+        assert!(matches!(
+            client.query_recovered_spawn(identity.durable_pane_id(), id(6_101)),
+            Err(BrokerControlClientError::SpawnQuarantined)
+        ));
+        assert!(matches!(
+            client.query_recovered_spawn(id(6_102), identity.spawn_effect_id()),
+            Err(BrokerControlClientError::SpawnQuarantined)
+        ));
         assert_eq!(
             client
-                .query_recovered_spawn(identity.durable_pane_id(), id(6_101))
-                .expect("query absent recovered Spawn identity"),
+                .query_recovered_spawn(id(6_104), id(6_105))
+                .expect("query an unrelated absent recovered Spawn identity"),
             None
         );
 
@@ -16521,20 +17251,20 @@ mod tests {
         };
         let binding = binding_for(&spawn_payload, &authenticated);
         let control_spawn = BrokerSpawnControlRequestV1::from_parts(
-            id(6_102),
+            identity.journal_id(),
             id(6_103),
             [0xab; BROKER_CATALOG_CHECKSUM_BYTES],
             binding,
             spawn_payload,
         )
-        .expect("valid disabled Spawn control payload");
+        .expect("valid recovered-collision Spawn control payload");
         let encoded_spawn = control_spawn
             .encode()
-            .expect("encode disabled Spawn control payload");
+            .expect("encode recovered-collision Spawn control payload");
         let spawn_request = BrokerControlRequestV1::new(
             BrokerControlRequestHeaderV1 {
                 operation: BrokerControlOperationV1::Spawn,
-                request_id: id(6_104),
+                request_id: binding.origin_request_id,
                 broker_incarnation,
                 guardian_incarnation: connection_identity.guardian_incarnation,
                 connection_id: client.connection_id,
@@ -16549,13 +17279,13 @@ mod tests {
             },
             &encoded_spawn,
         )
-        .expect("canonical disabled Spawn request");
+        .expect("canonical recovered-collision Spawn request");
         let spawn_response = client
             .exchange(&spawn_request)
-            .expect("receive disabled Spawn rejection");
+            .expect("receive recovered-collision Spawn quarantine");
         assert_eq!(
             spawn_response.header.status,
-            BrokerControlResponseStatusV1::Rejected
+            BrokerControlResponseStatusV1::Quarantined
         );
         assert!(!sentinel.exists(), "recovery visibility executed a child");
 
@@ -16696,8 +17426,8 @@ mod tests {
         drop(catalog);
 
         let head_before = fs::read(&head_path).expect("read unreconciled token-fence head");
-        let mut recovered_catalog =
-            BrokerSpawnWalCatalogV1::open(spawn_catalog_path).expect("reopen token-fence catalog");
+        let mut recovered_catalog = reopen_test_catalog_after_owner_drop(&spawn_catalog_path)
+            .expect("reopen token-fence catalog");
         let journals = recovered_catalog
             .scan_all_for_admission(&authenticator)
             .expect("scan token-fence catalog before token replacement");
@@ -16781,7 +17511,7 @@ mod tests {
         drop(journal);
         drop(catalog);
         let head_before = fs::read(&head_path).expect("read unreconciled effect-lease head");
-        let mut catalog = BrokerSpawnWalCatalogV1::open(spawn_catalog_path)
+        let mut catalog = reopen_test_catalog_after_owner_drop(&spawn_catalog_path)
             .expect("reopen reconciliation-effect-lease catalog");
         let journals = catalog
             .scan_all_for_admission(&authenticator)
@@ -16899,7 +17629,7 @@ mod tests {
         drop(journal);
         drop(catalog);
 
-        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered_catalog = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("reopen exact pinned broker catalog");
         let journals = recovered_catalog
             .scan_all_for_admission(&authenticator)
@@ -17696,7 +18426,10 @@ mod tests {
             .expect("consume published output authority into broker");
         assert!(prepared.output_journal.is_some());
         assert_eq!(prepared.resource_usage().child_handles, 0);
-        assert!(!sentinel.exists(), "output authority transfer spawned a child");
+        assert!(
+            !sentinel.exists(),
+            "output authority transfer spawned a child"
+        );
     }
 
     #[test]
@@ -18807,7 +19540,7 @@ mod tests {
         drop(second_journal);
         drop(catalog);
 
-        let mut recovered_catalog = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+        let mut recovered_catalog = reopen_test_catalog_after_owner_drop(directory.path())
             .expect("reopen catalog before interrupted reconciliation");
         let journals = recovered_catalog
             .scan_all_for_admission(&authenticator)
