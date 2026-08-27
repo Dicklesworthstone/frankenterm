@@ -127,9 +127,15 @@ license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankenterm"
 
 [workspace.lints.rust]
+# The int! macro generates an Err arm for conversions that are Infallible for some
+# widths, so that arm is unreachable by construction rather than by mistake.
+unreachable_code = "allow"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
+# New lint; wants assert_eq!(x, "") over assert!(x.is_empty()) purely for a better
+# failure message, with no defect behind it, and clippy --fix cannot apply it.
+assert_is_empty = "allow"
 # Use explicit priorities to avoid conflicts
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

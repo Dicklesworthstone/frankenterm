@@ -2,6 +2,10 @@
 //! that is similar to JSON or Lua values.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// The int! macro emits an Err arm for integer conversions that are Infallible at
+// some widths, so that arm is unreachable by construction, not by mistake.
+#![allow(unreachable_code)]
+
 extern crate alloc;
 
 mod array;

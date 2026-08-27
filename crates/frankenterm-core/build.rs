@@ -1,3 +1,6 @@
+// Build script: nested guards kept apart because each documents a separate probe.
+#![allow(clippy::collapsible_if)]
+
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
