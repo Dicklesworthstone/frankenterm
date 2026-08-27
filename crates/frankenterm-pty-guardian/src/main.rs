@@ -102,6 +102,10 @@ struct BrokerServeArgs {
     #[arg(long)]
     spawn_catalog_path: PathBuf,
 
+    /// Absolute path to an existing owner-only broker pane-lease catalog.
+    #[arg(long)]
+    lease_catalog_path: PathBuf,
+
     /// Maximum simultaneously connected successor guardians.
     #[arg(long, default_value_t = 64)]
     max_connections: usize,
@@ -171,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                 args.endpoint.socket_path,
                 args.endpoint.token_path,
                 args.spawn_catalog_path,
+                args.lease_catalog_path,
                 guardian_runtime_build_identity()?,
                 args.max_connections,
                 Duration::from_millis(args.poll_interval_ms),

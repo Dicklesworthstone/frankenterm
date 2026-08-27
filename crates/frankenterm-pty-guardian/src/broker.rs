@@ -2129,6 +2129,7 @@ pub struct BrokerControlServiceConfigV1 {
     socket_path: PathBuf,
     token_path: PathBuf,
     spawn_catalog_path: PathBuf,
+    lease_catalog_path: PathBuf,
     broker_build_identity: SealedAtomicBuildIdentity,
     max_connections: usize,
     poll_interval: Duration,
@@ -2151,6 +2152,7 @@ impl BrokerControlServiceConfigV1 {
         socket_path: PathBuf,
         token_path: PathBuf,
         spawn_catalog_path: PathBuf,
+        lease_catalog_path: PathBuf,
         broker_build_identity: SealedAtomicBuildIdentity,
         max_connections: usize,
         poll_interval: Duration,
@@ -2168,30 +2170,38 @@ impl BrokerControlServiceConfigV1 {
         if !broker_control_path_is_normalized_absolute(&socket_path)
             || !broker_control_path_is_normalized_absolute(&token_path)
             || !broker_control_path_is_normalized_absolute(&spawn_catalog_path)
+            || !broker_control_path_is_normalized_absolute(&lease_catalog_path)
         {
             return Err(BrokerControlServiceError::InvalidConfiguration(
-                "broker socket, token, and Spawn catalog paths must be normalized absolute paths",
+                "broker socket, token, Spawn catalog, and lease catalog paths must be normalized absolute paths",
             ));
         }
         if socket_path == token_path
             || socket_path == spawn_catalog_path
+            || socket_path == lease_catalog_path
             || token_path == spawn_catalog_path
+            || token_path == lease_catalog_path
+            || spawn_catalog_path == lease_catalog_path
         {
             return Err(BrokerControlServiceError::InvalidConfiguration(
-                "broker socket, token, and Spawn catalog paths must differ",
+                "broker socket, token, Spawn catalog, and lease catalog paths must differ",
             ));
         }
         if broker_endpoint_overlaps_catalog(&socket_path, &spawn_catalog_path)
             || broker_endpoint_overlaps_catalog(&token_path, &spawn_catalog_path)
+            || broker_endpoint_overlaps_catalog(&socket_path, &lease_catalog_path)
+            || broker_endpoint_overlaps_catalog(&token_path, &lease_catalog_path)
+            || broker_endpoint_overlaps_catalog(&spawn_catalog_path, &lease_catalog_path)
         {
             return Err(BrokerControlServiceError::InvalidConfiguration(
-                "broker socket and token paths must not contain or be contained by the Spawn catalog path",
+                "broker endpoints and catalog paths must not contain or be contained by one another",
             ));
         }
         Ok(Self {
             socket_path,
             token_path,
             spawn_catalog_path,
+            lease_catalog_path,
             broker_build_identity,
             max_connections,
             poll_interval,
@@ -2207,6 +2217,8 @@ pub enum BrokerControlServiceError {
     Endpoint(#[from] GuardianServiceError),
     #[error("broker Spawn catalog recovery failed")]
     SpawnCatalog(#[from] BrokerSpawnWalError),
+    #[error("broker pane-lease catalog recovery failed")]
+    LeaseCatalog(#[from] BrokerPaneLeaseWalErrorV1),
     #[error("broker output authority initialization failed")]
     Output(#[from] crate::output::GuardianOutputError),
     #[error("broker same-binary Spawn bootstrap initialization failed")]
@@ -2215,6 +2227,8 @@ pub enum BrokerControlServiceError {
     AuthenticationAuthority,
     #[error("broker recovered Spawn state cannot be represented safely")]
     InvalidRecoveredSpawnState,
+    #[error("broker recovered pane-lease state does not bind to recovered Spawn state")]
+    InvalidRecoveredLeaseState,
     #[error("broker control readiness loop failed at {site}")]
     Io {
         site: &'static str,
@@ -2636,10 +2650,20 @@ impl BrokerSpawnAckWorkerJobV1 {
     }
 }
 
+enum BrokerSpawnAckWorkerFailureV1 {
+    Spawn(BrokerSpawnWalError),
+    Lease(BrokerPaneLeaseWalErrorV1),
+}
+
+struct BrokerSpawnAckDurableResultV1 {
+    acknowledgement: BrokerSpawnWalReceiptV1,
+    lease_journal: BrokerPaneLeaseJournalV1,
+}
+
 struct BrokerSpawnAckWorkerCompletionV1 {
     fingerprint: BrokerSpawnAckFingerprintV1,
     retained: Box<BrokerSpawnWorkerCompletionV1>,
-    result: Option<Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError>>,
+    result: Option<Result<BrokerSpawnAckDurableResultV1, BrokerSpawnAckWorkerFailureV1>>,
     token_authority_failed: bool,
 }
 
@@ -2699,6 +2723,8 @@ struct BrokerSpawnWorkerEffectLeaseProbeV1 {
 struct BrokerSpawnWorkerStateV1 {
     spawn_catalog: BrokerSpawnWalCatalogV1,
     spawn_authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
+    lease_catalog: BrokerPaneLeaseWalCatalogV1,
+    lease_authenticator: GuardianBrokerLeaseWalAuthenticatorV1,
     output_pipeline: GuardianOutputPipeline,
     exec_launch: BrokerExecBootstrapLaunchV1,
     broker_incarnation: Uuid,
@@ -2900,11 +2926,40 @@ impl BrokerSpawnWorkerStateV1 {
         let result = authority_valid_before.then(|| match &mut job.retained.outcome {
             BrokerSpawnWorkerOutcomeV1::Applied {
                 journal, adoption, ..
-            } => journal.acknowledge_spawn_reply_and_sync(
-                job.fingerprint.ack_id,
-                adoption.pane.kernel_child_identity(),
-            ),
-            _ => Err(BrokerSpawnWalError::InvalidTransition),
+            } => {
+                let child_identity = adoption.pane.kernel_child_identity();
+                let initial_attachment = adoption.pane.active_attachment_identity().ok_or(
+                    BrokerSpawnAckWorkerFailureV1::Lease(
+                        BrokerPaneLeaseWalErrorV1::InvalidIdentity,
+                    ),
+                )?;
+                let lease_identity = BrokerPaneLeaseWalIdentityV1::new(
+                    journal.identity(),
+                    child_identity,
+                    initial_attachment,
+                    job.fingerprint.recovery_verifier,
+                )
+                .map_err(BrokerSpawnAckWorkerFailureV1::Lease)?;
+                // Prepare the durable lease namespace before committing the
+                // Spawn acknowledgement. A durable ReplyAcknowledged record
+                // therefore always has a matching authenticated lease header;
+                // a crash in the opposite cut leaves only an inert prepared
+                // lease that exact retry can resume without a second effect.
+                let lease_journal = self
+                    .lease_catalog
+                    .create_lease_journal(&lease_identity, self.lease_authenticator.clone())
+                    .map_err(BrokerSpawnAckWorkerFailureV1::Lease)?;
+                let acknowledgement = journal
+                    .acknowledge_spawn_reply_and_sync(job.fingerprint.ack_id, child_identity)
+                    .map_err(BrokerSpawnAckWorkerFailureV1::Spawn)?;
+                Ok(BrokerSpawnAckDurableResultV1 {
+                    acknowledgement,
+                    lease_journal,
+                })
+            }
+            _ => Err(BrokerSpawnAckWorkerFailureV1::Spawn(
+                BrokerSpawnWalError::InvalidTransition,
+            )),
         });
         let authority_valid_after = job.token_effect_lease.validate().is_ok();
         BrokerSpawnAckWorkerCompletionV1 {
@@ -3334,6 +3389,72 @@ fn open_and_scan_broker_spawn_catalog_under_token_authority(
     result
 }
 
+fn open_and_scan_broker_lease_catalog_under_token_authority(
+    token_authority: &mut GuardianTokenPathAuthority,
+    lease_catalog_path: PathBuf,
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+) -> Result<(BrokerPaneLeaseWalCatalogV1, Vec<BrokerPaneLeaseJournalV1>), BrokerControlServiceError>
+{
+    let mut token_effect_lease = token_authority.acquire_effect_lease()?;
+    token_effect_lease.validate()?;
+    token_authority.validate()?;
+    let result = (|| {
+        let lease_catalog = BrokerPaneLeaseWalCatalogV1::open(lease_catalog_path)?;
+        let recovered_journals = lease_catalog.scan_all_for_admission(authenticator)?;
+        Ok((lease_catalog, recovered_journals))
+    })();
+    let effect_validation = token_effect_lease.validate();
+    let authority_validation = token_authority.validate();
+    effect_validation?;
+    authority_validation?;
+    result
+}
+
+fn validate_broker_recovered_lease_bindings(
+    spawn_catalog: &BrokerRecoveredSpawnCatalogV1,
+    lease_journals: &[BrokerPaneLeaseJournalV1],
+) -> Result<(), BrokerControlServiceError> {
+    if lease_journals.len() > GUARDIAN_MAX_PANES {
+        return Err(BrokerControlServiceError::InvalidRecoveredLeaseState);
+    }
+    for lease in lease_journals {
+        let lease_status = lease.status();
+        if !matches!(lease_status.tail, BrokerPaneLeaseWalTailV1::Clean)
+            || !lease_status.append_authority_withheld
+            || lease_status.head_reconciliation_required
+        {
+            return Err(BrokerControlServiceError::InvalidRecoveredLeaseState);
+        }
+        let Some(spawn) = spawn_catalog
+            .journals
+            .iter()
+            .find(|spawn| spawn.identity() == lease_status.identity.spawn)
+        else {
+            return Err(BrokerControlServiceError::InvalidRecoveredLeaseState);
+        };
+        let spawn_status = spawn.status();
+        if !matches!(
+            spawn_status.phase,
+            Some(BrokerSpawnWalPhaseV1::SpawnObserved | BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+        ) || spawn_status.child_identity != Some(lease_status.identity.child_identity)
+            || spawn_status.recovery_verifier
+                != Some(lease_status.identity.initial_recovery_verifier)
+        {
+            return Err(BrokerControlServiceError::InvalidRecoveredLeaseState);
+        }
+    }
+    for spawn in &spawn_catalog.journals {
+        if spawn.status().phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+            && !lease_journals
+                .iter()
+                .any(|lease| lease.status().identity.spawn == spawn.identity())
+        {
+            return Err(BrokerControlServiceError::InvalidRecoveredLeaseState);
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_broker_catalog_under_token_authority(
     token_authority: &mut GuardianTokenPathAuthority,
     spawn_catalog: &BrokerSpawnWalCatalogV1,
@@ -3390,6 +3511,7 @@ struct BrokerLiveSpawnV1 {
     fingerprint: BrokerSpawnWorkerFingerprintV1,
     ack_id: Uuid,
     journal: BrokerSpawnJournalV1,
+    lease_journal: BrokerPaneLeaseJournalV1,
     adoption: Box<BrokerAdoptionV1>,
     recovery_verifier: BrokerPaneRecoveryVerifierV1,
     pending_successor: Option<BrokerPendingSuccessorClaimV1>,
@@ -3417,17 +3539,43 @@ impl BrokerLiveSpawnV1 {
     fn from_acknowledged_completion(
         completion: BrokerSpawnAckWorkerCompletionV1,
     ) -> Result<Self, Box<BrokerSpawnAckWorkerCompletionV1>> {
-        let Some(acknowledgement) = completion
+        let Some(durable_result) = completion
             .result
             .as_ref()
             .and_then(|result| result.as_ref().ok())
-            .copied()
-            .filter(|receipt| receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged)
         else {
             return Err(Box::new(completion));
         };
+        let acknowledgement = durable_result.acknowledgement;
+        if acknowledgement.phase() != BrokerSpawnWalPhaseV1::ReplyAcknowledged {
+            return Err(Box::new(completion));
+        }
+        let expected_lease_identity = match &completion.retained.outcome {
+            BrokerSpawnWorkerOutcomeV1::Applied {
+                journal, adoption, ..
+            } => adoption
+                .pane
+                .active_attachment_identity()
+                .and_then(|attachment| {
+                    BrokerPaneLeaseWalIdentityV1::new(
+                        journal.identity(),
+                        adoption.pane.kernel_child_identity(),
+                        attachment,
+                        completion.fingerprint.recovery_verifier,
+                    )
+                    .ok()
+                }),
+            _ => None,
+        };
+        let lease_status = durable_result.lease_journal.status();
         let durable_result_is_exact = completion.retained.fingerprint
             == completion.fingerprint.spawn
+            && expected_lease_identity == Some(lease_status.identity)
+            && matches!(lease_status.tail, BrokerPaneLeaseWalTailV1::Clean)
+            && lease_status.phase.is_none()
+            && lease_status.committed_records == 0
+            && !lease_status.append_authority_withheld
+            && !lease_status.head_reconciliation_required
             && matches!(
                 &completion.retained.outcome,
                 BrokerSpawnWorkerOutcomeV1::Applied {
@@ -3453,6 +3601,17 @@ impl BrokerLiveSpawnV1 {
             result,
             token_authority_failed,
         } = completion;
+        let durable_result = match result {
+            Some(Ok(durable_result)) => durable_result,
+            result => {
+                return Err(Box::new(BrokerSpawnAckWorkerCompletionV1 {
+                    fingerprint: acknowledgement_fingerprint,
+                    retained,
+                    result,
+                    token_authority_failed,
+                }));
+            }
+        };
         let BrokerSpawnWorkerCompletionV1 {
             fingerprint,
             outcome,
@@ -3478,7 +3637,7 @@ impl BrokerLiveSpawnV1 {
                             },
                             token_authority_failed: retained_token_authority_failed,
                         }),
-                        result,
+                        result: Some(Ok(durable_result)),
                         token_authority_failed,
                     }));
                 };
@@ -3486,6 +3645,7 @@ impl BrokerLiveSpawnV1 {
                     fingerprint,
                     ack_id: acknowledgement_fingerprint.ack_id,
                     journal,
+                    lease_journal: durable_result.lease_journal,
                     adoption,
                     recovery_verifier,
                     pending_successor: None,
@@ -3500,7 +3660,7 @@ impl BrokerLiveSpawnV1 {
                     outcome,
                     token_authority_failed: retained_token_authority_failed,
                 }),
-                result,
+                result: Some(Ok(durable_result)),
                 token_authority_failed,
             })),
         }
@@ -3508,6 +3668,7 @@ impl BrokerLiveSpawnV1 {
 
     fn census_entry(&self) -> Result<BrokerCensusEntryV1, BrokerControlProtocolError> {
         let status = self.journal.status();
+        let lease_status = self.lease_journal.status();
         let pane_status = self.adoption.pane.status();
         let identity = status.identity;
         let binding = self.fingerprint.binding;
@@ -3517,6 +3678,11 @@ impl BrokerLiveSpawnV1 {
             || status.child_identity != Some(self.adoption.pane.kernel_child_identity())
             || status.append_authority_withheld
             || status.head_reconciliation_required
+            || !matches!(lease_status.tail, BrokerPaneLeaseWalTailV1::Clean)
+            || lease_status.append_authority_withheld
+            || lease_status.head_reconciliation_required
+            || lease_status.identity.spawn != identity
+            || lease_status.identity.child_identity != self.adoption.pane.kernel_child_identity()
             || identity.journal_id() != self.fingerprint.journal_id
             || identity.mux_incarnation() != binding.mux_incarnation
             || identity.durable_pane_id() != binding.durable_pane_id
@@ -3661,6 +3827,7 @@ pub struct BrokerControlServiceV1 {
     blocked_worker_events: Vec<BrokerSpawnWorkerEventV1>,
     spawn_worker_unavailable: bool,
     recovered_catalog: BrokerRecoveredSpawnCatalogV1,
+    recovered_lease_journals: Vec<BrokerPaneLeaseJournalV1>,
     recovery_census_by_mux: HashMap<Uuid, Vec<BrokerCensusEntryV1>>,
     broker_incarnation: Uuid,
     broker_lineage_id: Uuid,
@@ -3691,6 +3858,9 @@ impl BrokerControlServiceV1 {
         let spawn_authenticator = secret
             .broker_spawn_wal_authenticator()
             .map_err(|_| BrokerControlServiceError::AuthenticationAuthority)?;
+        let lease_authenticator = secret
+            .broker_lease_wal_authenticator()
+            .map_err(|_| BrokerControlServiceError::AuthenticationAuthority)?;
         let broker_lineage_id = spawn_authenticator.lineage_id();
         let (spawn_catalog, recovered_journals) =
             open_and_scan_broker_spawn_catalog_under_token_authority(
@@ -3698,8 +3868,15 @@ impl BrokerControlServiceV1 {
                 config.spawn_catalog_path,
                 &spawn_authenticator,
             )?;
+        let (lease_catalog, recovered_lease_journals) =
+            open_and_scan_broker_lease_catalog_under_token_authority(
+                &mut token_authority,
+                config.lease_catalog_path,
+                &lease_authenticator,
+            )?;
         let recovered_catalog =
             BrokerRecoveredSpawnCatalogV1::admit(recovered_journals, &spawn_authenticator)?;
+        validate_broker_recovered_lease_bindings(&recovered_catalog, &recovered_lease_journals)?;
         // Classify every recovered journal before binding, but deliberately do
         // not reconcile its head or grant append authority. A restarted broker
         // no longer owns the old PTY master, even when WAL proves that the old
@@ -3829,6 +4006,8 @@ impl BrokerControlServiceV1 {
             BrokerSpawnWorkerStateV1 {
                 spawn_catalog,
                 spawn_authenticator,
+                lease_catalog,
+                lease_authenticator,
                 output_pipeline,
                 exec_launch,
                 broker_incarnation,
@@ -3873,6 +4052,7 @@ impl BrokerControlServiceV1 {
             blocked_worker_events,
             spawn_worker_unavailable: false,
             recovered_catalog,
+            recovered_lease_journals,
             recovery_census_by_mux,
             broker_incarnation,
             broker_lineage_id,
@@ -3917,6 +4097,11 @@ impl BrokerControlServiceV1 {
     #[must_use]
     pub const fn quarantined_live_leases(&self) -> u64 {
         self.quarantined_live_leases
+    }
+
+    #[must_use]
+    pub fn recovered_lease_count(&self) -> usize {
+        self.recovered_lease_journals.len()
     }
 
     pub fn run_forever(&mut self) -> Result<(), BrokerControlServiceError> {
@@ -8644,7 +8829,7 @@ pub enum BrokerSpawnWalError {
 }
 
 #[derive(Debug, Error)]
-enum BrokerPaneLeaseWalErrorV1 {
+pub enum BrokerPaneLeaseWalErrorV1 {
     #[error("broker pane-lease WAL identity is invalid")]
     InvalidIdentity,
     #[error("broker pane-lease WAL descriptor is not a regular file")]
@@ -16927,6 +17112,14 @@ mod tests {
             .expect("sealed test identity")
     }
 
+    fn create_private_lease_catalog(root: &Path) -> PathBuf {
+        let lease_catalog_path = root.join("lease-catalog");
+        fs::create_dir(&lease_catalog_path).expect("create broker pane-lease catalog");
+        fs::set_permissions(&lease_catalog_path, fs::Permissions::from_mode(0o700))
+            .expect("set broker pane-lease catalog owner-only");
+        lease_catalog_path
+    }
+
     fn authority(
         broker_incarnation: Uuid,
         guardian_incarnation: Uuid,
@@ -19144,55 +19337,88 @@ mod tests {
     fn broker_control_config_rejects_non_normalized_or_catalog_overlapping_endpoints() {
         let root = crate::canonical_test_temp_root().join("broker-control-config-path-contract");
         let catalog = root.join("spawn-catalog");
+        let lease_catalog = root.join("lease-catalog");
         let socket = root.join("broker.sock");
         let token = root.join("guardian.token");
-        let config = |socket_path, token_path, spawn_catalog_path| {
+        let config = |socket_path, token_path, spawn_catalog_path, lease_catalog_path| {
             BrokerControlServiceConfigV1::new(
                 socket_path,
                 token_path,
                 spawn_catalog_path,
+                lease_catalog_path,
                 sealed(0xa0),
                 4,
                 Duration::from_millis(5),
             )
         };
 
-        assert!(config(socket.clone(), token.clone(), catalog.clone()).is_ok());
+        assert!(
+            config(
+                socket.clone(),
+                token.clone(),
+                catalog.clone(),
+                lease_catalog.clone()
+            )
+            .is_ok()
+        );
         assert!(
             config(
                 root.join("spawn-catalog.sock"),
                 token.clone(),
-                catalog.clone()
+                catalog.clone(),
+                lease_catalog.clone()
             )
             .is_ok(),
             "component-based containment confused a sibling path prefix"
         );
         for rejected in [
-            config(catalog.join("broker.sock"), token.clone(), catalog.clone()),
+            config(
+                catalog.join("broker.sock"),
+                token.clone(),
+                catalog.clone(),
+                lease_catalog.clone(),
+            ),
             config(
                 socket.clone(),
                 catalog.join("guardian.token"),
                 catalog.clone(),
+                lease_catalog.clone(),
             ),
             config(
                 root.join("socket-parent"),
                 token.clone(),
                 root.join("socket-parent").join("spawn-catalog"),
+                lease_catalog.clone(),
             ),
             config(
                 socket.clone(),
                 root.join("token-parent"),
                 root.join("token-parent").join("spawn-catalog"),
+                lease_catalog.clone(),
             ),
             config(
                 PathBuf::from("relative-broker.sock"),
                 token.clone(),
                 catalog.clone(),
+                lease_catalog.clone(),
             ),
             config(
                 root.join("nested").join("..").join("broker.sock"),
                 token.clone(),
                 catalog.clone(),
+                lease_catalog.clone(),
+            ),
+            config(
+                socket.clone(),
+                token.clone(),
+                catalog.clone(),
+                catalog.clone(),
+            ),
+            config(
+                socket.clone(),
+                token.clone(),
+                catalog.clone(),
+                catalog.join("leases"),
             ),
         ] {
             assert!(matches!(
@@ -19212,6 +19438,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path).expect("provision broker token");
@@ -19220,6 +19447,7 @@ mod tests {
             socket_path.clone(),
             token_path,
             spawn_catalog_path,
+            lease_catalog_path,
             sealed(0xa1),
             max_connections,
             Duration::from_millis(5),
@@ -19273,6 +19501,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create response-token-fence Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set response-token-fence Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
@@ -19287,6 +19516,7 @@ mod tests {
             socket_path.clone(),
             token_path.clone(),
             spawn_catalog_path,
+            lease_catalog_path,
             broker_build,
             1,
             Duration::from_millis(5),
@@ -19400,6 +19630,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create enqueue-flush Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set enqueue-flush Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
@@ -19414,6 +19645,7 @@ mod tests {
             socket_path.clone(),
             token_path.clone(),
             spawn_catalog_path,
+            lease_catalog_path,
             sealed(0xa5),
             1,
             Duration::from_millis(5),
@@ -19519,6 +19751,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path).expect("provision broker token");
@@ -19526,6 +19759,7 @@ mod tests {
             socket_path.clone(),
             token_path,
             spawn_catalog_path,
+            lease_catalog_path,
             sealed(0xa4),
             2,
             Duration::from_millis(5),
@@ -19654,6 +19888,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path).expect("provision broker token");
@@ -19662,6 +19897,7 @@ mod tests {
             socket_path.clone(),
             token_path.clone(),
             spawn_catalog_path,
+            lease_catalog_path,
             broker_build,
             4,
             Duration::from_millis(5),
@@ -19810,6 +20046,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create paginated recovery Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set paginated recovery Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
@@ -19845,6 +20082,7 @@ mod tests {
             socket_path.clone(),
             token_path.clone(),
             spawn_catalog_path,
+            lease_catalog_path,
             broker_build,
             4,
             Duration::from_millis(5),
@@ -20774,10 +21012,14 @@ mod tests {
         fs::create_dir(&catalog_path).expect("create Spawn catalog directory");
         fs::set_permissions(&catalog_path, fs::Permissions::from_mode(0o700))
             .expect("make Spawn catalog private");
+        let lease_catalog_path = create_private_lease_catalog(&root);
         let token_path = root.join("broker.token");
         let (exec_launch, spawn_authenticator) = unit_test_exec_bootstrap_launch(&token_path, 0xd1);
-        let (_secret, mut token_authority) = load_guardian_secret_with_authority(&token_path)
+        let (secret, mut token_authority) = load_guardian_secret_with_authority(&token_path)
             .expect("load Spawn worker token authority");
+        let lease_authenticator = secret
+            .broker_lease_wal_authenticator()
+            .expect("derive Spawn worker lease-WAL authority");
         let poll = Poll::new().expect("create Spawn worker completion poll");
         let completion_waker = Arc::new(
             Waker::new(poll.registry(), Token(1)).expect("create Spawn worker completion waker"),
@@ -20787,6 +21029,8 @@ mod tests {
                 .expect("open Spawn worker output pipeline");
         let spawn_catalog =
             BrokerSpawnWalCatalogV1::open(catalog_path).expect("open Spawn worker catalog");
+        let lease_catalog = BrokerPaneLeaseWalCatalogV1::open(lease_catalog_path)
+            .expect("open Spawn worker lease catalog");
         let broker_incarnation = id(7_201);
         let authority = authority(
             broker_incarnation,
@@ -20845,6 +21089,8 @@ mod tests {
             BrokerSpawnWorkerStateV1 {
                 spawn_catalog,
                 spawn_authenticator,
+                lease_catalog,
+                lease_authenticator,
                 output_pipeline,
                 exec_launch,
                 broker_incarnation,
@@ -21053,7 +21299,11 @@ mod tests {
         );
         assert!(matches!(
             acknowledged.result.as_ref(),
-            Some(Ok(receipt)) if receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged
+            Some(Ok(result))
+                if result.acknowledgement.phase()
+                    == BrokerSpawnWalPhaseV1::ReplyAcknowledged
+                    && !result.lease_journal.status().append_authority_withheld
+                    && result.lease_journal.status().committed_records == 0
         ));
         let retained = *acknowledged.retained;
         let BrokerSpawnWorkerOutcomeV1::Applied {
@@ -21089,6 +21339,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create control Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("make control Spawn catalog private");
+        let lease_catalog_path = create_private_lease_catalog(&root);
         let socket_path = root.join("broker.sock");
         let token_path = root.join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
@@ -21099,6 +21350,7 @@ mod tests {
                 socket_path.clone(),
                 token_path.clone(),
                 spawn_catalog_path.clone(),
+                lease_catalog_path.clone(),
                 broker_build,
                 2,
                 Duration::from_millis(2),
@@ -21343,6 +21595,13 @@ mod tests {
             BrokerSpawnEffectAcknowledgementV1::Acknowledged
         );
         assert_eq!(
+            fs::read_dir(&lease_catalog_path)
+                .expect("enumerate live pane-lease catalog after exact Ack retry")
+                .count(),
+            4,
+            "exact Spawn-Ack retry published a duplicate pane-lease member"
+        );
+        assert_eq!(
             client
                 .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
                 .expect("query acknowledged live Spawn"),
@@ -21574,6 +21833,9 @@ mod tests {
         let authenticator = secret
             .broker_spawn_wal_authenticator()
             .expect("derive control Spawn WAL authority after service shutdown");
+        let lease_authenticator = secret
+            .broker_lease_wal_authenticator()
+            .expect("derive control Spawn lease-WAL authority after service shutdown");
         let mut catalog = reopen_test_catalog_after_owner_drop(&spawn_catalog_path)
             .expect("reopen acknowledged control Spawn catalog");
         let journals = catalog
@@ -21598,6 +21860,28 @@ mod tests {
         );
         drop(journals);
         drop(catalog);
+        let lease_catalog = reopen_test_lease_catalog_after_owner_drop(&lease_catalog_path)
+            .expect("reopen acknowledged control Spawn lease catalog");
+        let lease_journals = lease_catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("authenticate acknowledged control Spawn lease catalog");
+        let [lease_journal] = lease_journals.as_slice() else {
+            panic!("expected exactly one acknowledged control Spawn lease journal")
+        };
+        let lease_status = lease_journal.status();
+        assert_eq!(lease_status.identity.spawn, durable_status.identity);
+        assert_eq!(lease_status.identity.child_identity, child_identity);
+        assert_eq!(
+            lease_status.identity.initial_recovery_verifier,
+            durable_status
+                .recovery_verifier
+                .expect("acknowledged Spawn retained its recovery verifier")
+        );
+        assert!(lease_status.append_authority_withheld);
+        assert_eq!(lease_status.committed_records, 0);
+        drop(lease_journals);
+        drop(lease_catalog);
+        drop(lease_authenticator);
         drop(authenticator);
         drop(secret);
 
@@ -21607,6 +21891,7 @@ mod tests {
                 restart_socket_path.clone(),
                 token_path.clone(),
                 spawn_catalog_path,
+                lease_catalog_path,
                 broker_build,
                 2,
                 Duration::from_millis(2),
@@ -21614,6 +21899,7 @@ mod tests {
             .expect("construct restarted acknowledged Spawn service config"),
         )
         .expect("bind restarted acknowledged Spawn service");
+        assert_eq!(restarted.recovered_lease_count(), 1);
         let restarted = TestBrokerControlService::start(restarted);
         let mut restarted_client = BrokerControlClientV1::connect(
             &restart_socket_path,
@@ -21688,6 +21974,20 @@ mod tests {
         unreachable!("the bounded catalog reopen loop always returns")
     }
 
+    fn reopen_test_lease_catalog_after_owner_drop(
+        directory: &Path,
+    ) -> Result<BrokerPaneLeaseWalCatalogV1, BrokerPaneLeaseWalErrorV1> {
+        for attempt in 0..100 {
+            match BrokerPaneLeaseWalCatalogV1::open(directory.to_path_buf()) {
+                Err(BrokerPaneLeaseWalErrorV1::CatalogAuthority(
+                    BrokerSpawnWalError::CatalogAlreadyOwned,
+                )) if attempt < 99 => thread::sleep(Duration::from_millis(1)),
+                result => return result,
+            }
+        }
+        unreachable!("the bounded pane-lease catalog reopen loop always returns")
+    }
+
     fn bind_test_service_after_owner_drop(
         config: &BrokerControlServiceConfigV1,
     ) -> Result<BrokerControlServiceV1, BrokerControlServiceError> {
@@ -21700,6 +22000,11 @@ mod tests {
             match BrokerControlServiceV1::bind(config.clone()) {
                 Err(BrokerControlServiceError::SpawnCatalog(
                     BrokerSpawnWalError::CatalogAlreadyOwned,
+                )) if attempt < 99 => thread::sleep(Duration::from_millis(1)),
+                Err(BrokerControlServiceError::LeaseCatalog(
+                    BrokerPaneLeaseWalErrorV1::CatalogAuthority(
+                        BrokerSpawnWalError::CatalogAlreadyOwned,
+                    ),
                 )) if attempt < 99 => thread::sleep(Duration::from_millis(1)),
                 result => return result,
             }
@@ -22486,6 +22791,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create torn Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set torn Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
@@ -22541,6 +22847,7 @@ mod tests {
             socket_path.clone(),
             token_path,
             spawn_catalog_path,
+            lease_catalog_path,
             sealed(0xaa),
             4,
             Duration::from_millis(5),
@@ -22580,6 +22887,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create lifecycle-refusal Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set lifecycle-refusal Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
@@ -22620,6 +22928,7 @@ mod tests {
             socket_path.clone(),
             token_path.clone(),
             spawn_catalog_path.clone(),
+            lease_catalog_path,
             broker_build,
             4,
             Duration::from_millis(5),
@@ -23037,6 +23346,7 @@ mod tests {
         fs::create_dir(&spawn_catalog_path).expect("create running broker Spawn catalog");
         fs::set_permissions(&spawn_catalog_path, fs::Permissions::from_mode(0o700))
             .expect("set running broker Spawn catalog owner-only");
+        let lease_catalog_path = create_private_lease_catalog(root.path());
         let socket_path = root.path().join("broker.sock");
         let token_path = root.path().join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
@@ -23046,6 +23356,7 @@ mod tests {
             socket_path.clone(),
             token_path.clone(),
             spawn_catalog_path,
+            lease_catalog_path,
             sealed(0xab),
             4,
             Duration::from_millis(5),
@@ -25492,6 +25803,124 @@ mod tests {
         assert!(matches!(
             catalog.scan_all_for_admission(&lease_authenticator),
             Err(BrokerPaneLeaseWalErrorV1::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn recovered_lease_binding_accepts_prepared_cut_and_rejects_ack_without_lease() {
+        fn advance_to_observed(
+            journal: &mut BrokerSpawnJournalV1,
+            identity: &BrokerPaneLeaseWalIdentityV1,
+            attempt_id: Uuid,
+        ) {
+            journal
+                .append_intent_and_sync()
+                .expect("commit recovered lease-binding Spawn intent");
+            let permit = match journal
+                .begin_spawn_attempt_and_sync(attempt_id)
+                .expect("commit recovered lease-binding Spawn attempt")
+            {
+                BrokerSpawnAttemptAdmissionV1::Authorized(permit) => permit,
+                BrokerSpawnAttemptAdmissionV1::Reconciled(_) => {
+                    panic!("fresh recovered lease-binding attempt reconciled")
+                }
+            };
+            let observation = match permit
+                .invoke_once(|| Ok::<_, ()>(((), identity.child_identity)))
+            {
+                BrokerSpawnAttemptExecutionV1::EffectSucceeded { observation, .. } => observation,
+                BrokerSpawnAttemptExecutionV1::OutcomeIndeterminate { .. } => {
+                    panic!("valid recovered lease-binding child became indeterminate")
+                }
+            };
+            journal
+                .append_spawn_observed_with_recovery_and_sync(
+                    *observation,
+                    identity.initial_recovery_verifier,
+                )
+                .expect("commit recovered lease-binding Spawn observation");
+        }
+
+        let prepared_root = private_catalog_directory();
+        let prepared_spawn_path = prepared_root.path().join("spawn-catalog");
+        fs::create_dir(&prepared_spawn_path).expect("create prepared-cut Spawn catalog");
+        fs::set_permissions(&prepared_spawn_path, fs::Permissions::from_mode(0o700))
+            .expect("set prepared-cut Spawn catalog owner-only");
+        let prepared_lease_path = create_private_lease_catalog(prepared_root.path());
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xe5);
+        let prepared_identity = lease_catalog_identity(&spawn_authenticator, 0x45);
+        let mut spawn_catalog = BrokerSpawnWalCatalogV1::open(prepared_spawn_path.clone())
+            .expect("open prepared-cut Spawn catalog");
+        let mut spawn_journal = spawn_catalog
+            .create_spawn_journal(prepared_identity.spawn, spawn_authenticator.clone())
+            .expect("create prepared-cut Spawn journal");
+        advance_to_observed(&mut spawn_journal, &prepared_identity, id(45_001));
+        let lease_catalog = BrokerPaneLeaseWalCatalogV1::open(prepared_lease_path.clone())
+            .expect("open prepared-cut lease catalog");
+        drop(
+            lease_catalog
+                .create_lease_journal(&prepared_identity, lease_authenticator.clone())
+                .expect("prepare lease before Spawn acknowledgement"),
+        );
+        drop(spawn_journal);
+        drop(spawn_catalog);
+        drop(lease_catalog);
+
+        let mut recovered_spawn_catalog =
+            reopen_test_catalog_after_owner_drop(&prepared_spawn_path)
+                .expect("reopen prepared-cut Spawn catalog");
+        let recovered_spawns = recovered_spawn_catalog
+            .scan_all_for_admission(&spawn_authenticator)
+            .expect("scan prepared-cut Spawn catalog");
+        let recovered_spawns =
+            BrokerRecoveredSpawnCatalogV1::admit(recovered_spawns, &spawn_authenticator)
+                .expect("admit prepared-cut Spawn catalog");
+        let recovered_lease_catalog =
+            reopen_test_lease_catalog_after_owner_drop(&prepared_lease_path)
+                .expect("reopen prepared-cut lease catalog");
+        let recovered_leases = recovered_lease_catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("scan prepared-cut lease catalog");
+        validate_broker_recovered_lease_bindings(&recovered_spawns, &recovered_leases)
+            .expect("accept inert prepared lease beside SpawnObserved cut");
+        assert_eq!(recovered_leases.len(), 1);
+        assert!(recovered_leases[0].status().append_authority_withheld);
+
+        let missing_root = private_catalog_directory();
+        let missing_spawn_path = missing_root.path().join("spawn-catalog");
+        fs::create_dir(&missing_spawn_path).expect("create missing-lease Spawn catalog");
+        fs::set_permissions(&missing_spawn_path, fs::Permissions::from_mode(0o700))
+            .expect("set missing-lease Spawn catalog owner-only");
+        let missing_lease_path = create_private_lease_catalog(missing_root.path());
+        let missing_identity = lease_catalog_identity(&spawn_authenticator, 0x46);
+        let mut missing_spawn_catalog = BrokerSpawnWalCatalogV1::open(missing_spawn_path.clone())
+            .expect("open missing-lease Spawn catalog");
+        let mut missing_spawn = missing_spawn_catalog
+            .create_spawn_journal(missing_identity.spawn, spawn_authenticator.clone())
+            .expect("create missing-lease Spawn journal");
+        advance_to_observed(&mut missing_spawn, &missing_identity, id(46_001));
+        missing_spawn
+            .acknowledge_spawn_reply_and_sync(id(46_002), missing_identity.child_identity)
+            .expect("commit deliberately unmatched Spawn acknowledgement");
+        drop(missing_spawn);
+        drop(missing_spawn_catalog);
+
+        let mut missing_spawn_catalog = reopen_test_catalog_after_owner_drop(&missing_spawn_path)
+            .expect("reopen missing-lease Spawn catalog");
+        let missing_spawns = missing_spawn_catalog
+            .scan_all_for_admission(&spawn_authenticator)
+            .expect("scan missing-lease Spawn catalog");
+        let missing_spawns =
+            BrokerRecoveredSpawnCatalogV1::admit(missing_spawns, &spawn_authenticator)
+                .expect("admit missing-lease Spawn catalog");
+        let missing_lease_catalog = BrokerPaneLeaseWalCatalogV1::open(missing_lease_path)
+            .expect("open empty missing-lease catalog");
+        let missing_leases = missing_lease_catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("scan empty missing-lease catalog");
+        assert!(matches!(
+            validate_broker_recovered_lease_bindings(&missing_spawns, &missing_leases),
+            Err(BrokerControlServiceError::InvalidRecoveredLeaseState)
         ));
     }
 
