@@ -3674,11 +3674,9 @@ impl GuardianProxyLeasePlan {
     ) -> Result<GuardianProxyStaging, GuardianProxyError> {
         let generation = observed_generation
             .checked_add(1)
-            .ok_or_else(|| {
-                GuardianProxyError::Client(GuardianClientError::Protocol(
-                    GuardianProtocolError::GenerationExhausted,
-                ))
-            })?;
+            .ok_or(GuardianProxyError::Client(GuardianClientError::Protocol(
+                GuardianProtocolError::GenerationExhausted,
+            )))?;
         let identity = GuardianPaneLeaseIdentity::new(
             self.client.guardian_incarnation(),
             self.client.mux_incarnation(),
@@ -5665,7 +5663,7 @@ mod tests {
             <[u8; 32]>::from(Sha256::digest(state.payload.as_slice())),
             expected_payload_digest
         );
-        assert!(state.lose_reply_once.is_empty());
+        assert_eq!(state.lose_reply_once, Vec::new());
 
         let query_ids = state
             .calls
@@ -6127,8 +6125,9 @@ mod tests {
             })
             .expect_err("parser delivery failure must remain visible");
         assert_eq!(delivery_error.kind(), io::ErrorKind::BrokenPipe);
-        assert!(
-            replay_state.lock().acks.is_empty(),
+        assert_eq!(
+            replay_state.lock().acks,
+            Vec::new(),
             "failed parser delivery cannot acknowledge its replay page"
         );
 
@@ -6138,7 +6137,7 @@ mod tests {
         assert_eq!(terminal_error.kind(), io::ErrorKind::InvalidData);
         let state = replay_state.lock();
         assert_eq!(state.requests.len(), 1);
-        assert!(state.acks.is_empty());
+        assert_eq!(state.acks, Vec::new());
     }
 
     #[test]
