@@ -1697,6 +1697,73 @@ impl GuardianPaneOutputJournal {
         self.initial_remaining_records
     }
 
+    /// Consume one freshly published single-segment chain into the persistent
+    /// broker's sole synchronous output-journal authority.
+    ///
+    /// The ordinary guardian keeps the segment manager so it can roll over in
+    /// its bounded worker pool. A broker-owned PTY instead needs the exact raw
+    /// journal beside the child and appends before exposing each output prefix.
+    /// This one-way conversion is permitted only before the handle was cloned
+    /// and only while the complete manifest, path, and empty-chain invariants
+    /// still match. It never reopens a path or infers authority from a name.
+    pub(crate) fn into_fresh_broker_journal(
+        self,
+    ) -> Result<GuardianOutputJournal, GuardianOutputError> {
+        if self.initial_next_sequence != Some(1)
+            || self.initial_cumulative_plaintext_bytes != 0
+            || self.initial_remaining_records == 0
+        {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian broker output conversion requires a fresh journal handle",
+            ));
+        }
+        let authority = Arc::try_unwrap(self.authority)
+            .map_err(|_| {
+                GuardianOutputError::FilesystemAuthority(
+                    "guardian broker output conversion requires sole journal authority",
+                )
+            })?
+            .into_inner()
+            .map_err(|_| {
+                GuardianOutputError::FilesystemAuthority(
+                    "guardian broker output conversion found a poisoned journal lock",
+                )
+            })?;
+        authority.validate_path_authority().map_err(|_| {
+            GuardianOutputError::FilesystemAuthority(
+                "guardian broker output conversion failed path-authority validation",
+            )
+        })?;
+        let expected_segment = authority.segments.first().ok_or(
+            GuardianOutputError::FilesystemAuthority(
+                "guardian broker output conversion found no published segment",
+            ),
+        )?;
+        let manifest_segments = &authority.manifest.snapshot.segments;
+        let journal_identity = authority.current_journal.identity();
+        if authority.failed
+            || authority.total_records != 0
+            || authority.segments.len() != 1
+            || authority.physical_segment_files != 1
+            || authority.manifest_history.len() != 1
+            || authority.relevant_files != 3
+            || manifest_segments.as_slice() != [expected_segment.segment_identity]
+            || journal_identity != expected_segment.segment_identity
+            || authority.current_journal.record_count() != 0
+            || authority.current_journal.cumulative_plaintext_bytes() != 0
+            || authority.current_journal.next_sequence() != Some(1)
+            || authority.current_journal.terminal_receipt().is_some()
+            || authority.current_journal.tail() != GuardianOutputJournalTail::Clean
+            || authority.current_journal.is_poisoned()
+            || authority.current_journal.directory_entry_sync_required()
+        {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian broker output conversion found a non-fresh published chain",
+            ));
+        }
+        Ok(authority.current_journal)
+    }
+
     fn validate_checkpoint_record_origin(
         &self,
         descriptor: &GuardianCheckpointArtifactDescriptorV1,
@@ -15249,6 +15316,58 @@ mod tests {
             .map_err(|_| "journal authority was poisoned")?;
         let recovered = recover_all_segment_bytes(&authority)?;
         assert_eq!(recovered, b"firstsecond");
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_published_output_handle_transfers_exact_append_authority_to_broker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = kept_private_directory("ft-guardian-output-broker-transfer-")?;
+        let token_path = directory.join("guardian.token");
+        let poll = Poll::new()?;
+        let waker = Arc::new(Waker::new(poll.registry(), Token(1))?);
+        let pipeline = GuardianOutputPipeline::open(&token_path, 1, waker)?;
+        let guardian_incarnation = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let handle = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+
+        let mut journal = handle.into_fresh_broker_journal()?;
+        assert_eq!(journal.identity().durable_pane_id(), pane_id);
+        assert_eq!(journal.record_count(), 0);
+        assert_eq!(journal.cumulative_plaintext_bytes(), 0);
+        assert_eq!(journal.next_sequence(), Some(1));
+        assert_eq!(journal.tail(), GuardianOutputJournalTail::Clean);
+        assert!(!journal.directory_entry_sync_required());
+
+        let receipt = journal.append_and_sync(b"broker-owned-prefix")?;
+        assert_eq!(receipt.sequence(), 1);
+        assert_eq!(journal.record_count(), 1);
+        assert_eq!(journal.terminal_receipt(), Some(receipt));
+        Ok(())
+    }
+
+    #[test]
+    fn cloned_published_output_handle_cannot_duplicate_broker_append_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = kept_private_directory("ft-guardian-output-broker-clone-")?;
+        let token_path = directory.join("guardian.token");
+        let poll = Poll::new()?;
+        let waker = Arc::new(Waker::new(poll.registry(), Token(1))?);
+        let pipeline = GuardianOutputPipeline::open(&token_path, 1, waker)?;
+        let pane_id = Uuid::new_v4();
+        let retained = pipeline.prepare_pane(Uuid::new_v4(), pane_id)?;
+        let attempted_duplicate = retained.clone();
+
+        assert!(matches!(
+            attempted_duplicate.into_fresh_broker_journal(),
+            Err(GuardianOutputError::FilesystemAuthority(
+                "guardian broker output conversion requires sole journal authority"
+            ))
+        ));
+
+        let receipt = durable_commit(&pipeline, pane_id, &retained, b"still-owned-by-pipeline")?;
+        assert_eq!(receipt.sequence(), 1);
+        assert!(retained.receipt_is_current(receipt));
         Ok(())
     }
 

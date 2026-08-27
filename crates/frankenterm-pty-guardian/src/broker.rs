@@ -51,7 +51,7 @@
 #![allow(dead_code)] // Activation is intentionally held for the cross-process tranche.
 
 use crate::SealedAtomicBuildIdentity;
-use crate::output::GuardianPublishedGenesisAdmissionPermitV1;
+use crate::output::{GuardianPaneOutputJournal, GuardianPublishedGenesisAdmissionPermitV1};
 use crate::transport::{
     GuardianServiceError, GuardianTokenPathAuthority, SocketPathAuthority,
     bind_private_unix_listener, load_guardian_secret, load_guardian_secret_with_authority,
@@ -9369,6 +9369,18 @@ impl BrokerPreparedPaneV1 {
         Ok(self)
     }
 
+    /// Consume the output pipeline's exact fresh manifest-bound handle into
+    /// the broker-owned synchronous journal used by the persistent PTY pump.
+    pub(crate) fn bind_fresh_published_output_journal(
+        self,
+        journal: GuardianPaneOutputJournal,
+    ) -> Result<Self, BrokerError> {
+        let journal = journal
+            .into_fresh_broker_journal()
+            .map_err(|_| BrokerError::DurableOutputJournalUnavailable)?;
+        self.bind_fresh_output_journal(journal)
+    }
+
     #[must_use]
     pub fn resource_usage(&self) -> BrokerResourceUsageV1 {
         BrokerResourceUsageV1 {
@@ -17134,6 +17146,42 @@ mod tests {
 
         thread::sleep(Duration::from_millis(50));
         assert!(!sentinel.exists(), "journal rejection spawned a child");
+    }
+
+    #[test]
+    fn prepared_pane_consumes_exact_fresh_published_output_authority_before_spawn() {
+        let directory = private_catalog_directory().keep();
+        let token_path = directory.join("guardian-output.token");
+        let poll = Poll::new().expect("create output completion poll");
+        let waker = Arc::new(
+            mio::Waker::new(poll.registry(), Token(1)).expect("create output completion waker"),
+        );
+        let pipeline = crate::output::GuardianOutputPipeline::open(&token_path, 1, waker)
+            .expect("open published output pipeline");
+        let sentinel = directory.join("must-not-spawn-before-durable-commit");
+        let authority = authority(id(109), id(110), id(111), id(112), 0x93, 0x94);
+        let payload = command_payload("printf x >>\"$BROKER_SENTINEL\"", &sentinel);
+        let binding = binding_for(&payload, &authority);
+        let (prepared, _control) = prepare_for_test(
+            payload,
+            binding,
+            &authority,
+            BrokerResourceLimitsV1::default(),
+        )
+        .expect("prepare child-free pane");
+        let published = pipeline
+            .prepare_pane(
+                authority.owner.guardian_incarnation,
+                binding.durable_pane_id,
+            )
+            .expect("publish exact fresh output chain");
+
+        let prepared = prepared
+            .bind_fresh_published_output_journal(published)
+            .expect("consume published output authority into broker");
+        assert!(prepared.output_journal.is_some());
+        assert_eq!(prepared.resource_usage().child_handles, 0);
+        assert!(!sentinel.exists(), "output authority transfer spawned a child");
     }
 
     #[test]
