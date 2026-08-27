@@ -10925,10 +10925,102 @@ impl BrokerPaneLeaseWalCatalogV1 {
         self.open_completed_pair(journal_id, completed, authenticator)
     }
 
+    fn recover_creation_transactions(
+        &self,
+        authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    ) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        let states = self.scan_states()?;
+        if states.values().all(|pair| pair.creating_name.is_none()) {
+            return Ok(());
+        }
+
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(states.len())
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        let mut creating = Vec::new();
+        creating
+            .try_reserve_exact(states.len())
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        for (journal_id, pair) in &states {
+            let identity = if let Some(creating_name) = pair.creating_name.as_ref() {
+                let marker_identity = broker_spawn_catalog_stat_recoverable_creation_identity_at(
+                    &self.directory,
+                    creating_name,
+                    0,
+                    BROKER_LEASE_CREATION_MARKER_BYTES,
+                )?;
+                if marker_identity.bytes != BROKER_LEASE_CREATION_MARKER_BYTES {
+                    return Err(BrokerPaneLeaseWalErrorV1::IncompleteTail);
+                }
+                let mut marker = open_and_seal_broker_spawn_creation_file_mode_at(
+                    &self.directory,
+                    creating_name,
+                    BROKER_LEASE_CREATION_MARKER_BYTES,
+                    BROKER_LEASE_CREATION_MARKER_BYTES,
+                )?;
+                let identity = read_broker_lease_creation_marker(&mut marker, authenticator)?;
+                if identity.spawn.journal_id() != *journal_id
+                    || *creating_name != broker_lease_catalog_creating_name(*journal_id)
+                {
+                    return Err(BrokerPaneLeaseWalErrorV1::CreationMarkerMismatch);
+                }
+                let wal_header = encode_broker_lease_file_header(
+                    BROKER_LEASE_WAL_FILE_MAGIC,
+                    &identity,
+                    authenticator,
+                )?;
+                let head_header = encode_broker_lease_file_header(
+                    BROKER_LEASE_HEAD_FILE_MAGIC,
+                    &identity,
+                    authenticator,
+                )?;
+                if let Some(wal_name) = pair.wal_name.as_ref() {
+                    let mut wal = open_and_seal_broker_spawn_creation_file_mode_at(
+                        &self.directory,
+                        wal_name,
+                        0,
+                        BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+                    )?;
+                    validate_broker_lease_creation_prefix(&mut wal, &wal_header)?;
+                }
+                if let Some(head_name) = pair.head_name.as_ref() {
+                    let mut head = open_and_seal_broker_spawn_creation_file_mode_at(
+                        &self.directory,
+                        head_name,
+                        0,
+                        BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+                    )?;
+                    validate_broker_lease_creation_prefix(&mut head, &head_header)?;
+                }
+                creating.push((*journal_id, identity));
+                identity
+            } else {
+                self.open_completed_pair(*journal_id, pair, authenticator.clone())?
+                    .identity
+            };
+            identities.push(identity);
+        }
+        validate_broker_lease_catalog_identities(&identities, authenticator)?;
+        if self.scan_states()? != states {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+
+        for (journal_id, identity) in creating {
+            let current = self.scan_states()?;
+            let pair = current
+                .get(&journal_id)
+                .ok_or(BrokerPaneLeaseWalErrorV1::InvalidCreationState)?;
+            drop(self.complete_creation(&identity, pair, authenticator.clone())?);
+        }
+        self.validate_pinned_directory()
+    }
+
     fn scan_all_for_admission(
         &self,
         authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
     ) -> Result<Vec<BrokerPaneLeaseJournalV1>, BrokerPaneLeaseWalErrorV1> {
+        self.recover_creation_transactions(authenticator)?;
         let states = self.scan_states()?;
         let mut identities = Vec::new();
         identities
@@ -10939,9 +11031,7 @@ impl BrokerPaneLeaseWalCatalogV1 {
             .try_reserve_exact(states.len())
             .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
         for (journal_id, pair) in &states {
-            if pair.creating_name.is_some() {
-                return Err(BrokerPaneLeaseWalErrorV1::InvalidCreationState);
-            }
+            debug_assert!(pair.creating_name.is_none());
             let journal = self.open_completed_pair(*journal_id, pair, authenticator.clone())?;
             identities.push(journal.identity);
             recovered.push(journal);
@@ -25696,6 +25786,20 @@ mod tests {
         drop(wal);
         let retained_marker_prefix = fs::read(&creating_path).expect("read marker prefix");
         let retained_wal_prefix = fs::read(&wal_path).expect("read WAL prefix");
+        assert!(matches!(
+            catalog.scan_all_for_admission(&lease_authenticator),
+            Err(BrokerPaneLeaseWalErrorV1::IncompleteTail)
+        ));
+        assert_eq!(
+            fs::read(&creating_path).expect("reread rejected marker prefix"),
+            retained_marker_prefix,
+            "restart scan changed a marker whose identity was still incomplete"
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("reread rejected WAL prefix"),
+            retained_wal_prefix,
+            "restart scan changed a WAL whose marker identity was still incomplete"
+        );
 
         let resumed = catalog
             .create_lease_journal(&identity, lease_authenticator)
@@ -25714,6 +25818,198 @@ mod tests {
             &fs::read(&wal_path).expect("read completed WAL")[..retained_wal_prefix.len()],
             retained_wal_prefix.as_slice()
         );
+    }
+
+    #[test]
+    fn pane_lease_catalog_restart_completes_multiple_authenticated_creation_prefixes() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xe6);
+        let first = lease_catalog_identity(&spawn_authenticator, 0x47);
+        let second = lease_catalog_identity(&spawn_authenticator, 0x48);
+        let third = lease_catalog_identity(&spawn_authenticator, 0x4b);
+        let catalog = BrokerPaneLeaseWalCatalogV1::open(temp.path().to_path_buf())
+            .expect("open multi-recovery pane-lease catalog");
+
+        let first_marker = encode_broker_lease_file_header(
+            BROKER_LEASE_CREATION_MARKER_MAGIC,
+            &first,
+            &lease_authenticator,
+        )
+        .expect("encode first recoverable marker");
+        let first_wal = encode_broker_lease_file_header(
+            BROKER_LEASE_WAL_FILE_MAGIC,
+            &first,
+            &lease_authenticator,
+        )
+        .expect("encode first recoverable WAL header");
+        let second_marker = encode_broker_lease_file_header(
+            BROKER_LEASE_CREATION_MARKER_MAGIC,
+            &second,
+            &lease_authenticator,
+        )
+        .expect("encode second recoverable marker");
+        let third_marker = encode_broker_lease_file_header(
+            BROKER_LEASE_CREATION_MARKER_MAGIC,
+            &third,
+            &lease_authenticator,
+        )
+        .expect("encode marker-only recoverable transaction");
+        let second_head = encode_broker_lease_file_header(
+            BROKER_LEASE_HEAD_FILE_MAGIC,
+            &second,
+            &lease_authenticator,
+        )
+        .expect("encode second recoverable head header");
+        let first_marker_path = temp
+            .path()
+            .join(broker_lease_catalog_creating_name(first.spawn.journal_id()));
+        let first_wal_path = temp
+            .path()
+            .join(broker_lease_catalog_wal_name(first.spawn.journal_id()));
+        let second_marker_path = temp.path().join(broker_lease_catalog_creating_name(
+            second.spawn.journal_id(),
+        ));
+        let second_head_path = temp
+            .path()
+            .join(broker_lease_catalog_head_name(second.spawn.journal_id()));
+        let third_marker_path = temp
+            .path()
+            .join(broker_lease_catalog_creating_name(third.spawn.journal_id()));
+        let mut file = open_new_test_file(&first_marker_path);
+        file.write_all(&first_marker)
+            .expect("write first complete creation marker");
+        file.sync_all().expect("sync first creation marker");
+        drop(file);
+        let mut file = open_new_test_file(&first_wal_path);
+        file.write_all(&first_wal[..71])
+            .expect("write first WAL creation prefix");
+        file.sync_all().expect("sync first WAL creation prefix");
+        drop(file);
+        let retained_first_wal = fs::read(&first_wal_path).expect("read first WAL prefix");
+        let mut file = open_new_test_file(&second_marker_path);
+        file.write_all(&second_marker)
+            .expect("write second complete creation marker");
+        file.sync_all().expect("sync second creation marker");
+        drop(file);
+        let mut file = open_new_test_file(&second_head_path);
+        file.write_all(&second_head[..93])
+            .expect("write second head creation prefix");
+        file.sync_all().expect("sync second head creation prefix");
+        drop(file);
+        let retained_second_head = fs::read(&second_head_path).expect("read second head prefix");
+        let mut file = open_new_test_file(&third_marker_path);
+        file.write_all(&third_marker)
+            .expect("write complete marker-only transaction");
+        file.sync_all().expect("sync marker-only transaction");
+        drop(file);
+
+        let recovered = catalog
+            .scan_all_for_admission(&lease_authenticator)
+            .expect("complete all authenticated creation transactions at restart");
+        assert_eq!(recovered.len(), 3);
+        assert!(
+            recovered
+                .iter()
+                .all(|journal| journal.status().append_authority_withheld)
+        );
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .expect("enumerate recovered pane-lease catalog")
+                .count(),
+            10,
+            "restart recovery did not publish three exact lease pairs"
+        );
+        assert_eq!(
+            &fs::read(&first_wal_path).expect("read recovered first WAL")
+                [..retained_first_wal.len()],
+            retained_first_wal.as_slice()
+        );
+        assert_eq!(
+            &fs::read(&second_head_path).expect("read recovered second head")
+                [..retained_second_head.len()],
+            retained_second_head.as_slice()
+        );
+        for identity in [first, second, third] {
+            assert!(
+                !temp
+                    .path()
+                    .join(broker_lease_catalog_creating_name(
+                        identity.spawn.journal_id()
+                    ))
+                    .exists()
+            );
+            assert!(
+                temp.path()
+                    .join(broker_lease_catalog_completed_name(
+                        identity.spawn.journal_id()
+                    ))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn pane_lease_catalog_recovery_preflights_global_conflicts_without_pair_creation() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xe7);
+        let first = lease_catalog_identity(&spawn_authenticator, 0x49);
+        let mut conflicting = lease_catalog_identity(&spawn_authenticator, 0x4a);
+        conflicting.spawn.durable_pane_id = first.spawn.durable_pane_id();
+        let catalog = BrokerPaneLeaseWalCatalogV1::open(temp.path().to_path_buf())
+            .expect("open conflicting-recovery pane-lease catalog");
+        for identity in [first, conflicting] {
+            let marker_header = encode_broker_lease_file_header(
+                BROKER_LEASE_CREATION_MARKER_MAGIC,
+                &identity,
+                &lease_authenticator,
+            )
+            .expect("encode conflicting-recovery marker");
+            let marker_path = temp.path().join(broker_lease_catalog_creating_name(
+                identity.spawn.journal_id(),
+            ));
+            let mut marker = open_new_test_file(&marker_path);
+            marker
+                .write_all(&marker_header)
+                .expect("write conflicting-recovery marker");
+            marker.sync_all().expect("sync conflicting-recovery marker");
+        }
+        let entry_count = fs::read_dir(temp.path())
+            .expect("enumerate conflicting-recovery catalog")
+            .count();
+        assert_eq!(entry_count, 3);
+
+        assert!(matches!(
+            catalog.scan_all_for_admission(&lease_authenticator),
+            Err(BrokerPaneLeaseWalErrorV1::EffectIdentityConflict)
+        ));
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .expect("re-enumerate conflicting-recovery catalog")
+                .count(),
+            entry_count,
+            "global preflight conflict created a WAL or head member"
+        );
+        for identity in [first, conflicting] {
+            assert!(
+                temp.path()
+                    .join(broker_lease_catalog_creating_name(
+                        identity.spawn.journal_id()
+                    ))
+                    .exists()
+            );
+            assert!(
+                !temp
+                    .path()
+                    .join(broker_lease_catalog_wal_name(identity.spawn.journal_id()))
+                    .exists()
+            );
+            assert!(
+                !temp
+                    .path()
+                    .join(broker_lease_catalog_head_name(identity.spawn.journal_id()))
+                    .exists()
+            );
+        }
     }
 
     #[test]
