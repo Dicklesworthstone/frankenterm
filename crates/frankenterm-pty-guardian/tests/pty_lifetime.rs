@@ -175,17 +175,29 @@ fn replay_resume_wait_wakes_on_durable_output_and_expires_at_its_deadline() -> a
         ),
         "guardian returned an unexpected replay-wait spawn receipt"
     );
+    let claimed_lease = client.claim(pane_id, 0, Uuid::new_v4(), Uuid::new_v4())?;
     anyhow::ensure!(
-        matches!(
-            client.claim(pane_id, 0, Uuid::new_v4(), Uuid::new_v4())?,
-            GuardianReply::Claimed {
-                pane_id: claimed,
-                generation: 1,
-                next_sequence: 1
-            } if claimed == pane_id
-        ),
-        "guardian returned an unexpected replay-wait claim receipt"
+        claimed_lease.pane_id() == pane_id
+            && claimed_lease.generation() == 1
+            && claimed_lease.next_sequence() == 1,
+        "guardian returned an unexpected replay-wait claim capability"
     );
+    let attached_lease = GuardianClient::connect(
+        &socket_path,
+        &token_path,
+        claimed_lease.mux_incarnation(),
+    )?
+    .attach(pane_id, claimed_lease.generation(), Uuid::new_v4())?;
+    anyhow::ensure!(
+        attached_lease.guardian_incarnation() == claimed_lease.guardian_incarnation()
+            && attached_lease.mux_incarnation() == claimed_lease.mux_incarnation()
+            && attached_lease.pane_id() == pane_id
+            && attached_lease.generation() == claimed_lease.generation()
+            && attached_lease.next_sequence() == claimed_lease.next_sequence(),
+        "guardian returned an unexpected replay-wait attach capability"
+    );
+    let _claim_anchor = claimed_lease;
+    let mut client = attached_lease.into_client();
     // Census `next_sequence` is the control-plane mutation sequence, not the
     // encrypted output-journal sequence. Pin the exact pane segment length so
     // the wake assertion below observes the durable data-plane boundary.
@@ -387,18 +399,14 @@ fn guardian_owned_native_pty_survives_final_mux_connection_drop() -> anyhow::Res
         ),
         "guardian returned an unexpected spawn receipt"
     );
-    let claim = first_client.claim(pane_id, 0, Uuid::new_v4(), Uuid::new_v4())?;
+    let claimed_lease = first_client.claim(pane_id, 0, Uuid::new_v4(), Uuid::new_v4())?;
     anyhow::ensure!(
-        matches!(
-            claim,
-            GuardianReply::Claimed {
-                pane_id: claimed,
-                generation: 1,
-                next_sequence: 1
-            } if claimed == pane_id
-        ),
-        "guardian returned an unexpected claim receipt"
+        claimed_lease.pane_id() == pane_id
+            && claimed_lease.generation() == 1
+            && claimed_lease.next_sequence() == 1,
+        "guardian returned an unexpected claim capability"
     );
+    let first_client = claimed_lease.into_client();
     anyhow::ensure!(
         wait_until(Duration::from_secs(3), || pid_path.is_file()),
         "PTY child never published its process identity"

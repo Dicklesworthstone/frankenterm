@@ -8,7 +8,9 @@
 //! an off-topology [`ActivatedGuardianProxy`], and mux registration stays a
 //! separate caller-owned commit boundary.
 
-use frankenterm_pty_guardian::{GuardianClient, GuardianClientError};
+use frankenterm_pty_guardian::{
+    GuardianClaimedPaneLease, GuardianClient, GuardianClientError,
+};
 use mux::domain::DomainId;
 use mux::guardian_checkpoint::LiveParserCheckpointAck;
 use mux::guardian_protocol::{
@@ -1314,33 +1316,28 @@ fn map_replay_client_error(error: GuardianClientError) -> GuardianProxyError {
 }
 
 impl GuardianClientTransport {
-    fn connect(
+    fn from_claimed_lease(
         socket_path: &Path,
         token_path: &Path,
         identity: GuardianPaneLeaseIdentity,
-    ) -> Result<Self, GuardianProxyError> {
-        let mut transport = Self {
+        claimed_lease: GuardianClaimedPaneLease,
+    ) -> Self {
+        debug_assert_eq!(
+            claimed_lease.guardian_incarnation(),
+            identity.guardian_incarnation()
+        );
+        debug_assert_eq!(
+            claimed_lease.mux_incarnation(),
+            identity.mux_incarnation()
+        );
+        debug_assert_eq!(claimed_lease.pane_id(), identity.pane_id());
+        debug_assert_eq!(claimed_lease.generation(), identity.generation());
+        Self {
             socket_path: socket_path.to_path_buf(),
             token_path: token_path.to_path_buf(),
             identity,
-            client: None,
-        };
-        transport.ensure_client().map_err(|error| match error {
-            GuardianMutationTransportError::Client(error) => GuardianProxyError::Client(error),
-            GuardianMutationTransportError::GuardianIncarnationChanged => {
-                GuardianProxyError::GuardianIncarnationChanged
-            }
-            GuardianMutationTransportError::PaneNotFound => GuardianProxyError::PaneNotFound,
-            GuardianMutationTransportError::LeaseMismatch => GuardianProxyError::LeaseFenced,
-            GuardianMutationTransportError::PaneQuarantined => GuardianProxyError::PaneQuarantined,
-            GuardianMutationTransportError::ChildExitStatusUnavailable => {
-                GuardianProxyError::ChildExitStatusUnavailable
-            }
-            GuardianMutationTransportError::CensusAllocation => {
-                GuardianProxyError::CensusAllocation
-            }
-        })?;
-        Ok(transport)
+            client: Some(claimed_lease.into_client()),
+        }
     }
 
     fn ensure_client(&mut self) -> Result<&mut GuardianClient, GuardianMutationTransportError> {
@@ -1610,19 +1607,15 @@ impl fmt::Debug for GuardianPaneLeaseActor {
 }
 
 impl GuardianPaneLeaseActor {
-    fn with_transport(
+    fn with_validated_transport(
         identity: GuardianPaneLeaseIdentity,
         next_sequence: u64,
         size: PtySize,
         transport: Box<dyn GuardianMutationTransport>,
-    ) -> Result<Self, GuardianProxyError> {
-        if next_sequence == 0 {
-            return Err(GuardianProxyError::InvalidConfiguration(
-                "next mutation sequence must be nonzero",
-            ));
-        }
-        validate_pty_size(size)?;
-        Ok(Self {
+    ) -> Self {
+        debug_assert_ne!(next_sequence, 0);
+        debug_assert!(validate_pty_size(size).is_ok());
+        Self {
             identity,
             next_sequence,
             size,
@@ -1631,7 +1624,7 @@ impl GuardianPaneLeaseActor {
             transport,
             #[cfg(test)]
             fail_next_input_copy: false,
-        })
+        }
     }
 
     /// Return the immutable lease identity bound to every proxy facet.
@@ -3616,6 +3609,147 @@ impl GuardianReplayReaderSlot {
     }
 }
 
+/// Pre-Claim validation and transport authority for one guardian proxy lease.
+///
+/// Construction validates the PTY configuration and authenticates a client
+/// against the exact shared census coordinator before any lease mutation is
+/// sent. Consuming [`Self::claim`] or [`Self::attach`] is therefore the only
+/// production path into [`GuardianProxyStaging`]: once the guardian grants the
+/// lease, staging can install its rollback guard without another fallible
+/// configuration or identity check.
+pub struct GuardianProxyLeasePlan {
+    socket_path: PathBuf,
+    token_path: PathBuf,
+    size: PtySize,
+    census: Arc<GuardianCensusCoordinator>,
+    client: GuardianClient,
+}
+
+impl fmt::Debug for GuardianProxyLeasePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardianProxyLeasePlan")
+            .field("guardian_incarnation", &self.client.guardian_incarnation())
+            .field("mux_incarnation", &self.client.mux_incarnation())
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianProxyLeasePlan {
+    /// Validate local proxy state and authenticate the exact pre-Claim client.
+    pub fn prepare(
+        socket_path: &Path,
+        token_path: &Path,
+        size: PtySize,
+        census: Arc<GuardianCensusCoordinator>,
+    ) -> Result<Self, GuardianProxyError> {
+        validate_pty_size(size)?;
+        let client = GuardianClient::connect(
+            socket_path,
+            token_path,
+            census.mux_incarnation(),
+        )
+        .map_err(GuardianProxyError::Client)?;
+        if client.guardian_incarnation() != census.guardian_incarnation() {
+            return Err(GuardianProxyError::GuardianIncarnationChanged);
+        }
+        Ok(Self {
+            socket_path: socket_path.to_path_buf(),
+            token_path: token_path.to_path_buf(),
+            size,
+            census,
+            client,
+        })
+    }
+
+    /// Claim one currently unowned pane and immediately install rollback
+    /// authority before opening any secondary replay or checkpoint channel.
+    pub fn claim(
+        self,
+        pane_id: Uuid,
+        observed_generation: u64,
+        request_id: Uuid,
+        effect_id: Uuid,
+    ) -> Result<GuardianProxyStaging, GuardianProxyError> {
+        let generation = observed_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                GuardianProxyError::Client(GuardianClientError::Protocol(
+                    GuardianProtocolError::GenerationExhausted,
+                ))
+            })?;
+        let identity = GuardianPaneLeaseIdentity::new(
+            self.client.guardian_incarnation(),
+            self.client.mux_incarnation(),
+            pane_id,
+            generation,
+        )
+        .map_err(|_| {
+            GuardianProxyError::InvalidConfiguration(
+                "guardian Claim plan carried an invalid lease identity",
+            )
+        })?;
+        let Self {
+            socket_path,
+            token_path,
+            size,
+            census,
+            client,
+        } = self;
+        let claimed_lease = client
+            .claim(pane_id, observed_generation, request_id, effect_id)
+            .map_err(map_replay_client_error)?;
+        GuardianProxyStaging::from_planned_lease(
+            &socket_path,
+            &token_path,
+            identity,
+            claimed_lease,
+            size,
+            census,
+        )
+    }
+
+    /// Attach to one lease already owned by this mux and immediately install
+    /// rollback authority before opening secondary transport channels.
+    pub fn attach(
+        self,
+        pane_id: Uuid,
+        generation: u64,
+        request_id: Uuid,
+    ) -> Result<GuardianProxyStaging, GuardianProxyError> {
+        let identity = GuardianPaneLeaseIdentity::new(
+            self.client.guardian_incarnation(),
+            self.client.mux_incarnation(),
+            pane_id,
+            generation,
+        )
+        .map_err(|_| {
+            GuardianProxyError::InvalidConfiguration(
+                "guardian Attach plan carried an invalid lease identity",
+            )
+        })?;
+        let Self {
+            socket_path,
+            token_path,
+            size,
+            census,
+            client,
+        } = self;
+        let claimed_lease = client
+            .attach(pane_id, generation, request_id)
+            .map_err(map_replay_client_error)?;
+        GuardianProxyStaging::from_planned_lease(
+            &socket_path,
+            &token_path,
+            identity,
+            claimed_lease,
+            size,
+            census,
+        )
+    }
+}
+
 /// A connected, already-claimed guardian lease that is still off topology.
 ///
 /// No portable-pty object and no reader activation method are exposed from this
@@ -3725,32 +3859,38 @@ fn guardian_cleanup_retry_is_safe(error: &GuardianProxyError) -> bool {
 }
 
 impl GuardianProxyStaging {
-    /// Connect to the guardian and stage proxy authority for one lease already
-    /// proven by Claim or Attach.  This function performs neither operation.
-    pub fn connect(
+    fn from_planned_lease(
         socket_path: &Path,
         token_path: &Path,
         identity: GuardianPaneLeaseIdentity,
-        next_sequence: u64,
+        claimed_lease: GuardianClaimedPaneLease,
         size: PtySize,
         census: Arc<GuardianCensusCoordinator>,
     ) -> Result<Self, GuardianProxyError> {
-        census.ensure_binding(identity)?;
-        if next_sequence == 0 {
-            return Err(GuardianProxyError::InvalidConfiguration(
-                "next mutation sequence must be nonzero",
-            ));
-        }
-        validate_pty_size(size)?;
-        let mutation_transport =
-            GuardianClientTransport::connect(socket_path, token_path, identity)?;
-        let mut staging = Self::with_transports(
+        debug_assert_eq!(
+            claimed_lease.guardian_incarnation(),
+            identity.guardian_incarnation()
+        );
+        debug_assert_eq!(
+            claimed_lease.mux_incarnation(),
+            identity.mux_incarnation()
+        );
+        debug_assert_eq!(claimed_lease.pane_id(), identity.pane_id());
+        debug_assert_eq!(claimed_lease.generation(), identity.generation());
+        let next_sequence = claimed_lease.next_sequence();
+        let mutation_transport = GuardianClientTransport::from_claimed_lease(
+            socket_path,
+            token_path,
+            identity,
+            claimed_lease,
+        );
+        let mut staging = Self::with_validated_transports(
             identity,
             next_sequence,
             size,
             Box::new(mutation_transport),
             census,
-        )?;
+        );
         // Stage the rollback guard before opening the independent replay
         // channel. A replay-channel setup failure must not leak the Claim that
         // the caller completed before entering this constructor.
@@ -3767,6 +3907,7 @@ impl GuardianProxyStaging {
         Ok(staging)
     }
 
+    #[cfg(test)]
     fn with_transports(
         identity: GuardianPaneLeaseIdentity,
         next_sequence: u64,
@@ -3775,12 +3916,35 @@ impl GuardianProxyStaging {
         census: Arc<GuardianCensusCoordinator>,
     ) -> Result<Self, GuardianProxyError> {
         census.ensure_binding(identity)?;
-        let actor = Arc::new(Mutex::new(GuardianPaneLeaseActor::with_transport(
+        if next_sequence == 0 {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "next mutation sequence must be nonzero",
+            ));
+        }
+        validate_pty_size(size)?;
+        Ok(Self::with_validated_transports(
             identity,
             next_sequence,
             size,
             transport,
-        )?));
+            census,
+        ))
+    }
+
+    fn with_validated_transports(
+        identity: GuardianPaneLeaseIdentity,
+        next_sequence: u64,
+        size: PtySize,
+        transport: Box<dyn GuardianMutationTransport>,
+        census: Arc<GuardianCensusCoordinator>,
+    ) -> Self {
+        debug_assert!(census.ensure_binding(identity).is_ok());
+        let actor = Arc::new(Mutex::new(GuardianPaneLeaseActor::with_validated_transport(
+            identity,
+            next_sequence,
+            size,
+            transport,
+        )));
         // Claim/Attach completed before staging construction and may postdate
         // an otherwise fresh shared snapshot. Never publish a new pane
         // against a cache that could still describe the pre-claim fleet.
@@ -3795,14 +3959,14 @@ impl GuardianProxyStaging {
         )));
         #[cfg(not(test))]
         let checkpoint_publisher = None;
-        Ok(Self {
+        Self {
             actor,
             census,
             reader_slot: Arc::new(GuardianReplayReaderSlot::new()),
             replay_transport: None,
             checkpoint_publisher,
             lease_rollback,
-        })
+        }
     }
 
     /// Return the exact immutable lease identity.

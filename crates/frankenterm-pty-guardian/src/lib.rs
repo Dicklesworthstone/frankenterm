@@ -11,10 +11,12 @@
 //! permit, then synchronizes the terminal disposition before replying. A caller
 //! that loses the reply can query the exact effect by its sequence, byte length,
 //! and authenticated SHA-256 commitment without retaining plaintext. Output
-//! delivery/replay, checkpoint publication, guardian crash recovery, durable
-//! same-incarnation WAL reopening, and automated mux migration remain
-//! intentionally rejected until their anti-rollback and recovery authorities
-//! are integrated. The production-disabled broker separately exposes a
+//! Authenticated output replay and checkpoint Stage/catalog adoption are live
+//! behind typed, identity-bound transport operations. Production guardian
+//! selection, Genesis recovery-base creation, topology publication, service
+//! activation, and automated mux migration remain intentionally rejected until
+//! their anti-rollback and recovery authorities are integrated. The
+//! production-disabled broker separately exposes a
 //! content-free, paginated view of authenticated recovered Spawn journals, but
 //! that view grants no PTY, lease, output-replay, or mutation authority. The
 //! service can be stopped through an authenticated guarded
@@ -91,8 +93,9 @@ pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
 pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};
 #[cfg(unix)]
 pub use transport::{
-    GuardianClient, GuardianClientError, GuardianProbeReport, GuardianService,
-    GuardianServiceConfig, GuardianServiceError, ProvisionTokenOutcome, provision_guardian_token,
+    GuardianClaimedPaneLease, GuardianClient, GuardianClientError, GuardianProbeReport,
+    GuardianService, GuardianServiceConfig, GuardianServiceError, ProvisionTokenOutcome,
+    provision_guardian_token,
 };
 
 /// Canonical security-sensitive scratch root for Unix tests.

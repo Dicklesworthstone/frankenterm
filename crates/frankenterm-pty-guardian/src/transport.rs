@@ -28,6 +28,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
@@ -1953,6 +1954,71 @@ pub struct GuardianClient {
     request_wipe_probe: Option<Arc<ClientRequestWipeProbe>>,
 }
 
+/// Non-constructible authority for one authenticated guardian Claim or Attach.
+///
+/// The capability owns the exact client connection that received the lease
+/// reply. Consuming it into a mux-side staging transaction therefore proves
+/// that the transaction did not synthesize lease identity from census fields.
+/// Callers that need only the low-level client for protocol testing may
+/// explicitly consume and discard this authority with [`Self::into_client`].
+#[must_use = "a claimed guardian lease must be consumed by staging or an explicit protocol operation"]
+pub struct GuardianClaimedPaneLease {
+    client: GuardianClient,
+    pane_id: Uuid,
+    generation: u64,
+    next_sequence: u64,
+}
+
+impl fmt::Debug for GuardianClaimedPaneLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardianClaimedPaneLease")
+            .field("guardian_incarnation", &self.guardian_incarnation())
+            .field("mux_incarnation", &self.mux_incarnation())
+            .field("pane_id", &self.pane_id)
+            .field("generation", &self.generation)
+            .field("next_sequence", &self.next_sequence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianClaimedPaneLease {
+    #[must_use]
+    pub const fn guardian_incarnation(&self) -> Uuid {
+        self.client.guardian_incarnation
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(&self) -> Uuid {
+        self.client.mux_incarnation
+    }
+
+    #[must_use]
+    pub const fn pane_id(&self) -> Uuid {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    /// Consume the typed lease proof and return its authenticated connection.
+    ///
+    /// This is intentionally one-way: a raw client cannot reconstruct a
+    /// claimed-lease capability. Production mux staging consumes the
+    /// capability directly; protocol tests use this escape hatch when they
+    /// deliberately continue below the staging boundary.
+    pub fn into_client(self) -> GuardianClient {
+        self.client
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct ClientRequestWipeProbe {
@@ -2105,6 +2171,11 @@ impl GuardianClient {
         else {
             return Err(GuardianClientError::UnexpectedReply);
         };
+        if guardian_incarnation.is_nil() {
+            return Err(GuardianClientError::Protocol(
+                GuardianProtocolError::ZeroIdentity("guardian incarnation"),
+            ));
+        }
         client.guardian_incarnation = guardian_incarnation;
         Ok(client)
     }
@@ -2112,6 +2183,11 @@ impl GuardianClient {
     #[must_use]
     pub const fn guardian_incarnation(&self) -> Uuid {
         self.guardian_incarnation
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(&self) -> Uuid {
+        self.mux_incarnation
     }
 
     pub fn spawn(
@@ -2136,12 +2212,22 @@ impl GuardianClient {
     }
 
     pub fn claim(
-        &mut self,
+        mut self,
         pane_id: Uuid,
         observed_generation: u64,
         request_id: Uuid,
         effect_id: Uuid,
-    ) -> Result<GuardianReply, GuardianClientError> {
+    ) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        if pane_id.is_nil() {
+            return Err(GuardianClientError::Protocol(
+                GuardianProtocolError::ZeroIdentity("pane"),
+            ));
+        }
+        if observed_generation == u64::MAX {
+            return Err(GuardianClientError::Protocol(
+                GuardianProtocolError::GenerationExhausted,
+            ));
+        }
         let request = self.request(
             GuardianOperation::Claim,
             request_id,
@@ -2151,15 +2237,46 @@ impl GuardianClient {
             Some(effect_id),
             Vec::new(),
         );
-        self.exchange(request)
+        let GuardianReply::Claimed {
+            pane_id: claimed_pane_id,
+            generation,
+            next_sequence,
+        } = self.exchange(request)?
+        else {
+            return Err(GuardianClientError::UnexpectedReply);
+        };
+        if claimed_pane_id != pane_id
+            || observed_generation.checked_add(1) != Some(generation)
+            || next_sequence != 1
+        {
+            return Err(GuardianClientError::UnexpectedReply);
+        }
+        Ok(GuardianClaimedPaneLease {
+            client: self,
+            pane_id,
+            generation,
+            next_sequence,
+        })
     }
 
     pub fn attach(
-        &mut self,
+        mut self,
         pane_id: Uuid,
         generation: u64,
         request_id: Uuid,
-    ) -> Result<GuardianReply, GuardianClientError> {
+    ) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        if pane_id.is_nil() {
+            return Err(GuardianClientError::Protocol(
+                GuardianProtocolError::ZeroIdentity("pane"),
+            ));
+        }
+        if generation == 0 {
+            return Err(GuardianClientError::Protocol(
+                GuardianProtocolError::InvalidOperationScope {
+                    operation: GuardianOperation::Attach,
+                },
+            ));
+        }
         let request = self.request(
             GuardianOperation::Attach,
             request_id,
@@ -2169,7 +2286,26 @@ impl GuardianClient {
             None,
             Vec::new(),
         );
-        self.exchange(request)
+        let GuardianReply::Attached {
+            pane_id: attached_pane_id,
+            generation: attached_generation,
+            next_sequence,
+        } = self.exchange(request)?
+        else {
+            return Err(GuardianClientError::UnexpectedReply);
+        };
+        if attached_pane_id != pane_id
+            || attached_generation != generation
+            || next_sequence == 0
+        {
+            return Err(GuardianClientError::UnexpectedReply);
+        }
+        Ok(GuardianClaimedPaneLease {
+            client: self,
+            pane_id,
+            generation,
+            next_sequence,
+        })
     }
 
     /// Consume one authenticated checkpoint/output replay page.
