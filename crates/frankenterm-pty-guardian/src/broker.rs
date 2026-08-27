@@ -2072,6 +2072,8 @@ pub enum BrokerControlClientError {
     SpawnRejected,
     #[error("broker quarantined a conflicting or indeterminate Spawn admission")]
     SpawnQuarantined,
+    #[error("broker reports that the queried Spawn still has live PTY authority")]
+    SpawnPtyAvailable,
     #[error("broker client connection is poisoned after an ambiguous exchange")]
     ConnectionPoisoned,
 }
@@ -2399,11 +2401,91 @@ struct BrokerSpawnWorkerCompletionV1 {
     outcome: BrokerSpawnWorkerOutcomeV1,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerSpawnAckFingerprintV1 {
+    spawn: BrokerSpawnWorkerFingerprintV1,
+    ack_id: Uuid,
+}
+
+struct BrokerSpawnAckWorkerJobV1 {
+    fingerprint: BrokerSpawnAckFingerprintV1,
+    retained: Box<BrokerSpawnWorkerCompletionV1>,
+}
+
+impl BrokerSpawnAckWorkerJobV1 {
+    fn new(
+        ack_id: Uuid,
+        retained: Box<BrokerSpawnWorkerCompletionV1>,
+    ) -> Result<Self, Box<BrokerSpawnWorkerCompletionV1>> {
+        if ack_id.is_nil()
+            || !matches!(
+                &retained.outcome,
+                BrokerSpawnWorkerOutcomeV1::Applied { .. }
+            )
+        {
+            return Err(retained);
+        }
+        Ok(Self {
+            fingerprint: BrokerSpawnAckFingerprintV1 {
+                spawn: retained.fingerprint,
+                ack_id,
+            },
+            retained,
+        })
+    }
+}
+
+struct BrokerSpawnAckWorkerCompletionV1 {
+    fingerprint: BrokerSpawnAckFingerprintV1,
+    retained: Box<BrokerSpawnWorkerCompletionV1>,
+    result: Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError>,
+}
+
+// Keep the admitted Spawn job inline so queue admission cannot fail after a
+// separate allocation. This capacity-one control lane deliberately trades a
+// bounded move for allocation-free transfer into the effect worker.
+#[allow(clippy::large_enum_variant)]
+enum BrokerSpawnWorkerCommandV1 {
+    Spawn(BrokerSpawnWorkerJobV1),
+    Acknowledge(BrokerSpawnAckWorkerJobV1),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerSpawnWorkerActiveV1 {
+    Spawn(BrokerSpawnWorkerFingerprintV1),
+    Acknowledge(BrokerSpawnAckFingerprintV1),
+}
+
+// The worker must publish a completed external effect without allocating after
+// child creation. Boxing the Spawn completion here would manufacture an OOM
+// crash cut between PTY ownership and readiness-loop retention.
+#[allow(clippy::large_enum_variant)]
+enum BrokerSpawnWorkerEventV1 {
+    Spawn(BrokerSpawnWorkerCompletionV1),
+    Acknowledge(BrokerSpawnAckWorkerCompletionV1),
+}
+
+impl BrokerSpawnWorkerEventV1 {
+    const fn active(&self) -> BrokerSpawnWorkerActiveV1 {
+        match self {
+            Self::Spawn(completion) => BrokerSpawnWorkerActiveV1::Spawn(completion.fingerprint),
+            Self::Acknowledge(completion) => {
+                BrokerSpawnWorkerActiveV1::Acknowledge(completion.fingerprint)
+            }
+        }
+    }
+}
+
 enum BrokerSpawnWorkerCompletionStateV1 {
-    Ready(Box<BrokerSpawnWorkerCompletionV1>),
+    Ready(Box<BrokerSpawnWorkerEventV1>),
+    AuthorityLost(Box<BrokerSpawnWorkerEventV1>),
     Empty,
     Disconnected,
-    Poisoned,
+}
+
+struct BrokerSpawnAckWorkerSubmitErrorV1 {
+    kind: BrokerSpawnWorkerSubmitErrorV1,
+    job: BrokerSpawnAckWorkerJobV1,
 }
 
 struct BrokerSpawnWorkerStateV1 {
@@ -2416,7 +2498,18 @@ struct BrokerSpawnWorkerStateV1 {
 }
 
 impl BrokerSpawnWorkerStateV1 {
-    fn execute(&mut self, job: BrokerSpawnWorkerJobV1) -> BrokerSpawnWorkerCompletionV1 {
+    fn execute_command(&mut self, command: BrokerSpawnWorkerCommandV1) -> BrokerSpawnWorkerEventV1 {
+        match command {
+            BrokerSpawnWorkerCommandV1::Spawn(job) => {
+                BrokerSpawnWorkerEventV1::Spawn(self.execute_spawn(job))
+            }
+            BrokerSpawnWorkerCommandV1::Acknowledge(job) => {
+                BrokerSpawnWorkerEventV1::Acknowledge(Self::execute_acknowledgement(job))
+            }
+        }
+    }
+
+    fn execute_spawn(&mut self, job: BrokerSpawnWorkerJobV1) -> BrokerSpawnWorkerCompletionV1 {
         let BrokerSpawnWorkerJobV1 {
             fingerprint,
             owner,
@@ -2552,15 +2645,34 @@ impl BrokerSpawnWorkerStateV1 {
             outcome,
         }
     }
+
+    fn execute_acknowledgement(
+        mut job: BrokerSpawnAckWorkerJobV1,
+    ) -> BrokerSpawnAckWorkerCompletionV1 {
+        let result = match &mut job.retained.outcome {
+            BrokerSpawnWorkerOutcomeV1::Applied {
+                journal, adoption, ..
+            } => journal.acknowledge_spawn_reply_and_sync(
+                job.fingerprint.ack_id,
+                adoption.pane.kernel_child_identity(),
+            ),
+            _ => Err(BrokerSpawnWalError::InvalidTransition),
+        };
+        BrokerSpawnAckWorkerCompletionV1 {
+            fingerprint: job.fingerprint,
+            retained: job.retained,
+            result,
+        }
+    }
 }
 
 /// One blocking durability lane for Spawn. The active fingerprint is retained
 /// until the readiness loop consumes the completion, so neither a fast worker
 /// nor a lost wakeup can admit a second PTY while the first result is pending.
 struct BrokerSpawnWorkerV1 {
-    jobs: Option<SyncSender<BrokerSpawnWorkerJobV1>>,
-    completions: Receiver<BrokerSpawnWorkerCompletionV1>,
-    active: Arc<Mutex<Option<BrokerSpawnWorkerFingerprintV1>>>,
+    jobs: Option<SyncSender<BrokerSpawnWorkerCommandV1>>,
+    completions: Receiver<BrokerSpawnWorkerEventV1>,
+    active: Arc<Mutex<Option<BrokerSpawnWorkerActiveV1>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -2580,8 +2692,8 @@ impl BrokerSpawnWorkerV1 {
         let join = std::thread::Builder::new()
             .name("ft-broker-spawn".to_string())
             .spawn(move || {
-                while let Ok(job) = job_rx.recv() {
-                    let completion = state.execute(job);
+                while let Ok(command) = job_rx.recv() {
+                    let completion = state.execute_command(command);
                     if completion_tx.send(completion).is_err() {
                         break;
                     }
@@ -2602,23 +2714,24 @@ impl BrokerSpawnWorkerV1 {
         job: BrokerSpawnWorkerJobV1,
     ) -> Result<BrokerSpawnWorkerSubmissionV1, BrokerSpawnWorkerSubmitErrorV1> {
         let fingerprint = job.fingerprint;
+        let authority = BrokerSpawnWorkerActiveV1::Spawn(fingerprint);
         let mut active = self
             .active
             .lock()
             .map_err(|_| BrokerSpawnWorkerSubmitErrorV1::Poisoned)?;
         if let Some(current) = *active {
-            return if current == fingerprint {
+            return if current == authority {
                 Ok(BrokerSpawnWorkerSubmissionV1::RecoveredInFlight)
             } else {
                 Err(BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight)
             };
         }
-        *active = Some(fingerprint);
+        *active = Some(authority);
         let Some(jobs) = self.jobs.as_ref() else {
             *active = None;
             return Err(BrokerSpawnWorkerSubmitErrorV1::Disconnected);
         };
-        match jobs.try_send(job) {
+        match jobs.try_send(BrokerSpawnWorkerCommandV1::Spawn(job)) {
             Ok(()) => Ok(BrokerSpawnWorkerSubmissionV1::Submitted),
             Err(TrySendError::Full(_)) => {
                 *active = None;
@@ -2631,31 +2744,105 @@ impl BrokerSpawnWorkerV1 {
         }
     }
 
+    // Every rejection returns the complete Ack job, including its live PTY.
+    // Boxing this error would add a fallible allocation on the ownership-return
+    // path and could turn saturation into child loss.
+    #[allow(clippy::result_large_err)]
+    fn try_submit_acknowledgement(
+        &self,
+        job: BrokerSpawnAckWorkerJobV1,
+    ) -> Result<BrokerSpawnWorkerSubmissionV1, BrokerSpawnAckWorkerSubmitErrorV1> {
+        let authority = BrokerSpawnWorkerActiveV1::Acknowledge(job.fingerprint);
+        let mut active = match self.active.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                return Err(BrokerSpawnAckWorkerSubmitErrorV1 {
+                    kind: BrokerSpawnWorkerSubmitErrorV1::Poisoned,
+                    job,
+                });
+            }
+        };
+        if active.is_some() {
+            return Err(BrokerSpawnAckWorkerSubmitErrorV1 {
+                kind: BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight,
+                job,
+            });
+        }
+        *active = Some(authority);
+        let Some(jobs) = self.jobs.as_ref() else {
+            *active = None;
+            return Err(BrokerSpawnAckWorkerSubmitErrorV1 {
+                kind: BrokerSpawnWorkerSubmitErrorV1::Disconnected,
+                job,
+            });
+        };
+        match jobs.try_send(BrokerSpawnWorkerCommandV1::Acknowledge(job)) {
+            Ok(()) => Ok(BrokerSpawnWorkerSubmissionV1::Submitted),
+            Err(TrySendError::Full(command)) => {
+                *active = None;
+                let BrokerSpawnWorkerCommandV1::Acknowledge(job) = command else {
+                    unreachable!("Acknowledge submission returned a Spawn command")
+                };
+                Err(BrokerSpawnAckWorkerSubmitErrorV1 {
+                    kind: BrokerSpawnWorkerSubmitErrorV1::Saturated,
+                    job,
+                })
+            }
+            Err(TrySendError::Disconnected(command)) => {
+                *active = None;
+                let BrokerSpawnWorkerCommandV1::Acknowledge(job) = command else {
+                    unreachable!("Acknowledge submission returned a Spawn command")
+                };
+                Err(BrokerSpawnAckWorkerSubmitErrorV1 {
+                    kind: BrokerSpawnWorkerSubmitErrorV1::Disconnected,
+                    job,
+                })
+            }
+        }
+    }
+
     fn try_completion(&self) -> BrokerSpawnWorkerCompletionStateV1 {
         match self.completions.try_recv() {
             Ok(completion) => {
+                let completion = Box::new(completion);
                 let Ok(mut active) = self.active.lock() else {
-                    return BrokerSpawnWorkerCompletionStateV1::Poisoned;
+                    return BrokerSpawnWorkerCompletionStateV1::AuthorityLost(completion);
                 };
-                if *active != Some(completion.fingerprint) {
-                    return BrokerSpawnWorkerCompletionStateV1::Poisoned;
+                if *active != Some(completion.active()) {
+                    return BrokerSpawnWorkerCompletionStateV1::AuthorityLost(completion);
                 }
                 *active = None;
-                BrokerSpawnWorkerCompletionStateV1::Ready(Box::new(completion))
+                BrokerSpawnWorkerCompletionStateV1::Ready(completion)
             }
             Err(TryRecvError::Empty) => BrokerSpawnWorkerCompletionStateV1::Empty,
             Err(TryRecvError::Disconnected) => BrokerSpawnWorkerCompletionStateV1::Disconnected,
         }
     }
 
-    fn active_fingerprint(
+    fn active_spawn_fingerprint(
         &self,
     ) -> Result<Option<BrokerSpawnWorkerFingerprintV1>, BrokerSpawnWorkerSubmitErrorV1> {
         let active = self
             .active
             .lock()
             .map_err(|_| BrokerSpawnWorkerSubmitErrorV1::Poisoned)?;
-        Ok(*active)
+        Ok(active.map(|authority| match authority {
+            BrokerSpawnWorkerActiveV1::Spawn(fingerprint) => fingerprint,
+            BrokerSpawnWorkerActiveV1::Acknowledge(fingerprint) => fingerprint.spawn,
+        }))
+    }
+
+    fn active_ack_fingerprint(
+        &self,
+    ) -> Result<Option<BrokerSpawnAckFingerprintV1>, BrokerSpawnWorkerSubmitErrorV1> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| BrokerSpawnWorkerSubmitErrorV1::Poisoned)?;
+        Ok(active.and_then(|authority| match authority {
+            BrokerSpawnWorkerActiveV1::Spawn(_) => None,
+            BrokerSpawnWorkerActiveV1::Acknowledge(fingerprint) => Some(fingerprint),
+        }))
     }
 }
 
@@ -2926,9 +3113,17 @@ fn reconcile_broker_catalog_under_token_authority_with_hook(
 /// durability worker, and exposes lost-reply Query recovery plus an immutable
 /// paginated recovery census. Every recovered journal keeps append authority
 /// withheld, and every namespace collision with recovered state is
-/// quarantined. Spawn acknowledgement, live Census rows, proxy effects,
-/// connection-EOF lease fencing, and successor rotation remain disabled until
-/// their durable ownership transitions are integrated and proven together.
+/// quarantined. Exact Spawn acknowledgement is serialized through the same
+/// durability worker and transfers the retained PTY into live-pane authority.
+/// Live Census rows, proxy effects, connection-EOF lease fencing, and successor
+/// rotation remain disabled until their durable ownership transitions are
+/// integrated and proven together.
+struct BrokerLiveSpawnV1 {
+    ack_id: Uuid,
+    acknowledgement: BrokerSpawnWalReceiptV1,
+    retained: BrokerSpawnWorkerCompletionV1,
+}
+
 pub struct BrokerControlServiceV1 {
     poll: Poll,
     events: Events,
@@ -2940,10 +3135,13 @@ pub struct BrokerControlServiceV1 {
     spawn_worker: BrokerSpawnWorkerV1,
     spawn_completion_token: Token,
     retained_spawns: HashMap<Uuid, BrokerSpawnWorkerCompletionV1>,
+    live_spawns: HashMap<Uuid, BrokerLiveSpawnV1>,
     retained_spawn_by_effect: HashMap<Uuid, Uuid>,
     retained_spawn_by_journal: HashMap<Uuid, Uuid>,
     retained_spawn_by_origin_request: HashMap<Uuid, Uuid>,
     blocked_spawn_completion: Option<Box<BrokerSpawnWorkerCompletionV1>>,
+    blocked_ack_completion: Option<Box<BrokerSpawnAckWorkerCompletionV1>>,
+    blocked_worker_events: Vec<BrokerSpawnWorkerEventV1>,
     spawn_worker_unavailable: bool,
     recovered_catalog: BrokerRecoveredSpawnCatalogV1,
     recovery_census_by_mux: HashMap<Uuid, Vec<BrokerCensusEntryV1>>,
@@ -3047,6 +3245,12 @@ impl BrokerControlServiceV1 {
                     "retained Spawn result allocation failed",
                 )
             })?;
+        let mut live_spawns = HashMap::new();
+        live_spawns.try_reserve(GUARDIAN_MAX_PANES).map_err(|_| {
+            BrokerControlServiceError::InvalidConfiguration(
+                "live Spawn authority allocation failed",
+            )
+        })?;
         let mut retained_spawn_by_effect = HashMap::new();
         let mut retained_spawn_by_journal = HashMap::new();
         let mut retained_spawn_by_origin_request = HashMap::new();
@@ -3061,6 +3265,12 @@ impl BrokerControlServiceV1 {
                 )
             })?;
         }
+        let mut blocked_worker_events = Vec::new();
+        blocked_worker_events.try_reserve_exact(1).map_err(|_| {
+            BrokerControlServiceError::InvalidConfiguration(
+                "blocked Spawn worker event allocation failed",
+            )
+        })?;
         let spawn_completion_waker = Arc::new(
             Waker::new(poll.registry(), spawn_completion_token)
                 .map_err(|error| BrokerControlServiceError::io("spawn-worker-waker", error))?,
@@ -3122,10 +3332,13 @@ impl BrokerControlServiceV1 {
             spawn_worker,
             spawn_completion_token,
             retained_spawns,
+            live_spawns,
             retained_spawn_by_effect,
             retained_spawn_by_journal,
             retained_spawn_by_origin_request,
             blocked_spawn_completion: None,
+            blocked_ack_completion: None,
+            blocked_worker_events,
             spawn_worker_unavailable: false,
             recovered_catalog,
             recovery_census_by_mux,
@@ -3175,6 +3388,36 @@ impl BrokerControlServiceV1 {
         }
         #[cfg(test)]
         for retained in self.retained_spawns.values_mut() {
+            if let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } = &mut retained.outcome {
+                adoption.pane.terminate_and_wait_for_test();
+            }
+        }
+        #[cfg(test)]
+        for live in self.live_spawns.values_mut() {
+            if let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } = &mut live.retained.outcome
+            {
+                adoption.pane.terminate_and_wait_for_test();
+            }
+        }
+        #[cfg(test)]
+        if let Some(blocked) = self.blocked_spawn_completion.as_mut()
+            && let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } = &mut blocked.outcome
+        {
+            adoption.pane.terminate_and_wait_for_test();
+        }
+        #[cfg(test)]
+        if let Some(blocked) = self.blocked_ack_completion.as_mut()
+            && let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } =
+                &mut blocked.retained.outcome
+        {
+            adoption.pane.terminate_and_wait_for_test();
+        }
+        #[cfg(test)]
+        for event in &mut self.blocked_worker_events {
+            let retained = match event {
+                BrokerSpawnWorkerEventV1::Spawn(completion) => completion,
+                BrokerSpawnWorkerEventV1::Acknowledge(completion) => completion.retained.as_mut(),
+            };
             if let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } = &mut retained.outcome {
                 adoption.pane.terminate_and_wait_for_test();
             }
@@ -3249,29 +3492,51 @@ impl BrokerControlServiceV1 {
     }
 
     fn drain_spawn_completion(&mut self) {
-        let completion = match self.spawn_worker.try_completion() {
-            BrokerSpawnWorkerCompletionStateV1::Ready(completion) => completion,
+        let event = match self.spawn_worker.try_completion() {
+            BrokerSpawnWorkerCompletionStateV1::Ready(event) => event,
+            BrokerSpawnWorkerCompletionStateV1::AuthorityLost(event) => {
+                self.spawn_worker_unavailable = true;
+                self.blocked_worker_events.push(*event);
+                return;
+            }
             BrokerSpawnWorkerCompletionStateV1::Empty => return,
-            BrokerSpawnWorkerCompletionStateV1::Disconnected
-            | BrokerSpawnWorkerCompletionStateV1::Poisoned => {
+            BrokerSpawnWorkerCompletionStateV1::Disconnected => {
                 self.spawn_worker_unavailable = true;
                 return;
             }
         };
+        match *event {
+            BrokerSpawnWorkerEventV1::Spawn(completion) => {
+                self.retain_spawn_completion(completion);
+            }
+            BrokerSpawnWorkerEventV1::Acknowledge(completion) => {
+                self.retain_ack_completion(completion);
+            }
+        }
+    }
+
+    fn retain_spawn_completion(&mut self, completion: BrokerSpawnWorkerCompletionV1) {
         let durable_pane_id = completion.fingerprint.binding.durable_pane_id;
         let spawn_effect_id = completion.fingerprint.binding.spawn_effect_id;
         let journal_id = completion.fingerprint.journal_id;
         let origin_request_id = completion.fingerprint.binding.origin_request_id;
+        let represented_panes = self
+            .retained_spawns
+            .len()
+            .saturating_add(self.live_spawns.len());
         if self.blocked_spawn_completion.is_some()
-            || self.retained_spawns.len() >= GUARDIAN_MAX_PANES
+            || self.blocked_ack_completion.is_some()
+            || !self.blocked_worker_events.is_empty()
+            || represented_panes >= GUARDIAN_MAX_PANES
             || self.retained_spawns.contains_key(&durable_pane_id)
+            || self.live_spawns.contains_key(&durable_pane_id)
             || self.retained_spawn_by_effect.contains_key(&spawn_effect_id)
             || self.retained_spawn_by_journal.contains_key(&journal_id)
             || self
                 .retained_spawn_by_origin_request
                 .contains_key(&origin_request_id)
         {
-            self.blocked_spawn_completion = Some(completion);
+            self.blocked_spawn_completion = Some(Box::new(completion));
             self.spawn_worker_unavailable = true;
             return;
         }
@@ -3281,7 +3546,65 @@ impl BrokerControlServiceV1 {
             .insert(journal_id, durable_pane_id);
         self.retained_spawn_by_origin_request
             .insert(origin_request_id, durable_pane_id);
-        self.retained_spawns.insert(durable_pane_id, *completion);
+        self.retained_spawns.insert(durable_pane_id, completion);
+    }
+
+    fn retain_ack_completion(&mut self, completion: BrokerSpawnAckWorkerCompletionV1) {
+        let durable_pane_id = completion.fingerprint.spawn.binding.durable_pane_id;
+        let spawn_effect_id = completion.fingerprint.spawn.binding.spawn_effect_id;
+        let journal_id = completion.fingerprint.spawn.journal_id;
+        let origin_request_id = completion.fingerprint.spawn.binding.origin_request_id;
+        let Some(acknowledgement) = completion
+            .result
+            .as_ref()
+            .ok()
+            .copied()
+            .filter(|receipt| receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+        else {
+            self.blocked_ack_completion = Some(Box::new(completion));
+            self.spawn_worker_unavailable = true;
+            return;
+        };
+        let durable_result_is_exact = completion.retained.fingerprint
+            == completion.fingerprint.spawn
+            && matches!(
+                &completion.retained.outcome,
+                BrokerSpawnWorkerOutcomeV1::Applied {
+                    journal,
+                    adoption,
+                    ..
+                } if journal.status().phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+                    && journal.status().reply_ack_id == Some(completion.fingerprint.ack_id)
+                    && journal.status().child_identity
+                        == Some(adoption.pane.kernel_child_identity())
+            );
+        let indexes_are_exact = self.retained_spawn_by_effect.get(&spawn_effect_id)
+            == Some(&durable_pane_id)
+            && self.retained_spawn_by_journal.get(&journal_id) == Some(&durable_pane_id)
+            && self
+                .retained_spawn_by_origin_request
+                .get(&origin_request_id)
+                == Some(&durable_pane_id);
+        if self.blocked_spawn_completion.is_some()
+            || self.blocked_ack_completion.is_some()
+            || !self.blocked_worker_events.is_empty()
+            || !durable_result_is_exact
+            || !indexes_are_exact
+            || self.retained_spawns.contains_key(&durable_pane_id)
+            || self.live_spawns.contains_key(&durable_pane_id)
+        {
+            self.blocked_ack_completion = Some(Box::new(completion));
+            self.spawn_worker_unavailable = true;
+            return;
+        }
+        self.live_spawns.insert(
+            durable_pane_id,
+            BrokerLiveSpawnV1 {
+                ack_id: completion.fingerprint.ack_id,
+                acknowledgement,
+                retained: *completion.retained,
+            },
+        );
     }
 
     fn expire_unauthenticated_connections(&mut self) {
@@ -3548,7 +3871,10 @@ impl BrokerControlServiceV1 {
                 return self.dispatch_recovery_census(owner, request);
             }
             BrokerControlOperationV1::QueryEffect if request.header.lease_generation == 0 => {
-                return self.dispatch_recovered_spawn_query(owner, request);
+                return self.dispatch_spawn_query(owner, request);
+            }
+            BrokerControlOperationV1::AcknowledgeEffect if request.header.lease_generation == 0 => {
+                return self.dispatch_spawn_acknowledgement(owner, request);
             }
             _ => {}
         }
@@ -3591,6 +3917,34 @@ impl BrokerControlServiceV1 {
         };
         let fingerprint = job.fingerprint;
         let durable_pane_id = fingerprint.binding.durable_pane_id;
+        if let Some(live) = self.live_spawns.get(&durable_pane_id) {
+            if live.retained.fingerprint != fingerprint {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            return match &live.retained.outcome {
+                BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } => self
+                    .successful_spawn_response(
+                        request.header,
+                        BrokerControlResponseStatusV1::Recovered,
+                        adoption.pane.kernel_child_identity(),
+                    ),
+                _ => BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ()),
+            };
+        }
         if let Some(retained) = self.retained_spawns.get(&durable_pane_id) {
             if retained.fingerprint != fingerprint {
                 return BrokerControlResponseV1::new(
@@ -3618,6 +3972,27 @@ impl BrokerControlServiceV1 {
                 )
                 .map_err(|_| ()),
             };
+        }
+        match self.spawn_worker.active_ack_fingerprint() {
+            Ok(Some(active)) if active.spawn == fingerprint => {
+                return BrokerControlResponseV1::new(
+                    self.response_header(request.header, BrokerControlResponseStatusV1::Retryable),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            Err(_) => {
+                self.spawn_worker_unavailable = true;
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            Ok(_) => {}
         }
         let retained_identity_conflict = self
             .retained_spawn_by_effect
@@ -3688,6 +4063,239 @@ impl BrokerControlServiceV1 {
         header.lease_generation = 1;
         header.child_identity = Some(child_identity);
         BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+    }
+
+    fn dispatch_spawn_acknowledgement(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let durable_pane_id = request.header.durable_pane_id;
+        let spawn_effect_id = request.header.operation_id;
+        let ack_id = request.header.request_id;
+
+        if let Some(live) = self.live_spawns.get(&durable_pane_id)
+            && live.retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+        {
+            let status = if live.retained.fingerprint.binding.spawn_effect_id == spawn_effect_id
+                && live.ack_id == ack_id
+                && live.acknowledgement.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged
+            {
+                BrokerControlResponseStatusV1::Recovered
+            } else {
+                BrokerControlResponseStatusV1::Quarantined
+            };
+            return BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
+                .map_err(|_| ());
+        }
+
+        match self.spawn_worker.active_ack_fingerprint() {
+            Ok(Some(active)) if active.spawn.binding.mux_incarnation == owner.mux_incarnation => {
+                let exact_effect = active.spawn.binding.durable_pane_id == durable_pane_id
+                    && active.spawn.binding.spawn_effect_id == spawn_effect_id;
+                let namespace_conflict = active.spawn.binding.durable_pane_id == durable_pane_id
+                    || active.spawn.binding.spawn_effect_id == spawn_effect_id;
+                if exact_effect || namespace_conflict {
+                    let status = if exact_effect && active.ack_id == ack_id {
+                        BrokerControlResponseStatusV1::Retryable
+                    } else {
+                        BrokerControlResponseStatusV1::Quarantined
+                    };
+                    return BrokerControlResponseV1::new(
+                        self.response_header(request.header, status),
+                        &[],
+                    )
+                    .map_err(|_| ());
+                }
+            }
+            Err(_) => {
+                self.spawn_worker_unavailable = true;
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            Ok(_) => {}
+        }
+
+        if self.spawn_worker_unavailable
+            || self.blocked_spawn_completion.is_some()
+            || self.blocked_ack_completion.is_some()
+        {
+            return BrokerControlResponseV1::new(
+                self.response_header(request.header, BrokerControlResponseStatusV1::Quarantined),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+
+        if let Some(retained) = self.retained_spawns.get(&durable_pane_id)
+            && retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+        {
+            if retained.fingerprint.binding.spawn_effect_id != spawn_effect_id
+                || !matches!(
+                    &retained.outcome,
+                    BrokerSpawnWorkerOutcomeV1::Applied { .. }
+                )
+            {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            let Some(retained) = self.retained_spawns.remove(&durable_pane_id) else {
+                return Err(());
+            };
+            let job = match BrokerSpawnAckWorkerJobV1::new(ack_id, Box::new(retained)) {
+                Ok(job) => job,
+                Err(retained) => {
+                    self.retained_spawns.insert(durable_pane_id, *retained);
+                    return BrokerControlResponseV1::new(
+                        self.response_header(
+                            request.header,
+                            BrokerControlResponseStatusV1::Quarantined,
+                        ),
+                        &[],
+                    )
+                    .map_err(|_| ());
+                }
+            };
+            let status = match self.spawn_worker.try_submit_acknowledgement(job) {
+                Ok(BrokerSpawnWorkerSubmissionV1::Submitted) => {
+                    BrokerControlResponseStatusV1::Retryable
+                }
+                Ok(BrokerSpawnWorkerSubmissionV1::RecoveredInFlight) => {
+                    self.spawn_worker_unavailable = true;
+                    BrokerControlResponseStatusV1::Quarantined
+                }
+                Err(failure) => {
+                    self.retained_spawns
+                        .insert(durable_pane_id, *failure.job.retained);
+                    match failure.kind {
+                        BrokerSpawnWorkerSubmitErrorV1::Saturated => {
+                            BrokerControlResponseStatusV1::Retryable
+                        }
+                        BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight => {
+                            BrokerControlResponseStatusV1::Quarantined
+                        }
+                        BrokerSpawnWorkerSubmitErrorV1::Disconnected
+                        | BrokerSpawnWorkerSubmitErrorV1::Poisoned => {
+                            self.spawn_worker_unavailable = true;
+                            BrokerControlResponseStatusV1::Quarantined
+                        }
+                    }
+                }
+            };
+            return BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
+                .map_err(|_| ());
+        }
+
+        let retained_namespace_conflict = self
+            .retained_spawn_by_effect
+            .get(&spawn_effect_id)
+            .is_some_and(|indexed_pane_id| {
+                self.retained_spawns
+                    .get(indexed_pane_id)
+                    .is_some_and(|retained| {
+                        retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+                    })
+                    || self.live_spawns.get(indexed_pane_id).is_some_and(|live| {
+                        live.retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+                    })
+            });
+        if retained_namespace_conflict {
+            return BrokerControlResponseV1::new(
+                self.response_header(request.header, BrokerControlResponseStatusV1::Quarantined),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+
+        match self.spawn_worker.active_spawn_fingerprint() {
+            Ok(Some(active)) if active.binding.mux_incarnation == owner.mux_incarnation => {
+                let exact_effect = active.binding.durable_pane_id == durable_pane_id
+                    && active.binding.spawn_effect_id == spawn_effect_id;
+                let namespace_conflict = active.binding.durable_pane_id == durable_pane_id
+                    || active.binding.spawn_effect_id == spawn_effect_id;
+                if exact_effect || namespace_conflict {
+                    let status = if exact_effect {
+                        BrokerControlResponseStatusV1::Retryable
+                    } else {
+                        BrokerControlResponseStatusV1::Quarantined
+                    };
+                    return BrokerControlResponseV1::new(
+                        self.response_header(request.header, status),
+                        &[],
+                    )
+                    .map_err(|_| ());
+                }
+            }
+            Err(_) => {
+                self.spawn_worker_unavailable = true;
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            Ok(_) => {}
+        }
+
+        if let Some(status) = self.recovered_catalog.recovered_status_for_spawn_effect(
+            owner.mux_incarnation,
+            durable_pane_id,
+            spawn_effect_id,
+        ) {
+            let response_status = if status.phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+                && status.reply_ack_id == Some(ack_id)
+            {
+                BrokerControlResponseStatusV1::Recovered
+            } else {
+                BrokerControlResponseStatusV1::Quarantined
+            };
+            return BrokerControlResponseV1::new(
+                self.response_header(request.header, response_status),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+
+        let recovered_namespace_conflict = [
+            self.recovered_catalog
+                .by_durable_pane_id
+                .get(&durable_pane_id),
+            self.recovered_catalog
+                .by_spawn_effect_id
+                .get(&spawn_effect_id),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|index| {
+            self.recovered_catalog
+                .journals
+                .get(*index)
+                .is_some_and(|journal| {
+                    journal.identity().mux_incarnation() == owner.mux_incarnation
+                })
+        });
+        let status = if recovered_namespace_conflict {
+            BrokerControlResponseStatusV1::Quarantined
+        } else {
+            BrokerControlResponseStatusV1::Rejected
+        };
+        BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
+            .map_err(|_| ())
     }
 
     fn dispatch_recovery_census(
@@ -3793,11 +4401,29 @@ impl BrokerControlServiceV1 {
         .map_err(|_| ())
     }
 
-    fn dispatch_recovered_spawn_query(
+    fn dispatch_spawn_query(
         &self,
         owner: BrokerGuardianOwnerIdentity,
         request: &BrokerControlRequestV1,
     ) -> Result<BrokerControlResponseV1, ()> {
+        if let Some(live) = self.live_spawns.get(&request.header.durable_pane_id)
+            && live.retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+        {
+            if live.retained.fingerprint.binding.spawn_effect_id != request.header.operation_id {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            let mut header =
+                self.response_header(request.header, BrokerControlResponseStatusV1::Recovered);
+            header.lease_generation = 1;
+            return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+        }
         if let Some(retained) = self.retained_spawns.get(&request.header.durable_pane_id) {
             if retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation {
                 if retained.fingerprint.binding.spawn_effect_id != request.header.operation_id {
@@ -3833,9 +4459,15 @@ impl BrokerControlServiceV1 {
         let retained_effect_conflicts_for_owner = self
             .retained_spawn_by_effect
             .get(&request.header.operation_id)
-            .and_then(|durable_pane_id| self.retained_spawns.get(durable_pane_id))
-            .is_some_and(|retained| {
-                retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+            .is_some_and(|durable_pane_id| {
+                self.retained_spawns
+                    .get(durable_pane_id)
+                    .is_some_and(|retained| {
+                        retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+                    })
+                    || self.live_spawns.get(durable_pane_id).is_some_and(|live| {
+                        live.retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+                    })
             });
         if retained_effect_conflicts_for_owner {
             return BrokerControlResponseV1::new(
@@ -3844,7 +4476,7 @@ impl BrokerControlServiceV1 {
             )
             .map_err(|_| ());
         }
-        match self.spawn_worker.active_fingerprint() {
+        match self.spawn_worker.active_spawn_fingerprint() {
             Ok(Some(active))
                 if active.binding.mux_incarnation == owner.mux_incarnation
                     && active.binding.durable_pane_id == request.header.durable_pane_id
@@ -4117,8 +4749,17 @@ pub enum BrokerSpawnEffectQueryV1 {
     Absent,
     Pending,
     Applied(BrokerKernelChildIdentityV1),
+    Acknowledged { lease_generation: u64 },
     Quarantined,
     RecoveredWithoutPty(BrokerCensusEntryV1),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerSpawnEffectAcknowledgementV1 {
+    Absent,
+    Pending,
+    Acknowledged,
+    Quarantined,
 }
 
 fn broker_control_response_lease_generation_matches(
@@ -4135,6 +4776,17 @@ fn broker_control_response_lease_generation_matches(
             // Spawn is admitted before any attachment exists, so its request
             // is necessarily generation zero. A successful response creates
             // the one initial lease at generation one.
+            response.lease_generation == 1
+        }
+        BrokerControlOperationV1::QueryEffect
+            if request.lease_generation == 0
+                && matches!(
+                    response.status,
+                    BrokerControlResponseStatusV1::Applied
+                        | BrokerControlResponseStatusV1::Recovered
+                )
+                && response.child_identity.is_none() =>
+        {
             response.lease_generation == 1
         }
         _ => response.lease_generation == request.lease_generation,
@@ -4310,6 +4962,61 @@ impl BrokerControlClientV1 {
         }
     }
 
+    /// Durably acknowledge the exact generation-zero Spawn result without
+    /// blocking the client-facing readiness loop on WAL synchronization.
+    ///
+    /// The caller owns `ack_id` and must reuse it after any lost reply. A
+    /// `Pending` response means the worker owns the retained pane authority;
+    /// exact retries remain inert until `Acknowledged` is recovered.
+    pub fn acknowledge_spawn_effect(
+        &mut self,
+        durable_pane_id: Uuid,
+        spawn_effect_id: Uuid,
+        ack_id: Uuid,
+    ) -> Result<BrokerSpawnEffectAcknowledgementV1, BrokerControlClientError> {
+        if durable_pane_id.is_nil() || spawn_effect_id.is_nil() || ack_id.is_nil() {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::AcknowledgeEffect,
+                request_id: ack_id,
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id,
+                lease_generation: 0,
+                operation_id: spawn_effect_id,
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
+                Ok(BrokerSpawnEffectAcknowledgementV1::Absent)
+            }
+            BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
+                Ok(BrokerSpawnEffectAcknowledgementV1::Pending)
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().is_empty() =>
+            {
+                Ok(BrokerSpawnEffectAcknowledgementV1::Acknowledged)
+            }
+            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+                Ok(BrokerSpawnEffectAcknowledgementV1::Quarantined)
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
     /// Recover the exact generation-zero Spawn effect after an asynchronous
     /// admission, a lost Spawn reply, or a broker restart.
     pub fn query_spawn_effect(
@@ -4344,6 +5051,15 @@ impl BrokerControlClientV1 {
             }
             BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
                 Ok(BrokerSpawnEffectQueryV1::Pending)
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().is_empty()
+                    && response.header.child_identity.is_none()
+                    && response.header.lease_generation > 0 =>
+            {
+                Ok(BrokerSpawnEffectQueryV1::Acknowledged {
+                    lease_generation: response.header.lease_generation,
+                })
             }
             BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
                 if response.payload().is_empty() && response.header.child_identity.is_some() =>
@@ -4645,6 +5361,11 @@ impl BrokerControlClientV1 {
         let response = self.exchange(&request)?;
         match response.header.status {
             BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => Ok(None),
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().is_empty() =>
+            {
+                Err(BrokerControlClientError::SpawnPtyAvailable)
+            }
             BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
                 Err(BrokerControlClientError::SpawnQuarantined)
             }
@@ -12385,7 +13106,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match worker.try_completion() {
-                BrokerSpawnWorkerCompletionStateV1::Ready(completion) => return *completion,
+                BrokerSpawnWorkerCompletionStateV1::Ready(event) => match *event {
+                    BrokerSpawnWorkerEventV1::Spawn(completion) => return completion,
+                    BrokerSpawnWorkerEventV1::Acknowledge(_) => {
+                        panic!("Spawn worker helper received an acknowledgement completion")
+                    }
+                },
                 BrokerSpawnWorkerCompletionStateV1::Empty if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -12395,8 +13121,8 @@ mod tests {
                 BrokerSpawnWorkerCompletionStateV1::Disconnected => {
                     panic!("broker Spawn worker disconnected")
                 }
-                BrokerSpawnWorkerCompletionStateV1::Poisoned => {
-                    panic!("broker Spawn worker authority was poisoned")
+                BrokerSpawnWorkerCompletionStateV1::AuthorityLost(_) => {
+                    panic!("broker Spawn worker completion lost its authority")
                 }
             }
         }
@@ -16046,24 +16772,22 @@ mod tests {
 
         let completion = spawn_worker_completion(&worker);
         assert_eq!(completion.fingerprint.header, header);
-        let BrokerSpawnWorkerOutcomeV1::Applied {
-            journal,
-            adoption,
-            spawn_observed,
-        } = completion.outcome
-        else {
-            panic!("capacity-one worker did not durably apply Spawn")
+        let child_identity = match &completion.outcome {
+            BrokerSpawnWorkerOutcomeV1::Applied {
+                journal,
+                adoption,
+                spawn_observed,
+            } => {
+                assert_eq!(spawn_observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
+                assert_eq!(
+                    journal.status().phase,
+                    Some(BrokerSpawnWalPhaseV1::SpawnObserved)
+                );
+                assert_eq!(adoption.attachment.identity().lease_generation(), 1);
+                adoption.pane.kernel_child_identity()
+            }
+            _ => panic!("capacity-one worker did not durably apply Spawn"),
         };
-        assert_eq!(spawn_observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
-        assert_eq!(
-            journal.status().phase,
-            Some(BrokerSpawnWalPhaseV1::SpawnObserved)
-        );
-        let BrokerAdoptionV1 {
-            mut pane,
-            attachment,
-        } = *adoption;
-        assert_eq!(attachment.identity().lease_generation(), 1);
         let deadline = Instant::now() + Duration::from_secs(3);
         while !sentinel.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
@@ -16073,6 +16797,101 @@ mod tests {
             b"W",
             "one admitted Spawn created a duplicate child"
         );
+
+        let ack_id = id(7_209);
+        let ack_job = BrokerSpawnAckWorkerJobV1::new(ack_id, Box::new(completion))
+            .unwrap_or_else(|_| panic!("construct worker acknowledgement job"));
+        {
+            let mut active = worker.active.lock().expect("lock worker authority fixture");
+            assert!(active.is_none());
+            *active = Some(BrokerSpawnWorkerActiveV1::Spawn(ack_job.fingerprint.spawn));
+        }
+        let rejected = match worker.try_submit_acknowledgement(ack_job) {
+            Err(rejected) => rejected,
+            Ok(_) => panic!("conflicting worker authority accepted an acknowledgement"),
+        };
+        assert_eq!(
+            rejected.kind,
+            BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight
+        );
+        assert!(matches!(
+            &rejected.job.retained.outcome,
+            BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. }
+                if adoption.pane.kernel_child_identity() == child_identity
+        ));
+        {
+            let mut active = worker
+                .active
+                .lock()
+                .expect("unlock worker authority fixture");
+            assert!(active.take().is_some());
+        }
+        let acknowledgement_fingerprint = rejected.job.fingerprint;
+        assert_eq!(
+            worker.try_submit_acknowledgement(rejected.job).ok(),
+            Some(BrokerSpawnWorkerSubmissionV1::Submitted)
+        );
+        {
+            let mut active = worker
+                .active
+                .lock()
+                .expect("corrupt worker authority fixture");
+            assert_eq!(
+                *active,
+                Some(BrokerSpawnWorkerActiveV1::Acknowledge(
+                    acknowledgement_fingerprint
+                ))
+            );
+            *active = Some(BrokerSpawnWorkerActiveV1::Spawn(
+                acknowledgement_fingerprint.spawn,
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let acknowledged = loop {
+            match worker.try_completion() {
+                BrokerSpawnWorkerCompletionStateV1::AuthorityLost(event) => match *event {
+                    BrokerSpawnWorkerEventV1::Acknowledge(completion) => break completion,
+                    BrokerSpawnWorkerEventV1::Spawn(_) => {
+                        panic!("authority-loss proof received a Spawn completion")
+                    }
+                },
+                BrokerSpawnWorkerCompletionStateV1::Empty if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                BrokerSpawnWorkerCompletionStateV1::Empty => {
+                    panic!("authority-loss completion timed out")
+                }
+                BrokerSpawnWorkerCompletionStateV1::Ready(_) => {
+                    panic!("corrupt worker authority accepted a completion")
+                }
+                BrokerSpawnWorkerCompletionStateV1::Disconnected => {
+                    panic!("authority-loss worker disconnected")
+                }
+            }
+        };
+        assert_eq!(acknowledged.fingerprint.ack_id, ack_id);
+        assert!(matches!(
+            acknowledged.result.as_ref(),
+            Ok(receipt) if receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged
+        ));
+        let retained = *acknowledged.retained;
+        let BrokerSpawnWorkerOutcomeV1::Applied {
+            journal, adoption, ..
+        } = retained.outcome
+        else {
+            panic!("acknowledgement worker lost the live Spawn authority")
+        };
+        assert_eq!(
+            journal.status().phase,
+            Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+        );
+        assert_eq!(journal.status().reply_ack_id, Some(ack_id));
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = *adoption;
+        assert_eq!(attachment.identity().lease_generation(), 1);
+        assert_eq!(pane.kernel_child_identity(), child_identity);
         pane.terminate_and_wait_for_test();
     }
 
@@ -16098,7 +16917,7 @@ mod tests {
             BrokerControlServiceConfigV1::new(
                 socket_path.clone(),
                 token_path.clone(),
-                spawn_catalog_path,
+                spawn_catalog_path.clone(),
                 broker_build,
                 2,
                 Duration::from_millis(2),
@@ -16203,6 +17022,104 @@ mod tests {
                 outcome => panic!("control Spawn did not become live: {outcome:?}"),
             }
         };
+        assert!(matches!(
+            client.query_recovered_spawn(binding.durable_pane_id, binding.spawn_effect_id),
+            Err(BrokerControlClientError::SpawnPtyAvailable)
+        ));
+        assert_eq!(
+            client
+                .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("query live Spawn after recovered-only compatibility result"),
+            BrokerSpawnEffectQueryV1::Applied(child_identity),
+            "recovered-only compatibility result poisoned the live Spawn connection"
+        );
+        let other_mux_identity = BrokerGuardianConnectionIdentityV1::new(
+            id(7_311),
+            id(7_312),
+            sealed(0xd9),
+            sealed(0xda),
+        )
+        .expect("construct cross-mux control Spawn connection identity");
+        let mut other_mux_client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            other_mux_identity,
+            broker_build,
+        )
+        .expect("connect cross-mux control Spawn client");
+        assert_eq!(
+            other_mux_client
+                .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("query another mux's live Spawn identity"),
+            BrokerSpawnEffectQueryV1::Absent
+        );
+        assert_eq!(
+            other_mux_client
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    binding.spawn_effect_id,
+                    id(7_313),
+                )
+                .expect("acknowledge another mux's live Spawn identity"),
+            BrokerSpawnEffectAcknowledgementV1::Absent
+        );
+        drop(other_mux_client);
+        let ack_id = id(7_308);
+        assert_eq!(
+            client
+                .acknowledge_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id, ack_id,)
+                .expect("submit asynchronous Spawn acknowledgement"),
+            BrokerSpawnEffectAcknowledgementV1::Pending
+        );
+        assert_eq!(
+            client
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    binding.spawn_effect_id,
+                    id(7_309),
+                )
+                .expect("reject mutated Spawn acknowledgement identity"),
+            BrokerSpawnEffectAcknowledgementV1::Quarantined
+        );
+        assert_eq!(
+            client
+                .acknowledge_spawn_effect(binding.durable_pane_id, id(7_314), ack_id,)
+                .expect("reject acknowledgement with a conflicting effect namespace"),
+            BrokerSpawnEffectAcknowledgementV1::Quarantined
+        );
+        assert_eq!(
+            client
+                .acknowledge_spawn_effect(id(7_315), binding.spawn_effect_id, ack_id)
+                .expect("reject acknowledgement with a conflicting pane namespace"),
+            BrokerSpawnEffectAcknowledgementV1::Quarantined
+        );
+        let ack_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match client
+                .acknowledge_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id, ack_id)
+                .expect("recover asynchronous Spawn acknowledgement")
+            {
+                BrokerSpawnEffectAcknowledgementV1::Pending if Instant::now() < ack_deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                BrokerSpawnEffectAcknowledgementV1::Acknowledged => break,
+                outcome => panic!("Spawn acknowledgement did not become durable: {outcome:?}"),
+            }
+        }
+        assert_eq!(
+            client
+                .acknowledge_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id, ack_id,)
+                .expect("recover a second exact acknowledgement reply"),
+            BrokerSpawnEffectAcknowledgementV1::Acknowledged
+        );
+        assert_eq!(
+            client
+                .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("query acknowledged live Spawn"),
+            BrokerSpawnEffectQueryV1::Acknowledged {
+                lease_generation: 1
+            }
+        );
         let recovered = client
             .exchange(&spawn_request(header))
             .expect("recover exact completed control Spawn");
@@ -16232,6 +17149,81 @@ mod tests {
         );
         drop(client);
         service.finish();
+
+        let secret = crate::transport::load_guardian_secret(&token_path)
+            .expect("reload control Spawn token after service shutdown");
+        let authenticator = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive control Spawn WAL authority after service shutdown");
+        let mut catalog = reopen_test_catalog_after_owner_drop(&spawn_catalog_path)
+            .expect("reopen acknowledged control Spawn catalog");
+        let journals = catalog
+            .scan_all_for_admission(&authenticator)
+            .expect("scan acknowledged control Spawn catalog");
+        let [journal] = journals.as_slice() else {
+            panic!("expected exactly one acknowledged control Spawn journal")
+        };
+        assert_eq!(
+            journal.status().phase,
+            Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+        );
+        assert_eq!(journal.status().reply_ack_id, Some(ack_id));
+        assert_eq!(journal.status().child_identity, Some(child_identity));
+        drop(journals);
+        drop(catalog);
+        drop(authenticator);
+        drop(secret);
+
+        let restart_socket_path = root.join("broker-restart.sock");
+        let restarted = BrokerControlServiceV1::bind(
+            BrokerControlServiceConfigV1::new(
+                restart_socket_path.clone(),
+                token_path.clone(),
+                spawn_catalog_path,
+                broker_build,
+                2,
+                Duration::from_millis(2),
+            )
+            .expect("construct restarted acknowledged Spawn service config"),
+        )
+        .expect("bind restarted acknowledged Spawn service");
+        let restarted = TestBrokerControlService::start(restarted);
+        let mut restarted_client = BrokerControlClientV1::connect(
+            &restart_socket_path,
+            &token_path,
+            connection_identity,
+            broker_build,
+        )
+        .expect("connect to restarted acknowledged Spawn service");
+        assert_eq!(
+            restarted_client
+                .acknowledge_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id, ack_id,)
+                .expect("recover durable acknowledgement after broker restart"),
+            BrokerSpawnEffectAcknowledgementV1::Acknowledged
+        );
+        assert_eq!(
+            restarted_client
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    binding.spawn_effect_id,
+                    id(7_310),
+                )
+                .expect("reject mutated durable acknowledgement after broker restart"),
+            BrokerSpawnEffectAcknowledgementV1::Quarantined
+        );
+        match restarted_client
+            .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
+            .expect("query acknowledged Spawn after broker restart")
+        {
+            BrokerSpawnEffectQueryV1::RecoveredWithoutPty(entry) => {
+                assert_eq!(entry.phase, Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged));
+                assert_eq!(entry.reply_ack_id, Some(ack_id));
+                assert_eq!(entry.child_identity, Some(child_identity));
+            }
+            outcome => panic!("expected acknowledged PTY-unavailable recovery row: {outcome:?}"),
+        }
+        drop(restarted_client);
+        restarted.finish();
     }
 
     fn private_catalog_directory() -> tempfile::TempDir {
