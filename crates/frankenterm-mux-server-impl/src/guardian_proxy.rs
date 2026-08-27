@@ -1686,27 +1686,8 @@ impl BoundedReplayBuffer {
         self.bytes.len()
     }
 
-    fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
     fn as_slice(&self) -> &[u8] {
         self.bytes.as_slice()
-    }
-
-    fn copy_out(&mut self, offset: usize, target: &mut [u8]) -> Result<usize, GuardianProxyError> {
-        if offset > self.bytes.len() {
-            return Err(GuardianProxyError::ReplayInvariant(
-                "guardian replay reader offset exceeded its plaintext buffer",
-            ));
-        }
-        let count = target.len().min(self.bytes.len() - offset);
-        let end = offset
-            .checked_add(count)
-            .ok_or(GuardianProxyError::ReplayCapacity)?;
-        target[..count].copy_from_slice(&self.bytes[offset..end]);
-        self.bytes[offset..end].zeroize();
-        Ok(count)
     }
 
     fn zeroize_and_clear(&mut self) {
@@ -2791,6 +2772,7 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
 
 enum GuardianReplayReaderState {
     Staged,
+    #[cfg(test)]
     Ready(Option<Box<dyn Read + Send>>),
     Taken,
 }
@@ -2799,7 +2781,9 @@ impl fmt::Debug for GuardianReplayReaderState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Staged => formatter.write_str("Staged"),
+            #[cfg(test)]
             Self::Ready(Some(_)) => formatter.write_str("Ready(Some(<reader>))"),
+            #[cfg(test)]
             Self::Ready(None) => formatter.write_str("Ready(None)"),
             Self::Taken => formatter.write_str("Taken"),
         }
@@ -2822,10 +2806,16 @@ impl GuardianReplayReaderSlot {
         let mut state = self.state.lock();
         let prior = std::mem::replace(&mut *state, GuardianReplayReaderState::Taken);
         match prior {
+            #[cfg(test)]
             GuardianReplayReaderState::Ready(Some(reader)) => Ok(reader),
-            GuardianReplayReaderState::Ready(None)
-            | GuardianReplayReaderState::Staged
-            | GuardianReplayReaderState::Taken => {
+            #[cfg(test)]
+            GuardianReplayReaderState::Ready(None) => {
+                *state = prior;
+                Err(GuardianProxyError::InvalidConfiguration(
+                    "guardian replay reader is unavailable before exact restore activation or after its single take",
+                ))
+            }
+            GuardianReplayReaderState::Staged | GuardianReplayReaderState::Taken => {
                 *state = prior;
                 Err(GuardianProxyError::InvalidConfiguration(
                     "guardian replay reader is unavailable before exact restore activation or after its single take",
@@ -3639,10 +3629,9 @@ mod tests {
                     std::sync::mpsc::RecvTimeoutError::Disconnected => {
                         io::Error::new(io::ErrorKind::UnexpectedEof, "test guardian reader closed")
                     }
-                    std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "test guardian reader timed out",
-                    ),
+                    std::sync::mpsc::RecvTimeoutError::Timeout => {
+                        io::Error::new(io::ErrorKind::TimedOut, "test guardian reader timed out")
+                    }
                 })?;
             deliver(segment, output, payload)
         }
@@ -4068,7 +4057,7 @@ mod tests {
         let payload = b"guardian-checkpoint-base".to_vec();
         let (sender, receiver) = sync_channel(1);
         let (staging, mutation_state) = fake_staging([], 1);
-        let mut activated = staging
+        let activated = staging
             .activate_verified_restore(
                 inert_terminal(),
                 Box::new(ChannelGuardianReader { receiver }),
@@ -4385,7 +4374,7 @@ mod tests {
             state: Arc::clone(&replay_state),
         }));
 
-        let activated = staging
+        let mut activated = staging
             .restore_and_activate(test_terminal_config(), TerminalCheckpointLimits::default())
             .expect("consume checkpoint and activate proxy off topology");
         activated
@@ -4677,7 +4666,11 @@ mod tests {
                 .iter()
                 .all(|request| *request == state.requests[0])
         );
-        assert_eq!(state.acks.len(), 1, "successful record delivery is acknowledged");
+        assert_eq!(
+            state.acks.len(),
+            1,
+            "successful record delivery is acknowledged"
+        );
     }
 
     #[test]
