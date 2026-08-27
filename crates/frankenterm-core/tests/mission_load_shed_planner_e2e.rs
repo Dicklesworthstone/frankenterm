@@ -140,7 +140,7 @@ fn e2e_50_pane_overload_no_critical_starvation() {
         assert_eq!(report.schema_version, LOAD_SHED_PLAN_REPORT_SCHEMA_VERSION);
         assert!(report.dry_run);
         assert!(!report.enforcement_allowed);
-        assert!(!report.enforcement_blocker.is_empty());
+        assert_ne!(report.enforcement_blocker, "");
 
         // Bounded state: one entry per candidate.
         assert_eq!(

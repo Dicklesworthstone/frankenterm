@@ -279,8 +279,8 @@ proptest! {
 #[test]
 fn parse_schema_empty_object() {
     let doc = parse_schema(&json!({}));
-    assert!(doc.title.is_empty());
-    assert!(doc.description.is_empty());
+    assert_eq!(doc.title, "");
+    assert_eq!(doc.description, "");
     assert!(doc.properties.is_empty());
     assert!(doc.definitions.is_empty());
 }
@@ -288,7 +288,7 @@ fn parse_schema_empty_object() {
 #[test]
 fn parse_schema_null_value() {
     let doc = parse_schema(&Value::Null);
-    assert!(doc.title.is_empty());
+    assert_eq!(doc.title, "");
     assert!(doc.properties.is_empty());
 }
 
@@ -565,7 +565,7 @@ fn endpoint_category_all_returns_seven() {
 fn endpoint_category_titles_nonempty_and_distinct() {
     let titles: Vec<&str> = EndpointCategory::all().iter().map(|c| c.title()).collect();
     for title in &titles {
-        assert!(!title.is_empty());
+        assert_ne!(title, "");
     }
     // All distinct
     let mut sorted = titles.clone();
