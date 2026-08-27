@@ -74,8 +74,8 @@ use mux::guardian_output_journal::{
 };
 use mux::guardian_protocol::{
     GUARDIAN_MAC_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_PAYLOAD_BYTES,
-    GuardianBrokerControlAuthenticatorV1, GuardianBrokerSpawnWalAuthenticatorV1,
-    GuardianDurableSpawnFenceV1, GuardianSpawnPayload,
+    GuardianBrokerControlAuthenticatorV1, GuardianBrokerLeaseWalAuthenticatorV1,
+    GuardianBrokerSpawnWalAuthenticatorV1, GuardianDurableSpawnFenceV1, GuardianSpawnPayload,
 };
 use nix::unistd::{PathconfVar, fpathconf, geteuid};
 #[cfg(test)]
@@ -154,6 +154,29 @@ const BROKER_SPAWN_CREATION_BASE85: &[u8; 85] =
 const BROKER_SPAWN_CATALOG_MAX_ENTRIES: usize = GUARDIAN_MAX_PANES * 3 + 1;
 const BROKER_SPAWN_CATALOG_MAX_PHYSICAL_BYTES: u64 = GUARDIAN_MAX_PANES as u64
     * (BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES + BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES);
+const BROKER_LEASE_WAL_FILE_MAGIC: [u8; 8] = *b"FTBLW001";
+const BROKER_LEASE_HEAD_FILE_MAGIC: [u8; 8] = *b"FTBLH001";
+const BROKER_LEASE_WAL_RECORD_MAGIC: [u8; 8] = *b"FTBLR001";
+const BROKER_LEASE_HEAD_RECORD_MAGIC: [u8; 8] = *b"FTBLA001";
+const BROKER_LEASE_WAL_FORMAT_VERSION: u32 = 1;
+const BROKER_LEASE_WAL_FILE_HEADER_BYTES: usize = 352;
+const BROKER_LEASE_WAL_FILE_HEADER_BYTES_U32: u32 = 352;
+const BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64: u64 = 352;
+const BROKER_LEASE_WAL_AUTHENTICATED_HEADER_BYTES: usize = 320;
+const BROKER_LEASE_WAL_RECORD_BYTES: usize = 368;
+const BROKER_LEASE_WAL_RECORD_BYTES_U32: u32 = 368;
+const BROKER_LEASE_WAL_RECORD_BYTES_U64: u64 = 368;
+const BROKER_LEASE_WAL_AUTHENTICATED_RECORD_BYTES: usize = 336;
+const BROKER_LEASE_HEAD_RECORD_BYTES: usize = 120;
+const BROKER_LEASE_HEAD_RECORD_BYTES_U32: u32 = 120;
+const BROKER_LEASE_HEAD_RECORD_BYTES_U64: u64 = 120;
+const BROKER_LEASE_HEAD_AUTHENTICATED_RECORD_BYTES: usize = 88;
+const BROKER_LEASE_WAL_MAC_BYTES: usize = 32;
+const BROKER_LEASE_WAL_MAX_RECORDS: u64 = BROKER_ABSOLUTE_MAX_SUCCESSOR_HANDOFFS as u64 * 3;
+const BROKER_LEASE_WAL_MAX_PHYSICAL_BYTES: u64 = BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64
+    + BROKER_LEASE_WAL_MAX_RECORDS * BROKER_LEASE_WAL_RECORD_BYTES_U64;
+const BROKER_LEASE_HEAD_MAX_PHYSICAL_BYTES: u64 = BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64
+    + BROKER_LEASE_WAL_MAX_RECORDS * BROKER_LEASE_HEAD_RECORD_BYTES_U64;
 const BROKER_CONTROL_REQUEST_MAGIC: [u8; 4] = *b"FTBQ";
 const BROKER_CONTROL_RESPONSE_MAGIC: [u8; 4] = *b"FTBP";
 const BROKER_CONTROL_VERSION: u16 = 1;
@@ -8607,6 +8630,263 @@ pub enum BrokerSpawnWalError {
     Io(#[from] std::io::Error),
 }
 
+#[derive(Debug, Error)]
+enum BrokerPaneLeaseWalErrorV1 {
+    #[error("broker pane-lease WAL identity is invalid")]
+    InvalidIdentity,
+    #[error("broker pane-lease WAL descriptor is not a regular file")]
+    NotRegularFile,
+    #[error("broker pane-lease WAL or head descriptor is not empty")]
+    NewJournalNotEmpty,
+    #[error("broker pane-lease WAL file header is torn")]
+    TornFileHeader,
+    #[error("broker pane-lease WAL file magic is invalid")]
+    InvalidFileMagic,
+    #[error("unsupported broker pane-lease WAL version {observed}")]
+    UnsupportedVersion { observed: u32 },
+    #[error("broker pane-lease WAL file header length is invalid")]
+    InvalidFileHeaderLength,
+    #[error("broker pane-lease WAL file header is noncanonical")]
+    NonCanonicalFileHeader,
+    #[error("broker pane-lease WAL key identity does not match")]
+    KeyIdentityMismatch,
+    #[error("broker pane-lease WAL lineage does not match the bound Spawn WAL")]
+    LineageMismatch,
+    #[error("broker pane-lease WAL identity does not match")]
+    IdentityMismatch,
+    #[error("broker pane-lease WAL authentication failed")]
+    AuthenticationFailed,
+    #[error("broker pane-lease WAL record magic or length is invalid")]
+    InvalidRecordFraming,
+    #[error("broker pane-lease WAL record is noncanonical")]
+    NonCanonicalRecord,
+    #[error("broker pane-lease WAL phase value {observed} is invalid")]
+    InvalidPhase { observed: u8 },
+    #[error("broker pane-lease WAL sequence mismatch")]
+    SequenceMismatch,
+    #[error("broker pane-lease WAL phase transition is invalid")]
+    InvalidTransition,
+    #[error("broker pane-lease WAL record chain does not match")]
+    RecordChainMismatch,
+    #[error("broker pane-lease WAL local head is ahead of or conflicts with the WAL")]
+    HeadAnchorMismatch,
+    #[error("broker pane-lease WAL has more than one unreconciled head record")]
+    HeadReconciliationGap,
+    #[error("broker pane-lease WAL has an incomplete tail and is sealed")]
+    IncompleteTail,
+    #[error("broker pane-lease WAL must synchronize both new directory entries before append")]
+    DirectoryEntryNotDurable,
+    #[error("broker pane-lease WAL recovery append authority is withheld")]
+    RecoveryAuthorityUnavailable,
+    #[error("broker pane-lease WAL filesystem revalidation authority does not match")]
+    FilesystemRevalidationMismatch,
+    #[error("broker pane-lease WAL is poisoned after an ambiguous append or sync failure")]
+    Poisoned,
+    #[error("broker pane-lease WAL length changed outside its exclusive owner")]
+    ExternalLengthChange,
+    #[error("broker pane-lease WAL effect identity conflicts with durable state")]
+    EffectIdentityConflict,
+    #[error("broker pane-lease WAL capacity is exhausted")]
+    CapacityExhausted,
+    #[error("broker pane-lease WAL I/O failed")]
+    Io(#[from] std::io::Error),
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerPaneLeaseWalPhaseV1 {
+    PredecessorFenced = 1,
+    SuccessorClaimed = 2,
+    SuccessorAcknowledged = 3,
+}
+
+impl BrokerPaneLeaseWalPhaseV1 {
+    fn from_wire(value: u8) -> Result<Self, BrokerPaneLeaseWalErrorV1> {
+        match value {
+            1 => Ok(Self::PredecessorFenced),
+            2 => Ok(Self::SuccessorClaimed),
+            3 => Ok(Self::SuccessorAcknowledged),
+            observed => Err(BrokerPaneLeaseWalErrorV1::InvalidPhase { observed }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerPaneLeaseWalIdentityV1 {
+    spawn: BrokerSpawnWalIdentityV1,
+    child_identity: BrokerKernelChildIdentityV1,
+    initial_recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    initial_attachment_digest: [u8; 32],
+}
+
+impl BrokerPaneLeaseWalIdentityV1 {
+    fn new(
+        spawn: BrokerSpawnWalIdentityV1,
+        child_identity: BrokerKernelChildIdentityV1,
+        initial_attachment: BrokerAttachmentIdentityV1,
+        initial_recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    ) -> Result<Self, BrokerPaneLeaseWalErrorV1> {
+        spawn
+            .validate()
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::InvalidIdentity)?;
+        child_identity
+            .validate()
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::InvalidIdentity)?;
+        validate_broker_lease_attachment_for_spawn(initial_attachment, spawn)?;
+        if initial_attachment.lease_generation != 1
+            || initial_attachment.owner.mux_incarnation != spawn.mux_incarnation()
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+        }
+        let initial_attachment_digest = broker_lease_attachment_digest(initial_attachment)?;
+        let identity = Self {
+            spawn,
+            child_identity,
+            initial_recovery_verifier,
+            initial_attachment_digest,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(self) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        self.spawn
+            .validate()
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::InvalidIdentity)?;
+        self.child_identity
+            .validate()
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::InvalidIdentity)?;
+        if self.initial_recovery_verifier.into_bytes() == [0; 32]
+            || self.initial_attachment_digest == [0; 32]
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerPaneLeaseWalRecordFieldsV1 {
+    phase: BrokerPaneLeaseWalPhaseV1,
+    handoff_id: Uuid,
+    ack_id: Uuid,
+    predecessor_attachment_id: Uuid,
+    successor_attachment_id: Uuid,
+    lease_generation: u64,
+    owner: BrokerGuardianOwnerIdentity,
+    recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    attachment_digest: [u8; 32],
+    predecessor_attachment_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerPaneLeaseWalReceiptV1 {
+    sequence: u64,
+    phase: BrokerPaneLeaseWalPhaseV1,
+    committed_wal_bytes: u64,
+    committed_head_bytes: u64,
+    record_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    head_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerPaneLeaseWalRecordStateV1 {
+    fields: BrokerPaneLeaseWalRecordFieldsV1,
+    receipt: BrokerPaneLeaseWalReceiptV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerPaneLeaseWalTailV1 {
+    Clean,
+    Incomplete {
+        wal_trailing_bytes: u64,
+        head_trailing_bytes: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerPaneLeaseWalStatusV1 {
+    identity: BrokerPaneLeaseWalIdentityV1,
+    phase: Option<BrokerPaneLeaseWalPhaseV1>,
+    handoff_id: Option<Uuid>,
+    ack_id: Option<Uuid>,
+    predecessor_attachment_id: Option<Uuid>,
+    successor_attachment_id: Option<Uuid>,
+    lease_generation: u64,
+    owner: Option<BrokerGuardianOwnerIdentity>,
+    recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    attachment_digest: [u8; 32],
+    predecessor_attachment_digest: Option<[u8; 32]>,
+    committed_records: u64,
+    committed_wal_bytes: u64,
+    committed_head_bytes: u64,
+    tail: BrokerPaneLeaseWalTailV1,
+    append_authority_withheld: bool,
+    head_reconciliation_required: bool,
+}
+
+struct BrokerPaneLeaseWalScanV1 {
+    committed_bytes: u64,
+    trailing_bytes: u64,
+    records: Vec<BrokerPaneLeaseWalRecordStateV1>,
+}
+
+struct BrokerPaneLeaseHeadScanV1 {
+    committed_bytes: u64,
+    trailing_bytes: u64,
+    record_macs: Vec<[u8; BROKER_LEASE_WAL_MAC_BYTES]>,
+    terminal_head_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+}
+
+struct BrokerPaneLeaseJournalV1 {
+    wal: File,
+    head: File,
+    identity: BrokerPaneLeaseWalIdentityV1,
+    authenticator: GuardianBrokerLeaseWalAuthenticatorV1,
+    header_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    head_header_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    committed_wal_bytes: u64,
+    committed_head_bytes: u64,
+    wal_trailing_bytes: u64,
+    head_trailing_bytes: u64,
+    records: Vec<BrokerPaneLeaseWalRecordStateV1>,
+    terminal_head_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    publication_binding: Option<BrokerSpawnWalPublicationBindingV1>,
+    directory_entry_sync_required: bool,
+    recovery_append_authority_withheld: bool,
+    head_reconciliation_required: bool,
+    poisoned: bool,
+    #[cfg(test)]
+    injected_fault: Option<BrokerPaneLeaseWalInjectedFaultV1>,
+}
+
+struct BrokerPaneLeaseWalFilesystemRevalidationV1 {
+    identity: BrokerPaneLeaseWalIdentityV1,
+    observed_wal_bytes: u64,
+    observed_head_bytes: u64,
+}
+
+struct BrokerPaneLeaseWalRecoveryActivationV1 {
+    authority: BrokerPaneLeaseWalFilesystemRevalidationV1,
+    head: Option<BrokerPaneLeaseWalHeadReconciliationV1>,
+}
+
+struct BrokerPaneLeaseWalHeadReconciliationV1 {
+    encoded: [u8; BROKER_LEASE_HEAD_RECORD_BYTES],
+    durable_prefix_bytes: usize,
+    projected_head_bytes: u64,
+    head_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerPaneLeaseWalInjectedFaultV1 {
+    BeforeWalWrite,
+    AfterWalSyncBeforeHead,
+    BeforeHeadSync,
+    DuringRecoveredHeadWrite,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrokerSpawnWalInjectedFault {
@@ -8631,6 +8911,1224 @@ enum BrokerSpawnCreationInjectedFault {
     AfterHeadHeaderSync,
     AfterPairDirectorySyncBeforeMarkerRename,
     AfterMarkerRenameBeforeDirectorySync,
+}
+
+fn broker_lease_wal_authenticate(
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    bytes: &[u8],
+) -> Result<[u8; BROKER_LEASE_WAL_MAC_BYTES], BrokerPaneLeaseWalErrorV1> {
+    authenticator
+        .authenticate(bytes)
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::AuthenticationFailed)
+}
+
+fn broker_lease_wal_verify(
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    bytes: &[u8],
+    tag: &[u8],
+) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+    authenticator
+        .verify(bytes, tag)
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::AuthenticationFailed)
+}
+
+fn validate_broker_lease_attachment_for_spawn(
+    attachment: BrokerAttachmentIdentityV1,
+    spawn: BrokerSpawnWalIdentityV1,
+) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+    if attachment.broker_incarnation.is_nil()
+        || attachment.durable_pane_id != spawn.durable_pane_id()
+        || attachment.spawn_effect_id != spawn.spawn_effect_id()
+        || attachment.attachment_id.is_nil()
+        || !attachment.owner.is_valid()
+        || attachment.lease_generation == 0
+    {
+        return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+    }
+    Ok(())
+}
+
+fn broker_lease_attachment_digest(
+    attachment: BrokerAttachmentIdentityV1,
+) -> Result<[u8; 32], BrokerPaneLeaseWalErrorV1> {
+    if attachment.broker_incarnation.is_nil()
+        || attachment.durable_pane_id.is_nil()
+        || attachment.spawn_effect_id.is_nil()
+        || attachment.attachment_id.is_nil()
+        || !attachment.owner.is_valid()
+        || attachment.lease_generation == 0
+    {
+        return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankenterm.guardian-broker-lease-attachment.v1\0");
+    hasher.update(attachment.broker_incarnation.as_bytes());
+    hasher.update(attachment.durable_pane_id.as_bytes());
+    hasher.update(attachment.spawn_effect_id.as_bytes());
+    hasher.update(attachment.attachment_id.as_bytes());
+    hasher.update(attachment.owner.guardian_incarnation.as_bytes());
+    hasher.update(attachment.owner.connection_id.as_bytes());
+    hasher.update(attachment.owner.mux_incarnation.as_bytes());
+    hasher.update(attachment.owner.mux_build_identity_digest);
+    hasher.update(attachment.owner.guardian_build_identity_digest);
+    hasher.update(attachment.lease_generation.to_le_bytes());
+    Ok(hasher.finalize().into())
+}
+
+fn encode_broker_lease_file_header(
+    magic: [u8; 8],
+    identity: &BrokerPaneLeaseWalIdentityV1,
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+) -> Result<[u8; BROKER_LEASE_WAL_FILE_HEADER_BYTES], BrokerPaneLeaseWalErrorV1> {
+    identity.validate()?;
+    if identity.spawn.broker_lineage_id() != authenticator.lineage_id() {
+        return Err(BrokerPaneLeaseWalErrorV1::LineageMismatch);
+    }
+    let spawn_identity = encode_broker_spawn_creation_identity(identity.spawn)
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::InvalidIdentity)?;
+    let mut header = [0_u8; BROKER_LEASE_WAL_FILE_HEADER_BYTES];
+    header[0..8].copy_from_slice(&magic);
+    header[8..12].copy_from_slice(&BROKER_LEASE_WAL_FORMAT_VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&BROKER_LEASE_WAL_FILE_HEADER_BYTES_U32.to_le_bytes());
+    header[16..24].copy_from_slice(&authenticator.key_id());
+    header[24..192].copy_from_slice(&spawn_identity);
+    header[192..196].copy_from_slice(&identity.child_identity.process_id.to_le_bytes());
+    header[200..216].copy_from_slice(identity.child_identity.broker_child_nonce.as_bytes());
+    header[216..248].copy_from_slice(&identity.child_identity.kernel_start_identity_digest);
+    header[248..280].copy_from_slice(&identity.initial_recovery_verifier.into_bytes());
+    header[280..312].copy_from_slice(&identity.initial_attachment_digest);
+    let tag = broker_lease_wal_authenticate(
+        authenticator,
+        &header[..BROKER_LEASE_WAL_AUTHENTICATED_HEADER_BYTES],
+    )?;
+    header[320..352].copy_from_slice(&tag);
+    Ok(header)
+}
+
+fn decode_broker_lease_file_header(
+    header: &[u8; BROKER_LEASE_WAL_FILE_HEADER_BYTES],
+    magic: [u8; 8],
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+) -> Result<
+    (
+        BrokerPaneLeaseWalIdentityV1,
+        [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    ),
+    BrokerPaneLeaseWalErrorV1,
+> {
+    if header[0..8] != magic {
+        return Err(BrokerPaneLeaseWalErrorV1::InvalidFileMagic);
+    }
+    let version = read_broker_u32(&header[8..12]);
+    if version != BROKER_LEASE_WAL_FORMAT_VERSION {
+        return Err(BrokerPaneLeaseWalErrorV1::UnsupportedVersion { observed: version });
+    }
+    if read_broker_u32(&header[12..16]) != BROKER_LEASE_WAL_FILE_HEADER_BYTES_U32 {
+        return Err(BrokerPaneLeaseWalErrorV1::InvalidFileHeaderLength);
+    }
+    if header[16..24] != authenticator.key_id() {
+        return Err(BrokerPaneLeaseWalErrorV1::KeyIdentityMismatch);
+    }
+    if header[196..200].iter().any(|byte| *byte != 0)
+        || header[312..320].iter().any(|byte| *byte != 0)
+    {
+        return Err(BrokerPaneLeaseWalErrorV1::NonCanonicalFileHeader);
+    }
+    let mut encoded_spawn = [0_u8; BROKER_SPAWN_CREATION_IDENTITY_BYTES];
+    encoded_spawn.copy_from_slice(&header[24..192]);
+    let spawn = decode_broker_spawn_creation_identity(&encoded_spawn)
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::InvalidIdentity)?;
+    if spawn.broker_lineage_id() != authenticator.lineage_id() {
+        return Err(BrokerPaneLeaseWalErrorV1::LineageMismatch);
+    }
+    let child_identity = BrokerKernelChildIdentityV1 {
+        process_id: read_broker_u32(&header[192..196]),
+        broker_child_nonce: read_broker_uuid(&header[200..216]),
+        kernel_start_identity_digest: read_broker_array_32(&header[216..248]),
+    };
+    let initial_recovery_verifier =
+        BrokerPaneRecoveryVerifierV1::from_record(read_broker_array_32(&header[248..280]))
+            .ok_or(BrokerPaneLeaseWalErrorV1::InvalidIdentity)?;
+    let identity = BrokerPaneLeaseWalIdentityV1 {
+        spawn,
+        child_identity,
+        initial_recovery_verifier,
+        initial_attachment_digest: read_broker_array_32(&header[280..312]),
+    };
+    identity.validate()?;
+    broker_lease_wal_verify(
+        authenticator,
+        &header[..BROKER_LEASE_WAL_AUTHENTICATED_HEADER_BYTES],
+        &header[320..352],
+    )?;
+    Ok((identity, read_broker_array_32(&header[320..352])))
+}
+
+fn validate_broker_lease_record_fields(
+    fields: &BrokerPaneLeaseWalRecordFieldsV1,
+) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+    if fields.lease_generation <= 1
+        || !fields.owner.is_valid()
+        || fields.recovery_verifier.into_bytes() == [0; 32]
+        || fields.attachment_digest == [0; 32]
+        || fields.predecessor_attachment_id.is_nil()
+    {
+        return Err(BrokerPaneLeaseWalErrorV1::NonCanonicalRecord);
+    }
+    match fields.phase {
+        BrokerPaneLeaseWalPhaseV1::PredecessorFenced
+            if fields.handoff_id.is_nil()
+                && fields.ack_id.is_nil()
+                && fields.successor_attachment_id.is_nil()
+                && fields.predecessor_attachment_digest == [0; 32] =>
+        {
+            Ok(())
+        }
+        BrokerPaneLeaseWalPhaseV1::SuccessorClaimed
+            if !fields.handoff_id.is_nil()
+                && fields.ack_id.is_nil()
+                && !fields.successor_attachment_id.is_nil()
+                && fields.predecessor_attachment_digest != [0; 32] =>
+        {
+            Ok(())
+        }
+        BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged
+            if !fields.handoff_id.is_nil()
+                && !fields.ack_id.is_nil()
+                && !fields.successor_attachment_id.is_nil()
+                && fields.predecessor_attachment_digest != [0; 32] =>
+        {
+            Ok(())
+        }
+        _ => Err(BrokerPaneLeaseWalErrorV1::NonCanonicalRecord),
+    }
+}
+
+fn validate_broker_lease_record_transition(
+    identity: &BrokerPaneLeaseWalIdentityV1,
+    previous: Option<&BrokerPaneLeaseWalRecordFieldsV1>,
+    current: &BrokerPaneLeaseWalRecordFieldsV1,
+) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+    validate_broker_lease_record_fields(current)?;
+    match (previous, current.phase) {
+        (None, BrokerPaneLeaseWalPhaseV1::PredecessorFenced)
+            if current.lease_generation == 2
+                && current.owner.mux_incarnation == identity.spawn.mux_incarnation()
+                && current.recovery_verifier == identity.initial_recovery_verifier
+                && current.attachment_digest == identity.initial_attachment_digest =>
+        {
+            Ok(())
+        }
+        (Some(previous), BrokerPaneLeaseWalPhaseV1::PredecessorFenced)
+            if previous.phase == BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged
+                && current.lease_generation
+                    == previous
+                        .lease_generation
+                        .checked_add(1)
+                        .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?
+                && current.predecessor_attachment_id == previous.successor_attachment_id
+                && current.owner == previous.owner
+                && current.recovery_verifier == previous.recovery_verifier
+                && current.attachment_digest == previous.attachment_digest =>
+        {
+            Ok(())
+        }
+        (Some(previous), BrokerPaneLeaseWalPhaseV1::SuccessorClaimed)
+            if previous.phase == BrokerPaneLeaseWalPhaseV1::PredecessorFenced
+                && current.lease_generation == previous.lease_generation
+                && current.predecessor_attachment_id == previous.predecessor_attachment_id
+                && current.predecessor_attachment_digest == previous.attachment_digest =>
+        {
+            Ok(())
+        }
+        (Some(previous), BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged)
+            if previous.phase == BrokerPaneLeaseWalPhaseV1::SuccessorClaimed
+                && current.handoff_id == previous.handoff_id
+                && current.predecessor_attachment_id == previous.predecessor_attachment_id
+                && current.successor_attachment_id == previous.successor_attachment_id
+                && current.lease_generation == previous.lease_generation
+                && current.owner == previous.owner
+                && current.recovery_verifier == previous.recovery_verifier
+                && current.attachment_digest == previous.attachment_digest
+                && current.predecessor_attachment_digest
+                    == previous.predecessor_attachment_digest =>
+        {
+            Ok(())
+        }
+        _ => Err(BrokerPaneLeaseWalErrorV1::InvalidTransition),
+    }
+}
+
+fn encode_broker_lease_wal_record(
+    header_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    sequence: u64,
+    fields: &BrokerPaneLeaseWalRecordFieldsV1,
+    previous_record_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+) -> Result<[u8; BROKER_LEASE_WAL_RECORD_BYTES], BrokerPaneLeaseWalErrorV1> {
+    validate_broker_lease_record_fields(fields)?;
+    let mut record = [0_u8; BROKER_LEASE_WAL_RECORD_BYTES];
+    record[0..8].copy_from_slice(&BROKER_LEASE_WAL_RECORD_MAGIC);
+    record[8..12].copy_from_slice(&BROKER_LEASE_WAL_RECORD_BYTES_U32.to_le_bytes());
+    record[12] = fields.phase as u8;
+    record[16..24].copy_from_slice(&sequence.to_le_bytes());
+    record[24..40].copy_from_slice(fields.handoff_id.as_bytes());
+    record[40..56].copy_from_slice(fields.ack_id.as_bytes());
+    record[56..72].copy_from_slice(fields.predecessor_attachment_id.as_bytes());
+    record[72..88].copy_from_slice(fields.successor_attachment_id.as_bytes());
+    record[88..96].copy_from_slice(&fields.lease_generation.to_le_bytes());
+    record[96..112].copy_from_slice(fields.owner.guardian_incarnation.as_bytes());
+    record[112..128].copy_from_slice(fields.owner.connection_id.as_bytes());
+    record[128..144].copy_from_slice(fields.owner.mux_incarnation.as_bytes());
+    record[144..176].copy_from_slice(&fields.owner.mux_build_identity_digest);
+    record[176..208].copy_from_slice(&fields.owner.guardian_build_identity_digest);
+    record[208..240].copy_from_slice(&fields.recovery_verifier.into_bytes());
+    record[240..272].copy_from_slice(&fields.attachment_digest);
+    record[272..304].copy_from_slice(&fields.predecessor_attachment_digest);
+    record[304..336].copy_from_slice(&previous_record_mac);
+    let mut authenticated =
+        [0_u8; BROKER_LEASE_WAL_MAC_BYTES + BROKER_LEASE_WAL_AUTHENTICATED_RECORD_BYTES];
+    authenticated[..BROKER_LEASE_WAL_MAC_BYTES].copy_from_slice(&header_mac);
+    authenticated[BROKER_LEASE_WAL_MAC_BYTES..]
+        .copy_from_slice(&record[..BROKER_LEASE_WAL_AUTHENTICATED_RECORD_BYTES]);
+    let tag = broker_lease_wal_authenticate(authenticator, &authenticated)?;
+    record[336..368].copy_from_slice(&tag);
+    Ok(record)
+}
+
+fn decode_broker_lease_wal_record(
+    record: &[u8; BROKER_LEASE_WAL_RECORD_BYTES],
+    identity: &BrokerPaneLeaseWalIdentityV1,
+    header_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    expected_sequence: u64,
+    expected_previous_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    previous: Option<&BrokerPaneLeaseWalRecordFieldsV1>,
+) -> Result<BrokerPaneLeaseWalRecordStateV1, BrokerPaneLeaseWalErrorV1> {
+    if record[0..8] != BROKER_LEASE_WAL_RECORD_MAGIC
+        || read_broker_u32(&record[8..12]) != BROKER_LEASE_WAL_RECORD_BYTES_U32
+    {
+        return Err(BrokerPaneLeaseWalErrorV1::InvalidRecordFraming);
+    }
+    if record[13..16].iter().any(|byte| *byte != 0) {
+        return Err(BrokerPaneLeaseWalErrorV1::NonCanonicalRecord);
+    }
+    let sequence = read_broker_u64(&record[16..24]);
+    if sequence != expected_sequence {
+        return Err(BrokerPaneLeaseWalErrorV1::SequenceMismatch);
+    }
+    if record[304..336] != expected_previous_mac {
+        return Err(BrokerPaneLeaseWalErrorV1::RecordChainMismatch);
+    }
+    let mut authenticated =
+        [0_u8; BROKER_LEASE_WAL_MAC_BYTES + BROKER_LEASE_WAL_AUTHENTICATED_RECORD_BYTES];
+    authenticated[..BROKER_LEASE_WAL_MAC_BYTES].copy_from_slice(&header_mac);
+    authenticated[BROKER_LEASE_WAL_MAC_BYTES..]
+        .copy_from_slice(&record[..BROKER_LEASE_WAL_AUTHENTICATED_RECORD_BYTES]);
+    broker_lease_wal_verify(authenticator, &authenticated, &record[336..368])?;
+    let fields = BrokerPaneLeaseWalRecordFieldsV1 {
+        phase: BrokerPaneLeaseWalPhaseV1::from_wire(record[12])?,
+        handoff_id: read_broker_uuid(&record[24..40]),
+        ack_id: read_broker_uuid(&record[40..56]),
+        predecessor_attachment_id: read_broker_uuid(&record[56..72]),
+        successor_attachment_id: read_broker_uuid(&record[72..88]),
+        lease_generation: read_broker_u64(&record[88..96]),
+        owner: BrokerGuardianOwnerIdentity {
+            guardian_incarnation: read_broker_uuid(&record[96..112]),
+            connection_id: read_broker_uuid(&record[112..128]),
+            mux_incarnation: read_broker_uuid(&record[128..144]),
+            mux_build_identity_digest: read_broker_array_32(&record[144..176]),
+            guardian_build_identity_digest: read_broker_array_32(&record[176..208]),
+        },
+        recovery_verifier: BrokerPaneRecoveryVerifierV1::from_record(read_broker_array_32(
+            &record[208..240],
+        ))
+        .ok_or(BrokerPaneLeaseWalErrorV1::NonCanonicalRecord)?,
+        attachment_digest: read_broker_array_32(&record[240..272]),
+        predecessor_attachment_digest: read_broker_array_32(&record[272..304]),
+    };
+    validate_broker_lease_record_transition(identity, previous, &fields)?;
+    let record_mac = read_broker_array_32(&record[336..368]);
+    Ok(BrokerPaneLeaseWalRecordStateV1 {
+        fields,
+        receipt: BrokerPaneLeaseWalReceiptV1 {
+            sequence,
+            phase: fields.phase,
+            committed_wal_bytes: BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64
+                + (sequence + 1) * BROKER_LEASE_WAL_RECORD_BYTES_U64,
+            committed_head_bytes: BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+            record_mac,
+            head_mac: [0; BROKER_LEASE_WAL_MAC_BYTES],
+        },
+    })
+}
+
+fn encode_broker_lease_head_record(
+    head_header_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    sequence: u64,
+    wal_record_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    previous_head_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+) -> Result<[u8; BROKER_LEASE_HEAD_RECORD_BYTES], BrokerPaneLeaseWalErrorV1> {
+    let mut record = [0_u8; BROKER_LEASE_HEAD_RECORD_BYTES];
+    record[0..8].copy_from_slice(&BROKER_LEASE_HEAD_RECORD_MAGIC);
+    record[8..12].copy_from_slice(&BROKER_LEASE_HEAD_RECORD_BYTES_U32.to_le_bytes());
+    record[16..24].copy_from_slice(&sequence.to_le_bytes());
+    record[24..56].copy_from_slice(&wal_record_mac);
+    record[56..88].copy_from_slice(&previous_head_mac);
+    let mut authenticated =
+        [0_u8; BROKER_LEASE_WAL_MAC_BYTES + BROKER_LEASE_HEAD_AUTHENTICATED_RECORD_BYTES];
+    authenticated[..BROKER_LEASE_WAL_MAC_BYTES].copy_from_slice(&head_header_mac);
+    authenticated[BROKER_LEASE_WAL_MAC_BYTES..]
+        .copy_from_slice(&record[..BROKER_LEASE_HEAD_AUTHENTICATED_RECORD_BYTES]);
+    let tag = broker_lease_wal_authenticate(authenticator, &authenticated)?;
+    record[88..120].copy_from_slice(&tag);
+    Ok(record)
+}
+
+fn decode_broker_lease_head_record(
+    record: &[u8; BROKER_LEASE_HEAD_RECORD_BYTES],
+    head_header_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    expected_sequence: u64,
+    expected_wal_record_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+    expected_previous_head_mac: [u8; BROKER_LEASE_WAL_MAC_BYTES],
+) -> Result<[u8; BROKER_LEASE_WAL_MAC_BYTES], BrokerPaneLeaseWalErrorV1> {
+    if record[0..8] != BROKER_LEASE_HEAD_RECORD_MAGIC
+        || read_broker_u32(&record[8..12]) != BROKER_LEASE_HEAD_RECORD_BYTES_U32
+    {
+        return Err(BrokerPaneLeaseWalErrorV1::InvalidRecordFraming);
+    }
+    if record[12..16].iter().any(|byte| *byte != 0)
+        || read_broker_u64(&record[16..24]) != expected_sequence
+        || record[24..56] != expected_wal_record_mac
+        || record[56..88] != expected_previous_head_mac
+    {
+        return Err(BrokerPaneLeaseWalErrorV1::HeadAnchorMismatch);
+    }
+    let mut authenticated =
+        [0_u8; BROKER_LEASE_WAL_MAC_BYTES + BROKER_LEASE_HEAD_AUTHENTICATED_RECORD_BYTES];
+    authenticated[..BROKER_LEASE_WAL_MAC_BYTES].copy_from_slice(&head_header_mac);
+    authenticated[BROKER_LEASE_WAL_MAC_BYTES..]
+        .copy_from_slice(&record[..BROKER_LEASE_HEAD_AUTHENTICATED_RECORD_BYTES]);
+    broker_lease_wal_verify(authenticator, &authenticated, &record[88..120])?;
+    Ok(read_broker_array_32(&record[88..120]))
+}
+
+fn scan_broker_lease_wal(
+    wal: &mut File,
+    expected: &BrokerPaneLeaseWalIdentityV1,
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+) -> Result<([u8; BROKER_LEASE_WAL_MAC_BYTES], BrokerPaneLeaseWalScanV1), BrokerPaneLeaseWalErrorV1>
+{
+    let metadata = wal.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(BrokerPaneLeaseWalErrorV1::NotRegularFile);
+    }
+    let physical_bytes = metadata.len();
+    if physical_bytes < BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64 {
+        return Err(BrokerPaneLeaseWalErrorV1::TornFileHeader);
+    }
+    let maximum_with_tail = BROKER_LEASE_WAL_MAX_PHYSICAL_BYTES
+        .checked_add(BROKER_LEASE_WAL_RECORD_BYTES_U64 - 1)
+        .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+    if physical_bytes > maximum_with_tail {
+        return Err(BrokerPaneLeaseWalErrorV1::CapacityExhausted);
+    }
+    wal.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; BROKER_LEASE_WAL_FILE_HEADER_BYTES];
+    wal.read_exact(&mut header)?;
+    let (observed, header_mac) =
+        decode_broker_lease_file_header(&header, BROKER_LEASE_WAL_FILE_MAGIC, authenticator)?;
+    if observed != *expected {
+        return Err(BrokerPaneLeaseWalErrorV1::IdentityMismatch);
+    }
+    let record_region = physical_bytes - BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64;
+    let complete_records = record_region / BROKER_LEASE_WAL_RECORD_BYTES_U64;
+    if complete_records > BROKER_LEASE_WAL_MAX_RECORDS {
+        return Err(BrokerPaneLeaseWalErrorV1::CapacityExhausted);
+    }
+    let trailing_bytes = record_region % BROKER_LEASE_WAL_RECORD_BYTES_U64;
+    let capacity = usize::try_from(complete_records)
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(capacity)
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+    let mut previous_mac = header_mac;
+    let mut previous = None;
+    for sequence in 0..complete_records {
+        let mut record = [0_u8; BROKER_LEASE_WAL_RECORD_BYTES];
+        wal.read_exact(&mut record)?;
+        let decoded = decode_broker_lease_wal_record(
+            &record,
+            expected,
+            header_mac,
+            authenticator,
+            sequence,
+            previous_mac,
+            previous.as_ref(),
+        )?;
+        previous_mac = decoded.receipt.record_mac;
+        previous = Some(decoded.fields);
+        records.push(decoded);
+    }
+    Ok((
+        header_mac,
+        BrokerPaneLeaseWalScanV1 {
+            committed_bytes: BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64
+                + complete_records * BROKER_LEASE_WAL_RECORD_BYTES_U64,
+            trailing_bytes,
+            records,
+        },
+    ))
+}
+
+fn scan_broker_lease_head(
+    head: &mut File,
+    expected: &BrokerPaneLeaseWalIdentityV1,
+    authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    wal_records: &[BrokerPaneLeaseWalRecordStateV1],
+) -> Result<([u8; BROKER_LEASE_WAL_MAC_BYTES], BrokerPaneLeaseHeadScanV1), BrokerPaneLeaseWalErrorV1>
+{
+    let metadata = head.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(BrokerPaneLeaseWalErrorV1::NotRegularFile);
+    }
+    let physical_bytes = metadata.len();
+    if physical_bytes < BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64 {
+        return Err(BrokerPaneLeaseWalErrorV1::TornFileHeader);
+    }
+    let maximum_with_tail = BROKER_LEASE_HEAD_MAX_PHYSICAL_BYTES
+        .checked_add(BROKER_LEASE_HEAD_RECORD_BYTES_U64 - 1)
+        .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+    if physical_bytes > maximum_with_tail {
+        return Err(BrokerPaneLeaseWalErrorV1::CapacityExhausted);
+    }
+    head.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; BROKER_LEASE_WAL_FILE_HEADER_BYTES];
+    head.read_exact(&mut header)?;
+    let (observed, head_header_mac) =
+        decode_broker_lease_file_header(&header, BROKER_LEASE_HEAD_FILE_MAGIC, authenticator)?;
+    if observed != *expected {
+        return Err(BrokerPaneLeaseWalErrorV1::IdentityMismatch);
+    }
+    let record_region = physical_bytes - BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64;
+    let complete_records = record_region / BROKER_LEASE_HEAD_RECORD_BYTES_U64;
+    if complete_records > BROKER_LEASE_WAL_MAX_RECORDS
+        || complete_records
+            > u64::try_from(wal_records.len())
+                .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?
+    {
+        return Err(BrokerPaneLeaseWalErrorV1::HeadAnchorMismatch);
+    }
+    let trailing_bytes = record_region % BROKER_LEASE_HEAD_RECORD_BYTES_U64;
+    let capacity = usize::try_from(complete_records)
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+    let mut record_macs = Vec::new();
+    record_macs
+        .try_reserve_exact(capacity)
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+    let mut previous_head_mac = head_header_mac;
+    for sequence in 0..complete_records {
+        let index =
+            usize::try_from(sequence).map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        let wal_record = wal_records
+            .get(index)
+            .ok_or(BrokerPaneLeaseWalErrorV1::HeadAnchorMismatch)?;
+        let mut record = [0_u8; BROKER_LEASE_HEAD_RECORD_BYTES];
+        head.read_exact(&mut record)?;
+        let head_mac = decode_broker_lease_head_record(
+            &record,
+            head_header_mac,
+            authenticator,
+            sequence,
+            wal_record.receipt.record_mac,
+            previous_head_mac,
+        )?;
+        previous_head_mac = head_mac;
+        record_macs.push(head_mac);
+    }
+    if trailing_bytes != 0 {
+        let next_index = usize::try_from(complete_records)
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        let wal_record = wal_records
+            .get(next_index)
+            .ok_or(BrokerPaneLeaseWalErrorV1::IncompleteTail)?;
+        let expected_record = encode_broker_lease_head_record(
+            head_header_mac,
+            authenticator,
+            complete_records,
+            wal_record.receipt.record_mac,
+            previous_head_mac,
+        )?;
+        let prefix_bytes = usize::try_from(trailing_bytes)
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        let mut observed_prefix = [0_u8; BROKER_LEASE_HEAD_RECORD_BYTES];
+        head.read_exact(&mut observed_prefix[..prefix_bytes])?;
+        if observed_prefix[..prefix_bytes] != expected_record[..prefix_bytes] {
+            return Err(BrokerPaneLeaseWalErrorV1::IncompleteTail);
+        }
+    }
+    Ok((
+        head_header_mac,
+        BrokerPaneLeaseHeadScanV1 {
+            committed_bytes: BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64
+                + complete_records * BROKER_LEASE_HEAD_RECORD_BYTES_U64,
+            trailing_bytes,
+            record_macs,
+            terminal_head_mac: previous_head_mac,
+        },
+    ))
+}
+
+impl BrokerPaneLeaseJournalV1 {
+    fn create(
+        mut wal: File,
+        mut head: File,
+        identity: &BrokerPaneLeaseWalIdentityV1,
+        authenticator: GuardianBrokerLeaseWalAuthenticatorV1,
+    ) -> Result<Self, BrokerPaneLeaseWalErrorV1> {
+        identity.validate()?;
+        if identity.spawn.broker_lineage_id() != authenticator.lineage_id() {
+            return Err(BrokerPaneLeaseWalErrorV1::LineageMismatch);
+        }
+        if !wal.metadata()?.file_type().is_file() || !head.metadata()?.file_type().is_file() {
+            return Err(BrokerPaneLeaseWalErrorV1::NotRegularFile);
+        }
+        if wal.metadata()?.len() != 0 || head.metadata()?.len() != 0 {
+            return Err(BrokerPaneLeaseWalErrorV1::NewJournalNotEmpty);
+        }
+        let wal_header =
+            encode_broker_lease_file_header(BROKER_LEASE_WAL_FILE_MAGIC, identity, &authenticator)?;
+        let head_header = encode_broker_lease_file_header(
+            BROKER_LEASE_HEAD_FILE_MAGIC,
+            identity,
+            &authenticator,
+        )?;
+        wal.seek(SeekFrom::Start(0))?;
+        wal.write_all(&wal_header)?;
+        wal.sync_all()?;
+        head.seek(SeekFrom::Start(0))?;
+        head.write_all(&head_header)?;
+        head.sync_all()?;
+        Ok(Self {
+            wal,
+            head,
+            identity: *identity,
+            authenticator,
+            header_mac: read_broker_array_32(&wal_header[320..352]),
+            head_header_mac: read_broker_array_32(&head_header[320..352]),
+            committed_wal_bytes: BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+            committed_head_bytes: BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+            wal_trailing_bytes: 0,
+            head_trailing_bytes: 0,
+            records: Vec::new(),
+            terminal_head_mac: read_broker_array_32(&head_header[320..352]),
+            publication_binding: None,
+            directory_entry_sync_required: true,
+            recovery_append_authority_withheld: false,
+            head_reconciliation_required: false,
+            poisoned: false,
+            #[cfg(test)]
+            injected_fault: None,
+        })
+    }
+
+    fn open(
+        mut wal: File,
+        mut head: File,
+        identity: &BrokerPaneLeaseWalIdentityV1,
+        authenticator: GuardianBrokerLeaseWalAuthenticatorV1,
+    ) -> Result<Self, BrokerPaneLeaseWalErrorV1> {
+        identity.validate()?;
+        let (header_mac, mut wal_scan) = scan_broker_lease_wal(&mut wal, identity, &authenticator)?;
+        let (head_header_mac, head_scan) =
+            scan_broker_lease_head(&mut head, identity, &authenticator, &wal_scan.records)?;
+        let wal_record_count = wal_scan.records.len();
+        let head_record_count = head_scan.record_macs.len();
+        let head_gap = wal_record_count
+            .checked_sub(head_record_count)
+            .ok_or(BrokerPaneLeaseWalErrorV1::HeadAnchorMismatch)?;
+        if head_gap > 1 {
+            return Err(BrokerPaneLeaseWalErrorV1::HeadReconciliationGap);
+        }
+        for (index, head_mac) in head_scan.record_macs.iter().copied().enumerate() {
+            let record = wal_scan
+                .records
+                .get_mut(index)
+                .ok_or(BrokerPaneLeaseWalErrorV1::HeadAnchorMismatch)?;
+            record.receipt.head_mac = head_mac;
+            record.receipt.committed_head_bytes = BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64
+                + u64::try_from(index + 1)
+                    .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?
+                    * BROKER_LEASE_HEAD_RECORD_BYTES_U64;
+        }
+        Ok(Self {
+            wal,
+            head,
+            identity: *identity,
+            authenticator,
+            header_mac,
+            head_header_mac,
+            committed_wal_bytes: wal_scan.committed_bytes,
+            committed_head_bytes: head_scan.committed_bytes,
+            wal_trailing_bytes: wal_scan.trailing_bytes,
+            head_trailing_bytes: head_scan.trailing_bytes,
+            records: wal_scan.records,
+            terminal_head_mac: head_scan.terminal_head_mac,
+            publication_binding: None,
+            directory_entry_sync_required: false,
+            recovery_append_authority_withheld: true,
+            head_reconciliation_required: head_gap == 1,
+            poisoned: false,
+            #[cfg(test)]
+            injected_fault: None,
+        })
+    }
+
+    fn status(&self) -> BrokerPaneLeaseWalStatusV1 {
+        let terminal = self.records.last().copied();
+        let fields = terminal.map(|record| record.fields);
+        BrokerPaneLeaseWalStatusV1 {
+            identity: self.identity,
+            phase: fields.map(|fields| fields.phase),
+            handoff_id: fields
+                .filter(|fields| !fields.handoff_id.is_nil())
+                .map(|fields| fields.handoff_id),
+            ack_id: fields
+                .filter(|fields| !fields.ack_id.is_nil())
+                .map(|fields| fields.ack_id),
+            predecessor_attachment_id: fields.map(|fields| fields.predecessor_attachment_id),
+            successor_attachment_id: fields
+                .filter(|fields| !fields.successor_attachment_id.is_nil())
+                .map(|fields| fields.successor_attachment_id),
+            lease_generation: fields.map_or(1, |fields| fields.lease_generation),
+            owner: fields.map(|fields| fields.owner),
+            recovery_verifier: fields.map_or(self.identity.initial_recovery_verifier, |fields| {
+                fields.recovery_verifier
+            }),
+            attachment_digest: fields.map_or(self.identity.initial_attachment_digest, |fields| {
+                fields.attachment_digest
+            }),
+            predecessor_attachment_digest: fields
+                .filter(|fields| fields.predecessor_attachment_digest != [0; 32])
+                .map(|fields| fields.predecessor_attachment_digest),
+            committed_records: u64::try_from(self.records.len()).unwrap_or(u64::MAX),
+            committed_wal_bytes: self.committed_wal_bytes,
+            committed_head_bytes: self.committed_head_bytes,
+            tail: if self.wal_trailing_bytes == 0 && self.head_trailing_bytes == 0 {
+                BrokerPaneLeaseWalTailV1::Clean
+            } else {
+                BrokerPaneLeaseWalTailV1::Incomplete {
+                    wal_trailing_bytes: self.wal_trailing_bytes,
+                    head_trailing_bytes: self.head_trailing_bytes,
+                }
+            },
+            append_authority_withheld: self.directory_entry_sync_required
+                || self.recovery_append_authority_withheld
+                || self.head_reconciliation_required
+                || self.poisoned
+                || self.wal_trailing_bytes != 0
+                || self.head_trailing_bytes != 0,
+            head_reconciliation_required: self.head_reconciliation_required,
+        }
+    }
+
+    fn bind_parent_publication(
+        &mut self,
+        parent_directory: &File,
+        wal_name: &OsStr,
+        head_name: &OsStr,
+    ) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        if !self.directory_entry_sync_required || self.publication_binding.is_some() {
+            return Err(BrokerPaneLeaseWalErrorV1::DirectoryEntryNotDurable);
+        }
+        let parent = parent_directory.metadata()?;
+        validate_broker_spawn_catalog_directory_metadata(&parent)
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch)?;
+        revalidate_open_broker_spawn_catalog_file(
+            parent_directory,
+            wal_name,
+            &self.wal,
+            BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_LEASE_WAL_MAX_PHYSICAL_BYTES,
+        )
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch)?;
+        revalidate_open_broker_spawn_catalog_file(
+            parent_directory,
+            head_name,
+            &self.head,
+            BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_LEASE_HEAD_MAX_PHYSICAL_BYTES,
+        )
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch)?;
+        self.publication_binding = Some(BrokerSpawnWalPublicationBindingV1 {
+            parent_device: parent.dev(),
+            parent_inode: parent.ino(),
+            wal_name: wal_name.to_os_string(),
+            head_name: head_name.to_os_string(),
+        });
+        Ok(())
+    }
+
+    fn sync_parent_directory_and_activate(
+        &mut self,
+        parent_directory: &File,
+    ) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        if !self.directory_entry_sync_required {
+            return Ok(());
+        }
+        let binding = self
+            .publication_binding
+            .as_ref()
+            .ok_or(BrokerPaneLeaseWalErrorV1::DirectoryEntryNotDurable)?;
+        let parent = parent_directory.metadata()?;
+        validate_broker_spawn_catalog_directory_metadata(&parent)
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch)?;
+        if parent.dev() != binding.parent_device || parent.ino() != binding.parent_inode {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+        revalidate_open_broker_spawn_catalog_file(
+            parent_directory,
+            &binding.wal_name,
+            &self.wal,
+            BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_LEASE_WAL_MAX_PHYSICAL_BYTES,
+        )
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch)?;
+        revalidate_open_broker_spawn_catalog_file(
+            parent_directory,
+            &binding.head_name,
+            &self.head,
+            BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
+            BROKER_LEASE_HEAD_MAX_PHYSICAL_BYTES,
+        )
+        .map_err(|_| BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch)?;
+        parent_directory.sync_all()?;
+        self.directory_entry_sync_required = false;
+        self.publication_binding = None;
+        Ok(())
+    }
+
+    fn fence_predecessor_and_sync(
+        &mut self,
+        predecessor: BrokerAttachmentIdentityV1,
+        next_generation: u64,
+        recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    ) -> Result<BrokerPaneLeaseWalReceiptV1, BrokerPaneLeaseWalErrorV1> {
+        validate_broker_lease_attachment_for_spawn(predecessor, self.identity.spawn)?;
+        if predecessor
+            .lease_generation
+            .checked_add(1)
+            .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?
+            != next_generation
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+        }
+        let fields = BrokerPaneLeaseWalRecordFieldsV1 {
+            phase: BrokerPaneLeaseWalPhaseV1::PredecessorFenced,
+            handoff_id: Uuid::nil(),
+            ack_id: Uuid::nil(),
+            predecessor_attachment_id: predecessor.attachment_id,
+            successor_attachment_id: Uuid::nil(),
+            lease_generation: next_generation,
+            owner: predecessor.owner,
+            recovery_verifier,
+            attachment_digest: broker_lease_attachment_digest(predecessor)?,
+            predecessor_attachment_digest: [0; 32],
+        };
+        self.append_or_recover_exact(&fields)
+    }
+
+    fn claim_successor_and_sync(
+        &mut self,
+        handoff_id: Uuid,
+        predecessor: BrokerAttachmentIdentityV1,
+        successor: BrokerAttachmentIdentityV1,
+        successor_recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    ) -> Result<BrokerPaneLeaseWalReceiptV1, BrokerPaneLeaseWalErrorV1> {
+        if handoff_id.is_nil() {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+        }
+        validate_broker_lease_attachment_for_spawn(predecessor, self.identity.spawn)?;
+        validate_broker_lease_attachment_for_spawn(successor, self.identity.spawn)?;
+        if predecessor
+            .lease_generation
+            .checked_add(1)
+            .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?
+            != successor.lease_generation
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+        }
+        let fields = BrokerPaneLeaseWalRecordFieldsV1 {
+            phase: BrokerPaneLeaseWalPhaseV1::SuccessorClaimed,
+            handoff_id,
+            ack_id: Uuid::nil(),
+            predecessor_attachment_id: predecessor.attachment_id,
+            successor_attachment_id: successor.attachment_id,
+            lease_generation: successor.lease_generation,
+            owner: successor.owner,
+            recovery_verifier: successor_recovery_verifier,
+            attachment_digest: broker_lease_attachment_digest(successor)?,
+            predecessor_attachment_digest: broker_lease_attachment_digest(predecessor)?,
+        };
+        self.append_or_recover_exact(&fields)
+    }
+
+    fn acknowledge_successor_and_sync(
+        &mut self,
+        handoff_id: Uuid,
+        ack_id: Uuid,
+        predecessor: BrokerAttachmentIdentityV1,
+        successor: BrokerAttachmentIdentityV1,
+        successor_recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    ) -> Result<BrokerPaneLeaseWalReceiptV1, BrokerPaneLeaseWalErrorV1> {
+        if handoff_id.is_nil() || ack_id.is_nil() {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+        }
+        validate_broker_lease_attachment_for_spawn(predecessor, self.identity.spawn)?;
+        validate_broker_lease_attachment_for_spawn(successor, self.identity.spawn)?;
+        if predecessor
+            .lease_generation
+            .checked_add(1)
+            .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?
+            != successor.lease_generation
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+        }
+        let fields = BrokerPaneLeaseWalRecordFieldsV1 {
+            phase: BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged,
+            handoff_id,
+            ack_id,
+            predecessor_attachment_id: predecessor.attachment_id,
+            successor_attachment_id: successor.attachment_id,
+            lease_generation: successor.lease_generation,
+            owner: successor.owner,
+            recovery_verifier: successor_recovery_verifier,
+            attachment_digest: broker_lease_attachment_digest(successor)?,
+            predecessor_attachment_digest: broker_lease_attachment_digest(predecessor)?,
+        };
+        self.append_or_recover_exact(&fields)
+    }
+
+    fn append_or_recover_exact(
+        &mut self,
+        fields: &BrokerPaneLeaseWalRecordFieldsV1,
+    ) -> Result<BrokerPaneLeaseWalReceiptV1, BrokerPaneLeaseWalErrorV1> {
+        validate_broker_lease_record_fields(fields)?;
+        if let Some(existing) = self.records.iter().find(|record| record.fields == *fields) {
+            return Ok(existing.receipt);
+        }
+        let conflicts_with_generation = self.records.iter().any(|record| {
+            record.fields.phase == fields.phase
+                && record.fields.lease_generation == fields.lease_generation
+        });
+        if conflicts_with_generation {
+            return Err(BrokerPaneLeaseWalErrorV1::EffectIdentityConflict);
+        }
+        self.append_fields_and_head(fields)
+    }
+
+    fn append_fields_and_head(
+        &mut self,
+        fields: &BrokerPaneLeaseWalRecordFieldsV1,
+    ) -> Result<BrokerPaneLeaseWalReceiptV1, BrokerPaneLeaseWalErrorV1> {
+        self.require_append_authority()?;
+        let previous = self.records.last();
+        validate_broker_lease_record_transition(
+            &self.identity,
+            previous.map(|record| &record.fields),
+            fields,
+        )?;
+        let sequence = u64::try_from(self.records.len())
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        let previous_record_mac =
+            previous.map_or(self.header_mac, |record| record.receipt.record_mac);
+        let wal_record = encode_broker_lease_wal_record(
+            self.header_mac,
+            &self.authenticator,
+            sequence,
+            fields,
+            previous_record_mac,
+        )?;
+        let record_mac = read_broker_array_32(&wal_record[336..368]);
+        let head_record = encode_broker_lease_head_record(
+            self.head_header_mac,
+            &self.authenticator,
+            sequence,
+            record_mac,
+            self.terminal_head_mac,
+        )?;
+        let projected_wal_bytes = self
+            .committed_wal_bytes
+            .checked_add(BROKER_LEASE_WAL_RECORD_BYTES_U64)
+            .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        let projected_head_bytes = self
+            .committed_head_bytes
+            .checked_add(BROKER_LEASE_HEAD_RECORD_BYTES_U64)
+            .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+        if self.wal.metadata()?.len() != self.committed_wal_bytes
+            || self.head.metadata()?.len() != self.committed_head_bytes
+        {
+            self.poisoned = true;
+            return Err(BrokerPaneLeaseWalErrorV1::ExternalLengthChange);
+        }
+        #[cfg(test)]
+        if self.take_fault(BrokerPaneLeaseWalInjectedFaultV1::BeforeWalWrite) {
+            return Err(BrokerPaneLeaseWalErrorV1::Io(std::io::Error::other(
+                "injected broker pane-lease WAL fault before write",
+            )));
+        }
+        let result = (|| -> Result<(), BrokerPaneLeaseWalErrorV1> {
+            self.wal.seek(SeekFrom::Start(self.committed_wal_bytes))?;
+            self.wal.write_all(&wal_record)?;
+            self.wal.sync_all()?;
+            #[cfg(test)]
+            if self.take_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead) {
+                return Err(BrokerPaneLeaseWalErrorV1::Io(std::io::Error::other(
+                    "injected broker pane-lease WAL fault after WAL sync",
+                )));
+            }
+            self.head.seek(SeekFrom::Start(self.committed_head_bytes))?;
+            self.head.write_all(&head_record)?;
+            #[cfg(test)]
+            if self.take_fault(BrokerPaneLeaseWalInjectedFaultV1::BeforeHeadSync) {
+                return Err(BrokerPaneLeaseWalErrorV1::Io(std::io::Error::other(
+                    "injected broker pane-lease WAL fault before head sync",
+                )));
+            }
+            self.head.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        let head_mac = read_broker_array_32(&head_record[88..120]);
+        let receipt = BrokerPaneLeaseWalReceiptV1 {
+            sequence,
+            phase: fields.phase,
+            committed_wal_bytes: projected_wal_bytes,
+            committed_head_bytes: projected_head_bytes,
+            record_mac,
+            head_mac,
+        };
+        self.records.push(BrokerPaneLeaseWalRecordStateV1 {
+            fields: *fields,
+            receipt,
+        });
+        self.committed_wal_bytes = projected_wal_bytes;
+        self.committed_head_bytes = projected_head_bytes;
+        self.terminal_head_mac = head_mac;
+        Ok(receipt)
+    }
+
+    fn require_healthy_for_recovery(&self) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        if self.poisoned {
+            return Err(BrokerPaneLeaseWalErrorV1::Poisoned);
+        }
+        if self.directory_entry_sync_required {
+            return Err(BrokerPaneLeaseWalErrorV1::DirectoryEntryNotDurable);
+        }
+        if self.wal_trailing_bytes != 0
+            || (self.head_trailing_bytes != 0 && !self.head_reconciliation_required)
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::IncompleteTail);
+        }
+        Ok(())
+    }
+
+    fn require_append_authority(&self) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        self.require_healthy_for_recovery()?;
+        if self.recovery_append_authority_withheld || self.head_reconciliation_required {
+            return Err(BrokerPaneLeaseWalErrorV1::RecoveryAuthorityUnavailable);
+        }
+        if self.records.len()
+            >= usize::try_from(BROKER_LEASE_WAL_MAX_RECORDS)
+                .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::CapacityExhausted);
+        }
+        Ok(())
+    }
+
+    fn reconcile_recovered_head_and_activate(
+        &mut self,
+        authority: BrokerPaneLeaseWalFilesystemRevalidationV1,
+    ) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        let activation = self.preflight_recovered_head_activation(authority)?;
+        self.apply_recovered_head_activation(activation)
+    }
+
+    fn preflight_recovered_head_activation(
+        &self,
+        authority: BrokerPaneLeaseWalFilesystemRevalidationV1,
+    ) -> Result<BrokerPaneLeaseWalRecoveryActivationV1, BrokerPaneLeaseWalErrorV1> {
+        self.require_healthy_for_recovery()?;
+        if authority.identity != self.identity {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+        let authoritative_lengths = (authority.observed_wal_bytes, authority.observed_head_bytes);
+        let recovered_lengths = (
+            self.committed_wal_bytes,
+            self.committed_head_bytes
+                .checked_add(self.head_trailing_bytes)
+                .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?,
+        );
+        if authoritative_lengths != recovered_lengths
+            || (self.wal.metadata()?.len(), self.head.metadata()?.len()) != authoritative_lengths
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+        let head = if self.head_reconciliation_required {
+            let record = self
+                .records
+                .last()
+                .copied()
+                .ok_or(BrokerPaneLeaseWalErrorV1::HeadAnchorMismatch)?;
+            let sequence = u64::try_from(
+                self.records
+                    .len()
+                    .checked_sub(1)
+                    .ok_or(BrokerPaneLeaseWalErrorV1::HeadAnchorMismatch)?,
+            )
+            .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+            if record.receipt.sequence != sequence {
+                return Err(BrokerPaneLeaseWalErrorV1::SequenceMismatch);
+            }
+            let encoded = encode_broker_lease_head_record(
+                self.head_header_mac,
+                &self.authenticator,
+                sequence,
+                record.receipt.record_mac,
+                self.terminal_head_mac,
+            )?;
+            let durable_prefix_bytes = usize::try_from(self.head_trailing_bytes)
+                .map_err(|_| BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+            if durable_prefix_bytes >= BROKER_LEASE_HEAD_RECORD_BYTES {
+                return Err(BrokerPaneLeaseWalErrorV1::IncompleteTail);
+            }
+            Some(BrokerPaneLeaseWalHeadReconciliationV1 {
+                encoded,
+                durable_prefix_bytes,
+                projected_head_bytes: self
+                    .committed_head_bytes
+                    .checked_add(BROKER_LEASE_HEAD_RECORD_BYTES_U64)
+                    .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?,
+                head_mac: read_broker_array_32(&encoded[88..120]),
+            })
+        } else {
+            None
+        };
+        Ok(BrokerPaneLeaseWalRecoveryActivationV1 { authority, head })
+    }
+
+    fn apply_recovered_head_activation(
+        &mut self,
+        activation: BrokerPaneLeaseWalRecoveryActivationV1,
+    ) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        self.require_healthy_for_recovery()?;
+        if activation.authority.identity != self.identity {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+        let authoritative_lengths = (
+            activation.authority.observed_wal_bytes,
+            activation.authority.observed_head_bytes,
+        );
+        let recovered_lengths = (
+            self.committed_wal_bytes,
+            self.committed_head_bytes
+                .checked_add(self.head_trailing_bytes)
+                .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?,
+        );
+        if authoritative_lengths != recovered_lengths
+            || (self.wal.metadata()?.len(), self.head.metadata()?.len()) != authoritative_lengths
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+        match (self.head_reconciliation_required, activation.head) {
+            (true, Some(head)) => {
+                let result = (|| -> Result<(), BrokerPaneLeaseWalErrorV1> {
+                    let write_offset = self
+                        .committed_head_bytes
+                        .checked_add(self.head_trailing_bytes)
+                        .ok_or(BrokerPaneLeaseWalErrorV1::CapacityExhausted)?;
+                    self.head.seek(SeekFrom::Start(write_offset))?;
+                    #[cfg(test)]
+                    if self.take_fault(BrokerPaneLeaseWalInjectedFaultV1::DuringRecoveredHeadWrite)
+                    {
+                        let remaining = &head.encoded[head.durable_prefix_bytes..];
+                        let prefix_bytes = remaining.len().min(37);
+                        self.head.write_all(&remaining[..prefix_bytes])?;
+                        self.head.sync_all()?;
+                        return Err(BrokerPaneLeaseWalErrorV1::Io(std::io::Error::other(
+                            "injected partial broker pane-lease recovered-head write",
+                        )));
+                    }
+                    self.head
+                        .write_all(&head.encoded[head.durable_prefix_bytes..])?;
+                    self.head.sync_all()?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                let terminal = self
+                    .records
+                    .last_mut()
+                    .ok_or(BrokerPaneLeaseWalErrorV1::HeadAnchorMismatch)?;
+                self.committed_head_bytes = head.projected_head_bytes;
+                self.head_trailing_bytes = 0;
+                self.terminal_head_mac = head.head_mac;
+                terminal.receipt.head_mac = head.head_mac;
+                terminal.receipt.committed_head_bytes = self.committed_head_bytes;
+                self.head_reconciliation_required = false;
+            }
+            (false, None) => {}
+            _ => return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch),
+        }
+        self.recovery_append_authority_withheld = false;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_fault(&mut self, fault: BrokerPaneLeaseWalInjectedFaultV1) {
+        self.injected_fault = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn take_fault(&mut self, fault: BrokerPaneLeaseWalInjectedFaultV1) -> bool {
+        if self.injected_fault == Some(fault) {
+            self.injected_fault = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl BrokerPaneLeaseWalFilesystemRevalidationV1 {
+    fn from_revalidated_filesystem(
+        identity: &BrokerPaneLeaseWalIdentityV1,
+        observed_wal_bytes: u64,
+        observed_head_bytes: u64,
+    ) -> Result<Self, BrokerPaneLeaseWalErrorV1> {
+        identity.validate()?;
+        if !(BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64..=BROKER_LEASE_WAL_MAX_PHYSICAL_BYTES)
+            .contains(&observed_wal_bytes)
+            || !(BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64..=BROKER_LEASE_HEAD_MAX_PHYSICAL_BYTES)
+                .contains(&observed_head_bytes)
+        {
+            return Err(BrokerPaneLeaseWalErrorV1::FilesystemRevalidationMismatch);
+        }
+        Ok(Self {
+            identity: *identity,
+            observed_wal_bytes,
+            observed_head_bytes,
+        })
+    }
 }
 
 fn broker_genesis_binding_digest(binding: BrokerGenesisBinding) -> [u8; 32] {
@@ -14781,6 +16279,23 @@ mod tests {
             .expect("derive broker WAL authenticator")
     }
 
+    fn lease_wal_authenticators(
+        byte: u8,
+    ) -> (
+        GuardianBrokerSpawnWalAuthenticatorV1,
+        GuardianBrokerLeaseWalAuthenticatorV1,
+    ) {
+        let secret = mux::guardian_protocol::GuardianSecret::from_bytes([byte; 32])
+            .expect("nonzero guardian lease-WAL test secret");
+        let spawn = secret
+            .broker_spawn_wal_authenticator()
+            .expect("derive broker Spawn-WAL test authenticator");
+        let lease = secret
+            .broker_lease_wal_authenticator()
+            .expect("derive broker lease-WAL test authenticator");
+        (spawn, lease)
+    }
+
     fn control_authenticator(byte: u8) -> GuardianBrokerControlAuthenticatorV1 {
         mux::guardian_protocol::GuardianSecret::from_bytes([byte; 32])
             .expect("nonzero guardian test secret")
@@ -19474,6 +20989,62 @@ mod tests {
         (journal, wal_path, head_path)
     }
 
+    fn create_test_lease_journal(
+        directory: &Path,
+        identity: &BrokerPaneLeaseWalIdentityV1,
+        authenticator: GuardianBrokerLeaseWalAuthenticatorV1,
+    ) -> (
+        BrokerPaneLeaseJournalV1,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("set broker pane-lease WAL fixture parent owner-only");
+        let wal_path = directory.join("lease.wal");
+        let head_path = directory.join("lease.head");
+        let mut journal = BrokerPaneLeaseJournalV1::create(
+            open_new_test_file(&wal_path),
+            open_new_test_file(&head_path),
+            identity,
+            authenticator,
+        )
+        .expect("create broker pane-lease WAL");
+        let parent = File::open(directory).expect("open pane-lease test parent directory");
+        journal
+            .bind_parent_publication(&parent, OsStr::new("lease.wal"), OsStr::new("lease.head"))
+            .expect("bind exact broker pane-lease WAL parent entries");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate broker pane-lease WAL directory entries");
+        (journal, wal_path, head_path)
+    }
+
+    fn reopen_test_lease_journal(
+        wal_path: &Path,
+        head_path: &Path,
+        identity: &BrokerPaneLeaseWalIdentityV1,
+        authenticator: GuardianBrokerLeaseWalAuthenticatorV1,
+    ) -> BrokerPaneLeaseJournalV1 {
+        BrokerPaneLeaseJournalV1::open(
+            open_existing_test_file(wal_path),
+            open_existing_test_file(head_path),
+            identity,
+            authenticator,
+        )
+        .expect("reopen authenticated broker pane-lease WAL")
+    }
+
+    fn revalidate_recovered_test_lease_journal(
+        journal: &BrokerPaneLeaseJournalV1,
+    ) -> BrokerPaneLeaseWalFilesystemRevalidationV1 {
+        BrokerPaneLeaseWalFilesystemRevalidationV1::from_revalidated_filesystem(
+            &journal.identity,
+            journal.wal.metadata().expect("lease WAL metadata").len(),
+            journal.head.metadata().expect("lease head metadata").len(),
+        )
+        .expect("test pane-lease filesystem revalidation")
+    }
+
     #[test]
     fn new_spawn_journal_activation_rejects_an_unrelated_parent_descriptor() {
         let directory = private_catalog_directory();
@@ -22407,6 +23978,560 @@ mod tests {
             );
             pane.terminate_and_wait_for_test();
         }
+    }
+
+    #[test]
+    fn pane_lease_wal_persists_fence_claim_ack_and_exact_retries() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xd1);
+        assert_ne!(
+            spawn_authenticator.key_id(),
+            lease_authenticator.key_id(),
+            "Spawn and lease journals reused one HMAC key identity"
+        );
+        let spawn = recovered_catalog_identity(&spawn_authenticator, 0x31);
+        let broker_incarnation = id(30_001);
+        let initial_owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: id(30_002),
+            connection_id: id(30_003),
+            mux_incarnation: spawn.mux_incarnation(),
+            mux_build_identity_digest: [0x31; 32],
+            guardian_build_identity_digest: [0x32; 32],
+        };
+        let initial_attachment = BrokerAttachmentIdentityV1 {
+            broker_incarnation,
+            durable_pane_id: spawn.durable_pane_id(),
+            spawn_effect_id: spawn.spawn_effect_id(),
+            attachment_id: id(30_004),
+            owner: initial_owner,
+            lease_generation: 1,
+        };
+        let initial_secret = BrokerPaneRecoverySecretV1::from_wire(&[0x33; 32])
+            .expect("construct initial lease recovery capability");
+        let initial_verifier = initial_secret
+            .verifier(spawn, 1)
+            .expect("derive initial lease recovery verifier");
+        let identity = BrokerPaneLeaseWalIdentityV1::new(
+            spawn,
+            test_kernel_child(30_005),
+            initial_attachment,
+            initial_verifier,
+        )
+        .expect("construct pane-lease WAL identity");
+        let (mut journal, wal_path, head_path) =
+            create_test_lease_journal(temp.path(), &identity, lease_authenticator.clone());
+        assert_eq!(
+            journal.records.capacity(),
+            0,
+            "empty pane-lease journals preallocated the full transition budget"
+        );
+        let initial = journal.status();
+        assert_eq!(initial.phase, None);
+        assert_eq!(initial.lease_generation, 1);
+        assert_eq!(initial.recovery_verifier, initial_verifier);
+        assert_eq!(
+            initial.attachment_digest,
+            broker_lease_attachment_digest(initial_attachment)
+                .expect("digest initial lease attachment")
+        );
+        assert_eq!(initial.committed_records, 0);
+        assert!(!initial.append_authority_withheld);
+
+        let fenced = journal
+            .fence_predecessor_and_sync(initial_attachment, 2, initial_verifier)
+            .expect("durably fence initial attachment");
+        assert_eq!(fenced.phase, BrokerPaneLeaseWalPhaseV1::PredecessorFenced);
+        assert_eq!(
+            journal
+                .fence_predecessor_and_sync(initial_attachment, 2, initial_verifier)
+                .expect("recover exact predecessor-fence reply"),
+            fenced
+        );
+        assert_eq!(journal.status().committed_records, 1);
+
+        let successor_owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: id(30_006),
+            connection_id: id(30_007),
+            mux_incarnation: id(30_008),
+            mux_build_identity_digest: [0x34; 32],
+            guardian_build_identity_digest: [0x35; 32],
+        };
+        let successor = BrokerAttachmentIdentityV1 {
+            broker_incarnation,
+            durable_pane_id: spawn.durable_pane_id(),
+            spawn_effect_id: spawn.spawn_effect_id(),
+            attachment_id: id(30_009),
+            owner: successor_owner,
+            lease_generation: 2,
+        };
+        let successor_secret = BrokerPaneRecoverySecretV1::from_wire(&[0x36; 32])
+            .expect("construct successor recovery capability");
+        let successor_verifier = successor_secret
+            .verifier(spawn, 2)
+            .expect("derive successor recovery verifier");
+        let handoff_id = id(30_010);
+        let reused_attachment_id = BrokerAttachmentIdentityV1 {
+            attachment_id: initial_attachment.attachment_id,
+            ..successor
+        };
+        assert!(matches!(
+            journal.claim_successor_and_sync(
+                handoff_id,
+                initial_attachment,
+                reused_attachment_id,
+                successor_verifier,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::NonCanonicalRecord)
+        ));
+        let retained_owner = BrokerAttachmentIdentityV1 {
+            owner: initial_owner,
+            ..successor
+        };
+        assert!(matches!(
+            journal.claim_successor_and_sync(
+                handoff_id,
+                initial_attachment,
+                retained_owner,
+                successor_verifier,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::InvalidTransition)
+        ));
+        assert_eq!(
+            journal.status().committed_records,
+            1,
+            "invalid successor identities mutated the durable lease journal"
+        );
+        let claimed = journal
+            .claim_successor_and_sync(
+                handoff_id,
+                initial_attachment,
+                successor,
+                successor_verifier,
+            )
+            .expect("durably commit successor Claim");
+        assert_eq!(claimed.phase, BrokerPaneLeaseWalPhaseV1::SuccessorClaimed);
+        assert_eq!(
+            journal
+                .claim_successor_and_sync(
+                    handoff_id,
+                    initial_attachment,
+                    successor,
+                    successor_verifier,
+                )
+                .expect("recover exact successor Claim reply"),
+            claimed
+        );
+        assert_eq!(journal.status().committed_records, 2);
+
+        let ack_id = id(30_011);
+        let acknowledged = journal
+            .acknowledge_successor_and_sync(
+                handoff_id,
+                ack_id,
+                initial_attachment,
+                successor,
+                successor_verifier,
+            )
+            .expect("durably acknowledge successor Claim");
+        assert_eq!(
+            acknowledged.phase,
+            BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged
+        );
+        assert_eq!(
+            journal
+                .acknowledge_successor_and_sync(
+                    handoff_id,
+                    ack_id,
+                    initial_attachment,
+                    successor,
+                    successor_verifier,
+                )
+                .expect("recover exact successor acknowledgement reply"),
+            acknowledged
+        );
+        let acknowledged_status = journal.status();
+        assert_eq!(acknowledged_status.committed_records, 3);
+        assert_eq!(acknowledged_status.handoff_id, Some(handoff_id));
+        assert_eq!(acknowledged_status.ack_id, Some(ack_id));
+        assert_eq!(acknowledged_status.lease_generation, 2);
+        assert_eq!(acknowledged_status.owner, Some(successor_owner));
+        assert_eq!(acknowledged_status.recovery_verifier, successor_verifier);
+        drop(journal);
+
+        let mut recovered =
+            reopen_test_lease_journal(&wal_path, &head_path, &identity, lease_authenticator);
+        let recovered_status = recovered.status();
+        assert_eq!(
+            recovered_status,
+            BrokerPaneLeaseWalStatusV1 {
+                append_authority_withheld: true,
+                ..acknowledged_status
+            }
+        );
+        let revalidation = revalidate_recovered_test_lease_journal(&recovered);
+        recovered
+            .reconcile_recovered_head_and_activate(revalidation)
+            .expect("activate exact recovered pane-lease WAL/head pair");
+        assert!(!recovered.status().append_authority_withheld);
+        recovered
+            .fence_predecessor_and_sync(successor, 3, successor_verifier)
+            .expect("durably fence acknowledged successor generation");
+        assert_eq!(recovered.status().committed_records, 4);
+        assert_eq!(recovered.status().lease_generation, 3);
+    }
+
+    #[test]
+    fn pane_lease_wal_reconciles_wal_ahead_crash_without_duplicate_transition() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xd2);
+        let spawn = recovered_catalog_identity(&spawn_authenticator, 0x32);
+        let owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: id(31_001),
+            connection_id: id(31_002),
+            mux_incarnation: spawn.mux_incarnation(),
+            mux_build_identity_digest: [0x41; 32],
+            guardian_build_identity_digest: [0x42; 32],
+        };
+        let predecessor = BrokerAttachmentIdentityV1 {
+            broker_incarnation: id(31_003),
+            durable_pane_id: spawn.durable_pane_id(),
+            spawn_effect_id: spawn.spawn_effect_id(),
+            attachment_id: id(31_004),
+            owner,
+            lease_generation: 1,
+        };
+        let predecessor_secret = BrokerPaneRecoverySecretV1::from_wire(&[0x43; 32])
+            .expect("construct predecessor recovery capability");
+        let predecessor_verifier = predecessor_secret
+            .verifier(spawn, 1)
+            .expect("derive predecessor verifier");
+        let identity = BrokerPaneLeaseWalIdentityV1::new(
+            spawn,
+            test_kernel_child(31_005),
+            predecessor,
+            predecessor_verifier,
+        )
+        .expect("construct pane-lease WAL identity");
+        let (mut journal, wal_path, head_path) =
+            create_test_lease_journal(temp.path(), &identity, lease_authenticator.clone());
+        journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.fence_predecessor_and_sync(predecessor, 2, predecessor_verifier),
+            Err(BrokerPaneLeaseWalErrorV1::Io(_))
+        ));
+        assert!(journal.poisoned);
+        drop(journal);
+
+        let mut recovered = reopen_test_lease_journal(
+            &wal_path,
+            &head_path,
+            &identity,
+            lease_authenticator.clone(),
+        );
+        let pending = recovered.status();
+        assert_eq!(
+            pending.phase,
+            Some(BrokerPaneLeaseWalPhaseV1::PredecessorFenced)
+        );
+        assert_eq!(pending.committed_records, 1);
+        assert!(pending.head_reconciliation_required);
+        assert!(pending.append_authority_withheld);
+
+        let successor_owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: id(31_006),
+            connection_id: id(31_007),
+            mux_incarnation: id(31_008),
+            mux_build_identity_digest: [0x44; 32],
+            guardian_build_identity_digest: [0x45; 32],
+        };
+        let successor = BrokerAttachmentIdentityV1 {
+            broker_incarnation: predecessor.broker_incarnation,
+            durable_pane_id: spawn.durable_pane_id(),
+            spawn_effect_id: spawn.spawn_effect_id(),
+            attachment_id: id(31_009),
+            owner: successor_owner,
+            lease_generation: 2,
+        };
+        let successor_secret = BrokerPaneRecoverySecretV1::from_wire(&[0x46; 32])
+            .expect("construct successor recovery capability");
+        let successor_verifier = successor_secret
+            .verifier(spawn, 2)
+            .expect("derive successor verifier");
+        assert!(matches!(
+            recovered.claim_successor_and_sync(
+                id(31_010),
+                predecessor,
+                successor,
+                successor_verifier,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::RecoveryAuthorityUnavailable)
+        ));
+        let revalidation = revalidate_recovered_test_lease_journal(&recovered);
+        recovered
+            .reconcile_recovered_head_and_activate(revalidation)
+            .expect("publish missing pane-lease head anchor");
+        assert!(!recovered.status().append_authority_withheld);
+        recovered
+            .claim_successor_and_sync(id(31_010), predecessor, successor, successor_verifier)
+            .expect("append Claim after exact fence reconciliation");
+        assert_eq!(recovered.status().committed_records, 2);
+        drop(recovered);
+
+        let reopened =
+            reopen_test_lease_journal(&wal_path, &head_path, &identity, lease_authenticator);
+        assert_eq!(reopened.status().committed_records, 2);
+        assert_eq!(
+            reopened.status().phase,
+            Some(BrokerPaneLeaseWalPhaseV1::SuccessorClaimed)
+        );
+    }
+
+    #[test]
+    fn pane_lease_wal_partial_recovered_head_resumes_exact_suffix() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xd6);
+        let spawn = recovered_catalog_identity(&spawn_authenticator, 0x36);
+        let predecessor = BrokerAttachmentIdentityV1 {
+            broker_incarnation: id(31_101),
+            durable_pane_id: spawn.durable_pane_id(),
+            spawn_effect_id: spawn.spawn_effect_id(),
+            attachment_id: id(31_102),
+            owner: BrokerGuardianOwnerIdentity {
+                guardian_incarnation: id(31_103),
+                connection_id: id(31_104),
+                mux_incarnation: spawn.mux_incarnation(),
+                mux_build_identity_digest: [0x47; 32],
+                guardian_build_identity_digest: [0x48; 32],
+            },
+            lease_generation: 1,
+        };
+        let secret = BrokerPaneRecoverySecretV1::from_wire(&[0x49; 32])
+            .expect("construct partial-head recovery capability");
+        let verifier = secret
+            .verifier(spawn, 1)
+            .expect("derive partial-head recovery verifier");
+        let identity = BrokerPaneLeaseWalIdentityV1::new(
+            spawn,
+            test_kernel_child(31_105),
+            predecessor,
+            verifier,
+        )
+        .expect("construct partial-head pane-lease identity");
+        let (mut journal, wal_path, head_path) =
+            create_test_lease_journal(temp.path(), &identity, lease_authenticator.clone());
+        journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
+        assert!(matches!(
+            journal.fence_predecessor_and_sync(predecessor, 2, verifier),
+            Err(BrokerPaneLeaseWalErrorV1::Io(_))
+        ));
+        drop(journal);
+
+        let mut first_recovery = reopen_test_lease_journal(
+            &wal_path,
+            &head_path,
+            &identity,
+            lease_authenticator.clone(),
+        );
+        first_recovery.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::DuringRecoveredHeadWrite);
+        let revalidation = revalidate_recovered_test_lease_journal(&first_recovery);
+        assert!(matches!(
+            first_recovery.reconcile_recovered_head_and_activate(revalidation),
+            Err(BrokerPaneLeaseWalErrorV1::Io(_))
+        ));
+        assert!(first_recovery.poisoned);
+        drop(first_recovery);
+
+        let partial = fs::read(&head_path).expect("read partial pane-lease head evidence");
+        assert_eq!(
+            partial.len(),
+            BROKER_LEASE_WAL_FILE_HEADER_BYTES + 37,
+            "lease recovery did not retain the intended exact head prefix"
+        );
+        let mut resumed = reopen_test_lease_journal(
+            &wal_path,
+            &head_path,
+            &identity,
+            lease_authenticator.clone(),
+        );
+        assert_eq!(
+            resumed.status().tail,
+            BrokerPaneLeaseWalTailV1::Incomplete {
+                wal_trailing_bytes: 0,
+                head_trailing_bytes: 37,
+            }
+        );
+        assert!(resumed.status().head_reconciliation_required);
+        let revalidation = revalidate_recovered_test_lease_journal(&resumed);
+        resumed
+            .reconcile_recovered_head_and_activate(revalidation)
+            .expect("resume only the missing authenticated lease-head suffix");
+        assert!(!resumed.status().append_authority_withheld);
+        assert_eq!(resumed.status().tail, BrokerPaneLeaseWalTailV1::Clean);
+        drop(resumed);
+
+        let completed = fs::read(&head_path).expect("read completed pane-lease head record");
+        assert_eq!(
+            completed.len(),
+            BROKER_LEASE_WAL_FILE_HEADER_BYTES + BROKER_LEASE_HEAD_RECORD_BYTES
+        );
+        assert_eq!(
+            &completed[..partial.len()],
+            partial.as_slice(),
+            "lease recovery rewrote or truncated the already durable head prefix"
+        );
+        let reopened =
+            reopen_test_lease_journal(&wal_path, &head_path, &identity, lease_authenticator);
+        assert!(!reopened.status().head_reconciliation_required);
+        assert_eq!(reopened.status().committed_records, 1);
+    }
+
+    #[test]
+    fn pane_lease_wal_tamper_key_rotation_and_torn_tail_fail_closed() {
+        let temp = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xd3);
+        let spawn = recovered_catalog_identity(&spawn_authenticator, 0x33);
+        let owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: id(32_001),
+            connection_id: id(32_002),
+            mux_incarnation: spawn.mux_incarnation(),
+            mux_build_identity_digest: [0x51; 32],
+            guardian_build_identity_digest: [0x52; 32],
+        };
+        let predecessor = BrokerAttachmentIdentityV1 {
+            broker_incarnation: id(32_003),
+            durable_pane_id: spawn.durable_pane_id(),
+            spawn_effect_id: spawn.spawn_effect_id(),
+            attachment_id: id(32_004),
+            owner,
+            lease_generation: 1,
+        };
+        let secret = BrokerPaneRecoverySecretV1::from_wire(&[0x53; 32])
+            .expect("construct lease recovery capability");
+        let verifier = secret
+            .verifier(spawn, 1)
+            .expect("derive lease recovery verifier");
+        let identity = BrokerPaneLeaseWalIdentityV1::new(
+            spawn,
+            test_kernel_child(32_005),
+            predecessor,
+            verifier,
+        )
+        .expect("construct pane-lease WAL identity");
+        let (mut journal, wal_path, head_path) =
+            create_test_lease_journal(temp.path(), &identity, lease_authenticator.clone());
+        journal
+            .fence_predecessor_and_sync(predecessor, 2, verifier)
+            .expect("commit authenticated lease record");
+        drop(journal);
+
+        let (_, wrong_authenticator) = lease_wal_authenticators(0xd4);
+        assert!(matches!(
+            BrokerPaneLeaseJournalV1::open(
+                open_existing_test_file(&wal_path),
+                open_existing_test_file(&head_path),
+                &identity,
+                wrong_authenticator,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::KeyIdentityMismatch)
+        ));
+
+        let mut tampered = open_existing_test_file(&wal_path);
+        let verifier_offset = BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64 + 208;
+        tampered
+            .seek(SeekFrom::Start(verifier_offset))
+            .expect("seek lease verifier byte");
+        let mut byte = [0_u8; 1];
+        tampered
+            .read_exact(&mut byte)
+            .expect("read lease verifier byte");
+        byte[0] ^= 0x80;
+        tampered
+            .seek(SeekFrom::Start(verifier_offset))
+            .expect("rewind lease verifier byte");
+        tampered
+            .write_all(&byte)
+            .expect("write lease verifier mutation");
+        tampered.sync_all().expect("sync lease verifier mutation");
+        drop(tampered);
+        assert!(matches!(
+            BrokerPaneLeaseJournalV1::open(
+                open_existing_test_file(&wal_path),
+                open_existing_test_file(&head_path),
+                &identity,
+                lease_authenticator,
+            ),
+            Err(BrokerPaneLeaseWalErrorV1::AuthenticationFailed)
+        ));
+
+        let torn = private_catalog_directory();
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xd5);
+        let spawn = recovered_catalog_identity(&spawn_authenticator, 0x35);
+        let torn_predecessor = BrokerAttachmentIdentityV1 {
+            broker_incarnation: id(32_101),
+            durable_pane_id: spawn.durable_pane_id(),
+            spawn_effect_id: spawn.spawn_effect_id(),
+            attachment_id: id(32_102),
+            owner: BrokerGuardianOwnerIdentity {
+                guardian_incarnation: id(32_103),
+                connection_id: id(32_104),
+                mux_incarnation: spawn.mux_incarnation(),
+                mux_build_identity_digest: [0x54; 32],
+                guardian_build_identity_digest: [0x55; 32],
+            },
+            lease_generation: 1,
+        };
+        let torn_secret = BrokerPaneRecoverySecretV1::from_wire(&[0x56; 32])
+            .expect("construct torn-fixture recovery capability");
+        let torn_verifier = torn_secret
+            .verifier(spawn, 1)
+            .expect("derive torn-fixture verifier");
+        let torn_identity = BrokerPaneLeaseWalIdentityV1::new(
+            spawn,
+            test_kernel_child(32_105),
+            torn_predecessor,
+            torn_verifier,
+        )
+        .expect("construct torn-fixture identity");
+        let (mut torn_journal, torn_wal_path, torn_head_path) =
+            create_test_lease_journal(torn.path(), &torn_identity, lease_authenticator.clone());
+        torn_journal
+            .fence_predecessor_and_sync(torn_predecessor, 2, torn_verifier)
+            .expect("commit torn-fixture prefix");
+        drop(torn_journal);
+        let mut external = OpenOptions::new()
+            .append(true)
+            .open(&torn_wal_path)
+            .expect("open torn lease WAL fixture");
+        external
+            .write_all(&BROKER_LEASE_WAL_RECORD_MAGIC[..3])
+            .expect("append incomplete lease record tail");
+        external.sync_all().expect("sync incomplete lease tail");
+        drop(external);
+        let mut recovered = reopen_test_lease_journal(
+            &torn_wal_path,
+            &torn_head_path,
+            &torn_identity,
+            lease_authenticator,
+        );
+        assert_eq!(
+            recovered.status().tail,
+            BrokerPaneLeaseWalTailV1::Incomplete {
+                wal_trailing_bytes: 3,
+                head_trailing_bytes: 0,
+            }
+        );
+        let revalidation = revalidate_recovered_test_lease_journal(&recovered);
+        assert!(matches!(
+            recovered.reconcile_recovered_head_and_activate(revalidation),
+            Err(BrokerPaneLeaseWalErrorV1::IncompleteTail)
+        ));
+        assert_eq!(
+            fs::metadata(&torn_wal_path)
+                .expect("torn lease WAL metadata")
+                .len(),
+            BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64 + BROKER_LEASE_WAL_RECORD_BYTES_U64 + 3,
+            "lease recovery truncated preserved crash evidence"
+        );
     }
 
     #[test]

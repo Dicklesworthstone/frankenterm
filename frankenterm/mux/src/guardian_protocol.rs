@@ -134,6 +134,10 @@ const GUARDIAN_BROKER_SPAWN_WAL_MAC_DOMAIN: &[u8] =
     b"frankenterm.guardian-broker-spawn-wal.hmac.v1\0";
 const GUARDIAN_BROKER_SPAWN_WAL_KEY_ID_DOMAIN: &[u8] =
     b"frankenterm.guardian-broker-spawn-wal.key-id.v1\0";
+const GUARDIAN_BROKER_LEASE_WAL_MAC_DOMAIN: &[u8] =
+    b"frankenterm.guardian-broker-lease-wal.hmac.v1\0";
+const GUARDIAN_BROKER_LEASE_WAL_KEY_ID_DOMAIN: &[u8] =
+    b"frankenterm.guardian-broker-lease-wal.key-id.v1\0";
 const GUARDIAN_BROKER_LINEAGE_ID_DOMAIN: &[u8] = b"frankenterm.guardian-broker-lineage-id.v1\0";
 const GUARDIAN_BROKER_CONTROL_MAC_DOMAIN: &[u8] = b"frankenterm.guardian-broker-control.hmac.v1\0";
 const GUARDIAN_BROKER_CONTROL_KEY_ID_DOMAIN: &[u8] =
@@ -190,6 +194,16 @@ impl GuardianSecret {
         &self,
     ) -> Result<GuardianBrokerSpawnWalAuthenticatorV1, GuardianProtocolError> {
         GuardianBrokerSpawnWalAuthenticatorV1::from_secret(self)
+    }
+
+    /// Derive a separately domain-separated authenticator for durable pane
+    /// lease transitions. Lease records can therefore never be replayed as
+    /// Spawn records even though both authorities descend from the same
+    /// owner-only guardian token.
+    pub fn broker_lease_wal_authenticator(
+        &self,
+    ) -> Result<GuardianBrokerLeaseWalAuthenticatorV1, GuardianProtocolError> {
+        GuardianBrokerLeaseWalAuthenticatorV1::from_secret(self)
     }
 
     /// Derive the broker's request/response-separated control-channel MAC
@@ -292,6 +306,96 @@ impl std::fmt::Debug for GuardianBrokerSpawnWalAuthenticatorV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GuardianBrokerSpawnWalAuthenticatorV1")
+            .field("key_id", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Narrow HMAC authority for the broker's fixed-format pane-lease WAL.
+///
+/// This authority is deliberately distinct from both Spawn durability and
+/// control-frame authentication. It never exposes key bytes and is not
+/// serializable. As with the Spawn authenticator, an authenticated prefix is
+/// not by itself an anti-rollback proof; recovery must validate the paired
+/// durable head before granting append or pane-effect authority.
+#[derive(Clone)]
+pub struct GuardianBrokerLeaseWalAuthenticatorV1 {
+    secret: GuardianSecret,
+    key_id: [u8; 8],
+    lineage_id: Uuid,
+}
+
+impl GuardianBrokerLeaseWalAuthenticatorV1 {
+    fn from_secret(secret: &GuardianSecret) -> Result<Self, GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_LEASE_WAL_KEY_ID_DOMAIN);
+        let digest = mac.finalize().into_bytes();
+        let mut key_id = [0_u8; 8];
+        key_id.copy_from_slice(&digest[..8]);
+        let mut lineage_mac = HmacSha256::new_from_slice(&secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        lineage_mac.update(GUARDIAN_BROKER_LINEAGE_ID_DOMAIN);
+        let lineage_digest = lineage_mac.finalize().into_bytes();
+        let mut lineage_bytes = [0_u8; 16];
+        lineage_bytes.copy_from_slice(&lineage_digest[..16]);
+        let lineage_id = Uuid::from_bytes(lineage_bytes);
+        require_nonzero(lineage_id, "broker lineage identity")?;
+        Ok(Self {
+            secret: secret.clone(),
+            key_id,
+            lineage_id,
+        })
+    }
+
+    /// Nonsecret fingerprint stored in each lease-WAL header.
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; 8] {
+        self.key_id
+    }
+
+    /// Stable token-derived lineage shared with the corresponding Spawn WAL.
+    #[must_use]
+    pub const fn lineage_id(&self) -> Uuid {
+        self.lineage_id
+    }
+
+    /// Authenticate one canonical fixed-size lease-WAL structure.
+    pub fn authenticate(
+        &self,
+        authenticated_bytes: &[u8],
+    ) -> Result<[u8; GUARDIAN_MAC_BYTES], GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_LEASE_WAL_MAC_DOMAIN);
+        mac.update(&self.key_id);
+        mac.update(authenticated_bytes);
+        let output = mac.finalize().into_bytes();
+        let mut tag = [0_u8; GUARDIAN_MAC_BYTES];
+        tag.copy_from_slice(&output);
+        Ok(tag)
+    }
+
+    /// Verify one canonical fixed-size lease-WAL structure in constant time.
+    pub fn verify(
+        &self,
+        authenticated_bytes: &[u8],
+        tag: &[u8],
+    ) -> Result<(), GuardianProtocolError> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret.0)
+            .map_err(|_| GuardianProtocolError::SecretInitializationFailed)?;
+        mac.update(GUARDIAN_BROKER_LEASE_WAL_MAC_DOMAIN);
+        mac.update(&self.key_id);
+        mac.update(authenticated_bytes);
+        mac.verify_slice(tag)
+            .map_err(|_| GuardianProtocolError::AuthenticationFailed)
+    }
+}
+
+impl std::fmt::Debug for GuardianBrokerLeaseWalAuthenticatorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianBrokerLeaseWalAuthenticatorV1")
             .field("key_id", &"[REDACTED]")
             .finish_non_exhaustive()
     }
