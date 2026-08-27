@@ -138,7 +138,7 @@ atomic-component: {}",
 mod mcp;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-mod remote_upgrade_ledger;
+pub(crate) mod remote_upgrade_ledger;
 
 static CLAP_VERSION: LazyLock<String> = LazyLock::new(build_meta::short_version);
 
@@ -6534,7 +6534,7 @@ fn acquire_atomic_path_transition_lock(
         .create_new(true)
         .follow(FollowSymlinks::No)
         .mode(0o600);
-    let (file, created) = match parent.open_with(&name, &create_options) {
+    let (file, created) = match parent.open_with(name, &create_options) {
         Ok(file) => (file, true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let mut open_options = cap_std::fs::OpenOptions::new();
@@ -6542,7 +6542,7 @@ fn acquire_atomic_path_transition_lock(
                 .read(true)
                 .write(true)
                 .follow(FollowSymlinks::No);
-            (parent.open_with(&name, &open_options)?, false)
+            (parent.open_with(name, &open_options)?, false)
         }
         Err(error) => return Err(error).context("cannot create atomic transition lock"),
     };
@@ -6552,7 +6552,7 @@ fn acquire_atomic_path_transition_lock(
         parent_file.sync_all()?;
     }
     let metadata = file.metadata()?;
-    let named = parent.symlink_metadata(&name)?;
+    let named = parent.symlink_metadata(name)?;
     anyhow::ensure!(
         metadata.is_file()
             && named.is_file()
@@ -6571,7 +6571,7 @@ fn acquire_atomic_path_transition_lock(
             anyhow::anyhow!("cannot acquire atomic transition lock: {error}")
         })?;
     let locked_metadata = locked.metadata()?;
-    let named_after = parent.symlink_metadata(&name)?;
+    let named_after = parent.symlink_metadata(name)?;
     anyhow::ensure!(
         locked_metadata.dev() == named_after.dev()
             && locked_metadata.ino() == named_after.ino()
@@ -6841,27 +6841,30 @@ fn atomic_path_hash_node(
     );
 
     let path = Path::new(name);
-    let path_before = parent
-        .symlink_metadata(path)
-        .with_context(|| format!("cannot inspect atomic path entry {:?}", name))?;
+    let path_before = parent.symlink_metadata(path).with_context(|| {
+        format!(
+            "cannot inspect atomic path entry name-bytes-hex {}",
+            hex::encode(name.as_bytes())
+        )
+    })?;
     let metadata_before = AtomicPathObjectMetadata::from_cap_metadata(&path_before)?;
     anyhow::ensure!(
         metadata_before.uid == nix::unistd::geteuid().as_raw(),
-        "atomic path entry {:?} is not owned by the effective user",
-        name
+        "atomic path entry name-bytes-hex {} is not owned by the effective user",
+        hex::encode(name.as_bytes())
     );
     if metadata_before.object_kind != "symlink" {
         anyhow::ensure!(
             metadata_before.mode & 0o022 == 0,
-            "atomic path entry {:?} is group- or world-writable",
-            name
+            "atomic path entry name-bytes-hex {} is group- or world-writable",
+            hex::encode(name.as_bytes())
         );
     }
     if metadata_before.object_kind != "directory" {
         anyhow::ensure!(
             metadata_before.hard_link_count == 1,
-            "atomic path non-directory entry {:?} must have exactly one hard link",
-            name
+            "atomic path non-directory entry name-bytes-hex {} must have exactly one hard link",
+            hex::encode(name.as_bytes())
         );
     }
     atomic_path_hash_metadata(hasher, &metadata_before);
@@ -6872,14 +6875,17 @@ fn atomic_path_hash_node(
         "regular-file" => {
             let mut options = cap_std::fs::OpenOptions::new();
             options.read(true).follow(FollowSymlinks::No);
-            let mut file = parent
-                .open_with(path, &options)
-                .with_context(|| format!("cannot open atomic path file {:?}", name))?;
+            let mut file = parent.open_with(path, &options).with_context(|| {
+                format!(
+                    "cannot open atomic path file name-bytes-hex {}",
+                    hex::encode(name.as_bytes())
+                )
+            })?;
             let opened = AtomicPathObjectMetadata::from_cap_metadata(&file.metadata()?)?;
             anyhow::ensure!(
                 opened == metadata_before,
-                "atomic path file {:?} changed while it was opened",
-                name
+                "atomic path file name-bytes-hex {} changed while it was opened",
+                hex::encode(name.as_bytes())
             );
             let mut buffer = [0_u8; 64 * 1024];
             loop {
@@ -6894,32 +6900,38 @@ fn atomic_path_hash_node(
                 AtomicPathObjectMetadata::from_cap_metadata(&parent.symlink_metadata(path)?)?;
             anyhow::ensure!(
                 handle_after == metadata_before && path_after == metadata_before,
-                "atomic path file {:?} changed while its bytes were hashed",
-                name
+                "atomic path file name-bytes-hex {} changed while its bytes were hashed",
+                hex::encode(name.as_bytes())
             );
         }
         "symlink" => {
-            let target = parent
-                .read_link(path)
-                .with_context(|| format!("cannot read atomic path symlink {:?}", name))?;
+            let target = parent.read_link(path).with_context(|| {
+                format!(
+                    "cannot read atomic path symlink name-bytes-hex {}",
+                    hex::encode(name.as_bytes())
+                )
+            })?;
             atomic_path_hash_bounded_bytes(hasher, budget, target.as_os_str().as_bytes())?;
             let path_after =
                 AtomicPathObjectMetadata::from_cap_metadata(&parent.symlink_metadata(path)?)?;
             anyhow::ensure!(
                 path_after == metadata_before,
-                "atomic path symlink {:?} changed while its target was hashed",
-                name
+                "atomic path symlink name-bytes-hex {} changed while its target was hashed",
+                hex::encode(name.as_bytes())
             );
         }
         "directory" => {
-            let directory = parent
-                .open_dir_nofollow(path)
-                .with_context(|| format!("cannot open atomic path directory {:?}", name))?;
+            let directory = parent.open_dir_nofollow(path).with_context(|| {
+                format!(
+                    "cannot open atomic path directory name-bytes-hex {}",
+                    hex::encode(name.as_bytes())
+                )
+            })?;
             let opened = AtomicPathObjectMetadata::from_cap_metadata(&directory.dir_metadata()?)?;
             anyhow::ensure!(
                 opened == metadata_before,
-                "atomic path directory {:?} changed while it was opened",
-                name
+                "atomic path directory name-bytes-hex {} changed while it was opened",
+                hex::encode(name.as_bytes())
             );
             let mut names = Vec::new();
             let mut enumerated_name_bytes = 0_u64;
@@ -6972,8 +6984,8 @@ fn atomic_path_hash_node(
                 AtomicPathObjectMetadata::from_cap_metadata(&parent.symlink_metadata(path)?)?;
             anyhow::ensure!(
                 handle_after == metadata_before && path_after == metadata_before,
-                "atomic path directory {:?} changed while its tree was hashed",
-                name
+                "atomic path directory name-bytes-hex {} changed while its tree was hashed",
+                hex::encode(name.as_bytes())
             );
         }
         _ => unreachable!("object kind was validated above"),
@@ -7053,25 +7065,25 @@ fn inspect_atomic_path_content_id(_parent: &Path, _name: &str) -> anyhow::Result
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn atomic_path_transition_is_before(
     claim: &AtomicPathTransitionClaim,
-    stage: &Option<AtomicPathObjectIdentity>,
-    target: &Option<AtomicPathObjectIdentity>,
+    stage: Option<&AtomicPathObjectIdentity>,
+    target: Option<&AtomicPathObjectIdentity>,
 ) -> bool {
-    stage.as_ref() == Some(&claim.stage_before) && target == &claim.target_before
+    stage == Some(&claim.stage_before) && target == claim.target_before.as_ref()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn atomic_path_transition_is_after(
     claim: &AtomicPathTransitionClaim,
-    stage: &Option<AtomicPathObjectIdentity>,
-    target: &Option<AtomicPathObjectIdentity>,
+    stage: Option<&AtomicPathObjectIdentity>,
+    target: Option<&AtomicPathObjectIdentity>,
     operation: AtomicPathTransitionOperation,
 ) -> bool {
     match operation {
         AtomicPathTransitionOperation::PublishNoreplace => {
-            stage.is_none() && target.as_ref() == Some(&claim.stage_before)
+            stage.is_none() && target == Some(&claim.stage_before)
         }
         AtomicPathTransitionOperation::Exchange => {
-            stage == &claim.target_before && target.as_ref() == Some(&claim.stage_before)
+            stage == claim.target_before.as_ref() && target == Some(&claim.stage_before)
         }
     }
 }
@@ -7247,8 +7259,10 @@ where
     let ack = read_atomic_path_transition_json::<AtomicPathTransitionAck>(&parent_dir, &ack_name)?;
     let stage_now = atomic_path_entry_identity(&parent_dir, stage_name)?;
     let target_now = atomic_path_entry_identity(&parent_dir, target_name)?;
-    let is_before = atomic_path_transition_is_before(&claim, &stage_now, &target_now);
-    let is_after = atomic_path_transition_is_after(&claim, &stage_now, &target_now, operation);
+    let is_before =
+        atomic_path_transition_is_before(&claim, stage_now.as_ref(), target_now.as_ref());
+    let is_after =
+        atomic_path_transition_is_after(&claim, stage_now.as_ref(), target_now.as_ref(), operation);
 
     if let Some((ack, _)) = ack {
         validate_ack(&ack)?;
@@ -7270,10 +7284,13 @@ where
         let stage_revalidated = atomic_path_entry_identity(&parent_dir, stage_name)?;
         let target_revalidated = atomic_path_entry_identity(&parent_dir, target_name)?;
         anyhow::ensure!(
-            atomic_path_transition_is_before(&claim, &stage_revalidated, &target_revalidated)
-                && stage_revalidated
-                    .as_ref()
-                    .is_some_and(|stage| stage.fully_sealed),
+            atomic_path_transition_is_before(
+                &claim,
+                stage_revalidated.as_ref(),
+                target_revalidated.as_ref(),
+            ) && stage_revalidated
+                .as_ref()
+                .is_some_and(|stage| stage.fully_sealed),
             "atomic path transition authority changed immediately before the effect"
         );
         let flags = match operation {
@@ -7309,7 +7326,12 @@ where
     let stage_after = atomic_path_entry_identity(&parent_dir, stage_name)?;
     let target_after = atomic_path_entry_identity(&parent_dir, target_name)?;
     anyhow::ensure!(
-        atomic_path_transition_is_after(&claim, &stage_after, &target_after, operation),
+        atomic_path_transition_is_after(
+            &claim,
+            stage_after.as_ref(),
+            target_after.as_ref(),
+            operation,
+        ),
         "atomic path transition did not produce the exact claimed post-effect authority"
     );
 
@@ -8041,7 +8063,7 @@ enum SessionCommands {
         #[arg(long, short = 'o', value_name = "PATH")]
         output: PathBuf,
 
-        /// Maximum number of panes admitted to one compatible-client dump
+        /// Maximum robot-state projections admitted; unique pane targets may be fewer
         #[arg(long, default_value_t = 1024)]
         max_panes: usize,
 
@@ -8049,7 +8071,7 @@ enum SessionCommands {
         #[arg(long, default_value_t = 67_108_864)]
         max_total_bytes: usize,
 
-        /// Pane IDs requested per compatible-client subprocess
+        /// Unique pane IDs requested per compatible-client subprocess
         #[arg(long, default_value_t = 8)]
         batch_size: usize,
 
@@ -8057,7 +8079,7 @@ enum SessionCommands {
         #[arg(long, default_value_t = 30)]
         batch_timeout_secs: u64,
 
-        /// Maximum retained stdout bytes from one pane batch
+        /// Maximum retained stdout bytes from one pane batch (minimum 16384)
         #[arg(long, default_value_t = 33_554_432)]
         max_batch_output_bytes: usize,
 
@@ -76735,9 +76757,11 @@ async fn handle_session_command(
             let result = serde_json::json!({
                 "ok": published.complete || allow_partial,
                 "action": "dump",
+                "schema": &published.schema,
                 "complete": published.complete,
                 "path": output_path.display().to_string(),
                 "pane_count": published.pane_count,
+                "projection_count": published.projection_count,
                 "domain_pane_counts": &published.domain_pane_counts,
                 "error_count": published.error_count,
                 "payload_sha256": &published.payload_sha256,
@@ -76746,12 +76770,16 @@ async fn handle_session_command(
                 "durability": published.durability,
                 "publication_recovered_existing": published.recovered_existing,
                 "redaction_applied": true,
+                "executable_restore_image": published.executable_restore_image,
+                "production_mux_activation": false,
             });
             if !print_snapshot_session_structured_output(&result, output_format)? {
                 println!("Mux content dump written");
                 println!("  File:     {}", output_path.display());
+                println!("  Schema:   {}", published.schema);
                 println!("  Complete: {}", published.complete);
                 println!("  Panes:    {}", published.pane_count);
+                println!("  Projections: {}", published.projection_count);
                 println!("  Domain panes: {:?}", published.domain_pane_counts);
                 println!("  Errors:   {}", published.error_count);
                 println!("  Payload SHA-256:  {}", published.payload_sha256);
@@ -76761,6 +76789,11 @@ async fn handle_session_command(
                     published.recovered_existing
                 );
                 println!("  Content:  redacted");
+                println!(
+                    "  Executable restore:   {}",
+                    published.executable_restore_image
+                );
+                println!("  Mux activation:       disabled");
             }
             if !published.complete && !allow_partial {
                 anyhow::bail!(
@@ -77304,6 +77337,7 @@ const COMPATIBLE_CLIENT_DUMP_MAX_PANES: usize = 1_024;
 const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE: usize = 64;
 const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT: Duration = Duration::from_secs(120);
 const COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(7_200);
+const COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES: usize = 16 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_STATE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES: usize = 1024 * 1024;
@@ -77351,6 +77385,7 @@ struct MuxDumpVerificationReceipt {
     capture_complete: bool,
     executable_restore_image: bool,
     pane_count: usize,
+    projection_count: usize,
     domain_pane_counts: BTreeMap<String, usize>,
     error_count: usize,
     content_bytes: usize,
@@ -77394,9 +77429,11 @@ struct CompatibleClientDumpRequest {
 #[derive(Debug)]
 struct CompatibleClientDumpReceipt {
     path: PathBuf,
+    schema: String,
     recovery_environment_path: Option<PathBuf>,
     recovery_environment_path_sha256: String,
     pane_count: usize,
+    projection_count: usize,
     domain_pane_counts: BTreeMap<String, usize>,
     content_bytes: usize,
     payload_sha256: String,
@@ -77418,8 +77455,11 @@ struct CompatibleClientDumpReceipt {
 
 #[derive(Debug)]
 struct PublishedMuxDumpReceipt {
+    schema: String,
     complete: bool,
+    executable_restore_image: bool,
     pane_count: usize,
+    projection_count: usize,
     domain_pane_counts: BTreeMap<String, usize>,
     error_count: usize,
     content_bytes: usize,
@@ -77428,6 +77468,7 @@ struct PublishedMuxDumpReceipt {
     artifact_bytes: u64,
     durability: &'static str,
     recovered_existing: bool,
+    compatible_client: Option<VerifiedCompatibleClientDumpContract>,
 }
 
 #[cfg(unix)]
@@ -77537,11 +77578,39 @@ struct CompatibleClientPaneState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CompatibleClientRawPaneTopology {
+struct CompatibleClientContentTargetState {
     pane_id: u64,
     pane_uuid: Option<String>,
-    tab_id: u64,
+    domain: String,
+    title: Option<String>,
+    cwd: Option<String>,
+    observed: bool,
+    ignore_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct CompatibleClientPaneProjection {
     window_id: u64,
+    tab_id: u64,
+    pane_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompatibleClientAliasAwareCensus {
+    content_targets: BTreeMap<u64, CompatibleClientContentTargetState>,
+    projections: Vec<CompatibleClientPaneProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompatibleClientRawPaneTopology {
+    content_targets: Vec<CompatibleClientRawContentTargetTopology>,
+    projections: Vec<CompatibleClientPaneProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompatibleClientRawContentTargetTopology {
+    pane_id: u64,
+    pane_uuid: Option<String>,
     domain: String,
 }
 
@@ -77653,6 +77722,32 @@ fn compatible_client_batch_timeout_ms(
         .map_err(|_| anyhow::anyhow!("compatible-client batch timeout does not fit milliseconds"))
 }
 
+fn compatible_client_derived_total_deadline_ms(
+    unique_content_targets: usize,
+    batch_size: usize,
+    batch_timeout_ms: u64,
+) -> anyhow::Result<u128> {
+    anyhow::ensure!(
+        unique_content_targets > 0 && batch_size > 0 && batch_timeout_ms > 0,
+        "compatible-client deadline inputs must be non-zero"
+    );
+    let batch_count = unique_content_targets.div_ceil(batch_size);
+    let stage_count = batch_count
+        .checked_add(2)
+        .ok_or_else(|| anyhow::anyhow!("compatible-client deadline stage count overflow"))?;
+    let stage_count = u128::try_from(stage_count)
+        .map_err(|_| anyhow::anyhow!("compatible-client deadline stage count is not portable"))?;
+    let total_timeout_ms = u128::from(batch_timeout_ms)
+        .checked_mul(stage_count)
+        .ok_or_else(|| anyhow::anyhow!("compatible-client total deadline overflow"))?;
+    anyhow::ensure!(
+        total_timeout_ms <= COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT.as_millis(),
+        "pane count, batch size, and per-batch timeout derive a total deadline above {} seconds",
+        COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT.as_secs()
+    );
+    Ok(total_timeout_ms)
+}
+
 #[cfg(unix)]
 fn validate_compatible_client_dump_request(
     request: &CompatibleClientDumpRequest,
@@ -77688,15 +77783,20 @@ fn validate_compatible_client_dump_request(
         "--batch-timeout-secs must be in 1..={} seconds",
         COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT.as_secs()
     );
+    let batch_timeout_ms = compatible_client_batch_timeout_ms(request)?;
     anyhow::ensure!(
-        (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES)
+        batch_timeout_ms >= 1_000 && batch_timeout_ms % 1_000 == 0,
+        "--batch-timeout-secs must represent a positive whole number of seconds"
+    );
+    anyhow::ensure!(
+        (COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES
+            ..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES)
             .contains(&request.max_batch_output_bytes),
-        "--max-batch-output-bytes must be in 1..={COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES}"
+        "--max-batch-output-bytes must be in {COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES}..={COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES}"
     );
     let _ = compatible_client_path_parts(&request.client, "compatible client source")?;
     let _ = compatible_client_path_parts(&request.mux_socket, "compatible mux socket")?;
     let _ = compatible_client_path_parts(&request.output, "compatible-client dump output")?;
-    let _ = compatible_client_batch_timeout_ms(request)?;
     Ok(())
 }
 
@@ -77927,7 +78027,7 @@ fn create_compatible_client_environment(
     anyhow::ensure!(
         parent_metadata.is_dir()
             && parent_metadata.uid() == effective_uid
-            && parent_mode & 0o077 == 0,
+            && parent_mode.trailing_zeros() >= 6,
         "compatible-client output parent must be a private effective-user-owned directory"
     );
     let temporary = tempfile::Builder::new()
@@ -77942,7 +78042,7 @@ fn create_compatible_client_environment(
     anyhow::ensure!(
         root_metadata.is_dir()
             && root_metadata.uid() == effective_uid
-            && root_metadata.permissions().mode() & 0o077 == 0,
+            && root_metadata.permissions().mode().trailing_zeros() >= 6,
         "compatible-client recovery environment is not a private effective-user-owned directory"
     );
     revalidate_artifact_parent_directory(&output_parent_path, &output_parent)?;
@@ -78300,9 +78400,13 @@ where
 
 fn compatible_client_state_json_limits(max_panes: usize) -> JsonStructureLimits {
     JsonStructureLimits {
-        max_nodes: max_panes.saturating_mul(16).saturating_add(32),
+        // The exact v0.13 row has nine map entries when ignore_reason is
+        // present: one object node plus one key and one value node per entry.
+        // Keep explicit headroom for the nine-field Robot envelope and the
+        // data sequence without making the declared projection bound lie.
+        max_nodes: max_panes.saturating_mul(24).saturating_add(64),
         max_map_entries: max_panes.saturating_mul(10).saturating_add(16),
-        max_sequence_entries: max_panes.saturating_add(4),
+        max_sequence_entries: max_panes,
         max_string_bytes: COMPATIBLE_CLIENT_DUMP_MAX_STATE_OUTPUT_BYTES as u64,
         max_depth: 8,
     }
@@ -78324,17 +78428,23 @@ fn compatible_client_batch_json_limits(
 fn validate_compatible_client_state(
     mut panes: Vec<CompatibleClientPaneState>,
     max_panes: usize,
-) -> anyhow::Result<Vec<CompatibleClientPaneState>> {
+) -> anyhow::Result<CompatibleClientAliasAwareCensus> {
     anyhow::ensure!(
         !panes.is_empty() && panes.len() <= max_panes,
-        "compatible-client census pane count is outside the requested bound"
+        "compatible-client census projection count is outside the requested bound"
     );
     panes.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
-    let mut pane_ids = BTreeSet::new();
-    for pane in &panes {
+    let mut content_targets = BTreeMap::new();
+    let mut projections = Vec::with_capacity(panes.len());
+    for pane in panes {
+        let projection = CompatibleClientPaneProjection {
+            window_id: pane.window_id,
+            tab_id: pane.tab_id,
+            pane_id: pane.pane_id,
+        };
         anyhow::ensure!(
-            pane_ids.insert(pane.pane_id),
-            "compatible-client census contains a duplicate pane identity"
+            projections.last().copied() != Some(projection),
+            "compatible-client census contains a duplicate pane projection"
         );
         anyhow::ensure!(
             !pane.domain.is_empty()
@@ -78367,23 +78477,60 @@ fn validate_compatible_client_state(
                 "compatible-client census observed flag contradicts its ignore reason"
             );
         }
+        let target = CompatibleClientContentTargetState {
+            pane_id: pane.pane_id,
+            pane_uuid: pane.pane_uuid,
+            domain: pane.domain,
+            title: pane.title,
+            cwd: pane.cwd,
+            observed: pane.observed,
+            ignore_reason: pane.ignore_reason,
+        };
+        if let Some(existing) = content_targets.get(&target.pane_id) {
+            anyhow::ensure!(
+                existing == &target,
+                "compatible-client census contains conflicting metadata for one pane identity"
+            );
+        } else {
+            content_targets.insert(target.pane_id, target);
+        }
+        projections.push(projection);
     }
-    Ok(panes)
+    Ok(CompatibleClientAliasAwareCensus {
+        content_targets,
+        projections,
+    })
 }
 
 fn compatible_client_raw_topology(
-    panes: &[CompatibleClientPaneState],
-) -> Vec<CompatibleClientRawPaneTopology> {
-    panes
-        .iter()
-        .map(|pane| CompatibleClientRawPaneTopology {
-            pane_id: pane.pane_id,
-            pane_uuid: pane.pane_uuid.clone(),
-            tab_id: pane.tab_id,
-            window_id: pane.window_id,
-            domain: pane.domain.clone(),
+    census: &CompatibleClientAliasAwareCensus,
+) -> CompatibleClientRawPaneTopology {
+    let content_targets = census
+        .content_targets
+        .values()
+        .map(|target| CompatibleClientRawContentTargetTopology {
+            pane_id: target.pane_id,
+            pane_uuid: target.pane_uuid.clone(),
+            domain: target.domain.clone(),
         })
-        .collect()
+        .collect();
+    CompatibleClientRawPaneTopology {
+        content_targets,
+        projections: census.projections.clone(),
+    }
+}
+
+#[derive(Serialize)]
+struct CompatibleClientProjectedContentTargetTopology<'a> {
+    pane_id: u64,
+    pane_uuid: Option<std::borrow::Cow<'a, str>>,
+    domain_name: std::borrow::Cow<'a, str>,
+}
+
+#[derive(Serialize)]
+struct CompatibleClientProjectedTopology<'a> {
+    content_targets: Vec<CompatibleClientProjectedContentTargetTopology<'a>>,
+    projections: &'a [CompatibleClientPaneProjection],
 }
 
 #[derive(Serialize)]
@@ -78396,7 +78543,7 @@ struct CompatibleClientProjectedPaneTopology<'a> {
 }
 
 fn hash_compatible_client_projected_topology(
-    topology: &[CompatibleClientProjectedPaneTopology<'_>],
+    topology: &CompatibleClientProjectedTopology<'_>,
 ) -> anyhow::Result<String> {
     let (_bytes, fingerprint) = hash_json_bounded(
         &topology,
@@ -78409,25 +78556,40 @@ fn hash_compatible_client_projected_topology(
     Ok(fingerprint)
 }
 
+fn hash_compatible_client_projected_pane_topology(
+    topology: &[CompatibleClientProjectedPaneTopology<'_>],
+) -> anyhow::Result<String> {
+    let (_bytes, fingerprint) = hash_json_bounded(
+        &topology,
+        LIVE_MUX_DUMP_MAX_TOPOLOGY_BYTES,
+        JsonSerializationStyle::Compact,
+    )
+    .context(
+        "Failed to fingerprint compatible-client v1 projected topology within its safety limit",
+    )?;
+    Ok(fingerprint)
+}
+
 fn compatible_client_projected_topology_fingerprint(
-    panes: &[CompatibleClientPaneState],
+    census: &CompatibleClientAliasAwareCensus,
     redactor: &frankenterm_core::redactor::Redactor,
 ) -> anyhow::Result<String> {
-    let mut topology = panes
-        .iter()
-        .map(|pane| CompatibleClientProjectedPaneTopology {
-            pane_id: pane.pane_id,
-            pane_uuid: pane
+    let content_targets = census
+        .content_targets
+        .values()
+        .map(|target| CompatibleClientProjectedContentTargetTopology {
+            pane_id: target.pane_id,
+            pane_uuid: target
                 .pane_uuid
                 .as_deref()
                 .map(|value| std::borrow::Cow::Owned(redactor.redact(value))),
-            tab_id: pane.tab_id,
-            window_id: pane.window_id,
-            domain_name: std::borrow::Cow::Owned(redactor.redact(&pane.domain)),
+            domain_name: std::borrow::Cow::Owned(redactor.redact(&target.domain)),
         })
         .collect::<Vec<_>>();
-    topology.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
-    hash_compatible_client_projected_topology(&topology)
+    hash_compatible_client_projected_topology(&CompatibleClientProjectedTopology {
+        content_targets,
+        projections: &census.projections,
+    })
 }
 
 fn compatible_client_projected_topology_fingerprint_from_records(
@@ -78471,7 +78633,73 @@ fn compatible_client_projected_topology_fingerprint_from_records(
         });
     }
     topology.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
-    hash_compatible_client_projected_topology(&topology)
+    hash_compatible_client_projected_pane_topology(&topology)
+}
+
+fn compatible_client_projected_topology_fingerprint_from_v2_records(
+    content_target_records: &[serde_json::Value],
+    projection_records: &[serde_json::Value],
+) -> anyhow::Result<String> {
+    let mut content_targets = Vec::with_capacity(content_target_records.len());
+    for content_target_record in content_target_records {
+        let target = content_target_record
+            .get("target")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Compatible-client v2 content-target metadata is missing")
+            })?;
+        let pane_id = target
+            .get("pane_id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Compatible-client v2 content-target pane_id is invalid")
+            })?;
+        let pane_uuid = match target.get("pane_uuid") {
+            Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if !value.is_empty() => {
+                Some(std::borrow::Cow::Borrowed(value.as_str()))
+            }
+            _ => anyhow::bail!("Compatible-client v2 content-target pane_uuid is invalid"),
+        };
+        let domain_name = target
+            .get("domain_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Compatible-client v2 content-target domain_name is invalid")
+            })?;
+        content_targets.push(CompatibleClientProjectedContentTargetTopology {
+            pane_id,
+            pane_uuid,
+            domain_name: std::borrow::Cow::Borrowed(domain_name),
+        });
+    }
+    content_targets.sort_by_key(|target| target.pane_id);
+
+    let mut projections = Vec::with_capacity(projection_records.len());
+    for projection in projection_records {
+        let projection = projection.as_object().ok_or_else(|| {
+            anyhow::anyhow!("Compatible-client v2 pane projection is not an object")
+        })?;
+        let required_u64 = |field: &'static str| {
+            projection
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Compatible-client v2 projection field {field} is invalid")
+                })
+        };
+        projections.push(CompatibleClientPaneProjection {
+            window_id: required_u64("window_id")?,
+            tab_id: required_u64("tab_id")?,
+            pane_id: required_u64("pane_id")?,
+        });
+    }
+    projections.sort_unstable();
+    hash_compatible_client_projected_topology(&CompatibleClientProjectedTopology {
+        content_targets,
+        projections: &projections,
+    })
 }
 
 fn account_compatible_client_subprocess(
@@ -78655,7 +78883,7 @@ async fn capture_compatible_client_dump(
     let version = parse_compatible_client_version(&version_receipt.stdout)?;
 
     let capture_started_at = Instant::now();
-    let census_a_receipt = run_compatible_client_subprocess(
+    let initial_census_receipt = run_compatible_client_subprocess(
         cx,
         &mut source,
         &mut executable,
@@ -78666,33 +78894,27 @@ async fn capture_compatible_client_dump(
         request.batch_timeout,
     )
     .await?;
-    account_compatible_client_subprocess(&mut accounting, &census_a_receipt)?;
+    account_compatible_client_subprocess(&mut accounting, &initial_census_receipt)?;
     let census_a = parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
-        &census_a_receipt.stdout,
+        &initial_census_receipt.stdout,
         compatible_client_state_json_limits(request.max_panes),
     )?;
     let census_a = validate_compatible_client_state(census_a, request.max_panes)?;
     let raw_topology_a = compatible_client_raw_topology(&census_a);
-    let batch_count = census_a.len().div_ceil(request.batch_size);
-    let stage_count = batch_count
-        .checked_add(2)
-        .and_then(|count| u32::try_from(count).ok())
-        .ok_or_else(|| anyhow::anyhow!("compatible-client deadline stage count overflow"))?;
-    let total_timeout = request
-        .batch_timeout
-        .checked_mul(stage_count)
-        .filter(|timeout| *timeout <= COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "pane count, batch size, and per-batch timeout derive a total deadline above {} seconds",
-                COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT.as_secs()
-            )
-        })?;
+    let total_timeout_ms = compatible_client_derived_total_deadline_ms(
+        census_a.content_targets.len(),
+        request.batch_size,
+        compatible_client_batch_timeout_ms(request)?,
+    )?;
+    let total_timeout = Duration::from_millis(
+        u64::try_from(total_timeout_ms)
+            .map_err(|_| anyhow::anyhow!("compatible-client total deadline does not fit u64"))?,
+    );
 
     let redactor = frankenterm_core::redactor::Redactor::new();
     let mut pane_text = BTreeMap::new();
     let mut total_content_bytes = 0usize;
-    let pane_ids = census_a.iter().map(|pane| pane.pane_id).collect::<Vec<_>>();
+    let pane_ids = census_a.content_targets.keys().copied().collect::<Vec<_>>();
     for batch in pane_ids.chunks(request.batch_size) {
         let timeout = compatible_client_remaining_timeout(
             capture_started_at,
@@ -78734,7 +78956,7 @@ async fn capture_compatible_client_dump(
         total_timeout,
         request.batch_timeout,
     )?;
-    let census_b_receipt = run_compatible_client_subprocess(
+    let final_census_receipt = run_compatible_client_subprocess(
         cx,
         &mut source,
         &mut executable,
@@ -78745,9 +78967,9 @@ async fn capture_compatible_client_dump(
         final_timeout,
     )
     .await?;
-    account_compatible_client_subprocess(&mut accounting, &census_b_receipt)?;
+    account_compatible_client_subprocess(&mut accounting, &final_census_receipt)?;
     let census_b = parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
-        &census_b_receipt.stdout,
+        &final_census_receipt.stdout,
         compatible_client_state_json_limits(request.max_panes),
     )?;
     let census_b = validate_compatible_client_state(census_b, request.max_panes)?;
@@ -78757,47 +78979,38 @@ async fn capture_compatible_client_dump(
         "compatible-client raw pane topology changed between censuses"
     );
     anyhow::ensure!(
-        pane_text.len() == census_a.len(),
+        pane_text.len() == census_a.content_targets.len(),
         "compatible-client per-pane outcomes do not cover the census exactly once"
     );
 
     let mut domains = BTreeSet::new();
-    let mut pane_records = Vec::with_capacity(census_a.len());
+    let mut content_target_records = Vec::with_capacity(census_a.content_targets.len());
     let topology_sha256 = compatible_client_projected_topology_fingerprint(&census_a, &redactor)?;
     anyhow::ensure!(
         topology_sha256 == compatible_client_projected_topology_fingerprint(&census_b, &redactor)?,
         "compatible-client projected pane topology changed between censuses"
     );
-    for pane in &census_a {
-        let text = pane_text.remove(&pane.pane_id).ok_or_else(|| {
+    for target in census_a.content_targets.values() {
+        let text = pane_text.remove(&target.pane_id).ok_or_else(|| {
             anyhow::anyhow!("compatible-client pane outcome is missing after exact accounting")
         })?;
-        let domain_name = redactor.redact(&pane.domain);
+        let domain_name = redactor.redact(&target.domain);
         domains.insert(domain_name.clone());
         let text_sha256 = sha256_hex(text.as_bytes());
-        pane_records.push(serde_json::json!({
-            "pane": {
-                "pane_id": pane.pane_id,
-                "pane_uuid": pane.pane_uuid.as_deref().map(|value| redactor.redact(value)),
-                "tab_id": pane.tab_id,
-                "window_id": pane.window_id,
-                "domain_id": null,
+        content_target_records.push(serde_json::json!({
+            "target": {
+                "pane_id": target.pane_id,
+                "pane_uuid": target.pane_uuid.as_deref().map(|value| redactor.redact(value)),
                 "domain_name": domain_name,
                 "domain_identity_authority": "v0_13_robot_state_domain_field",
                 "identity_stability": "v0_13_projected_ephemeral_no_incarnation_authority",
-                "workspace": null,
-                "rows": 0,
-                "cols": 0,
-                "title": pane.title.as_deref().map(|value| redactor.redact(value)),
-                "cwd": pane.cwd.as_deref().map(|value| redactor.redact(value)),
-                "tty_name": null,
-                "cursor_x": null,
-                "cursor_y": null,
-                "cursor_visibility": null,
-                "left_col": null,
-                "top_row": null,
-                "is_active": false,
-                "is_zoomed": false,
+                "title": target.title.as_deref().map(|value| redactor.redact(value)),
+                "cwd": target.cwd.as_deref().map(|value| redactor.redact(value)),
+                "observed": target.observed,
+                "ignore_reason": target
+                    .ignore_reason
+                    .as_deref()
+                    .map(|value| redactor.redact(value)),
             },
             "content": {
                 "encoding": "utf-8",
@@ -78813,17 +79026,30 @@ async fn capture_compatible_client_dump(
         pane_text.is_empty(),
         "compatible-client pane outcome inventory is inconsistent"
     );
+    let projection_records = census_a
+        .projections
+        .iter()
+        .map(|projection| {
+            serde_json::json!({
+                "window_id": projection.window_id,
+                "tab_id": projection.tab_id,
+                "pane_id": projection.pane_id,
+            })
+        })
+        .collect::<Vec<_>>();
     anyhow::ensure!(
-        compatible_client_projected_topology_fingerprint_from_records(&pane_records)?
-            == topology_sha256,
-        "compatible-client pane records do not preserve the projected topology fingerprint"
+        compatible_client_projected_topology_fingerprint_from_v2_records(
+            &content_target_records,
+            &projection_records,
+        )? == topology_sha256,
+        "compatible-client v2 records do not preserve the projected topology fingerprint"
     );
     let mut initial_pane_ids = pane_ids;
     initial_pane_ids.sort_unstable();
     let source_identity = compatible_client_identity_value(&source.identity, Some(&source.sha256));
     let socket_identity = compatible_client_identity_value(&socket.identity, None);
     let payload = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at_epoch_ms": u64::try_from(now_epoch_ms()).unwrap_or(0),
         "source": {
             "kind": "live_mux",
@@ -78843,10 +79069,10 @@ async fn capture_compatible_client_dump(
         },
         "complete": true,
         "completeness_semantics": {
-            "meaning": "every initially listed v0.13 robot-state pane was read within limits and a second census matched pane_id, optional pane_uuid, tab_id, window_id, and raw domain; no authoritative mux incarnation or topology revision was available",
+            "meaning": "every unique numeric pane_id reported by the initial v0.13 robot-state census was requested exactly once and returned one untruncated outcome, every window/tab projection reported by both censuses was retained, and a second census matched pane_id, optional pane_uuid, raw domain, and every window/tab projection; no authoritative mux incarnation or topology revision was available",
             "point_in_time_content_snapshot": false,
-            "pane_content_consistency": "sequential_best_effort_non_atomic",
-            "topology_consistency": "v0_13_robot_state_double_census_projected_fields",
+            "pane_content_consistency": "sequential_subprocess_batches_with_bounded_concurrent_pane_reads_best_effort_non_atomic",
+            "topology_consistency": "v0_13_robot_state_double_census_alias_aware",
         },
         "capabilities": {
             "forensic_text_export": true,
@@ -78867,16 +79093,19 @@ async fn capture_compatible_client_dump(
             "max_batch_output_bytes": request.max_batch_output_bytes,
         },
         "summary": {
-            "panes_listed_initial": census_a.len(),
-            "panes_listed_final": census_b.len(),
-            "panes_captured": pane_records.len(),
+            "content_targets_listed_initial": census_a.content_targets.len(),
+            "content_targets_listed_final": census_b.content_targets.len(),
+            "content_targets_captured": content_target_records.len(),
+            "projections_listed_initial": census_a.projections.len(),
+            "projections_listed_final": census_b.projections.len(),
+            "projections_captured": census_a.projections.len(),
             "content_bytes": total_content_bytes,
             "capture_errors": 0,
             "domains": domains,
         },
         "topology_fence": {
             "kind": "v0_13_robot_state_double_census",
-            "fingerprint_scope": "pane_id_optional_redacted_pane_uuid_tab_id_window_id_redacted_domain",
+            "fingerprint_scope": "unique_pane_id_optional_redacted_pane_uuid_redacted_domain_plus_all_window_tab_pane_projections",
             "initial_pane_ids": initial_pane_ids,
             "initial_sha256": &topology_sha256,
             "final_sha256": &topology_sha256,
@@ -78887,7 +79116,8 @@ async fn capture_compatible_client_dump(
             "authoritative_mux_incarnation": false,
             "pane_id_aba_excluded": false,
         },
-        "panes": pane_records,
+        "content_targets": content_target_records,
+        "projections": projection_records,
         "errors": [],
     });
         Ok(CompatibleClientCapture {
@@ -78914,14 +79144,6 @@ async fn capture_compatible_client_dump(
     })
 }
 
-#[cfg(not(unix))]
-async fn capture_compatible_client_dump(
-    _cx: &frankenterm_core::cx::Cx,
-    _request: &CompatibleClientDumpRequest,
-) -> anyhow::Result<CompatibleClientCapture> {
-    anyhow::bail!("compatible-client dump requires Unix descriptor and socket identity support")
-}
-
 fn publish_mux_dump_payload(
     output_path: &Path,
     dump: serde_json::Value,
@@ -78933,7 +79155,15 @@ fn publish_mux_dump_payload(
     let pane_count = dump
         .get("panes")
         .and_then(serde_json::Value::as_array)
+        .or_else(|| {
+            dump.get("content_targets")
+                .and_then(serde_json::Value::as_array)
+        })
         .map_or(0, Vec::len);
+    let projection_count = dump
+        .get("projections")
+        .and_then(serde_json::Value::as_array)
+        .map_or(pane_count, Vec::len);
     let error_count = dump
         .get("errors")
         .and_then(serde_json::Value::as_array)
@@ -78944,8 +79174,16 @@ fn publish_mux_dump_payload(
         JsonSerializationStyle::Compact,
     )
     .context("Failed to hash mux dump payload within the artifact safety limit")?;
+    let schema = match dump
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(1) => "frankenterm.mux-content-dump.v1",
+        Some(2) => "frankenterm.mux-content-dump.v2",
+        _ => anyhow::bail!("Mux dump payload has an unsupported schema version"),
+    };
     let envelope = serde_json::json!({
-        "schema": "frankenterm.mux-content-dump.v1",
+        "schema": schema,
         "publication_state": "complete",
         "payload_sha256": &payload_sha256,
         "payload": dump,
@@ -78971,6 +79209,7 @@ fn publish_mux_dump_payload(
         || verification.artifact_bytes != artifact_receipt.bytes
         || verification.capture_complete != complete
         || verification.pane_count != pane_count
+        || verification.projection_count != projection_count
         || verification.error_count != error_count
     {
         anyhow::bail!(
@@ -78979,8 +79218,11 @@ fn publish_mux_dump_payload(
         );
     }
     Ok(PublishedMuxDumpReceipt {
+        schema: verification.schema,
         complete,
+        executable_restore_image: verification.executable_restore_image,
         pane_count,
+        projection_count,
         domain_pane_counts: verification.domain_pane_counts,
         error_count,
         content_bytes: verification.content_bytes,
@@ -78989,6 +79231,7 @@ fn publish_mux_dump_payload(
         artifact_bytes: verification.artifact_bytes,
         durability: artifact_receipt.durability,
         recovered_existing: artifact_receipt.recovered_existing,
+        compatible_client: verification.compatible_client,
     })
 }
 
@@ -79031,7 +79274,7 @@ fn locate_compatible_client_recovery_environment(
         anyhow::ensure!(
             metadata.is_dir()
                 && metadata.uid() == nix::unistd::geteuid().as_raw()
-                && mode & 0o077 == 0,
+                && mode.trailing_zeros() >= 6,
             "compatible-client recovery environment matching the artifact receipt is unsafe"
         );
         anyhow::ensure!(
@@ -79066,6 +79309,11 @@ fn reconcile_existing_compatible_client_dump(
             request.output.display()
         )
     })?;
+    anyhow::ensure!(
+        verification.schema == "frankenterm.mux-content-dump.v2",
+        "Compatible-client dump target {} uses a legacy schema that cannot prove alias-aware capture; offline verification remains available, but current lost-reply reconciliation requires schema v2",
+        request.output.display()
+    );
     anyhow::ensure!(
         verification.capture_complete && verification.error_count == 0,
         "Compatible-client dump target {} is not a complete compatible-client safety artifact; existing files are never overwritten",
@@ -79112,11 +79360,18 @@ fn reconcile_existing_compatible_client_dump(
         &request.output,
         &contract.source.recovery_environment_path_sha256,
     )?;
+    let total_deadline_ms = compatible_client_derived_total_deadline_ms(
+        verification.pane_count,
+        contract.batch_size,
+        contract.batch_timeout_ms,
+    )?;
     Ok(Some(CompatibleClientDumpReceipt {
         path: request.output.clone(),
+        schema: verification.schema,
         recovery_environment_path,
         recovery_environment_path_sha256: contract.source.recovery_environment_path_sha256.clone(),
         pane_count: verification.pane_count,
+        projection_count: verification.projection_count,
         domain_pane_counts: verification.domain_pane_counts,
         content_bytes: verification.content_bytes,
         payload_sha256: verification.payload_sha256,
@@ -79130,7 +79385,7 @@ fn reconcile_existing_compatible_client_dump(
         subprocess_count: 0,
         stderr_warning_commands: 0,
         stderr_bytes: 0,
-        total_deadline_ms: 0,
+        total_deadline_ms,
         durability: "file_and_parent_directory_synced",
         recovered_existing: true,
         reconciled_without_mux_contact: true,
@@ -79149,7 +79404,9 @@ fn emit_compatible_client_dump_receipt(
         "ok": true,
         "action": "compatible_client_dump",
         "path": receipt.path.display().to_string(),
+        "schema": &receipt.schema,
         "pane_count": receipt.pane_count,
+        "projection_count": receipt.projection_count,
         "domain_pane_counts": &receipt.domain_pane_counts,
         "content_bytes": receipt.content_bytes,
         "payload_sha256": &receipt.payload_sha256,
@@ -79178,7 +79435,9 @@ fn emit_compatible_client_dump_receipt(
     if !print_snapshot_session_structured_output(&result, output_format)? {
         println!("Compatible-client mux content dump written and verified");
         println!("  File:                 {}", receipt.path.display());
+        println!("  Schema:               {}", receipt.schema);
         println!("  Panes:                {}", receipt.pane_count);
+        println!("  Projections:          {}", receipt.projection_count);
         println!("  Domain panes:         {:?}", receipt.domain_pane_counts);
         println!("  Content bytes:        {}", receipt.content_bytes);
         println!("  Payload SHA-256:      {}", receipt.payload_sha256);
@@ -79204,21 +79463,19 @@ fn emit_compatible_client_dump_receipt(
     Ok(())
 }
 
+#[cfg(unix)]
 async fn run_compatible_client_dump_command(
     cx: &frankenterm_core::cx::Cx,
     request: CompatibleClientDumpRequest,
     format: &str,
 ) -> anyhow::Result<()> {
     let output_format = resolve_session_orphan_output_format(format);
-    #[cfg(unix)]
-    {
-        validate_compatible_client_dump_request(&request)?;
-        if let Some(receipt) = reconcile_existing_compatible_client_dump(&request)? {
-            return emit_compatible_client_dump_receipt(&receipt, output_format);
-        }
+    validate_compatible_client_dump_request(&request)?;
+    if let Some(receipt) = reconcile_existing_compatible_client_dump(&request)? {
+        return emit_compatible_client_dump_receipt(&receipt, output_format);
     }
     let capture = capture_compatible_client_dump(cx, &request).await?;
-    let output_path = request.output;
+    let output_path = request.output.clone();
     let CompatibleClientCapture {
         payload,
         recovery_environment_path,
@@ -79247,25 +79504,77 @@ async fn run_compatible_client_dump_command(
             )
         })?;
     anyhow::ensure!(
-        published.complete && published.error_count == 0,
+        published.schema == "frankenterm.mux-content-dump.v2"
+            && published.complete
+            && published.error_count == 0,
         "compatible-client dump verifier did not certify a complete forensic artifact; retained recovery environment: {}",
         retained_environment_path.display()
     );
+    let verified_contract = published.compatible_client.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "compatible-client dump verifier omitted its source contract; retained recovery environment: {}",
+            retained_environment_path.display()
+        )
+    })?;
+    let requested_batch_timeout_ms = compatible_client_batch_timeout_ms(&request)?;
+    anyhow::ensure!(
+        verified_contract.source.client_sha256 == client_sha256
+            && verified_contract.source.client_bytes == client_bytes
+            && verified_contract.source.client_version == client_version
+            && verified_contract.source.client_git_hash == client_git_hash
+            && verified_contract.source.mux_socket_path_sha256 == mux_socket_path_sha256
+            && verified_contract.source.recovery_environment_path_sha256
+                == recovery_environment_path_sha256
+            && verified_contract.max_panes == request.max_panes
+            && verified_contract.max_total_bytes == request.max_total_bytes
+            && verified_contract.batch_size == request.batch_size
+            && verified_contract.batch_timeout_ms == requested_batch_timeout_ms
+            && verified_contract.max_batch_output_bytes == request.max_batch_output_bytes,
+        "compatible-client dump verifier source contract disagrees with the captured request; retained recovery environment: {}",
+        retained_environment_path.display()
+    );
+    let verified_total_deadline_ms = compatible_client_derived_total_deadline_ms(
+        published.pane_count,
+        verified_contract.batch_size,
+        verified_contract.batch_timeout_ms,
+    )?;
+    anyhow::ensure!(
+        verified_total_deadline_ms == total_deadline_ms,
+        "compatible-client dump verifier deadline disagrees with the captured request; retained recovery environment: {}",
+        retained_environment_path.display()
+    );
+    let verified_source = verified_contract.source.clone();
+    let verified_recovery_environment_path = locate_compatible_client_recovery_environment(
+        &output_path,
+        &verified_source.recovery_environment_path_sha256,
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "compatible-client dump was verified, but its recovery environment is no longer retained at publication receipt time: {}",
+            retained_environment_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        verified_recovery_environment_path == recovery_environment_path,
+        "compatible-client dump was verified, but its retained recovery-environment path disagrees with the captured path"
+    );
     let receipt = CompatibleClientDumpReceipt {
         path: output_path,
-        recovery_environment_path: Some(recovery_environment_path),
-        recovery_environment_path_sha256,
+        schema: published.schema,
+        recovery_environment_path: Some(verified_recovery_environment_path),
+        recovery_environment_path_sha256: verified_source.recovery_environment_path_sha256,
         pane_count: published.pane_count,
+        projection_count: published.projection_count,
         domain_pane_counts: published.domain_pane_counts,
         content_bytes: published.content_bytes,
         payload_sha256: published.payload_sha256,
         artifact_sha256: published.artifact_sha256,
         artifact_bytes: published.artifact_bytes,
-        client_sha256,
-        client_bytes,
-        client_version,
-        client_git_hash,
-        mux_socket_path_sha256,
+        client_sha256: verified_source.client_sha256,
+        client_bytes: verified_source.client_bytes,
+        client_version: verified_source.client_version,
+        client_git_hash: verified_source.client_git_hash,
+        mux_socket_path_sha256: verified_source.mux_socket_path_sha256,
         subprocess_count,
         stderr_warning_commands,
         stderr_bytes,
@@ -79280,6 +79589,15 @@ async fn run_compatible_client_dump_command(
             retained_environment_path.display()
         )
     })
+}
+
+#[cfg(not(unix))]
+async fn run_compatible_client_dump_command(
+    _cx: &frankenterm_core::cx::Cx,
+    _request: CompatibleClientDumpRequest,
+    _format: &str,
+) -> anyhow::Result<()> {
+    anyhow::bail!("compatible-client dump requires Unix descriptor and socket identity support")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -79995,7 +80313,7 @@ fn require_exact_json_object_keys(
     context: &str,
 ) -> anyhow::Result<()> {
     if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
-        anyhow::bail!("Mux dump {context} does not match the frozen v1 field set");
+        anyhow::bail!("Mux dump {context} does not match its frozen field set");
     }
     Ok(())
 }
@@ -80244,7 +80562,7 @@ where
     };
     let expected_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let projected_count = retained_count
-        .checked_add(if stage_metadata.is_none() { 1 } else { 0 })
+        .checked_add(u64::from(stage_metadata.is_none()))
         .context("private artifact projected stage count overflowed")?;
     let existing_stage_bytes = stage_metadata.as_ref().map_or(0, |metadata| metadata.len());
     let projected_bytes = retained_bytes
@@ -80418,7 +80736,7 @@ where
 fn write_new_private_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<PrivateArtifactReceipt> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        return write_new_private_artifact_with_hook(path, bytes, |_| Ok(()));
+        write_new_private_artifact_with_hook(path, bytes, |_| Ok(()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -80827,7 +81145,9 @@ fn run_verify_mux_dump_command(
         "capture_complete": receipt.capture_complete,
         "required_complete": require_complete,
         "executable_restore_image": receipt.executable_restore_image,
+        "production_mux_activation": false,
         "pane_count": receipt.pane_count,
+        "projection_count": receipt.projection_count,
         "domain_pane_counts": &receipt.domain_pane_counts,
         "error_count": receipt.error_count,
         "content_bytes": receipt.content_bytes,
@@ -80839,14 +81159,566 @@ fn run_verify_mux_dump_command(
         println!("  Capture complete: {}", receipt.capture_complete);
         println!("  Required complete: {}", require_complete);
         println!("  Panes:            {}", receipt.pane_count);
+        println!("  Projections:      {}", receipt.projection_count);
         println!("  Domain panes:     {:?}", receipt.domain_pane_counts);
         println!("  Errors:           {}", receipt.error_count);
         println!("  Content bytes:    {}", receipt.content_bytes);
         println!("  Payload SHA-256:  {}", receipt.payload_sha256);
         println!("  Artifact SHA-256: {}", receipt.artifact_sha256);
         println!("  Restore image:    {}", receipt.executable_restore_image);
+        println!("  Mux activation:   disabled");
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_mux_dump_v2_payload(
+    payload: &serde_json::Value,
+    schema: &str,
+    payload_sha256: String,
+    artifact_sha256: String,
+    artifact_bytes: u64,
+) -> anyhow::Result<MuxDumpVerificationReceipt> {
+    anyhow::ensure!(
+        schema == "frankenterm.mux-content-dump.v2",
+        "Mux dump v2 verifier received the wrong envelope schema"
+    );
+    let source = verify_mux_dump_source_metadata(
+        payload
+            .get("source")
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 source metadata is missing"))?,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("Mux dump v2 requires a compatible-client source contract"))?;
+
+    let completeness = payload
+        .get("completeness_semantics")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 completeness metadata is invalid"))?;
+    require_exact_json_object_keys(
+        completeness,
+        &[
+            "meaning",
+            "point_in_time_content_snapshot",
+            "pane_content_consistency",
+            "topology_consistency",
+        ],
+        "v2 completeness metadata",
+    )?;
+    let expected_completeness = [
+        (
+            "/completeness_semantics/meaning",
+            serde_json::json!(
+                "every unique numeric pane_id reported by the initial v0.13 robot-state census was requested exactly once and returned one untruncated outcome, every window/tab projection reported by both censuses was retained, and a second census matched pane_id, optional pane_uuid, raw domain, and every window/tab projection; no authoritative mux incarnation or topology revision was available"
+            ),
+        ),
+        (
+            "/completeness_semantics/point_in_time_content_snapshot",
+            serde_json::json!(false),
+        ),
+        (
+            "/completeness_semantics/pane_content_consistency",
+            serde_json::json!(
+                "sequential_subprocess_batches_with_bounded_concurrent_pane_reads_best_effort_non_atomic"
+            ),
+        ),
+        (
+            "/completeness_semantics/topology_consistency",
+            serde_json::json!("v0_13_robot_state_double_census_alias_aware"),
+        ),
+    ];
+    for (pointer, expected) in expected_completeness {
+        anyhow::ensure!(
+            payload.pointer(pointer) == Some(&expected),
+            "Mux dump v2 completeness claim {pointer} is invalid"
+        );
+    }
+    anyhow::ensure!(
+        payload
+            .get("redaction_applied")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        "Mux dump v2 does not attest that redaction was applied"
+    );
+
+    let capabilities = payload
+        .get("capabilities")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 capabilities are invalid"))?;
+    require_exact_json_object_keys(
+        capabilities,
+        &[
+            "forensic_text_export",
+            "bounded_topology_metadata",
+            "executable_restore_image",
+            "terminal_parser_render_state",
+            "pty_descriptor_state",
+            "process_memory_state",
+            "running_process_continuity",
+            "stable_cross_restart_pane_identity",
+        ],
+        "v2 capabilities",
+    )?;
+    for (pointer, expected) in [
+        ("/capabilities/forensic_text_export", true),
+        ("/capabilities/bounded_topology_metadata", true),
+        ("/capabilities/executable_restore_image", false),
+        ("/capabilities/terminal_parser_render_state", false),
+        ("/capabilities/pty_descriptor_state", false),
+        ("/capabilities/process_memory_state", false),
+        ("/capabilities/running_process_continuity", false),
+        ("/capabilities/stable_cross_restart_pane_identity", false),
+    ] {
+        anyhow::ensure!(
+            payload
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_bool)
+                == Some(expected),
+            "Mux dump v2 capability claim {pointer} is invalid"
+        );
+    }
+
+    let limits = payload
+        .get("limits")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 limits are invalid"))?;
+    require_exact_json_object_keys(
+        limits,
+        &[
+            "max_panes",
+            "max_total_bytes",
+            "batch_size",
+            "batch_timeout_ms",
+            "max_batch_output_bytes",
+        ],
+        "v2 limits",
+    )?;
+    let bounded_usize = |field: &'static str, maximum: usize| {
+        limits
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (1..=maximum).contains(value))
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 limit {field} is outside its bound"))
+    };
+    let max_panes = bounded_usize("max_panes", COMPATIBLE_CLIENT_DUMP_MAX_PANES)?;
+    let max_total_bytes = bounded_usize("max_total_bytes", LIVE_MUX_DUMP_MAX_TOTAL_BYTES)?;
+    let batch_size = bounded_usize("batch_size", COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE)?;
+    let batch_timeout_ms = limits
+        .get("batch_timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| {
+            *value >= 1_000
+                && *value % 1_000 == 0
+                && u128::from(*value) <= COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT.as_millis()
+        })
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 batch timeout is outside its bound"))?;
+    let max_batch_output_bytes = limits
+        .get("max_batch_output_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| {
+            (COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES
+                ..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES)
+                .contains(value)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("Mux dump v2 max_batch_output_bytes is outside its bound")
+        })?;
+    let compatible_client = VerifiedCompatibleClientDumpContract {
+        source,
+        max_panes,
+        max_total_bytes,
+        batch_size,
+        batch_timeout_ms,
+        max_batch_output_bytes,
+    };
+
+    let content_targets = payload
+        .get("content_targets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 content_targets array is missing"))?;
+    anyhow::ensure!(
+        !content_targets.is_empty() && content_targets.len() <= max_panes,
+        "Mux dump v2 content-target count is outside its declared bound"
+    );
+    compatible_client_derived_total_deadline_ms(
+        content_targets.len(),
+        batch_size,
+        batch_timeout_ms,
+    )
+    .context("Mux dump v2 limits describe an impossible producer deadline")?;
+    let mut pane_ids = BTreeSet::new();
+    let mut previous_pane_id = None;
+    let mut captured_domains = BTreeSet::new();
+    let mut domain_pane_counts = BTreeMap::new();
+    let mut content_bytes = 0usize;
+    for record in content_targets {
+        let record = record
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 content-target record is invalid"))?;
+        require_exact_json_object_keys(record, &["target", "content"], "v2 content-target record")?;
+        let target = record
+            .get("target")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 target metadata is invalid"))?;
+        require_exact_json_object_keys(
+            target,
+            &[
+                "pane_id",
+                "pane_uuid",
+                "domain_name",
+                "domain_identity_authority",
+                "identity_stability",
+                "title",
+                "cwd",
+                "observed",
+                "ignore_reason",
+            ],
+            "v2 target metadata",
+        )?;
+        let pane_id = target
+            .get("pane_id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 target pane_id is invalid"))?;
+        anyhow::ensure!(
+            previous_pane_id.is_none_or(|previous| previous < pane_id) && pane_ids.insert(pane_id),
+            "Mux dump v2 content targets are not uniquely sorted by pane_id"
+        );
+        previous_pane_id = Some(pane_id);
+        match target.get("pane_uuid") {
+            Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(value))
+                if !value.is_empty()
+                    && value.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES => {}
+            _ => anyhow::bail!("Mux dump v2 target pane_uuid is invalid"),
+        }
+        let domain_name = target
+            .get("domain_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                !value.is_empty() && value.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES
+            })
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 target domain_name is invalid"))?;
+        anyhow::ensure!(
+            target
+                .get("domain_identity_authority")
+                .and_then(serde_json::Value::as_str)
+                == Some("v0_13_robot_state_domain_field")
+                && target
+                    .get("identity_stability")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("v0_13_projected_ephemeral_no_incarnation_authority"),
+            "Mux dump v2 target identity authority is invalid"
+        );
+        for field in ["title", "cwd", "ignore_reason"] {
+            match target.get(field) {
+                Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::String(value))
+                    if value.len() <= COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES => {}
+                _ => anyhow::bail!("Mux dump v2 target {field} is invalid"),
+            }
+        }
+        let observed = target
+            .get("observed")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 target observed flag is invalid"))?;
+        anyhow::ensure!(
+            !observed || target.get("ignore_reason") == Some(&serde_json::Value::Null),
+            "Mux dump v2 target observed flag contradicts its ignore reason"
+        );
+        captured_domains.insert(domain_name);
+        let count = domain_pane_counts
+            .entry(domain_name.to_string())
+            .or_insert(0_usize);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 domain pane count overflow"))?;
+
+        let content = record
+            .get("content")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 target content is invalid"))?;
+        require_exact_json_object_keys(
+            content,
+            &[
+                "encoding",
+                "redaction_applied",
+                "bytes",
+                "lines",
+                "sha256",
+                "text",
+            ],
+            "v2 target content",
+        )?;
+        anyhow::ensure!(
+            content.get("encoding").and_then(serde_json::Value::as_str) == Some("utf-8")
+                && content
+                    .get("redaction_applied")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
+            "Mux dump v2 target content encoding or redaction claim is invalid"
+        );
+        let text = content
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 target text is invalid"))?;
+        let declared_bytes = content
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 target byte count is invalid"))?;
+        let declared_lines = content
+            .get("lines")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 target line count is invalid"))?;
+        let expected_sha256 = sha256_hex(text.as_bytes());
+        anyhow::ensure!(
+            declared_bytes == text.len()
+                && declared_lines == text.lines().count()
+                && content.get("sha256").and_then(serde_json::Value::as_str)
+                    == Some(expected_sha256.as_str()),
+            "Mux dump v2 target content receipt is inconsistent"
+        );
+        content_bytes = content_bytes
+            .checked_add(declared_bytes)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 aggregate content bytes overflow"))?;
+        anyhow::ensure!(
+            content_bytes <= max_total_bytes,
+            "Mux dump v2 aggregate content exceeds its declared bound"
+        );
+    }
+
+    let projections = payload
+        .get("projections")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 projections array is missing"))?;
+    anyhow::ensure!(
+        !projections.is_empty() && projections.len() <= max_panes,
+        "Mux dump v2 projection count is outside its declared bound"
+    );
+    let mut previous_projection = None;
+    let mut referenced_pane_ids = BTreeSet::new();
+    for projection in projections {
+        let projection = projection
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 projection is invalid"))?;
+        require_exact_json_object_keys(
+            projection,
+            &["window_id", "tab_id", "pane_id"],
+            "v2 projection",
+        )?;
+        let required_u64 = |field: &'static str| {
+            projection
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("Mux dump v2 projection {field} is invalid"))
+        };
+        let identity = CompatibleClientPaneProjection {
+            window_id: required_u64("window_id")?,
+            tab_id: required_u64("tab_id")?,
+            pane_id: required_u64("pane_id")?,
+        };
+        anyhow::ensure!(
+            previous_projection.is_none_or(|previous| previous < identity),
+            "Mux dump v2 projections are not a unique canonical ordering"
+        );
+        anyhow::ensure!(
+            pane_ids.contains(&identity.pane_id),
+            "Mux dump v2 projection refers to a missing content target"
+        );
+        previous_projection = Some(identity);
+        referenced_pane_ids.insert(identity.pane_id);
+    }
+    anyhow::ensure!(
+        referenced_pane_ids == pane_ids,
+        "Mux dump v2 contains an unreferenced content target"
+    );
+
+    let errors = payload
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 errors array is missing"))?;
+    anyhow::ensure!(
+        errors.is_empty()
+            && payload.get("complete").and_then(serde_json::Value::as_bool) == Some(true),
+        "Mux dump v2 is not a complete zero-error artifact"
+    );
+
+    let summary = payload
+        .get("summary")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 summary is invalid"))?;
+    require_exact_json_object_keys(
+        summary,
+        &[
+            "content_targets_listed_initial",
+            "content_targets_listed_final",
+            "content_targets_captured",
+            "projections_listed_initial",
+            "projections_listed_final",
+            "projections_captured",
+            "content_bytes",
+            "capture_errors",
+            "domains",
+        ],
+        "v2 summary",
+    )?;
+    let summary_usize = |field: &'static str| {
+        summary
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 summary field {field} is invalid"))
+    };
+    for field in [
+        "content_targets_listed_initial",
+        "content_targets_listed_final",
+        "content_targets_captured",
+    ] {
+        anyhow::ensure!(
+            summary_usize(field)? == content_targets.len(),
+            "Mux dump v2 summary content-target counters disagree"
+        );
+    }
+    for field in [
+        "projections_listed_initial",
+        "projections_listed_final",
+        "projections_captured",
+    ] {
+        anyhow::ensure!(
+            summary_usize(field)? == projections.len(),
+            "Mux dump v2 summary projection counters disagree"
+        );
+    }
+    anyhow::ensure!(
+        summary_usize("content_bytes")? == content_bytes && summary_usize("capture_errors")? == 0,
+        "Mux dump v2 summary outcome counters disagree"
+    );
+    let summary_domains = summary
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 domain summary is invalid"))?;
+    let mut verified_summary_domains = BTreeSet::new();
+    let mut previous_domain: Option<&str> = None;
+    for domain in summary_domains {
+        let domain = domain
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 domain summary entry is invalid"))?;
+        anyhow::ensure!(
+            previous_domain.is_none_or(|previous| previous < domain)
+                && verified_summary_domains.insert(domain),
+            "Mux dump v2 domain summary is not a unique sorted set"
+        );
+        previous_domain = Some(domain);
+    }
+    anyhow::ensure!(
+        verified_summary_domains == captured_domains,
+        "Mux dump v2 domain summary disagrees with its content targets"
+    );
+
+    let topology = payload
+        .get("topology_fence")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 topology fence is invalid"))?;
+    require_exact_json_object_keys(
+        topology,
+        &[
+            "kind",
+            "fingerprint_scope",
+            "initial_pane_ids",
+            "initial_sha256",
+            "final_sha256",
+            "stable",
+            "mux_session_incarnation",
+            "authoritative_topology_revision",
+            "authoritative_topology",
+            "authoritative_mux_incarnation",
+            "pane_id_aba_excluded",
+        ],
+        "v2 topology fence",
+    )?;
+    anyhow::ensure!(
+        topology.get("kind").and_then(serde_json::Value::as_str)
+            == Some("v0_13_robot_state_double_census")
+            && topology
+                .get("fingerprint_scope")
+                .and_then(serde_json::Value::as_str)
+                == Some(
+                    "unique_pane_id_optional_redacted_pane_uuid_redacted_domain_plus_all_window_tab_pane_projections",
+                )
+            && topology.get("stable").and_then(serde_json::Value::as_bool) == Some(true)
+            && topology.get("mux_session_incarnation") == Some(&serde_json::Value::Null)
+            && topology.get("authoritative_topology_revision") == Some(&serde_json::Value::Null)
+            && topology
+                .get("authoritative_topology")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            && topology
+                .get("authoritative_mux_incarnation")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            && topology
+                .get("pane_id_aba_excluded")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false),
+        "Mux dump v2 topology authority claims are invalid"
+    );
+    let initial_pane_ids = topology
+        .get("initial_pane_ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 initial pane manifest is invalid"))?;
+    let mut manifest_pane_ids = BTreeSet::new();
+    let mut previous_manifest_pane_id = None;
+    for value in initial_pane_ids {
+        let pane_id = value
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("Mux dump v2 initial pane identity is invalid"))?;
+        anyhow::ensure!(
+            previous_manifest_pane_id.is_none_or(|previous| previous < pane_id)
+                && manifest_pane_ids.insert(pane_id),
+            "Mux dump v2 initial pane manifest is not a unique sorted set"
+        );
+        previous_manifest_pane_id = Some(pane_id);
+    }
+    anyhow::ensure!(
+        initial_pane_ids.len() == pane_ids.len() && manifest_pane_ids == pane_ids,
+        "Mux dump v2 initial pane manifest disagrees with its content targets"
+    );
+    let initial_sha256 = topology
+        .get("initial_sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| is_canonical_lowercase_sha256(value))
+        .ok_or_else(|| anyhow::anyhow!("Mux dump v2 initial topology checksum is invalid"))?;
+    anyhow::ensure!(
+        topology
+            .get("final_sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(initial_sha256),
+        "Mux dump v2 stable topology fence has mismatched checksums"
+    );
+    anyhow::ensure!(
+        compatible_client_projected_topology_fingerprint_from_v2_records(
+            content_targets,
+            projections,
+        )? == initial_sha256,
+        "Mux dump v2 topology checksum does not bind its content targets and projections"
+    );
+
+    Ok(MuxDumpVerificationReceipt {
+        schema: schema.to_string(),
+        payload_sha256,
+        artifact_sha256,
+        artifact_bytes,
+        capture_complete: true,
+        executable_restore_image: false,
+        pane_count: content_targets.len(),
+        projection_count: projections.len(),
+        domain_pane_counts,
+        error_count: 0,
+        content_bytes,
+        compatible_client: Some(compatible_client),
+    })
 }
 
 fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationReceipt> {
@@ -80870,7 +81742,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
     )
     .context(
-        "Mux dump does not use the one canonical v1 artifact encoding; duplicate keys and alternate encodings are forbidden",
+        "Mux dump does not use its one canonical artifact encoding; duplicate keys and alternate encodings are forbidden",
     )?;
     require_mux_dump_redaction_fixed_point(
         &envelope,
@@ -80880,9 +81752,11 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .get("schema")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Mux dump schema is missing"))?;
-    if schema != "frankenterm.mux-content-dump.v1" {
-        anyhow::bail!("Unsupported mux dump schema {schema:?}");
-    }
+    let schema_version = match schema {
+        "frankenterm.mux-content-dump.v1" => 1,
+        "frankenterm.mux-content-dump.v2" => 2,
+        _ => anyhow::bail!("Unsupported mux dump schema {schema:?}"),
+    };
     if envelope
         .get("publication_state")
         .and_then(serde_json::Value::as_str)
@@ -80896,22 +81770,42 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     let payload_object = payload
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Mux dump payload is not an object"))?;
+    let payload_keys_v1 = [
+        "schema_version",
+        "created_at_epoch_ms",
+        "source",
+        "complete",
+        "completeness_semantics",
+        "capabilities",
+        "redaction_applied",
+        "limits",
+        "summary",
+        "topology_fence",
+        "panes",
+        "errors",
+    ];
+    let payload_keys_v2 = [
+        "schema_version",
+        "created_at_epoch_ms",
+        "source",
+        "complete",
+        "completeness_semantics",
+        "capabilities",
+        "redaction_applied",
+        "limits",
+        "summary",
+        "topology_fence",
+        "content_targets",
+        "projections",
+        "errors",
+    ];
     require_exact_json_object_keys(
         payload_object,
-        &[
-            "schema_version",
-            "created_at_epoch_ms",
-            "source",
-            "complete",
-            "completeness_semantics",
-            "capabilities",
-            "redaction_applied",
-            "limits",
-            "summary",
-            "topology_fence",
-            "panes",
-            "errors",
-        ],
+        if schema_version == 1 {
+            &payload_keys_v1
+        } else {
+            &payload_keys_v2
+        },
         "payload",
     )?;
     let (_payload_bytes, actual_payload_sha256) = hash_json_bounded(
@@ -80936,9 +81830,9 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     if payload
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
-        != Some(1)
+        != Some(schema_version)
     {
-        anyhow::bail!("Mux dump payload schema_version is not 1");
+        anyhow::bail!("Mux dump payload schema_version does not match its envelope");
     }
     if payload
         .get("created_at_epoch_ms")
@@ -80946,6 +81840,15 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .is_none()
     {
         anyhow::bail!("Mux dump source identity metadata is invalid");
+    }
+    if schema_version == 2 {
+        return verify_mux_dump_v2_payload(
+            payload,
+            schema,
+            actual_payload_sha256,
+            artifact_sha256,
+            artifact_bytes,
+        );
     }
     let compatible_client_source = verify_mux_dump_source_metadata(
         payload
@@ -81080,7 +81983,8 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
                 .get("batch_timeout_ms")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|value| {
-                    *value > 0
+                    *value >= 1_000
+                        && *value % 1_000 == 0
                         && u128::from(*value)
                             <= COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT.as_millis()
                 })
@@ -81092,7 +81996,9 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok())
                 .filter(|value| {
-                    (1..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES).contains(value)
+                    (COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES
+                        ..=COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES)
+                        .contains(value)
                 })
                 .ok_or_else(|| {
                     anyhow::anyhow!("Mux dump compatible-client max_batch_output_bytes is outside the supported bounds")
@@ -81271,7 +82177,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             if !pane
                 .get(field)
                 .and_then(serde_json::Value::as_u64)
-                .is_some_and(|value| value <= u64::from(u32::MAX))
+                .is_some_and(|value| u32::try_from(value).is_ok())
             {
                 anyhow::bail!("Mux dump pane {pane_id} {field} is invalid");
             }
@@ -81282,7 +82188,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
                 Some(value)
                     if value
                         .as_u64()
-                        .is_some_and(|value| value <= u64::from(u32::MAX)) => {}
+                        .is_some_and(|value| u32::try_from(value).is_ok()) => {}
                 _ => anyhow::bail!("Mux dump pane {pane_id} {field} is invalid"),
             }
         }
@@ -81556,6 +82462,14 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         !compatible_client_semantics || initial_pane_count > 0,
         "Mux dump compatible-client census must contain at least one pane"
     );
+    if let Some(contract) = compatible_client.as_ref() {
+        compatible_client_derived_total_deadline_ms(
+            initial_pane_count,
+            contract.batch_size,
+            contract.batch_timeout_ms,
+        )
+        .context("Mux dump compatible-client limits describe an impossible producer deadline")?;
+    }
     if panes.len() > initial_pane_count {
         anyhow::bail!("Mux dump captured more panes than its initial topology listed");
     }
@@ -81815,6 +82729,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         capture_complete,
         executable_restore_image,
         pane_count: panes.len(),
+        projection_count: panes.len(),
         domain_pane_counts,
         error_count: errors.len(),
         content_bytes,
@@ -86352,7 +87267,7 @@ where
         } => {
             if previous_generation == generation_id {
                 anyhow::ensure!(
-                    current.target == PathBuf::from(target.as_str())
+                    current.target == Path::new(target.as_str())
                         && current.device == *device
                         && current.inode == *inode,
                     "already-current selector evidence changed from the committed pre-effect authority"
@@ -86367,7 +87282,7 @@ where
                     effective_uid,
                 )?;
                 anyhow::ensure!(
-                    displaced.target == PathBuf::from(target.as_str())
+                    displaced.target == Path::new(target.as_str())
                         && displaced.device == *device
                         && displaced.inode == *inode,
                     "displaced selector evidence does not match the committed pre-effect authority"
@@ -87185,7 +88100,7 @@ fn validate_remote_guardian_path(path: &str) -> anyhow::Result<&str> {
 
 fn remote_release_installer_command(tag: &str, staging_suffix: &str) -> anyhow::Result<String> {
     let installer_revision = build_meta::GIT_HASH;
-    if build_meta::GIT_DIRTY != ""
+    if !build_meta::GIT_DIRTY.is_empty()
         || installer_revision.len() != 40
         || !installer_revision
             .bytes()
@@ -88245,12 +89160,23 @@ fn parse_remote_mux_ownership_probe(output: &RemoteCommandOutput) -> anyhow::Res
     }
 }
 
-fn remote_mux_activation_summary(
+#[derive(Clone, Copy)]
+struct RemoteMuxActivationSummaryInput {
     apply_changes: bool,
     install_candidate: bool,
     active_mux_before_install: bool,
     mux_owner_active_after_setup: bool,
+}
+
+fn remote_mux_activation_summary(
+    input: RemoteMuxActivationSummaryInput,
 ) -> anyhow::Result<&'static str> {
+    let RemoteMuxActivationSummaryInput {
+        apply_changes,
+        install_candidate,
+        active_mux_before_install,
+        mux_owner_active_after_setup,
+    } = input;
     if !apply_changes {
         return Ok("not attempted; dry-run only");
     }
@@ -88891,12 +89817,12 @@ fi"#;
     } else {
         active_mux_before_install
     };
-    let activation_summary = remote_mux_activation_summary(
+    let activation_summary = remote_mux_activation_summary(RemoteMuxActivationSummaryInput {
         apply_changes,
-        options.install_ft,
+        install_candidate: options.install_ft,
         active_mux_before_install,
         mux_owner_active_after_setup,
-    )?;
+    })?;
 
     // Step 6: Enable linger
     let linger_output = run_remote_step(
@@ -96746,12 +97672,12 @@ reason = "overly conservative pending threshold"
 
         assert_eq!(report.schema_version, RESOURCE_WHAT_IF_SCHEMA_VERSION);
         assert!(report.dry_run);
-        assert!(report.mutation_surface.is_empty());
+        assert_eq!(report.mutation_surface, [] as [&str; 0]);
         assert_eq!(report.trace_hash, trace.trace_hash);
         assert_eq!(report.package_name, "resource what-if candidate");
         assert_eq!(report.package_override_count, 2);
-        assert!(!report.override_hash.is_empty());
-        assert!(!report.simulation_hash.is_empty());
+        assert_ne!(report.override_hash, "");
+        assert_ne!(report.simulation_hash, "");
         assert_eq!(report.side_effect_barrier_mode, "replay");
         assert_eq!(report.side_effects_captured, 0);
         assert_eq!(
@@ -96759,7 +97685,7 @@ reason = "overly conservative pending threshold"
             frankenterm_core_replay::replay_scenario_matrix::ProofStatus::Passed
         );
         assert!(report.high_scale_claim_allowed);
-        assert!(report.next_proof_steps.is_empty());
+        assert_eq!(report.next_proof_steps, [] as [String; 0]);
         assert!(
             report.decision_deltas.changed_steps > 0,
             "candidate should change at least one decision"
@@ -96967,8 +97893,8 @@ reason = "overly conservative pending threshold"
         let report = build_mission_operator_view_data(&mission, 10);
         assert!(report.degraded_state.is_degraded);
         assert_eq!(report.degraded_state.code.as_str(), "lifecycle_blocked");
-        assert!(!report.degraded_state.summary.is_empty());
-        assert!(!report.degraded_state.operator_action.is_empty());
+        assert_ne!(report.degraded_state.summary, "");
+        assert_ne!(report.degraded_state.operator_action, "");
     }
 
     #[test]
@@ -98113,7 +99039,7 @@ reason = "overly conservative pending threshold"
                 ..
             }
         ));
-        assert!(executor.recorded_calls().is_empty());
+        assert_eq!(executor.recorded_calls(), [] as [&str; 0]);
         assert_eq!(
             serde_json::to_value(&contract).expect("serialize rejected conflict fixture"),
             original_contract
@@ -99040,7 +99966,7 @@ recorder_backend = "rusqlite"
                 };
                 assert_eq!(payload["ok"], false);
                 assert_eq!(payload["error_code"], error_code);
-                assert!(!payload["error"].as_str().unwrap_or_default().is_empty());
+                assert_ne!(payload["error"].as_str().unwrap_or_default(), "");
                 assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"));
             }
         }
@@ -99215,6 +100141,96 @@ recorder_backend = "rusqlite"
         }
     }
 
+    #[test]
+    fn compatible_client_derived_deadline_matches_the_exact_producer_boundary() {
+        assert_eq!(
+            compatible_client_derived_total_deadline_ms(58, 1, 120_000)
+                .expect("58 one-pane batches plus two censuses fit exactly"),
+            COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT.as_millis()
+        );
+        assert!(
+            compatible_client_derived_total_deadline_ms(59, 1, 120_000).is_err(),
+            "one batch beyond the exact deadline boundary must fail closed"
+        );
+        assert_eq!(
+            compatible_client_derived_total_deadline_ms(1_024, 64, 120_000)
+                .expect("the maximum census fits when batching is bounded"),
+            2_160_000
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_client_request_rejects_a_fractional_second_timeout_contract() {
+        let mut request = compatible_client_test_request(PathBuf::from(
+            "/definitely-not-created/fractional-timeout.json",
+        ));
+        request.batch_timeout = Duration::from_millis(1_500);
+        assert!(
+            validate_compatible_client_dump_request(&request)
+                .expect_err("the CLI producer cannot encode fractional timeout seconds")
+                .to_string()
+                .contains("whole number of seconds")
+        );
+    }
+
+    #[test]
+    fn compatible_client_batch_output_minimum_fits_the_frozen_empty_max_batch_envelope() {
+        let pane_ids = (0..u64::try_from(COMPATIBLE_CLIENT_DUMP_MAX_BATCH_SIZE).unwrap())
+            .map(|offset| u64::MAX - offset)
+            .collect::<Vec<_>>();
+        let results = pane_ids
+            .iter()
+            .map(|pane_id| {
+                (
+                    *pane_id,
+                    serde_json::json!({
+                        "status": "ok",
+                        "text": "",
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let envelope = serde_json::json!({
+            "ok": true,
+            "data": {
+                "pane_ids": pane_ids,
+                "tail_lines": LIVE_MUX_DUMP_MAX_TOTAL_BYTES + 1,
+                "escapes_included": false,
+                "results": results,
+            },
+            "elapsed_ms": u64::MAX,
+            "version": COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION,
+            "now": u64::MAX,
+            "schema_version": 1,
+        });
+        let mut bytes = serde_json::to_vec_pretty(&envelope)
+            .expect("serialize the frozen v0.13 maximum empty batch envelope");
+        bytes.push(b'\n');
+        assert!(
+            bytes.len() <= COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES,
+            "the producer minimum must admit every identifier in an empty maximum-size batch: {} > {}",
+            bytes.len(),
+            COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_client_request_rejects_an_impossible_batch_output_budget() {
+        let mut request = compatible_client_test_request(PathBuf::from(
+            "/definitely-not-created/impossible-batch-output.json",
+        ));
+        request.max_batch_output_bytes = COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES - 1;
+        let error = validate_compatible_client_dump_request(&request)
+            .expect_err("the subprocess bound cannot be smaller than its control envelope");
+        assert!(error.to_string().contains("max-batch-output-bytes"));
+
+        request.max_batch_output_bytes = COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES;
+        validate_compatible_client_dump_request(&request)
+            .expect("the proven control-envelope minimum is source-valid");
+    }
+
     #[cfg(unix)]
     fn compatible_client_test_identity(mode: u32, bytes: u64) -> serde_json::Value {
         serde_json::json!({
@@ -99347,6 +100363,85 @@ recorder_backend = "rusqlite"
     }
 
     #[cfg(unix)]
+    fn compatible_client_test_payload_v2(
+        request: &CompatibleClientDumpRequest,
+    ) -> serde_json::Value {
+        let v1 = compatible_client_test_payload(request);
+        let content_targets = vec![serde_json::json!({
+            "target": {
+                "pane_id": 1,
+                "pane_uuid": "00112233445566778899aabbccddeeff",
+                "domain_name": "ssh:trj",
+                "domain_identity_authority": "v0_13_robot_state_domain_field",
+                "identity_stability": "v0_13_projected_ephemeral_no_incarnation_authority",
+                "title": "shell",
+                "cwd": "file:///tmp",
+                "observed": true,
+                "ignore_reason": null,
+            },
+            "content": {
+                "encoding": "utf-8",
+                "redaction_applied": true,
+                "bytes": 6,
+                "lines": 1,
+                "sha256": sha256_hex(b"hello\n"),
+                "text": "hello\n",
+            },
+        })];
+        let projections = vec![
+            serde_json::json!({"window_id": 3, "tab_id": 2, "pane_id": 1}),
+            serde_json::json!({"window_id": 4, "tab_id": 5, "pane_id": 1}),
+        ];
+        let topology_sha256 = compatible_client_projected_topology_fingerprint_from_v2_records(
+            &content_targets,
+            &projections,
+        )
+        .expect("hash compatible-client v2 topology fixture");
+        serde_json::json!({
+            "schema_version": 2,
+            "created_at_epoch_ms": 1,
+            "source": v1["source"].clone(),
+            "complete": true,
+            "completeness_semantics": {
+                "meaning": "every unique numeric pane_id reported by the initial v0.13 robot-state census was requested exactly once and returned one untruncated outcome, every window/tab projection reported by both censuses was retained, and a second census matched pane_id, optional pane_uuid, raw domain, and every window/tab projection; no authoritative mux incarnation or topology revision was available",
+                "point_in_time_content_snapshot": false,
+                "pane_content_consistency": "sequential_subprocess_batches_with_bounded_concurrent_pane_reads_best_effort_non_atomic",
+                "topology_consistency": "v0_13_robot_state_double_census_alias_aware",
+            },
+            "capabilities": v1["capabilities"].clone(),
+            "redaction_applied": true,
+            "limits": v1["limits"].clone(),
+            "summary": {
+                "content_targets_listed_initial": 1,
+                "content_targets_listed_final": 1,
+                "content_targets_captured": 1,
+                "projections_listed_initial": 2,
+                "projections_listed_final": 2,
+                "projections_captured": 2,
+                "content_bytes": 6,
+                "capture_errors": 0,
+                "domains": ["ssh:trj"],
+            },
+            "topology_fence": {
+                "kind": "v0_13_robot_state_double_census",
+                "fingerprint_scope": "unique_pane_id_optional_redacted_pane_uuid_redacted_domain_plus_all_window_tab_pane_projections",
+                "initial_pane_ids": [1],
+                "initial_sha256": &topology_sha256,
+                "final_sha256": &topology_sha256,
+                "stable": true,
+                "mux_session_incarnation": null,
+                "authoritative_topology_revision": null,
+                "authoritative_topology": false,
+                "authoritative_mux_incarnation": false,
+                "pane_id_aba_excluded": false,
+            },
+            "content_targets": content_targets,
+            "projections": projections,
+            "errors": [],
+        })
+    }
+
+    #[cfg(unix)]
     fn write_compatible_client_test_artifact(path: &Path, payload: serde_json::Value) {
         let (_payload_bytes, payload_sha256) = hash_json_bounded(
             &payload,
@@ -99354,8 +100449,16 @@ recorder_backend = "rusqlite"
             JsonSerializationStyle::Compact,
         )
         .expect("hash compatible-client fixture payload");
+        let schema = match payload
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(1) => "frankenterm.mux-content-dump.v1",
+            Some(2) => "frankenterm.mux-content-dump.v2",
+            _ => panic!("compatible-client fixture schema is supported"),
+        };
         let envelope = serde_json::json!({
-            "schema": "frankenterm.mux-content-dump.v1",
+            "schema": schema,
             "publication_state": "complete",
             "payload_sha256": payload_sha256,
             "payload": payload,
@@ -99372,7 +100475,7 @@ recorder_backend = "rusqlite"
         let output = directory.path().join("private").join("mux-dump.json");
         let request = compatible_client_test_request(output.clone());
         validate_compatible_client_dump_request(&request).expect("valid test request");
-        write_compatible_client_test_artifact(&output, compatible_client_test_payload(&request));
+        write_compatible_client_test_artifact(&output, compatible_client_test_payload_v2(&request));
         let original = std::fs::read(&output).expect("read original compatible-client artifact");
 
         let first = reconcile_existing_compatible_client_dump(&request)
@@ -99385,6 +100488,8 @@ recorder_backend = "rusqlite"
         assert!(first.reconciled_without_mux_contact && second.reconciled_without_mux_contact);
         assert_eq!(first.subprocess_count, 0);
         assert_eq!(second.subprocess_count, 0);
+        assert_eq!(first.pane_count, 1);
+        assert_eq!(first.projection_count, 2);
         assert_eq!(
             first.domain_pane_counts,
             BTreeMap::from([("ssh:trj".to_string(), 1)])
@@ -99432,6 +100537,314 @@ recorder_backend = "rusqlite"
 
     #[cfg(unix)]
     #[test]
+    fn compatible_client_v2_alias_artifact_verifies_and_query_ack_is_idempotent() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("compatible-client v2 tempdir");
+        let base = directory.path().join("private");
+        std::fs::create_dir(&base).expect("create private compatible-client fixture parent");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("seal compatible-client fixture parent");
+        let recovery_environment = base.join(".frankenterm-compatible-client-proof");
+        std::fs::create_dir(&recovery_environment)
+            .expect("create retained compatible-client fixture environment");
+        std::fs::set_permissions(
+            &recovery_environment,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("seal retained compatible-client fixture environment");
+        let output = base.join("mux-dump-v2.json");
+        let request = compatible_client_test_request(output.clone());
+        let mut payload = compatible_client_test_payload_v2(&request);
+        payload["source"]["recovery_environment"]["path_sha256"] =
+            serde_json::json!(sha256_hex(recovery_environment.as_os_str().as_bytes()));
+        let published = publish_mux_dump_payload(&output, payload)
+            .expect("publish canonical compatible-client v2 artifact");
+        assert_eq!(published.schema, "frankenterm.mux-content-dump.v2");
+        assert!(!published.executable_restore_image);
+        assert!(published.compatible_client.is_some());
+        assert_eq!(published.pane_count, 1);
+        assert_eq!(published.projection_count, 2);
+
+        let original = std::fs::read(&output).expect("read compatible-client v2 artifact");
+        let verified = verify_mux_dump_artifact(&output).expect("verify v2 alias artifact");
+        assert_eq!(verified.schema, "frankenterm.mux-content-dump.v2");
+        assert_eq!(verified.pane_count, 1);
+        assert_eq!(verified.projection_count, 2);
+        assert_eq!(
+            verified.domain_pane_counts,
+            BTreeMap::from([("ssh:trj".to_string(), 1)])
+        );
+
+        let first = reconcile_existing_compatible_client_dump(&request)
+            .expect("first v2 lost-reply query succeeds")
+            .expect("v2 artifact is acknowledged");
+        assert!(first.reconciled_without_mux_contact);
+        assert_eq!(first.schema, "frankenterm.mux-content-dump.v2");
+        assert_eq!(first.subprocess_count, 0);
+        assert_eq!(
+            first.recovery_environment_path.as_ref(),
+            Some(&recovery_environment)
+        );
+        assert_eq!(first.pane_count, 1);
+        assert_eq!(first.projection_count, 2);
+
+        let moved_recovery_environment = base.join("recovery-environment-moved-after-publication");
+        std::fs::rename(&recovery_environment, &moved_recovery_environment)
+            .expect("move the recovery environment without removing it");
+        let second = reconcile_existing_compatible_client_dump(&request)
+            .expect("Query/Ack remains available after the mux-side environment disappears")
+            .expect("the verified artifact remains acknowledged");
+        assert!(second.reconciled_without_mux_contact);
+        assert_eq!(second.schema, first.schema);
+        assert_eq!(second.subprocess_count, 0);
+        assert!(second.recovery_environment_path.is_none());
+        assert_eq!(second.artifact_sha256, first.artifact_sha256);
+        assert_eq!(std::fs::read(&output).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn compatible_client_v2_verifier_rejects_projection_digest_summary_and_authority_mutations() {
+        let directory = tempfile::tempdir().expect("compatible-client v2 mutation tempdir");
+        let base = directory.path().join("private");
+        let request = compatible_client_test_request(base.join("unused.json"));
+        let payload = compatible_client_test_payload_v2(&request);
+        let rejects = |name: &str, mutated: serde_json::Value, expected: &str| {
+            let path = base.join(name);
+            write_compatible_client_test_artifact(&path, mutated);
+            let error = verify_mux_dump_artifact(&path)
+                .expect_err("mutated compatible-client v2 artifact must fail closed");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error:#}"
+            );
+        };
+
+        let mut reordered = payload.clone();
+        reordered["projections"].as_array_mut().unwrap().reverse();
+        rejects("reordered.json", reordered, "unique canonical ordering");
+
+        let mut duplicate = payload.clone();
+        let first_projection = duplicate["projections"][0].clone();
+        duplicate["projections"][1] = first_projection;
+        rejects("duplicate.json", duplicate, "unique canonical ordering");
+
+        let mut dangling = payload.clone();
+        dangling["projections"][1]["pane_id"] = serde_json::json!(99);
+        rejects("dangling.json", dangling, "missing content target");
+
+        let mut unreferenced = payload.clone();
+        let mut second_target = unreferenced["content_targets"][0].clone();
+        second_target["target"]["pane_id"] = serde_json::json!(2);
+        unreferenced["content_targets"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_target);
+        rejects(
+            "unreferenced.json",
+            unreferenced,
+            "unreferenced content target",
+        );
+
+        let mut wrong_summary = payload.clone();
+        wrong_summary["summary"]["projections_captured"] = serde_json::json!(1);
+        rejects(
+            "wrong-summary.json",
+            wrong_summary,
+            "summary projection counters disagree",
+        );
+
+        for timeout_ms in [999_u64, 1_001] {
+            let mut impossible_timeout = payload.clone();
+            impossible_timeout["limits"]["batch_timeout_ms"] = serde_json::json!(timeout_ms);
+            rejects(
+                &format!("impossible-timeout-{timeout_ms}.json"),
+                impossible_timeout,
+                "batch timeout is outside its bound",
+            );
+        }
+
+        let mut impossible_batch_output = payload.clone();
+        impossible_batch_output["limits"]["max_batch_output_bytes"] =
+            serde_json::json!(COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES - 1);
+        rejects(
+            "impossible-batch-output.json",
+            impossible_batch_output,
+            "max_batch_output_bytes is outside its bound",
+        );
+
+        let mut false_authority = payload.clone();
+        false_authority["topology_fence"]["authoritative_topology"] = serde_json::json!(true);
+        rejects(
+            "false-authority.json",
+            false_authority,
+            "topology authority claims",
+        );
+
+        for (name, pointer, value) in [
+            (
+                "false-stable.json",
+                "/topology_fence/stable",
+                serde_json::json!(false),
+            ),
+            (
+                "invented-incarnation.json",
+                "/topology_fence/mux_session_incarnation",
+                serde_json::json!("invented"),
+            ),
+            (
+                "invented-revision.json",
+                "/topology_fence/authoritative_topology_revision",
+                serde_json::json!(1),
+            ),
+            (
+                "false-incarnation-authority.json",
+                "/topology_fence/authoritative_mux_incarnation",
+                serde_json::json!(true),
+            ),
+            (
+                "false-aba-exclusion.json",
+                "/topology_fence/pane_id_aba_excluded",
+                serde_json::json!(true),
+            ),
+            (
+                "false-running-continuity.json",
+                "/capabilities/running_process_continuity",
+                serde_json::json!(true),
+            ),
+        ] {
+            let mut mutation = payload.clone();
+            *mutation
+                .pointer_mut(pointer)
+                .expect("v2 fixture contains the mutated claim") = value;
+            let expected = if pointer.starts_with("/capabilities/") {
+                "capability claim"
+            } else {
+                "topology authority claims"
+            };
+            rejects(name, mutation, expected);
+        }
+
+        let mut stale_uuid_digest = payload.clone();
+        stale_uuid_digest["content_targets"][0]["target"]["pane_uuid"] =
+            serde_json::json!("ffeeddccbbaa99887766554433221100");
+        rejects(
+            "stale-uuid-digest.json",
+            stale_uuid_digest,
+            "does not bind its content targets and projections",
+        );
+
+        let mut wrong_manifest = payload.clone();
+        wrong_manifest["topology_fence"]["initial_pane_ids"] = serde_json::json!([2]);
+        rejects(
+            "wrong-initial-manifest.json",
+            wrong_manifest,
+            "initial pane manifest disagrees",
+        );
+
+        let mut unknown_target_field = payload.clone();
+        unknown_target_field["content_targets"][0]["target"]["unverified"] =
+            serde_json::json!(false);
+        rejects(
+            "unknown-target-field.json",
+            unknown_target_field,
+            "frozen field set",
+        );
+
+        let mut false_complete = payload.clone();
+        false_complete["complete"] = serde_json::json!(false);
+        rejects(
+            "false-complete.json",
+            false_complete,
+            "not a complete zero-error artifact",
+        );
+
+        let expanded_payload = |target_count: usize| {
+            let mut expanded = payload.clone();
+            let template = payload["content_targets"][0].clone();
+            let content_targets = (1..=target_count)
+                .map(|pane_id| {
+                    let mut target = template.clone();
+                    target["target"]["pane_id"] = serde_json::json!(pane_id);
+                    target
+                })
+                .collect::<Vec<_>>();
+            let mut projections = (1..=target_count)
+                .map(|pane_id| serde_json::json!({"window_id": 3, "tab_id": 2, "pane_id": pane_id}))
+                .collect::<Vec<_>>();
+            projections.push(serde_json::json!({
+                "window_id": 4,
+                "tab_id": 5,
+                "pane_id": 1,
+            }));
+            let topology_sha256 = compatible_client_projected_topology_fingerprint_from_v2_records(
+                &content_targets,
+                &projections,
+            )
+            .expect("hash expanded v2 deadline fixture");
+            expanded["content_targets"] = serde_json::json!(content_targets);
+            expanded["projections"] = serde_json::json!(projections);
+            expanded["limits"]["max_panes"] = serde_json::json!(64);
+            expanded["limits"]["batch_size"] = serde_json::json!(1);
+            expanded["limits"]["batch_timeout_ms"] = serde_json::json!(120_000);
+            for field in [
+                "content_targets_listed_initial",
+                "content_targets_listed_final",
+                "content_targets_captured",
+            ] {
+                expanded["summary"][field] = serde_json::json!(target_count);
+            }
+            let projection_count = target_count + 1;
+            for field in [
+                "projections_listed_initial",
+                "projections_listed_final",
+                "projections_captured",
+            ] {
+                expanded["summary"][field] = serde_json::json!(projection_count);
+            }
+            expanded["summary"]["content_bytes"] =
+                serde_json::json!(target_count.saturating_mul(6));
+            expanded["topology_fence"]["initial_pane_ids"] =
+                serde_json::json!((1..=target_count).collect::<Vec<_>>());
+            expanded["topology_fence"]["initial_sha256"] = serde_json::json!(&topology_sha256);
+            expanded["topology_fence"]["final_sha256"] = serde_json::json!(&topology_sha256);
+            expanded
+        };
+        let exact_deadline_path = base.join("exact-derived-deadline.json");
+        write_compatible_client_test_artifact(&exact_deadline_path, expanded_payload(58));
+        verify_mux_dump_artifact(&exact_deadline_path)
+            .expect("the exact derived producer deadline boundary is accepted");
+        rejects(
+            "impossible-derived-deadline.json",
+            expanded_payload(59),
+            "impossible producer deadline",
+        );
+
+        let mut wrong_topology_digest = payload.clone();
+        wrong_topology_digest["topology_fence"]["initial_sha256"] =
+            serde_json::json!("f".repeat(64));
+        wrong_topology_digest["topology_fence"]["final_sha256"] = serde_json::json!("f".repeat(64));
+        rejects(
+            "wrong-topology-digest.json",
+            wrong_topology_digest,
+            "does not bind its content targets and projections",
+        );
+
+        let mut wrong_content_digest = payload;
+        wrong_content_digest["content_targets"][0]["content"]["sha256"] =
+            serde_json::json!("e".repeat(64));
+        rejects(
+            "wrong-content-digest.json",
+            wrong_content_digest,
+            "content receipt is inconsistent",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn compatible_client_topology_contract_rejects_unavailable_or_overclaimed_authority() {
         let directory = tempfile::tempdir().expect("compatible topology contract tempdir");
         let base = directory.path().join("private");
@@ -99441,9 +100854,33 @@ recorder_backend = "rusqlite"
         let receipt = verify_mux_dump_artifact(&request.output)
             .expect("source-honest compatible-client topology is accepted");
         assert!(receipt.compatible_client.is_some());
+        assert_eq!(receipt.schema, "frankenterm.mux-content-dump.v1");
+        assert_eq!(receipt.projection_count, receipt.pane_count);
         assert_eq!(
             receipt.domain_pane_counts,
             BTreeMap::from([("ssh:trj".to_string(), 1)])
+        );
+        let legacy_reconciliation_error = reconcile_existing_compatible_client_dump(&request)
+            .expect_err("a legacy v1 artifact cannot satisfy current alias-aware Query/Ack");
+        assert!(
+            legacy_reconciliation_error
+                .to_string()
+                .contains("current lost-reply reconciliation requires schema v2")
+        );
+
+        let impossible_batch_output_path = base.join("impossible-batch-output.json");
+        let mut impossible_batch_output = payload.clone();
+        impossible_batch_output["limits"]["max_batch_output_bytes"] =
+            serde_json::json!(COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES - 1);
+        write_compatible_client_test_artifact(
+            &impossible_batch_output_path,
+            impossible_batch_output,
+        );
+        assert!(
+            verify_mux_dump_artifact(&impossible_batch_output_path)
+                .expect_err("legacy verifier also rejects an impossible subprocess envelope bound")
+                .to_string()
+                .contains("max_batch_output_bytes is outside the supported bounds")
         );
 
         let overclaim_path = base.join("overclaim.json");
@@ -99581,6 +101018,68 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
+    fn compatible_client_state_structure_budget_admits_the_full_declared_projection_bound() {
+        let envelope = |data: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "ok": true,
+                "data": data,
+                "error": null,
+                "error_code": null,
+                "hint": null,
+                "elapsed_ms": 3,
+                "version": COMPATIBLE_CLIENT_DUMP_REQUIRED_VERSION,
+                "now": 1,
+                "schema_version": 1,
+            })
+        };
+        let pane = |pane_id: usize, ignore_reason: Option<&str>| {
+            let mut value = serde_json::json!({
+                "pane_id": pane_id,
+                "pane_uuid": null,
+                "tab_id": pane_id,
+                "window_id": pane_id,
+                "domain": "local",
+                "title": null,
+                "cwd": null,
+                "observed": ignore_reason.is_none(),
+            });
+            if let Some(reason) = ignore_reason {
+                value
+                    .as_object_mut()
+                    .expect("pane fixture is an object")
+                    .insert("ignore_reason".to_string(), serde_json::json!(reason));
+            }
+            value
+        };
+        for ignore_reason in [None, Some("not observed")] {
+            let data = (0..COMPATIBLE_CLIENT_DUMP_MAX_PANES)
+                .map(|pane_id| pane(pane_id, ignore_reason))
+                .collect::<Vec<_>>();
+            let bytes = serde_json::to_vec(&envelope(data)).expect("serialize full census");
+            let parsed = parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+                &bytes,
+                compatible_client_state_json_limits(COMPATIBLE_CLIENT_DUMP_MAX_PANES),
+            )
+            .expect("the full declared projection bound must fit the structural budget");
+            assert_eq!(parsed.len(), COMPATIBLE_CLIENT_DUMP_MAX_PANES);
+        }
+
+        let over_bound = (0..=COMPATIBLE_CLIENT_DUMP_MAX_PANES)
+            .map(|pane_id| pane(pane_id, Some("not observed")))
+            .collect::<Vec<_>>();
+        let over_bound_bytes =
+            serde_json::to_vec(&envelope(over_bound)).expect("serialize oversized census");
+        assert!(
+            parse_compatible_client_robot_envelope::<Vec<CompatibleClientPaneState>>(
+                &over_bound_bytes,
+                compatible_client_state_json_limits(COMPATIBLE_CLIENT_DUMP_MAX_PANES),
+            )
+            .is_err(),
+            "one projection beyond the declared bound must fail closed"
+        );
+    }
+
+    #[test]
     fn compatible_client_batch_requires_exact_untruncated_once_per_pane_results() {
         let redactor = frankenterm_core::redactor::Redactor::new();
         let expected = [7, 9];
@@ -99646,6 +101145,58 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
+    fn compatible_client_alias_aware_census_reads_one_target_and_retains_all_projections() {
+        let pane = |window_id, tab_id| CompatibleClientPaneState {
+            pane_id: 7,
+            pane_uuid: Some("00112233445566778899aabbccddeeff".to_string()),
+            tab_id,
+            window_id,
+            domain: "ssh:trj".to_string(),
+            title: Some("shell".to_string()),
+            cwd: Some("file:///tmp".to_string()),
+            observed: true,
+            ignore_reason: None,
+        };
+        let census = validate_compatible_client_state(vec![pane(4, 5), pane(3, 2)], 2)
+            .expect("one pane projected twice is a valid alias-aware census");
+        assert_eq!(census.content_targets.len(), 1);
+        assert_eq!(
+            census.content_targets.keys().copied().collect::<Vec<_>>(),
+            vec![7],
+            "the get-text request inventory contains each numeric pane exactly once"
+        );
+        assert_eq!(
+            census.projections,
+            vec![
+                CompatibleClientPaneProjection {
+                    window_id: 3,
+                    tab_id: 2,
+                    pane_id: 7,
+                },
+                CompatibleClientPaneProjection {
+                    window_id: 4,
+                    tab_id: 5,
+                    pane_id: 7,
+                },
+            ]
+        );
+
+        let duplicate_error = validate_compatible_client_state(vec![pane(3, 2), pane(3, 2)], 2)
+            .expect_err("an exact repeated projection is ambiguous and must fail closed");
+        assert!(
+            duplicate_error
+                .to_string()
+                .contains("duplicate pane projection")
+        );
+
+        let mut conflicting = pane(4, 5);
+        conflicting.cwd = Some("file:///different".to_string());
+        let conflict_error = validate_compatible_client_state(vec![pane(3, 2), conflicting], 2)
+            .expect_err("one pane identity cannot carry conflicting metadata");
+        assert!(conflict_error.to_string().contains("conflicting metadata"));
+    }
+
+    #[test]
     fn compatible_client_topology_fence_uses_raw_domain_before_redaction() {
         let pane = |domain: &str| CompatibleClientPaneState {
             pane_id: 7,
@@ -99665,9 +101216,13 @@ recorder_backend = "rusqlite"
             redactor.redact(first_secret),
             redactor.redact(second_secret)
         );
+        let first = validate_compatible_client_state(vec![pane(first_secret)], 1)
+            .expect("first raw-domain census is valid");
+        let second = validate_compatible_client_state(vec![pane(second_secret)], 1)
+            .expect("second raw-domain census is valid");
         assert_ne!(
-            compatible_client_raw_topology(&[pane(first_secret)]),
-            compatible_client_raw_topology(&[pane(second_secret)]),
+            compatible_client_raw_topology(&first),
+            compatible_client_raw_topology(&second),
             "raw identity comparison must detect drift even when redaction collapses both domains"
         );
     }
@@ -100561,11 +102116,7 @@ recorder_backend = "rusqlite"
             .expect("write hidden-field dump");
         let hidden_field_error = verify_mux_dump_artifact(&hidden_field_path)
             .expect_err("a recomputed checksum must not authorize unknown v1 fields");
-        assert!(
-            hidden_field_error
-                .to_string()
-                .contains("frozen v1 field set")
-        );
+        assert!(hidden_field_error.to_string().contains("frozen field set"));
 
         let duplicate_key_path = dir.path().join("duplicate-key-mux-dump.json");
         let mut duplicate_key_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
@@ -100590,7 +102141,7 @@ recorder_backend = "rusqlite"
         assert!(
             duplicate_key_error
                 .to_string()
-                .contains("canonical v1 artifact encoding")
+                .contains("canonical artifact encoding")
         );
 
         let inconsistent_path = dir.path().join("internally-inconsistent-mux-dump.json");
@@ -100797,7 +102348,22 @@ recorder_backend = "rusqlite"
         );
         assert!(command.contains("run_cli_settled_blocking_effect("));
         assert!(!command.contains("run_cli_blocking_with_cx("));
-        assert!(command.contains("publish_mux_dump_payload(&publication_path, payload)"));
+        let publish = command
+            .find("publish_mux_dump_payload(&publication_path, payload)")
+            .expect("fresh dump publication remains present");
+        let revalidate_recovery_environment = command
+            .find("let verified_recovery_environment_path =")
+            .expect("fresh receipt revalidates its retained recovery environment");
+        let receipt = command
+            .find("let receipt = CompatibleClientDumpReceipt {")
+            .expect("fresh compatible-client receipt remains present");
+        assert!(
+            publish < revalidate_recovery_environment && revalidate_recovery_environment < receipt,
+            "fresh receipt must locate its recovery environment after publication and before claiming retention"
+        );
+        assert!(
+            command.contains("recovery_environment_path: Some(verified_recovery_environment_path)")
+        );
         assert!(command.contains("emit_compatible_client_dump_receipt(&receipt, output_format)"));
     }
 
@@ -105973,7 +107539,7 @@ log_level = "debug"
         assert!(parsed.get("command").is_some());
         assert!(parsed.get("expected_actions").is_some());
         let actions = parsed["expected_actions"].as_array().unwrap();
-        assert!(!actions.is_empty());
+        assert_ne!(actions.as_slice(), &[] as &[serde_json::Value; 0]);
     }
 
     #[test]
@@ -106117,27 +107683,47 @@ log_level = "debug"
 
     #[test]
     fn remote_activation_summary_never_promotes_service_liveness_to_generation_proof() {
-        let dry_run = remote_mux_activation_summary(false, false, false, false)
-            .expect("dry-run never requires a service mutation result");
+        let dry_run = remote_mux_activation_summary(RemoteMuxActivationSummaryInput {
+            apply_changes: false,
+            install_candidate: false,
+            active_mux_before_install: false,
+            mux_owner_active_after_setup: false,
+        })
+        .expect("dry-run never requires a service mutation result");
         assert_eq!(dry_run, "not attempted; dry-run only");
 
-        let started = remote_mux_activation_summary(true, false, false, true)
-            .expect("an active mux owner satisfies only the process-liveness gate");
+        let started = remote_mux_activation_summary(RemoteMuxActivationSummaryInput {
+            apply_changes: true,
+            install_candidate: false,
+            active_mux_before_install: false,
+            mux_owner_active_after_setup: true,
+        })
+        .expect("an active mux owner satisfies only the process-liveness gate");
         assert_eq!(
             started,
             "mux owner observed; exact service and running-generation identities remain unverified"
         );
         assert!(!started.contains("complete"));
 
-        let preserved = remote_mux_activation_summary(true, true, true, true)
-            .expect("a manual or service-owned live mux remains an activation fence");
+        let preserved = remote_mux_activation_summary(RemoteMuxActivationSummaryInput {
+            apply_changes: true,
+            install_candidate: true,
+            active_mux_before_install: true,
+            mux_owner_active_after_setup: true,
+        })
+        .expect("a manual or service-owned live mux remains an activation fence");
         assert_eq!(
             preserved,
             "pending; candidate not activated and the previously live mux owner was preserved"
         );
 
-        let lease_blocked = remote_mux_activation_summary(true, true, false, false)
-            .expect("a safely pending candidate does not require a mux to be started");
+        let lease_blocked = remote_mux_activation_summary(RemoteMuxActivationSummaryInput {
+            apply_changes: true,
+            install_candidate: true,
+            active_mux_before_install: false,
+            mux_owner_active_after_setup: false,
+        })
+        .expect("a safely pending candidate does not require a mux to be started");
         assert_eq!(
             lease_blocked,
             "pending; candidate not activated because no cross-launcher lifetime lease exists"
@@ -106146,8 +107732,13 @@ log_level = "debug"
 
     #[test]
     fn remote_activation_summary_fails_closed_when_a_preexisting_owner_disappears() {
-        let lost_owner = remote_mux_activation_summary(true, true, true, false)
-            .expect_err("loss of the previously live owner must not be hidden");
+        let lost_owner = remote_mux_activation_summary(RemoteMuxActivationSummaryInput {
+            apply_changes: true,
+            install_candidate: true,
+            active_mux_before_install: true,
+            mux_owner_active_after_setup: false,
+        })
+        .expect_err("loss of the previously live owner must not be hidden");
         assert!(lost_owner.to_string().contains("refusing to report"));
     }
 
@@ -106281,7 +107872,7 @@ log_level = "debug"
         use std::os::unix::process::ExitStatusExt;
         use std::sync::Mutex;
 
-        if build_meta::GIT_HASH == "unknown" || build_meta::GIT_DIRTY != "" {
+        if build_meta::GIT_HASH == "unknown" || !build_meta::GIT_DIRTY.is_empty() {
             return;
         }
 
@@ -106418,7 +108009,7 @@ log_level = "debug"
         use std::os::unix::process::ExitStatusExt;
         use std::sync::Mutex;
 
-        if build_meta::GIT_HASH == "unknown" || build_meta::GIT_DIRTY != "" {
+        if build_meta::GIT_HASH == "unknown" || !build_meta::GIT_DIRTY.is_empty() {
             return;
         }
 
@@ -106695,7 +108286,7 @@ log_level = "debug"
         ValidatedLocalProcessFamily {
             ft: LocalComponentSnapshot {
                 identity: LocalComponentIdentity {
-                    build_id: identity.build_id.clone(),
+                    build_id: identity.build_id,
                     target: identity.target.clone(),
                     profile: identity.profile.clone(),
                     version: identity.version.clone(),
@@ -108294,7 +109885,7 @@ log_level = "debug"
                 "exact component upload must succeed: {}",
                 String::from_utf8_lossy(&uploaded.stderr)
             );
-            assert!(uploaded.stdout.is_empty());
+            assert_eq!(uploaded.stdout, [] as [u8; 0]);
             assert_eq!(
                 std::fs::read(&remote_stage).expect("read exact uploaded component"),
                 std::fs::read(&ft_path).expect("read local exact component")
@@ -108368,7 +109959,7 @@ log_level = "debug"
                 !rejected.status.success(),
                 "a changed remote stage must fail before publication"
             );
-            assert!(rejected.stdout.is_empty());
+            assert_eq!(rejected.stdout, [] as [u8; 0]);
 
             let publish_command = local_process_family_publish_command(
                 "0123456789abcdef0123456789abcdef",
@@ -108412,7 +110003,7 @@ log_level = "debug"
                 !rejected_publication.status.success(),
                 "publication must recheck and reject a stage changed after its copy receipt"
             );
-            assert!(rejected_publication.stdout.is_empty());
+            assert_eq!(rejected_publication.stdout, [] as [u8; 0]);
             assert!(!remote_bin.join("ft").exists());
             assert!(!remote_bin.join("frankenterm-mux-server").exists());
             assert!(!remote_bin.join("frankenterm-pty-guardian").exists());
@@ -108575,7 +110166,7 @@ log_level = "debug"
                 !symlink_rejected.status.success(),
                 "a staged symlink must fail before publication"
             );
-            assert!(symlink_rejected.stdout.is_empty());
+            assert_eq!(symlink_rejected.stdout, [] as [u8; 0]);
         }
 
         write_atomic_component_fixture(
@@ -109538,7 +111129,7 @@ with open(path, "wb") as output:
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, target_os = "macos"))]
     fn create_valid_process_family_xz_archive(path: &Path, manifest_name: &str) {
         let program = r#"
 import io
@@ -109574,7 +111165,7 @@ with tarfile.open(path, "w:xz") as archive:
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, target_os = "macos"))]
     fn run_authenticated_process_family_extractor(
         installer: &Path,
         archive: &Path,
@@ -111477,7 +113068,7 @@ printf x > "$COSIGN_MARKER"
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
             .expect("make managed-selector destination private");
 
-        let installed = run_installer_family_function(
+        let install_output = run_installer_family_function(
             &installer,
             &old_family,
             &destination,
@@ -111485,11 +113076,11 @@ printf x > "$COSIGN_MARKER"
             None,
         );
         assert!(
-            installed.status.success(),
+            install_output.status.success(),
             "initial managed family install failed: {}",
-            String::from_utf8_lossy(&installed.stderr)
+            String::from_utf8_lossy(&install_output.stderr)
         );
-        let initial_receipt = parse_installer_process_family_receipt(&installed.stdout);
+        let initial_receipt = parse_installer_process_family_receipt(&install_output.stdout);
         assert_eq!(initial_receipt["activation"], "pending");
         assert_eq!(initial_receipt["active_authority"], "none");
         assert_initial_family_is_uniformly_unavailable(&destination);
@@ -111637,7 +113228,7 @@ printf x > "$COSIGN_MARKER"
         std::fs::create_dir(&destination).expect("create standalone app-test destination");
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
             .expect("make standalone app-test destination private");
-        let installed = run_installer_family_function(
+        let install_output = run_installer_family_function(
             &installer,
             &family,
             &destination,
@@ -111645,11 +113236,11 @@ printf x > "$COSIGN_MARKER"
             None,
         );
         assert!(
-            installed.status.success(),
+            install_output.status.success(),
             "standalone app-test family failed to install: {}",
-            String::from_utf8_lossy(&installed.stderr)
+            String::from_utf8_lossy(&install_output.stderr)
         );
-        let receipt = parse_installer_process_family_receipt(&installed.stdout);
+        let receipt = parse_installer_process_family_receipt(&install_output.stdout);
         assert_eq!(receipt["activation"], "pending");
         activate_installer_test_generation(&destination, &family);
         assert!(family_bytes_match(&destination, &family));
@@ -113006,7 +114597,7 @@ printf x > "$COSIGN_MARKER"
         assert!(parsed.get("policy_evaluation").is_some());
         assert!(parsed.get("expected_actions").is_some());
         let actions = parsed["expected_actions"].as_array().unwrap();
-        assert!(!actions.is_empty());
+        assert_ne!(actions.as_slice(), &[] as &[serde_json::Value; 0]);
     }
 
     #[test]
@@ -115216,7 +116807,10 @@ printf x > "$COSIGN_MARKER"
         let json = serde_json::to_value(&data).unwrap();
 
         assert_eq!(json["total"].as_u64().unwrap(), 0);
-        assert!(json["accounts"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["accounts"].as_array().unwrap().as_slice(),
+            &[] as &[serde_json::Value; 0]
+        );
     }
 
     #[test]
@@ -115673,7 +117267,10 @@ printf x > "$COSIGN_MARKER"
 
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["total"].as_u64().unwrap(), 0);
-        assert!(json["reservations"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["reservations"].as_array().unwrap().as_slice(),
+            &[] as &[serde_json::Value; 0]
+        );
     }
 
     // =========================================================================
@@ -116136,7 +117733,7 @@ printf x > "$COSIGN_MARKER"
     #[test]
     fn version_short_is_non_empty_and_contains_semver() {
         let v = build_meta::short_version();
-        assert!(!v.is_empty());
+        assert_ne!(v, "");
         // Must contain a semver-like pattern (X.Y.Z)
         assert!(
             v.contains('.'),
@@ -117920,7 +119517,7 @@ printf x > "$COSIGN_MARKER"
         assert_eq!(data["selected_targets"].as_array().unwrap().len(), 2);
         assert_eq!(data["receipt"]["status"], "dry_run");
         assert_eq!(data["receipt"]["steps"].as_array().unwrap().len(), 2);
-        assert!(executor.executed_steps.is_empty());
+        assert_eq!(executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -117983,7 +119580,7 @@ printf x > "$COSIGN_MARKER"
         assert_eq!(data["receipt"], serde_json::Value::Null);
         let (code, _, _) = robot_fleet_scale_failure(&data, false).expect("scale failure");
         assert_eq!(code, "robot.fleet.no_eligible_targets");
-        assert!(executor.executed_steps.is_empty());
+        assert_eq!(executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118012,7 +119609,7 @@ printf x > "$COSIGN_MARKER"
         );
         let (code, _, _) = robot_fleet_scale_failure(&data, false).expect("scale failure");
         assert_eq!(code, "robot.fleet.policy_denied");
-        assert!(executor.executed_steps.is_empty());
+        assert_eq!(executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118082,7 +119679,7 @@ printf x > "$COSIGN_MARKER"
 
         assert_eq!(replay["receipt"]["status"], "succeeded");
         assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
-        assert!(replay_executor.executed_steps.is_empty());
+        assert_eq!(replay_executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118114,7 +119711,7 @@ printf x > "$COSIGN_MARKER"
 
         assert_eq!(replay["status"], "durable_receipt_replayed");
         assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
-        assert!(replay_executor.executed_steps.is_empty());
+        assert_eq!(replay_executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118152,7 +119749,7 @@ printf x > "$COSIGN_MARKER"
         .expect("replay durable scale down");
 
         assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
-        assert!(replay_executor.executed_steps.is_empty());
+        assert_eq!(replay_executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118189,7 +119786,7 @@ printf x > "$COSIGN_MARKER"
                 frankenterm_core::fleet_mutation::FleetMutationPlanError::IdempotencyKeyConflict { .. }
             )
         ));
-        assert!(conflicting_executor.executed_steps.is_empty());
+        assert_eq!(conflicting_executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118277,7 +119874,7 @@ printf x > "$COSIGN_MARKER"
 
         assert_eq!(replay["receipt"]["status"], "compensated");
         assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
-        assert!(replay_executor.executed_steps.is_empty());
+        assert_eq!(replay_executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118385,7 +119982,7 @@ printf x > "$COSIGN_MARKER"
         assert_eq!(data["reassignments"][0]["from_agent"], "codex:1");
         assert_eq!(data["reassignments"][0]["to_agent"], "codex:2");
         assert_eq!(data["receipt"]["status"], "dry_run");
-        assert!(executor.executed_steps.is_empty());
+        assert_eq!(executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118517,7 +120114,7 @@ printf x > "$COSIGN_MARKER"
         assert!(reason_codes.contains("blocked_dependencies_present"));
         assert!(reason_codes.contains("owner_requires_inspection"));
         assert_eq!(data["receipt"], serde_json::Value::Null);
-        assert!(executor.executed_steps.is_empty());
+        assert_eq!(executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -118595,7 +120192,7 @@ printf x > "$COSIGN_MARKER"
 
         assert_eq!(replay["receipt"]["status"], "succeeded");
         assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
-        assert!(replay_executor.executed_steps.is_empty());
+        assert_eq!(replay_executor.executed_steps, [] as [String; 0]);
     }
 
     #[test]
@@ -121290,7 +122887,10 @@ printf x > "$COSIGN_MARKER"
         assert!(!report.raw_pane_content_stored);
         assert!(!report.live_mutation_allowed);
         assert!(!report.side_effects_executed);
-        assert!(!report.evaluation_log.is_empty());
+        assert_ne!(
+            report.evaluation_log.as_slice(),
+            &[] as &[frankenterm_core::rehearsal_score::RehearsalCriterionEvaluationLog; 0]
+        );
         let plain = render_rehearsal_score_plain(&report);
         assert!(plain.contains("rehearsal-score: missing_evidence"));
         assert!(plain.contains("blockers:"));
@@ -122471,7 +124071,7 @@ A  docs/new-proof.md\n";
                             scope,
                         },
                 }) => {
-                    assert!(agents.is_empty());
+                    assert_eq!(agents, [] as [String; 0]);
                     assert!(!all);
                     assert!(!dry_run);
                     assert_eq!(scope, RobotAgentConfigScope::Project);
@@ -122605,8 +124205,11 @@ A  docs/new-proof.md\n";
             assert_eq!(data.provider_filter.as_deref(), Some("agy"));
             assert_eq!(data.count, 1);
             assert!(data.discovery_complete);
-            assert!(data.incomplete.is_empty());
-            assert!(data.warnings.is_empty());
+            assert_eq!(
+                data.incomplete,
+                [] as [frankenterm_core::session_resume::SessionDiscoveryIncomplete; 0]
+            );
+            assert_eq!(data.warnings, [] as [String; 0]);
             let entry = &data.sessions[0];
             assert_eq!(entry.provider, "agy");
             assert_eq!(entry.session_id, conversation_id);
@@ -126862,7 +128465,7 @@ A  docs/new-proof.md\n";
             assert_eq!(features_check.status, DiagnosticStatus::Ok);
             // Features detail should be a string (either feature list or "default")
             let detail = features_check.detail.as_deref().unwrap();
-            assert!(!detail.is_empty());
+            assert_ne!(detail, "");
             // Should not contain secrets
             assert!(!detail.contains("sk-"));
             assert!(!detail.contains("Bearer"));
