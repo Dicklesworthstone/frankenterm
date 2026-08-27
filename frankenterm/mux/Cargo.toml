@@ -2,6 +2,13 @@
 name = "mux"
 version = "0.1.0"
 authors = ["Wez Furlong <wez@wezfurlong.org>"]
+# CONSTRAINT (gh #83): this crate is still on edition 2018 while the workspace
+# root is edition 2024, so Rust 2024-only syntax (e.g. `let` chains) does NOT
+# compile here — it has already broken `main` once (#83). Do not write 2024
+# syntax into mux sources, and gate edits with `cargo check -p mux --lib`.
+# Bumping to edition 2024 is the durable fix, but it is a deliberate migration
+# (this is inherited upstream WezTerm code under active rewrite), not a
+# one-line change to make in passing.
 edition = "2018"
 publish = false
 
