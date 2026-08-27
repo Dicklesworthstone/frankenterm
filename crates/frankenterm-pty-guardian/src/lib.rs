@@ -80,10 +80,10 @@ pub mod transport;
 
 #[cfg(unix)]
 pub use broker::{
-    BrokerCensusEntryV1, BrokerCensusPageRequestV1, BrokerCensusPageV1, BrokerControlClientError,
-    BrokerControlClientV1, BrokerControlServiceConfigV1, BrokerControlServiceError,
-    BrokerControlServiceV1, BrokerExecBootstrapErrorV1, BrokerGuardianConnectionIdentityV1,
-    BrokerRecoveredPaneDispositionV1, BrokerRecoveryCensusV1, run_broker_exec_bootstrap,
+    BrokerCensusDispositionV1, BrokerCensusEntryV1, BrokerCensusPageRequestV1, BrokerCensusPageV1,
+    BrokerCensusV1, BrokerControlClientError, BrokerControlClientV1, BrokerControlServiceConfigV1,
+    BrokerControlServiceError, BrokerControlServiceV1, BrokerExecBootstrapErrorV1,
+    BrokerGuardianConnectionIdentityV1, run_broker_exec_bootstrap,
 };
 #[cfg(unix)]
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};

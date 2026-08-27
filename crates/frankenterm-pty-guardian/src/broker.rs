@@ -20,8 +20,8 @@
 //! catalog members remain read-only and cannot share a pane, effect, journal,
 //! or origin-request namespace with a new Spawn. Exact effect acknowledgement
 //! now durably transfers a retained Spawn result into live-pane authority;
-//! retained-result reclamation, live-pane Census integration, activation
-//! wiring, startup adoption, durable output replay, and successor lease rotation
+//! live-pane startup adoption, activation wiring, durable output replay, and
+//! successor lease rotation
 //! must still land before any production selector may start it. The
 //! process-local PTY typestate below therefore still does **not** prove guardian-`SIGKILL`
 //! continuity. Catalog Genesis admission remains durable pre-Spawn intent,
@@ -164,6 +164,7 @@ const BROKER_CONTROL_CENSUS_PAGE_MAGIC: [u8; 4] = *b"FTBC";
 const BROKER_CONTROL_CENSUS_PAGE_VERSION: u16 = 1;
 const BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES: usize = 48;
 const BROKER_CONTROL_CENSUS_ENTRY_BYTES: usize = 224;
+const BROKER_CONTROL_CENSUS_SNAPSHOT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const BROKER_CONTROL_CENSUS_NO_CURSOR: u64 = u64::MAX;
 const BROKER_CONTROL_CENSUS_SNAPSHOT_ID_ATTEMPTS: usize = 16;
 pub(crate) const BROKER_CONTROL_MAX_FRAME_BYTES: usize =
@@ -1202,7 +1203,7 @@ impl BrokerControlOperationV1 {
     }
 }
 
-/// Bounded immutable-page request for the broker recovery census.
+/// Bounded immutable-page request for the broker Census.
 ///
 /// Cursor zero always requests a fresh broker-owned snapshot and therefore
 /// requires a nil snapshot identity. Continuations carry the exact nonzero
@@ -2059,15 +2060,15 @@ pub enum BrokerControlClientError {
     BrokerBuildIdentityMismatch,
     #[error("broker lineage did not match the persistent token authority")]
     BrokerLineageMismatch,
-    #[error("broker recovery Census snapshot expired; restart at cursor zero")]
+    #[error("broker Census snapshot expired; restart at cursor zero")]
     CensusSnapshotUnavailable,
-    #[error("broker recovery Census snapshot belongs to a different authenticated owner")]
+    #[error("broker Census snapshot belongs to a different authenticated owner")]
     CensusAuthorityConflict,
-    #[error("broker recovery Census snapshot capacity is temporarily unavailable")]
+    #[error("broker Census snapshot capacity is temporarily unavailable")]
     CensusCapacityUnavailable,
-    #[error("broker recovery Census collection exceeded its end-to-end deadline")]
+    #[error("broker Census collection exceeded its end-to-end deadline")]
     CensusCollectionDeadlineExceeded,
-    #[error("broker recovery Census collection allocation failed")]
+    #[error("broker Census collection allocation failed")]
     CensusCollectionCapacityExhausted,
     #[error("broker rejected the authenticated Spawn admission")]
     SpawnRejected,
@@ -2288,9 +2289,9 @@ struct BrokerReadyEventV1 {
     closed: bool,
 }
 
-#[derive(Clone, Copy)]
 struct BrokerCensusSnapshotV1 {
     owner: BrokerGuardianOwnerIdentity,
+    entries: Vec<BrokerCensusEntryV1>,
 }
 
 /// Complete identity of one admitted Spawn while it is owned by the broker's
@@ -3164,17 +3165,141 @@ fn reconcile_broker_catalog_under_token_authority_with_hook(
 /// The service authenticates and fences connections, opens the complete Spawn
 /// catalog before listening, admits new Spawn effects through one serialized
 /// durability worker, and exposes lost-reply Query recovery plus an immutable
-/// paginated recovery census. Every recovered journal keeps append authority
+/// paginated Census. Every recovered journal keeps append authority
 /// withheld, and every namespace collision with recovered state is
 /// quarantined. Exact Spawn acknowledgement is serialized through the same
 /// durability worker and transfers the retained PTY into live-pane authority.
-/// Live Census rows, proxy effects, connection-EOF lease fencing, and successor
-/// rotation remain disabled until their durable ownership transitions are
-/// integrated and proven together.
+/// Live Census rows retain exact PTY and lease availability, while proxy
+/// effects, connection-EOF lease fencing, and successor rotation remain
+/// disabled until their durable ownership transitions are integrated and
+/// proven together.
 struct BrokerLiveSpawnV1 {
+    fingerprint: BrokerSpawnWorkerFingerprintV1,
     ack_id: Uuid,
-    acknowledgement: BrokerSpawnWalReceiptV1,
-    retained: BrokerSpawnWorkerCompletionV1,
+    journal: BrokerSpawnJournalV1,
+    adoption: Box<BrokerAdoptionV1>,
+}
+
+impl BrokerLiveSpawnV1 {
+    fn from_acknowledged_completion(
+        completion: BrokerSpawnAckWorkerCompletionV1,
+    ) -> Result<Self, Box<BrokerSpawnAckWorkerCompletionV1>> {
+        let Some(acknowledgement) = completion
+            .result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .copied()
+            .filter(|receipt| receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+        else {
+            return Err(Box::new(completion));
+        };
+        let durable_result_is_exact = completion.retained.fingerprint
+            == completion.fingerprint.spawn
+            && matches!(
+                &completion.retained.outcome,
+                BrokerSpawnWorkerOutcomeV1::Applied {
+                    journal,
+                    adoption,
+                    ..
+                } if journal.status().phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+                    && journal.status().reply_ack_id == Some(completion.fingerprint.ack_id)
+                    && journal.status().child_identity
+                        == Some(adoption.pane.kernel_child_identity())
+                    && acknowledgement.sequence().checked_add(1)
+                        == Some(BROKER_SPAWN_WAL_MAX_RECORDS)
+            );
+        if completion.token_authority_failed || !durable_result_is_exact {
+            return Err(Box::new(completion));
+        }
+
+        let BrokerSpawnAckWorkerCompletionV1 {
+            fingerprint: acknowledgement_fingerprint,
+            retained,
+            result,
+            token_authority_failed,
+        } = completion;
+        let BrokerSpawnWorkerCompletionV1 {
+            fingerprint,
+            outcome,
+            token_authority_failed: retained_token_authority_failed,
+        } = *retained;
+        match outcome {
+            BrokerSpawnWorkerOutcomeV1::Applied {
+                journal,
+                adoption,
+                spawn_observed: _,
+            } => Ok(Self {
+                fingerprint,
+                ack_id: acknowledgement_fingerprint.ack_id,
+                journal,
+                adoption,
+            }),
+            outcome => Err(Box::new(BrokerSpawnAckWorkerCompletionV1 {
+                fingerprint: acknowledgement_fingerprint,
+                retained: Box::new(BrokerSpawnWorkerCompletionV1 {
+                    fingerprint,
+                    outcome,
+                    token_authority_failed: retained_token_authority_failed,
+                }),
+                result,
+                token_authority_failed,
+            })),
+        }
+    }
+
+    fn census_entry(&self) -> Result<BrokerCensusEntryV1, BrokerControlProtocolError> {
+        let status = self.journal.status();
+        let pane_status = self.adoption.pane.status();
+        let Some(owner_mux_incarnation) = pane_status.owner_mux_incarnation else {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        };
+        let identity = status.identity;
+        let binding = self.fingerprint.binding;
+        if !matches!(status.tail, BrokerSpawnWalTailV1::Clean)
+            || status.phase != Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+            || status.reply_ack_id != Some(self.ack_id)
+            || status.child_identity != Some(self.adoption.pane.kernel_child_identity())
+            || status.append_authority_withheld
+            || status.head_reconciliation_required
+            || identity.journal_id() != self.fingerprint.journal_id
+            || identity.mux_incarnation() != binding.mux_incarnation
+            || identity.durable_pane_id() != binding.durable_pane_id
+            || identity.spawn_effect_id() != binding.spawn_effect_id
+            || identity.origin_request_id() != binding.origin_request_id
+            || pane_status.lifecycle != BrokerPaneLifecycleV1::Active
+            || pane_status.child_identity.durable_pane_id != binding.durable_pane_id
+            || pane_status.child_identity.spawn_effect_id != binding.spawn_effect_id
+            || pane_status.lease_generation == 0
+            || self.adoption.pane.output_journal.is_none()
+        {
+            return Err(BrokerControlProtocolError::InvalidShape);
+        }
+        let entry = BrokerCensusEntryV1 {
+            journal_id: identity.journal_id(),
+            mux_incarnation: identity.mux_incarnation(),
+            durable_pane_id: identity.durable_pane_id(),
+            spawn_effect_id: identity.spawn_effect_id(),
+            origin_request_id: identity.origin_request_id(),
+            phase: status.phase,
+            disposition: BrokerCensusDispositionV1::ReplyAcknowledgedPtyAvailable,
+            attempt_id: status.attempt_id,
+            child_identity: status.child_identity,
+            reply_ack_id: status.reply_ack_id,
+            committed_records: status.committed_records,
+            committed_wal_bytes: status.committed_wal_bytes,
+            committed_head_bytes: status.committed_head_bytes,
+            append_authority_withheld: false,
+            head_reconciliation_required: false,
+            effects_disabled: false,
+            pty_available: true,
+            lease_available: true,
+            output_replay_available: true,
+            owner_mux_incarnation: Some(owner_mux_incarnation),
+            lease_generation: pane_status.lease_generation,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
 }
 
 pub struct BrokerControlServiceV1 {
@@ -3284,9 +3409,20 @@ impl BrokerControlServiceV1 {
             .map_err(|_| {
                 BrokerControlServiceError::InvalidConfiguration("Hello receipt allocation failed")
             })?;
+        let census_snapshot_bytes = GUARDIAN_MAX_PANES
+            .checked_mul(std::mem::size_of::<BrokerCensusEntryV1>())
+            .ok_or(BrokerControlServiceError::InvalidConfiguration(
+                "Census snapshot byte bound overflow",
+            ))?;
+        let max_census_snapshots = config.max_connections.min(
+            BROKER_CONTROL_CENSUS_SNAPSHOT_MEMORY_BYTES
+                .checked_div(census_snapshot_bytes)
+                .unwrap_or(0)
+                .max(1),
+        );
         let mut census_snapshots = HashMap::new();
         census_snapshots
-            .try_reserve(config.max_connections)
+            .try_reserve(max_census_snapshots)
             .map_err(|_| {
                 BrokerControlServiceError::InvalidConfiguration("Census snapshot allocation failed")
             })?;
@@ -3405,7 +3541,7 @@ impl BrokerControlServiceV1 {
             hello_receipts: BTreeMap::new(),
             hello_receipt_order,
             census_snapshots,
-            max_census_snapshots: config.max_connections,
+            max_census_snapshots,
             max_hello_receipts,
             accept_quantum,
             next_connection_generation: 1,
@@ -3449,10 +3585,7 @@ impl BrokerControlServiceV1 {
         }
         #[cfg(test)]
         for live in self.live_spawns.values_mut() {
-            if let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } = &mut live.retained.outcome
-            {
-                adoption.pane.terminate_and_wait_for_test();
-            }
+            live.adoption.pane.terminate_and_wait_for_test();
         }
         #[cfg(test)]
         if let Some(blocked) = self.blocked_spawn_completion.as_mut()
@@ -3576,8 +3709,10 @@ impl BrokerControlServiceV1 {
         let journal_id = completion.fingerprint.journal_id;
         let origin_request_id = completion.fingerprint.binding.origin_request_id;
         let represented_panes = self
-            .retained_spawns
+            .recovered_catalog
+            .journals
             .len()
+            .saturating_add(self.retained_spawns.len())
             .saturating_add(self.live_spawns.len());
         if self.blocked_spawn_completion.is_some()
             || self.blocked_ack_completion.is_some()
@@ -3610,35 +3745,6 @@ impl BrokerControlServiceV1 {
         let spawn_effect_id = completion.fingerprint.spawn.binding.spawn_effect_id;
         let journal_id = completion.fingerprint.spawn.journal_id;
         let origin_request_id = completion.fingerprint.spawn.binding.origin_request_id;
-        if completion.token_authority_failed {
-            self.blocked_ack_completion = Some(Box::new(completion));
-            self.spawn_worker_unavailable = true;
-            return;
-        }
-        let Some(acknowledgement) = completion
-            .result
-            .as_ref()
-            .and_then(|result| result.as_ref().ok())
-            .copied()
-            .filter(|receipt| receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged)
-        else {
-            self.blocked_ack_completion = Some(Box::new(completion));
-            self.spawn_worker_unavailable = true;
-            return;
-        };
-        let durable_result_is_exact = completion.retained.fingerprint
-            == completion.fingerprint.spawn
-            && matches!(
-                &completion.retained.outcome,
-                BrokerSpawnWorkerOutcomeV1::Applied {
-                    journal,
-                    adoption,
-                    ..
-                } if journal.status().phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
-                    && journal.status().reply_ack_id == Some(completion.fingerprint.ack_id)
-                    && journal.status().child_identity
-                        == Some(adoption.pane.kernel_child_identity())
-            );
         let indexes_are_exact = self.retained_spawn_by_effect.get(&spawn_effect_id)
             == Some(&durable_pane_id)
             && self.retained_spawn_by_journal.get(&journal_id) == Some(&durable_pane_id)
@@ -3649,23 +3755,29 @@ impl BrokerControlServiceV1 {
         if self.blocked_spawn_completion.is_some()
             || self.blocked_ack_completion.is_some()
             || !self.blocked_worker_events.is_empty()
-            || !durable_result_is_exact
             || !indexes_are_exact
             || self.retained_spawns.contains_key(&durable_pane_id)
-            || self.live_spawns.contains_key(&durable_pane_id)
         {
             self.blocked_ack_completion = Some(Box::new(completion));
             self.spawn_worker_unavailable = true;
             return;
         }
-        self.live_spawns.insert(
-            durable_pane_id,
-            BrokerLiveSpawnV1 {
-                ack_id: completion.fingerprint.ack_id,
-                acknowledgement,
-                retained: *completion.retained,
-            },
-        );
+        let std::collections::hash_map::Entry::Vacant(live_entry) =
+            self.live_spawns.entry(durable_pane_id)
+        else {
+            self.blocked_ack_completion = Some(Box::new(completion));
+            self.spawn_worker_unavailable = true;
+            return;
+        };
+        let live = match BrokerLiveSpawnV1::from_acknowledged_completion(completion) {
+            Ok(live) => live,
+            Err(completion) => {
+                self.blocked_ack_completion = Some(completion);
+                self.spawn_worker_unavailable = true;
+                return;
+            }
+        };
+        live_entry.insert(live);
     }
 
     fn expire_unauthenticated_connections(&mut self) {
@@ -3929,7 +4041,7 @@ impl BrokerControlServiceV1 {
                 return self.dispatch_spawn(owner, request);
             }
             BrokerControlOperationV1::Census => {
-                return self.dispatch_recovery_census(owner, request);
+                return self.dispatch_census(owner, request);
             }
             BrokerControlOperationV1::QueryEffect if request.header.lease_generation == 0 => {
                 return self.dispatch_spawn_query(owner, request);
@@ -3994,7 +4106,7 @@ impl BrokerControlServiceV1 {
         let fingerprint = job.fingerprint;
         let durable_pane_id = fingerprint.binding.durable_pane_id;
         if let Some(live) = self.live_spawns.get(&durable_pane_id) {
-            if live.retained.fingerprint != fingerprint {
+            if live.fingerprint != fingerprint {
                 return BrokerControlResponseV1::new(
                     self.response_header(
                         request.header,
@@ -4004,22 +4116,11 @@ impl BrokerControlServiceV1 {
                 )
                 .map_err(|_| ());
             }
-            return match &live.retained.outcome {
-                BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } => self
-                    .successful_spawn_response(
-                        request.header,
-                        BrokerControlResponseStatusV1::Recovered,
-                        adoption.pane.kernel_child_identity(),
-                    ),
-                _ => BrokerControlResponseV1::new(
-                    self.response_header(
-                        request.header,
-                        BrokerControlResponseStatusV1::Quarantined,
-                    ),
-                    &[],
-                )
-                .map_err(|_| ()),
-            };
+            return self.successful_spawn_response(
+                request.header,
+                BrokerControlResponseStatusV1::Recovered,
+                live.adoption.pane.kernel_child_identity(),
+            );
         }
         if let Some(retained) = self.retained_spawns.get(&durable_pane_id) {
             if retained.fingerprint != fingerprint {
@@ -4151,11 +4252,13 @@ impl BrokerControlServiceV1 {
         let ack_id = request.header.request_id;
 
         if let Some(live) = self.live_spawns.get(&durable_pane_id)
-            && live.retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+            && live.fingerprint.binding.mux_incarnation == owner.mux_incarnation
         {
-            let status = if live.retained.fingerprint.binding.spawn_effect_id == spawn_effect_id
+            let journal_status = live.journal.status();
+            let status = if live.fingerprint.binding.spawn_effect_id == spawn_effect_id
                 && live.ack_id == ack_id
-                && live.acknowledgement.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged
+                && journal_status.phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+                && journal_status.reply_ack_id == Some(ack_id)
             {
                 BrokerControlResponseStatusV1::Recovered
             } else {
@@ -4302,7 +4405,7 @@ impl BrokerControlServiceV1 {
                         retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
                     })
                     || self.live_spawns.get(indexed_pane_id).is_some_and(|live| {
-                        live.retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+                        live.fingerprint.binding.mux_incarnation == owner.mux_incarnation
                     })
             });
         if retained_namespace_conflict {
@@ -4392,7 +4495,7 @@ impl BrokerControlServiceV1 {
             .map_err(|_| ())
     }
 
-    fn dispatch_recovery_census(
+    fn dispatch_census(
         &mut self,
         owner: BrokerGuardianOwnerIdentity,
         request: &BrokerControlRequestV1,
@@ -4409,6 +4512,7 @@ impl BrokerControlServiceV1 {
         };
         let (snapshot_id, response_status) = if page_request.cursor == 0 {
             let snapshot_id = self.allocate_census_snapshot_id()?;
+            let entries = self.capture_census_snapshot_entries(owner)?;
             self.census_snapshots
                 .retain(|_, snapshot| snapshot.owner != owner);
             if self.census_snapshots.len() >= self.max_census_snapshots {
@@ -4420,7 +4524,7 @@ impl BrokerControlServiceV1 {
             }
             if self
                 .census_snapshots
-                .insert(snapshot_id, BrokerCensusSnapshotV1 { owner })
+                .insert(snapshot_id, BrokerCensusSnapshotV1 { owner, entries })
                 .is_some()
             {
                 return Err(());
@@ -4432,7 +4536,7 @@ impl BrokerControlServiceV1 {
                 BrokerControlResponseStatusV1::Recovered,
             )
         };
-        let Some(snapshot) = self.census_snapshots.get(&snapshot_id).copied() else {
+        let Some(snapshot) = self.census_snapshots.get(&snapshot_id) else {
             return BrokerControlResponseV1::new(
                 self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
                 &[],
@@ -4446,10 +4550,7 @@ impl BrokerControlServiceV1 {
             )
             .map_err(|_| ());
         }
-        let snapshot_entries = self
-            .recovery_census_by_mux
-            .get(&owner.mux_incarnation)
-            .map_or(&[] as &[BrokerCensusEntryV1], Vec::as_slice);
+        let snapshot_entries = snapshot.entries.as_slice();
         let total_entry_count = snapshot_entries.len();
         let total_entries = u64::try_from(total_entry_count).map_err(|_| ())?;
         let start = usize::try_from(page_request.cursor).map_err(|_| ())?;
@@ -4501,9 +4602,9 @@ impl BrokerControlServiceV1 {
         request: &BrokerControlRequestV1,
     ) -> Result<BrokerControlResponseV1, ()> {
         if let Some(live) = self.live_spawns.get(&request.header.durable_pane_id)
-            && live.retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+            && live.fingerprint.binding.mux_incarnation == owner.mux_incarnation
         {
-            if live.retained.fingerprint.binding.spawn_effect_id != request.header.operation_id {
+            if live.fingerprint.binding.spawn_effect_id != request.header.operation_id {
                 return BrokerControlResponseV1::new(
                     self.response_header(
                         request.header,
@@ -4515,7 +4616,7 @@ impl BrokerControlServiceV1 {
             }
             let mut header =
                 self.response_header(request.header, BrokerControlResponseStatusV1::Recovered);
-            header.lease_generation = 1;
+            header.lease_generation = live.adoption.pane.status().lease_generation;
             return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
         }
         if let Some(retained) = self.retained_spawns.get(&request.header.durable_pane_id) {
@@ -4560,7 +4661,7 @@ impl BrokerControlServiceV1 {
                         retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
                     })
                     || self.live_spawns.get(durable_pane_id).is_some_and(|live| {
-                        live.retained.fingerprint.binding.mux_incarnation == owner.mux_incarnation
+                        live.fingerprint.binding.mux_incarnation == owner.mux_incarnation
                     })
             });
         if retained_effect_conflicts_for_owner {
@@ -4652,6 +4753,42 @@ impl BrokerControlServiceV1 {
             &encoded,
         )
         .map_err(|_| ())
+    }
+
+    fn capture_census_snapshot_entries(
+        &self,
+        owner: BrokerGuardianOwnerIdentity,
+    ) -> Result<Vec<BrokerCensusEntryV1>, ()> {
+        let recovered = self
+            .recovery_census_by_mux
+            .get(&owner.mux_incarnation)
+            .map_or(&[] as &[BrokerCensusEntryV1], Vec::as_slice);
+        let live_count = self
+            .live_spawns
+            .values()
+            .filter(|live| {
+                live.adoption.pane.status().owner_mux_incarnation == Some(owner.mux_incarnation)
+            })
+            .count();
+        let total_entries = recovered.len().checked_add(live_count).ok_or(())?;
+        if total_entries > GUARDIAN_MAX_PANES {
+            return Err(());
+        }
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(total_entries).map_err(|_| ())?;
+        entries.extend_from_slice(recovered);
+        for live in self.live_spawns.values() {
+            if live.adoption.pane.status().owner_mux_incarnation == Some(owner.mux_incarnation) {
+                entries.push(live.census_entry().map_err(|_| ())?);
+            }
+        }
+        entries.sort_unstable_by(|left, right| {
+            left.durable_pane_id
+                .as_bytes()
+                .cmp(right.durable_pane_id.as_bytes())
+        });
+        validate_broker_census_entries(&entries).map_err(|_| ())?;
+        Ok(entries)
     }
 
     fn allocate_census_snapshot_id(&self) -> Result<Uuid, ()> {
@@ -5187,18 +5324,18 @@ impl BrokerControlClientV1 {
         }
     }
 
-    /// Collect the complete content-free recovery Census from one immutable
+    /// Collect the complete content-free Census from one immutable
     /// snapshot. The collector uses maximum bounded pages, one end-to-end
     /// deadline, strict cross-page ordering, and exact snapshot/total
     /// correlation.
-    pub fn recovery_census(&mut self) -> Result<BrokerRecoveryCensusV1, BrokerControlClientError> {
-        self.recovery_census_with_deadline(BROKER_CONTROL_CENSUS_COLLECTION_TIMEOUT)
+    pub fn census(&mut self) -> Result<BrokerCensusV1, BrokerControlClientError> {
+        self.census_with_deadline(BROKER_CONTROL_CENSUS_COLLECTION_TIMEOUT)
     }
 
-    fn recovery_census_with_deadline(
+    fn census_with_deadline(
         &mut self,
         collection_timeout: Duration,
-    ) -> Result<BrokerRecoveryCensusV1, BrokerControlClientError> {
+    ) -> Result<BrokerCensusV1, BrokerControlClientError> {
         if collection_timeout.is_zero() {
             return Err(BrokerControlClientError::CensusCollectionDeadlineExceeded);
         }
@@ -5207,7 +5344,7 @@ impl BrokerControlClientV1 {
             .ok_or(BrokerControlClientError::CensusCollectionDeadlineExceeded)?;
         let original_read_timeout = self.stream.read_timeout()?;
         let original_write_timeout = self.stream.write_timeout()?;
-        let result = self.collect_recovery_census_pages(deadline);
+        let result = self.collect_census_pages(deadline);
         let restore_read = self.stream.set_read_timeout(original_read_timeout);
         let restore_write = self.stream.set_write_timeout(original_write_timeout);
         if let Err(error) = restore_read.and(restore_write) {
@@ -5217,10 +5354,10 @@ impl BrokerControlClientV1 {
         result
     }
 
-    fn collect_recovery_census_pages(
+    fn collect_census_pages(
         &mut self,
         deadline: Instant,
-    ) -> Result<BrokerRecoveryCensusV1, BrokerControlClientError> {
+    ) -> Result<BrokerCensusV1, BrokerControlClientError> {
         let page_capacity = BROKER_CONTROL_MAX_PAYLOAD_BYTES
             .checked_sub(BROKER_CONTROL_CENSUS_PAGE_HEADER_BYTES)
             .ok_or(BrokerControlClientError::Protocol)?
@@ -5304,7 +5441,7 @@ impl BrokerControlClientV1 {
                         self.poisoned = true;
                         return Err(BrokerControlClientError::UnexpectedResponse);
                     }
-                    if let Err(error) = validate_broker_recovery_census_entries(&entries) {
+                    if let Err(error) = validate_broker_census_entries(&entries) {
                         self.poisoned = true;
                         return Err(match error {
                             BrokerControlProtocolError::CapacityExhausted => {
@@ -5316,7 +5453,7 @@ impl BrokerControlClientV1 {
                     if Instant::now() > deadline {
                         return Err(BrokerControlClientError::CensusCollectionDeadlineExceeded);
                     }
-                    return Ok(BrokerRecoveryCensusV1 {
+                    return Ok(BrokerCensusV1 {
                         snapshot_id,
                         entries,
                     });
@@ -6199,8 +6336,7 @@ impl BrokerSpawnWalStatusV1 {
     }
 }
 
-/// Fail-closed recovery classification for a Spawn WAL retained after a
-/// broker-process restart.
+/// Fail-closed classification for one Spawn WAL row in a broker Census.
 ///
 /// None of these variants grants PTY, child, Release, lease, or mutation
 /// authority. In particular, a durable child observation proves only what the
@@ -6208,15 +6344,16 @@ impl BrokerSpawnWalStatusV1 {
 /// that broker process and must never be reconstructed from WAL bytes.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BrokerRecoveredPaneDispositionV1 {
+pub enum BrokerCensusDispositionV1 {
     PreparedHeaderOnly = 1,
     IntentEffectsDisabled = 2,
     AttemptOutcomeIndeterminate = 3,
     SpawnObservedPtyUnavailable = 4,
     ReplyAcknowledgedPtyUnavailable = 5,
+    ReplyAcknowledgedPtyAvailable = 6,
 }
 
-impl BrokerRecoveredPaneDispositionV1 {
+impl BrokerCensusDispositionV1 {
     fn from_wire(value: u8) -> Result<Self, BrokerControlProtocolError> {
         match value {
             1 => Ok(Self::PreparedHeaderOnly),
@@ -6224,12 +6361,13 @@ impl BrokerRecoveredPaneDispositionV1 {
             3 => Ok(Self::AttemptOutcomeIndeterminate),
             4 => Ok(Self::SpawnObservedPtyUnavailable),
             5 => Ok(Self::ReplyAcknowledgedPtyUnavailable),
+            6 => Ok(Self::ReplyAcknowledgedPtyAvailable),
             _ => Err(BrokerControlProtocolError::InvalidShape),
         }
     }
 }
 
-/// One fixed-width, content-free row in the immutable broker recovery census.
+/// One fixed-width, content-free row in an immutable broker Census snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BrokerCensusEntryV1 {
     pub journal_id: Uuid,
@@ -6238,7 +6376,7 @@ pub struct BrokerCensusEntryV1 {
     pub spawn_effect_id: Uuid,
     pub origin_request_id: Uuid,
     pub phase: Option<BrokerSpawnWalPhaseV1>,
-    pub disposition: BrokerRecoveredPaneDispositionV1,
+    pub disposition: BrokerCensusDispositionV1,
     pub attempt_id: Option<Uuid>,
     pub child_identity: Option<BrokerKernelChildIdentityV1>,
     pub reply_ack_id: Option<Uuid>,
@@ -6251,6 +6389,8 @@ pub struct BrokerCensusEntryV1 {
     pub pty_available: bool,
     pub lease_available: bool,
     pub output_replay_available: bool,
+    pub owner_mux_incarnation: Option<Uuid>,
+    pub lease_generation: u64,
 }
 
 impl BrokerCensusEntryV1 {
@@ -6261,18 +6401,16 @@ impl BrokerCensusEntryV1 {
             return Err(BrokerControlProtocolError::InvalidShape);
         }
         let disposition = match status.phase {
-            None => BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly,
-            Some(BrokerSpawnWalPhaseV1::Intent) => {
-                BrokerRecoveredPaneDispositionV1::IntentEffectsDisabled
-            }
+            None => BrokerCensusDispositionV1::PreparedHeaderOnly,
+            Some(BrokerSpawnWalPhaseV1::Intent) => BrokerCensusDispositionV1::IntentEffectsDisabled,
             Some(BrokerSpawnWalPhaseV1::Attempted) => {
-                BrokerRecoveredPaneDispositionV1::AttemptOutcomeIndeterminate
+                BrokerCensusDispositionV1::AttemptOutcomeIndeterminate
             }
             Some(BrokerSpawnWalPhaseV1::SpawnObserved) => {
-                BrokerRecoveredPaneDispositionV1::SpawnObservedPtyUnavailable
+                BrokerCensusDispositionV1::SpawnObservedPtyUnavailable
             }
             Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged) => {
-                BrokerRecoveredPaneDispositionV1::ReplyAcknowledgedPtyUnavailable
+                BrokerCensusDispositionV1::ReplyAcknowledgedPtyUnavailable
             }
         };
         let entry = Self {
@@ -6295,6 +6433,8 @@ impl BrokerCensusEntryV1 {
             pty_available: false,
             lease_available: false,
             output_replay_available: false,
+            owner_mux_incarnation: None,
+            lease_generation: 0,
         };
         entry.validate()?;
         Ok(entry)
@@ -6306,11 +6446,10 @@ impl BrokerCensusEntryV1 {
             || self.durable_pane_id.is_nil()
             || self.spawn_effect_id.is_nil()
             || self.origin_request_id.is_nil()
-            || !self.append_authority_withheld
-            || !self.effects_disabled
-            || self.pty_available
-            || self.lease_available
-            || self.output_replay_available
+            || self
+                .owner_mux_incarnation
+                .is_some_and(|owner| owner.is_nil())
+            || self.lease_generation > u64::from(u32::MAX)
         {
             return Err(BrokerControlProtocolError::InvalidIdentity);
         }
@@ -6320,46 +6459,68 @@ impl BrokerCensusEntryV1 {
                 .map_err(|_| BrokerControlProtocolError::InvalidIdentity)?;
         }
         let expected_records = match (self.phase, self.disposition) {
-            (None, BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly)
+            (None, BrokerCensusDispositionV1::PreparedHeaderOnly)
                 if self.attempt_id.is_none()
                     && self.child_identity.is_none()
-                    && self.reply_ack_id.is_none() =>
+                    && self.reply_ack_id.is_none()
+                    && self.recovered_authority_is_withheld() =>
             {
                 0
             }
             (
                 Some(BrokerSpawnWalPhaseV1::Intent),
-                BrokerRecoveredPaneDispositionV1::IntentEffectsDisabled,
+                BrokerCensusDispositionV1::IntentEffectsDisabled,
             ) if self.attempt_id.is_none()
                 && self.child_identity.is_none()
-                && self.reply_ack_id.is_none() =>
+                && self.reply_ack_id.is_none()
+                && self.recovered_authority_is_withheld() =>
             {
                 1
             }
             (
                 Some(BrokerSpawnWalPhaseV1::Attempted),
-                BrokerRecoveredPaneDispositionV1::AttemptOutcomeIndeterminate,
+                BrokerCensusDispositionV1::AttemptOutcomeIndeterminate,
             ) if self.attempt_id.is_some()
                 && self.child_identity.is_none()
-                && self.reply_ack_id.is_none() =>
+                && self.reply_ack_id.is_none()
+                && self.recovered_authority_is_withheld() =>
             {
                 2
             }
             (
                 Some(BrokerSpawnWalPhaseV1::SpawnObserved),
-                BrokerRecoveredPaneDispositionV1::SpawnObservedPtyUnavailable,
+                BrokerCensusDispositionV1::SpawnObservedPtyUnavailable,
             ) if self.attempt_id.is_some()
                 && self.child_identity.is_some()
-                && self.reply_ack_id.is_none() =>
+                && self.reply_ack_id.is_none()
+                && self.recovered_authority_is_withheld() =>
             {
                 3
             }
             (
                 Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged),
-                BrokerRecoveredPaneDispositionV1::ReplyAcknowledgedPtyUnavailable,
+                BrokerCensusDispositionV1::ReplyAcknowledgedPtyUnavailable,
             ) if self.attempt_id.is_some()
                 && self.child_identity.is_some()
-                && self.reply_ack_id.is_some() =>
+                && self.reply_ack_id.is_some()
+                && self.recovered_authority_is_withheld() =>
+            {
+                4
+            }
+            (
+                Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged),
+                BrokerCensusDispositionV1::ReplyAcknowledgedPtyAvailable,
+            ) if self.attempt_id.is_some()
+                && self.child_identity.is_some()
+                && self.reply_ack_id.is_some()
+                && !self.append_authority_withheld
+                && !self.head_reconciliation_required
+                && !self.effects_disabled
+                && self.pty_available
+                && self.lease_available
+                && self.output_replay_available
+                && self.owner_mux_incarnation.is_some()
+                && self.lease_generation > 0 =>
             {
                 4
             }
@@ -6397,6 +6558,16 @@ impl BrokerCensusEntryV1 {
         Ok(())
     }
 
+    fn recovered_authority_is_withheld(self) -> bool {
+        self.append_authority_withheld
+            && self.effects_disabled
+            && !self.pty_available
+            && !self.lease_available
+            && !self.output_replay_available
+            && self.owner_mux_incarnation.is_none()
+            && self.lease_generation == 0
+    }
+
     fn encode(self) -> Result<[u8; BROKER_CONTROL_CENSUS_ENTRY_BYTES], BrokerControlProtocolError> {
         self.validate()?;
         let mut encoded = [0_u8; BROKER_CONTROL_CENSUS_ENTRY_BYTES];
@@ -6430,14 +6601,20 @@ impl BrokerCensusEntryV1 {
         encoded[200] = u8::from(self.pty_available);
         encoded[201] = u8::from(self.lease_available);
         encoded[202] = u8::from(self.output_replay_available);
+        encoded[203] = u8::from(self.owner_mux_incarnation.is_some());
+        if let Some(owner_mux_incarnation) = self.owner_mux_incarnation {
+            encoded[204..220].copy_from_slice(owner_mux_incarnation.as_bytes());
+        }
+        encoded[220..224].copy_from_slice(
+            &u32::try_from(self.lease_generation)
+                .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?
+                .to_be_bytes(),
+        );
         Ok(encoded)
     }
 
     fn decode(encoded: &[u8]) -> Result<Self, BrokerControlProtocolError> {
-        if encoded.len() != BROKER_CONTROL_CENSUS_ENTRY_BYTES
-            || encoded[108..112] != [0; 4]
-            || encoded[203..224] != [0; 21]
-        {
+        if encoded.len() != BROKER_CONTROL_CENSUS_ENTRY_BYTES || encoded[108..112] != [0; 4] {
             return Err(BrokerControlProtocolError::InvalidLength);
         }
         let phase = match encoded[80] {
@@ -6481,7 +6658,7 @@ impl BrokerCensusEntryV1 {
             spawn_effect_id: read_broker_uuid(&encoded[48..64]),
             origin_request_id: read_broker_uuid(&encoded[64..80]),
             phase,
-            disposition: BrokerRecoveredPaneDispositionV1::from_wire(encoded[81])?,
+            disposition: BrokerCensusDispositionV1::from_wire(encoded[81])?,
             attempt_id,
             child_identity,
             reply_ack_id: optional_uuid(encoded[84], &encoded[160..176])?,
@@ -6518,13 +6695,15 @@ impl BrokerCensusEntryV1 {
                 1 => true,
                 _ => return Err(BrokerControlProtocolError::InvalidShape),
             },
+            owner_mux_incarnation: optional_uuid(encoded[203], &encoded[204..220])?,
+            lease_generation: u64::from(read_broker_be_u32(&encoded[220..224])),
         };
         entry.validate()?;
         Ok(entry)
     }
 }
 
-/// One immutable, authenticated page of the broker's recovery census.
+/// One immutable, authenticated page of the broker Census.
 #[derive(Debug, Eq, PartialEq)]
 pub struct BrokerCensusPageV1 {
     snapshot_id: Uuid,
@@ -6655,7 +6834,7 @@ impl BrokerCensusPageV1 {
         {
             return Err(BrokerControlProtocolError::InvalidShape);
         }
-        validate_broker_recovery_census_entries(&self.entries)
+        validate_broker_census_entries(&self.entries)
     }
 
     fn validate_for_request(
@@ -6712,10 +6891,9 @@ impl BrokerCensusPageV1 {
 
     fn validate_for_mux(&self, mux_incarnation: Uuid) -> Result<(), BrokerControlProtocolError> {
         if mux_incarnation.is_nil()
-            || self
-                .entries
-                .iter()
-                .any(|entry| entry.mux_incarnation != mux_incarnation)
+            || self.entries.iter().any(|entry| {
+                entry.owner_mux_incarnation.unwrap_or(entry.mux_incarnation) != mux_incarnation
+            })
         {
             return Err(BrokerControlProtocolError::InvalidIdentity);
         }
@@ -6723,15 +6901,15 @@ impl BrokerCensusPageV1 {
     }
 }
 
-/// Complete bounded recovery Census collected from one immutable broker
-/// snapshot under a single end-to-end deadline.
+/// Complete bounded Census collected from one immutable broker snapshot under
+/// a single end-to-end deadline.
 #[derive(Debug, Eq, PartialEq)]
-pub struct BrokerRecoveryCensusV1 {
+pub struct BrokerCensusV1 {
     snapshot_id: Uuid,
     entries: Vec<BrokerCensusEntryV1>,
 }
 
-impl BrokerRecoveryCensusV1 {
+impl BrokerCensusV1 {
     #[must_use]
     pub const fn snapshot_id(&self) -> Uuid {
         self.snapshot_id
@@ -6743,7 +6921,7 @@ impl BrokerRecoveryCensusV1 {
     }
 }
 
-fn validate_broker_recovery_census_entries(
+fn validate_broker_census_entries(
     entries: &[BrokerCensusEntryV1],
 ) -> Result<(), BrokerControlProtocolError> {
     if entries.len() > GUARDIAN_MAX_PANES
@@ -12973,7 +13151,7 @@ mod tests {
             spawn_effect_id: id(300_000 + ordinal),
             origin_request_id: id(400_000 + ordinal),
             phase: None,
-            disposition: BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly,
+            disposition: BrokerCensusDispositionV1::PreparedHeaderOnly,
             attempt_id: None,
             child_identity: None,
             reply_ack_id: None,
@@ -12986,6 +13164,8 @@ mod tests {
             pty_available: false,
             lease_available: false,
             output_replay_available: false,
+            owner_mux_incarnation: None,
+            lease_generation: 0,
         };
         entry.validate().expect("valid prepared Census fixture");
         entry
@@ -14382,7 +14562,7 @@ mod tests {
         let entry = *entry;
         assert_eq!(
             entry.disposition,
-            BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly
+            BrokerCensusDispositionV1::PreparedHeaderOnly
         );
         assert!(entry.effects_disabled);
         assert!(!entry.pty_available);
@@ -14397,20 +14577,80 @@ mod tests {
         enabled_effects[87] = 0;
         assert!(matches!(
             BrokerCensusEntryV1::decode(&enabled_effects),
-            Err(BrokerControlProtocolError::InvalidIdentity)
+            Err(BrokerControlProtocolError::InvalidShape)
         ));
         let mut forged_pty = encoded_entry;
         forged_pty[200] = 1;
         assert!(matches!(
             BrokerCensusEntryV1::decode(&forged_pty),
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+        let mut forged_recovered_generation = encoded_entry;
+        forged_recovered_generation[223] = 1;
+        assert!(matches!(
+            BrokerCensusEntryV1::decode(&forged_recovered_generation),
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
+
+        let live_entry = BrokerCensusEntryV1 {
+            journal_id: id(765),
+            mux_incarnation: identity.mux_incarnation(),
+            durable_pane_id: id(766),
+            spawn_effect_id: id(767),
+            origin_request_id: id(768),
+            phase: Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged),
+            disposition: BrokerCensusDispositionV1::ReplyAcknowledgedPtyAvailable,
+            attempt_id: Some(id(769)),
+            child_identity: Some(BrokerKernelChildIdentityV1 {
+                process_id: 77,
+                broker_child_nonce: id(770),
+                kernel_start_identity_digest: [0x7a; 32],
+            }),
+            reply_ack_id: Some(id(771)),
+            committed_records: BROKER_SPAWN_WAL_MAX_RECORDS,
+            committed_wal_bytes: BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+            committed_head_bytes: BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+            append_authority_withheld: false,
+            head_reconciliation_required: false,
+            effects_disabled: false,
+            pty_available: true,
+            lease_available: true,
+            output_replay_available: true,
+            owner_mux_incarnation: Some(identity.mux_incarnation()),
+            lease_generation: 1,
+        };
+        let encoded_live_entry = live_entry
+            .encode()
+            .expect("encode canonical live Census row");
+        assert_eq!(
+            BrokerCensusEntryV1::decode(&encoded_live_entry)
+                .expect("decode canonical live Census row"),
+            live_entry
+        );
+        let successor_mux_incarnation = id(772);
+        let mut successor_live_entry = live_entry;
+        successor_live_entry.owner_mux_incarnation = Some(successor_mux_incarnation);
+        let successor_page = BrokerCensusPageV1 {
+            snapshot_id: id(773),
+            entries: vec![successor_live_entry],
+            next_cursor: None,
+            total_entries: 1,
+        };
+        successor_page
+            .validate_for_mux(successor_mux_incarnation)
+            .expect("bind live Census row to exact successor mux owner");
+        assert!(matches!(
+            successor_page.validate_for_mux(identity.mux_incarnation()),
             Err(BrokerControlProtocolError::InvalidIdentity)
         ));
-        let mut noncanonical_reserved = encoded_entry;
-        noncanonical_reserved[223] = 1;
-        assert!(matches!(
-            BrokerCensusEntryV1::decode(&noncanonical_reserved),
-            Err(BrokerControlProtocolError::InvalidLength)
-        ));
+        for offset in [85, 87, 200, 201, 202, 203, 223] {
+            let mut forged = encoded_live_entry;
+            forged[offset] ^= 1;
+            assert!(
+                BrokerCensusEntryV1::decode(&forged).is_err(),
+                "live Census authority mutation at byte {offset} was accepted"
+            );
+        }
 
         let snapshot_id = id(762);
         let page = BrokerCensusPageV1 {
@@ -14445,7 +14685,7 @@ mod tests {
 
         let distinct_entry = prepared_census_entry(900, identity.mux_incarnation());
         let canonical_pair = [entry, distinct_entry];
-        validate_broker_recovery_census_entries(&canonical_pair)
+        validate_broker_census_entries(&canonical_pair)
             .expect("distinct Census identities are canonical");
         let mut duplicate_journal = distinct_entry;
         duplicate_journal.journal_id = entry.journal_id;
@@ -14675,18 +14915,18 @@ mod tests {
                     Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged) => 4,
                 };
                 let expected_disposition = match phase {
-                    None => BrokerRecoveredPaneDispositionV1::PreparedHeaderOnly,
+                    None => BrokerCensusDispositionV1::PreparedHeaderOnly,
                     Some(BrokerSpawnWalPhaseV1::Intent) => {
-                        BrokerRecoveredPaneDispositionV1::IntentEffectsDisabled
+                        BrokerCensusDispositionV1::IntentEffectsDisabled
                     }
                     Some(BrokerSpawnWalPhaseV1::Attempted) => {
-                        BrokerRecoveredPaneDispositionV1::AttemptOutcomeIndeterminate
+                        BrokerCensusDispositionV1::AttemptOutcomeIndeterminate
                     }
                     Some(BrokerSpawnWalPhaseV1::SpawnObserved) => {
-                        BrokerRecoveredPaneDispositionV1::SpawnObservedPtyUnavailable
+                        BrokerCensusDispositionV1::SpawnObservedPtyUnavailable
                     }
                     Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged) => {
-                        BrokerRecoveredPaneDispositionV1::ReplyAcknowledgedPtyUnavailable
+                        BrokerCensusDispositionV1::ReplyAcknowledgedPtyUnavailable
                     }
                 };
                 assert_eq!(entry.phase, phase);
@@ -15943,7 +16183,7 @@ mod tests {
         assert_eq!(final_page.next_cursor(), None);
 
         let complete_census = first_client
-            .recovery_census()
+            .census()
             .expect("collect a complete bounded recovery Census");
         assert_ne!(complete_census.snapshot_id(), original_snapshot_id);
         assert_eq!(
@@ -16024,7 +16264,7 @@ mod tests {
                 mux_incarnation,
             ));
         }
-        validate_broker_recovery_census_entries(&canonical_entries)
+        validate_broker_census_entries(&canonical_entries)
             .expect("canonical cross-page Census fixture");
 
         for (case, namespace) in ["journal", "Spawn effect", "origin request"]
@@ -16043,7 +16283,7 @@ mod tests {
                 _ => unreachable!("the duplicate-identity fixture namespace is exhaustive"),
             }
             assert!(matches!(
-                validate_broker_recovery_census_entries(&entries),
+                validate_broker_census_entries(&entries),
                 Err(BrokerControlProtocolError::InvalidIdentity)
             ));
 
@@ -16136,7 +16376,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    client.recovery_census(),
+                    client.census(),
                     Err(BrokerControlClientError::UnexpectedResponse)
                 ),
                 "cross-page duplicate {namespace} identity was accepted"
@@ -16164,8 +16404,7 @@ mod tests {
                 mux_incarnation,
             ));
         }
-        validate_broker_recovery_census_entries(&entries)
-            .expect("canonical maximum-sized Census fixture");
+        validate_broker_census_entries(&entries).expect("canonical maximum-sized Census fixture");
 
         let client_authority = control_authenticator(0xc6);
         let server_authority = control_authenticator(0xc6);
@@ -16264,7 +16503,7 @@ mod tests {
             poisoned: false,
         };
         let census = client
-            .recovery_census()
+            .census()
             .expect("collect exact maximum-sized recovery Census");
         assert_eq!(census.snapshot_id(), snapshot_id);
         assert_eq!(census.entries().len(), GUARDIAN_MAX_PANES);
@@ -16457,7 +16696,7 @@ mod tests {
             poisoned: false,
         };
         assert!(matches!(
-            client.recovery_census_with_deadline(Duration::from_millis(25)),
+            client.census_with_deadline(Duration::from_millis(25)),
             Err(BrokerControlClientError::CensusCollectionDeadlineExceeded)
         ));
         assert!(
@@ -16519,7 +16758,7 @@ mod tests {
         let client_thread = thread::spawn(move || {
             let mut client = client;
             let started = Instant::now();
-            let result = client.recovery_census_with_deadline(Duration::from_millis(200));
+            let result = client.census_with_deadline(Duration::from_millis(200));
             let elapsed = started.elapsed();
             client_thread_done.store(true, Ordering::Release);
             (client, result, elapsed)
@@ -17306,6 +17545,28 @@ mod tests {
                 lease_generation: 1
             }
         );
+        let live_census = client
+            .census()
+            .expect("collect acknowledged live Spawn Census");
+        let [live_entry] = live_census.entries() else {
+            panic!("acknowledged live Spawn Census did not contain exactly one row")
+        };
+        assert_eq!(live_entry.durable_pane_id, binding.durable_pane_id);
+        assert_eq!(live_entry.spawn_effect_id, binding.spawn_effect_id);
+        assert_eq!(
+            live_entry.disposition,
+            BrokerCensusDispositionV1::ReplyAcknowledgedPtyAvailable
+        );
+        assert_eq!(
+            live_entry.owner_mux_incarnation,
+            Some(authenticated.owner.mux_incarnation)
+        );
+        assert_eq!(live_entry.lease_generation, 1);
+        assert!(!live_entry.append_authority_withheld);
+        assert!(!live_entry.effects_disabled);
+        assert!(live_entry.pty_available);
+        assert!(live_entry.lease_available);
+        assert!(live_entry.output_replay_available);
         let recovered = client
             .exchange(&spawn_request(header))
             .expect("recover exact completed control Spawn");
@@ -18383,7 +18644,7 @@ mod tests {
         assert_eq!(entry.phase, Some(BrokerSpawnWalPhaseV1::Intent));
         assert_eq!(
             entry.disposition,
-            BrokerRecoveredPaneDispositionV1::IntentEffectsDisabled
+            BrokerCensusDispositionV1::IntentEffectsDisabled
         );
         assert!(entry.append_authority_withheld);
         assert!(entry.head_reconciliation_required);
